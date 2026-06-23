@@ -129,7 +129,7 @@ FireCore has **significant GUI fragmentation** across 3 languages (C++, Python, 
 - `MMParams.js` - Parameter parser - **DUPLICATE**
 - `Draw3D_webgpu.js` - WebGPU rendering
 - `XPDBTopology.js` - XPBD physics
-- `MMFFLTopology.js` - MMFF topology
+- `SPFFLTopology.js` - SPFF topology
 
 **Critical Issue - Code Duplication:**
 - `molgui_web/` and `molgui_webgpu/` have **near-identical files**:
@@ -195,7 +195,7 @@ FireCore has **significant GUI fragmentation** across 3 languages (C++, Python, 
 ### Low Priority (Cross-Language Consistency)
 
 7. **Parameter File Loading**
-   - Python: `MMFFparams.h` (C++), `MMParams.js` (JS), manual parsing (Python)
+   - Python: `SPFFparams.h` (C++), `MMParams.js` (JS), manual parsing (Python)
    - Issue: Three different implementations for same `.dat` files
    - Action: Consider single source of truth or well-documented parity
 
@@ -332,7 +332,7 @@ FireCore has **significant GUI fragmentation** across 3 languages (C++, Python, 
 - `web/molgui_webgpu/MoleculeRenderer.js`
 - `web/molgui_webgpu/MoleculeSelection.js`
 - `web/molgui_webgpu/MoleculeUtils.js`
-- `web/molgui_webgpu/MMFFLTopology.js`
+- `web/molgui_webgpu/SPFFLTopology.js`
 - `web/molgui_webgpu/XPDBTopology.js`
 - `web/molgui_webgpu/XPDB_CPU.js`
 - `web/molgui_webgpu/XPDB_WebGPU.js`

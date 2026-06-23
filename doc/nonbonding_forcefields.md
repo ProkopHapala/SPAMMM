@@ -3,8 +3,8 @@
 This document covers pairwise and many-body non-covalent interactions: van der Waals, electrostatics, and short-range repulsion. FireCore implements these across several abstraction levels, from brute-force O(N²) pairwise loops to approximate O(N log N) tile-based Fast Multipole Methods.
 
 **Related Windsurf Codemaps:**
-- [FireCore Classical Forcefields: MMFFsp3 & UFF (CPU/GPU/Python)](https://windsurf.com/codemaps/53f2fe2c-ac5c-4c0b-b905-af6653adde97-8796fe608a7d71c1) — NBFF base class and LJ/Morse/Coulomb evaluation architecture.
-- [MMFF/UFF CPU vs GPU Testing](https://windsurf.com/codemaps/8d1b056f-1502-4363-b52d-8257de4be453-8796fe608a7d71c1) — CPU vs GPU parity for non-bonded terms (getLJQH, getMorsePLQH).
+- [FireCore Classical Forcefields: SPFFsp3 & UFF (CPU/GPU/Python)](https://windsurf.com/codemaps/53f2fe2c-ac5c-4c0b-b905-af6653adde97-8796fe608a7d71c1) — NBFF base class and LJ/Morse/Coulomb evaluation architecture.
+- [SPFF/UFF CPU vs GPU Testing](https://windsurf.com/codemaps/8d1b056f-1502-4363-b52d-8257de4be453-8796fe608a7d71c1) — CPU vs GPU parity for non-bonded terms (getLJQH, getMorsePLQH).
 - [FitREQ_PN: Hydrogen-Bond Parameter Fitting System](https://windsurf.com/codemaps/d977d597-94b4-42c3-a92a-0cefe34a3e82-8796fe608a7d71c1) — H-bond parameter fitting and REQ optimization.
 - [DFTB Reference Calculation & FDBM AFM Forcefield Comparison System](https://windsurf.com/codemaps/1153fe89-ff29-4d4b-b4a6-e97d8f37047f-fe86ab10a43f3d18) — Comparing DFTB reference to classical non-bonded potentials.
 - [AFM FDBM Pipeline: DFTB Backend & pySCF Integration Points](https://windsurf.com/codemaps/02d559c9-de47-4058-b07b-3318664b454e-fe86ab10a43f3d18) — DFTB-derived force-field parameter pipeline.
@@ -93,7 +93,7 @@ The choice is controlled at compile time or runtime via `bSubtractBonded` flags.
 ### Test Coverage
 
 - `tests/tUFF/test_UFF_multi.py` — tests that non-bonded exclusions are handled correctly in multi-system mode.
-- `tests/tMMFF/test_diamond_phonon_bands.py` — phonon bands are sensitive to non-bonded cutoff; validates that bulk moduli are reasonable.
+- `tests/tSPFF/test_diamond_phonon_bands.py` — phonon bands are sensitive to non-bonded cutoff; validates that bulk moduli are reasonable.
 
 ---
 
@@ -218,7 +218,7 @@ which is naturally compatible with the geometric-mean convention used in most fo
 
 - [Topical Audit Index](topical_audit.md) — priority ranking, dependency graph, missing topics
 - [Forcefields Overview](forcefields_overview.md) — high-level taxonomy of all force field classes
-- [Intramolecular Forcefields](intramolecular_forcefields.md) — UFF, MMFFsp3, ProjectiveDynamics, XPBD, RigidBody
+- [Intramolecular Forcefields](intramolecular_forcefields.md) — UFF, SPFFsp3, ProjectiveDynamics, XPBD, RigidBody
 - [Surface Interactions](surface_interactions.md) — GridFF, FoldedAtomicFunctions, Ewald2D
 - [Web Force Fields](forcefields_web_implementation.md) — WebGL/WebGPU shader implementations
 

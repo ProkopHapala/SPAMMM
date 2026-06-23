@@ -9,7 +9,7 @@ This document provides the high-level taxonomy. Detailed discussions of physics,
 **Windsurf Codemaps:**
 - [FireCore Force Field Navigation: From Audit Docs to Implementation](https://windsurf.com/codemaps/d550a435-7c6f-47b1-aeb5-efc9b098564f-fe86ab10a43f3d18) — Interactive trace from audit documents to source code (UFF, GridFF, Ewald2D, MolWorld orchestration, REQ→PLQ, test parity).
 
-- **`intramolecular_forcefields.md`** — Bonds, angles, dihedrals, torsions (UFF, MMFFsp3, ProjectiveDynamics, XPBD, RigidBody).
+- **`intramolecular_forcefields.md`** — Bonds, angles, dihedrals, torsions (UFF, SPFFsp3, ProjectiveDynamics, XPBD, RigidBody).
 - **`nonbonding_forcefields.md`** — Lennard-Jones, Morse, Coulomb, exclusion schemes, and Fast Multipole Method (FMM).
 - **`surface_interactions.md`** — GridFF (grid-based interpolation) and FoldedAtomicFunctions (plane-wave basis).
 - **`forcefields_web_implementation.md`** — WebGL/WebGPU shader implementations for browser-based visualization and simulation.
@@ -17,8 +17,8 @@ This document provides the high-level taxonomy. Detailed discussions of physics,
 ---
 
 **Related Codemaps (full list in topical_audit.md):**
-- [FireCore Classical Forcefields: MMFFsp3 & UFF](https://windsurf.com/codemaps/53f2fe2c-ac5c-4c0b-b905-af6653adde97-8796fe608a7d71c1)
-- [MMFF/UFF CPU vs GPU Testing](https://windsurf.com/codemaps/8d1b056f-1502-4363-b52d-8257de4be453-8796fe608a7d71c1)
+- [FireCore Classical Forcefields: SPFFsp3 & UFF](https://windsurf.com/codemaps/53f2fe2c-ac5c-4c0b-b905-af6653adde97-8796fe608a7d71c1)
+- [SPFF/UFF CPU vs GPU Testing](https://windsurf.com/codemaps/8d1b056f-1502-4363-b52d-8257de4be453-8796fe608a7d71c1)
 - [Surface Potential Evaluation: GridFF B-spline](https://windsurf.com/codemaps/2a639fae-c9cb-407a-9d45-7b806c90c749-8796fe608a7d71c1)
 - [FoldedAtomicFunctions](https://windsurf.com/codemaps/c9fc44a7-57a2-47c5-906f-886fa301ccc7-8796fe608a7d71c1)
 - [AFM PyOpenCL System: Morse/LJ and FDBM](https://windsurf.com/codemaps/9bb4c2a5-0c38-4943-abe9-254cfdcc75af-8796fe608a7d71c1)
@@ -34,16 +34,16 @@ These describe covalent bonding geometry: bond lengths, angles, and (optionally)
 | Class | Method | Key Files | Status |
 |-------|--------|-----------|--------|
 | **UFF** | Traditional topology-based force field with bonds, angles, dihedrals, inversions. | `cpp/common/molecular/UFF.h`, `relax_multi.cl` | Production |
-| **MMFFsp3** | GPU-optimized variant replacing 4-body terms with π–π and π–σ alignment terms motivated by quantum chemistry of sp-hybridization. | `cpp/common/molecular/MMFFsp3_loc.h`, `pyBall/OCL/MMFF.py` | Production |
+| **SPFFsp3** | GPU-optimized variant replacing 4-body terms with π–π and π–σ alignment terms motivated by quantum chemistry of sp-hybridization. | `cpp/common/molecular/SPFFsp3_loc.h`, `pyBall/OCL/SPFF.py` | Production |
 | **ProjectiveDynamics** | Position-based implicit solver for stiff harmonic bonds using Jacobi/Gauss-Seidel iterations. | `cpp/common/math/ProjectiveDynamics_d.h`, `pyBall/pyTruss/truss.cl` | Experimental |
 | **XPBD (2D/3D)** | eXtended Position-Based Dynamics with per-atom quaternions and port-based constraints. | `pyBall/XPBD_2D/`, `pyBall/XPDB_AVBD/` | Experimental |
 | **RigidBodyFF** | Whole-molecule rigid body dynamics (6/7 DOFs) for large time steps and robust assembly/AFM/STM. | `cpp/common/molecular/RigidBodyFF.h`, `pyBall/OCL/RigidBodyDynamics.py` | Production |
 | **ReactiveFF** | RARFF, EFF — semi-quantum force fields using localized orbital ansätze. | `cpp/common/molecular/RARFF.h`, `eFF.h` | Highly experimental |
 
 ### Design Philosophy
-- **GPU Parallelism**: MMFFsp3 and UFF use a *force-assembly* scheme to avoid atomic writes: forces are first emitted into auxiliary buffers, then assembled into the global force array.
-- **Node Atoms vs. Capping Atoms**: MMFFsp3 distinguishes "node" atoms (C, N, O with multiple neighbors) from "capping" atoms (H, lone pairs). Only node atoms carry angular terms; capping atoms feel only recoil from their host.
-- **Pi-Orbital Alignment**: MMFFsp3 replaces expensive 4-body dihedral terms with cheaper 2-body π–π (`k_pp`) and π–σ (`k_sp`) alignment terms that capture conjugation and orthogonality effects.
+- **GPU Parallelism**: SPFFsp3 and UFF use a *force-assembly* scheme to avoid atomic writes: forces are first emitted into auxiliary buffers, then assembled into the global force array.
+- **Node Atoms vs. Capping Atoms**: SPFFsp3 distinguishes "node" atoms (C, N, O with multiple neighbors) from "capping" atoms (H, lone pairs). Only node atoms carry angular terms; capping atoms feel only recoil from their host.
+- **Pi-Orbital Alignment**: SPFFsp3 replaces expensive 4-body dihedral terms with cheaper 2-body π–π (`k_pp`) and π–σ (`k_sp`) alignment terms that capture conjugation and orthogonality effects.
 
 ---
 

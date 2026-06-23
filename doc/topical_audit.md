@@ -81,7 +81,7 @@ Topics are ranked by **consolidation priority** — how much duplicate/scattered
 - Graph representations, bond finding, neighbor lists, ring/bridge detection across C++/Python/JavaScript
 - **Gap identified:** Crystal building (CIF parsing, lattice replication, slab cutting) exists only in JavaScript `CrystalUtils.js` (1188 lines) — no Python equivalent
 - **Audit Document:** [molecular_topology.md](molecular_topology.md)
-- **Key files:** `AtomicGraph.py` (392 lines), `AtomicSystem.py` (1314 lines), `EditableMolecule.js` (1057 lines), `MMFFBuilderBase.h` (808 lines)
+- **Key files:** `AtomicGraph.py` (392 lines), `AtomicSystem.py` (1314 lines), `EditableMolecule.js` (1057 lines), `SPFFBuilderBase.h` (808 lines)
 
 ### 1b. Molecular Topology — Type Assignment
 - Atom type assignment (sp1/sp2/sp3), VSEPR geometry, parameter loading
@@ -97,16 +97,16 @@ Topics are ranked by **consolidation priority** — how much duplicate/scattered
 ### 1d. Crystal Building (Gap — No Audit Document Yet)
 - **Current state:** `CrystalUtils.js` (1188 lines) — CIF parsing, symmetry ops, lattice vectors, frac↔cart, slab cutting (HKL), plane cutting, nanocrystal generation, dedup, bond building across cell boundaries
 - **Python gap:** No equivalent. `KekuleBackend` does hex grid for graphene only
-- **C++ gap:** `MMFFBuilder` has `insertAtoms`/`autoBonds` but no CIF/crystallography
+- **C++ gap:** `SPFFBuilder` has `insertAtoms`/`autoBonds` but no CIF/crystallography
 - **Action needed:** Create `crystal_building.md` audit document; port `CrystalUtils.js` → Python
 - **Related files:** `web/molgui_webgpu/CrystalUtils.js`, `web/molgui_webgpu/Nanocrystals.js` (631 lines), `web/molgui_webgpu/BuildersGUI.js` (1130 lines)
 
 ## Priority 2 (High) — Classical Force Fields
 
-**Why high:** Multiple FF implementations (MMFF, UFF, XPBD, ProjectiveDynamics) with CPU/GPU parity concerns across 3 languages. Core simulation capability.
+**Why high:** Multiple FF implementations (SPFF, UFF, XPBD, ProjectiveDynamics) with CPU/GPU parity concerns across 3 languages. Core simulation capability.
 
 ### 2a. Intramolecular Force Fields
-- UFF, MMFFsp3, ProjectiveDynamics, XPBD/XPDB, RigidBody FF
+- UFF, SPFFsp3, ProjectiveDynamics, XPBD/XPDB, RigidBody FF
 - **Audit Documents:**
   - [forcefields_overview.md](forcefields_overview.md) — High-level taxonomy
   - [intramolecular_forcefields.md](intramolecular_forcefields.md) — Detailed per-FF analysis
@@ -118,7 +118,7 @@ Topics are ranked by **consolidation priority** — how much duplicate/scattered
 - **Audit Document:** [nonbonding_forcefields.md](nonbonding_forcefields.md)
 
 ### 2c. Web Force Fields
-- XPBD/MMFFL in WebGPU compute shaders, WebGL legacy
+- XPBD/SPFFL in WebGPU compute shaders, WebGL legacy
 - **Audit Document:** [forcefields_web_implementation.md](forcefields_web_implementation.md)
 
 ### 2d. Parameter Fitting
@@ -199,7 +199,7 @@ Topics are ranked by **consolidation priority** — how much duplicate/scattered
               │                    │                    │
     ┌─────────▼────────┐ ┌────────▼─────────┐ ┌────────▼────────┐
     │ Intramolecular FF │ │ Non-Bonding FF   │ │ Surface Interac.│
-    │ (2a: MMFF, UFF,  │ │ (2b: NBFF, FMM,  │ │ (3: GridFF, FAF │
+    │ (2a: SPFF, UFF,  │ │ (2b: NBFF, FMM,  │ │ (3: GridFF, FAF │
     │  XPBD, RigidBody)│ │  PME)            │ │  Ewald2D)       │
     └────────┬─────────┘ └────────┬─────────┘ └────────┬────────┘
              │                    │                    │
@@ -237,7 +237,7 @@ Topics are ranked by **consolidation priority** — how much duplicate/scattered
 | **Molecular Dynamics (MD)** | XPBD MD in PyOpenCL, MD in WebGPU compute shaders, integrators | `pyBall/OCL/MolecularDynamics.py`, `web/molgui_webgpu/` (compute shaders) | High |
 | **File I/O & Format Parsing** | XYZ, MOL2, CIF, extended XYZ with Lattice — scattered across languages | `atomicUtils.py`, `CrystalUtils.js`, `IO_utils.h` | Medium |
 | **Visualization & Rendering** | VisPy (Python), OpenGL (C++), WebGPU/WebGL (JS) — 3 separate rendering stacks | `KekuleExplorerGUI.py`, `MolGUI.h`, `MoleculeRenderer.js` | Medium |
-| **Selection Systems** | 3 different selection implementations (C++ set, Python set, JS Selection class) | `Selection.js`, `AtomicSystem.py`, `MMFFBuilder.h` | Low |
+| **Selection Systems** | 3 different selection implementations (C++ set, Python set, JS Selection class) | `Selection.js`, `AtomicSystem.py`, `SPFFBuilder.h` | Low |
 
 ---
 
@@ -280,8 +280,8 @@ Topics are ranked by **consolidation priority** — how much duplicate/scattered
 * [Molecule-on-Surface Systems: GridFF, XYZ Scanning, Surface Sampling, and Assembly](https://windsurf.com/codemaps/f8407e23-3a2e-41f1-abcf-9c15f3644c41-8796fe608a7d71c1)
 
 ### Force Fields
-* [FireCore Classical Forcefields: MMFFsp3 & UFF (CPU/GPU/Python)](https://windsurf.com/codemaps/53f2fe2c-ac5c-4c0b-b905-af6653adde97-8796fe608a7d71c1)
-* [MMFF/UFF CPU vs GPU Testing: C++ OpenCL and PyOpenCL Parity Infrastructure](https://windsurf.com/codemaps/8d1b056f-1502-4363-b52d-8257de4be453-8796fe608a7d71c1)
+* [FireCore Classical Forcefields: SPFFsp3 & UFF (CPU/GPU/Python)](https://windsurf.com/codemaps/53f2fe2c-ac5c-4c0b-b905-af6653adde97-8796fe608a7d71c1)
+* [SPFF/UFF CPU vs GPU Testing: C++ OpenCL and PyOpenCL Parity Infrastructure](https://windsurf.com/codemaps/8d1b056f-1502-4363-b52d-8257de4be453-8796fe608a7d71c1)
 * [FitREQ_PN: Hydrogen-Bond Parameter Fitting System](https://windsurf.com/codemaps/d977d597-94b4-42c3-a92a-0cefe34a3e82-8796fe608a7d71c1)
 * [FitREQ Interactive GUI: Monte Carlo Optimization & Energy Decomposition Integration](https://windsurf.com/codemaps/e25a0dfc-f9a8-42ab-b8bb-1d959037ca68-fe86ab10a43f3d18)
 * [FitREQ Hydrogen Bond Fitting System - GPU-Accelerated Parameter Optimization](https://windsurf.com/codemaps/bf59a960-ac6c-4eea-b828-9bd18c3d44ac-fe86ab10a43f3d18)

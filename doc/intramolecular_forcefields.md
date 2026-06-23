@@ -1,10 +1,10 @@
 # Intramolecular Force Fields
 
-This document covers force fields that describe bonded geometry: bond lengths, angles, dihedrals, and related constraints. FireCore implements several distinct approaches, from traditional topology-based force fields (UFF, MMFFsp3) to position-based solvers (ProjectiveDynamics, XPBD) and rigid-body approximations.
+This document covers force fields that describe bonded geometry: bond lengths, angles, dihedrals, and related constraints. FireCore implements several distinct approaches, from traditional topology-based force fields (UFF, SPFFsp3) to position-based solvers (ProjectiveDynamics, XPBD) and rigid-body approximations.
 
 **Related Windsurf Codemaps:**
-- [FireCore Classical Forcefields: MMFFsp3 & UFF (CPU/GPU/Python)](https://windsurf.com/codemaps/53f2fe2c-ac5c-4c0b-b905-af6653adde97-8796fe608a7d71c1) — Architecture of UFF, MMFFsp3, GPU kernels, Python wrappers.
-- [MMFF/UFF CPU vs GPU Testing: C++ OpenCL and PyOpenCL Parity Infrastructure](https://windsurf.com/codemaps/8d1b056f-1502-4363-b52d-8257de4be453-8796fe608a7d71c1) — How CPU vs GPU parity tests are structured.
+- [FireCore Classical Forcefields: SPFFsp3 & UFF (CPU/GPU/Python)](https://windsurf.com/codemaps/53f2fe2c-ac5c-4c0b-b905-af6653adde97-8796fe608a7d71c1) — Architecture of UFF, SPFFsp3, GPU kernels, Python wrappers.
+- [SPFF/UFF CPU vs GPU Testing: C++ OpenCL and PyOpenCL Parity Infrastructure](https://windsurf.com/codemaps/8d1b056f-1502-4363-b52d-8257de4be453-8796fe608a7d71c1) — How CPU vs GPU parity tests are structured.
 - [XPBD Molecular Dynamics pyOpenCL](https://windsurf.com/codemaps/2e558e51-fdbe-4bd4-8732-7818724d4ced-8796fe608a7d71c1) — Position-based dynamics solver trace.
 - [Rigid Body Dynamics on Surfaces (pyOpenCL)](https://windsurf.com/codemaps/b5d9c2d2-50f0-4ba7-bc65-60db6e06e423-8796fe608a7d71c1) — Rigid body quaternion integration and GridFF coupling.
 - [Rigid Body Dynamics System for AFM Simulation](https://windsurf.com/codemaps/c9f13e1f-edfa-4702-814f-5036d03ea6c9-fe86ab10a43f3d18) — 6-DOF rigid body with AFM tip mechanics.
@@ -33,7 +33,7 @@ Each term is a simple analytical function parameterized by equilibrium values an
   - `evalAngleCosHalf(...)` (line 120) — improved angle bending using cos(θ/2), quasi-harmonic beyond 90°.
   - `evalPiAling(...)` (line 140) — π–π alignment interaction.
 - **`pyBall/OCL/UFF.py`** / **`pyBall/OCL/UFFbuilder.py`** — PyOpenCL wrappers and topology builders.
-- **`pyBall/MMFF_multi.py`** — Multi-system UFF interface.
+- **`pyBall/SPFF_multi.py`** — Multi-system UFF interface.
 
 ### Key Physics
 
@@ -67,16 +67,16 @@ Implemented in `evalBond()` as `fr = dl*k; *f = h*fr; return fr*dl*0.5;`.
 
 ---
 
-## 2. MMFFsp3_loc (Molecular Mechanics Force Field sp3 Localized)
+## 2. SPFFsp3_loc (Molecular Mechanics Force Field sp3 Localized)
 
 ### Physics & Purpose
 
-MMFFsp3 is *not* the Merck Molecular Force Field. It is a FireCore-specific formulation optimized for sp³-hybridized carbon and first-row organics (H, C, N, O). The key insight is that traditional 4-body dihedral and improper terms are:
+SPFFsp3 is *not* the Merck Molecular Force Field. It is a FireCore-specific formulation optimized for sp³-hybridized carbon and first-row organics (H, C, N, O). The key insight is that traditional 4-body dihedral and improper terms are:
 
 1. **Expensive** — require four-atom loops, poorly suited to GPU SIMT execution.
 2. **Redundant** — the same physics (orbital alignment) can be captured by 2-body π–π and π–σ terms.
 
-MMFFsp3 therefore **replaces explicit dihedrals** with:
+SPFFsp3 therefore **replaces explicit dihedrals** with:
 
 - **π–π alignment** (`k_pp`): penalizes misalignment of p-orbitals on conjugated systems.
 - **π–σ alignment** (`k_sp`): enforces orthogonality between π and σ orbital frameworks.
@@ -85,14 +85,14 @@ This is motivated by quantum chemistry: in sp-hybridized atoms, the three σ-bon
 
 ### Implementation Files
 
-- **`cpp/common/molecular/MMFFsp3_loc.h`** — Main `MMFFsp3_loc` class. Localized data layout where each "node" atom stores:
+- **`cpp/common/molecular/SPFFsp3_loc.h`** — Main `SPFFsp3_loc` class. Localized data layout where each "node" atom stores:
   - `k_pp` — π–π stiffness.
   - `k_sp` — π–σ stiffness.
   - `pipos` — π-orbital orientation vector.
   - `neighs`, `bonds`, `angles` — compact neighbor lists.
-- **`cpp/common_resources/cl/relax_multi.cl`** — Same kernel file as UFF; MMFF terms reuse `evalBond()`, `evalAngCos()`, and add `evalPiAling()`.
-- **`pyBall/MMFF.py`** — CPython `ctypes` bindings to the C++ library.
-- **`pyBall/OCL/MMFF.py`** — Pure PyOpenCL implementation for rapid prototyping.
+- **`cpp/common_resources/cl/relax_multi.cl`** — Same kernel file as UFF; SPFF terms reuse `evalBond()`, `evalAngCos()`, and add `evalPiAling()`.
+- **`pyBall/SPFF.py`** — CPython `ctypes` bindings to the C++ library.
+- **`pyBall/OCL/SPFF.py`** — Pure PyOpenCL implementation for rapid prototyping.
 
 ### Key Physics
 
@@ -109,13 +109,13 @@ For a bond A–B where B is a capping atom, the force on B is not computed indep
 - **Collision Damping**: A velocity-dependent damping term is added to stabilize the integrator:
   $$\mathbf{f}_{\text{damp}} = -c_{\text{damp}} \cdot \mathbf{v}$$
   This is essential because the π-alignment terms can create high-frequency oscillations.
-- **PyOpenCL Overhead**: The Python wrapper (`pyBall/OCL/MMFF.py`) is convenient for debugging but incurs ~10× overhead in topology preparation. For production, the C++ harness is preferred.
+- **PyOpenCL Overhead**: The Python wrapper (`pyBall/OCL/SPFF.py`) is convenient for debugging but incurs ~10× overhead in topology preparation. For production, the C++ harness is preferred.
 
 ### Test Coverage
 
-- `tests/tMMFF/test_diamond_phonon_bands.py` — Phonon band structure of diamond; validates force constants by finite differences.
-- `tests/tMMFF/test_MMFF_ocl_parity.py` — CPU vs GPU parity.
-- `tests/tMMFF/run_parity_mmff.sh` — automated parity suite.
+- `tests/tSPFF/test_diamond_phonon_bands.py` — Phonon band structure of diamond; validates force constants by finite differences.
+- `tests/tSPFF/test_SPFF_ocl_parity.py` — CPU vs GPU parity.
+- `tests/tSPFF/run_parity_spff.sh` — automated parity suite.
 
 ---
 
@@ -277,7 +277,7 @@ The lever arms are cached to avoid recomputation.
 ### Test Coverage
 
 - `doc/Topics/RigidBodyAssembly/RigidBodyAssemblyDiscussion.md` — Comprehensive design discussion.
-- `tests/tMMFF/test_assembly.py` — Packing and assembly tests.
+- `tests/tSPFF/test_assembly.py` — Packing and assembly tests.
 
 ---
 
@@ -290,7 +290,7 @@ The lever arms are cached to avoid recomputation.
 ### Implementation Files
 
 - **`cpp/common/molecular/MolWorld_sp3.h`** — Main `MolWorld_sp3` class:
-  - Instantiates `MMFFsp3`, `MMFFsp3_loc`, `UFF`, `ProjectiveDynamics_d`, `RigidBodyFF`, `NBFF`, and `GridFF`.
+  - Instantiates `SPFFsp3`, `SPFFsp3_loc`, `UFF`, `ProjectiveDynamics_d`, `RigidBodyFF`, `NBFF`, and `GridFF`.
   - `makeFFs()` — builds force field parameters from atomic coordinates and types.
   - `optimize()` / `relax()` — high-level relaxation routines.
   - Handles PBC, constraints, and surface interactions.
@@ -301,11 +301,11 @@ The lever arms are cached to avoid recomputation.
 Fixed atoms (anchors) are handled by zeroing their forces after each evaluation. For rigid bodies, anchor constraints are applied to the center-of-mass position and orientation.
 
 **Solver Routing**:
-The user selects the active force field at runtime (`bMMFF`, `bUFF`, `bRigid`). `MolWorld_sp3` dispatches to the appropriate `eval()` method and accumulates forces into the global `fapos` array.
+The user selects the active force field at runtime (`bSPFF`, `bUFF`, `bRigid`). `MolWorld_sp3` dispatches to the appropriate `eval()` method and accumulates forces into the global `fapos` array.
 
 ### Performance Considerations
 
-- **Lazy Initialization**: Force field objects are instantiated only when first requested (`bMMFF` must be `true` for UFF initialization—see memory note).
+- **Lazy Initialization**: Force field objects are instantiated only when first requested (`bSPFF` must be `true` for UFF initialization—see memory note).
 - **Buffer Sharing**: `MolWorld_sp3` owns the main `apos`, `fapos`, `REQs` arrays and binds them to sub-force fields via pointer sharing, avoiding data duplication.
 
 ---
@@ -315,7 +315,7 @@ The user selects the active force field at runtime (`bMMFF`, `bUFF`, `bRigid`). 
 | Force Field | DOFs per Atom | Body Terms | Angle Terms | Dihedral Terms | Solver | GPU Support |
 |-------------|---------------|------------|-------------|----------------|--------|-------------|
 | **UFF** | 3 (x,y,z) | Harmonic | cos(θ), cos(θ/2) | Explicit 4-body | Explicit Euler | OpenCL |
-| **MMFFsp3** | 3 + 2 (π-orientation) | Harmonic | cos(θ) | π–π, π–σ alignment | Explicit Euler | OpenCL |
+| **SPFFsp3** | 3 + 2 (π-orientation) | Harmonic | cos(θ) | π–π, π–σ alignment | Explicit Euler | OpenCL |
 | **ProjectiveDynamics** | 3 | Harmonic (stiff) | — | — | Implicit (Jacobi/GS/Cholesky) | OpenCL |
 | **XPBD (2D)** | 2 + 1 (rotation) | Port-based | Implicit in ports | Implicit in ports | Position-based | OpenCL |
 | **XPBD (3D)** | 3 + 3 (rotation) | Port-based | Implicit in ports | Implicit in ports | Position-based | OpenCL |

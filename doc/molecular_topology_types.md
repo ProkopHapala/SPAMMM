@@ -44,7 +44,7 @@ tests/tUFF/data_UFF/
 └── DihedralTypes.dat  # Torsion parameters by atom type quadruple
 ```
 
-These files are loaded by C++ (`MMFFparams.h`), Python (`OCL/MMFF.py`, `atomicUtils.py`), and JavaScript (`MMParams.js`). When modifying parameters, update this central directory — copies in other locations should be considered derived or legacy.
+These files are loaded by C++ (`SPFFparams.h`), Python (`OCL/SPFF.py`, `atomicUtils.py`), and JavaScript (`MMParams.js`). When modifying parameters, update this central directory — copies in other locations should be considered derived or legacy.
 
 ### ElementTypes.dat
 | Field | Description |
@@ -73,7 +73,7 @@ These files are loaded by C++ (`MMFFparams.h`), Python (`OCL/MMFF.py`, `atomicUt
 | `npi` | Number of pi orbitals |
 | `sym` | Symmetry |
 | `Ruff`, `RvdW`, `EvdW`, `Qbase`, `Hb` | General params |
-| `Ass`, `Asp`, `Kss`, `Ksp`, `Kep`, `Kpp` | MMFF params (cols 13-18) |
+| `Ass`, `Asp`, `Kss`, `Ksp`, `Kep`, `Kpp` | SPFF params (cols 13-18) |
 
 ### BondTypes.dat
 `typeA typeB order l0 k` — bond length and stiffness for atom type pairs.
@@ -89,8 +89,8 @@ Three separate parsers for the same file format:
 
 | Language | Class | Load Method | File |
 |----------|-------|-------------|------|
-| **C++** | `MMFFparams` | `loadElementTypes()`, `loadAtomTypes()` | `MMFFparams.h:280` |
-| **Python** | `MMparams` | `read_element_types()`, `read_atom_types()` | `MMFF.py:114` |
+| **C++** | `SPFFparams` | `loadElementTypes()`, `loadAtomTypes()` | `SPFFparams.h:280` |
+| **Python** | `SPparams` | `read_element_types()`, `read_atom_types()` | `SPFF.py:114` |
 | **JavaScript** | `MMParams` | `parseElementTypes()`, `parseAtomTypes()` | `MMParams.js:243` |
 
 **C++**: Custom `sscanf` parsing, stores in `std::vector<ElementType>`, `std::vector<AtomType>`.
@@ -109,11 +109,11 @@ Resolving an element symbol to an atom type:
 
 | Language | Function | Algorithm |
 |----------|----------|-----------|
-| **C++** | `MMFFparams::assignSubTypes()` | Map (iZ, npi, nep) → subtype index |
-| **Python** | `MMFF.initAtomProperties()` | Calculate npi/nep from atom_types dict |
+| **C++** | `SPFFparams::assignSubTypes()` | Map (iZ, npi, nep) → subtype index |
+| **Python** | `SPFF.initAtomProperties()` | Calculate npi/nep from atom_types dict |
 | **JavaScript** | `MMParams.resolveTypeNameTable()` | Symbol → exact key → symbol+`_` → first matching element_name |
 
-**C++ subtype assignment** (`MMFFparams.h:533`):
+**C++ subtype assignment** (`SPFFparams.h:533`):
 ```cpp
 // Example: Carbon (iZ=6)
 npi=0, nep=0 → C_sp3
@@ -132,17 +132,17 @@ npi=2, nep=0 → C_sp1
 
 ### C++
 
-`MM::Builder::assignSp3Type()` (`MMFFBuilder.h:445`):
+`MM::Builder::assignSp3Type()` (`SPFFBuilder.h:445`):
 - Iterates atom confs
 - Counts `npi` from pi-orbital flags
 - Counts `nep` from `nEPair`
-- Uses `MMFFparams::assignSubTypes()` to map → subtype
+- Uses `SPFFparams::assignSubTypes()` to map → subtype
 
 `AtomConf.fillIn_npi_sp3()`: Automatically fills in npi for sp3 atoms based on neighbor count.
 
 ### Python
 
-`MMFF.initAtomProperties()` (`pyBall/OCL/MMFF.py:51`):
+`SPFF.initAtomProperties()` (`pyBall/OCL/SPFF.py:51`):
 ```python
 def initAtomProperties(mol, atom_types, capping_atoms={'H'}):
     # Calculate npi from atom_types dict
@@ -153,11 +153,11 @@ def initAtomProperties(mol, atom_types, capping_atoms={'H'}):
     isNode = [...]
 ```
 
-Key detail: Python separates **node atoms** (heavy atoms with pi orbitals) from **capping atoms** (H, etc.). This separation is crucial for the `toMMFFsp3_loc()` conversion.
+Key detail: Python separates **node atoms** (heavy atoms with pi orbitals) from **capping atoms** (H, etc.). This separation is crucial for the `toSPFFsp3_loc()` conversion.
 
 ### JavaScript
 
-`MMFFLTopology.computePiOrientations()` (`MMFFLTopology.js:248`):
+`SPFFLTopology.computePiOrientations()` (`SPFFLTopology.js:248`):
 - Computes pi-orbital directions from neighbor geometry
 - Uses `computeAtomiPiDirectionFromNeighs()` — sum of normalized cross products
 - Propagates low-norm pi dirs from neighbors (min_norm=0.7, max_iter=4)
@@ -171,9 +171,9 @@ Identifying conjugated/aromatic systems for pi-pi interactions.
 
 | Language | Function | File |
 |----------|----------|------|
-| **C++** | `MM::Builder::assignPiFragments()` | `MMFFBuilder.h:398` |
+| **C++** | `MM::Builder::assignPiFragments()` | `SPFFBuilder.h:398` |
 | **Python** | Not explicit (part of type assignment) | — |
-| **JavaScript** | `computePiOrientations()` (direction only) | `MMFFLTopology.js:248` |
+| **JavaScript** | `computePiOrientations()` (direction only) | `SPFFLTopology.js:248` |
 
 **C++**: `assignPiFragments()` walks the graph to find connected pi-orbital networks. Sets `piFragment` IDs on atoms.
 
@@ -185,9 +185,9 @@ Assigning bond length (`l0`) and stiffness (`k`) from atom types and bond order.
 
 | Language | Function | File |
 |----------|----------|------|
-| **C++** | `MM::Builder::assignBondParams()` | `MMFFBuilder.h:554` |
-| **Python** | Implicit in `toMMFFsp3_loc()` | `MMFF.py` |
-| **JavaScript** | `buildMMFFLTopology()` → bonds in `topo.bonds_linear` | `MMFFLTopology.js` |
+| **C++** | `MM::Builder::assignBondParams()` | `SPFFBuilder.h:554` |
+| **Python** | Implicit in `toSPFFsp3_loc()` | `SPFF.py` |
+| **JavaScript** | `buildSPFFLTopology()` → bonds in `topo.bonds_linear` | `SPFFLTopology.js` |
 
 **C++**: `params->getBondParams(ai.type, aj.type, order, b.l0, b.k)` — looks up (typeA, typeB, order) in bond parameter table. Considers pi-bonds and lone pairs for pi-pi alignment.
 
@@ -207,10 +207,10 @@ function lawOfCosines(rab, rbc, cosTheta) {
 
 | Step | C++ | Python | JavaScript |
 |------|-----|--------|------------|
-| Load params | `MMFFparams::loadAtomTypes()` | `MMparams.read_atom_types()` | `MMParams.parseAtomTypes()` |
+| Load params | `SPFFparams::loadAtomTypes()` | `SPparams.read_atom_types()` | `MMParams.parseAtomTypes()` |
 | Count npi/nep | `AtomConf.npi/nEPair` | `initAtomProperties()` | `computePiOrientations()` |
 | Map → subtype | `assignSubTypes()` | Implicit in type dict | `resolveTypeNameTable()` |
-| Assign bond params | `assignBondParams()` | Implicit in `toMMFFsp3_loc()` | `buildMMFFLTopology()` |
+| Assign bond params | `assignBondParams()` | Implicit in `toSPFFsp3_loc()` | `buildSPFFLTopology()` |
 
 ### Known Differences
 
@@ -224,15 +224,15 @@ function lawOfCosines(rab, rbc, cosTheta) {
 ## File Index
 
 ### C++
-- `cpp/common/molecular/MMFFBuilder.h` (837 lines) — `assignSp3Type`, `assignPiFragments`, `assignBondParams`
-- `cpp/common/molecular/MMFFparams.h` (615 lines) — parameter loading, `assignSubTypes`
+- `cpp/common/molecular/SPFFBuilder.h` (837 lines) — `assignSp3Type`, `assignPiFragments`, `assignBondParams`
+- `cpp/common/molecular/SPFFparams.h` (615 lines) — parameter loading, `assignSubTypes`
 
 ### Python
-- `pyBall/OCL/MMFF.py` (1107 lines) — `initAtomProperties`, `toMMFFsp3_loc`
+- `pyBall/OCL/SPFF.py` (1107 lines) — `initAtomProperties`, `toSPFFsp3_loc`
 - `pyBall/atomicUtils.py` (2186 lines) — bond/angle utilities
 
 ### JavaScript
-- `web/molgui_webgpu/MMFFLTopology.js` (826 lines) — `buildMMFFLTopology`, `computePiOrientations`, `buildAngleBonds`
+- `web/molgui_webgpu/SPFFLTopology.js` (826 lines) — `buildSPFFLTopology`, `computePiOrientations`, `buildAngleBonds`
 - `web/molgui_webgpu/MMParams.js` (524 lines) — `parseAtomTypes`, `resolveTypeNameTable`, `bondLengthEstimate`
 
 ---

@@ -1,6 +1,6 @@
 # AFM/STM Simulation
 
-> Cross-language audit of Atomic Force Microscopy (AFM) and Scanning Tunneling Microscopy (STM) simulation components: force field computation, tip relaxation, rigid body dynamics, electronic structure, and orbital projection. See [surface_interactions.md](surface_interactions.md) for GridFF substrate potentials, [intramolecular_forcefields.md](intramolecular_forcefields.md) for MMFF/UFF, and [nonbonding_forcefields.md](nonbonding_forcefields.md) for NBFF.
+> Cross-language audit of Atomic Force Microscopy (AFM) and Scanning Tunneling Microscopy (STM) simulation components: force field computation, tip relaxation, rigid body dynamics, electronic structure, and orbital projection. See [surface_interactions.md](surface_interactions.md) for GridFF substrate potentials, [intramolecular_forcefields.md](intramolecular_forcefields.md) for SPFF/UFF, and [nonbonding_forcefields.md](nonbonding_forcefields.md) for NBFF.
 
 **Related Windsurf Codemaps:**
 - [AFM PyOpenCL System: Morse/LJ Path and FDBM Density-Based Path](https://windsurf.com/codemaps/9bb4c2a5-0c38-4943-abe9-254cfdcc75af-8796fe608a7d71c1) — AFM force evaluation using GridFF and FDBM models.
@@ -388,7 +388,7 @@ SDL2/OpenGL C++ application for interactive AFM scanning with GPU-accelerated ri
 |-----------|-------------|
 | `GridFF_OCL gridFFocl` | OpenCL GridFF wrapper for surface potential |
 | `RigidMolecularWorldOCL clworld` | Multi-system rigid body molecular world |
-| `MMFF world` | Molecular mechanics force field |
+| `SPFF world` | Molecular mechanics force field |
 | `DynamicOpt opt` | CPU dynamics optimizer (FIRE) |
 
 ### Key Operations
@@ -524,7 +524,7 @@ Build option `-DOPT_FIRE=1` enables FIRE relaxation, `-DOPT_FIRE=0` uses damped 
 | `run_dftb_zscan.py` | DFTB+ z-scan |
 | `plot_transition.py` | Transition plotting |
 
-### Rigid Body AFM Tests (`tests/tMMFF/`)
+### Rigid Body AFM Tests (`tests/tSPFF/`)
 
 | File | Purpose |
 |------|---------|
@@ -704,7 +704,7 @@ AppMolecularEditorOCL
   ├── init: Load AtomTypes.dat, BondTypes.dat
   ├── Load molecule types (XYZ) → builder.loadMolType()
   ├── Insert molecules → builder.insertMolecule()
-  ├── Build MMFF → builder.toMMFF(&world)
+  ├── Build SPFF → builder.toSPFF(&world)
   ├── initRigidSubstrate():
   │    ├── Load substrate cell (.lvs) + XYZ
   │    ├── genPLQ() → REQ → PLQ conversion
@@ -954,7 +954,7 @@ UnifiedAFMStudio (PyQt5 + Vispy)
 
 - [Topical Audit Index](topical_audit.md) — priority ranking, dependency graph, missing topics
 - [Surface Interactions](surface_interactions.md) — GridFF, FoldedAtomicFunctions, Ewald2D, Surface.cl
-- [Intramolecular Force Fields](intramolecular_forcefields.md) — MMFFsp3, UFF, ProjectiveDynamics, XPBD
+- [Intramolecular Force Fields](intramolecular_forcefields.md) — SPFFsp3, UFF, ProjectiveDynamics, XPBD
 - [Nonbonding Force Fields](nonbonding_forcefields.md) — NBFF, exclusion schemes, FMM
 - [Force Fields Overview](forcefields_overview.md) — High-level taxonomy
 - [H-transfer & DFTB+](Htransfer_Kekule_DFTB.md) — DFTB+ integration details

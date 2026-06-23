@@ -1,0 +1,2087 @@
+"""
+Grid_dftb.py — GPU density and orbital projection for DFTB (STO basis).
+
+Purpose: Project DFTB+ wavefunctions and density matrices onto real-space 3D grids
+using OpenCL GPU acceleration. Supports both sparse neighbor-based projection and
+dense orbital projection for STM imaging and FDBM density computation.
+
+Key functionality:
+  - GridProjector: OpenCL wrapper for density projection
+  - load_basis_sto() — evaluate Slater-type orbitals on uniform grid
+  - project_density() — project density matrix onto 3D grid
+  - project_orbitals() — project individual MOs for STM/LDOS
+  - setup_gridprojector_from_dftb() — convenience constructor from DFTB data
+
+Role in SPAMMM: DFTB density projection engine. Used by ModularPipeline.py Stage 2
+(density projection) and AFM_utils.py (STM/LDOS computation). The LCAO_grid.cl + LCAO_STM.cl
+kernel handles the GPU projection of STO basis functions.
+
+Major Functionality:
+-------------------
+1. Basis Loading
+   - load_basis_sto(): Load Slater-type orbital (STO) basis functions
+   - _load_kernels(): Load and compile OpenCL kernels (called in __init__)
+   - Evaluates STO analytically on uniform grid, packs as float2(value, d2)
+   - Supports sp (max_shells=2) and spd (max_shells=3) basis sets
+   - Caches basis data in GPU buffer for reuse
+
+2. Grid Projection Methods
+   - project_density_dense(): Project sparse density matrix to 3D grid
+   - project_orbital_dense(): Project single MO to 3D grid (dense coeffs)
+   - project_density_dense_points(): Evaluate density at arbitrary points
+   - project_orbital_dense_points(): Evaluate orbital at arbitrary points
+   - project_orbital(): Project orbital using sparse neighbor tasks
+   - project_orbital_points(): Evaluate orbital at points (sp basis)
+   - realloc_projection_buffers(): Reallocate sparse projection buffers
+   - realloc_dense_projection_buffers(): Reallocate dense projection buffers
+
+3. STM Imaging
+   - mo_overlap_points_exp_sk(): MO overlap scan with exponential SK hopping
+   - stm_dyson_wg_scan(): Dyson Green's function STM scan
+   - stm_gf_dyson_2mol_mo_scan(): Two-molecule GF-Dyson STM
+   - mo_overlap_points_exp_sk_2mol(): Two-molecule MO overlap (explicit kernel)
+   - response_amplitude_exp(): Response amplitude mapping
+
+4. Task Building
+   - build_tasks_gpu(): GPU-accelerated task generation for sparse projection
+   - realloc_task_buffers(): Reallocate task generation buffers
+   - Uses AABB-sphere collision detection to find overlapping grid blocks
+
+Optimization Policy:
+-------------------
+- Load kernels once during initialization (_load_kernels in __init__)
+- Use persistent GPU buffers via realloc_* methods (realloc_* methods do NOT have guards)
+- Add bTryAllocate guards in calling functions to skip dict creation/buffer allocation
+- Default bTryAllocate=True for safety, set False for hot paths with fixed buffer sizes
+- See OpenCLBase.py for full policy details
+"""
+
+import numpy as np
+import pyopencl as cl
+import pyopencl.cltypes
+import os
+import pyopencl.array as cl_array
+import time
+from ...utils.OpenCLBase import OpenCLBase
+
+class GridProjector(OpenCLBase):
+    """
+    Host class for projecting sparse density matrices to a real-space grid using OpenCL.
+    """
+    def __init__(self, fdata_dir, ctx=None, queue=None, nloc=32, debug_early_exit=False, debug_clear_only=False, debug_return0=False, debug_read_task=False, debug_read_grid=False, verbosity=0):
+        super().__init__(nloc=nloc)
+        self.fdata_dir = fdata_dir
+        self.debug_early_exit = bool(debug_early_exit)
+        self.debug_clear_only = bool(debug_clear_only)
+        self.debug_return0 = bool(debug_return0)
+        self.debug_read_task = bool(debug_read_task)
+        self.debug_read_grid = bool(debug_read_grid)
+        self.verbosity = int(verbosity)
+        if ctx:
+            self.ctx = ctx
+            self.queue = queue if queue else cl.CommandQueue(self.ctx)
+        self.task_dtype = [
+            ('x', 'i4'), ('y', 'i4'), ('z', 'i4'), ('w', 'i4'),
+            ('na', 'i4'), ('nj', 'i4'), ('pad1', 'i4'), ('pad2', 'i4')
+        ]
+        self.task_dtype_np = np.dtype(self.task_dtype)
+        self._load_kernels()
+        self.basis_data = {}
+
+    def load_basis_sto(self, species_list, dr=None, rc_max=None, max_shells=None):
+        """
+        Load STO (Slater-type orbital) basis for DFTB+ into the same GPU buffer as load_basis().
+        
+        Evaluates STO analytically on a uniform grid: R_l(r) = sum_i c_i * r^(l+pow-1) * exp(-alpha_i*r)
+        Packs identically to load_basis() as float2(value, d2) per node.
+        Default max_shells=2 (s and p) so the kernel is uniform (H p-shell = zeros).
+        Set max_shells=3 to include d-orbitals.
+        
+        Args:
+            species_list: list of dicts with keys:
+                'atomic_number': int
+                'orbitals': list of {'l', 'exponents', 'coefficients', 'cutoff'}
+                'resolution': float (Å, grid spacing hint)
+            dr: override common grid spacing (Å); if None, uses min resolution/2
+            rc_max: override max cutoff (Å); if None, uses max across all shells
+            max_shells: int, max angular momentum shells (default 2 for sp, use 3 for spd)
+        """
+        from .DFTBplusParser import _spline_d2_uniform, compute_sto_radial
+
+        all_nz = sorted(set(sp['atomic_number'] for sp in species_list))
+        if max_shells is None:
+            max_shells = 2  # Fixed: always s (shell 0) and p (shell 1), pad missing with zeros
+
+        # Determine common grid
+        all_rc = []
+        all_res = []
+        for sp in species_list:
+            for orb in sp['orbitals']:
+                all_rc.append(orb['cutoff'])
+            all_res.append(sp.get('resolution', 0.15))
+        if rc_max is None:
+            rc_max = max(all_rc)
+        if dr is None:
+            dr = min(all_res) / 2.0
+
+        n_nodes = int(np.ceil(rc_max / dr)) + 2
+
+        if self.verbosity > 0:
+            print(f"[GridProjector STO] Common grid: dr={dr:.6f} Å, rc_max={rc_max:.3f} Å, n_nodes={n_nodes}")
+
+        packed_basis = np.zeros((len(all_nz), max_shells, n_nodes, 2), dtype=np.float32)
+
+        # Map atomic_number -> index in all_nz
+        nz_map = {nz: i for i, nz in enumerate(all_nz)}
+
+        # Build species dict by atomic_number for easy lookup
+        sp_by_nz = {sp['atomic_number']: sp for sp in species_list}
+
+        r = np.arange(n_nodes) * dr
+
+        for nz in all_nz:
+            i_spec = nz_map[nz]
+            sp = sp_by_nz[nz]
+            # Sort orbitals by l so shell 0 = s, shell 1 = p
+            orbs_by_l = {}
+            for orb in sp['orbitals']:
+                l = orb['l']
+                if l not in orbs_by_l:
+                    orbs_by_l[l] = orb
+
+            for ish in range(max_shells):
+                l = ish  # shell index = angular momentum (0=s, 1=p)
+                if l not in orbs_by_l:
+                    # No orbital for this l (e.g. H has no p) — leave as zeros
+                    continue
+                orb = orbs_by_l[l]
+                aa = np.asarray(orb['coefficients'], dtype=np.float64)
+                alpha = np.asarray(orb['exponents'], dtype=np.float64)
+
+                # Evaluate STO on common grid
+                vals = compute_sto_radial(r, aa, alpha, l).astype(np.float32)
+                d2 = _spline_d2_uniform(vals.astype(np.float64), dr).astype(np.float32)
+
+                packed_basis[i_spec, ish, :, 0] = vals
+                packed_basis[i_spec, ish, :, 1] = d2
+
+                if self.verbosity > 0:
+                    nAlpha = len(alpha)
+                    nPow = aa.shape[0] if aa.ndim > 1 else 1
+                    print(f"[GridProjector STO]   Z={nz} shell {ish} (l={l}): nAlpha={nAlpha}, nPow={nPow}, cutoff={orb['cutoff']:.2f}")
+
+        self.d_basis = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=packed_basis)
+        self.basis_meta = {
+            'n_species': len(all_nz),
+            'max_shells': max_shells,
+            'n_nodes': n_nodes,
+            'dr': dr,
+            'nz_map': nz_map,
+        }
+        self.species_nz = all_nz
+        return packed_basis
+
+    def _load_kernels(self):
+        kernel_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../../kernels')
+        cl_paths = [
+            os.path.join(kernel_dir, 'LCAO_grid.cl'),
+            os.path.join(kernel_dir, 'LCAO_STM.cl'),
+        ]
+        # We might want to pass some constants to the kernel during build
+        build_opts = []
+        if self.debug_early_exit:
+            build_opts.append("-DDEBUG_EARLY_EXIT=1")
+        if self.debug_clear_only:
+            build_opts.append("-DDEBUG_CLEAR_ONLY=1")
+        if self.debug_return0:
+            build_opts.append("-DDEBUG_RETURN0=1")
+        if self.debug_read_task:
+            build_opts.append("-DDEBUG_READ_TASK=1")
+        if self.debug_read_grid:
+            build_opts.append("-DDEBUG_READ_GRID=1")
+        if hasattr(self, 'basis_meta') and ('max_shells' in self.basis_meta):
+            build_opts.append(f"-DMAX_ORBS={self.basis_meta['max_shells'] * 9}") # conservative upper bound
+
+        self.load_program_multi(cl_paths, build_options=build_opts if len(build_opts)>0 else None)
+
+    def check_overlap_sphere_aabb(self, center, radius, box_min, box_max):
+        """ Fast AABB-Sphere collision: Find closest point in box to sphere center """
+        closest_p = np.clip(center, box_min, box_max)
+        distance_sq = np.sum((center - closest_p)**2)
+        return distance_sq < (radius**2)
+
+    def realloc_task_buffers(self, natoms, n_blocks_total, nMaxAtom):
+        """(Re-)allocate GPU buffers for build_tasks_gpu using try_make_buffers."""
+        sz_i = 4  # int32
+        # AtomData struct: float4 pos_rcut + 4x int32 = 32 bytes per atom
+        buffs = {
+            "gtask_grid":            5 * 4 * 4,                          # grid_spec_np: 5x float4 = 80 bytes
+            "gtask_atoms":           32 * natoms,                        # AtomData structs
+            "gtask_block_counts":    sz_i * n_blocks_total,
+            "gtask_task_atoms_raw":  sz_i * n_blocks_total * nMaxAtom,
+            "gtask_block_fill":      sz_i * n_blocks_total,
+            "gtask_task_offsets":    sz_i * n_blocks_total,
+            "gtask_tasks_out":       32 * n_blocks_total,                # TaskData struct = 32 bytes each
+            "gtask_task_atoms_out":  sz_i * n_blocks_total * nMaxAtom,
+        }
+        self.try_make_buffers(buffs, suffix="_buff")
+
+    def realloc_projection_buffers(self, natoms, n_tasks, nMaxAtom, nx, ny, nz, neigh_max, numorb_max):
+        """(Re-)allocate GPU buffers for project_density using try_make_buffers."""
+        sz_f = 4  # float32
+        sz_i = 4  # int32
+        buffs = {
+            "proj_grid":        5 * 16,                                  # grid_spec_np: 5x float4 = 80 bytes
+            "proj_atoms":       32 * natoms,                             # AtomData structs
+            "proj_tasks":       max(32 * n_tasks, 32),                   # TaskData structs
+            "proj_task_atoms":  max(sz_i * n_tasks * nMaxAtom, sz_i * nMaxAtom),
+            "proj_rho":         sz_f * natoms * neigh_max * numorb_max * numorb_max,
+            "proj_neigh_j":     sz_i * natoms * neigh_max,
+            "proj_species_info":sz_i * 10 * 4,                          # placeholder
+            "proj_out":         sz_f * nx * ny * nz,
+        }
+        self.try_make_buffers(buffs, suffix="_buff")
+
+    def realloc_dense_projection_buffers(self, natoms, n_tasks, nMaxAtom, nx, ny, nz, norb_total):
+        """(Re-)allocate GPU buffers for project_density_dense / project_orbital_dense."""
+        sz_f = 4
+        sz_i = 4
+        buffs = {
+            "dproj_grid":       5 * 16,                                  # grid_spec_np: 5x float4 = 80 bytes
+            "dproj_atoms":      32 * natoms,
+            "dproj_tasks":      max(32 * n_tasks, 32),
+            "dproj_task_atoms": max(sz_i * n_tasks * nMaxAtom, sz_i * nMaxAtom),
+            "dproj_dm":         sz_f * norb_total * norb_total,         # density matrix or coeffs (largest case)
+            "dproj_out":        sz_f * nx * ny * nz,
+        }
+        self.try_make_buffers(buffs, suffix="_buff")
+
+    def build_tasks_gpu(self, atoms, grid_spec, block_res=8, nMaxAtom=64, bAlloc=True):
+        """
+        GPU-based task building using OpenCL kernels.
+        Pseudocode:
+        1) count_atoms_per_block: for each atom, find overlapping blocks (via floor-index range + sphere/AABB), atomic_inc block_counts[b].
+        2) fill_task_atoms: for each atom, again walk overlapping blocks, atomic_inc block_offsets[b], write atom id into task_atoms_raw[b][slot] if slot < nMaxAtom.
+        3) On host: read block_counts, derive mask, check max_count<=nMaxAtom, compute task_offsets = prefix over (mask).
+        4) compact_tasks: for each block with count>0, write TaskData(x,y,z,na,nj=-1) at task_offsets[b], copy task_atoms_raw[b] into compacted task_atoms_out.
+        5) Host copies tasks_np/task_atoms_np back; optional host sort by na desc.
+        Note: compaction is only at block level (drop empty blocks); task_atoms remains padded to nMaxAtom per task (holes stay).
+        """
+        nx, ny, nz = grid_spec['ngrid'][:3]
+        n_blocks_xyz = np.array([nx // block_res, ny // block_res, nz // block_res], dtype=np.int32)
+        n_blocks_total = int(np.prod(n_blocks_xyz))
+        natoms = len(atoms['pos'])
+
+        # 1. Prepare AtomData buffer
+        atom_data = np.zeros(natoms, dtype=[
+            ('pos_rcut', 'f4', 4),
+            ('type', 'i4'),
+            ('i0orb', 'i4'),
+            ('norb', 'i4'),
+            ('pad', 'i4')
+        ])
+        for i in range(natoms):
+            atom_data[i]['pos_rcut'][:3] = atoms['pos'][i]
+            atom_data[i]['pos_rcut'][3]  = atoms['Rcut'][i]
+            atom_data[i]['type'] = atoms['type'][i]
+            atom_data[i]['norb'] = 4
+            atom_data[i]['i0orb'] = 0
+            
+        # DEBUG: print first atom
+        if natoms > 0 and self.verbosity > 0:
+            print(f"[DEBUG] atom_data[0]: pos_rcut={atom_data[0]['pos_rcut']} type={atom_data[0]['type']}")
+
+        if bAlloc:
+            self.realloc_task_buffers(natoms, n_blocks_total, nMaxAtom)
+
+        self.toGPU_(self.gtask_grid_buff,  self.grid_to_np(grid_spec))
+        self.toGPU_(self.gtask_atoms_buff, atom_data)
+
+        T0 = time.perf_counter_ns()
+        # 2. Kernel 1: Count atoms per block
+        cl.enqueue_fill_buffer(self.queue, self.gtask_block_counts_buff, np.int32(0), 0, n_blocks_total * 4)
+        self.prg.count_atoms_per_block(
+            self.queue, (natoms,), None,
+            self.gtask_grid_buff, np.int32(natoms), self.gtask_atoms_buff, np.int32(block_res),
+            np.int32(n_blocks_xyz[0]), np.int32(n_blocks_xyz[1]), np.int32(n_blocks_xyz[2]),
+            self.gtask_block_counts_buff
+        )
+        self.queue.finish()
+        T1 = time.perf_counter_ns()
+        print(f"[TIME] count_atoms_per_block {(T1-T0)*1e-6:.3f} [ms]")
+
+        T0 = time.perf_counter_ns()
+        # 3. Kernel 2: Fill task_atoms
+        cl.enqueue_fill_buffer(self.queue, self.gtask_task_atoms_raw_buff, np.int32(-1), 0, n_blocks_total * nMaxAtom * 4)
+        cl.enqueue_fill_buffer(self.queue, self.gtask_block_fill_buff, np.int32(0), 0, n_blocks_total * 4)
+        self.prg.fill_task_atoms(
+            self.queue, (natoms,), None,
+            self.gtask_grid_buff, np.int32(natoms), self.gtask_atoms_buff, np.int32(block_res),
+            np.int32(n_blocks_xyz[0]), np.int32(n_blocks_xyz[1]), np.int32(n_blocks_xyz[2]),
+            self.gtask_block_fill_buff, self.gtask_task_atoms_raw_buff, np.int32(nMaxAtom)
+        )
+        # 4. Compact tasks
+        # Read back counts to host to identify non-empty blocks and compute stats
+        h_block_counts = np.empty(n_blocks_total, dtype=np.int32)
+        cl.enqueue_copy(self.queue, h_block_counts, self.gtask_block_counts_buff)
+        self.queue.finish()
+        T1 = time.perf_counter_ns()
+        print(f"[TIME] count_atoms_per_block.compact_tasks {(T1-T0)*1e-6:.3f} [ms]")
+
+        mask = h_block_counts > 0
+        n_tasks = np.sum(mask)
+        
+        # Stats
+        max_count    = h_block_counts.max() if n_blocks_total > 0 else 0
+        empty_blocks = np.sum(h_block_counts == 0)
+        one_blocks   = np.sum(h_block_counts == 1)
+        multi_blocks = n_blocks_total - empty_blocks - one_blocks
+        print(f"[DEBUG GPU] block atom stats: na_max={max_count}, nbloks: empty={empty_blocks}, one={one_blocks}, multi={multi_blocks}")
+        self.last_block_atom_counts = h_block_counts
+
+        if max_count > nMaxAtom:
+             raise RuntimeError(f"GPU build_tasks: block has {max_count} atoms > nMaxAtom={nMaxAtom}")
+
+        # tasks_np must have the correct structured dtype even when empty
+        self.task_dtype_np = np.dtype(self.task_dtype)
+        if n_tasks == 0:
+            return np.zeros(0, dtype=self.task_dtype_np), np.zeros((0, nMaxAtom), dtype=np.int32)
+
+
+
+        # Compute task offsets for compaction
+        h_task_offsets = np.zeros(n_blocks_total, dtype=np.int32)
+        h_task_offsets[mask] = np.arange(n_tasks, dtype=np.int32)
+        self.toGPU_(self.gtask_task_offsets_buff, h_task_offsets)
+
+        T0 = time.perf_counter_ns()
+        self.prg.compact_tasks(
+            self.queue, (int(n_blocks_xyz[0]), int(n_blocks_xyz[1]), int(n_blocks_xyz[2])), None,
+            np.int32(n_blocks_xyz[0]), np.int32(n_blocks_xyz[1]), np.int32(n_blocks_xyz[2]),
+            self.gtask_block_counts_buff, self.gtask_task_offsets_buff, self.gtask_task_atoms_raw_buff,
+            self.gtask_tasks_out_buff, self.gtask_task_atoms_out_buff, np.int32(nMaxAtom)
+        )
+        # 5. Read back results
+        tasks_np      = np.empty(n_tasks, dtype=self.task_dtype_np)
+        task_atoms_np = np.empty((n_tasks, nMaxAtom), dtype=np.int32)
+        cl.enqueue_copy(self.queue, tasks_np,      self.gtask_tasks_out_buff)
+        cl.enqueue_copy(self.queue, task_atoms_np, self.gtask_task_atoms_out_buff)
+        self.queue.finish()
+        T1 = time.perf_counter_ns()
+        print(f"[TIME] compact_tasks + readback {(T1-T0)*1e-6:.3f} [ms]")
+
+        # Optional: sorting by na (descending) on host
+        idx = np.argsort(tasks_np['na'])[::-1]
+        tasks_np = tasks_np[idx]
+        task_atoms_np = task_atoms_np[idx]
+        
+        return tasks_np, task_atoms_np
+
+    def build_tasks(self, atoms, grid_spec, block_res=8, nMaxAtom=64):
+        """
+        Partition the grid into tasks (active blocks).
+        """
+        nx, ny, nz = grid_spec['ngrid'][:3]
+        n_blocks = (
+            (int(nx) + block_res - 1) // block_res,
+            (int(ny) + block_res - 1) // block_res,
+            (int(nz) + block_res - 1) // block_res,
+        )
+        
+        tasks = []
+        atom_pos = atoms['pos']
+        atom_Rcut = atoms['Rcut']
+        natoms = len(atom_pos)
+        
+        origin = np.array(grid_spec['origin'][:3])
+        dA = np.array(grid_spec['dA'][:3])
+        dB = np.array(grid_spec['dB'][:3])
+        dC = np.array(grid_spec['dC'][:3])
+
+        block_counts = []
+        max_count = 0
+        empty_blocks = 0
+        one_blocks = 0
+
+        for fix in range(n_blocks[0]):
+            for fiy in range(n_blocks[1]):
+                for fiz in range(n_blocks[2]):
+                    block_min = origin    + np.array([fix*block_res*dA[0], fiy*block_res*dB[1], fiz*block_res*dC[2]])
+                    block_max = block_min + np.array([block_res*dA[0], block_res*dB[1], block_res*dC[2]])
+
+                    atoms_in_block = []
+                    for ia in range(natoms):
+                        if self.check_overlap_sphere_aabb(atom_pos[ia], atom_Rcut[ia], block_min, block_max):
+                            atoms_in_block.append(ia)
+
+                    block_counts.append(len(atoms_in_block))
+                    if len(atoms_in_block) == 0:
+                        empty_blocks += 1
+                        continue
+                    if len(atoms_in_block) == 1:
+                        one_blocks += 1
+                    if len(atoms_in_block) > max_count:
+                        max_count = len(atoms_in_block)
+                    if len(atoms_in_block) > nMaxAtom:
+                        raise RuntimeError(f"Block ({fix},{fiy},{fiz}) has {len(atoms_in_block)} atoms > nMaxAtom={nMaxAtom}")
+
+                    # We want ONE task per voxel block to avoid atomic adds.
+                    # We assume up to nMaxAtom (64) fits.
+                    tasks.append({
+                        'block_idx': (fix, fiy, fiz),
+                        'na': min(len(atoms_in_block), nMaxAtom),
+                        'nj': -1,
+                        'atoms': atoms_in_block[:nMaxAtom]
+                    })
+
+        # Sort tasks by workload (na)
+        tasks.sort(key=lambda x: x['na'], reverse=True)
+
+        multi_blocks = len(block_counts) - empty_blocks - one_blocks
+        if self.verbosity > 0: print(f"[DEBUG] block atom stats: na_max={max_count}, nbloks: empty={empty_blocks}, one={one_blocks}, multi={multi_blocks}")
+        self.last_block_atom_counts = np.array(block_counts, dtype=np.int32)
+
+        tasks_np = np.zeros(len(tasks), dtype=self.task_dtype_np)
+        
+        task_atoms_np = np.zeros((len(tasks), nMaxAtom), dtype=np.int32)
+        
+        for i, t in enumerate(tasks):
+            tasks_np[i]['x'], tasks_np[i]['y'], tasks_np[i]['z'] = t['block_idx']
+            tasks_np[i]['na'] = t['na']
+            tasks_np[i]['nj'] = t['nj']
+            task_atoms_np[i, :t['na']] = t['atoms']
+
+        if self.verbosity > 0: print(f"[DEBUG] build_tasks finished: n_tasks={len(tasks)}")
+        return tasks_np, task_atoms_np
+
+    def grid_to_np(self, grid_spec):
+        """Convert grid spec dictionary to numpy struct for GPU."""
+        grid_spec_np = np.zeros(1, dtype=[
+            ('origin', 'f4', 4),
+            ('dA', 'f4', 4),
+            ('dB', 'f4', 4),
+            ('dC', 'f4', 4),
+            ('ngrid', 'i4', 4)
+        ])
+        grid_spec_np[0]['origin'][:3] = grid_spec['origin']
+        grid_spec_np[0]['dA'][:3] = grid_spec['dA']
+        grid_spec_np[0]['dB'][:3] = grid_spec['dB']
+        grid_spec_np[0]['dC'][:3] = grid_spec['dC']
+        grid_spec_np[0]['ngrid'][:3] = grid_spec['ngrid']
+        
+        # DEBUG: print grid_spec_np values
+        if self.verbosity > 0: print(f"[DEBUG] grid_spec_np: origin={grid_spec_np[0]['origin']} dA={grid_spec_np[0]['dA']} dB={grid_spec_np[0]['dB']} dC={grid_spec_np[0]['dC']} ngrid={grid_spec_np[0]['ngrid']}")
+        
+        return grid_spec_np
+
+    def project_density(self, rho, neighs, atoms, grid_spec, tasks=None, nMaxAtom=64, use_gpu_tasks=False, use_tiled=True, bAlloc=True):
+        """
+        Main entry point for density projection using the tiled kernel.
+        """
+        if tasks is None:
+            T0 = time.perf_counter_ns()
+            if use_gpu_tasks:
+                tasks_np, task_atoms_np = self.build_tasks_gpu(atoms, grid_spec, nMaxAtom=nMaxAtom)
+            else:
+                tasks_np, task_atoms_np = self.build_tasks(atoms, grid_spec, nMaxAtom=nMaxAtom)
+            T1 = time.perf_counter_ns()
+            if self.verbosity > 0: print(f"[TIME] build_tasks finished in {(T1-T0)*1e-6:.3f} [ms]")
+        else:
+            tasks_np, task_atoms_np = tasks
+
+        n_tasks = len(tasks_np)
+        ngrid_in = grid_spec['ngrid']
+        if self.verbosity > 0: print(f"[DEBUG] grid_spec['ngrid']={ngrid_in} type={type(ngrid_in)}")
+        nx, ny, nz = [int(x) for x in ngrid_in[:3]]
+        if self.verbosity > 0: print(f"[DEBUG] derived grid dims nx,ny,nz=({nx},{ny},{nz})")
+
+        # Prepare other buffers
+        natoms = len(atoms['pos'])
+
+        # DEBUG/ASSERT: validate task_atoms indices for active entries
+        if n_tasks > 0:
+            na_arr = tasks_np['na'].astype(np.int32)
+            bad = []
+            for it in range(n_tasks):
+                na = int(na_arr[it])
+                if na <= 0: continue
+                idxs = task_atoms_np[it, :na]
+                if (idxs < 0).any() or (idxs >= natoms).any():
+                    bad.append((it, na, int(idxs.min()), int(idxs.max())))
+                    if len(bad) >= 5:
+                        break
+            if bad:
+                raise RuntimeError(f"GridProjector.project(): invalid atom index in task_atoms for tasks={bad} natoms={natoms}")
+
+        atom_data = np.zeros(natoms, dtype=[
+            ('pos_rcut', 'f4', 4),
+            ('type', 'i4'),
+            ('i0orb', 'i4'),
+            ('norb', 'i4'),
+            ('pad', 'i4')
+        ])
+        if (not hasattr(self, 'basis_meta')) or ('nz_map' not in self.basis_meta):
+            raise RuntimeError('GridProjector.project(): basis_meta.nz_map missing; call load_basis(species_nz) before project().')
+        if ('n_species' not in self.basis_meta) or ('max_shells' not in self.basis_meta) or ('n_nodes' not in self.basis_meta):
+            raise RuntimeError(f"GridProjector.project(): basis_meta incomplete keys={list(self.basis_meta.keys())}")
+        for i in range(natoms):
+            atom_data[i]['pos_rcut'][:3] = atoms['pos'][i]
+            atom_data[i]['pos_rcut'][3]  = atoms['Rcut'][i]
+            # IMPORTANT: kernel expects a compact species index into packed basis_data, not atomic Z
+            Z = int(atoms['type'][i])
+            try:
+                atom_data[i]['type'] = int(self.basis_meta['nz_map'][Z])
+            except Exception as e:
+                raise RuntimeError(f"GridProjector.project(): species nz={Z} not in loaded basis nz_map keys={list(self.basis_meta['nz_map'].keys())}") from e
+            atom_data[i]['norb'] = 4 # Default for C, H with s,p
+            atom_data[i]['i0orb'] = 0
+
+        # DEBUG/ASSERT: mapped species indices must be in-range for packed basis buffer
+        it_min = int(atom_data['type'].min()) if natoms > 0 else -1
+        it_max = int(atom_data['type'].max()) if natoms > 0 else -1
+        if self.verbosity > 0: print(f"[DEBUG] basis_meta: n_species={self.basis_meta['n_species']} max_shells={self.basis_meta['max_shells']} n_nodes={self.basis_meta['n_nodes']} dr={self.basis_meta['dr']:.6f}")
+        if self.verbosity > 0: print(f"[DEBUG] atom_data.type range=[{it_min},{it_max}] unique={sorted(set(atom_data['type'].tolist()))}")
+        if it_min < 0 or it_max >= int(self.basis_meta['n_species']):
+            raise RuntimeError(f"GridProjector.project(): atom_data.type out of range [0,{self.basis_meta['n_species']-1}] got range=[{it_min},{it_max}]")
+
+        # 2. Buffers - allocate persistently via try_make_buffers, only if bAlloc or not yet allocated
+        neigh_max   = rho.shape[1]
+        numorb_max  = rho.shape[2]
+        if bAlloc:
+            self.realloc_projection_buffers(natoms, n_tasks, nMaxAtom, nx, ny, nz, neigh_max, numorb_max)
+
+        # DEBUG: check tasks_np size and dtype
+        if self.verbosity > 0: print(f"[DEBUG] tasks_np: len={len(tasks_np)} itemsize={tasks_np.dtype.itemsize} nbytes={tasks_np.nbytes}")
+
+        self.toGPU_(self.proj_grid_buff,  self.grid_to_np(grid_spec))
+        self.toGPU_(self.proj_atoms_buff, atom_data)
+        if len(tasks_np) > 0:
+            self.toGPU_(self.proj_tasks_buff,      tasks_np)
+            self.toGPU_(self.proj_task_atoms_buff, task_atoms_np)
+        rho32 = rho.astype(np.float32)
+        self.toGPU_(self.proj_rho_buff,     rho32)
+        self.toGPU_(self.proj_neigh_j_buff, neighs.neigh_j.astype(np.int32))
+        species_info = np.zeros((10, 4), dtype=np.int32)
+        self.toGPU_(self.proj_species_info_buff, species_info)
+
+        out_nbytes = int(nx) * int(ny) * int(nz) * 4
+        if self.verbosity > 0: print(f"[DEBUG] using persistent d_out: nx,ny,nz=({nx},{ny},{nz}) out_nbytes={out_nbytes}")
+        cl.enqueue_fill_buffer(self.queue, self.proj_out_buff, np.float32(0), 0, out_nbytes)
+
+        # 3. Kernel launch
+        ls = (32,)  # local size
+        gs = (n_tasks * ls[0],)
+        
+        # d_basis placeholder
+        if not hasattr(self, 'd_basis'):
+             self.d_basis = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY, size=4)
+             self.basis_meta = {'n_nodes': 0, 'dr': 0.0, 'max_shells': 0}
+
+        if use_tiled:
+            if self.verbosity > 0: print(f"[DEBUG] project_tiled: gs={gs}, ls={ls}, n_tasks={n_tasks}")
+        else:
+            if self.verbosity > 0: print(f"[DEBUG] project (non-tiled): gs={gs}, ls={ls}, n_tasks={n_tasks}")
+
+        T0_ns = time.perf_counter_ns()
+        if use_tiled:
+            self.prg.project_density_sparse_tiled(
+                self.queue, gs, ls,
+                self.proj_grid_buff,
+                np.int32(n_tasks),
+                self.proj_tasks_buff, self.proj_atoms_buff, self.proj_task_atoms_buff,
+                self.proj_rho_buff,
+                self.proj_neigh_j_buff,
+                self.d_basis,
+                self.proj_species_info_buff,
+                np.int32(self.basis_meta['n_nodes']),
+                np.float32(self.basis_meta['dr']),
+                np.int32(self.basis_meta['max_shells']),
+                np.int32(neigh_max),
+                np.int32(numorb_max),
+                np.int32(nMaxAtom),
+                self.proj_out_buff
+            )
+        else:
+            self.prg.project_density_sparse(
+                self.queue, gs, ls,
+                self.proj_grid_buff,
+                np.int32(n_tasks),
+                self.proj_tasks_buff, self.proj_atoms_buff, self.proj_task_atoms_buff,
+                self.proj_rho_buff,
+                self.proj_neigh_j_buff,
+                self.d_basis,
+                self.proj_species_info_buff,
+                np.int32(self.basis_meta['n_nodes']),
+                np.float32(self.basis_meta['dr']),
+                np.int32(self.basis_meta['max_shells']),
+                np.int32(neigh_max),
+                np.int32(numorb_max),
+                np.int32(nMaxAtom),
+                self.proj_out_buff
+            )
+        self.queue.finish()
+        dt_ns = time.perf_counter_ns() - T0_ns
+        if self.verbosity > 0: print(f"[TIME] project_tiled finished in {dt_ns*1e-6:.9f} [ms]")
+
+        if self.verbosity > 0: print(f"[DEBUG] reading back host res: shape=({nx},{ny},{nz}) nbytes={int(nx)*int(ny)*int(nz)*4}")
+        res = np.empty((int(nx), int(ny), int(nz)), dtype=np.float32)
+        cl.enqueue_copy(self.queue, res, self.proj_out_buff)
+        self.queue.finish()
+
+        return res
+
+
+    def project_orbital_points(self, points, coeffs, norb_per, atoms_dict, _debug_Fortran_order=False, bTryAllocate=True):
+        """Evaluate a single orbital at arbitrary points (debugging parity with Fortran orb2points).
+
+        This avoids any grid sampling / slicing ambiguity.
+
+        Args:
+            points: (n_points,3) float32/float64 positions in Angstrom
+            coeffs: (natoms,4) coefficients. Default expects [px,py,pz,s].
+                    If _debug_Fortran_order=True and atom has 4 orbitals, expects [s,py,pz,px].
+            norb_per: (natoms,) number of orbitals per atom (1 or 4 for H/O in H2O)
+            atoms_dict: dict with 'pos','Rcut','type'
+        Returns:
+            psi: (n_points,) float32
+        """
+        import numpy as np
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(f"project_orbital_points: points must be (n,3), got {points.shape}")
+        natoms = len(atoms_dict['pos'])
+
+        # Pack coefficients (vectorized)
+        numorb_max = 4
+        _ORT_SPP_TO_OCL = np.array([3, 1, 2, 0], dtype=np.int32)  # [s,py,pz,px] -> [px,py,pz,s]
+        coeffs_flat = np.zeros((natoms, numorb_max), dtype=np.float32)
+        c4 = np.asarray(coeffs[:natoms, :4], dtype=np.float32)
+        if _debug_Fortran_order:
+            mask4 = (np.asarray(norb_per[:natoms], dtype=np.int32) == 4)
+            coeffs_flat[mask4]  = c4[mask4][:, _ORT_SPP_TO_OCL]
+            coeffs_flat[~mask4] = c4[~mask4]
+        else:
+            coeffs_flat[:] = c4
+        coeffs_flat = coeffs_flat.ravel()
+
+        # AtomData (vectorized)
+        atom_data = np.zeros(natoms, dtype=[('pos_rcut','f4',4),('type','i4'),('i0orb','i4'),('norb','i4'),('pad','i4')])
+        atom_data['pos_rcut'][:, :3] = np.asarray(atoms_dict['pos'][:natoms], dtype=np.float32)
+        atom_data['pos_rcut'][:,  3] = np.asarray(atoms_dict['Rcut'][:natoms], dtype=np.float32)
+        Zs = np.asarray(atoms_dict['type'][:natoms], dtype=np.int32)
+        nz_map = self.basis_meta['nz_map']
+        missing = [int(Z) for Z in Zs if int(Z) not in nz_map]
+        assert len(missing) == 0, f"project_orbital_points: species {missing} not loaded; loaded={list(nz_map.keys())}"
+        atom_data['type']  = np.array([nz_map[int(Z)] for Z in Zs], dtype=np.int32)
+        atom_data['norb']  = np.asarray(norb_per[:natoms], dtype=np.int32)
+        atom_data['i0orb'] = np.arange(natoms, dtype=np.int32) * numorb_max
+
+        # Persistent buffers
+        if bTryAllocate:
+            self.realloc_sp_point_buffers(len(points), natoms)
+        points_f4 = np.ascontiguousarray(np.c_[points, np.zeros((len(points),1), np.float32)], dtype=np.float32)
+        self.toGPU_(self.sp_points_buff, points_f4)
+        self.toGPU_(self.sp_atoms_buff,  atom_data)
+        self.toGPU_(self.sp_coeffs_buff, coeffs_flat)
+
+        # Launch
+        gs = (int(len(points)),)
+        self.prg.project_orbital_points(
+            self.queue, gs, None,
+            np.int32(len(points)),
+            self.sp_points_buff, self.sp_atoms_buff, np.int32(natoms),
+            self.sp_coeffs_buff,
+            self.d_basis,
+            np.int32(self.basis_meta['n_nodes']),
+            np.float32(self.basis_meta['dr']),
+            np.int32(self.basis_meta['max_shells']),
+            self.sp_out_buff
+        )
+        self.queue.finish()
+        out = np.empty(len(points), dtype=np.float32)
+        self.fromGPU_(self.sp_out_buff, out)
+        self.queue.finish()
+        return out
+
+    def prepare_orbital_points_projection(self, points, atoms_dict, nMaxAtom=64):
+        """
+        One-time setup for batched orbital projection at arbitrary points.
+        Pre-uploads all static GPU buffers (points, atoms).
+        """
+        mf = cl.mem_flags
+        t0 = time.perf_counter_ns()
+
+        points = np.asarray(points, dtype=np.float32)
+        n_points = len(points)
+        natoms   = len(atoms_dict['pos'])
+        numorb_max = 4
+
+        atom_data = np.zeros(natoms, dtype=[
+            ('pos_rcut', 'f4', 4), ('type', 'i4'), ('i0orb', 'i4'), ('norb', 'i4'), ('pad', 'i4')
+        ])
+        for ia in range(natoms):
+            atom_data[ia]['pos_rcut'][:3] = atoms_dict['pos'][ia]
+            atom_data[ia]['pos_rcut'][3]  = atoms_dict['Rcut'][ia]
+            Z = int(atoms_dict['type'][ia])
+            atom_data[ia]['type']  = int(self.basis_meta['nz_map'][Z])
+            atom_data[ia]['norb']  = int(4) # numorb_max
+            atom_data[ia]['i0orb'] = ia * numorb_max
+
+        # Upload static buffers
+        # points are expanded to float4 for alignment
+        points_f4 = np.zeros((n_points, 4), dtype=np.float32)
+        points_f4[:, :3] = points
+        d_points = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=points_f4)
+        d_atoms  = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=atom_data)
+
+        # Mutable/Reused buffers
+        d_coeffs = cl.Buffer(self.ctx, mf.READ_ONLY,  size=natoms * numorb_max * 4)
+        d_out    = cl.Buffer(self.ctx, mf.WRITE_ONLY, size=n_points * 4)
+
+        t1 = time.perf_counter_ns()
+        print(f"[prepare_orbital_points_projection] Setup: {(t1-t0)*1e-6:.1f} ms, n_points={n_points}")
+        return dict(
+            n_points=n_points, natoms=natoms, numorb_max=numorb_max,
+            d_points=d_points, d_atoms=d_atoms, d_coeffs=d_coeffs, d_out=d_out
+        )
+
+    def project_orbital_points_prepped(self, coeffs_flat, ctx):
+        """
+        Project orbital at pre-loaded points.
+        """
+        cl.enqueue_copy(self.queue, ctx['d_coeffs'], coeffs_flat.astype(np.float32))
+        
+        gs = (ctx['n_points'],)
+        ls = None
+        self.prg.project_orbital_points(
+            self.queue, gs, ls,
+            np.int32(ctx['n_points']),
+            ctx['d_points'],
+            ctx['d_atoms'],
+            np.int32(ctx['natoms']),
+            ctx['d_coeffs'],
+            self.d_basis,
+            np.int32(self.basis_meta['n_nodes']),
+            np.float32(self.basis_meta['dr']),
+            np.int32(self.basis_meta['max_shells']),
+            ctx['d_out']
+        )
+        self.queue.finish()
+        out = np.empty(ctx['n_points'], dtype=np.float32)
+        cl.enqueue_copy(self.queue, out, ctx['d_out'])
+        self.queue.finish()
+        return out
+
+
+
+
+    def mo_overlap_points_exp_sk(
+            self,
+            tip_centers,
+            tip_pos_rel,
+            smp_pos,
+            coeffs_tip,
+            coeffs_smp,
+            tip_quat=None,
+            beta=1.0,
+            r0=3.0,
+            rcut=8.0,
+            bTryAllocate=True,
+        ):
+        """GPU orbital-overlap scan map for molecular tip vs sample using exp+SK.
+
+        Each work-item computes one scan pixel corresponding to one tip-center position.
+
+        Args:
+            tip_centers: (npts,3) float32/64 tip center positions
+            tip_pos_rel: (ntip_atoms,3) float32/64 tip atom positions relative to tip center
+            smp_pos:     (nsmp_atoms,3) float32/64 sample atom positions
+            coeffs_tip:  (ntip_atoms,4) float32 coeffs [px,py,pz,s]
+            coeffs_smp:  (nsmp_atoms,4) float32 coeffs [px,py,pz,s]
+        Returns:
+            t: (npts,) float32 signed amplitude
+            I: (npts,) float32 intensity t^2
+        """
+        import numpy as np
+        import pyopencl as cl
+
+        tip_centers = np.asarray(tip_centers, dtype=np.float32)
+        if tip_quat is None:
+            tip_quat = np.zeros((len(tip_centers), 4), dtype=np.float32)
+            tip_quat[:, 3] = 1.0
+        tip_quat = np.asarray(tip_quat, dtype=np.float32)
+        assert tip_quat.shape[0] == tip_centers.shape[0]
+        assert tip_quat.shape[1] == 4
+        tip_pos_rel = np.asarray(tip_pos_rel, dtype=np.float32)
+        smp_pos = np.asarray(smp_pos, dtype=np.float32)
+        coeffs_tip = np.asarray(coeffs_tip, dtype=np.float32)
+        coeffs_smp = np.asarray(coeffs_smp, dtype=np.float32)
+
+        if tip_centers.ndim != 2 or tip_centers.shape[1] != 3:
+            raise ValueError(f"mo_overlap_points_exp_sk: tip_centers must be (n,3), got {tip_centers.shape}")
+        if tip_pos_rel.ndim != 2 or tip_pos_rel.shape[1] != 3:
+            raise ValueError(f"mo_overlap_points_exp_sk: tip_pos_rel must be (n,3), got {tip_pos_rel.shape}")
+        if smp_pos.ndim != 2 or smp_pos.shape[1] != 3:
+            raise ValueError(f"mo_overlap_points_exp_sk: smp_pos must be (n,3), got {smp_pos.shape}")
+        if coeffs_tip.shape != (len(tip_pos_rel), 4):
+            raise ValueError(f"mo_overlap_points_exp_sk: coeffs_tip must be (ntip,4), got {coeffs_tip.shape}")
+        if coeffs_smp.shape != (len(smp_pos), 4):
+            raise ValueError(f"mo_overlap_points_exp_sk: coeffs_smp must be (nsmp,4), got {coeffs_smp.shape}")
+
+        # Pack to float4 buffers
+        tip_centers4 = np.c_[tip_centers, np.zeros((len(tip_centers), 1), dtype=np.float32)].astype(np.float32)
+        tip_pos_rel4 = np.c_[tip_pos_rel, np.zeros((len(tip_pos_rel), 1), dtype=np.float32)].astype(np.float32)
+        smp_pos4 = np.c_[smp_pos, np.zeros((len(smp_pos), 1), dtype=np.float32)].astype(np.float32)
+
+        sz_f = 4
+        npts = len(tip_centers)
+        ntip = len(tip_pos_rel)
+        nsmp = len(smp_pos)
+        if bTryAllocate:
+            buffs = {
+                "mosk_tip_centers": sz_f * 4 * npts,
+                "mosk_tip_quat":    sz_f * 4 * npts,
+                "mosk_tip_pos_rel": sz_f * 4 * ntip,
+                "mosk_smp_pos":     sz_f * 4 * nsmp,
+                "mosk_ct":          sz_f * 4 * ntip,
+                "mosk_cs":          sz_f * 4 * nsmp,
+                "mosk_out_t":       sz_f * npts,
+                "mosk_out_I":       sz_f * npts,
+            }
+            self.try_make_buffers(buffs, suffix="_buff")
+        self.toGPU_(self.mosk_tip_centers_buff, tip_centers4)
+        self.toGPU_(self.mosk_tip_quat_buff,    tip_quat)
+        self.toGPU_(self.mosk_tip_pos_rel_buff, tip_pos_rel4)
+        self.toGPU_(self.mosk_smp_pos_buff,     smp_pos4)
+        self.toGPU_(self.mosk_ct_buff,          coeffs_tip.astype(np.float32))
+        self.toGPU_(self.mosk_cs_buff,          coeffs_smp.astype(np.float32))
+
+        gs = (int(npts),)
+        self.prg.mo_overlap_points_exp_sk(
+            self.queue, gs, None,
+            np.int32(npts),
+            self.mosk_tip_centers_buff,
+            self.mosk_tip_quat_buff,
+            self.mosk_tip_pos_rel_buff,
+            self.mosk_smp_pos_buff,
+            np.int32(ntip),
+            np.int32(nsmp),
+            self.mosk_ct_buff,
+            self.mosk_cs_buff,
+            np.float32(beta),
+            np.float32(r0),
+            np.float32(rcut),
+            self.mosk_out_t_buff,
+            self.mosk_out_I_buff
+        )
+        self.queue.finish()
+        out_t = np.empty(npts, dtype=np.float32)
+        out_I = np.empty(npts, dtype=np.float32)
+        self.fromGPU_(self.mosk_out_t_buff, out_t)
+        self.fromGPU_(self.mosk_out_I_buff, out_I)
+        self.queue.finish()
+        return out_t, out_I
+
+
+
+    # ============================================================================
+    # Dense-matrix orbital/density projection (d-orbital support)
+    # ============================================================================
+
+    def _build_atom_data_dense(self, atoms_dict, norb_per_atom, orb_offsets):
+        """Build AtomData with correct i0orb and norb for dense-matrix kernels (vectorized)."""
+        natoms = len(atoms_dict['pos'])
+        atom_data = np.zeros(natoms, dtype=[('pos_rcut','f4',4),('type','i4'),('i0orb','i4'),('norb','i4'),('pad','i4')])
+        atom_data['pos_rcut'][:, :3] = np.asarray(atoms_dict['pos'][:natoms], dtype=np.float32)
+        atom_data['pos_rcut'][:,  3] = np.asarray(atoms_dict['Rcut'][:natoms], dtype=np.float32)
+        Zs = np.asarray(atoms_dict['type'][:natoms], dtype=np.int32)
+        nz_map = self.basis_meta['nz_map']
+        missing = [int(Z) for Z in Zs if int(Z) not in nz_map]
+        assert len(missing) == 0, f"_build_atom_data_dense: species {missing} not loaded; loaded={list(nz_map.keys())}"
+        atom_data['type']  = np.array([nz_map[int(Z)] for Z in Zs], dtype=np.int32)
+        atom_data['i0orb'] = np.asarray(orb_offsets[:natoms], dtype=np.int32)
+        atom_data['norb']  = np.asarray(norb_per_atom[:natoms], dtype=np.int32)
+        return atom_data
+
+    def realloc_orbital_point_buffers(self, n_points, natoms, norb_total):
+        """(Re-)allocate persistent GPU buffers for project_orbital_dense_points* and project_density_dense_points."""
+        sz_f = 4
+        buffs = {
+            "opt_points": sz_f * 4 * n_points,      # float4 per point
+            "opt_atoms":  32 * natoms,               # AtomData struct per atom
+            "opt_coeffs": sz_f * norb_total,         # dense coeffs vector
+            "opt_dm":     sz_f * norb_total * norb_total,  # density matrix (largest case)
+            "opt_out":    sz_f * n_points,
+        }
+        self.try_make_buffers(buffs, suffix="_buff")
+
+    def realloc_sp_point_buffers(self, n_points, natoms):
+        """(Re-)allocate persistent GPU buffers for project_orbital_points* (sp basis, 4-wide packed coeffs)."""
+        sz_f = 4
+        numorb_max = 4
+        buffs = {
+            "sp_points": sz_f * 4 * n_points,       # float4 per point
+            "sp_atoms":  32 * natoms,                # AtomData struct per atom
+            "sp_coeffs": sz_f * numorb_max * natoms, # packed [px,py,pz,s] per atom
+            "sp_out":    sz_f * n_points,
+        }
+        self.try_make_buffers(buffs, suffix="_buff")
+
+    def project_orbital_dense_points(self, points, coeffs_dense, norb_per_atom, orb_offsets, atoms_dict, bAlloc=True):
+        """Evaluate a single orbital at arbitrary points using dense MO coefficient vector.
+        
+        Supports s, p, d orbitals via shell-based angular function evaluation.
+        
+        Args:
+            points: (n_points, 3) float32 positions in Angstrom
+            coeffs_dense: (norb_total,) dense MO coefficient vector in C row-major order.
+                          Orbital ordering per atom follows Fortran convention:
+                          s, py, pz, px, dxy, dyz, dz2, dxz, dx2-y2
+            norb_per_atom: (natoms,) number of orbitals per atom
+            orb_offsets: (natoms+1,) cumulative orbital offsets
+            atoms_dict: dict with 'pos', 'Rcut', 'type'
+        
+        Returns:
+            psi: (n_points,) float32 orbital values
+        """
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(f"project_orbital_dense_points: points must be (n,3), got {points.shape}")
+        
+        natoms = len(atoms_dict['pos'])
+        norb_total = int(orb_offsets[-1])
+        coeffs_dense = np.asarray(coeffs_dense, dtype=np.float32).ravel()
+        if coeffs_dense.shape[0] != norb_total:
+            raise ValueError(f"coeffs_dense shape {coeffs_dense.shape} != norb_total {norb_total}")
+        
+        atom_data = self._build_atom_data_dense(atoms_dict, norb_per_atom, orb_offsets)
+        if bAlloc: self.realloc_orbital_point_buffers(len(points), natoms, norb_total)
+        points_f4 = np.ascontiguousarray(np.c_[points, np.zeros((len(points),1), np.float32)], dtype=np.float32)
+        self.toGPU_(self.opt_points_buff, points_f4)
+        self.toGPU_(self.opt_atoms_buff,  atom_data)
+        self.toGPU_(self.opt_coeffs_buff, coeffs_dense)
+        
+        gs = (int(len(points)),)
+        self.prg.project_orbital_dense_points(
+            self.queue, gs, None,
+            np.int32(len(points)),
+            self.opt_points_buff, self.opt_atoms_buff, np.int32(natoms),
+            self.opt_coeffs_buff,
+            self.d_basis,
+            np.int32(self.basis_meta['n_nodes']),
+            np.float32(self.basis_meta['dr']),
+            np.int32(self.basis_meta['max_shells']),
+            self.opt_out_buff
+        )
+        self.queue.finish()
+        out = np.empty(len(points), dtype=np.float32)
+        self.fromGPU_(self.opt_out_buff, out)
+        self.queue.finish()
+        return out
+
+    def project_orbital_dense_points_exp(self, points, coeffs_dense, norb_per_atom, orb_offsets, atoms_dict, beta=1.0, r0=3.0, bAlloc=True):
+        """Evaluate a single orbital at arbitrary points using dense MO coefficient vector with exponential radial decay.
+        
+        Uses f(r) = exp(-beta*(r - r0)) instead of spline basis for long-range STM simulation.
+        Supports s, p, d orbitals via shell-based angular function evaluation.
+        
+        Args:
+            points: (n_points, 3) float32 positions in Angstrom
+            coeffs_dense: (norb_total,) dense MO coefficient vector in C row-major order.
+                          Orbital ordering per atom follows Fortran convention:
+                          s, py, pz, px, dxy, dyz, dz2, dxz, dx2-y2
+            norb_per_atom: (natoms,) number of orbitals per atom
+            orb_offsets: (natoms+1,) cumulative orbital offsets
+            atoms_dict: dict with 'pos', 'Rcut', 'type'
+            beta: exponential decay constant (Å^-1)
+            r0: reference distance (Å) where f=1
+        
+        Returns:
+            psi: (n_points,) float32 orbital values
+        """
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(f"project_orbital_dense_points_exp: points must be (n,3), got {points.shape}")
+        
+        natoms = len(atoms_dict['pos'])
+        norb_total = int(orb_offsets[-1])
+        coeffs_dense = np.asarray(coeffs_dense, dtype=np.float32).ravel()
+        if coeffs_dense.shape[0] != norb_total:
+            raise ValueError(f"coeffs_dense shape {coeffs_dense.shape} != norb_total {norb_total}")
+        
+        atom_data = self._build_atom_data_dense(atoms_dict, norb_per_atom, orb_offsets)
+        if bAlloc: self.realloc_orbital_point_buffers(len(points), natoms, norb_total)
+        points_f4 = np.ascontiguousarray(np.c_[points, np.zeros((len(points),1), np.float32)], dtype=np.float32)
+        self.toGPU_(self.opt_points_buff, points_f4)
+        self.toGPU_(self.opt_atoms_buff,  atom_data)
+        self.toGPU_(self.opt_coeffs_buff, coeffs_dense)
+        
+        gs = (int(len(points)),)
+        self.prg.project_orbital_dense_points_exp(
+            self.queue, gs, None,
+            np.int32(len(points)),
+            self.opt_points_buff, self.opt_atoms_buff, np.int32(natoms),
+            self.opt_coeffs_buff,
+            np.float32(beta),
+            np.float32(r0),
+            np.int32(self.basis_meta['max_shells']),
+            self.opt_out_buff
+        )
+        self.queue.finish()
+        out = np.empty(len(points), dtype=np.float32)
+        self.fromGPU_(self.opt_out_buff, out)
+        self.queue.finish()
+        return out
+
+    def project_density_dense_points(self, points, dm_dense, norb_per_atom, orb_offsets, atoms_dict, bAlloc=True):
+        """Evaluate density at arbitrary points using dense density matrix.
+        
+        Supports s, p, d orbitals via shell-based angular function evaluation.
+        
+        Args:
+            points: (n_points, 3) float32 positions in Angstrom
+            dm_dense: (norb_total, norb_total) dense density matrix in C row-major order
+            norb_per_atom: (natoms,) number of orbitals per atom
+            orb_offsets: (natoms+1,) cumulative orbital offsets
+            atoms_dict: dict with 'pos', 'Rcut', 'type'
+        
+        Returns:
+            rho: (n_points,) float32 density values
+        """
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(f"project_density_dense_points: points must be (n,3), got {points.shape}")
+        
+        natoms = len(atoms_dict['pos'])
+        norb_total = int(orb_offsets[-1])
+        dm_dense = np.asarray(dm_dense, dtype=np.float32)
+        if dm_dense.ndim == 2: dm_dense = dm_dense.ravel()
+        if dm_dense.shape[0] != norb_total * norb_total:
+            raise ValueError(f"dm_dense shape {dm_dense.shape} != {norb_total*norb_total}")
+        
+        atom_data = self._build_atom_data_dense(atoms_dict, norb_per_atom, orb_offsets)
+        if bAlloc: self.realloc_orbital_point_buffers(len(points), natoms, norb_total)
+        points_f4 = np.ascontiguousarray(np.c_[points, np.zeros((len(points),1), np.float32)], dtype=np.float32)
+        self.toGPU_(self.opt_points_buff, points_f4)
+        self.toGPU_(self.opt_atoms_buff,  atom_data)
+        self.toGPU_(self.opt_dm_buff,     dm_dense)
+        
+        gs = (int(len(points)),)
+        self.prg.project_density_dense_points(
+            self.queue, gs, None,
+            np.int32(len(points)),
+            self.opt_points_buff, self.opt_atoms_buff, np.int32(natoms),
+            self.opt_dm_buff, np.int32(norb_total),
+            self.d_basis,
+            np.int32(self.basis_meta['n_nodes']),
+            np.float32(self.basis_meta['dr']),
+            np.int32(self.basis_meta['max_shells']),
+            self.opt_out_buff
+        )
+        self.queue.finish()
+        out = np.empty(len(points), dtype=np.float32)
+        self.fromGPU_(self.opt_out_buff, out)
+        self.queue.finish()
+        return out
+
+    def project_orbital_dense(self, coeffs_dense, norb_per_atom, orb_offsets, atoms_dict, grid_spec, nMaxAtom=64, bTryAllocate=True):
+        """Project a single molecular orbital onto a 3D grid using dense MO coefficient vector.
+        
+        Args:
+            coeffs_dense: (norb_total,) dense MO coefficient vector
+            norb_per_atom: (natoms,) number of orbitals per atom
+            orb_offsets: (natoms+1,) cumulative orbital offsets
+            atoms_dict: dict with 'pos', 'Rcut', 'type'
+            grid_spec: dict with 'origin', 'dA', 'dB', 'dC', 'ngrid'
+            nMaxAtom: max atoms per task
+        
+        Returns:
+            psi: (nx, ny, nz) float32 signed wavefunction
+        """
+        import time
+        
+        tasks_np, task_atoms_np = self.build_tasks(atoms_dict, grid_spec, nMaxAtom=nMaxAtom, block_res=8)
+        if self.verbosity > 0: print(f"[DEBUG] project_orbital_dense: n_tasks={len(tasks_np)}")
+        
+        natoms = len(atoms_dict['pos'])
+        norb_total = int(orb_offsets[-1])
+        coeffs_dense = np.asarray(coeffs_dense, dtype=np.float32).ravel()
+        if coeffs_dense.shape[0] != norb_total:
+            raise ValueError(f"coeffs_dense shape {coeffs_dense.shape} != norb_total {norb_total}")
+        
+        atom_data = self._build_atom_data_dense(atoms_dict, norb_per_atom, orb_offsets)
+        
+        nx, ny, nz = [int(x) for x in grid_spec['ngrid'][:3]]
+        n_tasks = len(tasks_np)
+        if bTryAllocate:
+            self.realloc_dense_projection_buffers(natoms, n_tasks, nMaxAtom, nx, ny, nz, norb_total)
+        self.toGPU_(self.dproj_grid_buff,        self.grid_to_np(grid_spec))
+        self.toGPU_(self.dproj_atoms_buff,       atom_data)
+        self.toGPU_(self.dproj_dm_buff,          coeffs_dense)   # coeffs reuse dm slot
+        if n_tasks > 0: self.toGPU_(self.dproj_tasks_buff,  tasks_np)
+        if len(task_atoms_np) > 0: self.toGPU_(self.dproj_task_atoms_buff, task_atoms_np)
+        out_nbytes = nx * ny * nz * 4
+        cl.enqueue_fill_buffer(self.queue, self.dproj_out_buff, np.float32(0), 0, out_nbytes)
+        
+        ls = (32,)
+        gs = (n_tasks * ls[0],)
+        T0 = time.perf_counter_ns()
+        self.prg.project_orbital_dense(
+            self.queue, gs, ls,
+            self.dproj_grid_buff, np.int32(n_tasks),
+            self.dproj_tasks_buff, self.dproj_atoms_buff, self.dproj_task_atoms_buff,
+            self.dproj_dm_buff,
+            self.d_basis,
+            np.int32(self.basis_meta['n_nodes']),
+            np.float32(self.basis_meta['dr']),
+            np.int32(self.basis_meta['max_shells']),
+            np.int32(nMaxAtom),
+            self.dproj_out_buff
+        )
+        self.queue.finish()
+        T1 = time.perf_counter_ns()
+        if self.verbosity > 0: print(f"[TIME] project_orbital_dense {(T1-T0)*1e-6:.3f} [ms]")
+        res = np.empty((nx, ny, nz), dtype=np.float32)
+        self.fromGPU_(self.dproj_out_buff, res)
+        self.queue.finish()
+        return res
+
+    def project_density_dense(self, dm_dense, norb_per_atom, orb_offsets, atoms_dict, grid_spec, nMaxAtom=64, bAlloc=True):
+        """Project dense density matrix onto a 3D grid.
+        
+        Args:
+            dm_dense: (norb_total, norb_total) dense density matrix in C row-major order
+            norb_per_atom: (natoms,) number of orbitals per atom
+            orb_offsets: (natoms+1,) cumulative orbital offsets
+            atoms_dict: dict with 'pos', 'Rcut', 'type'
+            grid_spec: dict with 'origin', 'dA', 'dB', 'dC', 'ngrid'
+            nMaxAtom: max atoms per task
+            bAlloc: if True (default), reallocate GPU buffers if sizes changed
+        
+        Returns:
+            rho: (nx, ny, nz) float32 density
+        """
+        import time
+        
+        tasks_np, task_atoms_np = self.build_tasks(atoms_dict, grid_spec, nMaxAtom=nMaxAtom, block_res=8)
+        if self.verbosity > 0: print(f"[DEBUG] project_density_dense: n_tasks={len(tasks_np)}")
+        
+        natoms = len(atoms_dict['pos'])
+        norb_total = int(orb_offsets[-1])
+        dm_dense = np.asarray(dm_dense, dtype=np.float32)
+        if dm_dense.ndim == 2:
+            dm_dense = dm_dense.ravel()
+        if dm_dense.shape[0] != norb_total * norb_total:
+            raise ValueError(f"dm_dense shape {dm_dense.shape} != {norb_total*norb_total}")
+        
+        atom_data = self._build_atom_data_dense(atoms_dict, norb_per_atom, orb_offsets)
+        nx, ny, nz = grid_spec['ngrid'][:3]
+        n_tasks = len(tasks_np)
+
+        if bAlloc:
+            self.realloc_dense_projection_buffers(natoms, n_tasks, nMaxAtom, int(nx), int(ny), int(nz), norb_total)
+
+        self.toGPU_(self.dproj_grid_buff,  self.grid_to_np(grid_spec))
+        self.toGPU_(self.dproj_atoms_buff, atom_data)
+        if n_tasks > 0:
+            self.toGPU_(self.dproj_tasks_buff,      tasks_np)
+            self.toGPU_(self.dproj_task_atoms_buff, task_atoms_np)
+        self.toGPU_(self.dproj_dm_buff, dm_dense)
+
+        out_nbytes = int(nx) * int(ny) * int(nz) * 4
+        cl.enqueue_fill_buffer(self.queue, self.dproj_out_buff, np.float32(0), 0, out_nbytes)
+        
+        
+        ls = (32,)
+        gs = (max(n_tasks, 1) * ls[0],)
+        
+        T0 = time.perf_counter_ns()
+        self.prg.project_density_dense(
+            self.queue, gs, ls,
+            self.dproj_grid_buff, np.int32(n_tasks),
+            self.dproj_tasks_buff, self.dproj_atoms_buff, self.dproj_task_atoms_buff,
+            self.dproj_dm_buff, np.int32(norb_total),
+            self.d_basis,
+            np.int32(self.basis_meta['n_nodes']),
+            np.float32(self.basis_meta['dr']),
+            np.int32(self.basis_meta['max_shells']),
+            np.int32(nMaxAtom),
+            self.dproj_out_buff
+        )
+        self.queue.finish()
+        T1 = time.perf_counter_ns()
+        if self.verbosity > 0: print(f"[TIME] project_density_dense {(T1-T0)*1e-6:.3f} [ms]")
+        
+        res = np.empty((int(nx), int(ny), int(nz)), dtype=np.float32)
+        cl.enqueue_copy(self.queue, res, self.dproj_out_buff)
+        self.queue.finish()
+        
+        # Apply B3_FACTOR to convert from Bohr-normalized to Ang^-3 density
+        # This matches project_dftb_density() and project_neutral_density()
+        BOHR2ANG = 0.5291772109
+        B3_FACTOR = 1.0 / (BOHR2ANG**3)
+        return (res * B3_FACTOR).astype(np.float32)
+
+    def stm_dyson_wg_scan(
+            self,
+            tip_centers,
+            tip_pos_rel,
+            smp_pos,
+            GT_global=None,
+            GS_global=None,
+            uT_source=None,
+            beta=1.0,
+            r0=3.0,
+            rcut=8.0,
+            bTryAllocate=True,
+            local_size=32,
+        ):
+        import numpy as np
+        import pyopencl as cl
+
+        tip_centers = np.asarray(tip_centers, dtype=np.float32)
+        tip_pos_rel = np.asarray(tip_pos_rel, dtype=np.float32)
+        smp_pos     = np.asarray(smp_pos, dtype=np.float32)
+
+        if tip_centers.ndim != 2 or tip_centers.shape[1] != 3:
+            raise ValueError(f"stm_dyson_wg_scan: tip_centers must be (n,3), got {tip_centers.shape}")
+        if tip_pos_rel.ndim != 2 or tip_pos_rel.shape[1] != 3:
+            raise ValueError(f"stm_dyson_wg_scan: tip_pos_rel must be (n,3), got {tip_pos_rel.shape}")
+        if smp_pos.ndim != 2 or smp_pos.shape[1] != 3:
+            raise ValueError(f"stm_dyson_wg_scan: smp_pos must be (n,3), got {smp_pos.shape}")
+
+        n_pixels   = int(tip_centers.shape[0])
+        ntip_atoms = int(tip_pos_rel.shape[0])
+        nsmp_atoms = int(smp_pos.shape[0])
+        nt = 4 * ntip_atoms
+        ns = 4 * nsmp_atoms
+
+        if GT_global is None:
+            GT_global = np.eye(nt, dtype=np.complex64)
+        else:
+            GT_global = np.asarray(GT_global)
+        if GS_global is None:
+            GS_global = np.eye(ns, dtype=np.complex64)
+        else:
+            GS_global = np.asarray(GS_global)
+
+        if GT_global.shape != (nt, nt):
+            raise ValueError(f"stm_dyson_wg_scan: GT_global must be ({nt},{nt}), got {GT_global.shape}")
+        if GS_global.shape != (ns, ns):
+            raise ValueError(f"stm_dyson_wg_scan: GS_global must be ({ns},{ns}), got {GS_global.shape}")
+
+        if uT_source is None:
+            uT_source = np.zeros(nt, dtype=np.complex64)
+            uT_source[3] = 1.0 + 0.0j
+        else:
+            uT_source = np.asarray(uT_source)
+        if uT_source.shape != (nt,):
+            raise ValueError(f"stm_dyson_wg_scan: uT_source must be ({nt},), got {uT_source.shape}")
+
+        tip_centers4 = np.c_[tip_centers, np.zeros((n_pixels, 1), dtype=np.float32)].astype(np.float32)
+        tip_pos_rel4 = np.c_[tip_pos_rel, np.zeros((ntip_atoms, 1), dtype=np.float32)].astype(np.float32)
+        smp_pos4     = np.c_[smp_pos,     np.zeros((nsmp_atoms, 1), dtype=np.float32)].astype(np.float32)
+
+        # Pack complex64 -> float2
+        GT_f2 = np.asarray(GT_global, dtype=np.complex64).view(np.float32).reshape(nt*nt, 2)
+        GS_f2 = np.asarray(GS_global, dtype=np.complex64).view(np.float32).reshape(ns*ns, 2)
+        uT_f2 = np.asarray(uT_source, dtype=np.complex64).view(np.float32).reshape(nt, 2)
+
+        sz_f = 4
+        if bTryAllocate:
+            buffs = {
+                "dyson_tip_centers": sz_f * 4 * n_pixels,
+                "dyson_tip_pos_rel": sz_f * 4 * ntip_atoms,
+                "dyson_smp_pos":     sz_f * 4 * nsmp_atoms,
+                "dyson_GT":          sz_f * 2 * nt * nt,
+                "dyson_GS":          sz_f * 2 * ns * ns,
+                "dyson_uT":          sz_f * 2 * nt,
+                "dyson_out":         sz_f * n_pixels,
+            }
+            self.try_make_buffers(buffs, suffix="_buff")
+        self.toGPU_(self.dyson_tip_centers_buff, tip_centers4)
+        self.toGPU_(self.dyson_tip_pos_rel_buff, tip_pos_rel4)
+        self.toGPU_(self.dyson_smp_pos_buff,     smp_pos4)
+        self.toGPU_(self.dyson_GT_buff,          GT_f2.astype(np.float32))
+        self.toGPU_(self.dyson_GS_buff,          GS_f2.astype(np.float32))
+        self.toGPU_(self.dyson_uT_buff,          uT_f2.astype(np.float32))
+
+        ls = (int(local_size),)
+        gs = (int(n_pixels) * int(local_size),)
+        self.prg.solve_stm_dyson_wg(
+            self.queue, gs, ls,
+            np.int32(n_pixels),
+            self.dyson_tip_centers_buff,
+            self.dyson_tip_pos_rel_buff,
+            self.dyson_smp_pos_buff,
+            np.int32(ntip_atoms),
+            np.int32(nsmp_atoms),
+            self.dyson_GT_buff,
+            self.dyson_GS_buff,
+            self.dyson_uT_buff,
+            np.float32(beta),
+            np.float32(r0),
+            np.float32(rcut),
+            self.dyson_out_buff,
+        )
+        self.queue.finish()
+        out = np.empty(n_pixels, dtype=np.float32)
+        self.fromGPU_(self.dyson_out_buff, out)
+        self.queue.finish()
+        return out
+
+    def stm_gf_dyson_2mol_mo_scan(
+            self,
+            tip_centers,
+            tip_pos_rel,
+            smp_pos,
+            GT_global,
+            GS_global,
+            c_tip,
+            c_smp,
+            tip_norb_per,
+            smp_norb_per,
+            beta=1.0,
+            r0=3.0,
+            rcut=8.0,
+            bTryAllocate=True,
+        ):
+        """GPU GF-Dyson MO scan for 2-molecule STM (work-item per pixel).
+
+        Math: amp(p) = c_tip^H · GT · M_ts(p) · GS · c_smp
+
+        Precomputes on CPU:
+            v_S = GS @ c_smp   (remapped Fortran→OCL [px,py,pz,s] order)
+            u_T = c_tip^H @ GT (remapped Fortran→OCL [px,py,pz,s] order)
+
+        GPU kernel computes M_ts via simplified exponential SK hopping and
+        accumulates amp = Σ_{it,is} u_T[it] * V_{it,is} * v_S[is].
+
+        Args:
+            tip_centers:  (n_pixels, 3) float32 tip center positions in Å
+            tip_pos_rel:  (ntip_atoms, 3) float32 tip atom positions relative to center
+            smp_pos:      (nsmp_atoms, 3) float32 sample atom positions in Å
+            GT_global:    (tip_norb_fort, tip_norb_fort) complex Green's fcn (Fortran conv)
+            GS_global:    (smp_norb_fort, smp_norb_fort) complex Green's fcn (Fortran conv)
+            c_tip:        (tip_norb_fort,) complex MO coefficients (Fortran conv)
+            c_smp:        (smp_norb_fort,) complex MO coefficients (Fortran conv)
+            tip_norb_per: (ntip_atoms,) int32 orbitals per tip atom
+            smp_norb_per: (nsmp_atoms,) int32 orbitals per sample atom
+            beta, r0, rcut: exponential SK parameters
+
+        Returns:
+            out: (n_pixels,) float32 current intensity |amp|^2
+        """
+        import numpy as np
+        import pyopencl as cl
+
+        tip_centers = np.asarray(tip_centers, dtype=np.float32)
+        tip_pos_rel = np.asarray(tip_pos_rel, dtype=np.float32)
+        smp_pos     = np.asarray(smp_pos, dtype=np.float32)
+        GT_global   = np.asarray(GT_global, dtype=np.complex128)
+        GS_global   = np.asarray(GS_global, dtype=np.complex128)
+        c_tip       = np.asarray(c_tip, dtype=np.complex128)
+        c_smp       = np.asarray(c_smp, dtype=np.complex128)
+        tip_norb_per = np.asarray(tip_norb_per, dtype=np.int32)
+        smp_norb_per = np.asarray(smp_norb_per, dtype=np.int32)
+
+        n_pixels    = int(tip_centers.shape[0])
+        ntip_atoms  = int(tip_pos_rel.shape[0])
+        nsmp_atoms  = int(smp_pos.shape[0])
+
+        # --- Remap Fortran→OCL utility ---
+        # Fortran per-atom: [s, py, pz, px] (Ortega)
+        # OpenCL Grid:      [px, py, pz, s]  (Cartesian, padded to 4)
+        _PERM_F2O = np.array([3, 1, 2, 0], dtype=np.int32)  # Fort[r] → OCL[perm[r]]
+
+        def _remap_vec_fortran_to_ocl(v_fort, norb_per):
+            natoms = len(norb_per)
+            v_ocl = np.zeros(natoms * 4, dtype=np.complex128)
+            starts = np.zeros(natoms + 1, dtype=np.int32)
+            starts[1:] = np.cumsum(norb_per)
+            for ia in range(natoms):
+                no = int(norb_per[ia])
+                i0f = int(starts[ia])
+                i0o = ia * 4
+                if no == 1:
+                    v_ocl[i0o + 3] = v_fort[i0f]  # s → OCL slot 3
+                elif no == 4:
+                    for k in range(4):
+                        v_ocl[i0o + k] = v_fort[i0f + int(_PERM_F2O[k])]
+                else:
+                    v_ocl[i0o:i0o + no] = v_fort[i0f:i0f + no]
+            return v_ocl
+
+        # Precompute vectors in Fortran convention
+        v_S_fort = GS_global @ c_smp       # (smp_norb_fort,)
+        u_T_fort = np.conj(c_tip) @ GT_global  # (tip_norb_fort,)  row vector result
+
+        # Remap to OCL [px,py,pz,s] order
+        v_S_ocl = _remap_vec_fortran_to_ocl(v_S_fort, smp_norb_per)
+        u_T_ocl = _remap_vec_fortran_to_ocl(u_T_fort, tip_norb_per)
+
+        # Build orb2atom in OpenCL convention (padded to 4 per atom)
+        tip_norb_ocl = ntip_atoms * 4
+        smp_norb_ocl = nsmp_atoms * 4
+        tip_orb2atom_ocl = np.repeat(np.arange(ntip_atoms, dtype=np.int32), 4)
+        smp_orb2atom_ocl = np.repeat(np.arange(nsmp_atoms, dtype=np.int32), 4)
+
+        # Pack float4 buffers
+        tip_centers4 = np.c_[tip_centers, np.zeros((n_pixels, 1), dtype=np.float32)].astype(np.float32)
+        tip_pos_rel4 = np.c_[tip_pos_rel, np.zeros((ntip_atoms, 1), dtype=np.float32)].astype(np.float32)
+        smp_pos4     = np.c_[smp_pos,     np.zeros((nsmp_atoms, 1), dtype=np.float32)].astype(np.float32)
+
+        # Pack complex → float2
+        uT_f2 = np.asarray(u_T_ocl, dtype=np.complex64).view(np.float32).reshape(tip_norb_ocl, 2)
+        vS_f2 = np.asarray(v_S_ocl, dtype=np.complex64).view(np.float32).reshape(smp_norb_ocl, 2)
+
+        sz_f = 4
+        if bTryAllocate:
+            buffs = {
+                "gf2_tip_centers": sz_f * 4 * n_pixels,
+                "gf2_tip_pos_rel": sz_f * 4 * ntip_atoms,
+                "gf2_smp_pos":     sz_f * 4 * nsmp_atoms,
+                "gf2_tip_o2a":     sz_f * tip_norb_ocl,
+                "gf2_smp_o2a":     sz_f * smp_norb_ocl,
+                "gf2_uT":          sz_f * 2 * tip_norb_ocl,
+                "gf2_vS":          sz_f * 2 * smp_norb_ocl,
+                "gf2_out":         sz_f * n_pixels,
+            }
+            self.try_make_buffers(buffs, suffix="_buff")
+        self.toGPU_(self.gf2_tip_centers_buff, tip_centers4)
+        self.toGPU_(self.gf2_tip_pos_rel_buff, tip_pos_rel4)
+        self.toGPU_(self.gf2_smp_pos_buff,     smp_pos4)
+        self.toGPU_(self.gf2_tip_o2a_buff,     tip_orb2atom_ocl.astype(np.int32))
+        self.toGPU_(self.gf2_smp_o2a_buff,     smp_orb2atom_ocl.astype(np.int32))
+        self.toGPU_(self.gf2_uT_buff,          uT_f2.astype(np.float32))
+        self.toGPU_(self.gf2_vS_buff,          vS_f2.astype(np.float32))
+
+        gs = (int(n_pixels),)
+        self.prg.stm_gf_dyson_2mol_mo_scan(
+            self.queue, gs, None,
+            np.int32(n_pixels),
+            self.gf2_tip_centers_buff,
+            self.gf2_tip_pos_rel_buff,
+            self.gf2_smp_pos_buff,
+            self.gf2_tip_o2a_buff,
+            self.gf2_smp_o2a_buff,
+            self.gf2_uT_buff,
+            self.gf2_vS_buff,
+            np.int32(ntip_atoms),
+            np.int32(nsmp_atoms),
+            np.int32(tip_norb_ocl),
+            np.int32(smp_norb_ocl),
+            np.float32(float(beta)),
+            np.float32(float(r0)),
+            np.float32(float(rcut)),
+            self.gf2_out_buff,
+        )
+        self.queue.finish()
+        out = np.empty(n_pixels, dtype=np.float32)
+        self.fromGPU_(self.gf2_out_buff, out)
+        self.queue.finish()
+        return out
+
+    def mo_overlap_points_exp_sk_2mol(
+            self,
+            tip_centers,
+            tip_pos_rel,
+            smp_pos,
+            coeffs_tip,
+            coeffs_smp,
+            tip_quat=None,
+            beta=1.0,
+            r0=3.0,
+            rcut=8.0,
+            bTryAllocate=True,
+        ):
+        """Same as mo_overlap_points_exp_sk, but calls an explicit two-molecule kernel entrypoint.
+
+        This is intended for workflows where the tip and sample are different molecules.
+        The math is identical; we keep a separate kernel name to avoid breaking existing
+        call sites and make scripts self-documenting.
+        """
+        import numpy as np
+        import pyopencl as cl
+
+        tip_centers = np.asarray(tip_centers, dtype=np.float32)
+        if tip_quat is None:
+            tip_quat = np.zeros((len(tip_centers), 4), dtype=np.float32)
+            tip_quat[:, 3] = 1.0
+        tip_quat = np.asarray(tip_quat, dtype=np.float32)
+        assert tip_quat.shape[0] == tip_centers.shape[0]
+        assert tip_quat.shape[1] == 4
+        tip_pos_rel = np.asarray(tip_pos_rel, dtype=np.float32)
+        smp_pos = np.asarray(smp_pos, dtype=np.float32)
+        coeffs_tip = np.asarray(coeffs_tip, dtype=np.float32)
+        coeffs_smp = np.asarray(coeffs_smp, dtype=np.float32)
+
+        if tip_centers.ndim != 2 or tip_centers.shape[1] != 3: raise ValueError(f"mo_overlap_points_exp_sk_2mol: tip_centers must be (n,3), got {tip_centers.shape}")
+        if tip_pos_rel.ndim != 2 or tip_pos_rel.shape[1] != 3: raise ValueError(f"mo_overlap_points_exp_sk_2mol: tip_pos_rel must be (n,3), got {tip_pos_rel.shape}")
+        if smp_pos.ndim != 2 or smp_pos.shape[1] != 3: raise ValueError(f"mo_overlap_points_exp_sk_2mol: smp_pos must be (n,3), got {smp_pos.shape}")
+        if coeffs_tip.shape != (len(tip_pos_rel), 4):  raise ValueError(f"mo_overlap_points_exp_sk_2mol: coeffs_tip must be (ntip,4), got {coeffs_tip.shape}")
+        if coeffs_smp.shape != (len(smp_pos), 4): raise ValueError(f"mo_overlap_points_exp_sk_2mol: coeffs_smp must be (nsmp,4), got {coeffs_smp.shape}")
+
+        tip_centers4 = np.c_[tip_centers, np.zeros((len(tip_centers), 1), dtype=np.float32)].astype(np.float32)
+        tip_pos_rel4 = np.c_[tip_pos_rel, np.zeros((len(tip_pos_rel), 1), dtype=np.float32)].astype(np.float32)
+        smp_pos4 = np.c_[smp_pos, np.zeros((len(smp_pos), 1), dtype=np.float32)].astype(np.float32)
+
+        sz_f = 4
+        npts = len(tip_centers)
+        ntip = len(tip_pos_rel)
+        nsmp = len(smp_pos)
+        if bTryAllocate:
+            buffs = {
+                "mosk2_tip_centers": sz_f * 4 * npts,
+                "mosk2_tip_quat":    sz_f * 4 * npts,
+                "mosk2_tip_pos_rel": sz_f * 4 * ntip,
+                "mosk2_smp_pos":     sz_f * 4 * nsmp,
+                "mosk2_ct":          sz_f * 4 * ntip,
+                "mosk2_cs":          sz_f * 4 * nsmp,
+                "mosk2_out_t":       sz_f * npts,
+                "mosk2_out_I":       sz_f * npts,
+            }
+            self.try_make_buffers(buffs, suffix="_buff")
+        self.toGPU_(self.mosk2_tip_centers_buff, tip_centers4)
+        self.toGPU_(self.mosk2_tip_quat_buff,    tip_quat)
+        self.toGPU_(self.mosk2_tip_pos_rel_buff, tip_pos_rel4)
+        self.toGPU_(self.mosk2_smp_pos_buff,     smp_pos4)
+        self.toGPU_(self.mosk2_ct_buff,          coeffs_tip.astype(np.float32))
+        self.toGPU_(self.mosk2_cs_buff,          coeffs_smp.astype(np.float32))
+
+        gs = (int(npts),)
+        self.prg.mo_overlap_points_exp_sk_2mol(
+            self.queue, gs, None,
+            np.int32(npts),
+            self.mosk2_tip_centers_buff,
+            self.mosk2_tip_quat_buff,
+            self.mosk2_tip_pos_rel_buff,
+            self.mosk2_smp_pos_buff,
+            np.int32(ntip),
+            np.int32(nsmp),
+            self.mosk2_ct_buff,
+            self.mosk2_cs_buff,
+            np.float32(beta),
+            np.float32(r0),
+            np.float32(rcut),
+            self.mosk2_out_t_buff,
+            self.mosk2_out_I_buff
+        )
+        self.queue.finish()
+        out_t = np.empty(npts, dtype=np.float32)
+        out_I = np.empty(npts, dtype=np.float32)
+        self.fromGPU_(self.mosk2_out_t_buff, out_t)
+        self.fromGPU_(self.mosk2_out_I_buff, out_I)
+        self.queue.finish()
+        return out_t, out_I
+
+    def project_orbital_points_exp(self, points, coeffs, norb_per, atoms_dict, beta=1.0, r0=3.0, _debug_Fortran_order=False, bTryAllocate=True):
+        """Evaluate a single orbital at arbitrary points using exponential radial decay.
+
+        Uses OpenCL kernel `project_orbital_points_exp` from `cl/Grid.cl`.
+
+        Args:
+            points: (n_points,3) float32/float64 positions in Angstrom
+            coeffs: (natoms,4) coefficients in [px,py,pz,s] order (or Fortran order if _debug_Fortran_order=True)
+            norb_per: (natoms,) number of orbitals per atom
+            atoms_dict: dict with 'pos','Rcut','type'
+            beta, r0: exp(-beta*(r-r0)) parameters
+        Returns:
+            psi: (n_points,) float32
+        """
+        import numpy as np
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(f"project_orbital_points_exp: points must be (n,3), got {points.shape}")
+        natoms = len(atoms_dict['pos'])
+
+        # Pack coefficients (vectorized)
+        numorb_max = 4
+        _ORT_SPP_TO_OCL = np.array([3, 1, 2, 0], dtype=np.int32)  # [s,py,pz,px] -> [px,py,pz,s]
+        coeffs_flat = np.zeros((natoms, numorb_max), dtype=np.float32)
+        c4 = np.asarray(coeffs[:natoms, :4], dtype=np.float32)
+        if _debug_Fortran_order:
+            mask4 = (np.asarray(norb_per[:natoms], dtype=np.int32) == 4)
+            coeffs_flat[mask4]  = c4[mask4][:, _ORT_SPP_TO_OCL]
+            coeffs_flat[~mask4] = c4[~mask4]
+        else:
+            coeffs_flat[:] = c4
+        coeffs_flat = coeffs_flat.ravel()
+
+        # AtomData (vectorized)
+        atom_data = np.zeros(natoms, dtype=[('pos_rcut','f4',4),('type','i4'),('i0orb','i4'),('norb','i4'),('pad','i4')])
+        atom_data['pos_rcut'][:, :3] = np.asarray(atoms_dict['pos'][:natoms], dtype=np.float32)
+        atom_data['pos_rcut'][:,  3] = np.asarray(atoms_dict['Rcut'][:natoms], dtype=np.float32)
+        Zs = np.asarray(atoms_dict['type'][:natoms], dtype=np.int32)
+        nz_map = self.basis_meta['nz_map']
+        missing = [int(Z) for Z in Zs if int(Z) not in nz_map]
+        assert len(missing) == 0, f"project_orbital_points_exp: species {missing} not loaded; loaded={list(nz_map.keys())}"
+        atom_data['type']  = np.array([nz_map[int(Z)] for Z in Zs], dtype=np.int32)
+        atom_data['norb']  = np.asarray(norb_per[:natoms], dtype=np.int32)
+        atom_data['i0orb'] = np.arange(natoms, dtype=np.int32) * numorb_max
+
+        # Persistent buffers
+        if bTryAllocate:
+            self.realloc_sp_point_buffers(len(points), natoms)
+        points_f4 = np.ascontiguousarray(np.c_[points, np.zeros((len(points),1), np.float32)], dtype=np.float32)
+        self.toGPU_(self.sp_points_buff, points_f4)
+        self.toGPU_(self.sp_atoms_buff,  atom_data)
+        self.toGPU_(self.sp_coeffs_buff, coeffs_flat)
+
+        gs = (int(len(points)),)
+        self.prg.project_orbital_points_exp(
+            self.queue, gs, None,
+            np.int32(len(points)),
+            self.sp_points_buff,
+            self.sp_atoms_buff,
+            np.int32(natoms),
+            self.sp_coeffs_buff,
+            np.float32(beta),
+            np.float32(r0),
+            self.sp_out_buff
+        )
+        self.queue.finish()
+        out = np.empty(len(points), dtype=np.float32)
+        self.fromGPU_(self.sp_out_buff, out)
+        self.queue.finish()
+        return out
+
+    def response_amplitude_exp(
+        self, points, atoms_dict_s, norb_per_s, starts_s,
+        v, G0, E, eta, E_tip=0.0,
+        beta=1.0, r0=3.0, A_ss=-1.0, A_sp=-1.0, rcut=20.0, bTryAllocate=True
+    ):
+        """GPU-accelerated response amplitude map via OpenCL kernel `response_amplitude_exp`.
+
+        Precompute on CPU:
+            A_ss = (E + i*eta) * S_s - H_s
+            G0 = inv(A_ss)            # complex (ns, ns)
+            v  = C_MO^T @ G0          # complex (ns,)
+
+        GPU kernel builds coupling a_st = (E+iη)S_ts - H_ts per grid point
+        and computes resp = |v·a_st^H|^2 / |(E+iη-E_tip) - a_st·G0·a_st^H|^2.
+
+        Args:
+            points:      (npts, 3) float32 tip positions
+            atoms_dict_s: dict with 'pos', 'Rcut', 'type' for sample atoms
+            norb_per_s:  (natoms_s,) orbital counts
+            starts_s:    (natoms_s+1,) orbital offsets (cumsum)
+            v:           (ns,) complex64/128 precomputed v = C^T G0
+            G0:          (ns, ns) complex64/128 precomputed Green's function
+            E, eta:      float energy and broadening
+            E_tip:       float tip onsite energy
+            beta, r0, A_ss, A_sp, rcut: exponential SK parameters
+
+        Returns:
+            resp: (npts,) float32 response amplitudes
+        """
+        import numpy as np
+        import pyopencl as cl
+
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(f"points must be (n,3), got {points.shape}")
+        npts = len(points)
+        natoms_s = len(atoms_dict_s['pos'])
+        ns = int(starts_s[-1])
+        if ns > 256:
+            raise ValueError(f"ns={ns} > 256 kernel private array limit")
+
+        v = np.asarray(v, dtype=np.complex64)
+        G0 = np.asarray(G0, dtype=np.complex64)
+        starts_s = np.asarray(starts_s, dtype=np.int32)
+
+        # AtomData (vectorized)
+        atom_data = np.zeros(natoms_s, dtype=[('pos_rcut','f4',4),('type','i4'),('i0orb','i4'),('norb','i4'),('pad','i4')])
+        atom_data['pos_rcut'][:, :3] = np.asarray(atoms_dict_s['pos'][:natoms_s], dtype=np.float32)
+        atom_data['pos_rcut'][:,  3] = np.asarray(atoms_dict_s['Rcut'][:natoms_s], dtype=np.float32)
+        Zs = np.asarray(atoms_dict_s['type'][:natoms_s], dtype=np.int32)
+        nz_map = self.basis_meta['nz_map']
+        missing = [int(Z) for Z in Zs if int(Z) not in nz_map]
+        assert len(missing) == 0, f"response_amplitude_exp: species {missing} not loaded"
+        atom_data['type']  = np.array([nz_map[int(Z)] for Z in Zs], dtype=np.int32)
+        atom_data['norb']  = np.asarray(norb_per_s[:natoms_s], dtype=np.int32)
+        atom_data['i0orb'] = starts_s[:natoms_s].astype(np.int32)
+
+        # Persistent buffers
+        sz_f = 4
+        if bTryAllocate:
+            buffs = {
+                "resp_points": sz_f * 4 * npts,
+                "resp_atoms":  32 * natoms_s,
+                "resp_starts": sz_f * (natoms_s + 1),
+                "resp_vre":    sz_f * ns,
+                "resp_vim":    sz_f * ns,
+                "resp_G0re":   sz_f * ns * ns,
+                "resp_G0im":   sz_f * ns * ns,
+                "resp_out":    sz_f * npts,
+            }
+            self.try_make_buffers(buffs, suffix="_buff")
+        points_f4 = np.ascontiguousarray(np.c_[points, np.zeros((npts,1), np.float32)], dtype=np.float32)
+        self.toGPU_(self.resp_points_buff, points_f4)
+        self.toGPU_(self.resp_atoms_buff,  atom_data)
+        self.toGPU_(self.resp_starts_buff, starts_s)
+        self.toGPU_(self.resp_vre_buff,    v.real.astype(np.float32))
+        self.toGPU_(self.resp_vim_buff,    v.imag.astype(np.float32))
+        self.toGPU_(self.resp_G0re_buff,   G0.real.astype(np.float32).ravel())
+        self.toGPU_(self.resp_G0im_buff,   G0.imag.astype(np.float32).ravel())
+
+        gs = (int(npts),)
+        self.prg.response_amplitude_exp(
+            self.queue, gs, None,
+            np.int32(npts),
+            self.resp_points_buff,
+            np.int32(natoms_s),
+            self.resp_atoms_buff,
+            self.resp_starts_buff,
+            np.int32(ns),
+            self.resp_vre_buff, self.resp_vim_buff,
+            self.resp_G0re_buff, self.resp_G0im_buff,
+            np.float32(float(E)),
+            np.float32(float(eta)),
+            np.float32(float(E_tip)),
+            np.float32(float(beta)),
+            np.float32(float(r0)),
+            np.float32(float(A_ss)),
+            np.float32(float(A_sp)),
+            np.float32(float(rcut)),
+            self.resp_out_buff
+        )
+        self.queue.finish()
+        out = np.empty(npts, dtype=np.float32)
+        self.fromGPU_(self.resp_out_buff, out)
+        self.queue.finish()
+        return out
+
+    def project_orbital(self, coeffs, norb_per, atoms_dict, grid_spec, nMaxAtom=64, _debug_Fortran_order=False, bTryAllocate=True):
+        """
+        Project a single molecular orbital onto a 3D grid using the orbital projection kernel.
+
+        Computes ψ(r) = Σ_i C_i φ_i(r) (signed wavefunction, not density)
+
+        Args:
+            coeffs: (natoms, 4) MO coefficients.
+                    By default expects FireballOCL convention [px, py, pz, s].
+                    If _debug_Fortran_order=True, expects Fortran order [s, py, pz, px] for sp3 atoms.
+            norb_per: (natoms,) number of orbitals per atom
+            atoms_dict: dict with 'pos', 'Rcut', 'type'
+            grid_spec: dict with 'origin', 'dA', 'dB', 'dC', 'ngrid'
+            nMaxAtom: max atoms per task
+            _debug_Fortran_order: If True, coeffs are in Fortran order and will be remapped
+
+        Returns:
+            psi: (nx, ny, nz) signed wavefunction
+        """
+        import numpy as np
+        import time
+
+        # Build tasks
+        tasks_np, task_atoms_np = self.build_tasks(atoms_dict, grid_spec, nMaxAtom=64, block_res=8)
+        if self.verbosity > 0: print(f"[DEBUG] project_orbital: n_tasks={len(tasks_np)}")
+
+        # Coefficient packing (vectorized)
+        natoms = len(atoms_dict['pos'])
+        numorb_max = 4
+        _ORT_SPP_TO_OCL = np.array([3, 1, 2, 0], dtype=np.int32)
+        coeffs_flat = np.zeros((natoms, numorb_max), dtype=np.float32)
+        c4 = np.asarray(coeffs[:natoms, :4], dtype=np.float32)
+        if _debug_Fortran_order:
+            mask4 = (np.asarray(norb_per[:natoms], dtype=np.int32) == 4)
+            coeffs_flat[mask4]  = c4[mask4][:, _ORT_SPP_TO_OCL]
+            coeffs_flat[~mask4] = c4[~mask4]
+        else:
+            coeffs_flat[:] = c4
+        coeffs_flat = coeffs_flat.ravel()
+
+        # AtomData (vectorized)
+        atom_data = np.zeros(natoms, dtype=[('pos_rcut','f4',4),('type','i4'),('i0orb','i4'),('norb','i4'),('pad','i4')])
+        atom_data['pos_rcut'][:, :3] = np.asarray(atoms_dict['pos'][:natoms], dtype=np.float32)
+        atom_data['pos_rcut'][:,  3] = np.asarray(atoms_dict['Rcut'][:natoms], dtype=np.float32)
+        Zs = np.asarray(atoms_dict['type'][:natoms], dtype=np.int32)
+        nz_map = self.basis_meta['nz_map']
+        missing = [int(Z) for Z in Zs if int(Z) not in nz_map]
+        assert len(missing) == 0, f"project_orbital: species {missing} not loaded; loaded={list(nz_map.keys())}"
+        atom_data['type']  = np.array([nz_map[int(Z)] for Z in Zs], dtype=np.int32)
+        atom_data['norb']  = np.asarray(norb_per[:natoms], dtype=np.int32)
+        atom_data['i0orb'] = np.arange(natoms, dtype=np.int32) * numorb_max
+
+        # Persistent buffers (reuse projection_buffers slot — sp coeffs fit in proj_rho buffer)
+        nx, ny, nz = [int(x) for x in grid_spec['ngrid'][:3]]
+        n_tasks = len(tasks_np)
+        if bTryAllocate:
+            self.realloc_projection_buffers(natoms, n_tasks, nMaxAtom, nx, ny, nz, neigh_max=1, numorb_max=numorb_max)
+        self.toGPU_(self.proj_grid_buff,       self.grid_to_np(grid_spec))
+        self.toGPU_(self.proj_atoms_buff,      atom_data)
+        self.toGPU_(self.proj_rho_buff,        coeffs_flat)   # reuse rho slot for sp coeffs
+        if n_tasks > 0: self.toGPU_(self.proj_tasks_buff, tasks_np)
+        if len(task_atoms_np) > 0: self.toGPU_(self.proj_task_atoms_buff, task_atoms_np)
+        out_nbytes = nx * ny * nz * 4
+        cl.enqueue_fill_buffer(self.queue, self.proj_out_buff, np.float32(0), 0, out_nbytes)
+
+        ls = (32,)
+        gs = (n_tasks * ls[0],)
+        T0 = time.perf_counter_ns()
+        self.prg.project_orbital(
+            self.queue, gs, ls,
+            self.proj_grid_buff, np.int32(n_tasks),
+            self.proj_tasks_buff, self.proj_atoms_buff, self.proj_task_atoms_buff,
+            self.proj_rho_buff,
+            self.d_basis,
+            np.int32(self.basis_meta['n_nodes']),
+            np.float32(self.basis_meta['dr']),
+            np.int32(self.basis_meta['max_shells']),
+            np.int32(numorb_max),
+            np.int32(nMaxAtom),
+            self.proj_out_buff
+        )
+        self.queue.finish()
+        T1 = time.perf_counter_ns()
+        if self.verbosity > 0: print(f"[TIME] project_orbital {(T1-T0)*1e-6:.3f} [ms]")
+        res = np.empty((nx, ny, nz), dtype=np.float32)
+        self.fromGPU_(self.proj_out_buff, res)
+        self.queue.finish()
+        return res
+
+    def prepare_orbital_projection(self, atoms_dict, grid_spec, nMaxAtom=64):
+        """
+        One-time setup for batched orbital projection.
+        Pre-uploads all static GPU buffers (tasks, atom_data, grid_spec).
+        Returns a context dict to pass to project_orbital_prepped() in a loop.
+        Eliminates ~6 buffer allocations + build_tasks per orbital call.
+        """
+        mf = cl.mem_flags
+        t0 = time.perf_counter_ns()
+
+        tasks_np, task_atoms_np = self.build_tasks(atoms_dict, grid_spec, nMaxAtom=nMaxAtom)
+        n_tasks = len(tasks_np)
+        natoms   = len(atoms_dict['pos'])
+        numorb_max = 4
+        nx, ny, nz = [int(x) for x in grid_spec['ngrid'][:3]]
+        out_nbytes    = nx * ny * nz * 4
+        coeffs_nbytes = natoms * numorb_max * 4
+
+        atom_data = np.zeros(natoms, dtype=[
+            ('pos_rcut', 'f4', 4), ('type', 'i4'), ('i0orb', 'i4'), ('norb', 'i4'), ('pad', 'i4')
+        ])
+        for ia in range(natoms):
+            atom_data[ia]['pos_rcut'][:3] = atoms_dict['pos'][ia]
+            atom_data[ia]['pos_rcut'][3]  = atoms_dict['Rcut'][ia]
+            Z = int(atoms_dict['type'][ia])
+            atom_data[ia]['type']  = int(self.basis_meta['nz_map'][Z])
+            atom_data[ia]['norb']  = numorb_max
+            atom_data[ia]['i0orb'] = ia * numorb_max
+
+        # Upload static buffers once
+        d_grid       = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=self.grid_to_np(grid_spec))
+        d_tasks      = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=tasks_np)      if n_tasks > 0            else cl.Buffer(self.ctx, mf.READ_ONLY, size=32)
+        d_atoms      = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=atom_data)
+        d_task_atoms = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=task_atoms_np) if len(task_atoms_np) > 0 else cl.Buffer(self.ctx, mf.READ_ONLY, size=nMaxAtom * 4)
+
+        # Mutable buffers: reused every orbital (only coeffs changes)
+        d_coeffs = cl.Buffer(self.ctx, mf.READ_ONLY,  size=coeffs_nbytes)
+        d_out    = cl.Buffer(self.ctx, mf.WRITE_ONLY, size=out_nbytes)
+
+        t1 = time.perf_counter_ns()
+        print(f"[prepare_orbital_projection] Setup: {(t1-t0)*1e-6:.1f} ms, n_tasks={n_tasks}")
+        return dict(
+            n_tasks=n_tasks, natoms=natoms, numorb_max=numorb_max,
+            nx=nx, ny=ny, nz=nz, out_nbytes=out_nbytes, nMaxAtom=nMaxAtom,
+            d_grid=d_grid, d_tasks=d_tasks, d_atoms=d_atoms,
+            d_task_atoms=d_task_atoms, d_coeffs=d_coeffs, d_out=d_out,
+        )
+
+    def project_orbital_prepped(self, coeffs_flat, ctx):
+        """
+        Project a single orbital using pre-built GPU buffers from prepare_orbital_projection().
+        Only uploads coeffs_flat per call. Returns (nx,ny,nz) psi grid (float32).
+        """
+        cl.enqueue_copy(self.queue, ctx['d_coeffs'], coeffs_flat.astype(np.float32))
+        cl.enqueue_fill_buffer(self.queue, ctx['d_out'], np.float32(0), 0, ctx['out_nbytes'])
+
+        ls = (32,)
+        gs = (ctx['n_tasks'] * ls[0],)
+        self.prg.project_orbital(
+            self.queue, gs, ls,
+            ctx['d_grid'], np.int32(ctx['n_tasks']),
+            ctx['d_tasks'], ctx['d_atoms'], ctx['d_task_atoms'],
+            ctx['d_coeffs'],
+            self.d_basis,
+            np.int32(self.basis_meta['n_nodes']),
+            np.float32(self.basis_meta['dr']),
+            np.int32(self.basis_meta['max_shells']),
+            np.int32(ctx['numorb_max']),
+            np.int32(ctx['nMaxAtom']),
+            ctx['d_out']
+        )
+        self.queue.finish()
+        res = np.empty((ctx['nx'], ctx['ny'], ctx['nz']), dtype=np.float32)
+        cl.enqueue_copy(self.queue, res, ctx['d_out'])
+        self.queue.finish()
+        return res
+
+# ================================================================
+# High-level evaluation functions
+# ================================================================
+
+def evaluate_mos_on_points(projector, mo_indices, points, evecs, natoms, species_per_atom,
+                          species_names, species_list_ang, norb_per_atom, atoms_dict):
+    """
+    Evaluate multiple MOs at arbitrary points using OpenCL.
+    
+    Args:
+        projector: GridProjector instance (already configured with load_basis_sto)
+        mo_indices: list of 0-indexed MO indices
+        points: array [npoints, 3] in Angstrom
+        evecs: (nstates, norb) eigenvector array
+        natoms: number of atoms
+        species_per_atom: (natoms,) 0-based species indices
+        species_names: list of species names
+        species_list_ang: list from parse_basis_hsd_ang
+        norb_per_atom: (natoms,) number of orbitals per atom
+        atoms_dict: dict with 'pos', 'Rcut', 'type' for atoms
+    
+    Returns:
+        point_vals: list of arrays, each [npoints]
+    """
+    from .DFTBplusParser import evec_to_kernel_coeffs
+    
+    point_vals = []
+    for imo in mo_indices:
+        coeffs = evec_to_kernel_coeffs(evecs[imo], natoms, species_per_atom,
+                                      species_names, species_list_ang)
+        psi = projector.project_orbital_points(points, coeffs, norb_per_atom, atoms_dict)
+        point_vals.append(psi)
+    
+    return point_vals
+
+
+def setup_gridprojector_from_dftb(dftb_data, species_list_ang, ctx=None, queue=None, verbosity=0, max_shells=None):
+    """
+    Configure GridProjector instance from parsed DFTB+ data.
+    
+    Args:
+        dftb_data: dict with keys:
+            - coords_bohr: (natoms, 3) array (Bohr)
+            - species_per_atom: (natoms,) 0-based species indices
+            - species_names: list of species names
+        species_list_ang: list from parse_basis_hsd_ang (Å units)
+        ctx: OpenCL context (optional)
+        queue: OpenCL command queue (optional)
+        verbosity: verbosity level
+        max_shells: int, max angular momentum shells (default 2 for sp, use 3 for spd)
+    
+    Returns:
+        projector: configured GridProjector instance
+        atoms_dict: dict with 'pos', 'Rcut', 'type' for projection
+    """
+    projector = GridProjector(fdata_dir=None, ctx=ctx, queue=queue, verbosity=verbosity)
+    projector.load_basis_sto(species_list_ang, max_shells=max_shells)
+    
+    # Build atoms dict
+    coords_ang = dftb_data['coords_bohr'] * 0.5291772109  # Bohr -> Angstrom
+    sp_by_name = {sp['name']: sp for sp in species_list_ang}
+    
+    natoms = len(coords_ang)
+    atomic_numbers = np.array([sp_by_name[dftb_data['species_names'][si]]['atomic_number'] for si in dftb_data['species_per_atom']])
+    cutoffs = np.array([sp_by_name[dftb_data['species_names'][si]]['orbitals'][0]['cutoff'] for si in dftb_data['species_per_atom']])
+    
+    atoms_dict = {
+        'pos': coords_ang,
+        'Rcut': cutoffs,
+        'type': atomic_numbers
+    }
+    
+    return projector, atoms_dict
+
+
+BOHR2ANG = 0.5291772109
+B3_FACTOR = 1.0 / (BOHR2ANG**3)   # orbital-normalized-in-Bohr → density in Ang^-3
+
+
+def project_dftb_density(geo, evecs, projector, atoms_dict, grid_spec, basis, B3_FACTOR=B3_FACTOR):
+    """
+    Project SCF electron density onto a real-space grid.
+    Occupied MOs are accumulated as sum_i occ_i * |psi_i|^2.
+
+    Returns rho_grid (nx,ny,nz) float32 in e/Å³.
+    """
+    from .DFTBplusParser import precompute_coeff_gather
+    import time
+    natoms = geo['natoms']
+    occs   = geo['occupations'][:, 0, 0]
+    occ_idx = np.where(occs > 1e-6)[0]
+    print(f"[project_dftb_density] {len(occ_idx)} occupied states")
+
+    src_idx, dst_idx = precompute_coeff_gather(natoms, geo['species_per_atom'], geo['species_names'], basis)
+    proj_ctx = projector.prepare_orbital_projection(atoms_dict, grid_spec)
+
+    nx, ny, nz = proj_ctx['nx'], proj_ctx['ny'], proj_ctx['nz']
+    rho_grid    = np.zeros((nx, ny, nz), dtype=np.float32)
+    coeffs_flat = np.zeros(natoms * 4, dtype=np.float32)
+
+    t0 = time.time()
+    for i in occ_idx:
+        coeffs_flat[:] = 0.0
+        coeffs_flat[dst_idx] = evecs[i][src_idx]
+        psi = projector.project_orbital_prepped(coeffs_flat, proj_ctx)
+        rho_grid += occs[i] * (psi ** 2)
+    n = len(occ_idx)
+    print(f"[project_dftb_density] {time.time()-t0:.2f}s  ({(time.time()-t0)/n*1e3:.1f} ms/orbital)")
+    return (rho_grid * B3_FACTOR).astype(np.float32)
+
+
+def project_neutral_density(geo, projector, atoms_dict, grid_spec, basis, B3_FACTOR=B3_FACTOR):
+    """
+    Project superposition of neutral atom densities onto a real-space grid.
+    Uses reference valence occupations per (l, Z).
+
+    Returns rho_na_grid (nx,ny,nz) float32 in e/Å³.
+    """
+    from .DFTBplusParser import precompute_coeff_gather
+    import time
+    # Valence occupations per element (Z) and angular momentum (l)
+    # These are DFTB valence electron counts (frozen core approximation)
+    OCC_NA = {
+        1:  {0: 1.0},           # H: 1s1
+        6:  {0: 2.0, 1: 2/3},   # C: 2s2 2p2 -> p: 2/3 per orbital
+        7:  {0: 2.0, 1: 1.0},   # N: 2s2 2p3 -> p: 3/3 = 1 per orbital
+        8:  {0: 2.0, 1: 4/3},   # O: 2s2 2p4 -> p: 4/3 per orbital
+        9:  {0: 2.0, 1: 5/3},   # F: 2s2 2p5 -> p: 5/3 per orbital
+        15: {0: 2.0, 1: 3/3},   # P: 3s2 3p3 -> p: 3/3 = 1 per orbital
+        16: {0: 2.0, 1: 4/3},   # S: 3s2 3p4 -> p: 4/3 per orbital
+        17: {0: 2.0, 1: 5/3},   # Cl: 3s2 3p5 -> p: 5/3 per orbital
+        35: {0: 2.0, 1: 5/3},   # Br: 4s2 4p5 -> p: 5/3 per orbital (3d frozen)
+        53: {0: 2.0, 1: 5/3},   # I: 5s2 5p5 -> p: 5/3 per orbital (4d frozen)
+    }
+
+    natoms          = geo['natoms']
+    species_per_atom = geo['species_per_atom']
+    species_names   = geo['species_names']
+    sp_by_name      = {sp['name']: sp for sp in basis}
+
+    src_idx, dst_idx = precompute_coeff_gather(natoms, species_per_atom, species_names, basis)
+    proj_ctx = projector.prepare_orbital_projection(atoms_dict, grid_spec)
+
+    nx, ny, nz  = proj_ctx['nx'], proj_ctx['ny'], proj_ctx['nz']
+    rho_na      = np.zeros((nx, ny, nz), dtype=np.float32)
+    coeffs_flat = np.zeros(natoms * 4, dtype=np.float32)
+
+    t0 = time.time()
+    orb_offset = 0
+    for ia in range(natoms):
+        Z  = int(atoms_dict['type'][ia])
+        sp = sp_by_name[species_names[species_per_atom[ia]]]
+        occ_by_l = OCC_NA.get(Z, {0: 2.0, 1: 2/3})
+        for orb in sp['orbitals']:
+            l  = orb['l']
+            nm = 2 * l + 1
+            f_na = occ_by_l.get(l, 0.0)
+            if f_na > 0:
+                for m in range(nm):
+                    coeffs_flat[:] = 0.0
+                    coeffs_flat[dst_idx[orb_offset + m]] = 1.0
+                    psi = projector.project_orbital_prepped(coeffs_flat, proj_ctx)
+                    rho_na += f_na * (psi ** 2)
+            orb_offset += nm
+    print(f"[project_neutral_density] {time.time()-t0:.2f}s")
+    return (rho_na * B3_FACTOR).astype(np.float32)

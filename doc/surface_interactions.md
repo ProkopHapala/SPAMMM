@@ -123,11 +123,11 @@ This reduces the construction cost from O(N_substrate × N_grid) to O(N_grid) fo
 
 ### Test Coverage
 
-- `tests/tMMFF/run_test_GridFF.py` — Basic functionality: construct grid, sample at points, compare to direct sum.
-- `tests/tMMFF/run_test_GridFF_CaF2.py` — CaF₂(111) surface, validates against known adsorption sites.
-- `tests/tMMFF/run_test_GridFF_gauss_smear.py` — Tests Gaussian charge smearing for Coulomb grid convergence.
-- `tests/tMMFF/run_test_GridFF_ocl.py` / `run_test_GridFF_ocl_new.py` — OpenCL vs CPU parity.
-- `tests/tMMFF/GridFF_CaF2_doc_tutorial.md` — Step-by-step tutorial.
+- `tests/tSPFF/run_test_GridFF.py` — Basic functionality: construct grid, sample at points, compare to direct sum.
+- `tests/tSPFF/run_test_GridFF_CaF2.py` — CaF₂(111) surface, validates against known adsorption sites.
+- `tests/tSPFF/run_test_GridFF_gauss_smear.py` — Tests Gaussian charge smearing for Coulomb grid convergence.
+- `tests/tSPFF/run_test_GridFF_ocl.py` / `run_test_GridFF_ocl_new.py` — OpenCL vs CPU parity.
+- `tests/tSPFF/GridFF_CaF2_doc_tutorial.md` — Step-by-step tutorial.
 
 ---
 
@@ -201,7 +201,7 @@ where $V_0$ and $V_1$ are each expanded in the FAF basis. This doubles the coeff
 
 - `doc/py/FoldedAtomicFunctions/tutorial_folded_basis_pareto.md` — Tutorial with Pareto analysis.
 - `doc/py/FoldedAtomicFunctions/optimize_z_basis.md` — Optimization of the z-basis decay parameters.
-- `tests/tMMFF/run_test_GridFF.py` — GridFF tests also serve as reference data for FAF fitting.
+- `tests/tSPFF/run_test_GridFF.py` — GridFF tests also serve as reference data for FAF fitting.
 
 ---
 
@@ -306,7 +306,7 @@ where $V_0$ and $V_1$ are each expanded in the FAF basis. This doubles the coeff
 
 ### Purpose
 
-`pyBall/OCL/Surface_utils.py` is a high-level glue layer that imports and reuses existing modules (`GridFF.py`, `RigidBodyAFM.py`, `InteractionEnergy.py`) with minimal new code. It provides utilities for:
+`pyBall/OCL/Surface_utils.py` is a high-level glue layer that imports and reuses existing modules (`GridFF.py`, `RigidBodyAFM.py`) with minimal new code. It provides utilities for:
 
 1. **GridFF I/O** — Loading `.npy` grids with JSON metadata validation.
 2. **GridFF alignment verification** — Detecting origin/shift conventions.
@@ -343,40 +343,40 @@ where $P_t$ and $L_t$ are per-type Pauli and London scaling parameters fitted to
 
 ### Electrostatics Parity Tests
 
-- **`tests/tMMFF/test_electrostatics_comparison.py`** — **Primary validation script**.
+- **`tests/tSPFF/test_electrostatics_comparison.py`** — **Primary validation script**.
   - Compares three methods on NaCl surfaces: GridFF (OpenCL B-spline), Ewald2D (Python), Brute Force (direct sum).
   - Generates 1D line scans (z on Na, z on Cl, z midpoint) and 2D XY/XZ slices.
   - Optionally tests OpenCL Ewald (`--test_opencl`) against Python reference.
   - Reports RMSE and max error; asserts RMSE < 1e-5 eV.
   - Saves diagnostic PNGs and JSON report.
 
-- **`tests/tMMFF/test_gridff_alignment.py`** — GridFF alignment verification.
+- **`tests/tSPFF/test_gridff_alignment.py`** — GridFF alignment verification.
   - Uses `pyBall.OCL.Surface_utils.run_alignment_verification`.
   - Detects origin conventions (centered XY, z at top atom vs. bottom vs. zero).
   - Validates that sampled forces/energies match direct pairwise sums.
 
 ### Folded Basis Tests
 
-- **`tests/tMMFF/test_folded_fit_nacl1x1.py`** — FoldedAtomicFunctions fit on NaCl(001).
+- **`tests/tSPFF/test_folded_fit_nacl1x1.py`** — FoldedAtomicFunctions fit on NaCl(001).
   - Uses `SurfaceEwaldCL` to compute Coulomb reference potential.
   - Fits FAF basis to Morse + Coulomb reference.
   - Validates fit quality (RMSE, max error) across parameter scans.
 
 ### GridFF Generation & FDBM Tests
 
-- **`tests/tMMFF/gen_gridff_nacl_gpu.py`** — GPU-accelerated GridFF generation for NaCl surfaces.
+- **`tests/tSPFF/gen_gridff_nacl_gpu.py`** — GPU-accelerated GridFF generation for NaCl surfaces.
   - Uses `pyBall.OCL.Surface_utils.load_substrate_xyz_with_lvec` to load substrate.
   - Computes DFT electrostatics via `pySCF` or `DFTB+` (optional).
   - Generates B-spline PLQd grids with metadata JSON.
 
-- **`tests/tMMFF/test_fdbm_fit_dft.py`** — FDBM fit against DFT reference data.
+- **`tests/tSPFF/test_fdbm_fit_dft.py`** — FDBM fit against DFT reference data.
   - Uses `pyBall.OCL.Surface_utils.load_bspline_gridff` to load precomputed grids.
   - Fits per-type Pauli/London parameters to match DFT adsorption energies.
 
-- **`tests/tMMFF/test_fdbm_fit_gridff_mock.py`** — Mock FDBM fitting with synthetic data.
+- **`tests/tSPFF/test_fdbm_fit_gridff_mock.py`** — Mock FDBM fitting with synthetic data.
   - Tests the linear fitting pipeline without requiring DFT calculations.
 
-- **`tests/tMMFF/gui_fdbm_fit.py`** — Interactive PyQt5 GUI for FDBM parameter tuning.
+- **`tests/tSPFF/gui_fdbm_fit.py`** — Interactive PyQt5 GUI for FDBM parameter tuning.
   - Live 2×2 plot: potential, energy, force, error vs. parameter sliders.
   - Uses `pyBall.OCL.Surface_utils` as the shared backend.
 
@@ -401,7 +401,7 @@ where $P_t$ and $L_t$ are per-type Pauli and London scaling parameters fitted to
 For charged substrates, the Coulomb grid requires Ewald summation to converge. FireCore implements this via:
 
 - **`cpp/common/molecular/EwaldGrid.h`** — Ewald grid construction and solving.
-- **`pyBall/MMFF.py`** — Python bindings for `setupEwaldGrid()`, `projectAtomsEwaldGrid()`, `EwaldGridSolveLaplace()`.
+- **`pyBall/SPFF.py`** — Python bindings for `setupEwaldGrid()`, `projectAtomsEwaldGrid()`, `EwaldGridSolveLaplace()`.
 
 The Ewald method splits the potential:
 

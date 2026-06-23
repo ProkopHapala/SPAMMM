@@ -10,7 +10,7 @@ description: >-
 
 **One owner per heap array.** Other objects hold **borrowed aliases** (`T*` copies). Only the owner may `_dealloc`. Track with `bOwn*` flags set from `_bindOrRealloc` return value.
 
-We use **explicit `dealloc()` / `clearFFs()`**, not strict RAII. Destructors on some classes (`Atoms`) call `dealloc()`, but MMFF teardown is orchestrated by `MolWorld::clearFFs()`.
+We use **explicit `dealloc()` / `clearFFs()`**, not strict RAII. Destructors on some classes (`Atoms`) call `dealloc()`, but SPFF teardown is orchestrated by `MolWorld::clearFFs()`.
 
 ## Macros (`cpp/common/macroUtils.h`)
 
@@ -24,9 +24,9 @@ We use **explicit `dealloc()` / `clearFFs()`**, not strict RAII. Destructors on 
 |------|---------|
 | **ASAN** (`Build-asan`, see `firecore-cpp-build` skill) | double-free, UAF, overflow — **first choice** |
 | **DEBUG_ALLOCATOR** (`#define` in `macroUtils.h`) | alloc site ledger, invalid-free detection; call `debugAllocator_init()` |
-| `tests/tMMFF/test_asan_minimal.py` | init/clear/Hessian smoke test |
+| `tests/tSPFF/test_asan_minimal.py` | init/clear/Hessian smoke test |
 
-Python `getBuffs()` = non-owning views. After `MMFF.clear()`, old NumPy arrays are UAF.
+Python `getBuffs()` = non-owning views. After `SPFF.clear()`, old NumPy arrays are UAF.
 
 ## When investigating a crash
 
@@ -45,4 +45,4 @@ Python `getBuffs()` = non-owning views. After `MMFF.clear()`, old NumPy arrays a
 
 ## Full reference
 
-**[doc/dev_notes/MMFF/Memory_Ownership_and_Deallocation.md](../../../doc/dev_notes/MMFF/Memory_Ownership_and_Deallocation.md)**
+**[doc/dev_notes/SPFF/Memory_Ownership_and_Deallocation.md](../../../doc/dev_notes/SPFF/Memory_Ownership_and_Deallocation.md)**

@@ -20,7 +20,7 @@
 | **KekuleExplorerGUI** | Python / Vispy / PyQt5 | `KekuleBackend` + `AtomicGraph` | **Active** | Yes |
 | **MoleculeEditor2D** | Python / Matplotlib / PyQt5 | `AtomicSystem` directly | Experimental | **No** |
 | **molgui_web** | JS / WebGL | `EditableMolecule` + `MMParams` | **Legacy** | No |
-| **molgui_webgpu** | JS / WebGPU | `EditableMolecule` + `MMParams` + `MMFFLTopology` | **Active** | Yes |
+| **molgui_webgpu** | JS / WebGPU | `EditableMolecule` + `MMParams` + `SPFFLTopology` | **Active** | Yes |
 
 ---
 
@@ -117,14 +117,14 @@ addAtom(x, y, z, Z) {
 **File**: `web/molgui_webgpu/main.js` + supporting modules
 
 - WebGPU compute shaders for real-time MD
-- XPBD/MMFFL force fields
+- XPBD/SPFFL force fields
 - Parameter inspection
 - Editing + simulation in same interface
 
 **Key modules**:
 - `EditableMolecule.js` — topology editing
 - `MMParams.js` — parameter loading
-- `MMFFLTopology.js` — topology → XPDB packing
+- `SPFFLTopology.js` — topology → XPDB packing
 - `MoleculeRenderer.js` — WebGPU rendering
 - `GUI.js` — UI components
 
@@ -154,7 +154,7 @@ addAtom(x, y, z, Z) {
 
 | Language | Function | File |
 |----------|----------|------|
-| **C++** | `MM::Builder::splitByBond()` | `MMFFBuilder.h` |
+| **C++** | `MM::Builder::splitByBond()` | `SPFFBuilder.h` |
 | **Python** | Not explicit | — |
 | **JavaScript** | Not explicit | — |
 
@@ -206,7 +206,7 @@ addAtom(x, y, z, Z) {
 
 | Language | Implementation | Status |
 |----------|---------------|--------|
-| **C++** | `std::unordered_set<int>` in MMFFBuilder | Keep |
+| **C++** | `std::unordered_set<int>` in SPFFBuilder | Keep |
 | **Python** | Set-based in AtomicSystem | Keep |
 | **JavaScript** | `Selection.js` with banks | Keep |
 
@@ -298,7 +298,7 @@ Crystal building is a **critical gap** in the Python ecosystem. The JavaScript `
 
 ### C++ Implementation (Partial)
 
-`MMFFBuilder` (`cpp/common/molecular/MMFFBuilderBase.h`, 808 lines) has:
+`SPFFBuilder` (`cpp/common/molecular/SPFFBuilderBase.h`, 808 lines) has:
 - `insertAtoms(n, pos, types)` — add atoms to builder
 - `autoBonds(rCut)` — distance-based bond finding
 - No CIF parsing, no lattice vectors, no symmetry, no slab cutting
@@ -371,7 +371,7 @@ def compute_basis_bonds(lvec, basis_pos, basis_types, mm_params, bond_tol=0.2) -
 - `web/molgui_webgpu/Nanocrystals.js` (631 lines) — nanocrystal generation from CIF
 - `web/molgui_webgpu/BuildersGUI.js` (1130 lines) — crystal builder GUI
 - `web/molgui_webgpu/EditableMolecule.js` (1057 lines) — topology editor
-- `web/molgui_webgpu/MMFFLTopology.js` (826 lines) — XPDB packing
+- `web/molgui_webgpu/SPFFLTopology.js` (826 lines) — XPDB packing
 - `web/molgui_webgpu/MMParams.js` (524 lines) — parameters
 - `web/molgui_webgpu/MoleculeRenderer.js` — WebGPU rendering
 - `web/molgui_webgpu/GUI.js` — UI components
@@ -382,7 +382,7 @@ def compute_basis_bonds(lvec, basis_pos, basis_types, mm_params, bond_tol=0.2) -
 - `web/molgui_web/js/MMParams.js` (466 lines) — **[LEGACY]**
 
 ### C++
-- `cpp/common/molecular/MMFFBuilderBase.h` (808 lines) — FF builder with autoBonds (no crystallography)
+- `cpp/common/molecular/SPFFBuilderBase.h` (808 lines) — FF builder with autoBonds (no crystallography)
 - `cpp/apps/MolecularEditor/MolGUI.h` — C++ SDL-based GUI
 
 ---

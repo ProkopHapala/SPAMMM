@@ -28,9 +28,9 @@ Phase 1: Topology Building/Editing        Phase 2: Force Field Evaluation
 ```
 
 **The conversion boundary** (Topology → FF) is the critical bottleneck. Each language implements its own:
-- **C++**: `MMFFBuilder::toMMFFsp3_loc()` (implied in Builder)
-- **Python**: `MMFF.toMMFFsp3_loc()` [@/home/prokop/git/FireCore/pyBall/OCL/MMFF.py:377](pyBall/OCL/MMFF.py:377)
-- **JavaScript**: `MMFFLTopology.buildXPDBInputsFromMol()` [@/home/prokop/git/FireCore/web/molgui_webgpu/MMFFLTopology.js:31](web/molgui_webgpu/MMFFLTopology.js:31)
+- **C++**: `SPFFBuilder::toSPFFsp3_loc()` (implied in Builder)
+- **Python**: `SPFF.toSPFFsp3_loc()` [@/home/prokop/git/FireCore/pyBall/OCL/SPFF.py:377](pyBall/OCL/SPFF.py:377)
+- **JavaScript**: `SPFFLTopology.buildXPDBInputsFromMol()` [@/home/prokop/git/FireCore/web/molgui_webgpu/SPFFLTopology.js:31](web/molgui_webgpu/SPFFLTopology.js:31)
 
 ---
 
@@ -40,13 +40,13 @@ All three languages maintain the same duality: a **dynamic graph** for editing a
 
 | Language | Dynamic Graph (Editing) | Static Array (FF Evaluation) | Conversion |
 |----------|------------------------|------------------------------|------------|
-| **C++** | `MM::Builder` (integer-indexed arrays) | `MMFFsp3_loc` flat arrays | Builder → FF arrays |
-| **Python** | `AtomicGraph` (object-based) + `AtomicSystem` (array-based) | `MMFF` packed arrays | `toMMFFsp3_loc()` |
+| **C++** | `MM::Builder` (integer-indexed arrays) | `SPFFsp3_loc` flat arrays | Builder → FF arrays |
+| **Python** | `AtomicGraph` (object-based) + `AtomicSystem` (array-based) | `SPFF` packed arrays | `toSPFFsp3_loc()` |
 | **JavaScript** | `EditableMolecule` (object ID maps) | `XPDB` packed buffers | `buildXPDBInputsFromMol()` |
 
 ### C++: Integer-Indexed Arrays
 
-`MMFFBuilderBase.h` defines flat arrays:
+`SPFFBuilderBase.h` defines flat arrays:
 - `atoms[i]` — position, type, conf indices
 - `bonds[j]` — atom indices a/b, order, type
 - `confs[k]` — `AtomConf` with `nSigma`, `nPi`, `nEPair`, `capping`
@@ -75,7 +75,7 @@ Python has **both** object-based and array-based representations, with no clear 
 **`AtomicSystem`** (array-based):
 - `apos[natoms, 3]`, `atypes[natoms]`, `bonds[nbonds, 2]`
 - `neighs` list built from bonds
-- Used by: `MoleculeEditor2D`, `MMFF.toMMFFsp3_loc()`
+- Used by: `MoleculeEditor2D`, `SPFF.toSPFFsp3_loc()`
 
 **Recommendation needed**: Standardize on one canonical Python representation. `AtomicGraph` is better for editing; `AtomicSystem` is better for FF conversion.
 
@@ -104,7 +104,7 @@ Distance-based bond detection from atomic positions using covalent radii.
 
 | Language | Function | File |
 |----------|----------|------|
-| **C++** | `MM::BuilderBase::autoBonds()` | `MMFFBuilderBase.h:518` |
+| **C++** | `MM::BuilderBase::autoBonds()` | `SPFFBuilderBase.h:518` |
 | **Python** | `atomicUtils.findBondsNP()` | `atomicUtils.py` |
 | **Python** | `AtomicSystem.findBonds()` | `AtomicSystem.py` |
 | **JavaScript** | `EditableMolecule.recalculateBonds()` | `EditableMolecule.js` |
@@ -112,7 +112,7 @@ Distance-based bond detection from atomic positions using covalent radii.
 **Algorithm**: For each atom pair (i,j), compute `d = |ri - rj|`. If `d < (Rcov_i + Rcov_j) * bondFactor`, create bond. Default `bondFactor = 1.1`.
 
 **C++ details**:
-- Uses `MMFFparams` covalent radii via `ElementType.Rcov`
+- Uses `SPFFparams` covalent radii via `ElementType.Rcov`
 - `autoBonds()` can be called after `insertAtoms()` to auto-generate connectivity
 
 **Python details**:
@@ -133,8 +133,8 @@ Building adjacency from bonds for force field evaluation.
 |----------|----------|---------|
 | **C++** | `BuilderBase::makeNeighs()` | Build neighbor list from bonds |
 | **Python** | `AtomicSystem.neighs()` | List of neighbor atom indices per atom |
-| **Python** | `MMFF.make_back_neighs()` | Reverse neighbor lookup for force recoil |
-| **JavaScript** | `MMFFLTopology.buildMMFFLTopology()` | Build `bondsAdj` adjacency array |
+| **Python** | `SPFF.make_back_neighs()` | Reverse neighbor lookup for force recoil |
+| **JavaScript** | `SPFFLTopology.buildSPFFLTopology()` | Build `bondsAdj` adjacency array |
 
 **Key concept: Back-neighbors**. In a directed neighbor list (i → j), the back-neighbor is the index of i in j's neighbor list. Required for force accumulation (when j feels force from i, i feels equal and opposite from j).
 
@@ -146,9 +146,9 @@ Determining sp1/sp2/sp3 from bonding topology.
 
 | Language | Concept | Implementation |
 |----------|---------|---------------|
-| **C++** | `AtomConf.npi`, `AtomConf.nEPair` | `MMFFBuilderBase.h:60` |
-| **Python** | `npi_list`, `nep_list` | `MMFF.initAtomProperties()` `pyBall/OCL/MMFF.py:51` |
-| **JavaScript** | `npiList`, pi-orbital directions | `MMFFLTopology.computePiOrientations()` `MMFFLTopology.js:248` |
+| **C++** | `AtomConf.npi`, `AtomConf.nEPair` | `SPFFBuilderBase.h:60` |
+| **Python** | `npi_list`, `nep_list` | `SPFF.initAtomProperties()` `pyBall/OCL/SPFF.py:51` |
+| **JavaScript** | `npiList`, pi-orbital directions | `SPFFLTopology.computePiOrientations()` `SPFFLTopology.js:248` |
 
 **The VSEPR pipeline** (same in all languages):
 1. Count sigma bonds (`nSigma` = number of bonded neighbors)
@@ -207,7 +207,7 @@ See codemap trace [7] for algorithm walkthrough.
 
 | Language | API | File |
 |----------|-----|------|
-| **C++** | `std::unordered_set<int> selection` | `MMFFBuilder.h` |
+| **C++** | `std::unordered_set<int> selection` | `SPFFBuilder.h` |
 | **Python** | `grow_selection()`, `shrink_selection()`, `select_all_connected()` | `AtomicSystem.py` |
 | **JavaScript** | `Selection` class with banks | `web/common_js/Selection.js` |
 
@@ -253,22 +253,22 @@ See codemap trace [7] for algorithm walkthrough.
 ## File Index
 
 ### C++
-- `cpp/common/molecular/MMFFBuilderBase.h` (808 lines) — base topology structures
-- `cpp/common/molecular/MMFFBuilder.h` (837 lines) — advanced topology ops
+- `cpp/common/molecular/SPFFBuilderBase.h` (808 lines) — base topology structures
+- `cpp/common/molecular/SPFFBuilder.h` (837 lines) — advanced topology ops
 - `cpp/common/dataStructures/LimitedGraph.h` (181 lines) — graph + Tarjan bridges
 
 ### Python
 - `pyBall/atomicUtils.py` (2186 lines) — bond/angle/dihedral utilities
 - `pyBall/AtomicSystem.py` (1314 lines) — array-based atomic system
 - `pyBall/AtomicGraph.py` (392 lines) — object-graph representation
-- `pyBall/OCL/MMFF.py` (1107 lines) — topology → FF conversion
+- `pyBall/OCL/SPFF.py` (1107 lines) — topology → FF conversion
 - **GAP:** No crystal building module exists in Python
 
 ### JavaScript
 - `web/common_js/Selection.js` (168 lines) — generic selection class
 - `web/common_js/MeshBuilder.js` (1688 lines) — mesh + selection building
 - `web/molgui_webgpu/EditableMolecule.js` (1057 lines) — molecular topology editor
-- `web/molgui_webgpu/MMFFLTopology.js` (826 lines) — topology → XPDB conversion
+- `web/molgui_webgpu/SPFFLTopology.js` (826 lines) — topology → XPDB conversion
 - `web/molgui_webgpu/MMParams.js` (524 lines) — parameter loading
 - `web/molgui_webgpu/CrystalUtils.js` (1188 lines) — **crystal builder (no Python equivalent)**
 - `web/molgui_webgpu/Nanocrystals.js` (631 lines) — nanocrystal generation from CIF
@@ -277,7 +277,7 @@ See codemap trace [7] for algorithm walkthrough.
 
 ## See Also
 
-- [Type Assignment](molecular_topology_types.md) — atom type assignment, parameter files, MMFF/UFF
+- [Type Assignment](molecular_topology_types.md) — atom type assignment, parameter files, SPFF/UFF
 - [Editors & Editing](molecular_topology_editors.md) — GUIs, advanced editing, crystal building gap analysis, consolidation roadmap
 - [GUI Feature Audit](gui_audit.md) — detailed visualization & editor feature matrices
 - [Topical Audit Index](topical_audit.md) — priority ranking, dependency graph, missing topics
