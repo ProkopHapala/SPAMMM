@@ -708,6 +708,9 @@ class SPFF:
         # Prepare simple back-neighbor placeholder (atom indices). GPU expects indices into fneigh; left for future mapping.
         self.make_back_neighs()
 
+        # Build exclusion list for non-bonded kernel (1-2 and 1-3 exclusions)
+        self.excl = self._make_excl_1_2_3(self.neighs, self.neighCell, npbc=self.npbc)
+
     def _propagate_pi_dirs(self, mol, npi_list, *, min_norm=0.7, max_iter=4):
         if self.pipos is None:
             return

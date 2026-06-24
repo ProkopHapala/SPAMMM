@@ -4,7 +4,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from spammm.AtomicSystem import AtomicSystem
 from spammm.surfaces.Ewald2D import Ewald2D
-from tests.helpers.parity import rmse, correlation, max_err, overlay_plot, assert_parity, parity_report
+from tests.helpers.parity import rmse, correlation, max_err, plot_curves, assert_parity, parity_report
 from tests.helpers.scan import compare_scans, assert_scan
 
 def _load_substrate(path):
@@ -278,7 +278,7 @@ def test_visual_ewald_brute_zscan(substrate):
         - Correlation r > 0.999
 
     Caveats:
-        - A constant DC offset (~-2e-6 eV) is subtracted by overlay_plot;
+        - A constant DC offset (~-2e-6 eV) is subtracted by plot_curves;
           this is expected from the finite cluster boundary and shrinks as 1/K^2.
         - At z > 5A the potential is < 1e-5 eV, so float32 noise (~1e-6)
           dominates the relative error. This is the GPU precision floor,
@@ -301,9 +301,9 @@ def test_visual_ewald_brute_zscan(substrate):
         Z = z_arr.reshape(1, -1).astype(np.float32)
         phi_ewald = ew_cl.eval_full(X, Y, Z)[0, :]
         phi_brute = ew_cl.eval_cluster(X, Y, Z, cluster)[0, :]
-        overlay_plot(z_arr, [phi_brute, phi_ewald], ['Brute', 'Ewald'],
-                     f'z-scan {name} (RMSE={rmse(phi_ewald,phi_brute):.2e}, r={correlation(phi_ewald,phi_brute):.4f})',
-                     'z [A]', savepath=os.path.join(save_dir, f'zscan_{name}.png'))
+        plot_curves(z_arr, [phi_brute, phi_ewald], ['Brute', 'Ewald'],
+                    f'z-scan {name} (RMSE={rmse(phi_ewald,phi_brute):.2e}, r={correlation(phi_ewald,phi_brute):.4f})',
+                    'z [A]', savepath=os.path.join(save_dir, f'zscan_{name}.png'), pairs=[(1,0)])
 
 @pytest.mark.visual
 @pytest.mark.gpu
@@ -340,9 +340,9 @@ def test_visual_ewald_brute_xscan(substrate):
     Z = np.full((1, len(x_arr)), z0, dtype=np.float32)
     phi_ewald = ew_cl.eval_full(X, Y, Z)[0, :]
     phi_brute = ew_cl.eval_cluster(X, Y, Z, cluster)[0, :]
-    overlay_plot(x_arr, [phi_brute, phi_ewald], ['Brute', 'Ewald'],
-                 f'x-scan z={z0} (RMSE={rmse(phi_ewald,phi_brute):.2e}, r={correlation(phi_ewald,phi_brute):.4f})',
-                 'x [A]', savepath=os.path.join(save_dir, 'xscan_z2.png'))
+    plot_curves(x_arr, [phi_brute, phi_ewald], ['Brute', 'Ewald'],
+                f'x-scan z={z0} (RMSE={rmse(phi_ewald,phi_brute):.2e}, r={correlation(phi_ewald,phi_brute):.4f})',
+                'x [A]', savepath=os.path.join(save_dir, 'xscan_z2.png'), pairs=[(1,0)])
 
 @pytest.mark.visual
 @pytest.mark.gpu
@@ -385,22 +385,22 @@ def test_visual_ewald_lateral_scans(substrate):
     Z = np.full((1, len(t_arr)), z0, dtype=np.float32)
     phi_ew = ew_cl.eval_full(X, Y, Z)[0, :]
     phi_br = ew_cl.eval_cluster(X, Y, Z, cluster)[0, :]
-    overlay_plot(t_arr, [phi_br, phi_ew], ['Brute', 'Ewald'],
-                 f'x-scan y=0.0 z={z0} (RMSE={rmse(phi_ew,phi_br):.2e})', 'x [A]',
-                 savepath=os.path.join(save_dir, 'lateral_xscan.png'))
+    plot_curves(t_arr, [phi_br, phi_ew], ['Brute', 'Ewald'],
+                f'x-scan y=0.0 z={z0} (RMSE={rmse(phi_ew,phi_br):.2e})', 'x [A]',
+                savepath=os.path.join(save_dir, 'lateral_xscan.png'), pairs=[(1,0)])
     # y-scan through cluster center (x=0, Na site)
     X = np.full((1, len(t_arr)), 0.0, dtype=np.float32)
     Y = t_arr.reshape(1, -1).astype(np.float32)
     phi_ew = ew_cl.eval_full(X, Y, Z)[0, :]
     phi_br = ew_cl.eval_cluster(X, Y, Z, cluster)[0, :]
-    overlay_plot(t_arr, [phi_br, phi_ew], ['Brute', 'Ewald'],
-                 f'y-scan x=0.0 z={z0} (RMSE={rmse(phi_ew,phi_br):.2e})', 'y [A]',
-                 savepath=os.path.join(save_dir, 'lateral_yscan.png'))
+    plot_curves(t_arr, [phi_br, phi_ew], ['Brute', 'Ewald'],
+                f'y-scan x=0.0 z={z0} (RMSE={rmse(phi_ew,phi_br):.2e})', 'y [A]',
+                savepath=os.path.join(save_dir, 'lateral_yscan.png'), pairs=[(1,0)])
     # diagonal scan through cluster center (x=y)
     X = t_arr.reshape(1, -1).astype(np.float32)
     Y = t_arr.reshape(1, -1).astype(np.float32)
     phi_ew = ew_cl.eval_full(X, Y, Z)[0, :]
     phi_br = ew_cl.eval_cluster(X, Y, Z, cluster)[0, :]
-    overlay_plot(t_arr, [phi_br, phi_ew], ['Brute', 'Ewald'],
-                 f'diagonal x=y z={z0} (RMSE={rmse(phi_ew,phi_br):.2e})', 'x=y [A]',
-                 savepath=os.path.join(save_dir, 'lateral_diagonal.png'))
+    plot_curves(t_arr, [phi_br, phi_ew], ['Brute', 'Ewald'],
+                f'diagonal x=y z={z0} (RMSE={rmse(phi_ew,phi_br):.2e})', 'x=y [A]',
+                savepath=os.path.join(save_dir, 'lateral_diagonal.png'), pairs=[(1,0)])

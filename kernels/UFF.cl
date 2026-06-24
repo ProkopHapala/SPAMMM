@@ -226,8 +226,7 @@ __kernel void evalBondsAndHNeigh_UFF(
         }
 
         ftot += fi;
-        float E_contrib = (E - Enb) * 0.5f; // Energy contribution per atom
-        E_b += (E - Enb); // Accumulate total bond energy for atom ia
+        E_b += (E - Enb) * 0.5f; // Bond energy per atom (each bond shared by 2 atoms)
 
         // this is not done in UFF.cl assembleAtomForce, so I don't see why should we do it here. Keep it simple !!!
         // // Store bond recoil forces into fint
@@ -342,8 +341,8 @@ __kernel void evalAngles_UFF(
         float2 csn = cs; // will hold cos(n*theta), sin(n*theta)
 
         // Start with coefficients
-        float Eloc = c0;
-        float fmag = c1;
+        float Eloc = c0 + c1 * cs.x;  // n=0 (constant) + n=1 (cos(θ))
+        float fmag = c1;              // n=1: c1*sin(θ)/s = c1 (when s=sin(θ))
 
         // n=2 term
         // csn *= cs  => (cos2, sin2)
@@ -811,9 +810,8 @@ __kernel void assembleForces_UFF(
     if (bClearForce != 0) {
         // Read bond force accumulated by Kernel 1 (assuming it's in fapos)
         float4 bond_force = fapos[i0a + ia];
-        // Final force = bond_force + fint_forces
-        fapos[i0a + ia] = (float4)(bond_force.xyz + f_local, E_local); // Store total E in .w ? Or keep bond energy separate? C++ doesn't store E in fapos.
-                                                                 // Let's store total E contrib in .w here.
+        // Final force = bond_force + fint_forces, energy = bond_energy + fint_energy
+        fapos[i0a + ia] = (float4)(bond_force.xyz + f_local, bond_force.w + E_local);
     } else {
         // Accumulate angle/dih/inv forces onto existing forces (which should include bonds from Kernel 1)
         fapos[i0a + ia] += (float4)(f_local, E_local);
@@ -883,72 +881,55 @@ __kernel void updateAtomsSPFFf4(
 
     float4 fe      = aforce[iaa]; // force on atom or pi-orbital
 
-    // ------ Gather Forces from back-neighbors
     // ---- Limit Forces
-    float Flimit = MDpars.y;
-    float fr2 = dot(fe.xyz,fe.xyz);
-    if( fr2 > (Flimit*Flimit) ){  fe.xyz *= (Flimit/sqrt(fr2)); }
+    float Flimit = MDpars.z;
+    if(Flimit > 0.0f){
+        float fr2 = dot(fe.xyz,fe.xyz);
+        if( fr2 > (Flimit*Flimit) ){  fe.xyz *= (Flimit/sqrt(fr2)); }
+    }
 
     // =============== FORCE DONE
-    aforce[iaa] = fe;             // store force before limit
-    //aforce[iav] = float4Zero;   // clean force   : This can be done in the first forcefield run (best is NBFF)
+    aforce[iaa] = fe;
 
     // =============== DYNAMICS
 
-    float4 ve = avel[iaa]; // velocity of atom or pi-orbital
-    float4 pe = apos[iaa]; // position of atom or pi-orbital
+    float4 ve = avel[iaa];
+    float4 pe = apos[iaa];
 
-    // -------- Fixed Atoms and Bounding Box
-    if(iG<natoms){                  // only atoms have constraints, not pi-orbitals
-        // ------- bboxes
-        // const cl_Mat3 B = bboxes[iS];
-        // if(B.c.z>0.0f){ if(pe.z<B.a.z){ fe.z+=(B.a.z-pe.z)*B.c.z; }else if(pe.z>B.b.z){ fe.z+=(B.b.z-pe.z)*B.c.z; }; }
-        // ------- constrains
-        float4 cons = constr[ iaa ]; // constraints (x,y,z,K)
-        if( cons.w>0.f ){            // if stiffness is positive, we have constraint
+    // -------- Constraints
+    if(iG<natoms){
+        float4 cons = constr[ iaa ];
+        if( cons.w>0.f ){
             float4 cK = constrK[ iaa ];
             cK = max( cK, (float4){0.0f,0.0f,0.0f,0.0f} );
             const float3 fc = (cons.xyz - pe.xyz)*cK.xyz;
-            fe.xyz += fc; // add constraint force
-            if(iS==0){printf( "GPU::constr[ia=%i|iS=%i] (%g,%g,%g|K=%g) fc(%g,%g,%g) cK(%g,%g,%g)\n", iG, iS, cons.x,cons.y,cons.z,cons.w, fc.x,fc.y,fc.z , cK.x, cK.y, cK.z ); }
+            fe.xyz += fc;
         }
     }
 
-    // Thermal driving  - Langevin thermostat, see C++ SPFFsp3_loc::move_atom_Langevin()
-    if( TDrive.y > 0.0f ){ // if gamma>0
-        fe.xyz    += ve.xyz * -TDrive.y ;  // damping,  check the untis  ... cdamp/dt = gamma
-        //const float3 rnd = (float3){ hashf_wang(ve.x+TDrive.w,-1.0,1.0),hashf_wang(ve.y+TDrive.w,-1.0,1.0),hashf_wang(ve.z+TDrive.w,-1.0,1.0)};
+    // Thermal driving - Langevin thermostat
+    if( TDrive.y > 0.0f ){
+        fe.xyz += ve.xyz * -TDrive.y;
         __private float3 ix;
-        // + (float3){TDrive.w,TDrive.w,TDrive.w}
-        //const float4 rnd = fract( (ve*541547.1547987f + TDrive.wwww), &ix )*2.f - (float4){1.0,1.0,1.0,1.0};  // changes every frame
-        const float3 rvec = (float3){  // random vector depending on the index
+        const float3 rvec = (float3){
             (((iG+136  + (int)(1000.f*TDrive.w) ) * 2654435761 >> 16)&0xFF) * 0.00390625f,
             (((iG+778  + (int)(1013.f*TDrive.w) ) * 2654435761 >> 16)&0xFF) * 0.00390625f,
             (((iG+4578 + (int)( 998.f*TDrive.w) ) * 2654435761 >> 16)&0xFF) * 0.00390625f
         };
-        //const float3 rnd = fract( ( rvec + TDrive.www)*12.4565f, &ix )*2.f - (float3){1.0,1.0,1.0};
         const float3 rnd = sin( ( rvec + TDrive.www )*124.4565f );
-        //if(iS==3){  printf( "atom[%i] seed=%g rvec(%g,%g,%g) rnd(%g,%g,%g) \n", iG, TDrive.w, rvec.x,rvec.y,rvec.z, rnd.x,rnd.y,rnd.z ); }
-        fe.xyz    += rnd.xyz * sqrt( 2*const_kB*TDrive.x*TDrive.y/MDpars.x );
+        fe.xyz += rnd.xyz * sqrt( 2*const_kB*TDrive.x*TDrive.y/MDpars.x );
     }
 
-    float4 cvf = (float4){ dot(fe.xyz,fe.xyz),dot(ve.xyz,ve.xyz),dot(fe.xyz,ve.xyz), 0.0f };    // accumulate |f|^2 , |v|^2  and  <f|v>  to calculate damping coefficients for FIRE algorithm outside of this kernel
-    cvfs[iaa] += cvf;
-    //if(!bDrive){ ve.xyz *= MDpars.z; } // friction, velocity damping
-
-    if ((DBG_UFF>1) && (iS==IDBG_SYS) && (iG==IDBG_ATOM)){
-        printf( "GPU isys=%i iG=%i pos(%10.4e,%10.4e,%10.4e) vel(%10.4e,%10.4e,%10.4e) fe(%10.4e,%10.4e,%10.4e) cvf(%10.4e,%10.4e,%10.4e) \n", iS, iG, pe.x,pe.y,pe.z, ve.x,ve.y,ve.z, fe.x,fe.y,fe.z, cvf.x,cvf.y,cvf.z );
-    }
-
-    ve.xyz *=        MDpars.z;      // friction, velocity damping
-    ve.xyz += fe.xyz*MDpars.x;      // acceleration
-    pe.xyz += ve.xyz*MDpars.x;      // move
-    //ve     *= 0.99f;              // friction, velocity damping
-    //ve.xyz += fe.xyz*0.1f;        // acceleration
-    //pe.xyz += ve.xyz*0.1f;        // move
-    pe.w=0;ve.w=0;    // This seems to be needed, not sure why ?????
-    avel[iaa] = ve;   // store velocity
-    apos[iaa] = pe;   // store position
+    // ------ Semi-implicit (symplectic) Euler. damp=1.0 = pure NVE.
+    const float dt   = MDpars.x;
+    const float damp = MDpars.y;
+    float inv_mass = (pe.w > 1e-8f) ? (1.0f / pe.w) : 1.0f;
+    ve.xyz *= damp;
+    ve.xyz += fe.xyz * dt * inv_mass; // velocity update with force at current position
+    pe.xyz += ve.xyz * dt;            // position update with NEW velocity
+    ve.w=0;
+    avel[iaa] = ve;
+    apos[iaa] = pe;
 
 }
 

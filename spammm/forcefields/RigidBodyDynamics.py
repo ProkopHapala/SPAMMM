@@ -275,18 +275,44 @@ void rigid_body_gridff_kernel(
     const float              dt,
     const float4             md_params,
     const int                niter
+)""",
+            "rigid_body_folded_kernel": """__kernel
+void rigid_body_folded_kernel(
+    __global const int*      mols,
+    __global       float4*   poss,
+    __global       float4*   qrots,
+    __global       float4*   vposs,
+    __global       float4*   vrots,
+    __global const cl_Mat3*  I_body_inv,
+    __global const float4*   apos_body,
+    __global       float4*   apos_world,
+    __global       float4*   atom_force,
+    __global       float4*   body_force,
+    __global       float4*   body_torque,
+    __global const float4*   anchors,
+    __global const float*    folded_coeffs,
+    __global const float4*   folded_kxyz,
+    __global const int*      folded_atom_type,
+    const int4               folded_meta,
+    const float4             folded_lvec2d,
+    const float              dt,
+    const float4             md_params,
+    const int                niter
 )"""
         }
 
         self.kernel_params = {}
         self.kernel_args = None
         self.gridff_args = None
+        self.folded_args = None
         self.grid_shape = None
         self.grid_data = None
         self.grid_p0 = None
         self.grid_step = None
         self.atom_PLQ = None
         self.atom_REQ = None
+        self.folded_params = None
+        self.folded_atom_type_ids = None
         self.enames = None
         self.atom_masses = None
         self.atom_types_assigned = None
@@ -326,6 +352,13 @@ void rigid_body_gridff_kernel(
         self.create_buffer('atom_force', total_atom_bytes, mf.READ_WRITE)
         self.create_buffer('body_force', self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('body_torque', self.n_bodies * bytes_per_body, mf.READ_WRITE)
+
+        # Folded basis buffers (allocated on demand by init_folded)
+        FOLDED_BASIS_MAX = 128
+        FOLDED_TYPES_MAX = 8
+        self.create_buffer('folded_coeffs',  FOLDED_TYPES_MAX * FOLDED_BASIS_MAX * float_size, mf.READ_ONLY)
+        self.create_buffer('folded_kxyz',    FOLDED_BASIS_MAX * 4 * float_size, mf.READ_ONLY)
+        self.create_buffer('folded_atom_type', self.total_atoms * int_size, mf.READ_ONLY)
 
         self.kernel_params = {
             'natoms': np.int32(self.total_atoms),
@@ -457,6 +490,66 @@ void rigid_body_gridff_kernel(
         self.krnl_gridff(self.queue, global_size, local_size, *self.gridff_args)
         self.queue.finish()
 
+    def init_folded(self, folded_coeffs, folded_kxyz, folded_atom_type, folded_lvec2d, folded_meta=None):
+        """Initialize folded basis surface interaction for rigid body dynamics.
+
+        Args:
+            folded_coeffs: (ntypes, nbasis) float32 — fitted coefficients per atom type
+            folded_kxyz:   (nbasis, 4) float32 — basis params (ku, kv, alpha, z0) per basis function
+            folded_atom_type: (natoms,) int32 — type index per atom in the rigid body
+            folded_lvec2d: (4,) float32 — 2D lattice vectors as (ax, bx, ay, by)
+            folded_meta: (4,) int32 — (nbasis, ntypes, 0, 0). If None, inferred from shapes.
+        """
+        coeffs = np.asarray(folded_coeffs, dtype=np.float32)
+        kxyz   = np.asarray(folded_kxyz,   dtype=np.float32)
+        atype  = np.asarray(folded_atom_type, dtype=np.int32)
+        lvec2d = np.asarray(folded_lvec2d, dtype=np.float32)
+        ntypes, nbasis = coeffs.shape
+        if kxyz.shape[0] < nbasis:
+            raise ValueError(f"folded_kxyz has {kxyz.shape[0]} basis params but coeffs expects {nbasis}")
+        if atype.shape[0] != self.total_atoms:
+            raise ValueError(f"folded_atom_type length {atype.shape[0]} != total_atoms {self.total_atoms}")
+        if folded_meta is None:
+            folded_meta = np.array([nbasis, ntypes, 0, 0], dtype=np.int32)
+        else:
+            folded_meta = np.asarray(folded_meta, dtype=np.int32)
+        # Pad to GPU buffer sizes
+        FOLDED_BASIS_MAX = 128
+        FOLDED_TYPES_MAX = 8
+        if nbasis > FOLDED_BASIS_MAX:
+            raise ValueError(f"nbasis={nbasis} exceeds FOLDED_BASIS_MAX={FOLDED_BASIS_MAX}")
+        if ntypes > FOLDED_TYPES_MAX:
+            raise ValueError(f"ntypes={ntypes} exceeds FOLDED_TYPES_MAX={FOLDED_TYPES_MAX}")
+        coeff_pad = np.zeros((FOLDED_TYPES_MAX, FOLDED_BASIS_MAX), dtype=np.float32)
+        coeff_pad[:ntypes, :nbasis] = coeffs
+        kxyz_pad = np.zeros((FOLDED_BASIS_MAX, 4), dtype=np.float32)
+        kxyz_pad[:nbasis, :] = kxyz[:nbasis]
+        self.toGPU('folded_coeffs',    coeff_pad)
+        self.toGPU('folded_kxyz',      kxyz_pad)
+        self.toGPU('folded_atom_type', atype)
+        self.kernel_params['folded_meta']   = folded_meta
+        self.kernel_params['folded_lvec2d'] = lvec2d
+        self.kernel_params['md_params']     = np.array([0.92, 0.88, 1.0, 1.0], dtype=np.float32)
+        self.folded_params = {
+            'coeffs': coeffs.copy(), 'kxyz': kxyz[:nbasis].copy(),
+            'atom_type': atype.copy(), 'lvec2d': lvec2d.copy(), 'meta': folded_meta.copy(),
+        }
+        self.folded_atom_type_ids = atype.copy()
+        self.folded_args = self.generate_kernel_args("rigid_body_folded_kernel")
+        self.krnl_folded = cl.Kernel(self.prg, "rigid_body_folded_kernel")
+
+    def run_folded(self, num_steps, dt, lin_damp=0.92, ang_damp=0.88, force_scale=1.0, torque_scale=1.0):
+        if self.folded_args is None:
+            raise RuntimeError("Folded kernel arguments not initialized; call init_folded(...) first")
+        self.kernel_params['dt'] = np.float32(dt)
+        self.kernel_params['niter'] = np.int32(num_steps)
+        self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, force_scale, torque_scale], dtype=np.float32)
+        self.folded_args = self.generate_kernel_args("rigid_body_folded_kernel")
+        global_size = (self.roundUpGlobalSize(self.n_bodies * self.nloc),)
+        local_size = (self.nloc,)
+        self.krnl_folded(self.queue, global_size, local_size, *self.folded_args)
+        self.queue.finish()
+
     def download_outputs(self):
         pos         = np.empty((self.n_bodies, 4), dtype=np.float32)
         quats       = np.empty((self.n_bodies, 4), dtype=np.float32)
@@ -551,6 +644,7 @@ void rigid_body_gridff_kernel(
             'last_atom_force': None if self.last_atom_force is None else np.array(self.last_atom_force, copy=True),
             'last_body_force': None if self.last_body_force is None else np.array(self.last_body_force, copy=True),
             'last_body_torque': None if self.last_body_torque is None else np.array(self.last_body_torque, copy=True),
+            'folded_params': None if self.folded_params is None else {k: v.copy() for k, v in self.folded_params.items()},
         }
         return out
 

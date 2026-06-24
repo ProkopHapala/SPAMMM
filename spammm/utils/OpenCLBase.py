@@ -411,11 +411,11 @@ class OpenCLBase:
                 self.buffer_dict[buff_name] = buff
 
     def toGPU_(self, buf, host_data, byte_offset=0 ):
-        cl.enqueue_copy(self.queue, buf, host_data, device_offset=byte_offset)
+        cl.enqueue_copy(self.queue, buf, host_data, dst_offset=byte_offset)
 
     def fromGPU_(self, buf, host_data=None, byte_offset=0, shape=None, dtype='f4' ):
         if host_data is None: host_data = np.empty(shape, dtype=dtype)
-        cl.enqueue_copy(self.queue, host_data, buf, device_offset=byte_offset)
+        cl.enqueue_copy(self.queue, host_data, buf, src_offset=byte_offset)
         return host_data
         
     def toGPU(self, buf_name, host_data, byte_offset=0):
@@ -427,7 +427,7 @@ class OpenCLBase:
             host_data (numpy.ndarray): Data to upload
             byte_offset (int): Offset in bytes
         """
-        cl.enqueue_copy(self.queue, self.buffer_dict[buf_name], host_data, device_offset=byte_offset)
+        cl.enqueue_copy(self.queue, self.buffer_dict[buf_name], host_data, dst_offset=byte_offset)
     
     def fromGPU(self, buf_name, host_data, byte_offset=0):
         """
@@ -438,7 +438,7 @@ class OpenCLBase:
             host_data (numpy.ndarray): Array to store the downloaded data
             byte_offset (int): Offset in bytes
         """
-        cl.enqueue_copy(self.queue, host_data, self.buffer_dict[buf_name], device_offset=byte_offset)
+        cl.enqueue_copy(self.queue, host_data, self.buffer_dict[buf_name], src_offset=byte_offset)
     
     def download_buf(self, name_or_buf, dtype=None):
         """Minimal helper to download a full OpenCL buffer to a flat numpy array.

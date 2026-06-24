@@ -89,6 +89,43 @@ inline float evalBond( float3 h, float dl, float k, __private float3* f ){
     return fr*dl*0.5;  // energy
 }
 
+// ---- Torque-based pi interaction helpers (for rotational pi dynamics) ----
+
+// pi-sigma orthogonalization: returns torque on pi-orbital + recoil force on neighbor bond
+inline float evalPiSigma_tq(const float3 hpi, const float4 h, const float K, const float c0, __private float3 *tqi, __private float3 *fj){
+    const float c    = dot(hpi, h.xyz);
+    const float c_   = c - c0;
+    const float E    = K * c_ * c_;
+    const float fang = -2.0f * K * c_;
+    *tqi = cross(hpi, h.xyz) * fang;          // torque on pi
+    const float s2   = fang * h.w;            // recoil scaling
+    *fj  = (hpi - h.xyz * c) * s2;            // recoil force perpendicular to bond
+    return E;
+}
+
+// pi-pi alignment: returns (torque on pi, energy) as float4
+inline float4 evalPiAlign_tq(const float3 h1, const float3 h2, const float K){
+    const float c = dot(h1,h2);
+    const float E = -K * c;
+    return (float4){ cross(h1, h2) * K, E };
+}
+
+// ---- Rotation helpers for pi-orbital rotational dynamics ----
+
+float2 sinc_div_r2_taylor(float r2){
+    float s = 1.0f + r2 * ( (-1.0f/6.0f)  + r2 * ( (1.0f/120.0f) + r2 * (-1.0f/5040.0f  ) ) );
+    float c = 0.5f + r2 * ( (-1.0f/24.0f) + r2 * ( (1.0f/720.0f) + r2 * (-1.0f/40320.0f ) ) );
+    return (float2){s, c};
+}
+
+float3 rotate_by_omega_taylor(float3 p, float3 w){
+    float r2    = dot(w,w);
+    float2 sc   = sinc_div_r2_taylor(r2);
+    float3 wxp  = cross(w, p);
+    float3 wwxp = cross(w, wxp);
+    return p + wxp*sc.x + wwxp*sc.y;
+}
+
 // ---- getSPFFf4: bonding interactions (bonds, angles, torsions, pi-pi, H-bond) ----
 // ======================================================================
 //                          getSPFFf4()
@@ -224,7 +261,7 @@ __kernel void getSPFFf4(
             float ksp = Kspi[i];
             if(ksp>1.e-6){
                 esp += evalAngCos( (float4){hpi,1.}, h, ksp, par.w, &f1, &f2 );   fpi+=f1; fa-=f2;  fbs[i]+=f2;    //   pi-planarization (orthogonality), fpi is force on pi-orbital, fbs[i] is recoil force on i-th neighbor
-                E+=epp;
+                E+=esp;
             }
         }
 
@@ -285,9 +322,134 @@ __kernel void getSPFFf4(
         //fneigh[i4p+i] = (float4){fps[i],0};
     }
     //fapos[iav     ] = (float4){fa ,0}; // If we do  run it as first forcefield
-    fapos[iav       ] += (float4){fa ,0};  // If we not run it as first forcefield
+    fapos[iav       ] += (float4){fa ,E};  // If we not run it as first forcefield, store energy in .w
     //fapos[iav+nAtoms]  = (float4){fpi,0};
 
+}
+
+// ======================================================================
+//                          getSPFFf4_rot()
+// ======================================================================
+// Same as getSPFFf4 but uses torque-based pi interactions for rotational dynamics.
+// Pi-orbital forces are torques (not linear forces), stored in aforce[iav+nAtoms].
+//__attribute__((reqd_work_group_size(1,1,1)))
+__kernel void getSPFFf4_rot(
+    const int4 nDOFs,               // 1   (nAtoms,nnode) dimensions of the system
+    __global float4*  apos,         // 2  [natoms]     positions of atoms
+    __global float4*  aforce,       // 3  [natoms]     forces on atoms
+    __global float4*  fneigh,       // 4  [nnode*4*2]  recoil forces on neighbors
+    __global int4*    neighs,       // 5  [nnode]  neighboring atoms
+    __global int4*    neighCell,    // 5  [nnode]  neighboring atom cell index
+    __global float4*  REQs,         // 6  [natoms] non-bonding parameters
+    __global float4*  apars,        // 7  [nnode]  per atom forcefield parameters
+    __global float4*  bLs,          // 8  [nnode]  bond lengths
+    __global float4*  bKs,          // 9  [nnode]  bond stiffness
+    __global float4*  Ksp,          // 10 [nnode]  stiffness of pi-sigma orthogonalization
+    __global float4*  Kpp,          // 11 [nnode]  stiffness of pi-pi alignment
+    __global cl_Mat3* lvecs,        // 12 lattice vectors
+    __global cl_Mat3* ilvecs,       // 13 inverse lattice vectors
+    __global float4*  pbc_shifts,
+    const int npbc,
+    const int bSubtractVdW
+){
+    const int iG = get_global_id (0);
+    const int iS = get_global_id (1);
+    const int nAtoms=nDOFs.x;
+    const int nnode =nDOFs.y;
+    if(iG>=nnode) return;
+
+    const int i0a   = iS*nAtoms;
+    const int i0n   = iS*nnode;
+    const int i0v   = iS*(nAtoms+nnode);
+    const int iaa = iG + i0a;
+    const int ian = iG + i0n;
+    const int iav = iG + i0v;
+
+    #define NNEIGH 4
+    float4  hs [4];
+    float3  fbs[4];
+    float3  fa  = float3Zero;
+    float E=0;
+    const int4   ng  = neighs[iaa];
+    const float3 pa  = apos[iav].xyz;
+    const float4 par = apars[ian];
+    const int*   ings  = (int*)&ng;
+    const float   ssC0   = par.x*par.x - par.y*par.y;
+    for(int i=0; i<NNEIGH; i++){ fbs[i]=float3Zero; }
+    float3 f1,f2;
+
+    {
+        float3  fpi = float3Zero;
+        const int4   ngC = neighCell[iaa];
+        const float3 hpi = apos[iav+nAtoms].xyz;
+        const float4 vbL = bLs[ian];
+        const float4 vbK = bKs[ian];
+        const float4 vKs = Ksp[ian];
+        const float4 vKp = Kpp[ian];
+        const int*   ingC  = (int*)&ngC;
+        const float* bL    = (float*)&vbL;
+        const float* bK    = (float*)&vbK;
+        const float* Kspi  = (float*)&vKs;
+        const float* Kppi  = (float*)&vKp;
+        const int ipbc0 = iS*npbc;
+
+        for(int i=0; i<NNEIGH; i++){
+            float4 h;
+            const int ing  = ings[i];
+            const int ingv = ing+i0v;
+            if(ing<0) break;
+            h.xyz    = apos[ingv].xyz - pa;
+            { int ic = ingC[i]; h.xyz += pbc_shifts[ipbc0+ic].xyz; }
+            float  l = length(h.xyz);
+            h.w      = 1.f/l;
+            h.xyz   *= h.w;
+            hs[i]    = h;
+
+            if(iG<ing){
+                float elb = evalBond( h.xyz, l-bL[i], bK[i], &f1 );  fbs[i]-=f1;  fa+=f1; E+=elb;
+            }
+
+            float kpp = Kppi[i];
+            if( (ing<nnode) && (kpp>1.e-6f) ){
+                float3 hpj = apos[ingv+nAtoms].xyz;
+                float4 fepi = evalPiAlign_tq( hpi, hpj, kpp );
+                E  += fepi.w;
+                fpi += fepi.xyz;
+            }
+
+            float ksp = Kspi[i];
+            if(ksp>1.e-6f){
+                float esp = evalPiSigma_tq( hpi, h, ksp, par.w, &f1, &f2 );
+                E  += esp; fa-=f2;  fbs[i]+=f2; fpi+=f1;
+            }
+        }
+
+        aforce[iav+nAtoms]  = (float4){fpi,0};
+    }
+
+    {
+        for(int i=0; i<NNEIGH; i++){
+            int ing = ings[i];
+            if(ing<0) break;
+            const float4 hi = hs[i];
+            for(int j=i+1; j<NNEIGH; j++){
+                int jng  = ings[j];
+                if(jng<0) break;
+                const float4 hj = hs[j];
+                float ea = evalAngleCosHalf( hi, hj, par.xy, par.z, &f1, &f2 );
+                fa  -= f1+f2;
+                E   += ea;
+                fbs[i]+= f1;
+                fbs[j]+= f2;
+            }
+        }
+    }
+
+    const int i4 =(iG + iS*nnode*2 )*4;
+    for(int i=0; i<NNEIGH; i++){
+        fneigh[i4 +i] = (float4){fbs[i],0};
+    }
+    aforce[iav ] += (float4){fa.x,fa.y,fa.z,E};
 }
 
 // ---- updateGroups ----
@@ -668,32 +830,24 @@ __kernel void updateAtomsSPFFf4(
         }
     }
 
-    /*
-    // ------ Move (kvazi-FIRE)    - proper FIRE need to reduce dot(f,v),|f|,|v| over whole system (3*N dimensions), this complicates paralell implementaion, therefore here we do it only over individual particles (3 dimensions)
+    // ------ Simple damped MD (leap-frog when damp=1.0)
     if(bPi){
-        fe.xyz += pe.xyz * -dot( pe.xyz, fe.xyz );   // subtract forces  component which change pi-orbital lenght
-        ve.xyz += pe.xyz * -dot( pe.xyz, ve.xyz );   // subtract veocity component which change pi-orbital lenght
+        fe.xyz += pe.xyz * -dot( pe.xyz, fe.xyz );   // project out radial component for pi-orbitals
+        ve.xyz += pe.xyz * -dot( pe.xyz, ve.xyz );
     }
-    float ff = dot(fe.xyz,fe.xyz);
-	float vv = dot(ve.xyz,ve.xyz);
-    float vf = dot(ve.xyz,fe.xyz);
-    #define ff_safety 1e-8
-    float  c          = vf/sqrt( ff*vv + 1e-8 );
-    float  renorm_vf  = sqrt( vv/(ff + 1e-8) );
-    //float2 cvf = KvaziFIREdamp( c, MDpars.y*0.f, (float2){-0.2f,0.2f} );
-    float2 cvf = KvaziFIREdamp( c, (float2){-0.8f,-0.3f}, (float2){0.8f,0.999f} );
-    //if((iG==iG_DBG)&&(iS==iS_DBG)){ printf( "GPU cos=%g cv=%g \n", c, cvf.x ); }
-    ve.xyz *= cvf.x;
-    ve.xyz += fe.xyz*cvf.y*renorm_vf;
-    ve.xyz += fe.xyz*MDpars.x;
-    pe.xyz += ve.xyz*MDpars.x;
+    const float dt   = MDpars.x;
+    const float damp = MDpars.y;
+    float inv_mass = (pe.w > 1e-8f) ? (1.0f / pe.w) : 1.0f;
+    ve.xyz *= damp;
+    ve.xyz += fe.xyz * dt * inv_mass;
+    pe.xyz += ve.xyz * dt;
     if(bPi){
-        pe.xyz=normalize(pe.xyz);                   // normalize pi-orobitals
+        pe.xyz=normalize(pe.xyz);                   // normalize pi-orbitals
     }
-    pe.w=0;ve.w=0;  // This seems to be needed, not sure why ?????
+    ve.w=0;
+    avel[iav] = ve;
+    apos[iav] = pe;   // pe.w still holds mass
 }
-
-// ---- cleanForceSPFFf4 ----
 // ======================================================================
 //                     cleanForceSPFFf4()
 // ======================================================================
@@ -728,6 +882,119 @@ __kernel void cleanForceSPFFf4(
         fneigh[i4+3]=float4Zero;
     }
     //if(iG==0){ printf( "GPU::updateAtomsSPFFf4() END\n" ); }
+}
+
+// ======================================================================
+//                     updateAtomsSPFFf4_rot()
+// ======================================================================
+// MD integrator with rotational pi-orbital dynamics.
+// Pi-orbitals are integrated as rotational DOFs (torque -> angular velocity -> rotation).
+// Atoms use simple leap-frog integration.
+//__attribute__((reqd_work_group_size(1,1,1)))
+__kernel void updateAtomsSPFFf4_rot(
+    const int4        nDOFs,            // 1 // (natoms,nnode) dimensions of the system
+    __global float4*  apos,         // 2 // positions of atoms
+    __global float4*  avel,         // 3 // velocities of atoms (angular velocity for pi)
+    __global float4*  aforce,       // 4 // forces on atoms (torques on pi)
+    __global float4*  cvf,          // 5 // damping coefficients
+    __global float4*  fneigh,       // 6 // recoil forces on neighbors
+    __global int4*    bkNeighs,     // 7 // back neighbors indices
+    __global float4*  constr,       // 8 // constraints (x,y,z,K) for each atom
+    __global float4*  constrK,      // 9 // constraints stiffness (kx,ky,kz,?) for each atom
+    __global float4*  MDparams,     // 10 // MD parameters (dt,damp,Flimit)
+    __global float4*  TDrives,      // 11 // Thermal driving (T,gamma_damp,seed,?)
+    __global cl_Mat3* bboxes,       // 12 // bounding box
+    __global int*     sysneighs,    // 13 // inter-system neighbor indices
+    __global float4*  sysbonds,     // 14 // inter-system bond parameters
+    __global float4*  aforce_old    // 15 // previous step forces
+){
+    const int natoms=nDOFs.x;
+    const int nnode =nDOFs.y;
+    const int nMaxSysNeighs = nDOFs.z;
+    const int nvec  = natoms+nnode;
+    const int iG = get_global_id  (0);
+    if(iG>=nvec) return;
+    const int iS = get_global_id  (1);
+
+    const int iaa = iG + iS*natoms;
+    const int iav = iG + iS*nvec;
+
+    const float4 MDpars  = MDparams[iS]; // (dt,damp,Flimit)
+    const float4 TDrive = TDrives[iS];
+
+    if(iG>=(natoms+nnode)) return;
+
+    float4 fe      = aforce[iav];
+    const bool bPi = iG>=natoms;
+
+    int4 ngs = bkNeighs[ iav ];
+
+    if(!bPi){
+        if(ngs.x>=0){ fe += fneigh[ngs.x]; }
+        if(ngs.y>=0){ fe += fneigh[ngs.y]; }
+        if(ngs.z>=0){ fe += fneigh[ngs.z]; }
+        if(ngs.w>=0){ fe += fneigh[ngs.w]; }
+    }
+
+    float Flimit = MDpars.z;
+    if(Flimit>0){
+        float fr2 = dot(fe.xyz,fe.xyz);
+        if( fr2 > (Flimit*Flimit) ){  fe.xyz*=(Flimit/sqrt(fr2)); }
+    }
+
+    aforce[iav] = fe;
+
+    float4 ve = avel[iav];
+    float4 pe = apos[iav];
+
+    // Constraints and bounding box (atoms only)
+    if(iG<natoms){
+        const cl_Mat3 B = bboxes[iS];
+        if(B.c.z>0.0f){ if(pe.z<B.a.z){ fe.z+=(B.a.z-pe.z)*B.c.z; }else if(pe.z>B.b.z){ fe.z+=(B.b.z-pe.z)*B.c.z; }; }
+        float4 cons = constr[ iaa ];
+        if( cons.w>0.f ){
+            float4 cK = constrK[ iaa ];
+            cK = max( cK, (float4){0.0f,0.0f,0.0f,0.0f} );
+            const float3 fc = (cons.xyz - pe.xyz)*cK.xyz;
+            fe.xyz += fc;
+        }
+    }
+
+    // Inter-system interactions
+    if( nMaxSysNeighs>0 ){
+        for(int i=0; i<nMaxSysNeighs; i++){
+            const int j     = iS*nMaxSysNeighs + i;
+            const int    jS = sysneighs[j];
+            const float4 bj = sysbonds [j];
+            const float4 pj = apos[jS*nvec + iG];
+            float3 d        = pj.xyz - pe.xyz;
+            float  l = length( d );
+            if      (l<bj.x){ d*=(l-bj.x)*bj.z/l; }
+            else if (l>bj.y){ d*=(bj.y-l)*bj.w/l; }
+            fe.xyz += d;
+        }
+    }
+
+    const float dt   = MDpars.x;
+    const float damp = MDpars.y;
+
+    if (bPi){
+        // ROTATIONAL DYNAMICS FOR PI-ORBITAL
+        float inv_I  = 1.0f;
+        ve.xyz *= damp;
+        ve.xyz += (fe.xyz * inv_I) * dt;
+        pe.xyz  = rotate_by_omega_taylor( pe.xyz, ve.xyz*dt );
+        pe.xyz  = normalize(pe.xyz);
+    } else {
+        // LEAP-FROG FOR ATOMS with damping
+        float inv_mass = (pe.w > 1e-8f) ? (1.0f / pe.w) : 1.0f;
+        ve.xyz *= damp;
+        ve.xyz += fe.xyz * dt * inv_mass;
+        pe.xyz += ve.xyz * dt;
+    }
+    pe.w = 0.0f; ve.w = 0.0f;
+    avel[iav] = ve;
+    apos[iav] = (float4){ pe.xyz, 0.0f };
 }
 
 

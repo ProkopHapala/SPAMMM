@@ -91,6 +91,7 @@ class UFF_CL(OpenCLBase):
         uff_data['a2f_offsets'] = a2f_offsets
         uff_data['a2f_counts'] = a2f_counts
         uff_data['a2f_indices'] = a2f_indices
+        self.upload_topology_params(uff_data)
         return uff_data
 
     def realloc_buffers(self, natoms, nbonds, nangles, ndihedrals, ninversions, npbc, nSystems=1):
@@ -143,10 +144,24 @@ class UFF_CL(OpenCLBase):
         self.check_buf("Ea_contrib", nAng * f32sz)
         self.check_buf("Ed_contrib", nD * f32sz)
         self.check_buf("Ei_contrib", nInv * f32sz)
+        # MD integrator buffers (for updateAtomsSPFFf4)
+        self.check_buf("avel", nA * 4 * f32sz)
+        self.check_buf("cvfs", nA * 4 * f32sz)
+        self.check_buf("constr", nA * 4 * f32sz)
+        self.check_buf("constrK", nA * 4 * f32sz)
+        self.check_buf("MDparams", nSystems * 4 * f32sz)
+        self.check_buf("TDrives", nSystems * 4 * f32sz)
+        # alias aforce → fapos (updateAtomsSPFFf4 uses name 'aforce')
+        self.buffer_dict['aforce'] = self.buffer_dict['fapos']
+        # Zero-init MD state buffers
+        zero = np.zeros(1, dtype=np.float32)
+        for bn in ('avel', 'cvfs', 'constr', 'constrK', 'TDrives'):
+            cl.enqueue_fill_buffer(self.queue, self.buffer_dict[bn], zero, 0, self.buffer_dict[bn].size)
+        self.queue.finish()
         self.args_setup = False
         print(f"UFF buffers allocated for {nSystems} systems with {natoms} atoms each")
 
-    def upload_positions(self, positions, iSys=0):
+    def upload_positions(self, positions, iSys=0, masses=None):
         if positions.shape[0] != self.natoms:
             raise ValueError(f"Expected {self.natoms} atoms, got {positions.shape[0]}")
         if positions.dtype != np.float32:
@@ -155,8 +170,10 @@ class UFF_CL(OpenCLBase):
             positions = positions.reshape(-1, 3)
         padded_positions = np.zeros((self.natoms, 4), dtype=np.float32)
         padded_positions[:, :3] = positions
+        if masses is not None:
+            padded_positions[:, 3] = np.asarray(masses, dtype=np.float32)
         offset = iSys * self.natoms * 4
-        cl.enqueue_copy(self.queue, self.buffer_dict["apos"], padded_positions.flatten(), device_offset=offset * f32sz)
+        cl.enqueue_copy(self.queue, self.buffer_dict["apos"], padded_positions.flatten(), dst_offset=offset * f32sz)
 
     def upload_topology_params(self, uff_data, iSys=0):
         atom_offset = iSys * self.natoms
@@ -167,7 +184,7 @@ class UFF_CL(OpenCLBase):
         def _upload_if_present(buffer_name, data_key, dtype, offset_elements, element_size):
             if data_key in uff_data and uff_data[data_key] is not None and len(uff_data[data_key]) > 0:
                 data = uff_data[data_key].astype(dtype)
-                cl.enqueue_copy(self.queue, self.buffer_dict[buffer_name], data, device_offset=(offset_elements * element_size))
+                cl.enqueue_copy(self.queue, self.buffer_dict[buffer_name], data, dst_offset=(offset_elements * element_size))
         _upload_if_present("atype", "atype", np.int32, atom_offset, i32sz)
         _upload_if_present("REQs", "REQs", np.float32, atom_offset * 4, f32sz)
         _upload_if_present("bonAtoms", "bonAtoms", np.int32, bond_offset * 2, i32sz)
@@ -180,15 +197,15 @@ class UFF_CL(OpenCLBase):
             #   angParams2_w= [K]
             ang_params1   = np.ascontiguousarray(ang_params[:, 1:5])
             ang_params2_w = np.ascontiguousarray(ang_params[:, 0])
-            cl.enqueue_copy(self.queue, self.buffer_dict["angParams1"],   ang_params1,   device_offset=(angle_offset * 4 * f32sz))
-            cl.enqueue_copy(self.queue, self.buffer_dict["angParams2_w"], ang_params2_w, device_offset=(angle_offset * 1 * f32sz))
+            cl.enqueue_copy(self.queue, self.buffer_dict["angParams1"],   ang_params1,   dst_offset=(angle_offset * 4 * f32sz))
+            cl.enqueue_copy(self.queue, self.buffer_dict["angParams2_w"], ang_params2_w, dst_offset=(angle_offset * 1 * f32sz))
         _upload_if_present("dihAtoms", "dihAtoms", np.int32, dihedral_offset * 4, i32sz)
         if 'dihParams' in uff_data and uff_data['dihParams'] is not None and len(uff_data['dihParams']) > 0:
             p3 = np.ascontiguousarray(uff_data['dihParams'].astype(np.float32))
             assert p3.ndim == 2 and p3.shape[1] == 3
             p4 = np.zeros((p3.shape[0], 4), dtype=np.float32)
             p4[:, :3] = p3
-            cl.enqueue_copy(self.queue, self.buffer_dict["dihParams"], p4, device_offset=(dihedral_offset * 4 * f32sz))
+            cl.enqueue_copy(self.queue, self.buffer_dict["dihParams"], p4, dst_offset=(dihedral_offset * 4 * f32sz))
         _upload_if_present("invAtoms", "invAtoms", np.int32, inversion_offset * 4, i32sz)
         _upload_if_present("invParams", "invParams", np.float32, inversion_offset * 4, f32sz)
         _upload_if_present("neighs", "neighs", np.int32, atom_offset * 4, i32sz)
@@ -201,13 +218,13 @@ class UFF_CL(OpenCLBase):
             assert ng3.ndim == 2 and ng3.shape[1] == 3
             ng4 = np.full((ng3.shape[0], 4), -1, dtype=np.int32)
             ng4[:, :3] = ng3
-            cl.enqueue_copy(self.queue, self.buffer_dict["invNgs"], ng4, device_offset=(inversion_offset * 4 * i32sz))
+            cl.enqueue_copy(self.queue, self.buffer_dict["invNgs"], ng4, dst_offset=(inversion_offset * 4 * i32sz))
         _upload_if_present("a2f_offsets", "a2f_offsets", np.int32, atom_offset, i32sz)
         _upload_if_present("a2f_counts",  "a2f_counts",  np.int32, atom_offset, i32sz)
         if 'a2f_indices' in uff_data and uff_data['a2f_indices'] is not None and len(uff_data['a2f_indices']) > 0:
             # a2f_indices is per-system local; for now we upload whole map for iSys==0
             data = np.ascontiguousarray(uff_data['a2f_indices'].astype(np.int32))
-            cl.enqueue_copy(self.queue, self.buffer_dict["a2f_indices"], data, device_offset=0)
+            cl.enqueue_copy(self.queue, self.buffer_dict["a2f_indices"], data, dst_offset=0)
 
     def run_eval_step(self, bClearForce=True):
         if not self.args_setup:
@@ -218,6 +235,8 @@ class UFF_CL(OpenCLBase):
         # Clear fint when any term writes into it
         if self.bDoAngles or self.bDoDihedrals or self.bDoInversions:
             cl.enqueue_fill_buffer(queue, self.buffer_dict["fint"], np.float32(0), 0, self.buffer_dict["fint"].size)
+        # Clear energies buffer before kernel accumulation
+        cl.enqueue_fill_buffer(queue, self.buffer_dict["energies"], np.float32(0), 0, 5 * self.nSystems * f32sz)
 
         if self.bDoBonds:
             self.prg.evalBondsAndHNeigh_UFF(queue, (self.natoms * self.nSystems,), None, *self.kernel_args["evalBondsAndHNeigh_UFF"])
@@ -232,8 +251,7 @@ class UFF_CL(OpenCLBase):
             self.prg.assembleForces_UFF(queue, (self.natoms * self.nSystems,), None, *self.kernel_args["assembleForces_UFF"])
         if self.bDoNonBonded: self.prg.evalNonBonded(queue, (self.natoms * self.nSystems,), None, *self.kernel_args["evalNonBonded"])
         queue.finish()
-        energies = np.zeros(5 * self.nSystems, dtype=np.float32)
-        return energies[4::5]
+        return self.get_total_energy()
 
     def get_forces(self, iSys=None):
         if iSys is None:
@@ -243,13 +261,92 @@ class UFF_CL(OpenCLBase):
         else:
             forces = np.zeros(self.natoms * 4, dtype=np.float32)
             offset = iSys * self.natoms * 4
-            cl.enqueue_copy(self.queue, forces, self.buffer_dict["fapos"], device_offset=offset * f32sz)
+            cl.enqueue_copy(self.queue, forces, self.buffer_dict["fapos"], src_offset=offset * f32sz)
             return forces.reshape(self.natoms, 4)[:, :3]
 
-    def get_total_energy(self):
-        energies = np.zeros(5 * self.nSystems, dtype=np.float32)
-        cl.enqueue_copy(self.queue, energies, self.buffer_dict["energies"])
-        return energies.reshape(self.nSystems, 5)[:, 4]
+    def get_total_energy(self, buf=None):
+        if buf is None:
+            buf = np.zeros(self.natoms * self.nSystems * 4, dtype=np.float32)
+        cl.enqueue_copy(self.queue, buf, self.buffer_dict["fapos"])
+        fapos = buf.reshape(self.nSystems, self.natoms, 4)
+        return fapos[:, :, 3].sum(axis=1)  # Energy per-atom already includes sharing factors (E/2 for bonds, E/3 for angles)
+
+    def set_md_params(self, dt=0.01, damp=0.9, Flimit=100.0, T=0.0, gamma=0.0, seed=12345):
+        """Upload MD parameters to GPU. MDparams=(dt, damp, Flimit, 0), TDrives=(T, gamma, 0, seed)."""
+        md = np.array([[dt, damp, Flimit, 0.0]], dtype=np.float32)
+        td = np.array([[T, gamma, 0.0, seed]], dtype=np.float32)
+        cl.enqueue_copy(self.queue, self.buffer_dict["MDparams"], md)
+        cl.enqueue_copy(self.queue, self.buffer_dict["TDrives"], td)
+        self.queue.finish()
+
+    def _run_integrator(self):
+        """Call updateAtomsSPFFf4 kernel (GPU-side position+velocity update)."""
+        sz = (self.natoms, self.nSystems)
+        self.prg.updateAtomsSPFFf4(self.queue, sz, None, *self.kernel_args["updateAtomsSPFFf4"])
+        self.queue.finish()
+
+    def relax(self, nsteps=100, dt=0.01, damp=0.9, Flimit=100.0):
+        """Damped dynamics relaxation entirely on GPU. Returns final energy."""
+        self.set_md_params(dt=dt, damp=damp, Flimit=Flimit)
+        # Zero velocities
+        cl.enqueue_fill_buffer(self.queue, self.buffer_dict["avel"], np.float32(0), 0, self.buffer_dict["avel"].size)
+        for _ in range(nsteps):
+            self.run_eval_step()
+            self._run_integrator()
+        return self.get_total_energy()
+
+    def run_md(self, nsteps=100, dt=0.01, Flimit=1e10):
+        """NVE molecular dynamics entirely on GPU. Returns final energy."""
+        self.set_md_params(dt=dt, damp=1.0, Flimit=Flimit)  # damp=1.0 = no damping
+        for _ in range(nsteps):
+            self.run_eval_step()
+            self._run_integrator()
+        return self.get_total_energy()
+
+    def run_md_fast(self, nsteps=100, dt=0.01, Flimit=1e10):
+        """NVE MD entirely on GPU, no per-step host transfers. Returns final energy.
+        Kernels are enqueued back-to-back without queue.finish() between steps.
+        Only synchronizes at the end."""
+        self.set_md_params(dt=dt, damp=1.0, Flimit=Flimit)
+        queue = self.queue
+        for _ in range(nsteps):
+            # Inline run_eval_step without finish() and without downloading energy
+            cl.enqueue_fill_buffer(queue, self.buffer_dict["fapos"], np.float32(0), 0, self.natoms * self.nSystems * 4 * f32sz)
+            if self.bDoAngles or self.bDoDihedrals or self.bDoInversions:
+                cl.enqueue_fill_buffer(queue, self.buffer_dict["fint"], np.float32(0), 0, self.buffer_dict["fint"].size)
+            cl.enqueue_fill_buffer(queue, self.buffer_dict["energies"], np.float32(0), 0, 5 * self.nSystems * f32sz)
+            if self.bDoBonds:
+                self.prg.evalBondsAndHNeigh_UFF(queue, (self.natoms * self.nSystems,), None, *self.kernel_args["evalBondsAndHNeigh_UFF"])
+            if self.bDoAngles:
+                self.prg.evalAngles_UFF(queue, (self.nangles * self.nSystems,), None, *self.kernel_args["evalAngles_UFF"])
+            if self.bDoDihedrals:
+                self.prg.evalDihedrals_UFF(queue, (self.ndihedrals * self.nSystems,), None, *self.kernel_args["evalDihedrals_UFF"])
+            if self.bDoInversions:
+                self.prg.evalInversions_UFF(queue, (self.ninversions * self.nSystems,), None, *self.kernel_args["evalInversions_UFF"])
+            if self.bDoAngles or self.bDoDihedrals or self.bDoInversions:
+                self.prg.assembleForces_UFF(queue, (self.natoms * self.nSystems,), None, *self.kernel_args["assembleForces_UFF"])
+            if self.bDoNonBonded:
+                self.prg.evalNonBonded(queue, (self.natoms * self.nSystems,), None, *self.kernel_args["evalNonBonded"])
+            # Integrator (no finish between eval and integrate — GPU executes in order)
+            self.prg.updateAtomsSPFFf4(queue, (self.natoms, self.nSystems), None, *self.kernel_args["updateAtomsSPFFf4"])
+        queue.finish()
+        return self.get_total_energy()
+
+    def get_positions(self, iSys=0, buf=None):
+        """Download atom positions from GPU. Pass preallocated buf to avoid allocation."""
+        if buf is None:
+            buf = np.zeros(self.natoms * 4, dtype=np.float32)
+        offset = iSys * self.natoms * 4
+        cl.enqueue_copy(self.queue, buf, self.buffer_dict["apos"], src_offset=offset * f32sz)
+        return buf.reshape(self.natoms, 4)[:, :3]
+
+    def get_velocities(self, iSys=0, buf=None):
+        """Download atom velocities from GPU. Pass preallocated buf to avoid allocation."""
+        if buf is None:
+            buf = np.zeros(self.natoms * 4, dtype=np.float32)
+        offset = iSys * self.natoms * 4
+        cl.enqueue_copy(self.queue, buf, self.buffer_dict["avel"], src_offset=offset * f32sz)
+        return buf.reshape(self.natoms, 4)[:, :3]
 
     def prepare_kernel_args(self):
         """
@@ -271,6 +368,9 @@ class UFF_CL(OpenCLBase):
             self.kernel_params['npbc'] = np.int32(self.npbc)
             # Generic sizes used by clear kernels
             self.kernel_params['n'] = np.int32(self.natoms * self.nSystems)
+            # updateAtomsSPFFf4 expects int4 n = (natoms, nnode); for UFF nnode=natoms
+            self.kernel_params['n4'] = np.int32(self.natoms)
+            self.kernel_params['nnode'] = np.int32(self.natoms)
             # fint layout matching C++ UFF.h::realloc: dih|inv|ang|bon
             nf_per_system = self.ndihedrals * 4 + self.ninversions * 4 + self.nangles * 3 + self.nbonds
             self.kernel_params['nf_per_system'] = np.int32(nf_per_system)
@@ -304,13 +404,19 @@ class UFF_CL(OpenCLBase):
             'evalDihedrals_UFF',
             'evalInversions_UFF',
             'assembleForces_UFF',
+            'updateAtomsSPFFf4',
         }
         if self.bDoNonBonded:
             # Non-bonded kernels are optional; keep only if present
             needed.update({'getNonBond', 'getNonBond_ex2', 'getSurfMorse', 'getNonBond_GridFF_Bspline', 'getNonBond_GridFF_Bspline_ex2'})
 
         for kernel_name in needed:
-            if kernel_name in self.kernelheaders:
+            if kernel_name not in self.kernelheaders:
+                continue
+            if kernel_name == 'updateAtomsSPFFf4':
+                n_int4 = np.array([self.natoms, self.natoms, 0, 0], dtype=np.int32)
+                self.kernel_args[kernel_name] = self.generate_kernel_args(kernel_name, overrides={'n': n_int4})
+            else:
                 self.kernel_args[kernel_name] = self.generate_kernel_args(kernel_name)
 
         self.args_setup = True

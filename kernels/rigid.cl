@@ -12,6 +12,11 @@
 //   - rigid_body_gridff_kernel: MD step using precomputed GridFF (B-spline
 //     interpolated force field) for molecule-substrate interactions instead
 //     of pairwise atom-atom evaluation.
+//   - rigid_body_folded_kernel: MD step using analytic folded basis expansion
+//     (cos(kx*u)*cos(ky*v)*exp(-az*z)) for molecule-substrate interactions.
+//     Forces are computed analytically from the basis gradients — no grid
+//     precomputation needed. Coefficients are pre-fitted by
+//     fit_folded_surface_basis() to encode Pauli+London+Coulomb(Ewald).
 //
 // Helper functions: quat_mult, make_qrot, qrot_omega, quat_to_a/b/c,
 // sinc_div_r2_taylor, quat_factors_taylor (Taylor series for sin/cos).
@@ -448,6 +453,220 @@ void rigid_body_gridff_kernel(
     for (int i=0; i<ATOMS_PER_THREAD; i++) {
         const int atom_idx = lid + i*WORKGROUP_SIZE;
         if(atom_idx >= na) break;
+        const int ia = ia0 + atom_idx;
+        const float4 p_body = apos_body[ia];
+        const float3 p_world = pos.xyz + rotate_vec_by_matrix(p_body.xyz, &R);
+        apos_world[ia].xyz = p_world;
+    }
+    if (lid == 0) {
+        poss [gid] = pos;
+        qrots[gid] = qrot;
+        vposs[gid] = vpos;
+        vrots[gid] = vrot;
+    }
+}
+
+// ============================================================
+//  Folded Basis Rigid Body Dynamics (rigid_body_folded_kernel)
+// ============================================================
+//
+//  Same integration structure as rigid_body_gridff_kernel, but evaluates
+//  surface forces from an analytic folded basis expansion:
+//    E(x,y,z) = Sum_ib  c_ib * cos(2*pi*ku*u) * cos(2*pi*kv*v) * exp(-az*(z-z0))
+//  where (u,v) are fractional coordinates w.r.t. the 2D surface lattice.
+//
+//  The folded coefficients c_ib are pre-fitted (by fit_folded_surface_basis)
+//  to encode Pauli + London + Coulomb(2D Ewald) interactions per atom type.
+//
+//  Requires: common.cl + Forces.cl + rigid.cl  (self-contained, no surface.cl needed)
+
+#ifndef FOLDED_BASIS_MAX_RIGID
+#define FOLDED_BASIS_MAX_RIGID 128
+#endif
+#ifndef FOLDED_TYPES_MAX_RIGID
+#define FOLDED_TYPES_MAX_RIGID 8
+#endif
+
+inline float folded_eval_basis_rigid(float u, float v, float z, float4 prm){
+    float bx = cos( (2.0f*M_PI_F) * prm.x * u );
+    float by = cos( (2.0f*M_PI_F) * prm.y * v );
+    float dz = fmax(0.0f, z - prm.w);
+    float bz = exp( -prm.z * dz );
+    return bx * by * bz;
+}
+
+inline float3 folded_eval_grad_rigid(float u, float v, float z, float4 prm, float4 invLvec2d){
+    float phix = (2.0f*M_PI_F) * prm.x;
+    float phiy = (2.0f*M_PI_F) * prm.y;
+    float cu = cos(phix*u);
+    float su = sin(phix*u);
+    float cv = cos(phiy*v);
+    float sv = sin(phiy*v);
+    float dz = fmax(0.0f, z - prm.w);
+    float bz = exp(-prm.z * dz);
+    float dEdu = -phix * su * cv * bz;
+    float dEdv = -phiy * cu * sv * bz;
+    float dEdz = (z > prm.w) ? (-prm.z * cu * cv * bz) : 0.0f;
+    float dudx = invLvec2d.x;
+    float dudy = invLvec2d.z;
+    float dvdx = invLvec2d.y;
+    float dvdy = invLvec2d.w;
+    return (float3)( dEdu*dudx + dEdv*dvdx, dEdu*dudy + dEdv*dvdy, dEdz );
+}
+
+__kernel
+void rigid_body_folded_kernel(
+    __global const int*      mols,             // 1
+    __global       float4*   poss,             // 2
+    __global       float4*   qrots,            // 3
+    __global       float4*   vposs,            // 4
+    __global       float4*   vrots,            // 5
+    __global const cl_Mat3*  I_body_inv,       // 6
+    __global const float4*   apos_body,        // 7
+    __global       float4*   apos_world,       // 8
+    __global       float4*   atom_force,       // 9
+    __global       float4*   body_force,       // 10
+    __global       float4*   body_torque,      // 11
+    __global const float4*   anchors,          // 12
+    __global const float*    folded_coeffs,    // 13  [ntypes*nbasis]
+    __global const float4*   folded_kxyz,      // 14  [nbasis]
+    __global const int*      folded_atom_type, // 15  [natoms]
+    const int4               folded_meta,      // 16  (nbasis, ntypes, 0, 0)
+    const float4             folded_lvec2d,    // 17  (ax, bx, ay, by)
+    const float              dt,               // 18
+    const float4             md_params,        // 19  (lin_damp, ang_damp, force_scale, torque_scale)
+    const int                niter             // 20
+) {
+    const int gid   = get_group_id(0);
+    const int lid   = get_local_id(0);
+    const int lsize = get_local_size(0);
+    __local float4 pos;
+    __local float4 qrot;
+    __local float4 vpos;
+    __local float4 vrot;
+    __local float  inv_mass;
+    __local cl_Mat3 R;
+    __local cl_Mat3 Iinv_body;
+    __local float4 Ltorq [WORKGROUP_SIZE];
+    __local float4 Lforce[WORKGROUP_SIZE];
+    __local float4 LBASIS[FOLDED_BASIS_MAX_RIGID];
+    __local float  LCOEFFS[FOLDED_TYPES_MAX_RIGID * FOLDED_BASIS_MAX_RIGID];
+    const int ia0 = mols[gid];
+    const int na  = mols[gid+1]-ia0;
+    const int nbasis = folded_meta.x;
+    const int ntypes = folded_meta.y;
+
+    if (lid == 0) {
+        pos      = poss[gid];
+        qrot     = normalize(qrots[gid]);
+        vpos     = vposs[gid];
+        vrot     = vrots[gid];
+        inv_mass = (pos.w > 1e-8f) ? (1.0f / pos.w) : 1.0f;
+        Iinv_body.a = I_body_inv[gid].a;
+        Iinv_body.b = I_body_inv[gid].b;
+        Iinv_body.c = I_body_inv[gid].c;
+    }
+    // Cooperative load of basis params and coefficients into local memory
+    for (int j = lid; j < nbasis; j += lsize) {
+        LBASIS[j] = folded_kxyz[j];
+    }
+    for (int j = lid; j < nbasis * ntypes; j += lsize) {
+        LCOEFFS[j] = folded_coeffs[j];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Precompute inverse 2D lattice
+    float ax = folded_lvec2d.x;
+    float bx = folded_lvec2d.y;
+    float ay = folded_lvec2d.z;
+    float by = folded_lvec2d.w;
+    float det = ax*by - bx*ay;
+    float4 invLvec2d = (float4)( by/det, -bx/det, -ay/det, ax/det );
+
+    for (int step = 0; step < niter; ++step) {
+        if      (lid == 0) R.a = (float4){ quat_to_a(qrot), 0.f };
+        else if (lid == 1) R.b = (float4){ quat_to_b(qrot), 0.f };
+        else if (lid == 2) R.c = (float4){ quat_to_c(qrot), 0.f };
+        barrier(CLK_LOCAL_MEM_FENCE);
+        float4 total_torque = (float4)(0.0f);
+        float4 total_force  = (float4)(0.0f);
+        for (int i = 0; i < ATOMS_PER_THREAD; i++) {
+            const int atom_idx = lid + i*WORKGROUP_SIZE;
+            if (atom_idx >= na) break;
+            const int ia = ia0 + atom_idx;
+            const float4 p_body = apos_body[ia];
+            const float3 r_world = rotate_vec_by_matrix(p_body.xyz, &R);
+            const float3 p_world = pos.xyz + r_world;
+            // Compute fractional coordinates (u,v) from world (x,y)
+            float u = invLvec2d.x*p_world.x + invLvec2d.y*p_world.y;
+            float v = invLvec2d.z*p_world.x + invLvec2d.w*p_world.y;
+            u = u - floor(u);
+            v = v - floor(v);
+            // Evaluate folded basis potential and gradient for this atom's type
+            float E = 0.0f;
+            float3 f = (float3)(0.0f, 0.0f, 0.0f);
+            const int ityp = folded_atom_type[atom_idx];
+            if (ityp >= 0 && ityp < ntypes) {
+                int ioff = ityp * nbasis;
+                for (int ib = 0; ib < nbasis; ib++) {
+                    float c = LCOEFFS[ioff + ib];
+                    float4 prm = LBASIS[ib];
+                    float  b = folded_eval_basis_rigid(u, v, p_world.z, prm);
+                    float3 g = folded_eval_grad_rigid (u, v, p_world.z, prm, invLvec2d);
+                    E += c * b;
+                    f -= c * g;
+                }
+            }
+            // Anchor spring
+            float4 anchor = anchors[ia];
+            if (anchor.w > 0.0f) {
+                float3 d = p_world - anchor.xyz;
+                f += d * -anchor.w;
+            }
+            total_force.xyz  += f;
+            total_torque.xyz += cross(r_world, f);
+            apos_world[ia] = (float4)(p_world, E);
+            atom_force[ia] = (float4)(f, E);
+        }
+        Ltorq[lid]  = total_torque;
+        Lforce[lid] = total_force;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int stride = WORKGROUP_SIZE >> 1; stride > 0; stride >>= 1) {
+            if (lid < stride) {
+                Ltorq[lid]  += Ltorq [lid + stride];
+                Lforce[lid] += Lforce[lid + stride];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (lid == 0) {
+            const float lin_damp    = md_params.x;
+            const float ang_damp    = md_params.y;
+            const float force_scale = md_params.z;
+            const float torque_scale= md_params.w;
+            const float3 f       = Lforce[0].xyz * force_scale;
+            const float3 tq_world= Ltorq[0].xyz  * torque_scale;
+            body_force [gid] = (float4)(f, 0.0f);
+            body_torque[gid] = (float4)(tq_world, 0.0f);
+            const float3 tq_body    = mat3_dot_T(R, tq_world);
+            const float3 alpha_body = mat3_dot(Iinv_body, tq_body);
+            const float3 alpha_world= mat3_dot(R, alpha_body);
+            vpos.xyz *= lin_damp;
+            vrot.xyz *= ang_damp;
+            vpos.xyz += f * (dt * inv_mass);
+            vrot.xyz += alpha_world * dt;
+            pos.xyz  += vpos.xyz * dt;
+            qrot = normalize(quat_mult(qrot, make_qrot_taylor(vrot.xyz * dt)));
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    // Write back final state and world positions
+    if      (lid == 0) R.a = (float4){ quat_to_a(qrot), 0.f };
+    else if (lid == 1) R.b = (float4){ quat_to_b(qrot), 0.f };
+    else if (lid == 2) R.c = (float4){ quat_to_c(qrot), 0.f };
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int i = 0; i < ATOMS_PER_THREAD; i++) {
+        const int atom_idx = lid + i*WORKGROUP_SIZE;
+        if (atom_idx >= na) break;
         const int ia = ia0 + atom_idx;
         const float4 p_body = apos_body[ia];
         const float3 p_world = pos.xyz + rotate_vec_by_matrix(p_body.xyz, &R);

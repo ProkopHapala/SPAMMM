@@ -67,6 +67,11 @@ class Inversion:
 
 class UFF_Builder:
 
+    @staticmethod
+    def _hyb(name):
+        """Safely get hybridization char from UFF type name. 'H_' -> '1', 'C_3' -> '3', 'O_R' -> 'R'."""
+        return name[2] if len(name) > 2 else '1'
+
     def __init__(self, mol, bSimple=False, b141=False, bConj=False, bCumulene=False):
         self.mol = mol
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -1206,20 +1211,20 @@ class UFF_Builder:
                     rjk = self.assign_uff_params_calcrij(a.bonds[1])
                     rik = np.sqrt(rij**2 + rjk**2 - 2.0 * rij * rjk * ct)
                     kappa = 28.7989689090648 * ei.Quff * ek.Quff / (rik**5) * (3.0 * rij * rjk * st2 - rik**2 * ct)
-                    if self.params.atypes[aj.type].name[2] in ['1', '2', 'R']:
-                        if self.params.atypes[aj.type].name[2] == '1':
+                    if UFF_Builder._hyb(self.params.atypes[aj.type].name) in ['1', '2', 'R']:
+                        if UFF_Builder._hyb(self.params.atypes[aj.type].name) == '1':
                             a.k = kappa
                             a.C0 = 1.0
                             a.C1 = 1.0
                             a.C2 = 0.0
                             a.C3 = 0.0
-                        elif self.params.atypes[aj.type].name[2] in ['2', 'R']:
+                        elif UFF_Builder._hyb(self.params.atypes[aj.type].name) in ['2', 'R']:
                             a.k = kappa / 9.0
                             a.C0 = 1.0
                             a.C1 = 0.0
                             a.C2 = 0.0
                             a.C3 = -1.0
-                    elif self.params.atypes[aj.type].name[2] == '3':
+                    elif UFF_Builder._hyb(self.params.atypes[aj.type].name) == '3':
                         a.k = kappa
                         a.C2 = 1.0 / (4.0 * st2)
                         a.C1 = -4.0 * a.C2 * ct
@@ -1239,14 +1244,14 @@ class UFF_Builder:
             for in1 in range(n1):
                 i2 = neighs[i1, in1]
                 a2 = self.builder_atoms[i2]
-                if self.params.atypes[a2.type].name[0] == 'H' or self.params.atypes[a2.type].name[2] == '1':
+                if self.params.atypes[a2.type].name[0] == 'H' or UFF_Builder._hyb(self.params.atypes[a2.type].name) == '1':
                     continue
                 c2 = self.mol.confs[a2.iconf]
                 for in2 in range(c2.nbond):
                     i3 = neighs[i2, in2]
                     if i3 != i1:
                         a3 = self.builder_atoms[i3]
-                        if self.params.atypes[a3.type].name[0] == 'H' or self.params.atypes[a3.type].name[2] == '1':
+                        if self.params.atypes[a3.type].name[0] == 'H' or UFF_Builder._hyb(self.params.atypes[a3.type].name) == '1':
                             continue
                         c3 = self.mol.confs[a3.iconf]
                         for in3 in range(c3.nbond):
@@ -1258,7 +1263,7 @@ class UFF_Builder:
                                 d.bonds = (self.mol.get_bond_by_atoms(i1, i2), self.mol.get_bond_by_atoms(i2, i3), self.mol.get_bond_by_atoms(i3, i4))
                                 e2 = self.params.elementOfAtomType(a2.type)
                                 e3 = self.params.elementOfAtomType(a3.type)
-                                if self.params.atypes[a2.type].name[2] == '3' and self.params.atypes[a3.type].name[2] == '3':
+                                if UFF_Builder._hyb(self.params.atypes[a2.type].name) == '3' and UFF_Builder._hyb(self.params.atypes[a3.type].name) == '3':
                                     d.k = np.sqrt(e2.Vuff * e3.Vuff)
                                     d.d = 1
                                     d.n = 3
@@ -1268,29 +1273,29 @@ class UFF_Builder:
                                         d.k *= 2.0 if self.params.atypes[a2.type].name[0] == 'O' else 6.8
                                         d.k *= 2.0 if self.params.atypes[a3.type].name[0] == 'O' else 6.8
                                         d.k = np.sqrt(d.k)
-                                elif (self.params.atypes[a2.type].name[2] == '3' and self.params.atypes[a3.type].name[2] in ['2', 'R']) or (self.params.atypes[a2.type].name[2] in ['2', 'R'] and self.params.atypes[a3.type].name[2] == '3'):
+                                elif (UFF_Builder._hyb(self.params.atypes[a2.type].name) == '3' and UFF_Builder._hyb(self.params.atypes[a3.type].name) in ['2', 'R']) or (UFF_Builder._hyb(self.params.atypes[a2.type].name) in ['2', 'R'] and UFF_Builder._hyb(self.params.atypes[a3.type].name) == '3'):
                                     d.k = 4.1840 / 60.2214076 / 1.602176634
                                     d.d = -1
                                     d.n = 6
-                                    if (self.params.atypes[a2.type].name[2] == '3' and self.params.atypes[a2.type].name[0] in ['O', 'S']) or (self.params.atypes[a3.type].name[2] == '3' and self.params.atypes[a3.type].name[0] in ['O', 'S']):
+                                    if (UFF_Builder._hyb(self.params.atypes[a2.type].name) == '3' and self.params.atypes[a2.type].name[0] in ['O', 'S']) or (UFF_Builder._hyb(self.params.atypes[a3.type].name) == '3' and self.params.atypes[a3.type].name[0] in ['O', 'S']):
                                         ib = self.mol.get_bond_by_atoms(i2, i3)
                                         b = self.bonds[ib]
                                         d.k = 5.0 * np.sqrt(e2.Uuff * e3.Uuff) * (1.0 + 4.18 * np.log(b.order))
                                         d.d = 1
                                         d.n = 2
-                                    if self.params.atypes[a2.type].name[2] == '3':
-                                        found = any(self.params.atypes[self.builder_atoms[neighs[i3, i]].type].name[2] in ['2', 'R'] for i in range(c3.nbond))
+                                    if UFF_Builder._hyb(self.params.atypes[a2.type].name) == '3':
+                                        found = any(UFF_Builder._hyb(self.params.atypes[self.builder_atoms[neighs[i3, i]].type].name) in ['2', 'R'] for i in range(c3.nbond))
                                         if found:
                                             d.k = 2.0 * 4.1840 / 60.2214076 / 1.602176634
                                             d.d = 1
                                             d.n = 3
-                                    elif self.params.atypes[a3.type].name[2] == '3':
-                                        found = any(self.params.atypes[self.builder_atoms[neighs[i2, i]].type].name[2] in ['2', 'R'] for i in range(c2.nbond))
+                                    elif UFF_Builder._hyb(self.params.atypes[a3.type].name) == '3':
+                                        found = any(UFF_Builder._hyb(self.params.atypes[self.builder_atoms[neighs[i2, i]].type].name) in ['2', 'R'] for i in range(c2.nbond))
                                         if found:
                                             d.k = 2.0 * 4.1840 / 60.2214076 / 1.602176634
                                             d.d = 1
                                             d.n = 3
-                                elif self.params.atypes[a2.type].name[2] in ['2', 'R'] and self.params.atypes[a3.type].name[2] in ['2', 'R']:
+                                elif UFF_Builder._hyb(self.params.atypes[a2.type].name) in ['2', 'R'] and UFF_Builder._hyb(self.params.atypes[a3.type].name) in ['2', 'R']:
                                     ib = self.mol.get_bond_by_atoms(i2, i3)
                                     b = self.bonds[ib]
                                     d.k = 5.0 * np.sqrt(e2.Uuff * e3.Uuff) * (1.0 + 4.18 * np.log(b.order))
@@ -1326,20 +1331,20 @@ class UFF_Builder:
         i = Inversion()
         i.atoms = (i1, i2, i3, i4)
         i.bonds = (self.mol.get_bond_by_atoms(i1, i2), self.mol.get_bond_by_atoms(i1, i3), self.mol.get_bond_by_atoms(i1, i4))
-        if self.params.atypes[a1.type].name[0] == 'C' and self.params.atypes[a1.type].name[2] in ['2', 'R']:
-            if any(self.params.atypes[self.builder_atoms[at].type].name[0] == 'O' and self.params.atypes[self.builder_atoms[at].type].name[2] == '2' for at in [i2, i3, i4]):
+        if self.params.atypes[a1.type].name[0] == 'C' and UFF_Builder._hyb(self.params.atypes[a1.type].name) in ['2', 'R']:
+            if any(self.params.atypes[self.builder_atoms[at].type].name[0] == 'O' and UFF_Builder._hyb(self.params.atypes[self.builder_atoms[at].type].name) == '2' for at in [i2, i3, i4]):
                 i.k = 50.0 * 4.1840 / 60.2214076 / 1.602176634
             else:
                 i.k = 6.0 * 4.1840 / 60.2214076 / 1.602176634
             i.C0 = 1.0
             i.C1 = -1.0
             i.C2 = 0.0
-        elif self.params.atypes[a1.type].name[0] == 'N' and self.params.atypes[a1.type].name[2] in ['2', 'R']:
+        elif self.params.atypes[a1.type].name[0] == 'N' and UFF_Builder._hyb(self.params.atypes[a1.type].name) in ['2', 'R']:
             i.k = 6.0 * 4.1840 / 60.2214076 / 1.602176634
             i.C0 = 1.0
             i.C1 = -1.0
             i.C2 = 0.0
-        elif self.params.atypes[a1.type].name[0] == 'N' and self.params.atypes[a1.type].name[2] == '3':
+        elif self.params.atypes[a1.type].name[0] == 'N' and UFF_Builder._hyb(self.params.atypes[a1.type].name) == '3':
             i.k = 0.0
             i.C0 = 0.0
             i.C1 = 0.0

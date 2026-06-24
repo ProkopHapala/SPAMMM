@@ -153,7 +153,7 @@ class ManipulationPathOpt:
 
         # Start from the already-packed reference system0 geometry (includes atoms + nodes)
         apos0_full = np.empty((self.mm.nvecs, 4), dtype=np.float32)
-        cl.enqueue_copy(self.md.queue, apos0_full, self.md.buffer_dict['apos'], device_offset=0)
+        cl.enqueue_copy(self.md.queue, apos0_full, self.md.buffer_dict['apos'], src_offset=0)
         self.md.queue.finish()
 
         # Overwrite atom positions from provided initial_pos (keep node layout as in SPFF packing)

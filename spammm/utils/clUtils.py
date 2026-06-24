@@ -15,6 +15,7 @@ and GridFF.py (grid dimension management).
 
 import sys
 import os
+import warnings
 import numpy as np
 import ctypes
 import pyopencl as cl
@@ -92,9 +93,13 @@ def get_cl_info( device ):
               
     # Get local memory characteristics - handle missing characterize module gracefully
     try:
-        granularity      = cl.characterize.local_memory_access_granularity(device)
-        bank_count       = cl.characterize.local_memory_bank_count(device)
-        usable_local_mem = cl.characterize.usable_local_mem_size(device)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            granularity      = cl.characterize.local_memory_access_granularity(device)
+            bank_count       = cl.characterize.local_memory_bank_count(device)
+            usable_local_mem = cl.characterize.usable_local_mem_size(device)
+        for warning in w:
+            print(f"Note: {warning.category.__name__}: {warning.message}")
         # Print results
         print(f"Local Memory Access Granularity: {granularity} bytes")
         print(f"Number of Local Memory Banks: {bank_count}")

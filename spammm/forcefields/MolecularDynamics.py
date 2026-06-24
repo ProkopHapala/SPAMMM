@@ -89,14 +89,17 @@ class MolecularDynamics(OpenCLBase):
         super().__init__(nloc=nloc, device_index=0)
         
         # Load the OpenCL program (concatenated modular kernel files)
+        # nonbonded.cl contains getNonBond_ex2 (molecule-molecule) + bucket kernels
+        # that use getR4repulsion from surface.cl, so we need gridFF.cl + surface.cl first.
+        # nonbonded_grid.cl has GridFF-augmented NB kernels (loaded separately when needed).
         kernel_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../kernels')
         kernel_paths = [
             os.path.join(kernel_dir, 'common.cl'),
             os.path.join(kernel_dir, 'Forces.cl'),
             os.path.join(kernel_dir, 'SPFF.cl'),
-            os.path.join(kernel_dir, 'nonbonded.cl'),
             os.path.join(kernel_dir, 'gridFF.cl'),
             os.path.join(kernel_dir, 'surface.cl'),
+            os.path.join(kernel_dir, 'nonbonded.cl'),
         ]
         if not self.load_program_multi(kernel_paths, bPrint=False, build_options=debug_build_options):
             exit(1)
@@ -1069,9 +1072,12 @@ class MolecularDynamics(OpenCLBase):
             raise ValueError(f"set_folded_kernel_kind(): unknown kind '{kind}', expected one of {FOLDED_KERNEL_NAMES}")
         self.folded_kernel_kind = kind
 
-    def _build_folded_basis_params(self, nu=4, nv=4, nz=4, z0=0.0, z_scale=0.75):
+    def _build_folded_basis_params(self, nu=4, nv=4, nz=4, z0=0.0, z_scale=0.75, custom_alphas=None):
         params = []
-        alphas = z_scale * (1.0 + np.arange(int(nz), dtype=np.float32))
+        if custom_alphas is not None:
+            alphas = np.asarray(custom_alphas, dtype=np.float32)
+        else:
+            alphas = z_scale * (1.0 + np.arange(int(nz), dtype=np.float32))
         for iu in range(int(nu)):
             for iv in range(int(nv)):
                 for az in alphas:
@@ -1180,7 +1186,7 @@ class MolecularDynamics(OpenCLBase):
         out[2, :3] = np.array(self.surface_lvec[2, :3], dtype=np.float32)
         return out
 
-    def fit_folded_surface_basis(self, surf_xyz=None, type_map=None, nPBC=(4,4,0), z_range=(0.5, 8.0), nu=4, nv=4, nz=4, nxy=32, nz_samp=40, r_damp=0.0, alpha_morse=1.8, bMacro=True, components=('total',), fit_mask=None, weight_power=0.0, coulomb_solver='morse', ewald_n_harm=6):
+    def fit_folded_surface_basis(self, surf_xyz=None, type_map=None, nPBC=(4,4,0), z_range=(0.5, 8.0), nu=4, nv=4, nz=4, nxy=32, nz_samp=40, r_damp=0.0, alpha_morse=1.8, bMacro=True, components=('total',), fit_mask=None, weight_power=0.0, coulomb_solver='morse', ewald_n_harm=6, z_scale=None, custom_alphas=None):
         if self.rigid_REQs0 is None:
             raise ValueError('fit_folded_surface_basis(): call init_rigid_molecule_batch() first')
         if surf_xyz is None:
@@ -1191,7 +1197,9 @@ class MolecularDynamics(OpenCLBase):
         ntypes = len(uniq_REQs)
         if ntypes > FOLDED_TYPES_MAX:
             raise ValueError(f'fit_folded_surface_basis(): ntypes={ntypes} exceeds FOLDED_TYPES_MAX={FOLDED_TYPES_MAX}')
-        basis_params = self._build_folded_basis_params(nu=nu, nv=nv, nz=nz, z0=float(z_range[0]), z_scale=1.0/max(1e-6, float(z_range[1]-z_range[0])))
+        if z_scale is None:
+            z_scale = 1.0/max(1e-6, float(z_range[1]-z_range[0]))
+        basis_params = self._build_folded_basis_params(nu=nu, nv=nv, nz=nz, z0=float(z_range[0]), z_scale=float(z_scale), custom_alphas=custom_alphas)
         nbasis = len(basis_params)
         self.folded_lvec_basis = self._infer_folded_primitive_lvec2d()
         a = np.array(self.folded_lvec_basis[0, :3], dtype=np.float32)
@@ -1542,20 +1550,18 @@ class MolecularDynamics(OpenCLBase):
     
     def run_step_basic(self, do_nb=False ):
         """Run a single MD step using basic (non-rotational) force kernels."""
-        if do_nb: 
-            self.prg.getNonBond      (self.queue, self.sz_na,   self.sz_loc, *self.kernel_args_getNonBond)
-        else:
-            self.prg.cleanForceSPFFf4(self.queue, self.sz_na,   self.sz_loc, *self.kernel_args_cleanForceSPFFf4)
+        self.prg.cleanForceSPFFf4(self.queue, self.sz_na,   self.sz_loc, *self.kernel_args_cleanForceSPFFf4)
+        if do_nb:
+            self.prg.getNonBond_ex2  (self.queue, self.sz_na,   self.sz_loc, *self.kernel_args_getNonBond_ex2)
         self.prg.getSPFFf4           (self.queue, self.sz_node, self.sz_loc, *self.kernel_args_getSPFFf4)
         self.prg.updateAtomsSPFFf4   (self.queue, self.sz_nvec, self.sz_loc, *self.kernel_args_updateAtomsSPFFf4)
         self.queue.finish()
 
     def run_step_rot(self, do_nb=False):
         """Run a single MD step using rotational force and update kernels."""
-        if do_nb: 
-            self.prg.getNonBond       (self.queue, self.sz_na,   self.sz_loc, *self.kernel_args_getNonBond)
-        else:
-            self.prg.cleanForceSPFFf4 (self.queue, self.sz_na,   self.sz_loc, *self.kernel_args_cleanForceSPFFf4)
+        self.prg.cleanForceSPFFf4 (self.queue, self.sz_na,   self.sz_loc, *self.kernel_args_cleanForceSPFFf4)
+        if do_nb:
+            self.prg.getNonBond_ex2  (self.queue, self.sz_na,   self.sz_loc, *self.kernel_args_getNonBond_ex2)
         self.prg.getSPFFf4_rot        (self.queue, self.sz_node, self.sz_loc, *self.kernel_args_getSPFFf4_rot)
         self.prg.updateAtomsSPFFf4_rot(self.queue, self.sz_nvec, self.sz_loc, *self.kernel_args_updateAtomsSPFFf4_rot)
         self.queue.finish()
@@ -1571,6 +1577,50 @@ class MolecularDynamics(OpenCLBase):
         self.fromGPU('apos',   self.atoms)
         self.fromGPU('aforce', self.aforce)
         return self.atoms.reshape(-1, 4), self.aforce.reshape(-1, 4)
+
+    def get_total_energy(self):
+        """Download force buffer and sum .w (energy) component over all atoms."""
+        self.fromGPU('aforce', self.aforce)
+        return float(np.sum(self.aforce.reshape(-1, 4)[:self.natoms, 3]))
+
+    def get_positions(self):
+        """Download and return atom positions (natoms, 3)."""
+        self.fromGPU('apos', self.atoms)
+        return self.atoms.reshape(-1, 4)[:self.natoms, :3].copy()
+
+    def get_velocities(self):
+        """Download and return atom velocities (natoms, 3)."""
+        vel = np.zeros((self.nSystems, self.nvecs, 4), dtype=np.float32)
+        self.fromGPU('avel', vel)
+        return vel.reshape(-1, 4)[:self.natoms, :3].copy()
+
+    def get_forces(self):
+        """Download and return forces (natoms, 4)."""
+        self.fromGPU('aforce', self.aforce)
+        return self.aforce.reshape(-1, 4)[:self.natoms].copy()
+
+    def set_md_params(self, dt=0.01, damp=0.95, Flimit=1e10):
+        """Set MD parameters (dt, damp, Flimit) and upload to GPU."""
+        self.kernel_params['MDparams'] = np.array([dt, damp, Flimit, 0.0], dtype=np.float32)
+        float4_size = 4 * np.float32().itemsize
+        for iS in range(self.nSystems):
+            self.toGPU('MDparams', np.array([dt, damp, Flimit, 0.0], dtype=np.float32), byte_offset=iS*float4_size)
+
+    def relax(self, nsteps=100, dt=0.01, damp=0.95, Flimit=100.0, use_rot=False, do_nb=False):
+        """Run relaxation entirely on GPU. Returns final energy."""
+        self.set_md_params(dt=dt, damp=damp, Flimit=Flimit)
+        step_fn = self.run_step_rot if use_rot else self.run_step_basic
+        for _ in range(nsteps):
+            step_fn(do_nb=do_nb)
+        return self.get_total_energy()
+
+    def run_md(self, nsteps=100, dt=0.01, Flimit=1e10, use_rot=False, do_nb=False):
+        """NVE molecular dynamics entirely on GPU. Returns final energy."""
+        self.set_md_params(dt=dt, damp=1.0, Flimit=Flimit)
+        step_fn = self.run_step_rot if use_rot else self.run_step_basic
+        for _ in range(nsteps):
+            step_fn(do_nb=do_nb)
+        return self.get_total_energy()
     
     def initGridFF(self, grid_shape, bspline_data, grid_p0, grid_step, use_texture=False, r_damp=0.0, alpha_morse=0.0, bKernels=True):
         """Initialize GridFF with B-spline data"""
