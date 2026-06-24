@@ -21,8 +21,8 @@ projection) and pySCF (CPU evaluation).
 import os
 import numpy as np
 import spammm.atomicUtils as au
-from spammm.OCL import AFM as afm
-from spammm.OCL import AFM_utils as afm_utils
+from spammm.SPM import AFM as afm
+from spammm.SPM import AFM_utils as afm_utils
 from spammm.config_utils import get_config, get_path, get_dftb_basis_path
 
 class ModularAFMPipeline:
@@ -452,7 +452,7 @@ Hamiltonian = DFTB {{
         # Set default Pauli params based on backend
         if pauli_params is None:
             if self.backend == 'pyscf':
-                from spammm.OCL import AFM as afm_mod
+                from spammm.SPM import AFM as afm_mod
                 pyscf_basis_key = f"pyscf_{self.pyscf_params.get('basis', 'sto-3g')}"
                 if pyscf_basis_key in afm_mod.PAULI_FITTED_DEFAULTS:
                     pauli_params = afm_mod.PAULI_FITTED_DEFAULTS[pyscf_basis_key]
@@ -461,7 +461,7 @@ Hamiltonian = DFTB {{
                     print(f"  WARNING: No fitted Pauli params found for {pyscf_basis_key}, using default")
                     pauli_params = {'A': 1.15, 'beta': 0.36}  # Fitted for sto-3g
             else:
-                from spammm.OCL import AFM as afm_mod
+                from spammm.SPM import AFM as afm_mod
                 if self.basis in afm_mod.PAULI_FITTED_DEFAULTS:
                     pauli_params = afm_mod.PAULI_FITTED_DEFAULTS[self.basis]
                     print(f"  Using DFTB Pauli defaults for {self.basis}: A={pauli_params['A']:.2f}, beta={pauli_params['beta']:.2f}")

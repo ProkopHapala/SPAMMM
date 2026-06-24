@@ -47,6 +47,7 @@ inline float4 getMorseQH( float3 dp,  float4 REQH, float K, float R2damp ){
     return  (float4){ dp*fr, EMors+Eel };
 }
 
+#if 0  // --- macro templates below are not compiled directly; used via preprocess_opencl_source ---
 //>>>macro MODEL_LJQH2_PAIR
 {
     // Distance safeguards
@@ -217,6 +218,8 @@ inline float4 getMorseQH( float3 dp,  float4 REQH, float K, float R2damp ){
     float ELJ  =  E0 * ( e2p - 2.f * e );
     Ei += ELJ + Eel;
 }
+
+#endif  // --- end of macro templates ---
 
 // ---- Damped Coulomb potential ----
 // evaluate damped Coulomb potential and force

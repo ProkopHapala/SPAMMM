@@ -36,7 +36,7 @@ import pyopencl as cl
 import pyopencl.array as cl_array
 import time
 
-from . import clUtils as clu
+from ..utils import clUtils as clu
 
 COULOMB_CONST = 14.3996448915  # eV·Å/e²
 
@@ -87,6 +87,7 @@ class SurfaceEwaldCL:
             kernel_paths = [
                 os.path.join(kernel_dir, 'common.cl'),
                 os.path.join(kernel_dir, 'Forces.cl'),
+                os.path.join(kernel_dir, 'gridFF.cl'),
                 os.path.join(kernel_dir, 'surface.cl'),
             ]
             source_parts = []
@@ -401,6 +402,50 @@ class SurfaceEwaldCL:
         
         print(f"Brute evaluation: {N_points} points in {t1-t0:.3f} s ({N_points/(t1-t0):.0f} pts/s)")
         
+        return phi_out.reshape(X.shape)
+
+    def eval_cluster(self, X, Y, Z, ion_data):
+        """
+        Finite-cluster Coulomb sum (no PBC) on GPU.
+        Uses local-memory tiling for speed.
+
+        Parameters:
+            X, Y, Z: 2D arrays - evaluation coordinates
+            ion_data: (N,4) float32 array of [x,y,z,q] for the finite cluster
+
+        Returns:
+            phi: 2D array - potential in eV/e
+        """
+        x_flat = X.ravel().astype(np.float32)
+        y_flat = Y.ravel().astype(np.float32)
+        z_flat = Z.ravel().astype(np.float32)
+        N_points = len(x_flat)
+        eval_points = np.column_stack([x_flat, y_flat, z_flat, np.zeros(N_points, dtype=np.float32)])
+        ion_data = np.ascontiguousarray(ion_data, dtype=np.float32)
+        N_ions = len(ion_data)
+
+        mf = cl.mem_flags
+        eval_buff = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=eval_points)
+        ion_buff = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=ion_data)
+        phi_out = np.empty(N_points, dtype=np.float32)
+        phi_buff = cl.Buffer(self.ctx, mf.WRITE_ONLY, phi_out.nbytes)
+
+        lsz = 64
+        local_bytes = lsz * 16  # float4 = 16 bytes
+        n_global = ((N_points + lsz - 1) // lsz) * lsz
+
+        t0 = time.time()
+        self.prg.eval_potential_cluster(
+            self.queue, (n_global,), (lsz,),
+            eval_buff, ion_buff,
+            np.int32(N_points), np.int32(N_ions),
+            phi_buff,
+            cl.LocalMemory(local_bytes)
+        )
+        cl.enqueue_copy(self.queue, phi_out, phi_buff)
+        self.queue.finish()
+        t1 = time.time()
+        print(f"Cluster evaluation: {N_points} points x {N_ions} ions in {t1-t0:.3f} s ({N_points/(t1-t0):.0f} pts/s)")
         return phi_out.reshape(X.shape)
 
 

@@ -1322,7 +1322,7 @@ def project_density_grids(rho_sparse, rho_na_sparse, neighs, atomTypes, atomPos,
     Returns (rho_grid, rho_na_grid, rho_diff, projector).
     proj_kwargs: dict passed to GridProjector and .project() (e.g. use_tiled, debug flags).
     """
-    from spammm.FireballOCL import Grid as ocl_grid
+    from spammm.quantum.DFTB import Grid_dftb as ocl_grid
     if proj_kwargs is None:
         proj_kwargs = {}
     # Extract GridProjector constructor kwargs
@@ -1723,7 +1723,7 @@ def project_single_atom(Z, rho_4x4, step, margin, fdata_basis_dir, use_tiled=Tru
     Project density for a single atom at origin with given 4x4 density matrix block.
     Returns (rho_grid, grid_spec, integral, projector).
     """
-    from spammm.FireballOCL import Grid as ocl_grid
+    from spammm.quantum.DFTB import Grid_dftb as ocl_grid
     block = 8
     n = int(np.ceil(2*margin / step / block)) * block
     origin = np.array([-n*step/2, -n*step/2, -n*step/2], dtype=np.float32)

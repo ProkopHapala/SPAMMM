@@ -33,6 +33,8 @@
 // ---- Samplers for GridFF ----
 __constant sampler_t sampler_gff_norm =  CLK_NORMALIZED_COORDS_TRUE  | CLK_ADDRESS_REPEAT | CLK_FILTER_LINEAR;
 
+#ifndef MAKE_INDS_PBC_DEF
+#define MAKE_INDS_PBC_DEF
 inline int4 make_inds_pbc(const int n, const int iG) {
     switch( iG ){
         case 0: { return (int4)(0, 1,   2,   3  ); }
@@ -46,6 +48,7 @@ inline int4 make_inds_pbc(const int n, const int iG) {
     // iqs[2] = (int4)(0, 1,   2-n, 3-n);
     // iqs[3] = (int4)(0, 1-n, 2-n, 3-n);
 }
+#endif
 
 inline int4 choose_inds_pbc(const int i, const int n, const int4* iqs) {
     if (i >= (n-3)) {

@@ -48,3 +48,14 @@ Before writing ad-hoc debugging/plotting code, check these existing modules:
 - **Reuse over reinvent:** Before writing new debug/plot/test functions, search existing utility modules. Generalize existing functions if they almost fit your needs.
 - **Separate concerns:** Keep compute algorithms separate from plotting/diagnostics. Move ad-hoc plotting code from test scripts into shared utilities.
 - **Zero-copy buffers:** For Python-C++ interop, use `np.ctypeslib.as_array` pattern (see `python_native_bindings` skill) instead of copying data.
+
+## Plot Style Preferences
+
+When creating diagnostic comparison plots (e.g., reference vs model curves):
+
+- **Subtract constant offset (DC term):** Methods like Ewald summation cannot capture the constant (DC/zero-frequency) term, causing a constant shift between model and reference. Compute `dc = mean(model - ref)` and subtract it from the model so curves overlap. Center reference by subtracting its own mean for display. The residual difference after this shift reveals true numerical error.
+- **Reference curve:** `ls=':'`, `lw=1.5` (dotted, thick — clearly visible as the reference)
+- **Model curve(s):** `ls='-'`, `lw=0.5` (solid, thin — the thing being tested)
+- **Residual difference on twin axis:** Plot `(model_shifted - ref) * 100` on a secondary y-axis (twinx) so small residual errors are visible. Label it `diff x100`.
+- **RMSE/MaxErr box:** Show RMSE and max error in a text box (upper-left, monospace, semi-transparent background).
+- **General rule:** The reference should always be more visually prominent (thicker, dotted) than the model being compared.

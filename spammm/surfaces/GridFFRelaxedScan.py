@@ -25,9 +25,9 @@ import pyopencl as cl
 import importlib.util
 
 from spammm.AtomicSystem import AtomicSystem
-from spammm.OCL.SPFF import SPFF as SPFF_pyocl
-from spammm.OCL.MolecularDynamics import MolecularDynamics
-from spammm.tests import ocl_GridFF_new as gff_ocl
+from spammm.forcefields.SPFF import SPFF as SPFF_pyocl
+from spammm.forcefields.MolecularDynamics import MolecularDynamics
+from tests.surfaces import ocl_GridFF_new as gff_ocl
 
 
 DEFAULT_MOL_TYPE_MAP = {'C': 'C_R', 'O': 'O_2', 'H': 'H'}

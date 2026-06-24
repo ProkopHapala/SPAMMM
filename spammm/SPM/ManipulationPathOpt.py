@@ -24,8 +24,8 @@ import time
 import os
 
 from spammm.AtomicSystem import AtomicSystem
-from spammm.OCL.SPFF import SPFF as SPFF_pyocl
-from spammm.OCL.MolecularDynamics import MolecularDynamics
+from spammm.forcefields.SPFF import SPFF as SPFF_pyocl
+from spammm.forcefields.MolecularDynamics import MolecularDynamics
 import matplotlib.pyplot as plt
 
 class ManipulationPathOpt:

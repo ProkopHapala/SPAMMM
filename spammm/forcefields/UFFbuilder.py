@@ -17,7 +17,7 @@ the flat arrays that UFF.cl expects. Also used standalone for parameter inspecti
 
 import os
 import numpy as np
-from  .. import SPFF as spff
+from  . import SPFF as spff
 from ..topology import FFparams as mmparams
 from .. import atomicUtils as au
 

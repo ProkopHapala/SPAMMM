@@ -142,6 +142,11 @@ def select_device(platforms=None, preferred_vendor='nvidia', bPrint=False, devic
         ctx = cl.Context([device])
         if bPrint:
             print(f"Selected {preferred_vendor} device: {device.name}")
+        # Set PYOPENCL_CTX so any later cl.create_some_context() calls won't prompt
+        for pi, p in enumerate(platforms):
+            if p is platform:
+                os.environ.setdefault('PYOPENCL_CTX', str(pi))
+                break
     else:
         devices = []
         for platform in platforms:

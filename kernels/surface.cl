@@ -151,6 +151,8 @@ float4 getR4repulsion( float3 d, float R, float Rcut, float A ){
     }
 }
 
+#ifndef MAKE_INDS_PBC_DEF
+#define MAKE_INDS_PBC_DEF
 inline int4 make_inds_pbc(const int n, const int iG) {
     // Generate PBC index patterns for B-spline interpolation
     // Returns 4 indices: (i0, i1, i2, i3) for 4-point B-spline
@@ -163,6 +165,7 @@ inline int4 make_inds_pbc(const int n, const int iG) {
     inds.w = (i + 2) % n;
     return inds;
 }
+#endif
 
 // ============================================================
 //  Brute Force Surface Interaction (getSurfMorse)
@@ -790,6 +793,87 @@ __kernel void eval_potential_brute(
     }
 
     phi_out[ip] = phi * COULOMB_CONST;
+}
+
+// ------------------------------------------------------------------
+// Kernel 5: Finite-cluster Coulomb sum (no PBC, local-memory tiling)
+//
+// Computes V(r) = sum_j q_j / |r - r_j| * COULOMB_CONST for a finite
+// cluster of ions (no periodic boundary conditions). Used as a
+// brute-force reference for Ewald summation tests.
+//
+// Accumulation: two-sum (error-free transform) double-single, giving
+// ~48 bits of mantissa precision in float32. This reduces accumulation
+// error to ~1.3e-6, below the per-term q/r float32 error (~1.9e-6).
+// The remaining ~1.5e-6 RMSE is the float32 sqrt/division floor.
+//
+// CAVEAT: The bounds check `if(ip >= N_points) return;` MUST NOT be
+// placed before the barrier(CLK_LOCAL_MEM_FENCE). If some threads in
+// a workgroup return early, they skip the barrier, causing undefined
+// behavior (hang/crash/garbage) because not all threads cooperate on
+// loading ion_loc. The check must be inside the loop, around the
+// computation block only, so ALL threads participate in loading.
+// ------------------------------------------------------------------
+__kernel void eval_potential_cluster(
+    __global const float4* eval_points,
+    __global const float4* ion_data,
+    const int N_points,
+    const int N_ions,
+    __global float* phi_out,
+    __local float4* ion_loc
+){
+    const int ip = get_global_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+
+    float3 r = (float3)(0.0f, 0.0f, 0.0f);
+    if(ip < N_points){
+        float4 p = eval_points[ip];
+        r = (float3)(p.x, p.y, p.z);
+    }
+
+    // Double-single accumulator via two-sum (error-free transform)
+    // (hi, lo) together represent ~48 bits of precision
+    float phi_hi = 0.0f;
+    float phi_lo = 0.0f;
+
+    for(int base = 0; base < N_ions; base += lsz){
+        int j = base + lid;
+        if(j < N_ions){
+            ion_loc[lid] = ion_data[j];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        int imax = N_ions - base;
+        if(imax > lsz) imax = lsz;
+
+        if(ip < N_points){
+            for(int i = 0; i < imax; i++){
+                float4 ion = ion_loc[i];
+                float3 ri = (float3)(ion.x, ion.y, ion.z);
+                float q = ion.w;
+                float3 dr = r - ri;
+                float r_mag = sqrt(dr.x*dr.x + dr.y*dr.y + dr.z*dr.z);
+                if(r_mag > 1e-12f){
+                    float term = q / r_mag;
+                    // Two-sum: add term to (phi_hi, phi_lo)
+                    // Step 1: two_sum(phi_hi, term) -> (s, e)
+                    float s = phi_hi + term;
+                    float bb = s - phi_hi;
+                    float e = (phi_hi - (s - bb)) + (term - bb);
+                    // Step 2: add phi_lo and e, then renormalize
+                    float lo = phi_lo + e;
+                    phi_hi = s + lo;
+                    phi_lo = lo - (phi_hi - s);
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if(ip < N_points){
+        phi_out[ip] = (phi_hi + phi_lo) * COULOMB_CONST;
+    }
 }
 
 // ---- From relax_multi.cl: additional surface kernels ----

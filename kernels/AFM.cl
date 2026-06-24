@@ -118,7 +118,9 @@ void move_LeapFrog( float3 f, float3 p, float3 v, float2 RP ){
 #define N_RELAX_STEP_MAX  128
 #define F2CONV  1e-8f
 
+#ifndef OPT_FIRE
 #define OPT_FIRE 1
+#endif
 #if OPT_FIRE 
 #define FTDEC 0.5f
 #define FTINC 1.1f
@@ -150,6 +152,7 @@ float3 update_FIRE( float3 f, float3 v, float* dt, float* damp,    float dtmin, 
     //v  += f * dt;
     //p  += v * dt;
 }
+#endif // OPT_FIRE
 
 // ---- AFM force field sampling kernels ----
 __kernel void getFEinPoints(
@@ -721,7 +724,7 @@ __kernel void izoZ(
 // =========================================
 
 // ---- AFM-specific pair potential functions ----
-float4 getCoulomb( float4 atom, float3 pos ){
+float4 getCoulombAFM( float4 atom, float3 pos ){
      float3  dp  =  pos - atom.xyz;
      float   ir2 = 1.0f/( dot(dp,dp) +  R2SAFE );
      float   ir  = sqrt(ir2);
@@ -891,10 +894,10 @@ __kernel void evalLJC_QZs(
                 //if(iG==0) printf( "atom[%i](%g,%g,%g|%g) cLJ(%g,%g)\n", i, xyzq.x,xyzq.y,xyzq.z,  xyzq.w,   LCLJS[j].x, LCLJS[j].y );
                 fe += getLJ     ( xyzq.xyz, LCLJS[j], pos );
                 // ToDo : Electrostatics seems to be too strong in original forcefeidl
-                fe += getCoulomb( xyzq, pos+(float3)(0,0,QZs.x) ) * Qs.x;
-                fe += getCoulomb( xyzq, pos+(float3)(0,0,QZs.y) ) * Qs.y;
-                fe += getCoulomb( xyzq, pos+(float3)(0,0,QZs.z) ) * Qs.z;
-                fe += getCoulomb( xyzq, pos+(float3)(0,0,QZs.w) ) * Qs.w;
+                fe += getCoulombAFM( xyzq, pos+(float3)(0,0,QZs.x) ) * Qs.x;
+                fe += getCoulombAFM( xyzq, pos+(float3)(0,0,QZs.y) ) * Qs.y;
+                fe += getCoulombAFM( xyzq, pos+(float3)(0,0,QZs.z) ) * Qs.z;
+                fe += getCoulombAFM( xyzq, pos+(float3)(0,0,QZs.w) ) * Qs.w;
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -967,10 +970,10 @@ __kernel void evalLJC_QZs_toImg(
                 //if(iG==0) printf( "atom[%i](%g,%g,%g|%g) cLJ(%g,%g)\n", i, xyzq.x,xyzq.y,xyzq.z,  xyzq.w,   LCLJS[j].x, LCLJS[j].y );
                 fe += getLJ     ( xyzq.xyz, LCLJS[j], pos );
                 // ToDo : Electrostatics seems to be too strong in original forcefeidl
-                fe += getCoulomb( xyzq, pos+(float3)(0,0,QZs.x) ) * Qs.x;
-                fe += getCoulomb( xyzq, pos+(float3)(0,0,QZs.y) ) * Qs.y;
-                fe += getCoulomb( xyzq, pos+(float3)(0,0,QZs.z) ) * Qs.z;
-                fe += getCoulomb( xyzq, pos+(float3)(0,0,QZs.w) ) * Qs.w;
+                fe += getCoulombAFM( xyzq, pos+(float3)(0,0,QZs.x) ) * Qs.x;
+                fe += getCoulombAFM( xyzq, pos+(float3)(0,0,QZs.y) ) * Qs.y;
+                fe += getCoulombAFM( xyzq, pos+(float3)(0,0,QZs.z) ) * Qs.z;
+                fe += getCoulombAFM( xyzq, pos+(float3)(0,0,QZs.w) ) * Qs.w;
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -1024,10 +1027,10 @@ __kernel void evalMorseC_QZs_toImg(
                 float4 xyzq = LATOMS[j];
                 float3 dp   = pos - xyzq.xyz;
                 fe += getMorse( dp, LCLJS[j].xyz );
-                fe += getCoulomb( xyzq, pos+(float3)(0,0,QZs.x) ) * Qs.x;
-                fe += getCoulomb( xyzq, pos+(float3)(0,0,QZs.y) ) * Qs.y;
-                fe += getCoulomb( xyzq, pos+(float3)(0,0,QZs.z) ) * Qs.z;
-                fe += getCoulomb( xyzq, pos+(float3)(0,0,QZs.w) ) * Qs.w;
+                fe += getCoulombAFM( xyzq, pos+(float3)(0,0,QZs.x) ) * Qs.x;
+                fe += getCoulombAFM( xyzq, pos+(float3)(0,0,QZs.y) ) * Qs.y;
+                fe += getCoulombAFM( xyzq, pos+(float3)(0,0,QZs.z) ) * Qs.z;
+                fe += getCoulombAFM( xyzq, pos+(float3)(0,0,QZs.w) ) * Qs.w;
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);

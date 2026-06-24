@@ -120,8 +120,8 @@ def _ensure_pipeline(window):
     Re-creates only if geometry or basis/step parameters changed (S1 dirty).
     Returns the pipeline instance.
     """
-    from spammm.OCL.ModularPipeline import ModularAFMPipeline
-    from spammm import dftb_utils as du
+    from spammm.SPM.ModularPipeline import ModularAFMPipeline
+    from spammm.quantum import DFTB_utils as du
     import tempfile
 
     atomPos, _, enames = _get_afm_geometry(window)

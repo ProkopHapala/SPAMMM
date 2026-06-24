@@ -618,7 +618,7 @@ def get_density_from_fireball(atomPos, atomTypes, grid_spec, fdata_dir, fc_insta
     Returns:
         dict with 'rho_scf', 'rho_na', 'rho_diff', 'V_ES', 'origin', 'ngrid', 'grid_spec'
     """
-    from spammm.FireballOCL import Grid as ocl_grid
+    from spammm.quantum.DFTB import Grid_dftb as ocl_grid
     
     # Auto-generate grid spec if not provided
     if grid_spec is None:
@@ -793,7 +793,7 @@ def compare_gpu_cpu_interpolation(grads_total, origin, step, atomPos,
         output_path: path to save comparison plot
     """
     from scipy.ndimage import map_coordinates
-    from spammm.OCL import AFM as afm
+    from spammm.SPM import AFM as afm
     import pyopencl as cl
     import matplotlib
     matplotlib.use('Agg')
@@ -1073,8 +1073,7 @@ def compare_1d_at_position(grads_total, origin, step, atomPos, x_pos, y_pos, mol
         output_path: path to save plot
     """
     import sys
-    sys.path.insert(0, '/home/prokop/git/FireCore')
-    from spammm.OCL import AFM as afm
+    from spammm.SPM import AFM as afm
     import pyopencl as cl
     from scipy.ndimage import map_coordinates
     import matplotlib
@@ -3083,7 +3082,7 @@ def fit_pauli_parameters_pyscf(xyz_file, pyscf_basis='sto-3g', pyscf_method='RHF
         os.makedirs(fdbm_dir, exist_ok=True)
         
         # Use ModularPipeline with pySCF backend
-        from spammm.OCL import ModularPipeline as mp_mod
+        from spammm.SPM import ModularPipeline as mp_mod
         
         pipeline = mp_mod.ModularAFMPipeline(
             xyz_file=xyz_file,

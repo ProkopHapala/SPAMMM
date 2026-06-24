@@ -43,6 +43,8 @@ class UFF_CL(OpenCLBase):
                 os.path.join(kernel_dir, 'common.cl'),
                 os.path.join(kernel_dir, 'Forces.cl'),
                 os.path.join(kernel_dir, 'UFF.cl'),
+                os.path.join(kernel_dir, 'gridFF.cl'),
+                os.path.join(kernel_dir, 'surface.cl'),
                 os.path.join(kernel_dir, 'nonbonded.cl'),
             ]
         else:
