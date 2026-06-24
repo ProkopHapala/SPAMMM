@@ -18,10 +18,10 @@ Python workflow with the DFTB+ Fortran/C executable.
 import sys
 import os
 import numpy as np
-from . import elements
-from . import atomicUtils as au
+from .. import elements
+from .. import atomicUtils as au
 from textwrap import dedent,indent
-from .config_utils import get_config, get_path, get_dftb_basis_path, get_dftb_sk_path
+from ..config_utils import get_config, get_path, get_dftb_basis_path, get_dftb_sk_path
 
 def _check_dftb_exe():
     dftb_exe = os.environ.get('DFTB_EXE')
@@ -458,27 +458,50 @@ def save_xyz_movie(results, fname, lvs=None, label=None, key_order=None):
 # ============ AFM / FDBM shared paths
 # These are now loaded from config.json, with fallback to hardcoded paths for backward compatibility
 def _get_sk_paths():
-    """Load SK paths from config.json or use defaults."""
+    """Load SK paths from config.json or construct from dftb_sk_path."""
     config = get_config()
     sk_paths = {}
     if 'dftb' in config and 'basis_sets' in config['dftb']:
         for basis_name, basis_info in config['dftb']['basis_sets'].items():
             if 'sk_path' in basis_info:
                 sk_paths[basis_name] = basis_info['sk_path']
-    # Fallback: if config doesn't have them, raise error (no hardcoded paths for portability)
+    # Fallback: construct from dftb_sk_path + known basis names
+    if not sk_paths:
+        sk_lib_path = get_path('dftb_sk_path') or os.environ.get('DFTB_SK_PATH')
+        if sk_lib_path and os.path.isdir(sk_lib_path):
+            for basis_name in ['mio-1-1', '3ob-3-1']:
+                candidate = os.path.join(sk_lib_path, basis_name)
+                if os.path.isdir(candidate):
+                    sk_paths[basis_name] = candidate
     if not sk_paths:
         raise RuntimeError("SK paths not configured. Set them in firecore_config.json under dftb.basis_sets or use DFTB_SK_PATH environment variable.")
     return sk_paths
 
 def _get_wfc_hsd_paths():
-    """Load WFC HSD paths from config.json or use defaults."""
+    """Load WFC HSD paths from config.json or construct from dftb_basis_path."""
     config = get_config()
     wfc_paths = {}
     if 'dftb' in config and 'basis_sets' in config['dftb']:
         for basis_name, basis_info in config['dftb']['basis_sets'].items():
             if 'wfc_path' in basis_info:
                 wfc_paths[basis_name] = basis_info['wfc_path']
-    # Fallback: if config doesn't have them, raise error (no hardcoded paths for portability)
+    # Fallback: construct from dftb_basis_path + known basis names
+    if not wfc_paths:
+        basis_path = get_path('dftb_basis_path')
+        if basis_path and os.path.isdir(basis_path):
+            for basis_name in ['mio-1-1', '3ob-3-1']:
+                candidate = os.path.join(basis_path, f'wfc.{basis_name}.hsd')
+                if os.path.isfile(candidate):
+                    wfc_paths[basis_name] = candidate
+        # Also try quantum/DFTB/data
+        if not wfc_paths:
+            _ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+            dftb_data = os.path.join(_ROOT, 'spammm', 'quantum', 'DFTB', 'data')
+            if os.path.isdir(dftb_data):
+                for basis_name in ['mio-1-1', '3ob-3-1']:
+                    candidate = os.path.join(dftb_data, f'wfc.{basis_name}.hsd')
+                    if os.path.isfile(candidate):
+                        wfc_paths[basis_name] = candidate
     if not wfc_paths:
         raise RuntimeError("WFC paths not configured. Set them in firecore_config.json under dftb.basis_sets or use DFTB_BASIS_PATH environment variable.")
     return wfc_paths

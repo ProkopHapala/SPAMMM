@@ -39,7 +39,7 @@ REQ_DEFAULT = np.array([1.7, 0.1, 0.0, 0.0], dtype=np.float32)  # R, E, Q, paddi
 
 FOLDED_BASIS_MAX = 128
 FOLDED_TYPES_MAX = 8
-FOLDED_KERNEL_NAMES = ('orig', 'harmonics', 'workgroup')
+FOLDED_KERNEL_NAMES = ('orig', 'harmonics', 'workgroup', 'tensor')
 
 verbose=False
 
@@ -439,13 +439,13 @@ class MolecularDynamics(OpenCLBase):
         self.check_buf('surf_qQa', self.nSystems * 4 * float_size, mf.READ_ONLY)
         self.check_buf('surf_qQb', self.nSystems * 4 * float_size, mf.READ_ONLY)
         self.check_buf('surf_qQc', self.nSystems * 4 * float_size, mf.READ_ONLY)
-        self.check_buf('folded_coeffs', FOLDED_TYPES_MAX * FOLDED_BASIS_MAX * float_size, mf.READ_ONLY)
+        self.check_buf('folded_coeffs', FOLDED_TYPES_MAX * FOLDED_BASIS_MAX * 4 * float_size, mf.READ_ONLY)
         self.check_buf('folded_kxyz',   FOLDED_BASIS_MAX * 4 * float_size, mf.READ_ONLY)
         self.check_buf('folded_atom_type', self.natoms * np.int32().itemsize, mf.READ_ONLY)
         reqs_all = np.broadcast_to(self.rigid_REQs0[None, :, :], (self.nSystems, self.natoms, 4)).copy()
         self.toGPU('REQs', reqs_all)
         self.toGPU('folded_atom_type', np.zeros(self.natoms, dtype=np.int32))
-        self.toGPU('folded_coeffs', np.zeros((FOLDED_TYPES_MAX, FOLDED_BASIS_MAX), dtype=np.float32))
+        self.toGPU('folded_coeffs', np.zeros((FOLDED_TYPES_MAX * FOLDED_BASIS_MAX, 4), dtype=np.float32))
         self.toGPU('folded_kxyz', np.zeros((FOLDED_BASIS_MAX, 4), dtype=np.float32))
         cl.enqueue_fill_buffer(self.queue, self.buffer_dict['apos'], np.zeros(1, dtype=np.float32), 0, self.buffer_dict['apos'].size)
         cl.enqueue_fill_buffer(self.queue, self.buffer_dict['aforce'], np.zeros(1, dtype=np.float32), 0, self.buffer_dict['aforce'].size)
@@ -534,6 +534,20 @@ class MolecularDynamics(OpenCLBase):
                 self.kernel_args_getSurfFolded_workgroup = self.generate_kernel_args("getSurfFolded_workgroup")
             else:
                 warn_skip("getSurfFolded_workgroup", missing)
+        self.kernel_args_getSurfFolded_tensor_exp = None
+        if "getSurfFolded_tensor_exp" in self.kernelheaders:
+            ok, missing = can_bind_kernel("getSurfFolded_tensor_exp")
+            if ok:
+                self.kernel_args_getSurfFolded_tensor_exp = self.generate_kernel_args("getSurfFolded_tensor_exp")
+            else:
+                warn_skip("getSurfFolded_tensor_exp", missing)
+        self.kernel_args_getSurfFolded_tensor_poly = None
+        if "getSurfFolded_tensor_poly" in self.kernelheaders:
+            ok, missing = can_bind_kernel("getSurfFolded_tensor_poly")
+            if ok:
+                self.kernel_args_getSurfFolded_tensor_poly = self.generate_kernel_args("getSurfFolded_tensor_poly")
+            else:
+                warn_skip("getSurfFolded_tensor_poly", missing)
         self.kernel_args_sampleGridFF_Bspline_points = None
         if "sampleGridFF_Bspline_points" in self.kernelheaders:
             ok, missing = can_bind_kernel("sampleGridFF_Bspline_points")
@@ -617,6 +631,10 @@ class MolecularDynamics(OpenCLBase):
             'lvec':         np.zeros((3,4), dtype=np.float32),
             'pos0':         np.zeros(4, dtype=np.float32),
             'PLQH':         np.array([1.0, 1.0, 1.0, 0.0], dtype=np.float32),
+            # Folded tensor kernel scalars
+            'zmin':         np.float32(0.0),
+            'zcut':         np.float32(14.0),
+            'poly_R':       np.float32(14.0),
         }
 
         # SPFF.cl uses different arg names for the same dimensions
@@ -976,6 +994,18 @@ class MolecularDynamics(OpenCLBase):
             sz = (int(math.ceil(float(self.natoms) / lx) * lx), nSystems)
             loc = (lx, 1)
             self.prg.getSurfFolded_workgroup(self.queue, sz, loc, *self.kernel_args_getSurfFolded_workgroup)
+        elif kind == 'tensor':
+            basis_type = int(self.folded_params.get('basis_type', 0)) if self.folded_params else 0
+            kname = 'getSurfFolded_tensor_poly' if basis_type == 1 else 'getSurfFolded_tensor_exp'
+            arg_attr = 'kernel_args_' + kname
+            if getattr(self, arg_attr) is None:
+                setattr(self, arg_attr, self.generate_kernel_args(kname, bPrint=False))
+            lx = min(int(self.nloc), int(self.natoms))
+            while (lx > 1) and (int(self.natoms) % lx != 0):
+                lx -= 1
+            sz = (int(self.natoms), nSystems)
+            loc = (int(lx), 1)
+            getattr(self.prg, kname)(self.queue, sz, loc, *getattr(self, arg_attr))
         else:
             raise ValueError(f"run_getSurfFolded(): unknown folded kernel '{kind}', expected one of {FOLDED_KERNEL_NAMES}")
         self.queue.finish()
@@ -1026,11 +1056,13 @@ class MolecularDynamics(OpenCLBase):
         return self._component_plqh(component)
 
     def _set_folded_coefficients(self, coeffs):
+        kind = getattr(self, 'folded_kernel_kind', 'orig')
+        if kind == 'tensor' and coeffs is None:
+            coeffs = self.folded_params['coeffs']  # dummy, tensor reads from coeff_sets
         coeffs = np.asarray(coeffs, dtype=np.float32)
         if self.folded_params is None:
             raise ValueError('_set_folded_coefficients(): fit_folded_surface_basis() must be called first')
         ntypes = int(coeffs.shape[0])
-        kind = getattr(self, 'folded_kernel_kind', 'orig')
         if kind == 'orig':
             nbasis = int(self.folded_params['basis_params'].shape[0])
             coeff_pad = np.zeros((FOLDED_TYPES_MAX, FOLDED_BASIS_MAX), dtype=np.float32)
@@ -1047,9 +1079,32 @@ class MolecularDynamics(OpenCLBase):
         if kind == 'workgroup' and nu != nv:
             raise ValueError(f"_set_folded_coefficients(): workgroup kernel requires nu==nv, got nu={nu} nv={nv}")
         coeff_tensor = coeffs[:, :nu*nv*nz].reshape(ntypes, nu, nv, nz).transpose(0, 3, 2, 1)
-        coeff_pad = np.zeros((FOLDED_TYPES_MAX, FOLDED_BASIS_MAX), dtype=np.float32)
-        coeff_pad[:ntypes, :nu*nv*nz] = coeff_tensor.reshape(ntypes, nu*nv*nz)
-        self.toGPU('folded_coeffs', coeff_pad)
+        if kind == 'tensor':
+            # Pack float4 coefficients: (cPauli, cLondon, cCoulomb, cH)
+            coeff_sets = self.folded_params.get('coeff_sets', {})
+            c_pauli   = coeff_sets.get('pauli',   np.zeros((ntypes, nu*nv*nz), dtype=np.float32))
+            c_london  = coeff_sets.get('london',  np.zeros((ntypes, nu*nv*nz), dtype=np.float32))
+            c_coulomb = coeff_sets.get('coulomb', np.zeros((ntypes, nu*nv*nz), dtype=np.float32))
+            c_h       = coeff_sets.get('h_bond',  np.zeros((ntypes, nu*nv*nz), dtype=np.float32))
+            basis_type = int(self.folded_params.get('basis_type', 0))
+            if basis_type == 1:
+                # Poly kernel loop order: ix→iy→iz → coeff layout [ntype][ix][iy][iz]
+                ct = lambda c: c[:, :nu*nv*nz].reshape(ntypes, nu, nv, nz)
+            else:
+                # Exp kernel loop order: iz→iy→ix → coeff layout [ntype][iz][iy][ix]
+                ct = lambda c: c[:, :nu*nv*nz].reshape(ntypes, nu, nv, nz).transpose(0, 3, 2, 1)
+            coeff4 = np.zeros((ntypes, nu*nv*nz, 4), dtype=np.float32)
+            coeff4[..., 0] = ct(c_pauli).reshape(ntypes, -1)
+            coeff4[..., 1] = ct(c_london).reshape(ntypes, -1)
+            coeff4[..., 2] = ct(c_coulomb).reshape(ntypes, -1)
+            coeff4[..., 3] = ct(c_h).reshape(ntypes, -1)
+            coeff_pad4 = np.zeros((FOLDED_TYPES_MAX * FOLDED_BASIS_MAX, 4), dtype=np.float32)
+            coeff_pad4[:ntypes * nu*nv*nz] = coeff4.reshape(-1, 4)
+            self.toGPU('folded_coeffs', coeff_pad4)
+        else:
+            coeff_pad = np.zeros((FOLDED_TYPES_MAX, FOLDED_BASIS_MAX), dtype=np.float32)
+            coeff_pad[:ntypes, :nu*nv*nz] = coeff_tensor.reshape(ntypes, nu*nv*nz)
+            self.toGPU('folded_coeffs', coeff_pad)
         basis_params = np.asarray(self.folded_params['basis_params'], dtype=np.float32).reshape(nu, nv, nz, 4)
         u_params = np.zeros((nu, 4), dtype=np.float32); u_params[:, 0] = basis_params[:, 0, 0, 0]
         v_params = np.zeros((nv, 4), dtype=np.float32); v_params[:, 1] = basis_params[0, :, 0, 1]
@@ -1060,6 +1115,13 @@ class MolecularDynamics(OpenCLBase):
         elif kind == 'workgroup':
             kxyz = np.vstack([u_params, z_params])
             self.kernel_params['folded_meta'] = np.array([nu, nz, ntypes, 0], dtype=np.int32)
+        elif kind == 'tensor':
+            kxyz = np.vstack([u_params, v_params, z_params])
+            m_start = int(self.folded_params.get('m_start', 0))
+            self.kernel_params['folded_meta'] = np.array([nu, nz, ntypes, m_start], dtype=np.int32)
+            z_range = self.folded_params.get('z_range', (0.0, 8.0))
+            self.kernel_params['zmin'] = np.float32(z_range[0])
+            self.kernel_params['zcut'] = np.float32(self.folded_params.get('poly_R', 14.0))
         else:
             raise ValueError(f"_set_folded_coefficients(): unknown folded kernel '{kind}', expected one of {FOLDED_KERNEL_NAMES}")
         kxyz_pad = np.zeros((FOLDED_BASIS_MAX, 4), dtype=np.float32)
@@ -1071,6 +1133,8 @@ class MolecularDynamics(OpenCLBase):
         if kind not in FOLDED_KERNEL_NAMES:
             raise ValueError(f"set_folded_kernel_kind(): unknown kind '{kind}', expected one of {FOLDED_KERNEL_NAMES}")
         self.folded_kernel_kind = kind
+        if hasattr(self, '_tensor_coeffs_set'):
+            del self._tensor_coeffs_set
 
     def _build_folded_basis_params(self, nu=4, nv=4, nz=4, z0=0.0, z_scale=0.75, custom_alphas=None):
         params = []
@@ -1237,7 +1301,7 @@ class MolecularDynamics(OpenCLBase):
         ew = None
         z_top = None
         if want_coulomb and coulomb_solver == 'ewald2d':
-            from .SurfaceEwald import SurfaceEwaldCL
+            from ..surfaces.SurfaceEwald import SurfaceEwaldCL
             if surf_xyz is None:
                 raise ValueError('fit_folded_surface_basis(): coulomb_solver=ewald2d requires surf_xyz')
             if getattr(self, 'surface_atoms', None) is None:
@@ -1285,7 +1349,16 @@ class MolecularDynamics(OpenCLBase):
                 if weight_power != 0.0:
                     ymin = float(np.min(y[z_mask])) if np.any(z_mask) else float(np.min(y))
                     ww *= np.exp(np.clip(weight_power*(ymin - y), -60.0, 60.0))
-                Phiw = Phi * ww[:, None]
+                # For tensor kernel: fit with powered basis to match kernel formula
+                # E = sum_i (cCoulomb_i*B_i + cLondon_i*B_i^2 + cPauli_i*B_i^3)
+                kind = getattr(self, 'folded_kernel_kind', 'orig')
+                if kind == 'tensor':
+                    power_map = {'pauli': 3, 'london': 2, 'coulomb': 1, 'h_bond': 1, 'total': 1}
+                    p = power_map.get(ck, 1)
+                    Phi_use = Phi ** p if p != 1 else Phi
+                else:
+                    Phi_use = Phi
+                Phiw = Phi_use * ww[:, None]
                 yw = y * ww
                 S, *_ = np.linalg.lstsq(Phiw, yw, rcond=None)
                 coeff_sets[ck][it, :nbasis] = S.astype(np.float32)
@@ -1303,6 +1376,9 @@ class MolecularDynamics(OpenCLBase):
             'nu': int(nu), 'nv': int(nv), 'nz': int(nz),
             'z_range': (float(z_range[0]), float(z_range[1])),
             'nxy': int(nxy), 'nz_samp': int(nz_samp),
+            'basis_type': 0,   # 0=exp, 1=poly (set by caller if needed)
+            'poly_R': 14.0,    # default poly cutoff
+            'm_start': 0,      # starting power for poly basis (Coulomb/Morse differ)
         }
         self.folded_fit_info = {
             'uvz': uvz,
@@ -1323,17 +1399,25 @@ class MolecularDynamics(OpenCLBase):
             self.kernel_args_getSurfFolded_harmonics = self.generate_kernel_args('getSurfFolded_harmonics', bPrint=False)
         if 'getSurfFolded_workgroup' in self.kernelheaders:
             self.kernel_args_getSurfFolded_workgroup = self.generate_kernel_args('getSurfFolded_workgroup', bPrint=False)
+        if 'getSurfFolded_tensor_exp' in self.kernelheaders:
+            self.kernel_args_getSurfFolded_tensor_exp = self.generate_kernel_args('getSurfFolded_tensor_exp', bPrint=False)
+        if 'getSurfFolded_tensor_poly' in self.kernelheaders:
+            self.kernel_args_getSurfFolded_tensor_poly = self.generate_kernel_args('getSurfFolded_tensor_poly', bPrint=False)
         return self.folded_params
 
     def eval_rigid_getSurfFolded(self, transforms, chunk_size=None, component='total'):
         if self.folded_params is None:
             raise ValueError('eval_rigid_getSurfFolded(): call fit_folded_surface_basis() first')
         key = str(component).lower()
+        kind = getattr(self, 'folded_kernel_kind', 'orig')
         coeff_sets = self.folded_params.get('coeff_sets', None) if self.folded_params is not None else None
-        if coeff_sets is not None:
+        if coeff_sets is not None and kind != 'tensor':
             if key not in coeff_sets:
                 raise ValueError(f"eval_rigid_getSurfFolded(): component '{component}' not available, have {sorted(coeff_sets.keys())}")
             self._set_folded_coefficients(coeff_sets[key])
+        elif kind == 'tensor' and not hasattr(self, '_tensor_coeffs_set'):
+            self._set_folded_coefficients(None)
+            self._tensor_coeffs_set = True
         T = self.wrap_rigid_transforms_PBC(transforms).reshape(-1, 3, 4)
         nconf = len(T)
         if nconf <= 0:

@@ -530,6 +530,232 @@ __kernel void getSurfFolded_harmonics(
 }
 
 // ============================================================
+//  Folded Basis Tensor Product Kernels — exp & poly variants
+// ============================================================
+//
+//  One thread per atom. No private arrays.
+//  folded_coeffs preloaded into local memory for performance.
+//  Full-accuracy sincos/exp used once per atom, amortized by cmul.
+//
+//  float4 coefficients per basis function: (cPauli, cLondon, cCoulomb, cH)
+//    E = B * (cCoulomb + B*(cLondon + B*cPauli))
+//      = cCoulomb*B + cLondon*B^2 + cPauli*B^3
+//    Coulomb decays as t^n (slowest), London as t^(2n), Pauli as t^(3n)
+//    dE/dB = cCoulomb + B*(2*cLondon + B*3*cPauli)
+//    c.w (H) omitted for now
+//
+//  Two specialized kernels:
+//    getSurfFolded_tensor_exp:  iz→iy→ix (exp expensive, outermost)
+//      needs folded_kxyz for per-basis alpha and z0
+//    getSurfFolded_tensor_poly: ix→iy→iz (cheap tpow*=t innermost)
+//      no folded_kxyz — uses scalar zmin, zcut, m_start
+//      powers = m_start, m_start+1, ..., m_start+Nz-1
+
+#ifndef FOLDED_TYPES_MAX
+#define FOLDED_TYPES_MAX 8
+#endif
+#ifndef FOLDED_BASIS_MAX
+#define FOLDED_BASIS_MAX 128
+#endif
+
+// Complex multiply helper (needed by tensor kernels)
+inline float2 cmul(float2 a, float2 b) {
+    return (float2)(a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x);
+}
+
+// --- Exponential variant ---
+__kernel void getSurfFolded_tensor_exp(
+    const int4 ns,                     // (natoms, nnode, 0, 0)
+    __global float4*  atoms,
+    __global float4*  REQs,
+    __global float4*  forces,
+    __global float4*  folded_coeffs,   // [ntypes * Nxy * Nxy * Nz] float4
+    __global float4*  folded_kxyz,
+    __global int*     folded_atom_type,
+    const int4        folded_meta,     // (Nxy, Nz, ntypes, 0)
+    const float4      folded_lvec2d,
+    const float       poly_R           // unused
+){
+    const int iG = get_global_id(0);
+    const int iS = get_global_id(1);
+    if(iG >= ns.x) return;
+
+    const int Nxy = folded_meta.x;
+    const int Nz  = folded_meta.y;
+    const int ntypes = folded_meta.z;
+    const int nbasis_total = Nxy * Nxy * Nz;
+
+    // Preload coefficients into local memory
+    __local float4 L_coeffs[FOLDED_TYPES_MAX * FOLDED_BASIS_MAX];
+    int total_coeffs = ntypes * nbasis_total;
+    int lid = get_local_linear_id();
+    int lsize = get_local_size(0) * get_local_size(1);
+    for(int i = lid; i < total_coeffs; i += lsize){  L_coeffs[i] = folded_coeffs[i]; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    int ityp = folded_atom_type[iG];
+    if(ityp < 0 || ityp >= ntypes) return;
+
+    float det = folded_lvec2d.x * folded_lvec2d.w - folded_lvec2d.y * folded_lvec2d.z;
+    float4 invLvec = (float4)(folded_lvec2d.w/det, -folded_lvec2d.y/det,
+                              -folded_lvec2d.z/det,  folded_lvec2d.x/det);
+    int iav = iG + iS * (ns.x + ns.y);
+    float3 pos = atoms[iav].xyz;
+    float u = invLvec.x * pos.x + invLvec.y * pos.y;
+    float v = invLvec.z * pos.x + invLvec.w * pos.y;
+    u -= floor(u);
+    v -= floor(v);
+
+    float cu, su = sincos(2.0f * M_PI_F * u, &cu);
+    float cv, sv = sincos(2.0f * M_PI_F * v, &cv);
+    float2 z1_u = (float2)(cu, su);
+    float2 z1_v = (float2)(cv, sv);
+
+    float E_tot = 0.0f, dEdu_tot = 0.0f, dEdv_tot = 0.0f, dEdz_tot = 0.0f;
+    int ic = ityp * nbasis_total;
+
+    for(int iz = 0; iz < Nz; iz++){
+        float alpha = folded_kxyz[2*Nxy + iz].z;
+        float z0    = folded_kxyz[2*Nxy + iz].w;
+        float dz = fmax(0.0f, pos.z - z0);
+        float bz = exp(-alpha * dz);
+        float dbz = (pos.z > z0) ? (-alpha * bz) : 0.0f;
+
+        float2 z_v = (float2)(1.0f, 0.0f);
+        for(int iy = 0; iy < Nxy; iy++){
+            float by = z_v.x;
+            float dby = -2.0f * M_PI_F * (float)iy * z_v.y;
+            float bz_by = bz * by, dbz_by = dbz * by, bz_dby = bz * dby;
+            float2 z_u = (float2)(1.0f, 0.0f);
+            for(int ix = 0; ix < Nxy; ix++){
+                float bx = z_u.x;
+                float dbx = -2.0f * M_PI_F * (float)ix * z_u.y;
+                float B = bx * bz_by;
+                float4 c = L_coeffs[ic++];
+                E_tot    += B * (c.z + B*(c.y + B*c.x));
+                float dE_fac = c.z + B*(2.0f*c.y + B*3.0f*c.x);
+                dEdu_tot += dE_fac * (dbx * bz_by);
+                dEdv_tot += dE_fac * (bx * bz_dby);
+                dEdz_tot += dE_fac * (bx * dbz_by);
+                z_u = cmul(z_u, z1_u);
+            }
+            z_v = cmul(z_v, z1_v);
+        }
+    }
+
+    float3 F_tot;
+    F_tot.x = -(dEdu_tot * invLvec.x + dEdv_tot * invLvec.z);
+    F_tot.y = -(dEdu_tot * invLvec.y + dEdv_tot * invLvec.w);
+    F_tot.z = -dEdz_tot;
+    forces[iav] += (float4)(F_tot.x, F_tot.y, F_tot.z, -E_tot);
+}
+
+// --- Polynomial variant ---
+// Loop order: ix→iy→iz (cheap tpow*=t innermost, expensive cmul outermost)
+// Coefficient layout: coeffs[ntype][ix][iy][iz] (natural order, no transpose)
+__kernel void getSurfFolded_tensor_poly(
+    const int4 ns,                     // (natoms, nnode, 0, 0)
+    __global float4*  atoms,
+    __global float4*  REQs,
+    __global float4*  forces,
+    __global float4*  folded_coeffs,   // [ntypes * Nxy * Nxy * Nz] float4
+    __global int*     folded_atom_type,
+    const int4        folded_meta,     // (Nxy, Nz, ntypes, m_start)
+    const float4      folded_lvec2d,
+    const float       zmin,
+    const float       zcut
+){
+    const int iG = get_global_id(0);
+    const int iS = get_global_id(1);
+    if(iG >= ns.x) return;
+
+    const int Nxy = folded_meta.x;
+    const int Nz  = folded_meta.y;
+    const int ntypes = folded_meta.z;
+    const int m_start = folded_meta.w;
+    const int nbasis_total = Nxy * Nxy * Nz;
+
+    // Preload coefficients into local memory
+    __local float4 L_coeffs[FOLDED_TYPES_MAX * FOLDED_BASIS_MAX];
+    int total_coeffs = ntypes * nbasis_total;
+    int lid = get_local_linear_id();
+    int lsize = get_local_size(0) * get_local_size(1);
+    for(int i = lid; i < total_coeffs; i += lsize)
+        L_coeffs[i] = folded_coeffs[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    int ityp = folded_atom_type[iG];
+    if(ityp < 0 || ityp >= ntypes) return;
+
+    float det = folded_lvec2d.x * folded_lvec2d.w - folded_lvec2d.y * folded_lvec2d.z;
+    float4 invLvec = (float4)(folded_lvec2d.w/det, -folded_lvec2d.y/det,
+                              -folded_lvec2d.z/det,  folded_lvec2d.x/det);
+    int iav = iG + iS * (ns.x + ns.y);
+    float3 pos = atoms[iav].xyz;
+    float u = invLvec.x * pos.x + invLvec.y * pos.y;
+    float v = invLvec.z * pos.x + invLvec.w * pos.y;
+    u -= floor(u);
+    v -= floor(v);
+
+    float cu, su = sincos(2.0f * M_PI_F * u, &cu);
+    float cv, sv = sincos(2.0f * M_PI_F * v, &cv);
+    float2 z1_u = (float2)(cu, su);
+    float2 z1_v = (float2)(cv, sv);
+
+    // Poly z-basis: t = 1 - min(dz/zcut, 1), powers = m_start..m_start+Nz-1
+    float dz = fmax(0.0f, pos.z - zmin);
+    float invR = 1.0f / zcut;
+    float x = fmin(dz * invR, 1.0f);
+    float t = 1.0f - x;
+    bool active_z = (pos.z > zmin) && (x < 1.0f);
+
+    // Precompute t^m_start and t^(m_start-1) for reset inside loop
+    float t_m_start = 1.0f, t_m_start_prev = 1.0f;
+    for(int i = 0; i < m_start; i++){ t_m_start_prev = t_m_start; t_m_start *= t; }
+
+    float E_tot = 0.0f, dEdu_tot = 0.0f, dEdv_tot = 0.0f, dEdz_tot = 0.0f;
+    int ic = ityp * nbasis_total;
+
+    float2 z_u = (float2)(1.0f, 0.0f);
+    for(int ix = 0; ix < Nxy; ix++){
+        float bx = z_u.x;
+        float dbx = -2.0f * M_PI_F * (float)ix * z_u.y;
+
+        float2 z_v = (float2)(1.0f, 0.0f);
+        for(int iy = 0; iy < Nxy; iy++){
+            float by = z_v.x;
+            float dby = -2.0f * M_PI_F * (float)iy * z_v.y;
+
+            float tpow = t_m_start, tprev = t_m_start_prev;
+            for(int iz = 0; iz < Nz; iz++){
+                float n = (float)(m_start + iz);
+                float bz = tpow;
+                float dbz = active_z ? (-n * invR * tprev) : 0.0f;
+
+                float B = bx * by * bz;
+                float4 c = L_coeffs[ic++];
+                E_tot    += B * (c.z + B*(c.y + B*c.x));
+                float dE_fac = c.z + B*(2.0f*c.y + B*3.0f*c.x);
+                dEdu_tot += dE_fac * (dbx * by * bz);
+                dEdv_tot += dE_fac * (bx * dby * bz);
+                dEdz_tot += dE_fac * (bx * by * dbz);
+
+                tprev = tpow;
+                tpow *= t;
+            }
+            z_v = cmul(z_v, z1_v);
+        }
+        z_u = cmul(z_u, z1_u);
+    }
+
+    float3 F_tot;
+    F_tot.x = -(dEdu_tot * invLvec.x + dEdv_tot * invLvec.z);
+    F_tot.y = -(dEdu_tot * invLvec.y + dEdv_tot * invLvec.w);
+    F_tot.z = -dEdz_tot;
+    forces[iav] += (float4)(F_tot.x, F_tot.y, F_tot.z, -E_tot);
+}
+
+// ============================================================
 //  OpenCL Ewald2D Kernels (GPU-accelerated surface electrostatics)
 // ============================================================
 // Reference: pyBall/Ewald2D.py (Python implementation)
@@ -545,10 +771,7 @@ __kernel void getSurfFolded_harmonics(
 //
 // This reduces N_G cos/sin evaluations to just 2 per point!
 
-// Helper: Complex multiply
-inline float2 cmul(float2 a, float2 b) {
-    return (float2)(a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x);
-}
+// (cmul defined earlier, before tensor kernels)
 
 // ------------------------------------------------------------------
 // Kernel 1: Compute C_G coefficients (vacuum) and w[g,i] (full)

@@ -148,7 +148,7 @@ def _make_grid_spec(atomPos, step, margin, z_extra):
 
 def _project_densities(geo, evecs, basis, grid_spec, verbosity=0):
     """Shared projection logic: returns (rho_scf, rho_na, rho_diff) using Grid_dftb backends."""
-    from spammm.DFTB import Grid_dftb as dg
+    from spammm.quantum.DFTB import Grid_dftb as dg
     dftb_data = {k: geo[k] for k in ('coords_bohr', 'species_per_atom', 'species_names')}
     projector, atoms_dict = dg.setup_gridprojector_from_dftb(dftb_data, basis, verbosity=verbosity)
     rho_scf = dg.project_dftb_density(geo, evecs, projector, atoms_dict, grid_spec, basis)
@@ -204,9 +204,9 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
     Returns:
         dict with 'rho_scf', 'rho_na', 'rho_diff', 'V_ES', 'origin', 'ngrid', 'grid_spec'
     """
-    from spammm.DFTB.DFTBcore import DFTBcore
-    from spammm.DFTB.DFTBplusParser import parse_wfc_hsd, convert_wfc_to_species_list_ang
-    from spammm.DFTB import Grid_dftb as dg
+    from spammm.quantum.DFTB.DFTBcore import DFTBcore
+    from spammm.quantum.DFTB.DFTBplusParser import parse_wfc_hsd, convert_wfc_to_species_list_ang
+    from spammm.quantum.DFTB import Grid_dftb as dg
     from spammm import atomicUtils as au
     import multiprocessing as mp
     import shutil
@@ -250,8 +250,8 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
     basis_name = os.path.basename(basis_hsd_path).replace('wfc.', '').replace('.hsd', '')
 
     # Prepare DFTBcore input (minimal, no Analysis/Options blocks like DFTB+ needs)
-    from spammm import dftb_utils as du
-    sk_dir = du.SK_PATHS.get(basis_name, os.path.join(os.environ.get('DFTB_SK_PATH', ''), basis_name))
+    from spammm.quantum.DFTB_utils import SK_PATHS as _SK_PATHS
+    sk_dir = _SK_PATHS.get(basis_name, os.path.join(os.environ.get('DFTB_SK_PATH', ''), basis_name))
     xyz_path = os.path.join(work_dir, 'geom.xyz')
     hsd_path = os.path.join(work_dir, 'dftb_in.hsd')
 
@@ -533,7 +533,8 @@ def get_density_from_dftb_plus(atomPos, atomTypes, basis, slako_prefix, work_dir
 
     Returns dict with 'rho_scf', 'rho_na', 'rho_diff', 'V_ES', 'origin', 'ngrid', 'grid_spec'.
     """
-    from spammm import dftb_utils as du
+    from spammm.quantum.DFTB_utils import SK_PATHS as _SK_PATHS, WFC_HSD_PATHS as _WFC_HSD_PATHS
+    from spammm.quantum.DFTB_utils import run_dftb_for_density as _run_dftb_for_density
     ELEM_Z = {'H':1,'C':6,'N':7,'O':8,'P':15,'S':16,'Br':35,'I':53}
     inv_z = {v:k for k,v in ELEM_Z.items()}
     enames = [inv_z.get(int(z), 'C') for z in atomTypes]
@@ -543,19 +544,19 @@ def get_density_from_dftb_plus(atomPos, atomTypes, basis, slako_prefix, work_dir
     else:
         origin, ngrid, step = grid_spec['origin'], grid_spec['ngrid'], grid_spec['dA'][0]
 
-    geo, evecs = du.run_dftb_for_density(work_dir, enames, atomPos, slako_prefix)
+    geo, evecs = _run_dftb_for_density(work_dir, enames, atomPos, slako_prefix)
     
     # Parse basis HSD file for density projection
     # Use waveplot_in.hsd from DFTB output if it exists (matches actual calculation)
     # Otherwise fall back to pre-defined basis file
-    from spammm.DFTB.DFTBplusParser import parse_basis_hsd_ang
+    from spammm.quantum.DFTB.DFTBplusParser import parse_basis_hsd_ang
     waveplot_hsd = os.path.join(work_dir, 'waveplot_in.hsd')
     if os.path.exists(waveplot_hsd):
         species_list_ang = parse_basis_hsd_ang(waveplot_hsd)
     else:
-        basis_hsd_path = du.WFC_HSD_PATHS.get(basis)
+        basis_hsd_path = _WFC_HSD_PATHS.get(basis)
         if basis_hsd_path is None:
-            raise ValueError(f"No basis HSD file defined for basis '{basis}'. Available: {list(du.WFC_HSD_PATHS.keys())}")
+            raise ValueError(f"No basis HSD file defined for basis '{basis}'. Available: {list(_WFC_HSD_PATHS.keys())}")
         species_list_ang = parse_basis_hsd_ang(basis_hsd_path)
     
     # Validate that all atoms in the molecule are present in the basis
@@ -578,7 +579,7 @@ def get_density_from_dftb(atomPos, atomTypes, dftb_dir, basis=None,
 
     Returns dict with 'rho_scf', 'rho_na', 'rho_diff', 'V_ES', 'origin', 'ngrid', 'grid_spec'.
     """
-    from spammm.DFTB.DFTBplusParser import parse_detailed_xml_custom, parse_eigenvec_bin_custom, parse_basis_hsd_ang
+    from spammm.quantum.DFTB.DFTBplusParser import parse_detailed_xml_custom, parse_eigenvec_bin_custom, parse_basis_hsd_ang
 
     if grid_spec is None:
         grid_spec, origin, ngrid, step = _make_grid_spec(atomPos, step, margin, z_extra)
@@ -1696,7 +1697,7 @@ def run_afm_pipeline(
         z_min = fit_pauli_params.get('z_min', 2.0)
         z_max = fit_pauli_params.get('z_max', 3.0)
         
-        from spammm.DFTB import TestUtils as tu
+        from spammm.quantum.DFTB import TestUtils as tu
         
         # Load DFTB reference for each target atom
         all_A, all_beta = [], []
@@ -2130,11 +2131,11 @@ def run_afm_from_xyz(
     heights  = np.arange(height_range[0], height_range[1], height_step)
 
     # Set up Slater-Koster path
-    from spammm import dftb_utils as du
+    from spammm.quantum.DFTB_utils import SK_PATHS as _SK_PATHS
     if slako_prefix == 'mio-1-1':
-        slako_prefix = du.SK_PATHS.get('mio-1-1', slako_prefix)
+        slako_prefix = _SK_PATHS.get('mio-1-1', slako_prefix)
     elif slako_prefix == '3ob-3-1':
-        slako_prefix = du.SK_PATHS.get('3ob-3-1', slako_prefix)
+        slako_prefix = _SK_PATHS.get('3ob-3-1', slako_prefix)
 
     # Get densities from DFTB+ (sparse or dense method)
     if work_dir is None:
@@ -2547,7 +2548,7 @@ def _run_dftb_zscan_for_atom(target_idx, mol_names, mol_pos, tip_names, sk_prefi
                              z_distances, out_dir, xyz_path, tip_path):
     """Run DFTB z-scan for a single target atom. Returns z_vals, e_vals."""
     import time
-    from spammm import dftb_utils as du
+    from spammm.quantum.DFTB_utils import SK_PATHS as _SK_PATHS, run_dftb_sp as _run_dftb_sp
     from spammm import atomicUtils as au
     
     HAU2EV = 27.211386245988
@@ -2585,7 +2586,7 @@ def _run_dftb_zscan_for_atom(target_idx, mol_names, mol_pos, tip_names, sk_prefi
             work_dir = os.path.join(atom_dir, f'zscan_z{z:.2f}')
             t_start = time.time()
             try:
-                energy_ha = du.run_dftb_sp(work_dir, combined_names, combined_pos, sk_prefix)
+                energy_ha = _run_dftb_sp(work_dir, combined_names, combined_pos, sk_prefix)
                 energy_ev = energy_ha * HAU2EV
                 t_elapsed = time.time() - t_start
                 print(f"  Energy: {energy_ha:.8f} Ha = {energy_ev:.6f} eV  ({t_elapsed:.1f}s)")
@@ -2658,8 +2659,8 @@ def fit_pauli_parameters(xyz_file, basis='mio-1-1', target_indices=[0],
     import json
     import time
     from spammm import atomicUtils as au
-    from spammm.DFTB import TestUtils as tu
-    from spammm import dftb_utils as du
+    from spammm.quantum.DFTB import TestUtils as tu
+    from spammm.quantum.DFTB_utils import SK_PATHS as _SK_PATHS
     
     A_PAULI_DEFAULT = 16.0
     t0 = time.time()
@@ -2674,10 +2675,10 @@ def fit_pauli_parameters(xyz_file, basis='mio-1-1', target_indices=[0],
     
     # Set up SK path
     if sk_prefix is None:
-        if basis in du.SK_PATHS:
-            sk_prefix = du.SK_PATHS[basis]
+        if basis in _SK_PATHS:
+            sk_prefix = _SK_PATHS[basis]
         else:
-            raise ValueError(f"Basis '{basis}' not found in dftb_utils.SK_PATHS; provide sk_prefix explicitly")
+            raise ValueError(f"Basis '{basis}' not found in DFTB_utils.SK_PATHS; provide sk_prefix explicitly")
     
     # Step 1: Generate FDBM grids if needed
     if fdbm_dir is None or not os.path.isdir(fdbm_dir):
@@ -3058,7 +3059,7 @@ def fit_pauli_parameters_pyscf(xyz_file, pyscf_basis='sto-3g', pyscf_method='RHF
     import json
     import time
     from spammm import atomicUtils as au
-    from spammm.DFTB import TestUtils as tu
+    from spammm.quantum.DFTB import TestUtils as tu
     
     t0 = time.time()
     os.makedirs(output_dir, exist_ok=True)

@@ -104,7 +104,7 @@ def get_config(config_path=None):
         config['paths']['firecore_root'] = str(Path(__file__).parent.parent)
     
     if 'dftb_basis_path' not in config['paths'] or config['paths']['dftb_basis_path'] is None:
-        config['paths']['dftb_basis_path'] = str(Path(config['paths']['firecore_root']) / 'spammm' / 'DFTB' / 'data')
+        config['paths']['dftb_basis_path'] = str(Path(config['paths']['firecore_root']) / 'spammm' / 'quantum' / 'DFTB' / 'data')
     
     if 'fdata_dir' not in config['paths'] or config['paths']['fdata_dir'] is None:
         config['paths']['fdata_dir'] = str(Path(config['paths']['firecore_root']) / 'tests' / 'pyFireball' / 'Fdata')

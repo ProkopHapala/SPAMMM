@@ -115,6 +115,14 @@ class DFTBcore:
         if not os.path.exists(libpath):
             raise FileNotFoundError(f"libdftbcore.so not found at: {libpath}")
         
+        # Preload libdftbplus.so if it exists alongside libdftbcore.so — it contains
+        # Fortran module symbols (hamiltonian_store, etc.) that libdftbcore.so depends on.
+        dftbplus_lib = os.path.join(os.path.dirname(libpath), '..', '..', 'src', 'dftbp', 'libdftbplus.so')
+        dftbplus_lib = os.path.normpath(os.path.abspath(dftbplus_lib))
+        self._dep_libs = []
+        if os.path.exists(dftbplus_lib):
+            self._dep_libs.append(ctypes.CDLL(dftbplus_lib, mode=ctypes.RTLD_GLOBAL))
+        
         self._lib = ctypes.CDLL(libpath, mode=ctypes.RTLD_LOCAL)
         self._basis_size = 0
         self._setup_signatures()

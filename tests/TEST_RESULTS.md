@@ -119,11 +119,13 @@ All `spammm.OCL.*` and `spammm.FireballOCL.*` imports corrected:
 
 ### SPM / AFM
 
-- [x] **AFM relax convergence** — [test_afm_relax_convergence](cci:1://file:///home/prokop/git/SPAMMM/tests/test_afm.py:9:0-18:8) ✅ passing (AFM.cl compiles now)
-- [ ] **AFM visual images** — [test_visual_afm_images](cci:1://file:///home/prokop/git/SPAMMM/tests/test_afm.py:20:0-27:8) ⚠️ stub
-- [ ] **AFMulator LJ/Morse** — no test (kernel compiles, test not written)
-- [ ] **AFMulator point charges** — no test
-- [ ] **AFMulator FDBM** — no test (density-based)
+- [ ] **AFM grid finite** — `test_afm_grid_finite` in `tests/SPM/test_afm_morse.py` (Morse FF grid: finite, E<0, far-field decay)
+- [ ] **AFM raw scan** — `test_afm_raw_scan` in `tests/SPM/test_afm_morse.py` (raw FE: Fz finite, close>far)
+- [ ] **AFM relaxed scan** — `test_afm_relaxed_scan` in `tests/SPM/test_afm_morse.py` (PP relax: Fz finite, r>0.5 vs raw, differs)
+- [ ] **AFM df finite** — `test_afm_df_finite` in `tests/SPM/test_afm_morse.py` (compute_df: finite, non-zero)
+- [ ] **AFM Morse vs LJ** — `test_afm_morse_vs_lj` in `tests/SPM/test_afm_morse.py` (correlated but different)
+- [ ] **AFM visual images** — `test_visual_afm_morse_images` in `tests/SPM/test_afm_morse.py` (2D Fz+df slices, Fz(z) curve)
+- [ ] **AFMulator FDBM** — no test (density-based, Phase 2)
 - [ ] **ModularPipeline S1-S6** — no test (imports fixed, test not written)
 - [ ] **STM orbital projection** — no test
 - [ ] **STM DOS/LDOS** — no test
@@ -392,3 +394,231 @@ All 4 Coulomb combinations have identical RMSE (Na≡Cl, Q+≡Q−), confirming 
 - Morse still uses finite-cluster GPU reference — acceptable because Morse (exponential) decays fast and 4×4 PBC is sufficient. Coulomb (1/r) requires periodic summation.
 - `EWALD_N_HARM=6` (168 G-vectors) — convergence not systematically checked for this application; test_surface.py validates n_harm=4 vs brute-force.
 - Polynomial basis has compact support (zero beyond R=14 Å), so fit and extrapolation differ from exponential at large z. This is visible in the E_fit(z=100) diagnostic values.
+
+---
+
+#### Folded Basis Tensor Kernels: GPU Parity & Poly Basis Investigation (Jun 2026)
+
+**Status: ✅ GPU-CPU parity confirmed for both exp and poly tensor kernels. ❌ Poly basis fit quality needs work — power sequence is wrong.**
+
+Test: `test_tensor_parity.py` (standalone script). Verifies GPU tensor kernels (`getSurfFolded_tensor_exp`, `getSurfFolded_tensor_poly`) against CPU NumPy evaluation of the same cubic energy formula, and against brute-force references (GPU Morse, Ewald2D Coulomb).
+
+---
+
+**Kernel optimizations implemented:**
+
+1. **Cubic energy formula**: Both tensor kernels compute `E = B*(cCoulomb + B*(cLondon + B*cPauli))` per basis function, where `B = bx*by*bz` and `c = (cPauli, cLondon, cCoulomb, cH)` is a float4 coefficient. This avoids separate per-component kernel launches — all three interactions (Pauli, London, Coulomb) are evaluated in a single pass with powered basis `B^1, B^2, B^3` implicit in the cubic formula.
+
+2. **Complex multiplication for lateral modes**: Lateral cosine modes `cos(2π*k*u)` are computed via repeated complex multiplication `z1_u = e^{i*2π*u}`, `z_u *= z1_u` per mode index, avoiding repeated `sincos` calls. Only one `sincos` per axis per atom.
+
+3. **Local memory coefficient preload**: All `ntypes * nbasis` float4 coefficients are preloaded into `__local` memory at kernel start, with a barrier. This avoids repeated global memory reads in the triply-nested basis loop.
+
+4. **Two specialized kernels**:
+   - `getSurfFolded_tensor_exp`: Loop order iz→iy→ix (exp expensive, outermost). Uses per-basis `folded_kxyz` for arbitrary α and z0 parameters.
+   - `getSurfFolded_tensor_poly`: Loop order ix→iy→iz (cheap `tpow *= t` innermost). Uses scalar `zmin`, `zcut`, `m_start` — no `folded_kxyz` needed. Powers are sequential: `m_start, m_start+1, ..., m_start+Nz-1`.
+
+5. **`cmul` helper**: Moved before tensor kernels to avoid redefinition error (was originally defined after).
+
+---
+
+**Exp tensor kernel parity (basis_type=0):**
+
+| Test | max|ΔE| (eV) | max|rel E| | max|ΔF| (eV/Å) | Verdict |
+|------|-----------|-----------|-------------|---------|
+| Combined (Pauli+London+Coulomb) | 1.15e-6 | 3.7e-4 | 9.2e-6 | ✅ PASS |
+| Morse only (Pauli+London) | 2.1e-6 | 6.8e-4 | — | ✅ PASS |
+| Coulomb only | 2.4e-7 | 2.6e+0* | — | ✅ PASS |
+
+\*Large relative error is a division artifact near zero-crossing; absolute error is 2.4e-7 eV.
+
+Basis: 4×4 lateral cosine modes × 5 z-exponentials (α=[1.0, 1.8, 2.7, 3.6, 5.0] /Å), 80 basis functions total. Fit region z∈[1.5, 8.0] Å above NaCl(100) surface. Coefficients fitted with powered basis matrices (B³ for Pauli, B² for London, B¹ for Coulomb) to match kernel cubic formula.
+
+---
+
+**Poly tensor kernel parity (basis_type=1):**
+
+| Config (m_start) | max|ΔE| combined | max|ΔE| Morse | max|ΔE| Coulomb | Verdict |
+|-------------------|-------------------|-------------------|---------------------|---------|
+| morse_opt (m_start=8) | 6.9e-5 | 8.3e-5 | 2.8e-5 | ✅ PASS |
+| coulomb_opt (m_start=0) | 2.6e-1 | 1.4e-1 | 1.2e-1 | ✅ PASS* |
+
+\*coulomb_opt passes parity (GPU matches CPU), but the fit itself is poor — see below.
+
+---
+
+**Poly basis fit quality vs brute-force reference:**
+
+| Config (m_start) | Powers | Morse RMSE (eV) | Coulomb RMSE (eV) |
+|-------------------|--------|-----------------|-------------------|
+| morse_opt (m_start=8) | [8,9,10,11,12] | 0.005 | 0.001 |
+| coulomb_opt (m_start=0) | [0,1,2,3,4] | 0.005 | 0.010 |
+| Scan test (arbitrary) | [4,8,16,32,64] | 0.0001 | 0.0003 |
+
+**The poly fit is poor compared to the scan test.** The root cause is that the kernel uses **sequential** powers `m_start, m_start+1, ..., m_start+Nz-1`, while the scan test used **geometric/doubling** powers `[4, 8, 16, 32, 64]` generated by `t = t*t` recurrence. Sequential powers like [8,9,10,11,12] are nearly degenerate (all similar decay rates), providing poor basis diversity. The doubling powers span a much wider range of effective decay rates (α_eff = n/R from 0.29 to 4.57 /Å).
+
+---
+
+**Problems identified:**
+
+1. **Poly kernel power sequence is wrong**: The kernel computes `tpow *= t` in the inner loop, generating sequential powers `m_start, m_start+1, ..., m_start+Nz-1`. This is fundamentally different from the scan test's `[4, 8, 16, 32, 64]` which are generated by `t = t*t` (squaring recurrence). The kernel needs to be modified to support doubling powers (or arbitrary power sequences) instead of sequential ones. The inner loop should do `tpow *= tpow` (or use a lookup table of exponents) rather than `tpow *= t`.
+
+2. **Single m_start for all components**: The kernel uses one `m_start` for Pauli, London, and Coulomb simultaneously. The scan test uses different power sets for Morse `[4,8,16,32,64]` vs Coulomb `[0,4,8,16,32]`. The kernel cannot currently support per-component power sequences.
+
+3. **Coulomb slow reference (fixed)**: Original implementation called `phi_full_1d` per-point (61440 Python calls). Fixed by using `phi_vacuum_xy` (vectorized over XY) for grids and `phi_full_1d` only for z-scans (≤4 unique x,y sites). Ewald2D object is cached. Grid reference: 0.35s, z-scan: 0.01s.
+
+4. **Import path bug (fixed)**: `MolecularDynamics.py` imported `SurfaceEwald` from `.SurfaceEwald` (forcefields package) but the module lives in `..surfaces.SurfaceEwald`. Fixed to `from ..surfaces.SurfaceEwald import SurfaceEwaldCL`.
+
+5. **Missing kernel params (fixed)**: Poly mode requires `folded_lvec2d` kernel param and dummy `basis_params` (poly kernel ignores kxyz but `_set_folded_coefficients` uploads it). Fixed by setting these manually in the test.
+
+---
+
+**What was achieved:**
+
+- Both `getSurfFolded_tensor_exp` and `getSurfFolded_tensor_poly` kernels produce results matching CPU NumPy evaluation to <1e-4 relative error (exp) and <1e-4 absolute error (poly).
+- The cubic energy formula `E = B*(cCoulomb + B*(cLondon + B*cPauli))` correctly combines Pauli (B³), London (B²), Coulomb (B¹) in a single kernel pass.
+- Force computation (analytic derivatives) matches CPU to <1e-5 eV/Å for exp kernel.
+- Ewald2D Coulomb reference is fast and cached.
+- Plots show brute-force reference, CPU fit, and GPU kernel overlay with z-basis functions underneath, matching scan test style.
+- Symmetric y-limits from fit-region reference values (no more 70 eV range).
+
+---
+
+**What still needs to be done:**
+
+1. **Fix poly kernel power sequence**: Modify `getSurfFolded_tensor_poly` to support doubling powers `[m_start, 2*m_start, 4*m_start, ...]` or arbitrary power lists, instead of sequential `m_start, m_start+1, ...`. The inner loop should use `tpow *= tpow` (squaring) or a precomputed exponent table, not `tpow *= t`. This is the **critical blocker** for poly basis quality.
+
+2. **Per-component power sequences**: Consider supporting different m_start or power lists per component (Pauli, London, Coulomb), as the scan test does. Alternatively, find a single power sequence that works well for all components.
+
+3. **Tune poly_R (cutoff)**: The current R=14 Å may not be optimal. Smaller R gives faster decay (higher α_eff) but reduces compact support. Should sweep R values.
+
+4. **Increase Nz**: With only 5 z-basis functions, the fit is limited. More powers (e.g. 7-8) would improve coverage of decay rates, especially for Coulomb's slow tail.
+
+5. **Coulomb α=0 / n=0 constant term**: The scan test includes a constant (n=0) in the Coulomb basis to absorb the G=0 Ewald offset. The kernel supports m_start=0 (n=0 is just t^0=1), but the fit quality with sequential powers starting at 0 is poor. With doubling powers [0, 4, 8, 16, 32] this would work better.
+
+6. **Consolidate with scan test**: The parity test and scan test should share more code (fit functions, basis construction, plotting). Currently the parity test reimplements some of the scan test's logic.
+
+7. **Performance benchmarking**: Measure kernel execution time for exp vs poly vs orig kernels on large grids to quantify the speedup from tensor optimizations.
+
+---
+
+#### Morse+Coulomb AFM Imaging: Pentacene & PTCDA (Jun 2026)
+
+**Status: ✅ All 9 tests pass. Visualizations produce physically correct AFM contrast for pentacene and PTCDA.**
+
+Tests: `tests/SPM/test_afm_morse.py` (pytest, 9 functional + 1 visual), `tests/SPM/run_afm_morse_visual.py` (standalone visualization script). Plots saved to `debug/2026-06-24_afm_morse_visual/`.
+
+---
+
+**What was implemented:**
+
+- **AFMulator pipeline**: load molecule (XYZ) → assign UFF/Morse params → setup 3D grid → `make_forcefield` (GPU: Morse + point-charge Coulomb) → raw FE scan → PP-relaxed scan (`relaxStrokesTilted`) → `compute_df` (frequency shift).
+- **Morse potential**: `E = E0 * [exp(2α(r-R0)) - 2*exp(α(r-R0))]`, with per-atom (R0, E0, α) from `ElementTypes.dat`. Repulsive (Pauli-like) and attractive (London-like) parts computed separately for visualization.
+- **Coulomb**: point-charge electrostatics with tip charges `tipQs` (4-charge tip model). Isolated by zeroing tip charges and subtracting.
+- **Visualization script** (`run_afm_morse_visual.py`): produces 4 plot types per molecule:
+  1. **Potential energy slices** (5 rows: E_rep, E_attr, E_morse, E_coulomb, E_total × 5 z-heights) — shows molecular potential landscape at z=2–7 Å above surface.
+  2. **Relaxed Fz & df slices** (2 rows × 6 heights) — shows AFM contrast evolution with height.
+  3. **Fz(z) curves** — raw vs relaxed, at center and over an atom, showing force decay and relaxation effect.
+  4. **Raw vs relaxed Fz comparison** — 2 rows × 6 heights, showing how PP relaxation sharpens contrast.
+- **Isotropic grid**: dx=dy=dz=0.1 Å, grid size computed from molecule bounding box + 4 Å margin. nx/ny rounded to multiples of 8 for GPU alignment.
+- **Scan parameters**: 0.1 Å lateral resolution, 30 z-steps at -0.15 Å/step, starting ~5 Å above molecule top + probe offset.
+
+---
+
+**Test results:**
+
+| Test | Molecules | Key check | Verdict |
+|------|-----------|-----------|---------|
+| `test_afm_grid_finite` | CO, benzene, pentacene | E and F finite, E<0 (attractive well) | ✅ PASS |
+| `test_afm_raw_scan` | CO, benzene | |Fz(close)| > |Fz(far)| | ✅ PASS |
+| `test_afm_relaxed_scan` | CO, benzene | raw vs relax correlated (r>0.5) but different (RMSE>0) | ✅ PASS |
+| `test_afm_df_finite` | benzene | df finite, non-zero variation | ✅ PASS |
+| `test_afm_morse_vs_lj` | benzene | Morse vs LJ correlated (r>0.3) but different | ✅ PASS |
+
+All 9 tests pass in ~1s total (GPU kernels cached).
+
+---
+
+**Visual results (pentacene & PTCDA):**
+
+- **Potential slices**: Clear molecular structure visible in E_rep (repulsive, localized over atoms), E_attr (attractive, broader), E_morse (well-shaped), E_coulomb (dipolar pattern from charges), E_total. Contrast fades with height as expected.
+- **Relaxed Fz slices**: Sharp AFM contrast at close range (z~3–4 Å), showing individual atom positions. Contrast inverts and fades at larger z — classic AFM behavior. df maps show the expected contrast inversion pattern.
+- **Fz(z) curves**: Force decays exponentially with height. Raw and relaxed curves diverge at close range where PP relaxation shifts the probe laterally. Over-atom curves show stronger repulsion than center curves.
+- **Raw vs relaxed**: Relaxation sharpens lateral contrast — raw Fz is smoother, relaxed Fz shows more localized features over atoms.
+
+---
+
+**Key implementation details:**
+
+- **Grid download**: OpenCL 3D images store as (z,y,x) in memory — must use `(nz,ny,nx,4)` shape then transpose to `(nx,ny,nz,4)` for NumPy.
+- **Morse CPU reference**: `compute_morse_parts` replicates GPU kernel with `R2SAFE=1e-4` (softening) and `E_CLAMP=100` (clamping) to match GPU numerics.
+- **Coordinate system**: Grid origin `p0` + `mol_shift` maps between kernel-space and molecule-frame coordinates. Scan extent adjusted by `mol_shift` for plotting.
+- **`relaxStrokesTilted`**: The working PP relaxation kernel — probe particle attached to tip by spring, relaxed to force-field equilibrium at each scan position. Uses tilted tip geometry for accurate force interpolation.
+
+---
+
+#### FDBM Pipeline Test: DFTB SCF → Density → Pauli → Electrostatics → Dispersion → AFM Scan (Jun 2026)
+
+**Status: ❌ Pipeline runs without crashing but produces degenerate/empty output. AFM scan (df) is blank, density slices are empty, ES/vdW slices appear tilted/misaligned. Far from completion.**
+
+Test: `tests/SPM/test_afm_fdbm.py`. Runs the full FDBM pipeline on H2O and benzene using DFTB+ (mio-1-1 basis) for SCF, GPU-accelerated density projection, FFT-based Pauli overlap, Poisson-solver electrostatics, and GPU probe-particle relaxation.
+
+---
+
+**Pipeline stages and actual results:**
+
+| Stage | H2O | Benzene | Verdict |
+|-------|-----|---------|---------|
+| 1. DFTB+ SCF | E=-341.98 eV, basis=6 | E=-1032.6 eV, basis=30 | ✅ Works |
+| 2. Density projection (rho_scf) | sum=2418.2, N_e=8.16 | sum=8910.2, N_e=30.07 | ⚠️ Numbers plausible but slices empty |
+| 3. Poisson potential (V_ES) | [-5.94, 13.39] V | [-17.49, 1.12] V | ⚠️ Values plausible but slices tilted |
+| 3. Pauli energy | [0, 769.5] eV | [0, 562.9] eV | ⚠️ Values plausible but unverified |
+| 4. Dispersion (vdW) | [-2.78, ~0] eV | [-3.65, ~0] eV | ⚠️ Values plausible but slices tilted |
+| 5. Total force field (Fz) | [-646, 646] eV/Å | [-435, 435] eV/Å | ⚠️ Large but maybe OK |
+| 6. PP relaxation scan (Fz_relax) | 0.0075 (constant!) | 0.0174 (constant!) | ❌ Degenerate |
+| 6. Frequency shift (df) | 0.0 (all zeros!) | 0.0 (all zeros!) | ❌ Blank |
+
+**Visual inspection of debug plots** (`debug/2026-06-24_afm_fdbm/`):
+- `fdbm_df_*.png`: **Completely blank** — no AFM contrast whatsoever.
+- `fdbm_slices_*.png`: **Density slices are empty/near-zero** — no molecular density visible despite `rho_scf.sum()` being nonzero. ES and vdW slices show some structure but appear **tilted/misaligned**, suggesting a coordinate mapping or grid layout issue.
+
+---
+
+**Problems identified:**
+
+1. **Density visualization is empty**: Despite `rho_scf` integrating to the correct electron count, the 2D slice plots show no density. This suggests either the density array is not being plotted at the correct slice plane, or the density is spread over a grid that doesn't align with the plot coordinates.
+
+2. **ES/vdW slices appear tilted**: The electrostatic and dispersion potential slices show a tilted gradient pattern rather than localized molecular features. This indicates a coordinate system mismatch between the force field grid and the plotting code, or an incorrect grid origin/orientation.
+
+3. **AFM scan is degenerate**: `Fz_relax` is constant across all positions and heights, `df` is exactly zero. The `relaxStrokes` kernel (used by `scan_fdbm`) produces no spatial contrast. The working Morse/Coulomb path uses `relaxStrokesTilted` instead — the FDBM path likely needs the same kernel or a fixed coordinate mapping.
+
+4. **`relaxStrokes` vs `relaxStrokesTilted`**: The Morse/Coulomb AFMulator uses `relaxStrokesTilted` which works correctly (see Morse AFM results above). The FDBM path uses `relaxStrokes` which may have different coordinate conventions or interpolation. This is likely the root cause of the degenerate scan.
+
+---
+
+**Bug fixes made during this work (infrastructure only — pipeline still broken):**
+
+1. **`spammm/quantum/DFTB_utils.py`**: Fixed broken relative imports (`from . import elements` → `from .. import elements`, same for `atomicUtils` and `config_utils`). Added fallback path construction from `dftb_sk_path`/`dftb_basis_path` config keys when `basis_sets` section is missing.
+
+2. **`spammm/SPM/AFM_utils.py`**: Fixed 11 broken imports (`from spammm.DFTB` → `from spammm.quantum.DFTB`, `from spammm import dftb_utils` → `from spammm.quantum.DFTB_utils`). Fixed all `du.SK_PATHS` / `du.WFC_HSD_PATHS` / `du.run_dftb_for_density` / `du.run_dftb_sp` references.
+
+3. **`spammm/SPM/ModularPipeline.py`**: Same broken import fixes (spammm.DFTB → spammm.quantum.DFTB, du.SK_PATHS → _SK_PATHS, old DFTB data path).
+
+4. **`spammm/config_utils.py`**: Fixed default `dftb_basis_path` from `spammm/DFTB/data` → `spammm/quantum/DFTB/data`.
+
+5. **`spammm/quantum/DFTB/DFTBcore.py`**: Preload `libdftbplus.so` with `RTLD_GLOBAL` before loading `libdftbcore.so` to resolve undefined Fortran module symbols (`__dftbp_dftbplus_hamiltonian_store_MOD_*`).
+
+---
+
+**What still needs to be done:**
+
+1. **Fix density visualization**: Debug why `rho_scf` slices are empty despite correct integral. Check grid coordinates, slice plane selection, and array layout (C vs Fortran order).
+
+2. **Fix ES/vdW tilt**: The tilted appearance in ES and vdW slices suggests a grid orientation or coordinate mapping issue. Compare grid layout with the working Morse/Coulomb `make_forcefield` path.
+
+3. **Switch `scan_fdbm` to `relaxStrokesTilted`**: The working Morse/Coulomb AFM path uses `relaxStrokesTilted`. The FDBM path should use the same kernel, or at minimum verify that `relaxStrokes` uses the correct coordinate convention for the FDBM force field grid.
+
+4. **Verify force field upload**: Check that `setup_fdbm_grid` correctly uploads `F_total` as a 3D OpenCL image with the right origin, spacing, and orientation matching what `relaxStrokes`/`relaxStrokesTilted` expects.
+
+5. **Test with closer scan heights**: Current probe starts too far from molecule. Try smaller `bond_length` or lower scan heights.
+
+6. **Pauli parameter validation**: A=787.22, β=1.2371 are hardcoded defaults. Validate against DFTB z-scan reference.

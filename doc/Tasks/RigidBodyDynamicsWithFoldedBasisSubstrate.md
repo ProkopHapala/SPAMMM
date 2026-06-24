@@ -1,15 +1,3 @@
-Let me explore the codebase to understand the existing rigid body dynamics, force fields, and surface-related code.
-
-Let me read the key files in more detail to understand the full picture.
-
-Let me look at the folded basis machinery and the SurfaceEwald GPU implementation more closely.
-
-Let me see the rest of the folded fitting and how it connects to the rigid body dynamics.
-
-Now let me check the `nonbonded.cl` file the user has open, and the `RigidBodyAFM.py` for the [update_anchors](cci:1://file:///home/prokop/git/SPAMMM/spammm/forcefields/RigidBodyDynamics.py:664:4-666:29) method.
-Now I have a comprehensive picture. Here's my inventory and analysis:
-
----
 
 # Inventory of Existing Components
 
