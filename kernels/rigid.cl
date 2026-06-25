@@ -107,12 +107,6 @@ inline float3 mat3_dot_T(const cl_Mat3 M, const float3 v){
     return M.a.xyz*v.x + M.b.xyz*v.y + M.c.xyz*v.z;
 }
 
-inline int modulo(const int i, const int m) {
-    int result = i % m;
-    if (result < 0) result += m;
-    return result;
-}
-
 inline int4 make_inds_pbc(const int n, const int iG) {
     switch( iG ){
         case 0: { return (int4)(0, 1,   2,   3  ); }

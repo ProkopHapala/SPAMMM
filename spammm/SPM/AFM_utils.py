@@ -116,23 +116,24 @@ def plot_grid_Fz(Fz, heights, label, fname, x_ext=None, y_ext=None, ncols=7, sav
     """Plot grid of 2D Fz images at all heights with per-slice colorbars."""
     nz_p = len(heights)
     nrows = int(np.ceil(nz_p / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(2.5*ncols, 2.8*nrows))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4*ncols, 4*nrows), squeeze=False,
+                             gridspec_kw={'wspace': 0.05, 'hspace': 0.15})
     axes = np.array(axes).reshape(nrows, ncols)
     fig.suptitle(f"{label} (eV/Å) [per-slice]", fontsize=10)
     ext = [x_ext[0], x_ext[1], y_ext[0], y_ext[1]] if x_ext is not None and y_ext is not None else None
-    kw = dict(origin='lower', cmap='bwr', aspect='auto')
+    kw = dict(origin='lower', cmap='seismic', aspect='equal')
     if ext: kw['extent'] = ext
     for k in range(nz_p):
         r, c = divmod(k, ncols); ax = axes[r, c]
         vabs = max(float(np.percentile(np.abs(Fz[:,:,k]), 99)), 1e-6)
         norm = safe_norm(Fz[:,:,k])
         im = ax.imshow(Fz[:,:,k].T, norm=norm, **kw)
-        ax.set_title(f"h={heights[k]:.1f}Å ±{vabs:.2g}", fontsize=6); ax.tick_params(labelsize=4)
-        plt.colorbar(im, ax=ax, shrink=0.8)
+        ax.set_title(f"h={heights[k]:.1f}Å ±{vabs:.2g}", fontsize=7); ax.tick_params(labelsize=5)
+        cb = plt.colorbar(im, ax=ax, shrink=0.6, pad=0.02, fraction=0.04)
+        cb.ax.tick_params(labelsize=5)
     for k in range(nz_p, nrows*ncols):
         r, c = divmod(k, ncols); axes[r, c].set_visible(False)
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, fname), dpi=90, bbox_inches='tight'); plt.close()
+    plt.savefig(os.path.join(save_dir, fname), dpi=150, bbox_inches='tight'); plt.close()
     print(f"Saved {fname}")
 
 

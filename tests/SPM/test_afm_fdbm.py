@@ -24,7 +24,7 @@ Requires:
   - SK files (mio-1-1 or 3ob-3-1)
   - GPU (OpenCL)
 """
-import pytest, numpy as np, os, datetime, shutil
+import pytest, numpy as np, os, shutil
 
 os.environ.setdefault('PYOPENCL_CTX', '0')
 os.environ.setdefault('PYOPENCL_COMPILER_OUTPUT', '1')
@@ -41,8 +41,10 @@ STEP = 0.15       # Å — coarser than Morse tests for speed (DFTB projection i
 MARGIN = 4.0      # Å
 Z_EXTRA = 6.0     # Å above molecule top
 
-def _debug_dir(name='afm_fdbm'):
-    d = os.path.join('debug', f'{datetime.date.today()}_{name}')
+def _debug_dir(name=None):
+    d = os.path.join('debug', 'test_afm_fdbm')
+    if name:
+        d = os.path.join(d, name)
     os.makedirs(d, exist_ok=True)
     return d
 

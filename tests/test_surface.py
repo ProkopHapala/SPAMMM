@@ -1,4 +1,4 @@
-import pytest, numpy as np, os, datetime
+import pytest, numpy as np, os
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -94,8 +94,10 @@ def _plot_cluster(cluster, save_dir, name='cluster'):
             el = 'Na' if q[i] > 0 else 'Cl'
             f.write(f'  {el}   {x[i]:10.3f}   {y[i]:10.3f}   {z[i]:10.3f}  {q[i]:+.4f}\n')
 
-def _debug_dir(name='surface'):
-    d = os.path.join('debug', f'{datetime.date.today()}_{name}')
+def _debug_dir(name=None):
+    d = os.path.join('debug', 'test_surface')
+    if name:
+        d = os.path.join(d, name)
     os.makedirs(d, exist_ok=True)
     return d
 

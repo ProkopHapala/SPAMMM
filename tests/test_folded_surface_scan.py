@@ -14,7 +14,7 @@ Each plot: top = reference + fit + error (residual), bottom = basis functions.
 Run:  python tests/test_folded_surface_scan.py
 """
 
-import os, sys, datetime
+import os, sys
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -33,7 +33,7 @@ from spammm.surfaces.Ewald2D import Ewald2D
 # =============================================================================
 
 NACL_SUBSTRATE = os.path.join(_proj_root, 'data', 'substrates', 'NaCl_1x1_L3.xyz')
-PLOT_DIR = os.path.join(_proj_root, 'debug', f'{datetime.date.today()}_folded_scan')
+PLOT_DIR = os.path.join(_proj_root, 'debug', 'test_folded_surface_scan')
 
 R_O = 1.7500; SQRT_E_O = np.sqrt(0.00260184625)
 PROBES = {

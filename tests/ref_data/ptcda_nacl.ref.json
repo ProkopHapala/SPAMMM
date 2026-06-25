@@ -1,0 +1,202 @@
+{
+  "description": "Reference for ptcda_nacl: relaxed molecule on NaCl(100) folded basis",
+  "test_func": "test_relax_ptcda_nacl",
+  "test_module": "tests.test_folded_relax",
+  "ref_name": "ptcda_nacl",
+  "z_rel": 3.2471,
+  "force": 1.4e-05,
+  "torque": 0.0,
+  "atom_distances": [
+    {
+      "element": "C",
+      "d_Na": 3.906,
+      "d_Cl": 3.43
+    },
+    {
+      "element": "C",
+      "d_Na": 3.706,
+      "d_Cl": 3.5
+    },
+    {
+      "element": "C",
+      "d_Na": 3.848,
+      "d_Cl": 3.551
+    },
+    {
+      "element": "C",
+      "d_Na": 3.906,
+      "d_Cl": 3.43
+    },
+    {
+      "element": "C",
+      "d_Na": 3.566,
+      "d_Cl": 3.555
+    },
+    {
+      "element": "C",
+      "d_Na": 3.566,
+      "d_Cl": 3.559
+    },
+    {
+      "element": "C",
+      "d_Na": 3.848,
+      "d_Cl": 3.551
+    },
+    {
+      "element": "C",
+      "d_Na": 3.707,
+      "d_Cl": 3.5
+    },
+    {
+      "element": "C",
+      "d_Na": 3.566,
+      "d_Cl": 3.559
+    },
+    {
+      "element": "C",
+      "d_Na": 3.457,
+      "d_Cl": 3.643
+    },
+    {
+      "element": "C",
+      "d_Na": 3.567,
+      "d_Cl": 3.554
+    },
+    {
+      "element": "C",
+      "d_Na": 3.467,
+      "d_Cl": 3.63
+    },
+    {
+      "element": "C",
+      "d_Na": 3.403,
+      "d_Cl": 3.75
+    },
+    {
+      "element": "C",
+      "d_Na": 3.705,
+      "d_Cl": 3.49
+    },
+    {
+      "element": "C",
+      "d_Na": 3.319,
+      "d_Cl": 3.889
+    },
+    {
+      "element": "C",
+      "d_Na": 3.403,
+      "d_Cl": 3.75
+    },
+    {
+      "element": "C",
+      "d_Na": 3.456,
+      "d_Cl": 3.644
+    },
+    {
+      "element": "C",
+      "d_Na": 3.324,
+      "d_Cl": 3.878
+    },
+    {
+      "element": "C",
+      "d_Na": 3.467,
+      "d_Cl": 3.63
+    },
+    {
+      "element": "C",
+      "d_Na": 3.324,
+      "d_Cl": 3.878
+    },
+    {
+      "element": "C",
+      "d_Na": 3.706,
+      "d_Cl": 3.49
+    },
+    {
+      "element": "C",
+      "d_Na": 3.4,
+      "d_Cl": 3.762
+    },
+    {
+      "element": "C",
+      "d_Na": 3.32,
+      "d_Cl": 3.889
+    },
+    {
+      "element": "C",
+      "d_Na": 3.4,
+      "d_Cl": 3.762
+    },
+    {
+      "element": "O",
+      "d_Na": 3.817,
+      "d_Cl": 3.68
+    },
+    {
+      "element": "O",
+      "d_Na": 3.817,
+      "d_Cl": 3.681
+    },
+    {
+      "element": "O",
+      "d_Na": 3.264,
+      "d_Cl": 4.095
+    },
+    {
+      "element": "O",
+      "d_Na": 3.257,
+      "d_Cl": 4.143
+    },
+    {
+      "element": "O",
+      "d_Na": 3.264,
+      "d_Cl": 4.094
+    },
+    {
+      "element": "O",
+      "d_Na": 3.258,
+      "d_Cl": 4.141
+    },
+    {
+      "element": "H",
+      "d_Na": 3.696,
+      "d_Cl": 3.437
+    },
+    {
+      "element": "H",
+      "d_Na": 3.837,
+      "d_Cl": 3.34
+    },
+    {
+      "element": "H",
+      "d_Na": 3.708,
+      "d_Cl": 3.429
+    },
+    {
+      "element": "H",
+      "d_Na": 3.708,
+      "d_Cl": 3.429
+    },
+    {
+      "element": "H",
+      "d_Na": 3.837,
+      "d_Cl": 3.34
+    },
+    {
+      "element": "H",
+      "d_Na": 3.833,
+      "d_Cl": 3.343
+    },
+    {
+      "element": "H",
+      "d_Na": 3.696,
+      "d_Cl": 3.437
+    },
+    {
+      "element": "H",
+      "d_Na": 3.833,
+      "d_Cl": 3.344
+    }
+  ],
+  "n_atoms": 38
+}

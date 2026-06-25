@@ -1,10 +1,12 @@
-import pytest, numpy as np, os, datetime
+import pytest, numpy as np, os
 from spammm.AtomicSystem import AtomicSystem
 from tests.helpers.parity import overlay_plot, rmse, correlation
 from tests.helpers.scan import compare_scans
 
-def _debug_dir(name='integration'):
-    d = os.path.join('debug', f'{datetime.date.today()}_{name}')
+def _debug_dir(name=None):
+    d = os.path.join('debug', 'test_integration')
+    if name:
+        d = os.path.join(d, name)
     os.makedirs(d, exist_ok=True)
     return d
 

@@ -1,4 +1,4 @@
-import pytest, numpy as np, os, datetime
+import pytest, numpy as np, os
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -9,8 +9,10 @@ from tests.helpers.parity import plot_curves, overlay_plot, rmse, correlation
 
 os.environ.setdefault('PYOPENCL_COMPILER_OUTPUT', '1')
 
-def _debug_dir(name='forcefield'):
-    d = os.path.join('debug', f'{datetime.date.today()}_{name}')
+def _debug_dir(name=None):
+    d = os.path.join('debug', 'test_forcefield')
+    if name:
+        d = os.path.join(d, name)
     os.makedirs(d, exist_ok=True)
     return d
 
