@@ -1,6 +1,6 @@
 ---
 name: visual-debugging
-description: Use when creating diagnostic plots or visualizations for debugging
+description: Use when creating diagnostic plots, visualizations, or headless visual tests for debugging
 trigger:
   glob:
     - "**/tests/**/*"
@@ -11,51 +11,53 @@ trigger:
     - "**/*benchmark*.py"
 ---
 
-## Shared Utilities
+## Rules
 
-Before writing ad-hoc debugging/plotting code, check these existing modules:
+1. **Reuse before reinvent.** Check existing helpers before writing plotting code:
+   - `tests/helpers/geometry.py` — `plot_geometry()`, `render_graph()`, `render_before_after()`, bond/angle checks
+   - `tests/helpers/parity.py` — `plot_curves()`, `overlay_plot()`, `assert_parity()`, RMSE/correlation
+   - `tests/helpers/topology_test.py` — `TopologySnapshot`, `TopologyDiff` for graph before/after assertions
+   - `spammm/GUI/VispyUtils.py` — `AtomScene` for interactive 3D (not for headless tests)
 
-**Python Visualization:**
-- `pyBall/plotUtils.py` - matplotlib utilities: 1D/2D function plots, geometry visualization, field slices, scan profiles, derivative plots
-- `pyBall/VispyUtils.py` - GPU-accelerated 3D visualization: AtomScene class for interactive molecular viewing, bond visualization, force vectors
+2. **Two-layer testing for visual/editing features:**
+   - **L1 (always):** Assert topology diff via `TopologySnapshot`/`TopologyDiff`. Fast, deterministic, no display.
+   - **L2 (`--visual` flag or `@pytest.mark.visual`):** Render before/after PNG with matplotlib Agg. Annotate cursor position (clicks), highlight selected atoms, color diff (green=added, red=removed).
 
-**Python Testing/Diagnostics:**
-- `pyBall/DFTB/TestUtils.py` - RMS error computation, checkpoint management (save/load/compare), grid generation, eigenvec printing
-- `pyBall/atomicUtils.py` - Atomic utilities: normalize, findAllBonds, graph preprocessing, adjacency lists
+3. **Test backend logic, not GUI widgets.** Simulate user actions via direct API calls:
+   - Click atom → `graph.pick_atom(pos, radius=0.5)`
+   - Press button → call backend method directly (e.g., `backend.add_ring(q, r)`)
+   - Selection query → `compile_select_query(q); apply_select_query(graph, compiled)`
 
-**C++ Testing/Diagnostics:**
-- `cpp/common/testUtils.h` - Print arrays/vectors/matrices, compareVecs, derivative checking (checkDeriv, checkDeriv3d), timing (StopWatch), error macros (TEST_ERROR_PROC_N, SPEED_TEST_FUNC)
+4. **Output organization:** Save PNGs to `tests/visual_output/{test_name}.png`. Report exact paths.
 
-## Test Artifacts
+5. **Plot style for comparison curves:**
+   - Reference: `ls=':'`, `lw=1.5` (dotted, thick)
+   - Model: `ls='-'`, `lw=0.5` (solid, thin)
+   - Subtract DC offset: `dc = mean(model - ref)` before plotting
+   - Residual on twin axis: `(model_shifted - ref) * 100`, labeled `diff x100`
+   - RMSE/MaxErr text box: upper-left, monospace, semi-transparent
 
-- **Structured outputs:** Group all debugging, benchmarking, and testing outputs into organized, numbered directories (e.g., `tests/003_case_name/`). Do not clutter root directories. Explicitly report their location.
-- **Foreground execution:** Run tests synchronously in the foreground with full output. Never hide output or use background commands (`&`, `| tail`, `| head`, or silent redirects). Full `stdout` must be visible.
+6. **No `plt.show()` in library code.** Only in CLI/main entry points. Use `--saveFig` / `--noPlot` flags.
 
-## Visual Review
+7. **Foreground execution.** Never hide output (`| tail`, `| head`, `&`). Full stdout visible.
 
-- **Python tests:** Generate diagnostic plots using `matplotlib` saved as `.png` files. Use shared helpers like `plotUtils.py` (e.g., `plot_scan_profile`, `plot_field_slice`, `plotGeometryWithForces`).
-- **Optional plotting:** Make plotting optional via flags (e.g., `--noPlot`, `--saveFig`). Isolate `plt.show()` strictly to the CLI/main entry point.
-- **Report paths:** Always report the exact paths/folders of generated plots.
+## Headless Visual Testing for Molecular Editing
 
-## Diagnostics
+**Full design doc:** `doc/HowTo/VisualDEbugging.md`
 
-- **Numerical range sanity:** Strategically place checks throughout calculations to ensure values are within reasonable limits and are not `NaN`, infinity, or unexpected zeros.
-- **Checkpointing:** Use `pyBall/DFTB/TestUtils.py` checkpoint functions (`save_checkpoint`, `load_checkpoint`, `compare_checkpoint`) for parity testing and reproducible debugging.
-- **RMS error:** Use `compute_rms_error` from `TestUtils.py` for array comparisons.
+Molecular editing features are visual (clicks, selections, buttons). Test them headlessly:
 
-## Consolidation Principle
-
-- **Reuse over reinvent:** Before writing new debug/plot/test functions, search existing utility modules. Generalize existing functions if they almost fit your needs.
-- **Separate concerns:** Keep compute algorithms separate from plotting/diagnostics. Move ad-hoc plotting code from test scripts into shared utilities.
-- **Zero-copy buffers:** For Python-C++ interop, use `np.ctypeslib.as_array` pattern (see `python_native_bindings` skill) instead of copying data.
-
-## Plot Style Preferences
-
-When creating diagnostic comparison plots (e.g., reference vs model curves):
-
-- **Subtract constant offset (DC term):** Methods like Ewald summation cannot capture the constant (DC/zero-frequency) term, causing a constant shift between model and reference. Compute `dc = mean(model - ref)` and subtract it from the model so curves overlap. Center reference by subtracting its own mean for display. The residual difference after this shift reveals true numerical error.
-- **Reference curve:** `ls=':'`, `lw=1.5` (dotted, thick — clearly visible as the reference)
-- **Model curve(s):** `ls='-'`, `lw=0.5` (solid, thin — the thing being tested)
-- **Residual difference on twin axis:** Plot `(model_shifted - ref) * 100` on a secondary y-axis (twinx) so small residual errors are visible. Label it `diff x100`.
-- **RMSE/MaxErr box:** Show RMSE and max error in a text box (upper-left, monospace, semi-transparent background).
-- **General rule:** The reference should always be more visually prominent (thicker, dotted) than the model being compared.
+- **Topology snapshot/diff:** `TopologySnapshot(graph)` captures atoms/bonds/rings/neighbors by stable `_id`. `snap_before.diff(snap_after)` returns `TopologyDiff` with `added_atoms`, `removed_bonds`, etc. Use `diff.assert_counts(name, added_atoms=6, added_bonds=6)` — no hardcoding atom IDs.
+- **GUI simulation table:**
+  - Click atom → `graph.pick_atom(world_pos, radius=0.5)`
+  - Click bond → `graph.pick_bond(world_pos, radius=0.5)`
+  - Click ring → `graph.pick_ring(world_pos, radius=1.0)`
+  - Button press → call backend method directly (e.g., `backend.add_ring(q, r)`)
+  - Selection query → `compile_select_query(q); apply_select_query(graph, compiled)`
+- **Visual annotations on before/after PNGs:**
+  - Cursor crosshair at world-space click position
+  - Colored halo around selected atom IDs
+  - Diff coloring: green=added, red=removed, blue=new bonds, dashed red=removed bonds
+  - Atom labels: `id:element` (e.g., `42:C`)
+- **pytest setup:** `--visual` flag → `visual_output_dir` fixture returns `tests/visual_output/` or `None`. L1 assertions always run; L2 rendering only when fixture is not `None`.
+- **Stable IDs are key:** `AtomicGraph` uses object identity (`_id`), not array indices. Atoms don't renumber after deletion. Snapshots are reliable across operations.
