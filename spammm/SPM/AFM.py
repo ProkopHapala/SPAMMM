@@ -1155,6 +1155,38 @@ def compute_df(Fz, dz):
     """df = -dFz/dz  (frequency-shift proxy).  Fz shape (nx,ny,nz)."""
     return -np.gradient(Fz, abs(dz), axis=2)
 
+def compute_df_amp(Fz, dz, amp=1.0):
+    """Frequency shift with finite oscillation amplitude (weighted average of dFz/dz).
+
+    df(z) = -<dFz/dz>_amp = -∫_{-1}^{1} dFz/dz(z + amp*u) * (2/π)*sqrt(1-u^2) du
+
+    Uses Gauss-Chebyshev quadrature with 9 points for the semi-circle weight.
+    Fz shape (nx,ny,nz), dz = z-step, amp = oscillation amplitude [Å].
+    """
+    from scipy.ndimage import map_coordinates
+    nz = Fz.shape[2]
+    dz_abs = abs(dz)
+    # 9-point Gauss-Chebyshev quadrature nodes: u_k = cos((2k+1)/(2n)*π)
+    n_quad = 9
+    k = np.arange(n_quad)
+    u_k = np.cos((2*k + 1) / (2*n_quad) * np.pi)  # nodes in [-1, 1]
+    w_k = np.full(n_quad, 1.0 / n_quad)            # equal weights for Chebyshev
+    # z indices for each quadrature point: iz + u_k * amp / dz
+    iz_grid = np.arange(nz, dtype=np.float64)
+    df = np.zeros_like(Fz, dtype=np.float64)
+    nx, ny = Fz.shape[0], Fz.shape[1]
+    for uk, wk in zip(u_k, w_k):
+        iz_shift = uk * amp / dz_abs
+        iz_query = iz_grid[None, None, :] + iz_shift  # (1, 1, nz)
+        # Use map_coordinates for each (ix, iy) — vectorize via broadcasting
+        coords = np.array([np.broadcast_to(np.arange(nx)[:, None, None], (nx, ny, nz)),
+                           np.broadcast_to(np.arange(ny)[None, :, None], (nx, ny, nz)),
+                           np.broadcast_to(iz_query, (nx, ny, nz))])
+        Fz_shifted = map_coordinates(Fz.astype(np.float64), coords, order=1, mode='nearest')
+        df_z = np.gradient(Fz_shifted, dz_abs, axis=2)
+        df -= wk * df_z
+    return df.astype(np.float32)
+
 def fft_poisson(rho, step):
     """FFT Poisson solver: V(r) from charge density rho(r) on uniform grid with spacing `step`."""
     nx, ny, nz = rho.shape
@@ -1572,11 +1604,19 @@ def pp_relax_2d_cl(afmulator, F_total, origin, step,
 # FDBM AFM field computation helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Pauli parameters fitted against DFTB z-scan with raw overlap (A=1,beta=1 convolution)
+# Pauli parameters fitted against Ez reference z-scans with Gaussian tip overlap (sigma=0.7 Å)
 # E_pauli = A_pauli * overlap_raw^beta_pauli
+# Fit method: global log-log linear regression over all curves pooled per method
+# Fit range: z = 1.7–2.3 Å above target atoms
+# Molecules: C2H4, CH2O, H2O, NH3, CH2NH, benzene, pyridine, pyrrole, PTCDA
+# See: tests/ref_data/Ez_FDBM/pauli_fit_results.json
 PAULI_FITTED_DEFAULTS = {
-    'mio-1-1': {'A': 787.22, 'beta': 1.2371},  # fitted for pentacene atom 0, raw overlap (A=1,beta=1 convolution)
-    '3ob-3-1': {'A': 509.28, 'beta': 1.0586},  # fitted for pentacene atom 0, raw overlap (A=1,beta=1 convolution)
+    'mio-1-1':    {'A': 155.33, 'beta': 1.5507},   # global log-log fit, R²=0.963, 120 points
+    '3ob-3-1':    {'A': 124.84, 'beta': 1.4330},   # global log-log fit, R²=0.961, 120 points
+    'pyscf_6-31g*': {'A': 39.53, 'beta': 1.1544},  # avg of PBE (A=39.95,β=1.169) & B3LYP (A=39.11,β=1.140), R²≈0.94
+    # Old values (pentacene single-atom fit, kept for reference):
+    # 'mio-1-1':    {'A': 787.22, 'beta': 1.2371},
+    # '3ob-3-1':    {'A': 509.28, 'beta': 1.0586},
     'pyscf_sto-3g': {'A': 1.15, 'beta': 0.36},  # fitted for pentacene atom 0, pySCF sto-3g, fit range 3.0-6.0 Å
 }
 

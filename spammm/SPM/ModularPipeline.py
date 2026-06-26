@@ -459,7 +459,7 @@ Hamiltonian = DFTB {{
                     print(f"  Using pySCF Pauli defaults for {pyscf_basis_key}: A={pauli_params['A']:.2f}, beta={pauli_params['beta']:.2f}")
                 else:
                     print(f"  WARNING: No fitted Pauli params found for {pyscf_basis_key}, using default")
-                    pauli_params = {'A': 1.15, 'beta': 0.36}  # Fitted for sto-3g
+                    pauli_params = {'A': 39.53, 'beta': 1.1544}  # Fitted for 6-31g*
             else:
                 from spammm.SPM import AFM as afm_mod
                 if self.basis in afm_mod.PAULI_FITTED_DEFAULTS:
@@ -467,7 +467,7 @@ Hamiltonian = DFTB {{
                     print(f"  Using DFTB Pauli defaults for {self.basis}: A={pauli_params['A']:.2f}, beta={pauli_params['beta']:.2f}")
                 else:
                     print(f"  WARNING: No fitted Pauli params found for {self.basis}, using default")
-                    pauli_params = {'A': 787.22, 'beta': 1.2371}
+                    pauli_params = {'A': 155.33, 'beta': 1.5507}  # mio-1-1 default
         
         # Step 2: Electrostatics
         V_ES = afm.fft_poisson(rho_diff, self.step)

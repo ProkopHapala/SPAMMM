@@ -64,6 +64,10 @@ def main():
     parser.add_argument('--h_min', type=float, default=3.0, help='Min probe height above mol [Ang]')
     parser.add_argument('--h_max', type=float, default=6.0, help='Max probe height above mol [Ang]')
     parser.add_argument('--h_step', type=float, default=0.25, help='Probe height step [Ang]')
+    parser.add_argument('--cmap', default='seismic', help='Colormap for Fz/dz plots (default: seismic). Try bwr, RdBu, coolwarm')
+    parser.add_argument('--df_cmap', default='gray', help='Colormap for df plots (default: gray). Try hot, viridis, seismic')
+    parser.add_argument('--amp', type=float, default=1.0, help='Oscillation amplitude for df [Ang] (default: 1.0)')
+    parser.add_argument('--scan_margin', type=float, default=5.0, help='Margin around molecule for scan area [Ang] (default: 5.0)')
     args = parser.parse_args()
 
     import matplotlib
@@ -132,7 +136,7 @@ def main():
     print(f"F_total: Fz=[{F_total[...,2].min():.4e}, {F_total[...,2].max():.4e}]")
 
     # Setup scan grid
-    scan_margin = 1.0
+    scan_margin = args.scan_margin
     x_min = float(atomPos[:,0].min() - scan_margin)
     x_max = float(atomPos[:,0].max() + scan_margin)
     y_min = float(atomPos[:,1].min() - scan_margin)
@@ -150,9 +154,9 @@ def main():
         ppm_mode=True, use_fire=True
     )
     Fz_relax = FEs_relax[:,:,:,2]
-    df = afm.compute_df(Fz_relax, float(heights[1] - heights[0]))
+    df = afm.compute_df_amp(Fz_relax, float(heights[1] - heights[0]), amp=args.amp)
     print(f"Fz_relax: [{Fz_relax.min():.4e}, {Fz_relax.max():.4e}]  mean={Fz_relax.mean():.4e}")
-    print(f"df:       [{df.min():.4e}, {df.max():.4e}]  mean={df.mean():.4e}")
+    print(f"df (amp={args.amp:.1f} Å): [{df.min():.4e}, {df.max():.4e}]  mean={df.mean():.4e}")
     print(f"tip dz:   [{tip_disp['dz'].min():.4e}, {tip_disp['dz'].max():.4e}]")
 
     # Check for NaN
@@ -165,11 +169,11 @@ def main():
 
     # === 1-3: Use existing AFM_utils.plot_grid_Fz (per-slice symmetric safe_norm, bwr) ===
     afm_utils.plot_grid_Fz(Fz_relax, heights, f'Fz_relax — {base}',
-        f'Fz_relax_{base}.png', x_ext=x_ext, y_ext=y_ext, save_dir=args.outdir)
-    afm_utils.plot_grid_Fz(df, heights, f'df — {base}',
-        f'df_{base}.png', x_ext=x_ext, y_ext=y_ext, save_dir=args.outdir)
+        f'Fz_relax_{base}.png', x_ext=x_ext, y_ext=y_ext, save_dir=args.outdir, cmap=args.cmap)
+    afm_utils.plot_grid_Fz(df, heights, f'df (amp={args.amp:.1f} Å) — {base}',
+        f'df_{base}.png', x_ext=x_ext, y_ext=y_ext, save_dir=args.outdir, cmap=args.df_cmap)
     afm_utils.plot_grid_Fz(tip_disp['dz'], heights, f'tip dz — {base}',
-        f'tip_dz_{base}.png', x_ext=x_ext, y_ext=y_ext, save_dir=args.outdir)
+        f'tip_dz_{base}.png', x_ext=x_ext, y_ext=y_ext, save_dir=args.outdir, cmap=args.cmap)
 
     # === 4. 1D Fz vs height above carbon atom ===
     carbon_atoms = [(i, atomPos[i]) for i, e in enumerate(enames) if e == 'C']

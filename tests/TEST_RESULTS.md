@@ -1016,4 +1016,94 @@ python tests/SPM/plot_zscan_reference.py
 - pySCF PBE shows deeper attractive wells (~−0.03 eV) than B3LYP (~−0.02 eV) for H atoms
 - DFTB generally overestimates repulsion compared to pySCF at close contact (z < 2.5 Å)
 - PTCDA shows distinct curves for chemically different O sites (carbonyl vs bridging) and C sites (core vs anhydride)
+
+---
+
+## FDBM Relaxation Simulations with Fitted Pauli Parameters
+
+### Overview
+
+Full FDBM (Full Dynamical Bonding Model) simulations with PP (Pauli Potential) relaxation were run for PTCDA and pentacene using DFTB densities (mio-1-1 and 3ob-3-1 basis sets) with the new globally fitted Pauli parameters. The simulations produce 2D force field (Fz), frequency shift (df), and tip displacement (dz) maps at multiple probe heights, plus 1D Fz/df curves above a central carbon atom.
+
+### Pauli Parameters Used
+
+Fitted via global log-log regression of Pauli overlap vs Ez reference curves over z = 1.7–2.3 Å, 9 molecules × multiple sites (120 data points per method). See `tests/ref_data/Ez_FDBM/pauli_fit_results.json`.
+
+| Basis set | A | β | R² | Source |
+|---|---|---|---|---|
+| `mio-1-1` | 155.33 | 1.5507 | 0.963 | global log-log fit |
+| `3ob-3-1` | 124.84 | 1.4330 | 0.961 | global log-log fit |
+| `pyscf_6-31g*` | 39.53 | 1.1544 | ~0.94 | avg of PBE & B3LYP |
+
+Formula: `E_pauli = A * overlap_raw^β` where `overlap_raw` is the raw electron density overlap between sample and Gaussian tip (σ=0.7 Å).
+
+### Simulation Setup
+
+- **Script:** `tests/SPM/plot_fdbm_relax.py`
+- **Grid step:** 0.15 Å
+- **Density grid margin:** 8.0 Å around molecule
+- **Scan margin:** 5.0 Å around molecule
+- **Probe heights:** 3.0–5.8 Å above molecule (step 0.25 Å)
+- **Oscillation amplitude:** 1.0 Å (Gauss-Chebyshev quadrature, 9-point)
+- **Tip:** CO tip (DFTB density), K_LAT=0.5, K_RAD=20.0 eV/Å², bond_length=2.0 Å
+- **df colormap:** grayscale (AFM-style), Fz colormap: seismic (diverging)
+
+### Results
+
+#### Grid sizes
+
+| Molecule | Atoms | Grid (nx×ny×nz) | Scan points | Scan area (Å) |
+|---|---|---|---|---|
+| PTCDA | 38 | 192×160×152 | 196,620 | 21.6 × 16.7 |
+| Pentacene | 36 | 200×144×152 | 193,920 | 23.9 × 15.0 |
+
+#### Energy and force ranges
+
+| Quantity | PTCDA 3ob | PTCDA mio | Pentacene 3ob | Pentacene mio |
+|---|---|---|---|---|
+| E_pauli max (eV) | 10,684 | 19,697 | 3,307 | 5,876 |
+| E_ES range (eV) | [-2.19, 3.05] | [-2.20, 3.12] | — | — |
+| E_vdw min (eV) | -3.73 | -3.73 | — | — |
+| Fz_relax max (eV/Å) | 9.22 | 7.63 | 6.11 | 8.25 |
+| df range (Hz proxy) | [-0.54, 4.20] | [-0.25, 3.56] | [-0.62, 2.54] | [-0.34, 3.83] |
+| NaN count | 0 | 0 | 0 | 0 |
+
+#### Key observations
+
+- **mio-1-1** produces higher Pauli energy than 3ob-3-1 (A=155 vs 125, β=1.55 vs 1.43) → steeper repulsive wall
+- **3ob-3-1** gives slightly stronger df contrast at close approach (softer Pauli wall allows tip to approach closer)
+- Both basis sets produce clean PTCDA/pentacene images with no NaNs
+- Grayscale df images show characteristic AFM contrast: bright (repulsive) over atoms, dark over hollow sites
+- PTCDA: O atoms (carbonyl) clearly visible at periphery; pentacene: backbone structure resolved
+
+### Output files
+
+| Directory | Contents |
+|---|---|
+| `debug/fdbm_relax_PTCDA_3ob/` | Fz_relax, df (grayscale), tip_dz, 1D Fz/df curves |
+| `debug/fdbm_relax_PTCDA_mio/` | same |
+| `debug/fdbm_relax_pentacene_3ob/` | same |
+| `debug/fdbm_relax_pentacene_mio/` | same |
+
+### Usage
+
+```bash
+# PTCDA with 3ob basis, large grid
+python tests/SPM/plot_fdbm_relax.py --xyz data/xyz/PTCDA.xyz --basis 3ob-3-1 \
+    --step 0.15 --margin 8.0 --scan_margin 5.0 --amp 1.0 \
+    --outdir debug/fdbm_relax_PTCDA_3ob
+
+# Pentacene with mio basis, custom colormaps
+python tests/SPM/plot_fdbm_relax.py --xyz data/xyz/pentacene.xyz --basis mio-1-1 \
+    --step 0.15 --margin 8.0 --scan_margin 5.0 --amp 1.0 \
+    --cmap bwr --df_cmap hot \
+    --outdir debug/fdbm_relax_pentacene_mio
+```
+
+CLI options:
+- `--cmap`: colormap for Fz/dz plots (default: seismic, try bwr, RdBu_r, coolwarm)
+- `--df_cmap`: colormap for df plots (default: gray, try hot, viridis, seismic)
+- `--amp`: oscillation amplitude in Å (default: 1.0)
+- `--scan_margin`: scan area margin around molecule in Å (default: 5.0)
+- `--margin`: density grid margin in Å (default: 6.0)
 - CH₂NH nicely supplements CH₂O and C₂H₄: same sp² C but with N instead of O, enabling element-specific comparison

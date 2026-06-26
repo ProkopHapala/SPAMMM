@@ -310,6 +310,121 @@ def plot_per_element_overlay(curves, outdir):
         print(f"  Saved: {path}")
 
 
+def fit_exponential_decay(z, e, z_min=2.5, z_max=6.0):
+    """Fit log(E) = a + b*z for E > 0 in [z_min, z_max]. Returns (a, b, r2) or None."""
+    mask = (z >= z_min) & (z <= z_max) & (e > 1e-10)
+    if mask.sum() < 3:
+        return None
+    log_e = np.log(e[mask])
+    z_fit = z[mask]
+    A_mat = np.vstack([np.ones_like(z_fit), z_fit]).T
+    coeffs, _, _, _ = np.linalg.lstsq(A_mat, log_e, rcond=None)
+    a, b = coeffs
+    pred = A_mat @ coeffs
+    ss_res = np.sum((log_e - pred) ** 2)
+    ss_tot = np.sum((log_e - log_e.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    return {'a': a, 'b': b, 'r2': r2, 'E0': np.exp(a), 'decay': b, 'n': int(mask.sum())}
+
+
+def plot_log_linear(curves, outdir):
+    """Plot log(E) vs z for all curves with fitted exponential decay lines overlaid.
+
+    Generates per-method figures: each curve as log(E) vs z with linear fit in tail region.
+    Also generates a per-element figure with subplots per method.
+    """
+    method_order = ['dftb_mio', 'dftb_3ob', 'pyscf_pbe', 'pyscf_b3lyp']
+    mol_list = sorted(set(c['mol'] for c in curves.values()))
+    mol_colors = {m: plt.cm.tab10(i / max(1, len(mol_list))) for i, m in enumerate(mol_list)}
+
+    # === Per-method: all curves on one plot, log(E) vs z, with fitted lines ===
+    for method in method_order:
+        method_curves = {k: v for k, v in curves.items() if v['method'] == method}
+        if not method_curves:
+            continue
+        mstyle = METHOD_STYLES.get(method, {'label': method})
+        fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+        for key, c in sorted(method_curves.items()):
+            elem = _get_elem(c['site'])
+            ls = ELEM_LS.get(elem, '-')
+            color = mol_colors.get(c['mol'], 'gray')
+            label = f"{c['mol']}/{c['site']}({c['atom_idx']})"
+            z = c['z']; e = c['e_rel']
+            pos_mask = e > 1e-10
+            if pos_mask.any():
+                ax.plot(z[pos_mask], np.log(e[pos_mask]), color=color, ls=ls, linewidth=1, label=label, alpha=0.7)
+                # Fit exponential decay in tail
+                fit = fit_exponential_decay(z, e, z_min=2.5, z_max=6.0)
+                if fit:
+                    z_line = np.linspace(2.5, 6.0, 50)
+                    log_e_line = fit['a'] + fit['b'] * z_line
+                    ax.plot(z_line, log_e_line, color=color, ls=':', linewidth=0.8, alpha=0.5)
+        ax.set_xlabel('z (Å)', fontsize=11)
+        ax.set_ylabel('log(E_rel) [eV]', fontsize=11)
+        ax.set_title(f"{mstyle['label']} — log-linear (dotted = exp fit in 2.5–6.0 Å)", fontsize=12)
+        ax.set_xlim([1.5, 6.0])
+        ax.legend(fontsize=5, loc='upper right', ncol=2)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        path = os.path.join(outdir, f'zscan_method_{method}_loglinear.png')
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"  Saved: {path}")
+
+    # === Per-element: subplots per method, log(E) vs z with fitted lines ===
+    elements = ['C', 'O', 'H', 'N']
+    for elem in elements:
+        elem_curves = {k: c for k, c in curves.items() if _get_elem(c['site']) == elem}
+        if not elem_curves:
+            continue
+        methods_present = [m for m in method_order if any(c['method'] == m for c in elem_curves.values())]
+        n_meth = len(methods_present)
+        fig, axes = plt.subplots(1, n_meth, figsize=(5 * n_meth, 4), squeeze=False)
+        for col, method in enumerate(methods_present):
+            ax = axes[0, col]
+            mstyle = METHOD_STYLES.get(method, {'label': method})
+            for key, c in sorted(elem_curves.items()):
+                if c['method'] != method:
+                    continue
+                color = mol_colors.get(c['mol'], 'gray')
+                label = f"{c['mol']}/{c['site']}({c['atom_idx']})"
+                z = c['z']; e = c['e_rel']
+                pos_mask = e > 1e-10
+                if pos_mask.any():
+                    ax.plot(z[pos_mask], np.log(e[pos_mask]), color=color, linewidth=1, label=label, alpha=0.7)
+                    fit = fit_exponential_decay(z, e, z_min=2.5, z_max=6.0)
+                    if fit:
+                        z_line = np.linspace(2.5, 6.0, 50)
+                        log_e_line = fit['a'] + fit['b'] * z_line
+                        ax.plot(z_line, log_e_line, color=color, ls=':', linewidth=0.8, alpha=0.5)
+            ax.set_xlabel('z (Å)', fontsize=10)
+            if col == 0:
+                ax.set_ylabel('log(E_rel) [eV]', fontsize=10)
+            ax.set_title(mstyle['label'], fontsize=11)
+            ax.legend(fontsize=5, loc='upper right')
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim([1.5, 6.0])
+        fig.suptitle(f"Element {elem} — log-linear (dotted = exp fit 2.5–6.0 Å)", fontsize=13)
+        fig.tight_layout()
+        path = os.path.join(outdir, f'zscan_elem_{elem}_loglinear.png')
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"  Saved: {path}")
+
+    # === Summary table of exponential decay parameters ===
+    print(f"\n{'='*90}")
+    print(f"{'Mol':>8} {'Site':>8} {'Method':>14} {'E0 (eV)':>12} {'decay (1/Å)':>12} {'R²':>8} {'n':>4}")
+    print(f"{'-'*90}")
+    for key in sorted(curves.keys()):
+        c = curves[key]
+        fit = fit_exponential_decay(c['z'], c['e_rel'], z_min=2.5, z_max=6.0)
+        if fit:
+            print(f"{c['mol']:>8} {c['site']:>8} {c['method']:>14} {fit['E0']:12.4f} {fit['decay']:12.4f} {fit['r2']:8.4f} {fit['n']:4d}")
+        else:
+            print(f"{c['mol']:>8} {c['site']:>8} {c['method']:>14} {'N/A':>12} {'N/A':>12} {'N/A':>8} {'N/A':>4}")
+    print(f"{'='*90}")
+
+
 def print_summary(curves):
     """Print numerical summary table."""
     print(f"\n{'='*80}")
@@ -340,6 +455,7 @@ def main():
     plot_per_molecule(curves, outdir)
     plot_per_method_overlay(curves, outdir)
     plot_per_element_overlay(curves, outdir)
+    plot_log_linear(curves, outdir)
     print(f"\nAll plots saved to {outdir}/")
 
 if __name__ == '__main__':

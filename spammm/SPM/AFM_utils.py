@@ -112,7 +112,7 @@ def plot_slices(data, title, fname, sym=False, cmap='magma', save_dir='.'):
     print(f"Saved {fname}")
 
 
-def plot_grid_Fz(Fz, heights, label, fname, x_ext=None, y_ext=None, ncols=7, save_dir='.'):
+def plot_grid_Fz(Fz, heights, label, fname, x_ext=None, y_ext=None, ncols=7, save_dir='.', cmap='seismic'):
     """Plot grid of 2D Fz images at all heights with per-slice colorbars."""
     nz_p = len(heights)
     nrows = int(np.ceil(nz_p / ncols))
@@ -121,7 +121,7 @@ def plot_grid_Fz(Fz, heights, label, fname, x_ext=None, y_ext=None, ncols=7, sav
     axes = np.array(axes).reshape(nrows, ncols)
     fig.suptitle(f"{label} (eV/Å) [per-slice]", fontsize=10)
     ext = [x_ext[0], x_ext[1], y_ext[0], y_ext[1]] if x_ext is not None and y_ext is not None else None
-    kw = dict(origin='lower', cmap='seismic', aspect='equal')
+    kw = dict(origin='lower', cmap=cmap, aspect='equal')
     if ext: kw['extent'] = ext
     for k in range(nz_p):
         r, c = divmod(k, ncols); ax = axes[r, c]
