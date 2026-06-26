@@ -1,0 +1,99 @@
+{
+  "description": "E(z) reference curves for CO tip approaching molecules",
+  "z_grid": [
+    1.5,
+    1.6,
+    1.7,
+    1.8,
+    1.9,
+    2.0,
+    2.1,
+    2.2,
+    2.3,
+    2.4,
+    2.5,
+    2.6,
+    2.7,
+    2.8,
+    2.9,
+    3.0,
+    3.2,
+    3.4,
+    3.6,
+    3.8,
+    4.0,
+    4.2,
+    4.4,
+    4.6,
+    4.8,
+    5.0,
+    5.5,
+    6.0,
+    6.5,
+    7.0,
+    7.5,
+    8.0
+  ],
+  "n_points": 32,
+  "co_bond": 1.13,
+  "n_workers": 15,
+  "methods": {
+    "dftb_mio": {
+      "type": "dftb",
+      "basis": "mio-1-1"
+    },
+    "dftb_3ob": {
+      "type": "dftb",
+      "basis": "3ob-3-1"
+    },
+    "pyscf_pbe": {
+      "type": "pyscf",
+      "basis": "6-31g*",
+      "xc": "pbe"
+    },
+    "pyscf_b3lyp": {
+      "type": "pyscf",
+      "basis": "6-31g*",
+      "xc": "b3lyp"
+    }
+  },
+  "molecules": {
+    "CH2NH": {
+      "xyz": "CH2NH.xyz",
+      "targets": [
+        [
+          "C",
+          0
+        ],
+        [
+          "N",
+          1
+        ],
+        [
+          "H",
+          2
+        ]
+      ],
+      "methods": [
+        "dftb_mio",
+        "dftb_3ob",
+        "pyscf_pbe",
+        "pyscf_b3lyp"
+      ]
+    }
+  },
+  "curves": [
+    "CH2NH/C/dftb_mio",
+    "CH2NH/C/dftb_3ob",
+    "CH2NH/C/pyscf_pbe",
+    "CH2NH/C/pyscf_b3lyp",
+    "CH2NH/N/dftb_mio",
+    "CH2NH/N/dftb_3ob",
+    "CH2NH/N/pyscf_pbe",
+    "CH2NH/N/pyscf_b3lyp",
+    "CH2NH/H/dftb_mio",
+    "CH2NH/H/dftb_3ob",
+    "CH2NH/H/pyscf_pbe",
+    "CH2NH/H/pyscf_b3lyp"
+  ]
+}

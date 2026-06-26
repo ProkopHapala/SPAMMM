@@ -1031,14 +1031,15 @@ class AtomicSystem( ):
                 self.place_electron_pair(i, m_c*-1.)
             elif nb == 1:  # like =O 
                 #print( f"make_epair_geom() like =O {self.enames[i]}    ia: {i} npi: {npi} nb: {nb}" )
-                m_b = self.get_atomi_pi_direction( self.ngs[i][0] )
+                first_neighbor = list(self.ngs[i].keys())[0]
+                m_b = self.get_atomi_pi_direction( first_neighbor )
                 m_c = au.normalize(np.cross( v1, m_b ))
                 self.place_electron_pair(i, v1*-0.5 + m_c*0.86602540378)
                 self.place_electron_pair(i, v1*-0.5 - m_c*0.86602540378)
-        # elif npi == 2:
-        #     if nb == 1:
-        #         m_c = normalize(neighbors[0] - pos)
-        #         self._place_electron_pair(i, -m_c)
+        elif npi == 2:
+            if nb == 1:  # like ≡N (sp, triple bond)
+                # 1 electron pair pointing opposite to the single bond
+                self.place_electron_pair(i, v1 * -1.)
 
     def place_electron_pair(self, i, direction, distance=0.5, ename='E', atype=200, qs=0.0, Rs=1.0):
         """

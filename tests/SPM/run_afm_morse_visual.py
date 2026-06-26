@@ -11,7 +11,7 @@ Produces:
 Usage:
   python tests/SPM/run_afm_morse_visual.py
 """
-import os, sys, datetime
+import os, sys
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -322,8 +322,7 @@ def run_molecule(mol_file, save_dir):
     del afm
 
 def main():
-    today = datetime.date.today()
-    save_dir = os.path.join('debug', f'{today}_afm_morse_visual')
+    save_dir = os.path.join('debug', 'run_afm_morse_visual')
     os.makedirs(save_dir, exist_ok=True)
     print(f"Output directory: {save_dir}")
 

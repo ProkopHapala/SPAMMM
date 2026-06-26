@@ -22,7 +22,7 @@ import sys
 import os
 import numpy as np
 from spammm.AtomicSystem import AtomicSystem
-from spammm.AtomicGraph import AtomicGraph
+from spammm.topology.AtomicGraph import AtomicGraph
 from spammm import elements
 from spammm import atomicUtils as au
 
@@ -731,10 +731,14 @@ class KekuleBackend:
             b.alive = False
             debug_print(1, f"  Marked bond {b._id} as dead (will recreate)")
         
-        # Create new bonds from survivor to other atoms
+        # Create new bonds from survivor to other atoms, shift neighbors symmetrically
+        # shift = half the bond vector (from removed atom toward center)
+        shift = center - to_remove.pos
         for _, other in bonds_to_transfer:
             new_bond = self.graph.add_bond(survivor, other)
             debug_print(1, f"  Created new bond {new_bond._id} between survivor({survivor._id}) and Atom({other._id})")
+            other.pos = other.pos + shift
+            debug_print(1, f"  Shifted Atom({other._id}) by {shift[:2]} (symmetric bond collapse)")
         
         # Note: survivor's existing bonds (to atoms other than to_remove) are preserved
         # Only the bond between survivor and to_remove is marked dead
@@ -769,6 +773,8 @@ class KekuleBackend:
     def remove_h_caps(self):
         """Remove all H cap atoms from the graph (soft delete)."""
         for h in [a for a in list(self.graph.atoms.values()) if a.subtype == 'H_cap']:
+            for b in h.bonds:
+                b.alive = False
             h.alive = False
         self.graph.cleanup_invalid()
 
@@ -1037,7 +1043,7 @@ class KekuleBackend:
     def load_xyz(self, fname):
         """Load a system from an XYZ file and map it back to the grid."""
         self.graph = AtomicGraph()   # full reset
-        from . import atomicUtils as au
+        from spammm import atomicUtils as au
         apos, Zs, es, qs, comment = au.load_xyz(fname)
         # Add heavy atoms snapped to grid
         for i, e in enumerate(es):
@@ -1075,13 +1081,19 @@ class KekuleBackend:
         n2a = self.graph._pin_to_atom
         for q in range(-20, 21):
             for r in range(-20, 21):
-                if (q, r) in self.graph.rings: continue
                 ring_nodes = honeycomb_ring_nodes(q, r, self.a_CC)
                 ring_atom_objs = [n2a[snap_to_grid(nd, self.a_CC)]
                                   for nd in ring_nodes
                                   if snap_to_grid(nd, self.a_CC) in n2a]
                 if len(ring_atom_objs) == 6:
-                    self.graph.add_ring(q, r, ring_atom_objs)
+                    ring_bonds = []
+                    for i in range(6):
+                        b = self.graph.get_bond(ring_atom_objs[i], ring_atom_objs[(i+1)%6])
+                        if b is not None:
+                            ring_bonds.append(b)
+                    if len(ring_bonds) == 6:
+                        self.graph.add_ring(ring_atom_objs, ring_bonds)
+                    self.hex_tiles.add((q, r))
 
     # ============ Ribbon construction (replaces GrapheneRibbonBuilder) ============
 
@@ -1275,6 +1287,7 @@ class KekuleBackend:
         else:
             # Non-periodic mode: build using rings, then apply selective passivation
             self._build_ribbon_from_rings(width_chains, length_cells, start_with_A)
+            self._sync_sys()  # sync graph → sys before passivation reads sys arrays
             # Apply top/bottom passivation only (not to side edges)
             self._passivate_edges_top_bottom_only_separate(passivation_bottom, passivation_top)
             # Apply side passivation if specified

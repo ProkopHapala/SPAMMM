@@ -23,7 +23,7 @@ Strategy:
 Run:  python tests/test_tensor_parity.py
 """
 
-import os, sys, datetime
+import os, sys
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -42,7 +42,7 @@ from spammm.surfaces.Ewald2D import Ewald2D
 # =============================================================================
 
 NACL_SUBSTRATE = os.path.join(_proj_root, 'data', 'substrates', 'NaCl_1x1_L3.xyz')
-PLOT_DIR = os.path.join(_proj_root, 'debug', f'{datetime.date.today()}_tensor_parity')
+PLOT_DIR = os.path.join(_proj_root, 'debug', 'test_tensor_parity')
 
 R_O = 1.7500; SQRT_E_O = np.sqrt(0.00260184625)
 PROBE_REQ = np.array([[R_O, SQRT_E_O, -0.5, 0.0]], dtype=np.float32)

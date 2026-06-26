@@ -21,7 +21,7 @@ Expected physics:
   - PP relaxation should reduce lateral forces, modifying Fz vs raw
   - df (frequency shift) should be negative in the attractive regime
 """
-import pytest, numpy as np, os, datetime
+import pytest, numpy as np, os
 
 os.environ.setdefault('PYOPENCL_CTX', '0')
 os.environ.setdefault('PYOPENCL_COMPILER_OUTPUT', '1')
@@ -31,8 +31,10 @@ from tests.helpers.parity import rmse, correlation
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'data')
 PARAMS_PATH = os.path.join(DATA_DIR, 'ElementTypes.dat')
 
-def _debug_dir(name='afm_morse'):
-    d = os.path.join('debug', f'{datetime.date.today()}_{name}')
+def _debug_dir(name=None):
+    d = os.path.join('debug', 'test_afm_morse')
+    if name:
+        d = os.path.join(d, name)
     os.makedirs(d, exist_ok=True)
     return d
 

@@ -250,11 +250,17 @@ def hessian_hartree_bohr_to_eV_angstrom(hessian):
     return hessian * (27.2114 / (0.529177 ** 2))
 
 def parse_energy_out(fname='OUT', allow_unconverged=False):
+    """Parse total energy from DFTB+ OUT file. Returns energy in Hartree."""
+    import re
     with open(fname, 'r') as f:
         lines = f.readlines()
     hits = [line for line in lines if "Total Energy" in line]
     if hits:
-        return float(hits[-1][51:70].strip())
+        line = hits[-1]
+        m = re.search(r'Total Energy:\s+([\d.eE+-]+)\s+H', line)
+        if m:
+            return float(m.group(1))
+        return float(line[51:70].strip())
     if not allow_unconverged:
         raise AssertionError(f"Could not parse Total Energy from {fname}")
     # Fallback: parse last SCC iteration electronic energy (not a proper total energy).
@@ -527,6 +533,9 @@ def _write_dftb_input_base(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, m
     max_ang = {s: '"s"' if s == 'H' else '"p"' for s in species}
     max_ang_str = '\n    '.join([f'{s} = {max_ang[s]}' for s in species])
     
+    if not sk_prefix.endswith('/'):
+        sk_prefix = sk_prefix + '/'
+
     hsd = f"""Geometry = xyzFormat {{
   <<< "{os.path.basename(xyz_path)}"
 }}

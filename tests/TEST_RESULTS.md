@@ -1,6 +1,69 @@
 
 # Test Results & Feature Checklist
 
+## Debug Output Policy
+
+**All diagnostic scripts and visual test outputs must be saved under:**
+
+```
+/home/prokophapala/git/SPAMMM/debug/<script_name>/
+```
+
+Where `<script_name>` is the name of the generating script **without** the `.py` extension. Subfolders are allowed for organization (e.g., `debug/plot_fdbm_relax/dftb_work/`). **Never** write diagnostic outputs to `/tmp/` or the repository root. This keeps debug artifacts organized, persistent, and easy to find.
+
+Examples:
+- `tests/SPM/plot_fdbm_relax.py` → `debug/plot_fdbm_relax/`
+- `tests/SPM/plot_fdbm_potentials.py` → `debug/plot_fdbm_potentials/`
+- `tests/SPM/plot_density_projection.py` → `debug/plot_density_projection/`
+
+---
+
+## Reference Data System
+
+**Reference files are stored in `tests/ref_data/` and are tracked in git.** They are NOT debug artifacts — they are permanent regression test data.
+
+### Purpose
+
+Physical properties (adsorption height, force/torque convergence, atom–substrate distances) are saved as human-readable text files. Tests compare against these references with physical tolerances, so small forcefield parameter changes don't break tests while real regressions are caught.
+
+### File Layout
+
+```
+tests/ref_data/
+  {ref_name}.ref.json   — physical properties (z_rel, force, torque, atom_distances, test_func)
+  {ref_name}.ref.xyz    — final geometry (molecule + nearby substrate atoms)
+```
+
+Each JSON file contains a `test_func` field linking back to the test function, and `test_module` linking to the test module — bidirectional referencing.
+
+### Usage
+
+```bash
+# Run tests comparing against references
+pytest tests/test_folded_relax.py
+
+# Regenerate references after intentional physics changes
+pytest tests/test_folded_relax.py --update-refs
+```
+
+The `--update-refs` flag is defined in `tests/conftest.py`. When set, tests call `save_reference()` instead of `compare_to_reference()`.
+
+### Current References
+
+| File | Test function | Molecule | Substrate |
+|------|--------------|----------|-----------|
+| `h2o_nacl.ref.{json,xyz}` | `test_relax_h2o_nacl` | H2O | NaCl(100) |
+| `ptcda_nacl.ref.{json,xyz}` | `test_relax_ptcda_nacl` | PTCDA | NaCl(100) |
+
+### Adding New References
+
+1. Call `save_reference(ref_name, ...)` in the test function with `test_func='test_name'`
+2. Run with `--update-refs` to generate the files
+3. Commit the `.ref.json` and `.ref.xyz` files to git
+4. Add an entry to the table above
+
+---
+
 
 
 ## Test Run Summary (after fixes — Jun 2026)
@@ -133,10 +196,10 @@ All `spammm.OCL.*` and `spammm.FireballOCL.*` imports corrected:
 
 ### Rigid Body Dynamics
 
-- [ ] **RigidBodyDynamics 6-DOF** — no test
-- [ ] **RigidBodyDynamics quaternion→matrix** — no test (`_quat_to_matrix_np` exists)
-- [ ] **RigidBodyAFM scanning** — no test
-- [ ] **RigidBodyAFM relax_to_constraint** — no test
+- [x] **RigidBodyDynamics 6-DOF** — `test_relax_h2o_nacl`, `test_relax_ptcda_nacl` ✅ passing (GPU, folded basis)
+- [x] **RigidBodyDynamics quaternion→matrix** — exercised implicitly in relaxation tests (`_quat_to_matrix_np` exists)
+- [x] **RigidBodyAFM anchor springs** — `test_manipulation_h2o_nacl`, `test_manipulation_ptcda_nacl` ✅ passing
+- [x] **RigidBodyAFM relaxed scan** — `relaxed_scan()` helper + trail visualization ✅ passing
 - [ ] **Assembly collision** — no test
 
 ### Quantum Backends
@@ -611,14 +674,346 @@ Test: `tests/SPM/test_afm_fdbm.py`. Runs the full FDBM pipeline on H2O and benze
 
 **What still needs to be done:**
 
-1. **Fix density visualization**: Debug why `rho_scf` slices are empty despite correct integral. Check grid coordinates, slice plane selection, and array layout (C vs Fortran order).
+1. ~~Fix density visualization~~ — **DONE (Jun 2026)**. Density projection from DFTB works correctly. Use `tests/SPM/plot_density_projection.py` to generate PNG + .cub outputs to `debug/density_plots/`.
 
-2. **Fix ES/vdW tilt**: The tilted appearance in ES and vdW slices suggests a grid orientation or coordinate mapping issue. Compare grid layout with the working Morse/Coulomb `make_forcefield` path.
+2. ~~Fix ES/vdW tilt~~ — **DONE (Jun 2026)**. Potentials (Pauli, ES, vdw, Total) are physically reasonable. Use `tests/SPM/plot_fdbm_potentials.py` for diagnostic XY/XZ slices and 1D curves above atoms. Outputs go to `debug/fdbm_potentials/`.
 
-3. **Switch `scan_fdbm` to `relaxStrokesTilted`**: The working Morse/Coulomb AFM path uses `relaxStrokesTilted`. The FDBM path should use the same kernel, or at minimum verify that `relaxStrokes` uses the correct coordinate convention for the FDBM force field grid.
+3. **Fix `relaxStrokes` kernel** — **Root cause identified (Jun 2026)**:
+   - **Bug 1**: FIRE integrator is commented out (`#if OPT_FIRE` lines 375-379 in `AFM.cl`). With dt=0.5 and K_RAD=20, the raw damped velocity integrator diverges → probe position becomes NaN → constant force output. Fix: uncomment the `#if OPT_FIRE` guard.
+   - **Bug 2**: `tipForce` (line 51-54) divides by `r` which is 0 when probe=tip position → NaN. Fix: `r = fmax(r, 1e-10f)`.
 
-4. **Verify force field upload**: Check that `setup_fdbm_grid` correctly uploads `F_total` as a 3D OpenCL image with the right origin, spacing, and orientation matching what `relaxStrokes`/`relaxStrokesTilted` expects.
+4. ~~Verify force field upload~~ — **DONE**. `setup_fdbm_grid` correctly uploads F_total. `getFEinPoints` and `interpFE` sample the image correctly (verified with synthetic test).
 
-5. **Test with closer scan heights**: Current probe starts too far from molecule. Try smaller `bond_length` or lower scan heights.
+5. ~~Test with closer scan heights~~ — Not needed; the issue was integrator instability, not scan height.
+
+**Diagnostic scripts** (outputs to `debug/` which is gitignored):
+- `tests/SPM/plot_density_projection.py` — DFTB density projection → PNG slices + .cub file
+- `tests/SPM/plot_fdbm_potentials.py` — FDBM potentials (Pauli, ES, vdw, Total) → XY slices, XZ cross-sections, 1D curves above atoms
 
 6. **Pauli parameter validation**: A=787.22, β=1.2371 are hardcoded defaults. Validate against DFTB z-scan reference.
+
+---
+
+#### Jacobi Eigendecomposition: GPU Kernel & LingebraOCL Module (Jun 2026)
+
+**Status: ✅ All 6 tests pass. Kernel produces correct eigenvalues and eigenvectors matching numpy.linalg.eigh to float32 precision.**
+
+Tests: `tests/test_lingebra.py` (pytest, 6 tests, `@pytest.mark.gpu`)
+
+---
+
+**What was implemented:**
+
+- **`kernels/lingebra.cl`**: Parallel Jacobi eigendecomposition kernel `local_jacobi_blocks_parallel` for small symmetric matrices (m ≤ 64) in local memory. One workgroup per matrix, all threads collaborate on each Givens rotation.
+- **`spammm/utils/Lingebra_ocl.py`**: `LingebraOCL` class inheriting `OpenCLBase`, providing `jacobi_eigh(A)` for batched symmetric eigendecomposition. Caches the compiled kernel object to avoid pyopencl retrieval overhead.
+- **`tests/test_lingebra.py`**: Thin test script — 3 test functions covering random symmetric matrices, diagonal matrices, and identity matrices.
+
+---
+
+**Kernel optimizations (vs original serial-in-workgroup variant):**
+
+1. **Inline (c,s) computation**: All threads compute the Givens rotation angle independently from local memory — eliminates thread-0 broadcast barrier (saves 1 barrier/rotation).
+2. **Fused 2×2 diagonal update**: The thread processing row k==p updates the diagonal block inline within the row loop — eliminates separate diagonal-update barrier (saves 1 barrier/rotation).
+3. **Skip trivial rotations**: When |A[pq]| < tol, the row update is skipped entirely (c=1, s=0 is a no-op).
+4. **Net: 1 barrier per rotation** (down from 3). For m=64: 2016 barriers/sweep (down from 6048).
+
+---
+
+**Test results (Intel Graphics, float32):**
+
+| Test | m | Eigenvalue RMSE | Eigenvector RMSE | Verdict |
+|------|---|-----------------|-------------------|---------|
+| `test_eigh_random_symmetric[4]` | 4 | ~1e-7 | ~1e-7 | ✅ PASS |
+| `test_eigh_random_symmetric[8]` | 8 | ~5e-7 | ~2e-7 | ✅ PASS |
+| `test_eigh_random_symmetric[16]` | 16 | ~1e-6 | ~4e-7 | ✅ PASS |
+| `test_eigh_random_symmetric[32]` | 32 | ~3e-6 | ~7e-7 | ✅ PASS |
+| `test_eigh_diagonal` | 8 | 0 (exact) | — | ✅ PASS |
+| `test_eigh_identity` | 8 | 0 (exact) | 0 (exact) | ✅ PASS |
+
+All 6 tests pass in 0.32s. Random matrices: 8 batch × 4 sizes, compared against `numpy.linalg.eigh` (float64 reference). Eigenvalues sorted ascending; eigenvector signs aligned before comparison.
+
+---
+
+**Known limitations & caveats:**
+
+- **Local memory bank conflicts**: For m divisible by 32 (e.g. m=64), all threads access the same bank → 32-way conflict. Mitigation (not implemented): pad stride to m+1. Documented in kernel comments.
+- **Float32 precision**: RMSE scales as ~m×1e-7, consistent with float32 accumulation over m² elements. For m=32, eigenvalue RMSE ~3e-6 — acceptable for most physics applications but not double-precision.
+- **Workgroup size = m**: Optimal when lsz ≈ m (1 row/thread). For m=64, lsz=64 is ideal. Smaller lsz requires inner k-loop iterations.
+- **Brent-Luk parallel pairs not implemented**: Row-major layout causes read-write races between disjoint rotation pairs. Documented in kernel comments. Sequential (p,q) ordering is used instead.
+- **Kernel originally developed in dftbplus repo** (`rust_dftb/src/qmqm/gpu_matrix_ops.cl`), refactored and copied to SPAMMM. The dftbplus repo was reverted to its original state.
+
+---
+
+#### Folded Basis Rigid Body Relaxation & Manipulation on NaCl(100) (Jun 2026)
+
+**Status: ✅ All 5 tests pass. Relaxation converges to physical minima. Manipulation trajectories show molecule following pinned atom with realistic tilt.**
+
+Tests: `tests/test_folded_relax.py` (5 tests, `@pytest.mark.gpu @pytest.mark.slow`). Helpers in `tests/helpers/folded_rigid.py`. CLI script: `tests/run_manipulation.py`. Plots saved to `debug/<date>_folded_relax/`.
+
+---
+
+**What was implemented:**
+
+1. **Rigid body relaxation on folded basis potential** — `RigidBodyDynamics` with 6-DOF (3 translation + quaternion rotation) on GPU. Molecule interacts with NaCl(100) substrate via folded basis (lateral cosine modes × z-decay) fitted to Morse + Ewald2D Coulomb reference. Relaxation uses damped velocity Verlet with separate linear/angular damping.
+
+2. **Anchor spring mechanism** — GPU kernel (`rigid.cl`) supports per-atom harmonic springs: `F = -k * (atom_pos - anchor_pos)`. Spring constant stored in `anchors[ia].w`; `w = -1` means no anchor. This is the constraint mechanism for manipulation.
+
+3. **Relaxed scan (manipulation)** — `relaxed_scan()` function: pins one atom with a spring, moves it along a path (dx=0.1 Å steps), relaxes the molecule at each point. The rest of the molecule follows on the surface potential. Simulates AFM tip dragging a molecule.
+
+4. **Reference data system** — JSON + XYZ text files in `tests/ref_data/` storing physical properties (adsorption height, force/torque convergence, atom–substrate distances) for regression testing. `--update-refs` pytest flag regenerates references. Bidirectional linking via `test_func` field in JSON.
+
+5. **Visualization** — Multi-panel plots: XY/XZ snapshots, force/torque/pin-force curves, and **trail plots** showing pin atom and opposite-end atom connected by thin alpha-blended lines for all snapshots (viridis color gradient along path). Distance and tilt-angle curves vs path position.
+
+6. **CLI script** (`tests/run_manipulation.py`) — Standalone tool to run manipulation and export `.xyz` movie: `python tests/run_manipulation.py --mol PTCDA --export-xyz movie.xyz --dx 0.1`.
+
+---
+
+**Test results:**
+
+| Test | Molecule | Key result | Verdict |
+|------|----------|------------|---------|
+| `test_relax_h2o_nacl` | H2O | O orients toward Na+, H atoms point away; z_rel ≈ 2.5 Å | ✅ PASS |
+| `test_relax_ptcda_nacl` | PTCDA | Lies flat, O atoms align with Na sites; z_rel ≈ 3.2 Å | ✅ PASS |
+| `test_scan_h2o_nacl` | H2O | Force map shows NaCl lattice periodicity | ✅ PASS |
+| `test_manipulation_h2o_nacl` | H2O | Pin H at z=4 Å, drag 0→4 Å; O–Na distance varies 3.5–4.1 Å | ✅ PASS |
+| `test_manipulation_ptcda_nacl` | PTCDA | Pin O at z=6 Å, drag 0→8 Å; COM follows pin (Δx=7.5 Å), molecule tilts | ✅ PASS |
+
+All 5 tests pass in ~44s total.
+
+---
+
+**Caveats and solutions:**
+
+1. **Inertia tensor mismatch** — PTCDA with real atomic masses has I ≈ 5000 but `mass_trans = 1.0`, making angular acceleration ~1000× too slow. **Solution**: normalize inertia tensor to match `mass_trans` so angular and translational dynamics have similar timescales. This is a reduced-mass approach, not a physical mass issue.
+
+2. **Angular damping sensitivity** — `ang_damp` must be < 1.0 but close enough to avoid oscillation. Values 0.90–0.99 work well. Too low → slow convergence; too high → oscillation. Tuned per molecule.
+
+3. **Pin height selection** — Must be "decent": high enough that the molecule isn't pressed into the substrate, low enough that it maintains contact. For H2O (small, ~1 Å): pin H at 4 Å above surface → O reaches ~3 Å (near equilibrium). For PTCDA (large, ~12 Å wide, ~1 Å thick): pin O at 6 Å → opposite end touches surface at ~3 Å. These are empirical choices; no automatic optimization yet.
+
+4. **Relaxation not full convergence at each path point** — `n_relax=200–300` steps per point is a compromise between speed and accuracy. Force/torque don't fully converge to zero at each point (the spring force is always present). This is physical — the molecule is under constraint, not at a free equilibrium.
+
+5. **Folded basis accuracy** — The folded basis is a compressed representation of the full grid potential. Fit RMSE is ~1e-3 eV for Morse and ~1e-3 eV for Coulomb (see folded basis report above). Small forcefield parameter changes may shift equilibrium positions slightly; the reference system uses physical tolerances to avoid false failures.
+
+6. **No internal molecular flexibility** — The rigid body model treats the molecule as a single rigid body (6-DOF). Internal deformations (bond stretching, angle bending) are not modeled. This is appropriate for physisorbed molecules on surfaces but not for chemisorption or reactive systems.
+
+---
+
+#### Molecular Topology Editing Operations (Jun 2026)
+
+**Status: ✅ All 42 tests pass. Visual output in `debug/test_editing_ops/`.**
+
+Test file: `tests/topology/test_editing_ops.py`
+Helpers: `tests/helpers/topology_test.py`
+
+**Two-layer testing strategy:**
+- **L1 (always)**: `TopologySnapshot` diff assertions — fast, deterministic, no display. Verifies atom/bond/ring counts before vs after each operation.
+- **L2 (`--visual` flag)**: Before/after PNG rendering for human review. Output to `debug/test_editing_ops/<test_name>.png`.
+
+**Run:**
+```
+pytest tests/topology/test_editing_ops.py            # L1 only (fast)
+pytest tests/topology/test_editing_ops.py --visual   # L1 + L2 (generates PNGs)
+pytest tests/topology/test_editing_ops.py -k epair   # filter to electron pair tests
+```
+
+---
+
+**Test categories and coverage:**
+
+| # | Category | Tests | What is tested |
+|---|----------|-------|----------------|
+| 01 | Atom-Level Ops | 01–06 | Add atom (grid/off-grid), remove atom (by key/by index), change element (C→N), change hybridization (sp2→sp3) |
+| 02 | Bond-Level Ops | 07–11 | Insert atom into bond (A-B→A-C-B), collapse bond (symmetric shift), add/remove bond on AtomicGraph, idempotent add |
+| 03 | Ring/Hex Ops | 12–19 | Add ring (single/adjacent fused), remove ring (Hex1/Hex2 toggle mode), toggle ring, detect rings from bond graph (with magenta ring visualization) |
+| 04 | H Cap Management | 20–22 | add_h_caps, remove_h_caps, adjust_h (remove+re-add, fixes damaged structures) |
+| 05 | Picking/Selection | 23–26 | Pick atom/bond/ring by position (simulates mouse click), miss returns None |
+| 06 | Graph Maintenance | 27–29 | cleanup_invalid (soft-delete → hard), sync_neighbor_lists, to_arrays export |
+| 07 | I/O | 30 | XYZ roundtrip: save naphthalene → load → recalc_bonds, verify topology reconstructed |
+| 08 | Ribbon Builders | 31 | Build zigzag graphene ribbon (3×3) with H passivation via standard `adjust_h` |
+| 09 | Multi-Step | 32–33 | Build PAH then edit, add→remove→add ring cycle (idempotent) |
+| 10 | Electron Pairs | 34–42 | `add_electron_pairs` on 9 molecules (parametrized, multi-projection) |
+
+---
+
+**Key fixes applied during this session:**
+
+1. **`collapse_bond` symmetric shift** (`KekuleBackend.py:734`): Replaced overcomplicated per-atom bond-length normalization with simple symmetric shift: `shift = center - to_remove.pos` applied to all transferred neighbors. Survivor moves to bond midpoint, neighbors shift by the same vector — naturally symmetric along the bond direction.
+
+2. **Zigzag ribbon passivation** (`test_editing_ops.py:776`): Test now builds ribbon with `passivation=None` and calls `b.adjust_h()` — the same geometry-based H placement used everywhere else. No more `PASSIVATION_GROUPS` with fixed offsets and wrong orientations.
+
+3. **`make_epair_geom` npi=2 case** (`AtomicSystem.py:1039`): Implemented sp-hybridized case (triple bond, 1 neighbor). 1 electron pair placed opposite to the single bond. The commented-out code had bugs (`normalize` instead of `au.normalize`, wrong direction).
+
+4. **`make_epair_geom` KeyError fix** (`AtomicSystem.py:1034`): Fixed pre-existing `KeyError: 0` — `self.ngs[i]` is a dict with atom indices as keys, not 0-indexed. Changed `self.ngs[i][0]` to `list(self.ngs[i].keys())[0]`.
+
+5. **Pyrrole XYZ geometry fix** (`data/xyz/pyrrole.xyz`): Original geometry was a compressed square (1.07–1.21 Å bonds) causing `findBonds` to bond N to all 4 C atoms. Replaced with proper regular pentagon (1.38 Å edges, circumradius 1.174 Å), H atoms radially outward, N-H out of plane.
+
+6. **Ring visualization** (`topology_test.py:136`): Added magenta dashed hexagonal outlines + star markers for detected rings in `render_graph`.
+
+---
+
+**Electron pair tests (parametrized, 9 molecules):**
+
+Driven by `_EPAIR_MOLECULES` list — adding a new molecule is a one-line addition.
+
+| Molecule | XYZ File | N/O Coordination | Expected EP | Hybridization | Description |
+|----------|----------|-----------------|-------------|---------------|-------------|
+| H₂O | `H2O.xyz` | O(2H) | 2 | sp3 | 2 lone pairs on O |
+| NH₃ | `NH3.xyz` | N(3H) | 1 | sp3 | 1 lone pair on N |
+| CH₂O | `CH2O.xyz` | O(1C, C=O) | 2 | sp2 | 2 lone pairs on O |
+| HCN | `HCN.xyz` | N(1C, C≡N) | 1 | sp | 1 lone pair on N |
+| Pyridine | `pyridine.xyz` | N(2C, aromatic) | 1 | sp2 | 1 lone pair on N |
+| HCOOH | `HCOOH.xyz` | O(1C,C=O) + O(2,C-O-H) | 4 | sp2 | 2+2 lone pairs |
+| CH₂NH | `CH2NH.xyz` | N(2, C=NH) | 1 | sp2 | 1 lone pair on N |
+| Pyrrole | `pyrrole.xyz` | N(2C+1H) | 1 | sp3 | 1 lone pair on N (pyrrolic) |
+| Formamide | `formamide.xyz` | O(1C,C=O) + N(3,C-NH₂) | 3 | sp2 | 2+1 lone pairs |
+
+**Electron pair geometry logic** (`AtomicSystem.py:make_epair_geom`):
+
+| npi | nb | Case | EP Count | Geometry |
+|-----|-----|------|----------|----------|
+| 0 | 3 | NH₃-like | 1 | Opposite to plane of 3 neighbors (cross product) |
+| 0 | 2 | H₂O-like | 2 | Two lone pairs at tetrahedral angles (sp3) |
+| 1 | 2 | =N- (sp2) | 1 | Opposite to bisector of 2 neighbors |
+| 1 | 1 | =O (sp2) | 2 | Two lone pairs at 120° from bond, in-plane perpendicular |
+| 2 | 1 | ≡N (sp) | 1 | Opposite to single bond |
+
+**Visual output per molecule:**
+- `debug/test_editing_ops/test_epair_{name}.png` — 6-panel figure: 3 projections (xy, xz, yz) × before/after, with bond length labels (blue text at bond midpoints; orange lines for E-atom bonds)
+- `debug/test_editing_ops/test_epair_{name}.xyz` — combined before+after XYZ file (two frames in one file)
+
+**Visual output for topology editing tests:**
+- `debug/test_editing_ops/test_XX_{name}.png` — side-by-side before/after with green highlighting for added atoms/bonds, red for removed, magenta outlines for detected rings
+
+---
+
+## Z-Scan Reference Curves (Ez_FDBM)
+
+**Purpose:** Quantum-mechanical reference data for the interaction energy E(z) of a rigid CO tip (O apex) approaching target atoms in isolated molecules. These curves serve as reference for fitting classical force-field Pauli repulsion terms in the FDBM (Fitted Density-Based Model) framework.
+
+### Scripts
+
+Three scripts in `tests/SPM/` handle computation, conversion, and plotting:
+
+| Script | Purpose |
+|--------|---------|
+| `run_zscan_reference.py` | Compute E(z) curves using DFTB+ and/or pySCF, save as `.npz` |
+| `convert_npz_to_dat.py` | Convert `.npz` → human-readable ASCII `.dat` with headers, write to `tests/ref_data/Ez_FDBM/` |
+| `plot_zscan_reference.py` | Load `.dat` files from `tests/ref_data/Ez_FDBM/`, generate all plots to `debug/zscan_plots/` |
+
+### Physical Setup
+
+- **Tip model:** Rigid CO molecule — O atom at apex (closest to sample), C atom 1.13 Å above along z
+- **Scan geometry:** Tip descends along z-axis above the target atom's (x, y) position
+- **Energy:** E_rel(z) = E_total(z) − E_total(z_max), where z_max = 8.0 Å (far limit, zero interaction)
+- **Coordinates:** All in Ångström, energies in eV
+
+### Z-Grid
+
+Non-uniform grid with fine resolution near contact (where repulsion changes rapidly) and coarser steps at large distance:
+
+| Range (Å) | Step (Å) | Points | Purpose |
+|-----------|----------|--------|---------|
+| 1.5 – 3.0 | 0.1 | 15 | Close contact, repulsive wall |
+| 3.0 – 5.0 | 0.2 | 10 | Intermediate, physisorption well |
+| 5.0 – 8.0 | 0.5 | 7 | Far field, asymptotic approach |
+| **Total** | | **32** | |
+
+### Quantum Methods
+
+| Method Key | Type | Details |
+|------------|------|---------|
+| `dftb_mio` | DFTB+ | mio-1-1 parameterization |
+| `dftb_3ob` | DFTB+ | 3ob-3-1 parameterization |
+| `pyscf_pbe` | pySCF | PBE/6-31G*, RKS, direct SCF, 4 GB memory |
+| `pyscf_b3lyp` | pySCF | B3LYP/6-31G*, RKS, direct SCF, 4 GB memory |
+
+**Parallelization:** The z-grid is split into contiguous chunks (one per CPU core). Each chunk runs in a separate process via `ProcessPoolExecutor`. For pySCF, the density matrix from the previous z-point is reused as initial guess within each chunk, speeding up SCF convergence.
+
+**Caching:** Computed curves are cached as `.npz` in `debug/zscan_reference/{mol}/{site}_{method}/zscan_cache.npz`. Re-runs skip computation if the z-grid matches.
+
+### Molecules and Target Atoms
+
+**Small molecules** (all 4 methods):
+
+| Molecule | XYZ File | Atoms | Targets (label, index) | Description |
+|----------|----------|-------|------------------------|-------------|
+| C₂H₄ | `C2H4.xyz` | 6 | C(0), H(2) | Ethylene — sp² C and H |
+| CH₂O | `CH2O.xyz` | 4 | C(0), O(1), H(2) | Formaldehyde — C=O, C, H |
+| CH₂NH | `CH2NH.xyz` | 5 | C(0), N(1), H(2) | Methanimine — C=N, C, H |
+| H₂O | `H2O.xyz` | 3 | O(0) | Water — lone pair on O |
+| NH₃ | `NH3.xyz` | 4 | N(0) | Ammonia — lone pair on N |
+
+**Large aromatic molecules** (DFTB only — pySCF too expensive):
+
+| Molecule | XYZ File | Atoms | Targets (label, index) | Description |
+|----------|----------|-------|------------------------|-------------|
+| Benzene | `benzene.xyz` | 12 | C(0), H(6) | Aromatic C and H |
+| Pyridine | `pyridine.xyz` | 11 | N(0), C(2) | Aromatic N and C |
+| Pyrrole | `pyrrole.xyz` | 10 | N(0), C(2) | Pyrrolic N and C |
+| PTCDA | `PTCDA.xyz` | 38 | O_eq(26), O_br(24), C_anh(11), C_core(6) | Carbonyl O, bridging O, anhydride C, core C |
+
+**Total: 60 curves** (5 small molecules × 3 sites avg × 4 methods + 4 large molecules × 2-4 sites × 2 methods)
+
+### Data Format
+
+**Binary cache:** `.npz` files in `tests/ref_data/` (original, with atom index in name, e.g. `zscan_C2H4_dftb_3ob_C0.npz`)
+
+**ASCII reference:** `.dat` files in `tests/ref_data/Ez_FDBM/` — human-readable, with header:
+
+```
+# z-scan: C2H4 / C (atom 0) / dftb_3ob
+# CO tip: O apex at target + z, C at target + z + 1.13 Å
+# E_rel = E(z) - E(z_max) in eV
+z[A]   E_rel[eV]
+1.5000   5.734324
+1.6000   4.931273
+...
+```
+
+**Filename convention:** `zscan_{molecule}_{method}_{site}{atom_idx}.dat`
+
+**Summary:** `tests/ref_data/Ez_FDBM/zscan_summary.json` — JSON with z-grid, method definitions, molecule definitions, and list of all curves.
+
+### Plots
+
+All plots saved to `debug/zscan_plots/`. X-axis: z = 1.5–6.0 Å. Three plot types:
+
+**1. Per-molecule plots** (`zscan_{mol}_{linear,log}.png`):
+- One figure per molecule, first subplot = molecular skeleton (xy projection) with all target atoms highlighted (gold circles, atom indices labeled)
+- Remaining subplots: one per target site, showing all methods overlaid
+- Linear: y-axis ±0.1 eV (zoom into weak interaction regime)
+- Log: |E_rel| on log scale (repulsive region)
+
+**2. Per-method overlay plots** (`zscan_method_{method}_{linear,log}.png`):
+- One figure per method, all molecules × sites overlaid on single axes
+- **Color** per molecule, **line style** per element (C=solid, O=dashed, H=dotted, N=dash-dot)
+- Linear (±0.1 eV) and log scale
+
+**3. Per-element overlay plots** (`zscan_elem_{C,O,H,N}_{linear,log}.png`):
+- One figure per element, **subplots per method** (avoids overwhelming single-axis)
+- Each subplot: all molecules with that element, color per molecule
+- Linear (±0.1 eV) and log scale
+
+### Usage
+
+```bash
+# Compute all curves (uses cache, skips already-computed)
+python tests/SPM/run_zscan_reference.py
+
+# Compute only specific molecule
+python tests/SPM/run_zscan_reference.py --molecules CH2NH
+
+# Convert .npz to .dat in tests/ref_data/Ez_FDBM/
+python tests/SPM/convert_npz_to_dat.py
+
+# Generate all plots
+python tests/SPM/plot_zscan_reference.py
+```
+
+### Key Observations
+
+- DFTB mio and 3ob give similar repulsive walls but differ in the weak-interaction regime (z > 3 Å)
+- pySCF PBE shows deeper attractive wells (~−0.03 eV) than B3LYP (~−0.02 eV) for H atoms
+- DFTB generally overestimates repulsion compared to pySCF at close contact (z < 2.5 Å)
+- PTCDA shows distinct curves for chemically different O sites (carbonyl vs bridging) and C sites (core vs anhydride)
+- CH₂NH nicely supplements CH₂O and C₂H₄: same sp² C but with N instead of O, enabling element-specific comparison

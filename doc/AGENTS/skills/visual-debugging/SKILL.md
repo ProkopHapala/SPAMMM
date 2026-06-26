@@ -61,3 +61,7 @@ Molecular editing features are visual (clicks, selections, buttons). Test them h
   - Atom labels: `id:element` (e.g., `42:C`)
 - **pytest setup:** `--visual` flag → `visual_output_dir` fixture returns `tests/visual_output/` or `None`. L1 assertions always run; L2 rendering only when fixture is not `None`.
 - **Stable IDs are key:** `AtomicGraph` uses object identity (`_id`), not array indices. Atoms don't renumber after deletion. Snapshots are reliable across operations.
+
+- **Output location policy:** All diagnostic scripts and visual test outputs must be saved under `debug/<script_name>/` (e.g., `debug/plot_fdbm_relax/`). The `<script_name>` is the generating script's name without `.py`. Subfolders are allowed for organization. **Never** write to `/tmp/` or the repository root. This keeps artifacts persistent and easy to find.
+- **Structured outputs:** Group all debugging, benchmarking, and testing outputs into organized, numbered directories (e.g., `tests/003_case_name/`). Do not clutter root directories. Explicitly report their location.
+- **Foreground execution:** Run tests synchronously in the foreground with full output. Never hide output or use background commands (`&`, `| tail`, `| head`, or silent redirects). Full `stdout` must be visible.

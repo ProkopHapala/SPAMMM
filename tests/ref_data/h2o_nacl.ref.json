@@ -1,0 +1,27 @@
+{
+  "description": "Reference for h2o_nacl: relaxed molecule on NaCl(100) folded basis",
+  "test_func": "test_relax_h2o_nacl",
+  "test_module": "tests.test_folded_relax",
+  "ref_name": "h2o_nacl",
+  "z_rel": 2.1649,
+  "force": 0.000388,
+  "torque": 0.000519,
+  "atom_distances": [
+    {
+      "element": "O",
+      "d_Na": 2.116,
+      "d_Cl": 3.412
+    },
+    {
+      "element": "H",
+      "d_Na": 2.797,
+      "d_Cl": 4.074
+    },
+    {
+      "element": "H",
+      "d_Na": 2.797,
+      "d_Cl": 3.246
+    }
+  ],
+  "n_atoms": 3
+}

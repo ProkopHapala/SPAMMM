@@ -221,7 +221,6 @@ class RigidBodyDynamics(OpenCLBase):
         kernel_paths = [
             os.path.join(kernel_dir, 'common.cl'),
             os.path.join(kernel_dir, 'Forces.cl'),
-            os.path.join(kernel_dir, 'gridFF.cl'),
             os.path.join(kernel_dir, 'rigid.cl'),
         ]
         if not self.load_program_multi(kernel_paths, build_options=build_options, bMakeHeaders=False):
@@ -520,9 +519,9 @@ void rigid_body_folded_kernel(
             raise ValueError(f"nbasis={nbasis} exceeds FOLDED_BASIS_MAX={FOLDED_BASIS_MAX}")
         if ntypes > FOLDED_TYPES_MAX:
             raise ValueError(f"ntypes={ntypes} exceeds FOLDED_TYPES_MAX={FOLDED_TYPES_MAX}")
-        coeff_pad = np.zeros((FOLDED_TYPES_MAX * FOLDED_BASIS_MAX, 4), dtype=np.float32)
+        coeff_pad = np.zeros(FOLDED_TYPES_MAX * FOLDED_BASIS_MAX * 4, dtype=np.float32)
         coeff_flat = np.asarray(coeffs, dtype=np.float32).reshape(ntypes, -1)[:, :nbasis]
-        coeff_pad[:ntypes * nbasis, 0] = coeff_flat.flatten()  # cPauli in .x, rest zero
+        coeff_pad[:ntypes * nbasis] = coeff_flat.flatten()
         kxyz_pad = np.zeros((FOLDED_BASIS_MAX, 4), dtype=np.float32)
         kxyz_pad[:nbasis, :] = kxyz[:nbasis]
         self.toGPU('folded_coeffs',    coeff_pad)

@@ -50,6 +50,7 @@ __constant sampler_t sampler_nearest =  CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRES
 
 float3 tipForce( float3 dpos, float4 stiffness, float4 dpos0 ){
     float r = sqrt( dot( dpos,dpos) );
+    r = fmax(r, 1e-10f);
     return  (dpos-dpos0.xyz) * stiffness.xyz        // harmonic 3D
          + dpos * ( stiffness.w * (r-dpos0.w)/r );  // radial
 }
@@ -372,11 +373,11 @@ __kernel void relaxStrokes(
             float3 f  = fe.xyz;
             f        += tipForce( pos-tipPos, stiffness, dpos0 );
             
-            //#if OPT_FIRE
-            //v = update_FIRE( f, v, &dt, &damp, dtmin, dtmax, damp0 );
-            //#else
+            #if OPT_FIRE
+            v = update_FIRE( f, v, &dt, &damp, dtmin, dtmax, damp0 );
+            #else
             v        *=    (1 - damp);
-            //#endif
+            #endif
             v        += f * dt;
             pos.xyz  += v * dt;
 
