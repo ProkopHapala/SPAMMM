@@ -2209,3 +2209,93 @@ def generate_xyz_movie(matched_data, output_file, include_substrate=False,
             f.write(f"{len(all_enames)}\n{comment}\n")
             for e, p in zip(all_enames, all_apos):
                 f.write(f"{e} {p[0]:.10f} {p[1]:.10f} {p[2]:.10f}\n")
+
+
+# ============================================
+# ===== Atom type REQ arrays (from dat files) =====
+# ============================================
+# Moved from tests/surfaces/ocl_GridFF_new.py
+# These functions build xyzq and REQs arrays from AtomicSystem + AtomTypes.dat/ElementTypes.dat
+# Lazy imports used for AtomicSystem and FFparams to avoid circular dependency:
+#   atomicUtils ← AtomicSystem ← atomicUtils
+#   atomicUtils ← FFparams ← atomicUtils
+
+def getAtomTypeREQs( atoms, Atom_Types_name="./data/AtomTypes.dat", Element_Types_name="./data/ElementTypes.dat" ):
+    from spammm.topology.FFparams import read_atom_types, read_element_types
+    etypes = read_element_types(Element_Types_name)
+    atypes = read_atom_types(Atom_Types_name, element_types=etypes)
+    alias_map = {
+        'Ca': ('Ca', 'Ca+2'),
+        'F' : ('F', 'F-'),
+    }
+    REvdW = np.zeros((len(atoms.atypes),2), dtype=np.float32)
+    for i, iz in enumerate(atoms.atypes):
+        ename = elements.ELEMENTS[int(iz)-1][1]
+        names_to_try = alias_map.get(ename, (ename,))
+        at = None
+        for nm in names_to_try:
+            at = atypes.get(nm, None)
+            if at is not None:
+                break
+        if at is None:
+            raise KeyError(f"getAtomTypeREQs(): atom type '{ename}' not found in {Atom_Types_name}")
+        REvdW[i,0] = at.RvdW
+        REvdW[i,1] = at.EvdW
+    return REvdW
+
+
+def make_atoms_arrays( atoms=None, fname=None, bSymetrize=False, Atom_Types_name="./data/AtomTypes.dat", Element_Types_name="./data/ElementTypes.dat", bSqrtEvdw=True ):
+    """Build atom arrays for GridFF generation/sampling.
+    
+    CRITICAL: ElementTypes.dat stores EvdW (energy), but GridFF generation uses sqrt(EvdW) in REQ.y.
+    The bSqrtEvdw parameter controls this conversion:
+        - bSqrtEvdw=True (default): REQ.y = sqrt(EvdW) - REQUIRED for GridFF
+        - bSqrtEvdw=False: REQ.y = EvdW - used for other force fields
+    
+    This sqrt(E) convention ensures proper mixed interaction:
+        Eij = sqrt(Ei * Ej) when GridFF channels contain substrate sqrt(Ej)
+    
+    Args:
+        bSqrtEvdw: If True, convert EvdW to sqrt(EvdW) for GridFF compatibility
+    """
+    from spammm.AtomicSystem import AtomicSystem
+    if atoms is None:
+        atoms = AtomicSystem( fname=fname )
+    if bSymetrize:
+        na_before = len(atoms.atypes)
+        atoms, ws = atoms.symmetrized()
+
+    print( "Qtot ", np.sum(atoms.qs)," Qabs ", np.sum(np.abs(atoms.qs)) )
+    REvdW = getAtomTypeREQs( atoms, Atom_Types_name=Atom_Types_name, Element_Types_name=Element_Types_name )
+    if bSymetrize:
+        REvdW[:,1] *= ws
+        print( "n_atoms (symetrized): ", len(atoms.atypes)," before symmertization: ", na_before )
+    na = len(atoms.atypes)
+    REQs=np.zeros( (na,4), dtype=np.float32 )
+    xyzq=np.zeros( (na,4), dtype=np.float32 )
+    xyzq[:,:3] = atoms.apos
+    xyzq[:,3]  = atoms.qs
+    REQs[:,0]  = REvdW[:,0]
+    if bSqrtEvdw:
+        REQs[:,1]  = np.sqrt(REvdW[:,1])
+    else:
+        REQs[:,1]  = REvdW[:,1]
+    REQs[:,2]  = atoms.qs
+    REQs[:,3]  = 0.0
+
+    return xyzq, REQs, atoms
+
+
+def make_xyzq_only(atoms=None, fname=None, bSymetrize=False):
+    from spammm.AtomicSystem import AtomicSystem
+    if atoms is None:
+        atoms = AtomicSystem( fname=fname )
+    if bSymetrize:
+        atoms, _ = atoms.symmetrized()
+    if atoms.qs is None:
+        raise ValueError(f"make_xyzq_only(): missing charges for {fname}")
+    na = len(atoms.atypes)
+    xyzq = np.zeros( (na,4), dtype=np.float32 )
+    xyzq[:,:3] = atoms.apos
+    xyzq[:,3]  = atoms.qs
+    return xyzq, atoms

@@ -22,19 +22,10 @@ import matplotlib.pyplot as plt
 import time
 import json
 
-#exit()
-#from . import utils as ut
-from .. import atomicUtils as au
-from ..AtomicSystem import AtomicSystem
-from ..OCL.SPparams import read_atom_types, read_element_types
-#from .. import FunctionSampling as fu
-#exit()
-from ..OCL.GridFF import GridFF_cl, GridShape
-#exit()
-#from .Ewald import compute_potential, plot1Dcut
-from .utils import compute_potential, plot1Dcut
-#from ..plotUtils import plot1Dcut
-#from ..OCL.Surface_utils import save_gridff_metadata
+from spammm import atomicUtils as au
+from spammm.AtomicSystem import AtomicSystem
+from spammm.surfaces.GridFF import GridFF_cl, GridShape
+from spammm.surfaces.Surface_utils import save_gridff_metadata
 
 # =============  Functions
 
@@ -43,40 +34,6 @@ spff = None
 os.environ['PYOPENCL_CTX'] = '0'
 clgff = GridFF_cl()
 
-
-def save_gridff_metadata(grid_path, g0, dg, ns, lvec, z0, grid_type="PLQ", generation_script="unknown"):
-    """
-    Save GridFF metadata to JSON file.
-    
-    Args:
-        grid_path: Path to Bspline_PLQd.npy or similar (used to derive metadata path)
-        g0: Grid origin (x0, y0, z0)
-        dg: Grid spacing (dx, dy, dz)
-        ns: Grid shape (nx, ny, nz)
-        lvec: Lattice vectors (3x3 array)
-        z0: Top atom z-coordinate
-        grid_type: Type of grid (e.g., "PLQ", "PL")
-        generation_script: Name of script that generated the grid
-    """
-    # Derive metadata path from grid path
-    base_dir = os.path.dirname(grid_path)
-    base_name = os.path.splitext(os.path.basename(grid_path))[0]
-    meta_path = os.path.join(base_dir, f"{base_name}_meta.json")
-    
-    metadata = {
-        "g0": [float(x) for x in g0],
-        "dg": [float(x) for x in dg],
-        "ns": [int(x) for x in ns],
-        "lvec": [[float(x) for x in row] for row in np.asarray(lvec).tolist()],
-        "z0": float(z0),
-        "grid_type": grid_type,
-        "generation_script": generation_script
-    }
-    
-    print(f"Saving GridFF metadata to: {meta_path}")
-    with open(meta_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
-        
 
 def try_load_spff():
     global spff
@@ -250,88 +207,6 @@ def coulomb_brute_1D( atoms, kind='z', p0=[0.0,0.0,2.0], bPlot=False, nPBC=(60,6
         return FEps
         #plt.show()
 
-def getAtomTypeREQs( atoms, Atom_Types_name="./data/AtomTypes.dat", Element_Types_name="./data/ElementTypes.dat" ):
-    etypes = read_element_types(Element_Types_name)
-    atypes = read_atom_types(Atom_Types_name, element_types=etypes)
-    # Allow aliases in AtomTypes.dat (e.g., Ca+2, F-) by falling back to simple element name
-    alias_map = {
-        'Ca': ('Ca', 'Ca+2'),
-        'F' : ('F', 'F-'),
-    }
-    REvdW = np.zeros((len(atoms.atypes),2), dtype=np.float32)
-    for i, iz in enumerate(atoms.atypes):
-        ename = au.elements.ELEMENTS[int(iz)-1][1]
-        names_to_try = alias_map.get(ename, (ename,))
-        at = None
-        for nm in names_to_try:
-            at = atypes.get(nm, None)
-            if at is not None:
-                break
-        if at is None:
-            raise KeyError(f"getAtomTypeREQs(): atom type '{ename}' not found in {Atom_Types_name}")
-        REvdW[i,0] = at.RvdW
-        REvdW[i,1] = at.EvdW
-    return REvdW
-
-
-def make_atoms_arrays( atoms=None, fname=None, bSymetrize=False, Atom_Types_name="./data/AtomTypes.dat", Element_Types_name="./data/ElementTypes.dat", bSqrtEvdw=True ):
-    """Build atom arrays for GridFF generation/sampling.
-    
-    CRITICAL: ElementTypes.dat stores EvdW (energy), but GridFF generation uses sqrt(EvdW) in REQ.y.
-    The bSqrtEvdw parameter controls this conversion:
-        - bSqrtEvdw=True (default): REQ.y = sqrt(EvdW) - REQUIRED for GridFF
-        - bSqrtEvdw=False: REQ.y = EvdW - used for other force fields
-    
-    This sqrt(E) convention ensures proper mixed interaction:
-        Eij = sqrt(Ei * Ej) when GridFF channels contain substrate sqrt(Ej)
-    
-    Args:
-        bSqrtEvdw: If True, convert EvdW to sqrt(EvdW) for GridFF compatibility
-    """ 
-    #print( os.getcwd() )
-    if atoms is None:
-        atoms = AtomicSystem( fname=fname )
-    if bSymetrize:
-        na_before = len(atoms.atypes)
-        atoms, ws = atoms.symmetrized()
-        #print( "ws ",    ws    )
-
-    print( "Qtot ", np.sum(atoms.qs)," Qabs ", np.sum(np.abs(atoms.qs)) )
-    REvdW = getAtomTypeREQs( atoms, Atom_Types_name=Atom_Types_name, Element_Types_name=Element_Types_name )
-    #print( "REvdW ", REvdW )
-    if bSymetrize: 
-        REvdW[:,1] *= ws
-        print( "n_atoms (symetrized): ", len(atoms.atypes)," before symmertization: ", na_before )
-    #print( "REvdW ", REvdW )
-    na = len(atoms.atypes)
-    REQs=np.zeros( (na,4), dtype=np.float32 )
-    xyzq=np.zeros( (na,4), dtype=np.float32 )
-    xyzq[:,:3] = atoms.apos
-    xyzq[:,3]  = atoms.qs
-    REQs[:,0]  = REvdW[:,0]
-    if bSqrtEvdw:
-        REQs[:,1]  = np.sqrt(REvdW[:,1])
-    else:
-        REQs[:,1]  = REvdW[:,1]
-    REQs[:,2]  = atoms.qs
-    REQs[:,3]  = 0.0
-
-    return xyzq, REQs, atoms
-
-
-def make_xyzq_only(atoms=None, fname=None, bSymetrize=False):
-    if atoms is None:
-        atoms = AtomicSystem( fname=fname )
-    if bSymetrize:
-        atoms, _ = atoms.symmetrized()
-    if atoms.qs is None:
-        raise ValueError(f"make_xyzq_only(): missing charges for {fname}")
-    na = len(atoms.atypes)
-    xyzq = np.zeros( (na,4), dtype=np.float32 )
-    xyzq[:,:3] = atoms.apos
-    xyzq[:,3]  = atoms.qs
-    return xyzq, atoms
-
 
 def plotTrjs( trjs, names, save_path=None, show=True ):
     colors = ["b","g","r","c","m","y","k"]
@@ -362,10 +237,10 @@ def test_gridFF_ocl( fname="./data/xyz/NaCl_1x1_L1.xyz", Atom_Types_name="./data
     #Element_Types_name="/home/prokop/git/FireCore/tests/tSPFF/data/ElementTypes.dat"
 
     if job == "Ewald":
-        xyzq, atoms = make_xyzq_only( fname=fname )
+        xyzq, atoms = au.make_xyzq_only( fname=fname )
         REQs = None
     else:
-        xyzq, REQs, atoms = make_atoms_arrays( fname=fname, bSymetrize=bSymetrize, Atom_Types_name=Atom_Types_name, Element_Types_name=Element_Types_name )
+        xyzq, REQs, atoms = au.make_atoms_arrays( fname=fname, bSymetrize=bSymetrize, Atom_Types_name=Atom_Types_name, Element_Types_name=Element_Types_name )
 
     if np.isnan(z0): z0 = xyzq[0,2].max()
     print( "test_gridFF_ocl() z0= ", z0 )
@@ -711,7 +586,7 @@ def test_gridFF_ocl( fname="./data/xyz/NaCl_1x1_L1.xyz", Atom_Types_name="./data
 
         # plt.subplot(1,6,6); plt.imshow( Vbrute, cmap='bwr' ); plt.colorbar(); plt.title( "Vbrute[200:300,:,0]" );
 
-        xyzq_sym, _ = make_xyzq_only( atoms=atoms, bSymetrize=True )
+        xyzq_sym, _ = au.make_xyzq_only( atoms=atoms, bSymetrize=True )
         Vbrute         = coulomb_brute_1D( xyzq_sym, kind='z', p0=[0.0,0.0,0.0], bPlot=False )
 
         plt.figure( figsize=(7,5) )
