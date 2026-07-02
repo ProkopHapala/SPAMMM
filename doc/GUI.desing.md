@@ -30,6 +30,7 @@ Interactive molecular editor for designing carbon-based nanostructures (graphene
 | **Hex2** (toggle) | Add hex ring | — | Remove hex ring (preserve shared) | — | Like Hex1 but preserves atoms shared with neighboring rings |
 | **Atom** | Click: change type / Drag: move atom / Empty: add atom | Drag: create bond (rubber-band) | Delete atom | Delete atom + bridge neighbors | Free atom placement, drag-to-bond, type change |
 | **Bond** | Insert atom (no push) | Insert atom (push aside) | Delete bond | Collapse bond (merge atoms) | Edit existing bonds with Ctrl for atom adjustment |
+| **Ring** | Add n-gon ring on bond | — | Delete bond | — | Click bond to create n-membered ring (default 5) sharing that bond; ring size spinbox + numpad +/- in side panel; ghost preview on hover shows ring on mouse side |
 | **pi** | Cycle pi-orbital count (0→1→2→0) | — | Delete atom | — | Adjust hybridization (sp3→sp2→sp) on clicked atom |
 | **Select** | Drag selected atoms | — | Rectangle select / Delete | — | RMB drag = selection box; Delete = remove selected; Ctrl-C/V = copy/paste |
 
@@ -90,7 +91,7 @@ Pre-built nanoribbon generator for quick starts:
 | **Middle-click** | Toggle H state on nearest atom |
 | **Scroll** | Zoom in/out |
 | **RMB drag** (Select mode) | Rectangle selection |
-| **LMB drag** (Atom/Select mode) | Drag atom(s) to new position |
+| **LMB drag** (Atom/Select mode) | Drag atom(s) to new position. Drop atom on top of another → merge (target survives, bonds transfer) |
 
 ### Keyboard
 | Key | Action |
@@ -179,6 +180,9 @@ Extensions that fail to load (missing dependency) show a grayed-out panel with t
 | Delete bond | `delete_bond(bond)` | Soft-delete bond only, keep both atoms |
 | Insert into bond | `insert_atom_into_bond(bond, ename, push_aside)` | Splits bond with new atom; `push_aside` controls if A/B move |
 | Collapse bond | `collapse_bond(bond, pos)` | Merges two atoms into one at given position |
+| Merge atoms (drag) | `merge_atoms(dragged_id, target_id)` | Drag atom onto another → target survives, dragged atom's heavy bonds transfer (no duplicates), H caps readjusted |
+| Add adjacent ring | `add_adjacent_ring(bond, n_members, ename, side)` | Creates n-membered ring sharing picked bond as one edge; `side` (+1/-1) from mouse position |
+| Ring preview | `compute_adjacent_ring_positions(bond, n, side)` | Pure geometry: returns n-gon vertex positions without creating atoms (for hover preview) |
 | Adjust H caps | `adjust_h()` | Remove all H caps → re-add based on valency |
 | Recalculate bonds | `recalc_bonds()` | Distance-based bond detection (dangerous: may create spurious bonds) |
 | Snap to pins | `snap_atoms_to_pins()` | Reset all atom positions to their grid pin coordinates |
@@ -212,7 +216,7 @@ Pre-defined edge terminations for ribbons:
 
 3. **Soft-delete:** Atoms are marked `alive=False`, not removed from dict. `to_arrays()` filters them out. `cleanup_invalid()` is deferred — not called after every deletion. Neighbor queries must filter by `n.alive` and `n.npi != -1` (exclude H caps).
 
-4. **Local neighbor updates:** `add_bond` and `remove_bond` update `atom.neighbors` in-place (O(degree)). Global `sync_neighbor_lists()` is only needed for bulk operations (ring add/remove, `collapse_bond`).
+4. **Local neighbor updates:** `add_bond` and `remove_bond` update `atom.neighbors` in-place (O(degree)). `add_bond` is idempotent — if a dead bond exists between the pair, it revives it instead of creating a duplicate. Global `sync_neighbor_lists()` is only needed for bulk operations (ring add/remove, `collapse_bond`).
 
 5. **Double event handling:** Both `AtomScene` and `SPAMMM_GUI` handle `mouse_press`. Mode checks prevent conflicts. `ev.handled = True` does NOT stop other callbacks in Vispy.
 
@@ -221,6 +225,10 @@ Pre-defined edge terminations for ribbons:
 7. **Undo stack:** `UndoStack(maxlen=100)` stores `PackedMolecule` snapshots. `_push_undo()` is called before all graph mutations. Ctrl+Z restores previous state.
 
 8. **Clipboard:** `PackedMolecule` serializes selected atoms + internal bonds. Ctrl+C stores packed + Qt clipboard (MOL/XYZ text). Ctrl+V rebuilds from packed.
+
+9. **Drag-to-merge:** In Atom mode, dragging an atom onto another (within `pick_radius`) triggers `merge_atoms` — the non-dragged atom survives, all heavy-atom bonds transfer (idempotent `add_bond` prevents duplicates), H caps are removed and readjusted. Undo (Ctrl+Z) reverts.
+
+10. **Ring mode ghost preview:** Hovering a bond in Ring mode shows a cyan n-gon outline on the mouse side of the bond. Numpad +/- changes ring size (3–12), synced with spinbox.
 
 See `doc/GUI_topology_edit.desing.md` for detailed internal design and bug history.
 

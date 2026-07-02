@@ -241,7 +241,11 @@ class AtomicGraph:
     def add_bond(self, a: Atom, b: Atom, order=1) -> Bond:
         for bond in a.bonds:
             if bond.other(a) is b:
-                return bond   # already exists
+                if not bond.alive:
+                    bond.alive = True  # revive dead bond
+                    a.neighbors.append(b)
+                    b.neighbors.append(a)
+                return bond   # already exists (now alive)
         bond = Bond(a, b, order)
         self.bonds[bond._id] = bond
         a.bonds.append(bond)

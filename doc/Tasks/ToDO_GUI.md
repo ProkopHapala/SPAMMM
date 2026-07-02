@@ -25,3 +25,5 @@
 - Kekule Solver ?  - fast estimation of pi-orbitals structures?
 
 - Forming hydrogen bonds when dragging ?
+
+- Export LAMMPS topology file (or GROMAS?)

@@ -261,10 +261,15 @@ class KekuleExplorerWindow(BaseGUI):
         
         # Edit Mode (from Builder)
         self.label("Edit Mode:", layout=layout)
-        self.mode_combo = self.comboBox(["Hex1", "Hex2", "Atom", "Bond", "pi", "Select"], self.set_edit_mode, layout=layout)
+        self.mode_combo = self.comboBox(["Hex1", "Hex2", "Atom", "Bond", "Ring", "pi", "Select"], self.set_edit_mode, layout=layout)
         
         # Atom type and auto h-cap (from Builder)
         row = QtWidgets.QHBoxLayout()
+        # Ring size spinbox (visible in Ring mode)
+        self.ring_size_label = QtWidgets.QLabel("Ring size:")
+        self.ring_size_spinbox = self.spinBox(5, 1.0, max_width=50, vmin=3, vmax=12, int_mode=True)
+        self.ring_size_label.setVisible(False)
+        self.ring_size_spinbox.setVisible(False)
         self.label("Type:", layout=row)
         self.atom_combo = self.comboBox(["C", "N", "O"], self.set_atom_type, layout=row)
         self.auto_h_cap_btn = self.button("Auto H", self.toggle_auto_h_cap, layout=row)
@@ -274,6 +279,12 @@ class KekuleExplorerWindow(BaseGUI):
         self.auto_bonds_btn.setCheckable(True)
         self.auto_bonds_btn.setChecked(self.backend.auto_recalc_bonds)
         layout.addLayout(row)
+
+        # Ring size row (visible only in Ring mode)
+        row_ring = QtWidgets.QHBoxLayout()
+        row_ring.addWidget(self.ring_size_label)
+        row_ring.addWidget(self.ring_size_spinbox)
+        layout.addLayout(row_ring)
 
         # Pick radius (kept in main editors section)
         row_grid = QtWidgets.QHBoxLayout()
@@ -658,22 +669,42 @@ class KekuleExplorerWindow(BaseGUI):
             self.scene.set_selection_mode(True)
             self.scene.lock_drag = False
             self.scene._link_mode = False
+            self.ring_size_label.setVisible(False)
+            self.ring_size_spinbox.setVisible(False)
+            self.scene.ring_preview_line.visible = False
             self.statusBar().showMessage("LMB: Select/Deselect | RMB: Delete | Scroll: Zoom")
         elif mode == 'Bond':
             self.scene.set_selection_mode(False)
             self.scene.lock_drag = True   # No atom dragging in bond mode
             self.scene._link_mode = False
+            self.ring_size_label.setVisible(False)
+            self.ring_size_spinbox.setVisible(False)
+            self.scene.ring_preview_line.visible = False
             self.statusBar().showMessage("LMB: Insert atom (Ctrl: push aside) | RMB: Delete bond (Ctrl: collapse) | Scroll: Zoom")
+        elif mode == 'Ring':
+            self.scene.set_selection_mode(False)
+            self.scene.lock_drag = True   # No atom dragging in ring mode
+            self.scene._link_mode = False
+            self.ring_size_label.setVisible(True)
+            self.ring_size_spinbox.setVisible(True)
+            self.scene.ring_preview_line.visible = False
+            self.statusBar().showMessage("LMB: Add n-gon ring on bond | RMB: Delete bond | Numpad +/-: Ring size | Scroll: Zoom")
         elif mode in ('Hex1', 'Hex2'):
             self.scene.set_selection_mode(False)
             self.scene.lock_drag = True   # No atom dragging in hex mode
             self.scene._link_mode = False
+            self.ring_size_label.setVisible(False)
+            self.ring_size_spinbox.setVisible(False)
+            self.scene.ring_preview_line.visible = False
             mode_str = "Hex1 (paint: force add/remove)" if mode == 'Hex1' else "Hex2 (toggle: preserve shared)"
             self.statusBar().showMessage(f"{mode_str}: LMB: Add | RMB: Remove")
         else:
             self.scene.set_selection_mode(False)
             self.scene.lock_drag = False
             self.scene._link_mode = (mode == 'Atom')  # Enable Ctrl+drag bond creation in Atom mode
+            self.ring_size_label.setVisible(False)
+            self.ring_size_spinbox.setVisible(False)
+            self.scene.ring_preview_line.visible = False
             if mode == 'Atom':
                 self.statusBar().showMessage("LMB: Add/Change type/Drag move | Ctrl+LMB drag: Create bond | RMB: Delete (Ctrl: bridge neighbors) | Scroll: Zoom")
             else:
@@ -820,6 +851,16 @@ class KekuleExplorerWindow(BaseGUI):
             self.undo()
             return
 
+        # Numpad +/- changes ring size in Ring mode (synced with spinbox)
+        if self.edit_mode == 'Ring' and event.key in ('+', 'KP_ADD', '='):
+            val = int(self.ring_size_spinbox.value()) + 1
+            self.ring_size_spinbox.setValue(min(val, self.ring_size_spinbox.maximum()))
+            return
+        if self.edit_mode == 'Ring' and event.key in ('-', 'KP_SUBTRACT', '_'):
+            val = int(self.ring_size_spinbox.value()) - 1
+            self.ring_size_spinbox.setValue(max(val, self.ring_size_spinbox.minimum()))
+            return
+
         if not selected:
             return
 
@@ -933,6 +974,29 @@ class KekuleExplorerWindow(BaseGUI):
                 return
             for i, atom in enumerate(atom_list):
                 atom.pos[:] = scene_pos[i]
+
+            # Check for atom merge: if dragged atom overlaps another heavy atom
+            if atom_id >= 0:
+                dragged = self.backend.graph.atoms.get(atom_id)
+                if dragged is not None and dragged.alive and dragged.npi != -1:
+                    # Find nearest other heavy atom (excluding dragged itself)
+                    drag_pos = dragged.pos[:2]
+                    nearest_other = None
+                    nearest_dist = self.pick_radius
+                    for a in self.backend.graph.atoms.values():
+                        if a is dragged or not a.alive or a.npi == -1: continue
+                        dist = np.linalg.norm(a.pos[:2] - drag_pos)
+                        if dist < nearest_dist:
+                            nearest_dist = dist
+                            nearest_other = a
+                    if nearest_other is not None:
+                        debug_print(2, f"Drag end: merge Atom({atom_id}) onto Atom({nearest_other._id}) (dist={nearest_dist:.3f})")
+                        self._push_undo()
+                        self.backend.merge_atoms(atom_id, nearest_other._id)
+                        self.refresh_view()
+                        self.sig_geometry_changed.emit()
+                        return
+
             # Sync sys.apos from AtomicGraph (now authoritative)
             self.backend._sync_sys()
             # Update scene's internal _pos array from sys.apos to keep in sync
@@ -974,13 +1038,24 @@ class KekuleExplorerWindow(BaseGUI):
                         face_color='transparent', size=20
                     )
                     debug_print(3, f"Hovered atom: {hovered_atom}")
-            elif self.edit_mode == 'Bond':
-                # Bond mode: highlight bonds only
+            elif self.edit_mode in ('Bond', 'Ring'):
+                # Bond/Ring modes: highlight bonds only
                 if hovered_bond:
                     pos_a = hovered_bond.a.pos
                     pos_b = hovered_bond.b.pos
                     self.scene.hover_bond_line.set_data(pos=np.array([pos_a, pos_b], dtype=np.float32))
                     debug_print(3, f"Hovered bond: {hovered_bond}")
+                # Ring mode: show ghost n-gon preview on mouse side of bond
+                if self.edit_mode == 'Ring' and hovered_bond:
+                    n = int(self.ring_size_spinbox.value())
+                    side = self.backend.compute_ring_side(hovered_bond, p_world)
+                    verts = self.backend.compute_adjacent_ring_positions(hovered_bond, n, side)
+                    # Close the loop for visualization
+                    closed = np.vstack([verts, verts[:1]]).astype(np.float32)
+                    self.scene.ring_preview_line.set_data(pos=closed, color=(0.2, 0.8, 0.8, 0.6))
+                    self.scene.ring_preview_line.visible = True
+                else:
+                    self.scene.ring_preview_line.visible = False
             elif self.edit_mode in ('Hex1', 'Hex2'):
                 # Hex modes: highlight rings only (existing hex highlighting below)
                 pass
@@ -1064,9 +1139,9 @@ class KekuleExplorerWindow(BaseGUI):
         if self.edit_mode == 'Select':
             return
 
-        # In Hex modes, prevent dragging - we only want add/remove hex operations
-        if self.edit_mode in ('Hex1', 'Hex2'):
-            # Continue to handle_click for hex operations, but don't let Vispy handle drag
+        # In Hex/Ring/Bond modes, prevent dragging - we only want add/remove operations
+        if self.edit_mode in ('Hex1', 'Hex2', 'Ring', 'Bond'):
+            # Continue to handle_click for operations, but don't let Vispy handle drag
             pass
         else:
             # For non-ring modes, if atoms are selected and LMB, let Vispy handle dragging
@@ -1189,8 +1264,8 @@ class KekuleExplorerWindow(BaseGUI):
             q, r = self.backend.snap_to_ring(x, y)
             nearest_atom_idx = None
             nearest_atom_id = None
-        elif self.edit_mode == 'Bond':
-            # Bond mode: pick bond
+        elif self.edit_mode in ('Bond', 'Ring'):
+            # Bond/Ring modes: pick bond
             bond = self.backend.pick_bond(p_world)
             nearest_atom_idx = None
             nearest_atom_id = None
@@ -1211,6 +1286,12 @@ class KekuleExplorerWindow(BaseGUI):
                 if bond is not None:
                     new_atom = self.backend.insert_atom_into_bond(bond, self.cur_atom_type, push_aside=ctrl)
                     debug_print(2, f"Inserted atom into bond {bond._id}, new atom {new_atom._id} (push_aside={ctrl})")
+            elif self.edit_mode == 'Ring':
+                if bond is not None:
+                    n = int(self.ring_size_spinbox.value())
+                    side = self.backend.compute_ring_side(bond, p_world)
+                    new_atoms = self.backend.add_adjacent_ring(bond, n_members=n, ename=self.cur_atom_type, side=side)
+                    debug_print(2, f"Added {n}-ring on bond {bond._id} side={side}, {len(new_atoms)} new atoms")
             elif self.edit_mode == 'pi':
                 # Cycle pi orbitals: sp3(0) -> sp2(1) -> sp(2) -> sp3(0)
                 if nearest_atom_idx is not None:
@@ -1239,9 +1320,9 @@ class KekuleExplorerWindow(BaseGUI):
             if self.edit_mode in ('Hex1', 'Hex2'):
                 if q is not None and r is not None:
                     self.backend.remove_ring(q, r)
-            elif self.edit_mode == 'Bond':
+            elif self.edit_mode in ('Bond', 'Ring'):
                 if bond is not None:
-                    if ctrl:
+                    if ctrl and self.edit_mode == 'Bond':
                         survivor = self.backend.collapse_bond(bond, np.array([x, y]))
                         debug_print(2, f"Collapsed bond {bond._id}, survivor atom {survivor._id}")
                     else:

@@ -684,6 +684,94 @@ class KekuleBackend:
         
         return new_atom
 
+    @staticmethod
+    def compute_adjacent_ring_positions(bond, n_members=5, side=1):
+        """Compute vertex positions of an n-gon sharing a bond as one edge. Pure geometry, no mutation.
+
+        Args:
+            bond: Bond object (must be alive)
+            n_members: Ring size (>= 3)
+            side: +1 or -1 — which side of the bond to place the ring (perpendicular direction)
+
+        Returns:
+            (n, 3) array of vertex positions [A, new_1, ..., new_{n-2}, B]
+        """
+        if bond is None or not bond.alive:
+            raise ValueError("Invalid bond (None or not alive)")
+        if n_members < 3:
+            raise ValueError(f"n_members must be >= 3, got {n_members}")
+
+        pos_a = bond.a.pos[:2]
+        pos_b = bond.b.pos[:2]
+        d = np.linalg.norm(pos_b - pos_a)
+        if d < 1e-6:
+            raise ValueError("Bond has zero length — cannot build ring")
+
+        R = d / (2.0 * np.sin(np.pi / n_members))
+        mid = 0.5 * (pos_a + pos_b)
+        dir_ab = (pos_b - pos_a) / d
+        perp = np.array([-dir_ab[1], dir_ab[0]]) * side
+        center = mid + perp * (R * np.cos(np.pi / n_members))
+
+        angle_a = np.arctan2(pos_a[1] - center[1], pos_a[0] - center[0])
+        angle_b = np.arctan2(pos_b[1] - center[1], pos_b[0] - center[0])
+        angle_step = 2.0 * np.pi / n_members
+        delta = angle_b - angle_a
+        if delta > np.pi: delta -= 2 * np.pi
+        if delta < -np.pi: delta += 2 * np.pi
+        # Short arc is the existing bond (1 step). New atoms fill the long arc (n-2 steps).
+        angle_dir = -angle_step if delta > 0 else angle_step
+
+        verts = [np.array([pos_a[0], pos_a[1], 0.0])]
+        for i in range(1, n_members - 1):
+            angle = angle_a + angle_dir * i
+            verts.append(np.array([center[0] + R * np.cos(angle), center[1] + R * np.sin(angle), 0.0]))
+        verts.append(np.array([pos_b[0], pos_b[1], 0.0]))
+        return np.array(verts)
+
+    @staticmethod
+    def compute_ring_side(bond, mouse_pos):
+        """Determine which side of a bond the mouse is on. Returns +1 or -1."""
+        pos_a = bond.a.pos[:2]
+        pos_b = bond.b.pos[:2]
+        d = np.linalg.norm(pos_b - pos_a)
+        if d < 1e-6: return 1
+        dir_ab = (pos_b - pos_a) / d
+        perp = np.array([-dir_ab[1], dir_ab[0]])
+        mouse_vec = np.array(mouse_pos[:2]) - pos_a
+        return 1 if np.dot(perp, mouse_vec) > 0 else -1
+
+    def add_adjacent_ring(self, bond, n_members=5, ename='C', side=1):
+        """Create an n-membered carbon ring adjacent to a bond (sharing that bond as one edge).
+
+        Args:
+            bond: Bond object (from graph.pick_bond())
+            n_members: Ring size (default 5). Must be >= 3.
+            ename: Element name for new atoms (default 'C')
+            side: +1 or -1 — which side of the bond to place the ring
+
+        Returns:
+            List of newly created Atom objects
+        """
+        verts = self.compute_adjacent_ring_positions(bond, n_members, side)
+        a, b = bond.a, bond.b
+
+        new_atoms = []
+        prev = a
+        for i in range(1, n_members - 1):
+            atom = self.graph.add_atom(verts[i], ename, elements.ELEMENT_DICT[ename][0],
+                                       pin=None, parent=None, npi=1)
+            new_atoms.append(atom)
+            self.graph.add_bond(prev, atom)
+            prev = atom
+        self.graph.add_bond(prev, b)
+
+        self._rings_dirty = True
+        self._sync_sys()
+        if self.auto_h_cap:
+            self.adjust_h()
+        return new_atoms
+
     def collapse_bond(self, bond, mouse_pos):
         """Collapse a bond by removing one atom and transferring its bonds to the other.
         
@@ -792,6 +880,61 @@ class KekuleBackend:
             self.adjust_h()
         
         return survivor
+
+    def merge_atoms(self, dragged_id, target_id):
+        """Merge two atoms: target survives, dragged atom is removed. Bonds transfer to target.
+
+        Called when user drags an atom on top of another (within pick radius).
+        Only heavy-atom bonds transfer (H cap bonds are discarded with the dragged atom's H caps).
+
+        Args:
+            dragged_id: Atom._id of the dragged atom (will be removed)
+            target_id: Atom._id of the target atom (survives, keeps its position)
+
+        Returns:
+            The surviving Atom object, or None if merge was not performed
+        """
+        dragged = self.graph.atoms.get(dragged_id)
+        target = self.graph.atoms.get(target_id)
+        if dragged is None or target is None or not dragged.alive or not target.alive:
+            return None
+        if dragged is target:
+            return None
+        # Only merge heavy atoms (not H caps)
+        if dragged.npi == -1 or target.npi == -1:
+            return None
+
+        debug_print(1, f"Merge: dragged Atom({dragged._id}) into target Atom({target._id})")
+
+        # Remove H caps of dragged atom
+        for h in self.graph.h_children(dragged):
+            self.graph.remove_atom(h)
+            debug_print(1, f"  Removed H cap Atom({h._id})")
+
+        # Transfer heavy-atom bonds from dragged to target
+        for b in list(dragged.bonds):
+            if not b.alive: continue
+            other = b.other(dragged)
+            if other is target: continue  # skip bond between the two
+            if other.npi == -1: continue  # skip H cap bonds (shouldn't exist after above)
+            # Mark old bond dead, create new bond target-other (if not already bonded)
+            b.alive = False
+            self.graph.add_bond(target, other)
+            debug_print(1, f"  Transferred bond to Atom({other._id})")
+
+        # Kill bond between dragged and target if any
+        for b in dragged.bonds:
+            if b.alive and b.other(dragged) is target:
+                b.alive = False
+
+        # Soft-delete dragged atom
+        self.graph.remove_atom(dragged)
+
+        self._rings_dirty = True
+        self._sync_sys()
+        if self.auto_h_cap:
+            self.adjust_h()
+        return target
 
     def delete_bond(self, bond):
         """Delete a bond (soft-delete only, keep both atoms)."""

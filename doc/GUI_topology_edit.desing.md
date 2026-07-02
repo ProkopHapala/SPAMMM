@@ -53,9 +53,11 @@ The central design challenge: **topology operations need flexibility (add/remove
 ### When to call `sync_neighbor_lists()`
 
 - `Atom.neighbors` is a **derived** list rebuilt from alive bonds.
+- `add_bond` and `remove_bond` now update `neighbors` **locally** (O(degree)) — no global sync needed for single bond add/remove.
+- `add_bond` is **idempotent**: if a dead bond exists between the pair, it revives it (`alive=True`, restores neighbors) instead of creating a duplicate.
 - After **soft-delete only**: neighbor lists become stale (contain dead atoms), but consumers filter by `n.alive`. No sync needed.
-- After **bond creation** (e.g., `insert_atom_into_bond`, `add_h_caps`): `sync_neighbor_lists()` is called to include new bonds.
 - After **collapse_bond**: topology changes, so `sync_neighbor_lists()` is called.
+- `sync_neighbor_lists()` is only needed for **bulk operations** where many bonds change at once.
 
 ### `h_children()` is O(N)
 
@@ -260,10 +262,13 @@ This allows deferring `sync_neighbor_lists()` — the O(N+B) global rebuild — 
 
 ### When `sync_neighbor_lists()` IS needed
 
-- After `add_h_caps()` — new bonds were created, neighbor lists must include them.
-- After `insert_atom_into_bond()` — new bonds created.
-- After `collapse_bond()` — topology changed.
+- After `add_h_caps()` — new bonds were created (though `add_bond` now updates locally, bulk sync is a safety net).
+- After `collapse_bond()` — topology changed, multiple bonds marked dead + created.
 - **NOT** after `remove_atom_by_id()` — soft-delete + `n.alive` filter suffices.
+- **NOT** after `delete_bond()` — `remove_bond` updates neighbors locally.
+- **NOT** after `insert_atom_into_bond()` — `add_bond` updates neighbors locally.
+- **NOT** after `add_adjacent_ring()` — `add_bond` updates neighbors locally.
+- **NOT** after `merge_atoms()` — `add_bond` (idempotent revive) + `remove_atom` handle neighbors locally.
 
 ---
 
@@ -331,8 +336,8 @@ Vispy renders fresh scene
 
 | File | Role |
 |------|------|
-| `spammm/topology/AtomicGraph.py` | Authoritative topology: `Atom`, `Bond`, `Ring` classes, soft-delete, `to_arrays()`, `cleanup_invalid()`, `sync_neighbor_lists()` |
-| `spammm/topology/KekuleBackend.py` | Bridge: `_sync_sys()` (export + 4 mappings), `remove_atom_by_id()`, `adjust_h()`, `add_h_caps()` |
+| `spammm/topology/AtomicGraph.py` | Authoritative topology: `Atom`, `Bond`, `Ring` classes, soft-delete, `to_arrays()`, `cleanup_invalid()`, `sync_neighbor_lists()`, local neighbor updates in `add_bond`/`remove_bond` |
+| `spammm/topology/KekuleBackend.py` | Bridge: `_sync_sys()` (export + 4 mappings), `remove_atom_by_id()`, `adjust_h()`, `add_h_caps()`, `merge_atoms()`, `add_adjacent_ring()`, `compute_adjacent_ring_positions()` |
 | `spammm/GUI/VispyUtils.py` | Rendering: `AtomScene` class, picking, drag, selection, signals (all emit `Atom._id`) |
 | `spammm/GUI/SPAMMM_GUI.py` | Controller: signal handlers, `on_atom_remove()`, `refresh_view()`, `handle_click()` |
 
@@ -351,6 +356,15 @@ Vispy renders fresh scene
 - [ ] Export/Import .xyz/.mol/.mol2 → round-trip preserves atoms, bonds, positions
 - [ ] Pi-mode cycling (sp3→sp2→sp→sp3) → `npi` changes correctly, H caps adjust
 - [ ] Add→remove→add ring cycle → atoms re-created correctly (pin cache not stale)
+- [ ] Ring mode: LMB on bond → n-gon created on mouse side, correct size
+- [ ] Ring mode: numpad +/- changes ring size, spinbox syncs, ghost preview updates
+- [ ] Ring mode: ghost preview shows on correct side when mouse crosses bond
+- [ ] Drag-to-merge: drag atom onto another → target survives, bonds transfer (no duplicates)
+- [ ] Drag-to-merge: H caps readjusted after merge
+- [ ] Drag-to-merge: undo (Ctrl+Z) reverts merge
+- [ ] Ctrl+LMB drag (Atom mode): rubber-band bond creation between two atoms
+- [ ] Ctrl+RMB (Atom mode): remove atom + bridge 2 heavy neighbors
+- [ ] Bond mode: LMB insert (no push), Ctrl+LMB insert (push aside), RMB delete, Ctrl+RMB collapse
 
 ---
 

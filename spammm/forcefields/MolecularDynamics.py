@@ -1705,7 +1705,54 @@ class MolecularDynamics(OpenCLBase):
         for _ in range(nsteps):
             step_fn(do_nb=do_nb)
         return self.get_total_energy()
-    
+
+    # --- Pinning / Constraints ---
+    # The kernel updateAtomsSPFFf4 already supports per-atom harmonic constraints
+    # via constr[iaa] = (x,y,z, K_flag) and constrK[iaa] = (kx,ky,kz, 0).
+    # If K_flag > 0, a spring force (target_pos - current_pos) * stiffness is added.
+    # We use this to pin atoms: set target = saved position, stiffness = large value.
+
+    def set_pinned(self, indices, positions, iSys=0, K=1e6):
+        """Pin selected atoms to given positions using GPU constraint buffers.
+
+        Args:
+            indices: array of atom indices to pin
+            positions: (n_pinned, 3) target positions
+            iSys: system index (default 0)
+            K: constraint stiffness (large = rigid pin)
+        """
+        indices = np.asarray(indices, dtype=np.int32)
+        positions = np.asarray(positions, dtype=np.float32)
+        natoms = self.natoms
+        float4_size = 4 * np.float32().itemsize
+        # Build constr array: (x,y,z, K_flag) per atom, 0 for unpinned
+        constr = np.zeros((natoms, 4), dtype=np.float32)
+        constrK = np.zeros((natoms, 4), dtype=np.float32)
+        for idx, pos in zip(indices, positions):
+            constr[idx, :3] = pos
+            constr[idx, 3] = 1.0  # K_flag > 0 activates constraint
+            constrK[idx, :3] = K
+        offset = iSys * natoms * float4_size
+        self.toGPU('constr', constr.flatten(), byte_offset=offset)
+        self.toGPU('constrK', constrK.flatten(), byte_offset=offset)
+        self._pinned_indices = indices.copy()
+        self._pinned_positions = positions.copy()
+
+    def clear_pinned(self, iSys=0):
+        """Remove all pin constraints."""
+        natoms = self.natoms
+        float4_size = 4 * np.float32().itemsize
+        zero = np.zeros((natoms, 4), dtype=np.float32)
+        offset = iSys * natoms * float4_size
+        self.toGPU('constr', zero.flatten(), byte_offset=offset)
+        self.toGPU('constrK', zero.flatten(), byte_offset=offset)
+        self._pinned_indices = np.array([], dtype=np.int32)
+        self._pinned_positions = np.zeros((0, 3), dtype=np.float32)
+
+    def get_pinned_indices(self):
+        """Return array of currently pinned atom indices."""
+        return getattr(self, '_pinned_indices', np.array([], dtype=np.int32))
+
     def initGridFF(self, grid_shape, bspline_data, grid_p0, grid_step, use_texture=False, r_damp=0.0, alpha_morse=0.0, bKernels=True):
         """Initialize GridFF with B-spline data"""
         

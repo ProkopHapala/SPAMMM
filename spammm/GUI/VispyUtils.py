@@ -195,18 +195,21 @@ class AtomScene(QtCore.QObject):
         # Link line for Ctrl+drag bond creation (rubber-band)
         self.link_line = visuals.Line(parent=self.view.scene, color=(0.2, 0.8, 0.2, 0.8), width=3.0, antialias=True, method='gl')
         self.link_line.visible = False
+        # Ring preview ghost (n-gon outline shown when hovering bond in Ring mode)
+        self.ring_preview_line = visuals.Line(parent=self.view.scene, color=(0.2, 0.8, 0.8, 0.6), width=2.0, antialias=True, method='gl')
+        self.ring_preview_line.visible = False
         # Selection rectangle (Line visual) - create lazily to avoid initialization issues
         self.selection_rect = None
 
         # Enforce z-order when supported
-        for o, v in enumerate((self.radius_markers, self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.atom_markers, self.axes, self.text_labels, self.hover_bond_line, self.hover_ring_lines, self.hover_ring_markers, self.hover_ring_text, self.hover_atom_marker, self.link_line)):
+        for o, v in enumerate((self.radius_markers, self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.atom_markers, self.axes, self.text_labels, self.hover_bond_line, self.hover_ring_lines, self.hover_ring_markers, self.hover_ring_text, self.hover_atom_marker, self.link_line, self.ring_preview_line)):
             if hasattr(v, 'order'):
                 v.order = int(o)
 
         # GL state: radius translucent and never blocks other overlays
         try:
             self.radius_markers.set_gl_state('translucent', depth_test=False)
-            for v in (self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.hover_bond_line, self.hover_ring_lines, self.link_line):
+            for v in (self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.hover_bond_line, self.hover_ring_lines, self.link_line, self.ring_preview_line):
                 v.set_gl_state('translucent', depth_test=False)
             self.atom_markers.set_gl_state('translucent', depth_test=False)
             self.hover_ring_markers.set_gl_state('translucent', depth_test=False)

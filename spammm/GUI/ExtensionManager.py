@@ -92,6 +92,11 @@ EXTENSION_REGISTRY = {
         dependencies=[], req_paths=[],
         build_ui='build_ui',
     ),
+    'relax': dict(
+        module='spammm.GUI.RelaxationExtension', class_name=None,
+        dependencies=['pyopencl'], req_paths=[],
+        build_ui='build_ui',
+    ),
     'grid': dict(
         module='spammm.FireballOCL.Grid', class_name='GridProjector',
         dependencies=['pyopencl'], req_paths=['fdata_dir'],
@@ -127,6 +132,7 @@ DEFAULT_CONFIG = {
     'dftb':     dict(enabled=True,  executable='dftb+', workdir='./dftb_workdir'),
     'afm':      dict(enabled=True, cl_src_dir='../../kernels'),
     'spff':     dict(enabled=False, lib_path=''),
+    'relax':    dict(enabled=False),  # enable when GUI hooks are wired
     'grid':     dict(enabled=False, fdata_dir=''),
     'psi4':     dict(enabled=False),
     'pyscf':    dict(enabled=False),
