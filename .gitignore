@@ -220,6 +220,9 @@ __marimo__/
 # Debug output (generated test plots, .xyz cluster files)
 debug/
 
+# GUI output (screenshots, saved plots)
+output/
+
 # Binary density files (large, regenerable — keep in debug/)
 tests/ref_data/densities/
 tests/ref_data/bak/

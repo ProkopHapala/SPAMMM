@@ -23,6 +23,7 @@ import os
 import numpy as np
 from spammm.AtomicSystem import AtomicSystem
 from spammm.topology.AtomicGraph import AtomicGraph
+from spammm.topology.HexGrid import HexGrid, snap_to_grid
 from spammm import elements
 from spammm import atomicUtils as au
 
@@ -121,16 +122,17 @@ class KekuleBackend:
 
     Authoritative state: self.graph (AtomicGraph) — object graph, no integer indices.
     Render state:        self.sys  (AtomicSystem) — synced on demand via _sync_sys().
+    Auxiliary grid:      self.grid (HexGrid) — hex ruler for drawing/snapping, decoupled from topology.
 
     AtomicGraph contains Atom objects.  Each Atom carries:
-        .pin     : (rx,ry) grid node key, or None for H caps
+        .pin     : (rx,ry) grid node key, or None (optional, invalidatable on grid transform)
         .parent  : Atom object (heavy atom this H belongs to), or None
         .subtype : 'C_sp2', 'H_cap', etc.
     Rings are stored in graph.rings as {(q,r): Ring(atoms=[Atom,...])}
     """
 
     def __init__(self, a_CC=1.42):
-        self.a_CC = a_CC
+        self.grid = HexGrid(a_CC=a_CC)
         self.graph = AtomicGraph()
         self.sys   = AtomicSystem(apos=np.zeros((0,3)), atypes=np.array([],dtype=np.int32), enames=np.array([],dtype=object))
         self.pbc_x = False
@@ -142,6 +144,14 @@ class KekuleBackend:
         self._rings_dirty = True  # flag to re-detect geometry rings
         self.auto_h_cap = True  # auto-adjust hydrogen caps when structure changes
         self.auto_recalc_bonds = False  # auto-recalculate bonds based on distance (DANGEROUS - can create spurious bonds)
+
+    @property
+    def a_CC(self):
+        return self.grid.a_CC
+
+    @a_CC.setter
+    def a_CC(self, value):
+        self.grid.a_CC = value
 
     # ── Properties for GUI compatibility ─────────────────────────────────────
 
@@ -238,7 +248,15 @@ class KekuleBackend:
         return a  # return Atom object; callers that need int index use graph.to_arrays()
 
     def _sync_sys(self):
-        """Rebuild self.sys arrays from graph for rendering/export. Called before any sys read."""
+        """Rebuild self.sys arrays from graph for rendering/export. Called before any sys read.
+        
+        Builds 4 mapping arrays for O(1) index↔ID conversion:
+          _atom_ids[i]      = Atom._id at dense index i        (dense→graph)
+          _atom_idx_map[id] = dense index for Atom._id         (graph→dense)
+          _bond_ids[i]      = Bond._id at dense index i        (dense→graph)
+          _bond_idx_map[id] = dense index for Bond._id         (graph→dense)
+        These are ephemeral — rebuilt on each export, not maintained during topology ops.
+        """
         atom_list, enames, apos, atypes, bonds, bond_list, ring_list = self.graph.to_arrays()
         self.sys.apos    = apos.astype(np.float64)
         self.sys.enames  = enames
@@ -246,6 +264,11 @@ class KekuleBackend:
         self.sys.natoms  = len(atom_list)
         self.sys.bonds   = bonds if len(bonds) else None
         self.sys.ngs     = None  # invalidate neighbor cache
+        # 4 mapping arrays: dense index ↔ stable _id (atoms and bonds)
+        self._atom_ids    = np.array([a._id for a in atom_list], dtype=np.int64)
+        self._atom_idx_map = {a._id: i for i, a in enumerate(atom_list)}
+        self._bond_ids    = np.array([b._id for b in bond_list], dtype=np.int64)
+        self._bond_idx_map = {b._id: i for i, b in enumerate(bond_list)}
         # Store bond_list and ring_list for picking/visualization
         self._bond_list = bond_list
         self._ring_list = ring_list
@@ -319,8 +342,8 @@ class KekuleBackend:
         key = (q, r)
         n2a = self.graph._pin_to_atom
         new_atoms = []
-        for node in honeycomb_ring_nodes(q, r, self.a_CC):
-            nk = snap_to_grid(node, self.a_CC)
+        for node in self.grid.ring_nodes(q, r):
+            nk = snap_to_grid(node)
             if nk not in n2a:
                 a = self.graph.add_atom(np.array([nk[0], nk[1], 0.0]),
                                         'C', elements.ELEMENT_DICT['C'][0],
@@ -330,9 +353,9 @@ class KekuleBackend:
         if new_atoms:
             # Create bonds between all ring atoms at proper C-C distance
             # This bonds new atoms to each other AND to existing ring atoms
-            all_ring_atoms = [n2a[snap_to_grid(node, self.a_CC)] 
-                             for node in honeycomb_ring_nodes(q, r, self.a_CC)
-                             if snap_to_grid(node, self.a_CC) in n2a]
+            all_ring_atoms = [n2a[snap_to_grid(node)]
+                             for node in self.grid.ring_nodes(q, r)
+                             if snap_to_grid(node) in n2a]
             self._create_bonds_for_ring_atoms(all_ring_atoms)
             self.graph.sync_neighbor_lists()  # Sync neighbors after bond creation
         self._rings_dirty = True
@@ -351,8 +374,8 @@ class KekuleBackend:
         key = (q, r)
         n2a = self.graph._pin_to_atom
         to_remove = []   # Atom objects
-        for node in honeycomb_ring_nodes(q, r, self.a_CC):
-            nk = snap_to_grid(node, self.a_CC)
+        for node in self.grid.ring_nodes(q, r):
+            nk = snap_to_grid(node)
             atom = n2a.get(nk)
             if atom is not None and atom not in to_remove:
                 if self.hex_mode == 'Hex2':
@@ -361,8 +384,8 @@ class KekuleBackend:
                     for other_q, other_r in self.hex_tiles:
                         if (other_q, other_r) == key:
                             continue
-                        for other_node in honeycomb_ring_nodes(other_q, other_r, self.a_CC):
-                            other_nk = snap_to_grid(other_node, self.a_CC)
+                        for other_node in self.grid.ring_nodes(other_q, other_r):
+                            other_nk = snap_to_grid(other_node)
                             if other_nk == nk:
                                 shared = True
                                 break
@@ -374,14 +397,11 @@ class KekuleBackend:
                     # Paint mode: remove all atoms
                     to_remove.append(atom)
         self.hex_tiles.discard(key)
-        # Remove atoms and their H children
+        # Soft-delete atoms and their H children
         for atom in to_remove:
             for h in self.graph.h_children(atom):
                 self.graph.remove_atom(h)
             self.graph.remove_atom(atom)
-        # Clean up dead bonds and sync (no recalc_bonds!)
-        self.graph.cleanup_invalid()
-        self.graph.sync_neighbor_lists()
         self._rings_dirty = True
         if self.auto_h_cap:
             self.adjust_h()
@@ -395,40 +415,15 @@ class KekuleBackend:
     
     def snap_to_ring(self, x, y):
         """Find the axial coordinates (q, r) of the hexagon whose center is closest to (x, y)."""
-        s3 = np.sqrt(3.0)
-        r_exact = y / (1.5 * self.a_CC)
-        q_exact = x / (s3 * self.a_CC) - r_exact * 0.5
-        return int(round(q_exact)), int(round(r_exact))
+        return self.grid.snap_to_ring(x, y)
 
     def snap_to_node(self, x, y, tol=0.2):
         """Find the rounded Cartesian coordinates (rx, ry) of the honeycomb node closest to (x, y)."""
-        # Find the nearest hexagon first
-        q, r = self.snap_to_ring(x, y)
-        
-        best_node = None
-        min_dist = float('inf')
-        # Check nodes of this hexagon and its 6 neighbors
-        for dq, dr in [(0,0), (1,0), (-1,0), (0,1), (0,-1), (1,-1), (-1,1)]:
-            nodes = honeycomb_ring_nodes(q+dq, r+dr, self.a_CC)
-            for node in nodes:
-                d = np.sqrt((node[0] - x)**2 + (node[1] - y)**2)
-                if d < min_dist:
-                    min_dist = d
-                    best_node = node
-        
-        if min_dist < tol:
-            return snap_to_grid(best_node, self.a_CC)
-        return None
+        return self.grid.snap_to_node(x, y, tol)
 
     def get_guide_points(self, qrange=(-10, 10), rrange=(-10, 10)):
         """Return all node positions in the specified range for UI guide dots."""
-        nodes = set()
-        for q in range(qrange[0], qrange[1] + 1):
-            for r in range(rrange[0], rrange[1] + 1):
-                ring_nodes = honeycomb_ring_nodes(q, r, self.a_CC)
-                for node in ring_nodes:
-                    nodes.add(snap_to_grid(node, self.a_CC))
-        return np.array(list(nodes))
+        return self.grid.get_guide_points(qrange, rrange)
 
     def set_atom_type(self, node_key, element):
         """Set or change the element at a pinned grid node. Adds new atom if node is empty."""
@@ -549,33 +544,86 @@ class KekuleBackend:
     def remove_atom(self, node_key):
         """Remove atom at snapped grid position node_key.
         
-        Also removes any H atoms attached to the removed heavy atom.
-        Does NOT call recalc_bonds() - just removes from graph and syncs.
+        Soft-deletes the atom and its H children. No compaction, no global sync.
         """
         n2a = self.graph._pin_to_atom
         a = n2a.get(node_key)
         if a is None:
             return
-        ia = self._atom_to_index(a)
-        self._rebuild_after_delete([ia])
-        # Clean up dead bonds and sync neighbor lists (no recalc_bonds!)
-        self.graph.cleanup_invalid()
-        self.graph.sync_neighbor_lists()
+        for h in self.graph.h_children(a):
+            self.graph.remove_atom(h)
+        self.graph.remove_atom(a)
         if self.auto_h_cap:
             self.adjust_h()
+        self._sync_sys()
+
+    def remove_atom_by_id(self, atom_id):
+        """Remove atom by stable Atom._id. O(1) soft-delete, no compaction.
+        
+        Soft-deletes the atom (flips alive=False) and its H children.
+        No cleanup_invalid(), no sync_neighbor_lists() — those are deferred.
+        Caller is responsible for calling _sync_sys() when done with topology ops.
+        """
+        a = self.graph.atoms.get(atom_id)
+        if a is None or not a.alive:
+            debug_print(1, f"remove_atom_by_id: Atom _id={atom_id} not found or dead")
+            return
+        for h in self.graph.h_children(a):
+            self.graph.remove_atom(h)
+        self.graph.remove_atom(a)
+        if self.auto_h_cap:
+            self.adjust_h()
+        self._sync_sys()
+
+    def remove_atoms_by_id(self, atom_ids):
+        """Remove multiple atoms by stable Atom._id. Pure soft-delete, no compaction.
+        
+        Collects all atoms (including H children) first, then soft-deletes each.
+        One _sync_sys() at the end. No index shifting issues.
+        """
+        atoms_to_remove = []
+        for aid in atom_ids:
+            a = self.graph.atoms.get(aid)
+            if a is None or not a.alive:
+                continue
+            atoms_to_remove.append(a)
+            for h in self.graph.h_children(a):
+                atoms_to_remove.append(h)
+        for a in atoms_to_remove:
+            self.graph.remove_atom(a)
+        if self.auto_h_cap:
+            self.adjust_h()
+        self._sync_sys()
+
+    def set_atom_type_by_id(self, atom_id, element):
+        """Set or change the element of atom by stable Atom._id."""
+        a = self.graph.atoms.get(atom_id)
+        if a is None or not a.alive:
+            return
+        a.ename = element
+        a.atype = elements.ELEMENT_DICT[element][0]
+        a.subtype = self._get_element_default_subtype(element)
+        if self.auto_h_cap:
+            self.adjust_h()
+        self._sync_sys()
+
+    def set_atom_subtype_by_id(self, atom_id, subtype):
+        """Set subtype of atom by stable Atom._id."""
+        a = self.graph.atoms.get(atom_id)
+        if a is None or not a.alive:
+            return
+        a.subtype = subtype
 
     def remove_atom_by_index(self, atom_idx):
         """Remove atom at specific index (independent of grid).
         
-        Also removes any H atoms attached to the removed heavy atom.
-        Does NOT call recalc_bonds() - just removes from graph and syncs.
+        DEPRECATED: Use remove_atom_by_id() for robust ID-based deletion.
+        Kept for backward compatibility.
         """
         self._rebuild_after_delete([atom_idx])
-        # Clean up dead bonds and sync neighbor lists (no recalc_bonds!)
-        self.graph.cleanup_invalid()
-        self.graph.sync_neighbor_lists()
         if self.auto_h_cap:
             self.adjust_h()
+        self._sync_sys()
 
     def insert_atom_into_bond(self, bond, new_ename='C'):
         """Insert a new atom into the middle of a bond, pushing original atoms aside.
@@ -640,11 +688,7 @@ class KekuleBackend:
         bond_bc = self.graph.add_bond(atom_b, new_atom)
         debug_print(1, f"  Created new bonds: {bond_ac._id} (A-C), {bond_bc._id} (B-C)")
         
-        # Cleanup dead objects
-        n_atoms, n_bonds, n_rings = self.graph.cleanup_invalid()
-        debug_print(1, f"  Cleanup removed: {n_atoms} atoms, {n_bonds} bonds, {n_rings} rings")
-        
-        # Sync neighbor lists from bonds (derived data)
+        # Sync neighbor lists (new bonds were created)
         self.graph.sync_neighbor_lists()
         
         # Sync sys from graph
@@ -753,11 +797,7 @@ class KekuleBackend:
         to_remove.alive = False
         debug_print(1, f"  Marked Atom({to_remove._id}) as dead")
         
-        # Cleanup dead objects
-        n_atoms, n_bonds, n_rings = self.graph.cleanup_invalid()
-        debug_print(1, f"  Cleanup removed: {n_atoms} atoms, {n_bonds} bonds, {n_rings} rings")
-        
-        # Sync neighbor lists from bonds (derived data)
+        # Sync neighbor lists (topology changed)
         self.graph.sync_neighbor_lists()
         
         # Sync sys from graph
@@ -771,12 +811,15 @@ class KekuleBackend:
         return survivor
 
     def remove_h_caps(self):
-        """Remove all H cap atoms from the graph (soft delete)."""
-        for h in [a for a in list(self.graph.atoms.values()) if a.subtype == 'H_cap']:
+        """Soft-delete all H cap atoms (flip alive=False). No compaction.
+        
+        Dead H caps stay in graph.atoms dict but are filtered by to_arrays().
+        cleanup_invalid() is deferred — called only when explicit compaction is needed.
+        """
+        for h in [a for a in list(self.graph.atoms.values()) if a.subtype == 'H_cap' and a.alive]:
             for b in h.bonds:
                 b.alive = False
             h.alive = False
-        self.graph.cleanup_invalid()
 
     def add_h_caps(self):
         """Add H caps to undercoordinated heavy atoms based on current topology."""
@@ -794,8 +837,9 @@ class KekuleBackend:
             npi = self._get_npi_from_subtype(a.subtype)
             target = self._target_sigma(a.ename, npi)
             
-            # Count heavy atom neighbors (excluding H caps) using graph.neighbors
-            heavy_neighbors = [n for n in a.neighbors if n.subtype != 'H_cap']
+            # Count heavy atom neighbors (excluding H caps and dead atoms)
+            # n.alive filter handles stale neighbor lists after soft-delete — no sync needed
+            heavy_neighbors = [n for n in a.neighbors if n.alive and n.subtype != 'H_cap']
             current = len(heavy_neighbors)
             n_missing = target - current
             
@@ -817,7 +861,7 @@ class KekuleBackend:
                                             pin=None, parent=a, subtype='H_cap')
                 self.graph.add_bond(a, h_atom)  # Explicit bond between heavy atom and H
                 added_h_atoms.append(h_atom)
-                debug_print(1, f"  Added H cap to Atom({a._id}) at {h_pos[:2]}")
+                debug_print(3, f"  Added H cap to Atom({a._id}) at {h_pos[:2]}")
         
         # Sync neighbor lists to include new H atoms
         self.graph.sync_neighbor_lists()
@@ -961,6 +1005,18 @@ class KekuleBackend:
         for a in self.graph.atoms.values():
             if a.pin is not None:
                 a.pos[0] = a.pin[0]; a.pos[1] = a.pin[1]; a.pos[2] = 0.0
+
+    def reassign_pins(self):
+        """Rebuild pin cache by snapping all alive heavy atoms to current grid.
+        Call after grid transform changes. Atoms not near any grid node get pin=None."""
+        pin_map = {}
+        for a in self.graph.atoms.values():
+            if not a.alive or a.ename in ('H', 'E') or a.subtype == 'H_cap':
+                pin_map[a] = None
+                continue
+            nk = self.grid.snap_to_node(a.pos[0], a.pos[1], tol=0.3)
+            pin_map[a] = nk
+        self.graph.rebuild_pin_cache(pin_map)
     
     def build_system(self):
         """Return the persistent AtomicSystem (sys is now the authoritative state)."""
@@ -1041,19 +1097,19 @@ class KekuleBackend:
                 f.write(f"{ename} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}\n")
 
     def load_xyz(self, fname):
-        """Load a system from an XYZ file and map it back to the grid."""
+        """Load a system from an XYZ file. Atoms placed at actual positions, pins assigned optionally."""
         self.graph = AtomicGraph()   # full reset
         from spammm import atomicUtils as au
         apos, Zs, es, qs, comment = au.load_xyz(fname)
-        # Add heavy atoms snapped to grid
+        # Add heavy atoms at actual XYZ positions; assign pin if close to a grid node
         for i, e in enumerate(es):
             if e in ('H', 'E'): continue
-            nk = snap_to_grid(apos[i], self.a_CC)
-            if nk not in self.graph._pin_to_atom:
-                self.graph.add_atom(np.array([nk[0], nk[1], 0.0]),
-                                    e, elements.ELEMENT_DICT[e][0],
-                                    pin=nk, parent=None,
-                                    subtype=self._get_element_default_subtype(e))
+            pos = apos[i]
+            nk = self.grid.snap_to_node(pos[0], pos[1], tol=0.3)
+            self.graph.add_atom(np.array([pos[0], pos[1], pos[2] if len(pos) > 2 else 0.0]),
+                                e, elements.ELEMENT_DICT[e][0],
+                                pin=nk, parent=None,
+                                subtype=self._get_element_default_subtype(e))
         # Create bonds for all heavy atoms (no recalc_bonds!)
         heavy_atoms = [a for a in self.graph.atoms.values() if a.alive and a.ename not in ('H', 'E')]
         for a in heavy_atoms:
@@ -1075,16 +1131,17 @@ class KekuleBackend:
                                     pin=None, parent=best_a, subtype='H_cap')
         # Sync after loading H atoms (bonds already created above)
         self.graph.sync_neighbor_lists()
+        self._sync_sys()
 
     def _guess_rings(self):
-        """Heuristic: infer ring axial coords from heavy atom grid positions."""
+        """Heuristic: infer ring axial coords from heavy atom positions via grid."""
         n2a = self.graph._pin_to_atom
         for q in range(-20, 21):
             for r in range(-20, 21):
-                ring_nodes = honeycomb_ring_nodes(q, r, self.a_CC)
-                ring_atom_objs = [n2a[snap_to_grid(nd, self.a_CC)]
+                ring_nodes = self.grid.ring_nodes(q, r)
+                ring_atom_objs = [n2a[snap_to_grid(nd)]
                                   for nd in ring_nodes
-                                  if snap_to_grid(nd, self.a_CC) in n2a]
+                                  if snap_to_grid(nd) in n2a]
                 if len(ring_atom_objs) == 6:
                     ring_bonds = []
                     for i in range(6):

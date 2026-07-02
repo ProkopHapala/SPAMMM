@@ -21,7 +21,7 @@ import os
 import numpy as np
 from PyQt5 import QtWidgets, QtCore
 from spammm.GUI.CollapsibleSection import CollapsibleSection
-from spammm.ExtensionManager import UIComponents
+from spammm.GUI.ExtensionManager import UIComponents
 
 
 # ============================================================

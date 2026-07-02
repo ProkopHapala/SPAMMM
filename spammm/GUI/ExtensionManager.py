@@ -78,17 +78,17 @@ EXTENSION_REGISTRY = {
         build_ui='build_fireball_ui',
     ),
     'dftb': dict(
-        module='spammm.dftb_utils', class_name=None,
+        module='spammm.quantum.DFTB_utils', class_name=None,
         dependencies=[], req_paths=[],
         build_ui='build_dftb_ui',
     ),
     'afm': dict(
-        module='spammm.AFMExtension', class_name=None,
+        module='spammm.GUI.AFMExtension', class_name=None,
         dependencies=['pyopencl'], req_paths=[],
         build_ui='build_ui',
     ),
     'spff': dict(
-        module='spammm.SPFF', class_name=None,
+        module='spammm.forcefields.SPFF', class_name=None,
         dependencies=[], req_paths=[],
         build_ui='build_ui',
     ),
@@ -103,12 +103,12 @@ EXTENSION_REGISTRY = {
         build_ui='build_ui',
     ),
     'pyscf': dict(
-        module='spammm.pyscf_utils', class_name=None,
+        module='spammm.quantum.pySCF_utils', class_name=None,
         dependencies=['pyscf'], req_paths=[],
         build_ui='build_ui',
     ),
     'moldyn': dict(
-        module='spammm.OCL.MolecularDynamics', class_name='MolecularDynamics',
+        module='spammm.forcefields.MolecularDynamics', class_name='MolecularDynamics',
         dependencies=['pyopencl'], req_paths=[],
         build_ui='build_ui',
     ),

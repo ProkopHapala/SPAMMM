@@ -30,14 +30,14 @@ CODE STYLE POLICIES:
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 from spammm.GUI.BaseGUI import BaseGUI
-from spammm.VispyUtils import AtomScene
-from spammm.KekuleBackend import KekuleBackend
-import spammm.KekuleBackend as KB
+from spammm.GUI.VispyUtils import AtomScene
+from spammm.topology.KekuleBackend import KekuleBackend
+import spammm.topology.KekuleBackend as KB
 from spammm import atomicUtils as au
 from vispy import scene
 
@@ -54,35 +54,43 @@ def debug_print(level, message):
     if VERBOSITY_LEVEL >= level:
         print(message)
 
-from spammm import VispyUtils as vu
+from spammm.GUI import VispyUtils as vu
 from spammm import elements
 from spammm import atomicUtils as au
 from spammm import elements
 from spammm.GUI.BaseGUI import BaseGUI
-from spammm.VispyUtils import compute_bond_colors_by_length, generate_atom_labels
+from spammm.GUI.VispyUtils import compute_bond_colors_by_length, generate_atom_labels
 
-from spammm.ExtensionManager import ExtensionManager, ExtensionNotAvailableError
+from spammm.GUI.ExtensionManager import ExtensionManager, ExtensionNotAvailableError
 from spammm.GUI.CollapsibleSection import CollapsibleSection
 
 class KekuleExplorerWindow(BaseGUI):
     sig_geometry_changed = QtCore.pyqtSignal()  # Emitted whenever atom geometry changes
 
-    def __init__(self):
+    def __init__(self, output_dir=None, fdata_path=None, verbosity=None):
         super().__init__("Kekule Structure Explorer")
         self.resize(1024, 768)
 
         self.extensions = ExtensionManager()
         self.backend = KekuleBackend()
         self.cur_atom_type = 'C'
-        self.edit_mode = 'Hex1'  # 'Hex1' (paint), 'Hex2' (toggle), 'Atom', 'pi', 'Select'
-        self.last_clicked_node = None
+        self.edit_mode = 'Hex1'  # 'Hex1' (paint), 'Hex2' (toggle), 'Atom', 'Bond', 'pi', 'Select'
         self.label_mode = 'Element+Index'
-        self.grid_mode = True  # True: snap to grid, False: free placement
-        self.pick_radius = 0.2  # Distance in Angstroms for atom picking
+        self.pick_radius = 0.5  # Distance in Angstroms for atom picking (matches spinbox default)
+
+        # Output directory for saved images (screenshots, plots)
+        _repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.output_dir = output_dir or os.path.join(_repo_root, 'output')
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # Override global verbosity if specified
+        global VERBOSITY_LEVEL
+        if verbosity is not None:
+            VERBOSITY_LEVEL = verbosity
 
         # Load settings
         self.settings = QtCore.QSettings("FireCore", "KekuleExplorer")
-        self.fdata_path = self.settings.value("fdata_path", "/home/prokop/Fireball/Fdata_HCNOS")
+        self.fdata_path = fdata_path or self.settings.value("fdata_path", "/home/prokop/Fireball/Fdata_HCNOS")
         # Sync fdata_path into ExtensionManager config so FireCore/Grid can find it
         self.extensions.set_config('firecore', 'fdata_dir', self.fdata_path)
         self.initUI()
@@ -95,6 +103,7 @@ class KekuleExplorerWindow(BaseGUI):
     def initUI(self):
         # --- Central Widget (Vispy Scene) ---
         self.scene = vu.AtomScene(bgcolor=(0.95, 0.95, 0.95), backend=self.backend)
+        self.scene.pick_radius = self.pick_radius
         
         # Link axes to view
         self.scene.view.parent = None # Re-parent from central_widget to grid
@@ -134,6 +143,7 @@ class KekuleExplorerWindow(BaseGUI):
         
         # Add sections
         side_layout.addWidget(self.create_editors_section())
+        side_layout.addWidget(self.create_grid_section())
         side_layout.addWidget(self.create_ribbon_section())
         self._build_extension_panels(side_layout)
         side_layout.addStretch()
@@ -219,7 +229,7 @@ class KekuleExplorerWindow(BaseGUI):
             act_save = menu.addAction('Save Screenshot...')
             action = menu.exec_(canvas.mapToGlobal(pos))
             if action is act_save:
-                start_dir = os.getcwd()
+                start_dir = getattr(self, 'output_dir', os.getcwd())
                 if hasattr(self, 'settings'):
                     try:
                         start_dir = str(self.settings.value('last_screenshot_dir', start_dir))
@@ -260,17 +270,14 @@ class KekuleExplorerWindow(BaseGUI):
         self.auto_bonds_btn.setChecked(self.backend.auto_recalc_bonds)
         layout.addLayout(row)
 
-        # Grid mode and pick radius
+        # Pick radius (kept in main editors section)
         row_grid = QtWidgets.QHBoxLayout()
-        self.grid_mode_btn = self.button("Grid", self.toggle_grid_mode, layout=row_grid)
-        self.grid_mode_btn.setCheckable(True)
-        self.grid_mode_btn.setChecked(self.grid_mode)
         self.label("Pick Radius:", layout=row_grid)
         self.pick_radius_spinbox = self.spinBox(0.5, 0.1, max_width=60, vmin=0.1, vmax=5.0)
         self.pick_radius_spinbox.valueChanged.connect(self.set_pick_radius)
         row_grid.addWidget(self.pick_radius_spinbox)
         layout.addLayout(row_grid)
-        
+
         # Editor buttons (from Editor)
         row1 = QtWidgets.QHBoxLayout()
         self.button("Snap", self.reset_offsets, layout=row1)
@@ -306,6 +313,53 @@ class KekuleExplorerWindow(BaseGUI):
         
         # Wrap in CollapsibleSection
         sec = CollapsibleSection("Editors", collapsed=False, parent=self)
+        sec.setContent(widget)
+        return sec
+
+    def create_grid_section(self):
+        """Grid transform controls in a compact collapsible panel."""
+        layout = QtWidgets.QVBoxLayout()
+        layout.setSpacing(2)
+
+        # Row 1: a_CC (lattice constant) | Transpose toggle
+        row1 = QtWidgets.QHBoxLayout()
+        self.label("a_CC:", layout=row1)
+        self.a_CC_spin = self.spinBox(1.42, 0.01, max_width=55, vmin=0.5, vmax=5.0, decimals=3)
+        self.a_CC_spin.valueChanged.connect(self.set_a_CC)
+        row1.addWidget(self.a_CC_spin)
+        self.grid_transpose_btn = self.button("Transpose", self.transpose_grid, layout=row1)
+        self.grid_transpose_btn.setCheckable(True)
+        self.grid_transpose_btn.setChecked(self.backend.grid.transpose)
+        layout.addLayout(row1)
+
+        # Row 2: Rotate° | Offset unit checkbox
+        row2 = QtWidgets.QHBoxLayout()
+        self.label("Rot°:", layout=row2)
+        self.grid_rotate_spin = self.spinBox(0.0, 1.0, max_width=55, vmin=-180.0, vmax=180.0, decimals=1)
+        self.grid_rotate_spin.valueChanged.connect(self.set_grid_rotation)
+        row2.addWidget(self.grid_rotate_spin)
+        self.grid_offset_unit_chk = self.checkBox("grid units", checked=True, callback=self.toggle_offset_unit, layout=row2)
+        layout.addLayout(row2)
+
+        # Row 3: Offset X, Y (step depends on unit mode)
+        row3 = QtWidgets.QHBoxLayout()
+        self.label("Off:", layout=row3)
+        self.grid_offset_x_spin = self.spinBox(0.0, 1.0, max_width=50, vmin=-20.0, vmax=20.0, decimals=3)
+        self.grid_offset_x_spin.valueChanged.connect(self.set_grid_offset_x)
+        row3.addWidget(self.grid_offset_x_spin)
+        self.grid_offset_y_spin = self.spinBox(0.0, 1.0, max_width=50, vmin=-20.0, vmax=20.0, decimals=3)
+        self.grid_offset_y_spin.valueChanged.connect(self.set_grid_offset_y)
+        row3.addWidget(self.grid_offset_y_spin)
+        layout.addLayout(row3)
+
+        # Row 4: Reset
+        row4 = QtWidgets.QHBoxLayout()
+        self.button("Reset Grid", self.reset_grid_transform, layout=row4)
+        layout.addLayout(row4)
+
+        widget = QtWidgets.QWidget()
+        widget.setLayout(layout)
+        sec = CollapsibleSection("Grid Transform", collapsed=True, parent=self)
         sec.setContent(widget)
         return sec
 
@@ -624,12 +678,68 @@ class KekuleExplorerWindow(BaseGUI):
         self.backend.auto_recalc_bonds = self.auto_bonds_btn.isChecked()
         debug_print(2, f"Auto Recalc Bonds: {self.backend.auto_recalc_bonds}")
 
-    def toggle_grid_mode(self):
-        self.grid_mode = self.grid_mode_btn.isChecked()
-        debug_print(2, f"Grid Mode: {self.grid_mode}")
+    def set_a_CC(self, value):
+        self.backend.grid.a_CC = value
+        self.backend.reassign_pins()
+        self.refresh_view()
+        debug_print(2, f"a_CC = {value}")
+
+    def transpose_grid(self):
+        self.backend.grid.toggle_transpose()
+        self.grid_transpose_btn.setChecked(self.backend.grid.transpose)
+        self.backend.reassign_pins()
+        self.refresh_view()
+        debug_print(2, f"Grid transpose: {self.backend.grid.transpose}")
+
+    def set_grid_rotation(self, degrees):
+        self.backend.grid.set_rotation(np.radians(degrees))
+        self.backend.reassign_pins()
+        self.refresh_view()
+        debug_print(2, f"Grid rotation: {degrees}°")
+
+    def toggle_offset_unit(self):
+        grid_units = self.grid_offset_unit_chk.isChecked()
+        a = self.backend.grid.a_CC
+        if grid_units:
+            self.grid_offset_x_spin.setSingleStep(1.0)
+            self.grid_offset_y_spin.setSingleStep(1.0)
+        else:
+            self.grid_offset_x_spin.setSingleStep(0.1)
+            self.grid_offset_y_spin.setSingleStep(0.1)
+        debug_print(2, f"Offset unit: {'grid' if grid_units else 'Å'}")
+
+    def _offset_to_angstrom(self, value):
+        """Convert spinbox value to Å based on unit checkbox."""
+        if self.grid_offset_unit_chk.isChecked():
+            a = self.backend.grid.a_CC
+            s3 = np.sqrt(3.0)
+            return value * s3 * a  # grid vector along x = sqrt(3)*a_CC
+        return value
+
+    def set_grid_offset_x(self, value):
+        self.backend.grid.set_offset(self._offset_to_angstrom(value), self.backend.grid.offset[1])
+        self.backend.reassign_pins()
+        self.refresh_view()
+
+    def set_grid_offset_y(self, value):
+        self.backend.grid.set_offset(self.backend.grid.offset[0], self._offset_to_angstrom(value))
+        self.backend.reassign_pins()
+        self.refresh_view()
+
+    def reset_grid_transform(self):
+        self.backend.grid.reset_transform()
+        self.backend.reassign_pins()
+        self.grid_rotate_spin.setValue(0.0)
+        self.grid_offset_x_spin.setValue(0.0)
+        self.grid_offset_y_spin.setValue(0.0)
+        self.grid_transpose_btn.setChecked(False)
+        self.a_CC_spin.setValue(1.42)
+        self.refresh_view()
+        debug_print(2, "Grid transform reset")
 
     def set_pick_radius(self, value):
         self.pick_radius = value
+        self.scene.pick_radius = value
         debug_print(2, f"Pick Radius: {self.pick_radius}")
 
     def find_nearest_atom_index(self, pos, radius):
@@ -642,6 +752,15 @@ class KekuleExplorerWindow(BaseGUI):
         if distances[min_idx] <= radius:
             return min_idx
         return None
+
+    def find_nearest_atom_id(self, pos, radius):
+        """Find Atom._id of nearest atom within radius of pos. O(1) via _atom_ids."""
+        idx = self.find_nearest_atom_index(pos, radius)
+        if idx is None:
+            return None
+        if hasattr(self.backend, '_atom_ids') and self.backend._atom_ids is not None:
+            return int(self.backend._atom_ids[idx])
+        return idx  # fallback to index if _atom_ids not available
 
     def set_label_mode(self, mode):
         """Set label display mode."""
@@ -674,7 +793,7 @@ class KekuleExplorerWindow(BaseGUI):
 
     def on_key_press(self, event):
         """Handle keyboard shortcuts."""
-        selected = self.scene.get_selected_indices()
+        selected = self.scene.get_selected_ids()
         if not selected:
             return
 
@@ -692,30 +811,30 @@ class KekuleExplorerWindow(BaseGUI):
             self.paste_copied_atoms()
 
     def delete_selected_atoms(self):
-        """Delete currently selected atoms."""
-        selected = list(self.scene.get_selected_indices())
-        if not selected:
+        """Delete currently selected atoms by Atom._id."""
+        ids = list(self.scene.get_selected_ids())
+        if not ids:
             return
-        # Sort in descending order to avoid index issues
-        selected.sort(reverse=True)
-        for idx in selected:
-            self.backend._rebuild_after_delete([idx])
-        # Clean up dead bonds and sync (no recalc_bonds!)
-        self.backend.graph.cleanup_invalid()
-        self.backend.graph.sync_neighbor_lists()
+        self.backend.remove_atoms_by_id(ids)
         self.scene.clear_selection()
         self.refresh_view()
-        debug_print(2, f"Deleted {len(selected)} atoms")
+        debug_print(2, f"Deleted {len(ids)} atoms")
 
     def copy_selected_atoms(self):
         """Copy currently selected atoms to clipboard."""
-        selected = list(self.scene.get_selected_indices())
-        if not selected:
+        ids = list(self.scene.get_selected_ids())
+        if not ids:
             return
-        enames = [self.backend.sys.enames[i] for i in selected]
-        apos = [self.backend.sys.apos[i].copy() for i in selected]
+        # Map IDs to current sys indices for array access
+        enames = []
+        apos = []
+        for aid in ids:
+            idx = self.scene._id_to_idx_safe(aid)
+            if idx >= 0:
+                enames.append(self.backend.sys.enames[idx])
+                apos.append(self.backend.sys.apos[idx].copy())
         self.copied_atoms = (enames, apos)
-        debug_print(2, f"Copied {len(selected)} atoms")
+        debug_print(2, f"Copied {len(ids)} atoms")
 
     def paste_copied_atoms(self):
         """Paste copied atoms at original position (duplicate in place)."""
@@ -723,31 +842,26 @@ class KekuleExplorerWindow(BaseGUI):
             debug_print(2, "No atoms copied")
             return
         enames, apos_orig = self.copied_atoms
-        # Track indices of newly added atoms
-        new_indices = []
-        # Add atoms at original positions using _append_atom to avoid adjust_h()
+        new_atom_ids = []
         new_atoms = []
         for ename, pos in zip(enames, apos_orig):
             a = self.backend._append_atom(pos=list(pos.copy()), ename=ename, pin=None,parent=None,subtype=f"{ename}_sp2"  )
-            new_indices.append(a._id if hasattr(a, '_id') else a)
+            new_atom_ids.append(a._id)
             new_atoms.append(a)
-        # Create bonds for new atoms (no recalc_bonds!)
         for a in new_atoms:
             self.backend._create_bond_to_nearest_heavy(a)
         self.backend.graph.sync_neighbor_lists()
-        # Don't call adjust_h() - it adds H atoms and shifts indices
-        # Refresh view first to update scene arrays
         self.refresh_view()
-        # Select the newly pasted atoms
-        self.scene.set_selected_indices(new_indices)
+        # Select the newly pasted atoms by ID
+        self.scene.set_selected_ids(new_atom_ids)
         debug_print(2, f"Pasted {len(enames)} atoms at original positions")
 
-    def on_drag_state(self, state, idx, pos):
+    def on_drag_state(self, state, atom_id, pos):
         """Handle drag state changes from scene.
         
         Args:
             state: 1 = drag start, 0 = drag end
-            idx: atom index being dragged
+            atom_id: Atom._id being dragged
             pos: position of dragged atom
         
         On drag end (state=0), sync scene positions back to AtomicGraph (authoritative)
@@ -836,12 +950,12 @@ class KekuleExplorerWindow(BaseGUI):
 
             # Highlight hexagon under mouse if in hex mode
             if self.edit_mode in ('Hex1', 'Hex2') and hasattr(self.backend, 'snap_to_ring'):
-                from spammm.KekuleBackend import honeycomb_ring_nodes, snap_to_grid
+                from spammm.topology.HexGrid import snap_to_grid
                 q, r = self.backend.snap_to_ring(p_world[0], p_world[1])
-                ring_nodes = honeycomb_ring_nodes(q, r, self.backend.a_CC)
+                ring_nodes = self.backend.grid.ring_nodes(q, r)
                 hover_pos = []
                 for node in ring_nodes:
-                    nk = snap_to_grid(node, self.backend.a_CC)
+                    nk = snap_to_grid(node)
                     hover_pos.append([nk[0], nk[1], -0.08])
                 if hover_pos:
                     self.hover_markers.set_data(
@@ -854,12 +968,12 @@ class KekuleExplorerWindow(BaseGUI):
             else:
                 self.hover_markers.visible = False
 
-    def on_atom_remove(self, idx):
-        """Remove atom at index and refresh view. Only in Atom/pi/Select modes."""
+    def on_atom_remove(self, atom_id):
+        """Remove atom by Atom._id and refresh view. Only in Atom/pi/Select modes."""
         if self.edit_mode in ('Hex1', 'Hex2', 'Bond'):
             return   # In Hex/Bond modes, RMB is handled by handle_click (hex removal / bond collapse)
-        # Remove atom directly by index (grid-independent)
-        self.backend.remove_atom_by_index(idx)
+        debug_print(2, f"[RMB_REMOVE] atom_id={atom_id}")
+        self.backend.remove_atom_by_id(atom_id)
         self.refresh_view()
         self.sig_geometry_changed.emit()
 
@@ -874,16 +988,17 @@ class KekuleExplorerWindow(BaseGUI):
             pass
         else:
             # For non-ring modes, if atoms are selected and LMB, let Vispy handle dragging
-            selected = self.scene.get_selected_indices()
+            selected = self.scene.get_selected_ids()
             if selected and event.button == 1:
                 return
 
         # If atom picked and LMB in atom/pi mode, handle atom change instead of drag
         picked = self.scene._pick_idx
+        picked_id = self.scene._pick_id
         if picked >= 0 and event.button == 1:
             if self.edit_mode == 'Atom':
-                # Change atom type directly by index (grid-independent)
-                self.backend.set_atom_type_by_index(picked, self.cur_atom_type)
+                # Change atom type by Atom._id
+                self.backend.set_atom_type_by_id(picked_id, self.cur_atom_type)
                 self.refresh_view()
                 return
             elif self.edit_mode == 'pi':
@@ -893,7 +1008,7 @@ class KekuleExplorerWindow(BaseGUI):
                 new_npi = (current_npi + 1) % 3
                 e = self.backend.sys.enames[picked]
                 sp_map = {0: 'sp3', 1: 'sp2', 2: 'sp'}
-                self.backend.set_atom_subtype_by_index(picked, f"{e}_{sp_map.get(new_npi, 'sp2')}")
+                self.backend.set_atom_subtype_by_id(picked_id, f"{e}_{sp_map.get(new_npi, 'sp2')}")
                 if self.backend.auto_h_cap:
                     self.backend.adjust_h()
                 self.refresh_view()
@@ -970,42 +1085,24 @@ class KekuleExplorerWindow(BaseGUI):
         x, y = p_world[0], p_world[1]
         pos_2d = np.array([x, y])
 
-        # 2. For Hex modes, always use grid snapping
+        # 2. Mode-specific target resolution
         if self.edit_mode in ('Hex1', 'Hex2'):
+            # Hex modes: use grid snapping for ring placement
             q, r = self.backend.snap_to_ring(x, y)
-            node_key = None
             nearest_atom_idx = None
+            nearest_atom_id = None
         elif self.edit_mode == 'Bond':
             # Bond mode: pick bond
             bond = self.backend.pick_bond(p_world)
-            node_key = None
-            q, r = (None, None)
             nearest_atom_idx = None
+            nearest_atom_id = None
+            q, r = (None, None)
         else:
-            # For Atom/pi modes, check if we're near an existing atom first
+            # Atom/pi/Select modes: position-based atom picking, no grid snapping
             nearest_atom_idx = self.find_nearest_atom_index(p_world, self.pick_radius)
-            
-            if nearest_atom_idx is not None:
-                # Found atom within pick radius - use it directly
-                node_key = None
-                q, r = (None, None)
-                debug_print(2, f"Click at ({x:.2f}, {y:.2f}) -> Found atom {nearest_atom_idx} within radius {self.pick_radius}")
-            elif self.grid_mode:
-                # Grid mode: snap to grid
-                node_key = self.backend.snap_to_node(x, y)
-                q, r = (None, None)
-                debug_print(2, f"Click at ({x:.2f}, {y:.2f}) -> Grid mode, snapped to node {node_key}")
-            else:
-                # Free mode: use exact position, never snap to grid
-                node_key = None
-                q, r = (None, None)
-                debug_print(2, f"Click at ({x:.2f}, {y:.2f}) -> Free mode, exact position")
-        
-        debug_print(2, f"Click at ({x:.2f}, {y:.2f}) -> Mode={self.edit_mode} Grid={self.grid_mode} Ring={(q,r)} Node={node_key} AtomIdx={nearest_atom_idx} | Action: {action}")
-
-        # Track last clicked node for pi mode
-        if node_key:
-            self.last_clicked_node = node_key
+            nearest_atom_id = self.find_nearest_atom_id(p_world, self.pick_radius)
+            q, r = (None, None)
+            debug_print(2, f"Click at ({x:.2f}, {y:.2f}) -> Mode={self.edit_mode} AtomIdx={nearest_atom_idx} | Action: {action}")
 
         # 3. Modify backend
         if action == 'add':
@@ -1014,7 +1111,6 @@ class KekuleExplorerWindow(BaseGUI):
                     self.backend.add_ring(q, r)
             elif self.edit_mode == 'Bond':
                 if bond is not None:
-                    # Pass Bond object directly (not index!)
                     new_atom = self.backend.insert_atom_into_bond(bond, self.cur_atom_type)
                     debug_print(2, f"Inserted atom into bond {bond._id}, new atom {new_atom._id}")
             elif self.edit_mode == 'pi':
@@ -1025,43 +1121,17 @@ class KekuleExplorerWindow(BaseGUI):
                     new_npi = (current_npi + 1) % 3
                     e = self.backend.sys.enames[nearest_atom_idx]
                     sp_map = {0: 'sp3', 1: 'sp2', 2: 'sp'}
-                    self.backend.set_atom_subtype_by_index(nearest_atom_idx, f"{e}_{sp_map.get(new_npi, 'sp2')}")
+                    self.backend.set_atom_subtype_by_id(nearest_atom_id, f"{e}_{sp_map.get(new_npi, 'sp2')}")
                     if self.backend.auto_h_cap:
                         self.backend.adjust_h()
                     self.refresh_view()
                     return
-                elif node_key:
-                    ia = self.backend._build_node_to_atom().get(node_key)
-                    if ia is not None:
-                        subtype = self.backend.atom_subtype[ia]
-                        current_npi = self.backend._get_npi_from_subtype(subtype)
-                        new_npi = (current_npi + 1) % 3
-                        self.backend.set_atom_valency(node_key, new_npi)
-                        debug_print(2, f"Set atom {node_key} to npi={new_npi}")
             elif nearest_atom_idx is not None:
-                # Change atom type directly by index (free mode or near atom)
-                self.backend.set_atom_type_by_index(nearest_atom_idx, self.cur_atom_type)
-            elif node_key:
-                # Grid mode: use grid node
-                debug_print(2, f"DEBUG: Setting node {node_key} to {self.cur_atom_type}")
-                self.backend.set_atom_type(node_key, self.cur_atom_type)
-            elif self.grid_mode:
-                # Grid mode but too far from any grid node - add at exact position
-                debug_print(2, f"Grid mode: No grid node found, adding atom at exact position")
+                # Change atom type by Atom._id
+                self.backend.set_atom_type_by_id(nearest_atom_id, self.cur_atom_type)
+            else:
+                # Free placement at exact position
                 self.backend._append_atom(pos=[x, y, 0.0], ename=self.cur_atom_type, pin=None, parent=None, subtype=self.backend._get_element_default_subtype(self.cur_atom_type))
-                # Create bond to nearest heavy atom
-                atom_list, *_ = self.backend.graph.to_arrays()
-                if atom_list:
-                    new_atom = atom_list[-1]
-                    self.backend._create_bond_to_nearest_heavy(new_atom)
-                    self.backend.graph.sync_neighbor_lists()
-                if self.backend.auto_h_cap:
-                    self.backend.adjust_h()
-                self.backend._sync_sys()
-            elif not self.grid_mode:
-                # Free mode: add atom at exact position
-                self.backend._append_atom(pos=[x, y, 0.0], ename=self.cur_atom_type, pin=None, parent=None, subtype=self.backend._get_element_default_subtype(self.cur_atom_type))
-                # Create bond to nearest heavy atom
                 atom_list, *_ = self.backend.graph.to_arrays()
                 if atom_list:
                     new_atom = atom_list[-1]
@@ -1076,25 +1146,13 @@ class KekuleExplorerWindow(BaseGUI):
                     self.backend.remove_ring(q, r)
             elif self.edit_mode == 'Bond':
                 if bond is not None:
-                    # Pass Bond object directly (not index!)
                     survivor = self.backend.collapse_bond(bond, np.array([x, y]))
                     debug_print(2, f"Collapsed bond {bond._id}, survivor atom {survivor._id}")
             elif nearest_atom_idx is not None:
-                # Remove atom directly by index (free mode or near atom)
-                self.backend.remove_atom_by_index(nearest_atom_idx)
-            elif node_key:
-                # Grid mode: use grid node
-                self.backend.remove_atom(node_key)
+                self.backend.remove_atom_by_id(nearest_atom_id)
         elif action == 'toggle_h':
             if nearest_atom_idx is not None:
-                # Toggle H on nearest atom
-                nk = self.backend.atom_pin[nearest_atom_idx] if nearest_atom_idx < len(self.backend.atom_pin) else None
-                if nk:
-                    self.backend.toggle_h_state(nk)
-            else:
-                nk = self.backend.snap_to_node(x, y)
-                if nk:
-                    self.backend.toggle_h_state(nk)
+                self.backend.toggle_h_state(nearest_atom_idx)
         
         self.refresh_view()
         self.sig_geometry_changed.emit()
@@ -1422,7 +1480,14 @@ class KekuleExplorerWindow(BaseGUI):
             QtWidgets.QMessageBox.information(self, "Settings Saved", f"Fdata path set to:\n{selected}")
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description='SPAMMM GUI — Molecular editor and AFM simulation')
+    parser.add_argument('--output-dir', '-o', type=str, default=None, help='Directory for saved images (default: <repo>/output)')
+    parser.add_argument('--fdata-path', '-f', type=str, default=None, help='Path to Fdata directory')
+    parser.add_argument('--verbosity', '-v', type=int, default=None, choices=[0, 1, 2, 3], help='Verbosity level 0-3 (default: 2)')
+    args = parser.parse_args()
+
     app = QtWidgets.QApplication(sys.argv)
-    window = KekuleExplorerWindow()
+    window = KekuleExplorerWindow(output_dir=args.output_dir, fdata_path=args.fdata_path, verbosity=args.verbosity)
     window.show()
     sys.exit(app.exec_())

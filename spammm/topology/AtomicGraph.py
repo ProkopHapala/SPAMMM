@@ -124,7 +124,32 @@ class AtomicGraph:
         self.atoms  = {}    # id -> Atom
         self.bonds  = {}    # id -> Bond
         self.rings  = {}    # id -> Ring
-        self._pin_to_atom = {}   # (rx,ry) -> Atom  — kept in sync with every add/remove
+        self._pin_to_atom = {}   # (rx,ry) -> Atom  — rebuildable cache, not primary index
+
+    # ── Pin cache management ─────────────────────────────────────────────────
+
+    def invalidate_pin_cache(self):
+        """Clear all pins and the pin→atom cache. Call when grid transform changes."""
+        for a in self.atoms.values():
+            if a.alive:
+                a.pin = None
+        self._pin_to_atom.clear()
+
+    def rebuild_pin_cache(self, pin_map):
+        """Rebuild pin cache from a {Atom: pin_key} mapping. Overwrites all pins.
+        Args:
+            pin_map: dict {Atom: (rx, ry)} or None entries (None = no pin for that atom)
+        """
+        self._pin_to_atom.clear()
+        for a, pin in pin_map.items():
+            a.pin = pin
+            if pin is not None:
+                self._pin_to_atom[pin] = a
+
+    def ensure_pin_cache(self):
+        """No-op: cache is maintained in real-time by add_atom/remove_atom.
+        Kept for API symmetry with future lazy-cache designs."""
+        pass
 
     # ── Atom operations ──────────────────────────────────────────────────────
 
