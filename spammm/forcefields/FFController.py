@@ -1,5 +1,5 @@
 """
-RelaxationController.py — Pure logic orchestrator for molecular relaxation.
+FFController.py — Pure logic orchestrator for forcefield-based relaxation and MD.
 
 Purpose: Bridge AtomicSystem → forcefield build → GPU relaxation → positions/forces download.
 No Qt dependencies — pure Python/NumPy/OpenCL. The GUI extension layer calls this.
@@ -13,13 +13,13 @@ Key functionality:
   - update_positions(apos) — push new positions to GPU (e.g. after user drag)
   - teardown() — release GPU resources
 
-Role in SPAMMM: Called by RelaxationExtension.py (GUI). Wraps SPFF + MolecularDynamics.
+Role in SPAMMM: Called by FFExtension.py (GUI). Wraps SPFFbuilder + SPFF_cl.
 """
 
 import numpy as np
 
-from .SPFF import SPFF
-from .MolecularDynamics import MolecularDynamics
+from .SPFFbuilder import SPFF
+from .SPFF_cl import SPFF_cl
 from ..topology.FFparams import SPFFparams
 
 # Mass lookup for apos.w (kernel uses it for velocity Verlet)
@@ -33,7 +33,7 @@ DEFAULT_FLIMIT = 100.0
 DEFAULT_PIN_K = 1e6  # constraint stiffness for pinned atoms
 
 
-class RelaxationController:
+class FFController:
     """Orchestrates forcefield building and GPU relaxation for a single molecular system.
 
     Lifecycle:
@@ -89,14 +89,17 @@ class RelaxationController:
         if sys.bonds is None:
             sys.findBonds()
 
-        # Assign atom types
-        if not hasattr(sys, 'atom_types_spff') or sys.atom_types_spff is None:
+        # Assign atom types — prefer atom_types_spff (hybridization-aware) over generic enames
+        at_spff = getattr(sys, 'atom_types_spff', None)
+        if at_spff is not None:
+            sys.atypes = np.array([self.params.getAtomType(t, bErr=False) for t in at_spff], dtype=np.int32)
+        else:
             sys.atypes = np.array([self.params.getAtomType(e, bErr=False) for e in sys.enames], dtype=np.int32)
 
         if self.ff_type == 'spff':
             return self._build_spff(sys)
         elif self.ff_type == 'uff':
-            # TODO: UFF path needs UFF.cl kernel integration with MolecularDynamics
+            # TODO: UFF path needs UFF_cl kernel integration with SPFF_cl
             raise NotImplementedError("UFF relaxation path not yet integrated with MD engine")
         else:
             raise ValueError(f"Unknown ff_type={self.ff_type!r}, expected 'spff' or 'uff'")
@@ -115,7 +118,7 @@ class RelaxationController:
         self.natoms = self.spff.natoms
 
         # Create MD engine and upload
-        self.md = MolecularDynamics(enable_nonbond=self.enable_nonbond,
+        self.md = SPFF_cl(enable_nonbond=self.enable_nonbond,
                                      debug_build_options=self.debug_build_options)
         self.md.realloc(self.spff, nSystems=1)
         self.md.upload_all_systems()
@@ -154,29 +157,74 @@ class RelaxationController:
         do_nb = do_nb if do_nb is not None else self.enable_nonbond
         self.md.run_step_basic(do_nb=do_nb)
 
+    def _can_use_serial(self, do_nb):
+        """Check if relax_serial is applicable (single system, small enough, no non-bonded)."""
+        return (self.md.nSystems == 1 and self.md.nvecs <= 128 and self.md.nnode <= 64 and not do_nb)
+
     def relax_n(self, nsteps=100, dt=None, damp=None, Flimit=None, do_nb=None):
         """Run nsteps of relaxation on GPU. Returns final energy.
+        Uses relax_serial (single-kernel local-memory) when possible for ~150x speedup."""
+        if not self._built:
+            raise RuntimeError("FF not built — call build_ff() first")
+        _dt = dt if dt is not None else DEFAULT_DT
+        _damp = damp if damp is not None else DEFAULT_DAMP
+        _Flimit = Flimit if Flimit is not None else DEFAULT_FLIMIT
+        _do_nb = do_nb if do_nb is not None else self.enable_nonbond
+        if self._can_use_serial(_do_nb):
+            self.md.relax_serial(nsteps=nsteps, dt=_dt, damp=_damp, Flimit=_Flimit)
+        else:
+            self.md.set_md_params(dt=_dt, damp=_damp, Flimit=_Flimit)
+            self.md.relax_batch(nsteps=nsteps, do_nb=_do_nb)
+        return self.md.get_total_energy()
+
+    def get_fmax(self):
+        """Return max force magnitude across all atoms (convergence metric)."""
+        if not self._built:
+            raise RuntimeError("FF not built — call build_ff() first")
+        forces = self.md.get_forces()[:self.natoms, :3]
+        return float(np.max(np.linalg.norm(forces, axis=1)))
+
+    def relax_until_converged(self, fmax_tol=0.05, max_steps=5000, dt=None, damp=None, Flimit=None, do_nb=None, callback=None, batch_size=None):
+        """Run relaxation until max force drops below fmax_tol or max_steps reached.
 
         Args:
-            nsteps: number of MD steps
-            dt, damp, Flimit: MD parameters (defaults from build)
-            do_nb: include non-bonded (default: self.enable_nonbond)
+            fmax_tol: convergence threshold on max force magnitude (eV/Å)
+            max_steps: hard stop to prevent infinite loop
+            dt, damp, Flimit: MD parameters
+            do_nb: include non-bonded
+            callback: optional fn(step, E, fmax) called every batch — return False to abort
+            batch_size: steps per GPU batch (default: same as max_steps, i.e. single batch)
 
         Returns:
-            float: final total energy
+            dict: {converged, nsteps, energy, fmax}
         """
         if not self._built:
             raise RuntimeError("FF not built — call build_ff() first")
-        if dt is not None or damp is not None or Flimit is not None:
-            self.md.set_md_params(
-                dt=dt if dt is not None else DEFAULT_DT,
-                damp=damp if damp is not None else DEFAULT_DAMP,
-                Flimit=Flimit if Flimit is not None else DEFAULT_FLIMIT,
-            )
-        do_nb = do_nb if do_nb is not None else self.enable_nonbond
-        self.md.relax(nsteps=nsteps, dt=dt or DEFAULT_DT, damp=damp or DEFAULT_DAMP,
-                       Flimit=Flimit or DEFAULT_FLIMIT, use_rot=False, do_nb=do_nb)
-        return self.md.get_total_energy()
+        _dt = dt if dt is not None else DEFAULT_DT
+        _damp = damp if damp is not None else DEFAULT_DAMP
+        _Flimit = Flimit if Flimit is not None else DEFAULT_FLIMIT
+        _do_nb = do_nb if do_nb is not None else self.enable_nonbond
+        self.md.set_md_params(dt=_dt, damp=_damp, Flimit=_Flimit)
+        batch = batch_size if batch_size is not None else max_steps  # single batch if not specified
+        use_serial = self._can_use_serial(_do_nb)
+        total = 0
+        E = self.md.get_total_energy()
+        fmax = self.get_fmax()
+        # do-while: always run at least one batch (fmax=0 before any force eval → false "converged")
+        first = True
+        while first or (total < max_steps and fmax > fmax_tol):
+            first = False
+            n = min(batch, max_steps - total)
+            if use_serial:
+                self.md.relax_serial(nsteps=n, dt=_dt, damp=_damp, Flimit=_Flimit)
+            else:
+                self.md.relax_batch(nsteps=n, do_nb=_do_nb)
+            total += n
+            E = self.md.get_total_energy()
+            fmax = self.get_fmax()
+            if callback is not None and not callback(total, E, fmax):
+                break
+        return {'converged': fmax <= fmax_tol, 'nsteps': total, 'energy': E, 'fmax': fmax}
 
     def get_state(self):
         """Download current state from GPU.

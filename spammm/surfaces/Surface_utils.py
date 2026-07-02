@@ -37,7 +37,7 @@ from ..forcefields.RigidBodyDynamics import RigidBodyDynamics, _reqs_to_plq
 # When reading from ElementTypes.dat, you MUST sqrt the E value before calling _reqs_to_plq.
 # This matches the GridFF generation convention in ocl_GridFF_new.py::make_atoms_arrays(bSqrtEvdw=True).
 
-from ..forcefields.MolecularDynamics import MolecularDynamics
+from ..forcefields.SPFF_cl import SPFF_cl as MolecularDynamics
 
 # Import Ewald2D for electrostatics comparison
 from .Ewald2D import Ewald2D

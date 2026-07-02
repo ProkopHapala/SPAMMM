@@ -1,19 +1,20 @@
 """
-SPFF.py — PyOpenCL SPFFsp3 force field implementation.
+SPFFbuilder.py — SPFFsp3 force field topology builder (setup phase).
 
-Purpose: Evaluate SPFFsp3 energies and forces on the GPU using the SPFF.cl
-kernel. Supports bonds, angles, torsions, pi-pi alignments, H-bonds, and
-non-bonded (LJ + Coulomb) interactions.
+Purpose: Convert an AtomicSystem into SPFFsp3-compatible topology arrays:
+atom positions, neighbors, bond parameters, angle parameters, pi-orbital
+directions, and REQ parameters. Assigns force field parameters from
+ElementTypes.dat / AtomTypes.dat.
 
 Key functionality:
-  - SPFFsp3 energy evaluation and force computation
-  - Topology builder: from AtomicSystem → SPFF arrays (neighbors, params)
-  - Non-bonded interactions with periodic boundary conditions
-  - Buffer management for multi-system simulations
+  - SPFF class: topology builder (from AtomicSystem → SPFF arrays)
+  - toSPFFsp3_loc(): main conversion method
+  - Bond parameter assignment, pi-orbital setup, neighbor lists
+  - Non-bonded exclusion list generation
 
-Role in SPAMMM: Primary covalent force field for molecular relaxation. Used by
-MolecularDynamics.py (FIRE/velocity Verlet MD) and GridFFRelaxedScan.py
-(relaxed PES scans). The SPFF.cl kernel is loaded via OpenCLBase.
+Role in SPAMMM: Setup phase for SPFF force field. The runtime GPU evaluation
+is handled by SPFF_cl.py. Used by FFController.py, GridFFRelaxedScan.py,
+and ManipulationPathOpt.py.
 """
 
 import numpy as np
@@ -583,7 +584,7 @@ class SPFF:
                 if verbosity > 0: print( "nbond", nbond )
                 # Setup neighbors - ngs is already populated above
                 hs = np.zeros((4, 3), dtype=np.float64)
-                print(f"DEBUG SPFF: ia={ia} {tname} nbond={nbond} conf_npi={conf_npi} conf_ne={conf_ne}")
+                if verbosity > 1: print(f"DEBUG SPFF: ia={ia} {tname} nbond={nbond} conf_npi={conf_npi} conf_ne={conf_ne}")
                 for k in range(nbond):
                     ja = ngi[k]  # ja is the atom index of the neighbor
                     if verbosity > 2: print( "ia,ja", ia,ja )
@@ -749,7 +750,7 @@ class SPFF:
                 acc_norm = np.linalg.norm(acc)
                 if acc_norm >= min_norm:
                     self.pipos[ia] = (acc / acc_norm).astype(np.float32)
-                    print(f"DEBUG SPFF: propagate pi_vec ia={ia} -> {self.pipos[ia]} using neighbors {neigh_ids}")
+                    if verbosity > 1: print(f"DEBUG SPFF: propagate pi_vec ia={ia} -> {self.pipos[ia]} using neighbors {neigh_ids}")
                     self._dbg_topo(
                         f"PI_PROP ia={ia:4d} neigh={neigh_ids} "
                         f"acc=({acc[0]: .6f},{acc[1]: .6f},{acc[2]: .6f}) acc_norm={float(acc_norm): .6f} "
@@ -1063,7 +1064,7 @@ class SPFF:
             print()
 
     def printArrays(self):
-        print("SPFF::printArrays(): natoms: {self.natoms}  nvecs: {self.nvecs}  nnode: {self.nnode}  ncap: {self.ncap}  ntors: {self.ntors}")
+        print(f"SPFF::printArrays(): natoms: {self.natoms}  nvecs: {self.nvecs}  nnode: {self.nnode}  ncap: {self.ncap}  ntors: {self.ntors}")
         print("apos",   self.apos )
         print("REQs",   self.REQs )
         print("neighs", self.neighs )

@@ -88,12 +88,12 @@ EXTENSION_REGISTRY = {
         build_ui='build_ui',
     ),
     'spff': dict(
-        module='spammm.forcefields.SPFF', class_name=None,
+        module='spammm.forcefields.SPFFbuilder', class_name=None,
         dependencies=[], req_paths=[],
         build_ui='build_ui',
     ),
-    'relax': dict(
-        module='spammm.GUI.RelaxationExtension', class_name=None,
+    'ff': dict(
+        module='spammm.GUI.FFExtension', class_name=None,
         dependencies=['pyopencl'], req_paths=[],
         build_ui='build_ui',
     ),
@@ -113,12 +113,17 @@ EXTENSION_REGISTRY = {
         build_ui='build_ui',
     ),
     'moldyn': dict(
-        module='spammm.forcefields.MolecularDynamics', class_name='MolecularDynamics',
+        module='spammm.forcefields.SPFF_cl', class_name='SPFF_cl',
         dependencies=['pyopencl'], req_paths=[],
         build_ui='build_ui',
     ),
     'povray': dict(
         module='spammm.POVray', class_name=None,
+        dependencies=[], req_paths=[],
+        build_ui='build_ui',
+    ),
+    'kekule': dict(
+        module='spammm.GUI.KekuleExtension', class_name=None,
         dependencies=[], req_paths=[],
         build_ui='build_ui',
     ),
@@ -132,12 +137,13 @@ DEFAULT_CONFIG = {
     'dftb':     dict(enabled=True,  executable='dftb+', workdir='./dftb_workdir'),
     'afm':      dict(enabled=True, cl_src_dir='../../kernels'),
     'spff':     dict(enabled=False, lib_path=''),
-    'relax':    dict(enabled=False),  # enable when GUI hooks are wired
+    'ff':       dict(enabled=True),  # FFController + FFExtension panel
     'grid':     dict(enabled=False, fdata_dir=''),
     'psi4':     dict(enabled=False),
     'pyscf':    dict(enabled=False),
-    'moldyn':   dict(enabled=False),
+    'moldyn':   dict(enabled=False),  # TODO: update to SPFF_cl import
     'povray':   dict(enabled=False),
+    'kekule':   dict(enabled=True),
 }
 
 # ---------------------------------------------------------------------------

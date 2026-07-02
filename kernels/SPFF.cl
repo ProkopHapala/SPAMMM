@@ -998,4 +998,254 @@ __kernel void updateAtomsSPFFf4_rot(
 }
 
 
+// ======================================================================
+//                     relax_nsteps_serial()
+// ======================================================================
+// Single-workgroup relaxation kernel: runs nsteps MD steps entirely in
+// local memory. Eliminates Python dispatch overhead (3 kernel calls/step
+// -> 1 call total). No non-bonded interactions (slot reserved for future).
+//
+// Workgroup size: 128 threads (WG_SIZE). Covers molecules up to ~80 atoms
+// (nvec = natoms + nnode <= WG_SIZE=128, nnode <= MAX_NNODE=64).
+//
+// Data flow per step:
+//   1. Zero aforce + fneigh (all threads)
+//   2. Compute SPFF bonded forces (threads 0..nnode-1)
+//   3. Gather recoil + integrate (threads 0..nvec-1)
+// All data stays in __local memory between steps.
+// ======================================================================
+#ifndef WG_SIZE
+#define WG_SIZE 128
+#endif
+#ifndef MAX_NNODE
+#define MAX_NNODE 64
+#endif
+
+__kernel void relax_nsteps_serial(
+    const int4  nDOFs,              // (natoms, nnode, nsteps, 0)
+    __global       float4*  g_apos,     // [nvec] positions (atoms + pi)
+    __global       float4*  g_avel,     // [nvec] velocities
+    __global       float4*  g_aforce,   // [nvec] forces (output)
+    __global const int4*    g_neighs,   // [natoms] neighbor indices
+    __global const int4*    g_bkNeighs, // [nvec] back-neighbor indices into fneigh
+    __global const float4*  g_apars,    // [nnode] FF params {c0ss, Kss, c0sp}
+    __global const float4*  g_bLs,      // [nnode] bond lengths (4 per node)
+    __global const float4*  g_bKs,      // [nnode] bond stiffness
+    __global const float4*  g_Ksp,      // [nnode] sigma-pi stiffness
+    __global const float4*  g_Kpp,      // [nnode] pi-pi stiffness
+    __global const float4*  g_constr,   // [natoms] constraints (xyz, K_flag)
+    __global const float4*  g_constrK,  // [natoms] constraint stiffness
+    __global const float4*  g_MDparams, // (dt, damp, Flimit, 0)
+    // --- reserved slots for future non-bonded (not used now) ---
+    __global const float4*  g_REQs,     // [natoms] non-bonded params (unused)
+    __global const int4*    g_excl      // [natoms*EXCL_MAX] exclusions (unused)
+){
+    const int natoms = nDOFs.x;
+    const int nnode  = nDOFs.y;
+    const int nsteps = nDOFs.z;
+    const int nvec   = natoms + nnode;
+    const int iL     = get_local_id(0);
+
+    // ---- Local memory buffers ----
+    __local float4  s_apos   [WG_SIZE];     // positions (atoms + pi)
+    __local float4  s_avel   [WG_SIZE];     // velocities
+    __local float4  s_aforce [WG_SIZE];     // forces
+    __local float4  s_fneigh [MAX_NNODE*8];   // recoil forces (nnode*4*2 max)
+    __local int4    s_neighs [WG_SIZE];     // neighbor indices
+    __local int4    s_bkNeighs[WG_SIZE];    // back-neighbor indices
+    __local float4  s_apars  [WG_SIZE];     // FF params
+    __local float4  s_bLs    [WG_SIZE];     // bond lengths
+    __local float4  s_bKs    [WG_SIZE];     // bond stiffness
+    __local float4  s_Ksp    [WG_SIZE];     // sigma-pi stiffness
+    __local float4  s_Kpp    [WG_SIZE];     // pi-pi stiffness
+    __local float4  s_constr [WG_SIZE];     // constraints
+    __local float4  s_constrK[WG_SIZE];     // constraint stiffness
+
+    // ---- Cooperative load from global to local ----
+    for(int i = iL; i < nvec;    i += WG_SIZE) s_apos[i]      = g_apos[i];
+    for(int i = iL; i < nvec;    i += WG_SIZE) s_avel[i]      = g_avel[i];
+    for(int i = iL; i < natoms;  i += WG_SIZE) s_neighs[i]    = g_neighs[i];
+    for(int i = iL; i < nvec;    i += WG_SIZE) s_bkNeighs[i]  = g_bkNeighs[i];
+    for(int i = iL; i < nnode;   i += WG_SIZE) s_apars[i]     = g_apars[i];
+    for(int i = iL; i < nnode;   i += WG_SIZE) s_bLs[i]       = g_bLs[i];
+    for(int i = iL; i < nnode;   i += WG_SIZE) s_bKs[i]       = g_bKs[i];
+    for(int i = iL; i < nnode;   i += WG_SIZE) s_Ksp[i]       = g_Ksp[i];
+    for(int i = iL; i < nnode;   i += WG_SIZE) s_Kpp[i]       = g_Kpp[i];
+    for(int i = iL; i < natoms;  i += WG_SIZE) s_constr[i]    = g_constr[i];
+    for(int i = iL; i < natoms;  i += WG_SIZE) s_constrK[i]   = g_constrK[i];
+    for(int i = iL; i < nnode*8; i += WG_SIZE) s_fneigh[i]   = float4Zero;
+
+    // Load MD params
+    const float4 MDpars = g_MDparams[0];
+    const float dt   = MDpars.x;
+    const float damp = MDpars.y;
+    const float Flimit = MDpars.z;
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    #define NNEIGH 4
+
+    // ---- Main relaxation loop ----
+    for(int step = 0; step < nsteps; step++){
+
+        // === Phase 1: Zero forces ===
+        for(int i = iL; i < nvec;    i += WG_SIZE) s_aforce[i] = float4Zero;
+        for(int i = iL; i < nnode*8; i += WG_SIZE) s_fneigh[i] = float4Zero;
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // === Phase 2: Compute SPFF bonded forces (threads 0..nnode-1) ===
+        if(iL < nnode){
+            const int iG = iL;
+            float4  hs[4];
+            float3  fbs[4];
+            float3  fps[4];
+            float3  fa  = float3Zero;
+            float   E   = 0;
+
+            const int4  ng  = s_neighs[iG];
+            const float3 pa = s_apos[iG].xyz;
+            const float4 par = s_apars[iG];
+            const int*  ings = (int*)&ng;
+
+            for(int i=0; i<NNEIGH; i++){ fbs[i]=float3Zero; fps[i]=float3Zero; }
+
+            float3 fpi = float3Zero;
+
+            // --- Bonds ---
+            {
+                const float4 vbL = s_bLs[iG];
+                const float4 vbK = s_bKs[iG];
+                const float4 vKs = s_Ksp[iG];
+                const float4 vKp = s_Kpp[iG];
+                const float* bL   = (float*)&vbL;
+                const float* bK   = (float*)&vbK;
+                const float* Kspi = (float*)&vKs;
+                const float* Kppi = (float*)&vKp;
+                const float3 hpi  = s_apos[natoms + iG].xyz;
+
+                for(int i=0; i<NNEIGH; i++){
+                    float4 h;
+                    const int ing = ings[i];
+                    if(ing<0) break;
+                    const int ingv = ing;
+
+                    h.xyz = s_apos[ingv].xyz - pa;
+                    float l = length(h.xyz);
+                    h.w = 1.f/l;
+                    h.xyz *= h.w;
+                    hs[i] = h;
+
+                    if(iG < ing){
+                        float3 f1;
+                        E += evalBond(h.xyz, l-bL[i], bK[i], &f1);
+                        fbs[i] -= f1; fa += f1;
+
+                        float kpp = Kppi[i];
+                        if((ing < nnode) && (kpp > 1e-6f)){
+                            float3 f1p, f2p;
+                            const float3 hpi_j = s_apos[natoms + ing].xyz;
+                            E += evalPiAling(hpi, hpi_j, kpp, &f1p, &f2p);
+                            fpi += f1p; fps[i] += f2p;
+                        }
+                    }
+
+                    float ksp = Kspi[i];
+                    if(ksp > 1e-6f){
+                        float3 f1, f2;
+                        E += evalAngCos((float4){hpi,1.f}, h, ksp, par.w, &f1, &f2);
+                        fpi += f1; fa -= f2; fbs[i] += f2;
+                    }
+                }
+
+                const int i4p = iG*4 + nnode*4;
+                for(int i=0; i<NNEIGH; i++) s_fneigh[i4p+i] = (float4){fps[i], 0};
+                s_aforce[natoms + iG] = (float4){fpi, 0};
+            }
+
+            // --- Angles ---
+            for(int i=0; i<NNEIGH; i++){
+                int ing = ings[i];
+                if(ing<0) break;
+                const float4 hi = hs[i];
+                for(int j=i+1; j<NNEIGH; j++){
+                    int jng = ings[j];
+                    if(jng<0) break;
+                    const float4 hj = hs[j];
+                    float3 f1, f2;
+                    E += evalAngleCosHalf(hi, hj, par.xy, par.z, &f1, &f2);
+                    fa -= f1 + f2;
+                    fbs[i] += f1;
+                    fbs[j] += f2;
+                }
+            }
+
+            // --- Store forces ---
+            const int i4 = iG*4;
+            for(int i=0; i<NNEIGH; i++) s_fneigh[i4+i] = (float4){fbs[i], 0};
+            s_aforce[iG] += (float4){fa, E};
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // === Phase 3: Gather recoil + integrate (threads 0..nvec-1) ===
+        if(iL < nvec){
+            const int iG = iL;
+            float4 fe = s_aforce[iG];
+            const bool bPi = (iG >= natoms);
+
+            // Gather recoil from back-neighbors
+            const int4 ngs = s_bkNeighs[iG];
+            float4 frec = float4Zero;
+            if(ngs.x>=0) frec += s_fneigh[ngs.x];
+            if(ngs.y>=0) frec += s_fneigh[ngs.y];
+            if(ngs.z>=0) frec += s_fneigh[ngs.z];
+            if(ngs.w>=0) frec += s_fneigh[ngs.w];
+            fe += frec;
+
+            // Force limiting
+            if(Flimit > 0){
+                float fr2 = dot(fe.xyz, fe.xyz);
+                if(fr2 > Flimit*Flimit) fe.xyz *= Flimit / sqrt(fr2);
+            }
+
+            s_aforce[iG] = fe;
+
+            // Constraints (only for atoms, not pi)
+            if(iG < natoms){
+                float4 cons = s_constr[iG];
+                if(cons.w > 0){
+                    float4 cK = s_constrK[iG];
+                    cK = max(cK, (float4){0,0,0,0});
+                    float4 pe_c = s_apos[iG];
+                    fe.xyz += (cons.xyz - pe_c.xyz) * cK.xyz;
+                }
+            }
+
+            // Damped MD integration
+            float4 ve = s_avel[iG];
+            float4 pe = s_apos[iG];
+
+            if(bPi){
+                fe.xyz += pe.xyz * (-dot(pe.xyz, fe.xyz));
+                ve.xyz += pe.xyz * (-dot(pe.xyz, ve.xyz));
+            }
+
+            float inv_mass = (pe.w > 1e-8f) ? (1.f / pe.w) : 1.f;
+            ve.xyz *= damp;
+            ve.xyz += fe.xyz * dt * inv_mass;
+            pe.xyz += ve.xyz * dt;
+
+            if(bPi) pe.xyz = normalize(pe.xyz);
+
+            ve.w = 0;
+            s_avel[iG] = ve;
+            s_apos[iG] = pe;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }  // end step loop
+
+    // ---- Write results back to global memory ----
+    for(int i = iL; i < nvec;    i += WG_SIZE) g_apos[i]   = s_apos[i];
+    for(int i = iL; i < nvec;    i += WG_SIZE) g_avel[i]   = s_avel[i];
+    for(int i = iL; i < nvec;    i += WG_SIZE) g_aforce[i] = s_aforce[i];
+}
 

@@ -3,7 +3,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from spammm.AtomicSystem import AtomicSystem
-from spammm.forcefields.UFF import UFF_CL
+from spammm.forcefields.UFF_cl import UFF_cl
 from tests.helpers.geometry import distort, bond_lengths, bond_angle, assert_geometry, find_bonds, save_xyz_frames, plot_geometry
 from tests.helpers.parity import plot_curves, overlay_plot, rmse, correlation
 
@@ -51,8 +51,8 @@ def test_relax(xyz, mol_file, ff, nsteps, expected, bNonBond):
     nb_tag = '_nb' if bNonBond else ''
     tag = f'{mol_file.replace(".xyz","")}_{ff}{nb_tag}'
     if ff == 'UFF':
-        from spammm.forcefields.UFF import UFF_CL
-        uff = UFF_CL()
+        from spammm.forcefields.UFF_cl import UFF_cl
+        uff = UFF_cl()
         uff.toUFF(mol)
         # Approximate masses: C=12, H=1, O=16, N=14
         mass_map = {'H': 1.0, 'C': 12.0, 'O': 16.0, 'N': 14.0}
@@ -64,8 +64,8 @@ def test_relax(xyz, mol_file, ff, nsteps, expected, bNonBond):
         fmax = np.max(np.linalg.norm(forces, axis=1))
         assert fmax < 1.0, f'{mol_file} {ff}: force too large after relax: {fmax:.2f}'
     elif ff == 'SPFF':
-        from spammm.forcefields.MolecularDynamics import MolecularDynamics
-        from spammm.forcefields.SPFF import SPFF
+        from spammm.forcefields.SPFF_cl import SPFF_cl
+        from spammm.forcefields.SPFFbuilder import SPFF
         from spammm.topology.FFparams import SPFFparams
         import pyopencl as cl
         # 1. Assign atom types
@@ -80,7 +80,7 @@ def test_relax(xyz, mol_file, ff, nsteps, expected, bNonBond):
             e = mol.enames[ia]
             spff.apos[ia, 3] = mass_map.get(e, 12.0)
         # 4. Initialize MD engine, upload to GPU
-        md = MolecularDynamics(enable_nonbond=bNonBond)
+        md = SPFF_cl(enable_nonbond=bNonBond)
         md.realloc(spff, nSystems=1)
         md.upload_all_systems()
         md.setup_kernels()
@@ -127,9 +127,9 @@ def test_uff_energy_finite(xyz):
     A non-zero positive energy means the molecule is slightly strained relative
     to UFF equilibrium parameters (which differ from the input geometry).
     """
-    from spammm.forcefields.UFF import UFF_CL
+    from spammm.forcefields.UFF_cl import UFF_cl
     mol = AtomicSystem(fname=xyz('H2O.xyz'))
-    uff = UFF_CL()
+    uff = UFF_cl()
     uff.toUFF(mol)
     uff.upload_positions(mol.apos)
     uff.run_eval_step()
@@ -140,9 +140,9 @@ def test_uff_energy_finite(xyz):
 @pytest.mark.gpu
 def test_uff_force_newton3(xyz):
     """Net force on isolated molecule should be ~0 (Newton's 3rd law)."""
-    from spammm.forcefields.UFF import UFF_CL
+    from spammm.forcefields.UFF_cl import UFF_cl
     mol = AtomicSystem(fname=xyz('CH4.xyz'))
-    uff = UFF_CL()
+    uff = UFF_cl()
     uff.toUFF(mol)
     uff.upload_positions(mol.apos)
     uff.run_eval_step()
@@ -167,10 +167,10 @@ def test_invariants(xyz, mol_file, mass_map, nsteps, dt, distort_amp, dE_abs_tol
     Tests both symmetric (CH4) and asymmetric (CH2NH) molecules.
     Starts from strained (distorted) configuration to test invariants under oscillation.
     """
-    from spammm.forcefields.UFF import UFF_CL
+    from spammm.forcefields.UFF_cl import UFF_cl
     import pyopencl as cl
     mol = AtomicSystem(fname=xyz(mol_file))
-    uff = UFF_CL()
+    uff = UFF_cl()
     uff.toUFF(mol)
     masses = np.array([mass_map[e] for e in mol.enames], dtype=np.float32)
     # Start from strained (distorted) configuration — no relaxation.
@@ -265,12 +265,12 @@ def test_invariants(xyz, mol_file, mass_map, nsteps, dt, distort_amp, dE_abs_tol
 @pytest.mark.gpu
 def test_visual_relax_energy(xyz):
     """Plot energy vs step for water relaxation (GPU-side integrator)."""
-    from spammm.forcefields.UFF import UFF_CL
+    from spammm.forcefields.UFF_cl import UFF_cl
     mol = AtomicSystem(fname=xyz('H2O.xyz'))
     apos_init = mol.apos.copy()
     mol.apos = distort(mol.apos, 0.2)
     apos_distort = mol.apos.copy()
-    uff = UFF_CL()
+    uff = UFF_cl()
     uff.toUFF(mol)
     mass_map = {'H': 1.0, 'C': 12.0, 'O': 16.0, 'N': 14.0}
     masses = np.array([mass_map.get(e, 12.0) for e in mol.enames], dtype=np.float32)
@@ -320,7 +320,7 @@ def _setup_uff(mol_file):
     """Create UFF eval_fn for a molecule. Returns (eval_fn, pos0, natoms, perm).
     perm=None (UFF does not reorder atoms)."""
     mol = AtomicSystem(fname=f'data/xyz/{mol_file}')
-    uff = UFF_CL()
+    uff = UFF_cl()
     uff.toUFF(mol)
     uff.bDoNonBonded = False
     uff.args_setup = False
@@ -338,8 +338,8 @@ def _setup_uff(mol_file):
 def _setup_spff(mol_file):
     """Create SPFF eval_fn for a molecule. Returns (eval_fn, pos0, natoms, perm).
     perm maps original atom indices → SPFF reordered indices."""
-    from spammm.forcefields.MolecularDynamics import MolecularDynamics
-    from spammm.forcefields.SPFF import SPFF
+    from spammm.forcefields.SPFF_cl import SPFF_cl
+    from spammm.forcefields.SPFFbuilder import SPFF
     from spammm.topology.FFparams import SPFFparams
     import pyopencl as cl
     mol = AtomicSystem(fname=f'data/xyz/{mol_file}')
@@ -351,7 +351,7 @@ def _setup_spff(mol_file):
     for ia in range(spff.natoms):
         e = mol.enames[ia]
         spff.apos[ia, 3] = mass_map.get(e, 12.0)
-    md = MolecularDynamics(enable_nonbond=False)
+    md = SPFF_cl(enable_nonbond=False)
     md.realloc(spff, nSystems=1)
     md.upload_all_systems()
     md.setup_kernels()

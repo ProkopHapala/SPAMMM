@@ -183,6 +183,8 @@ class AtomScene(QtCore.QObject):
         self.ch_bond_lines = visuals.Line(parent=self.view.scene, color=(0.4, 0.4, 0.4, 0.6), width=1.0, antialias=True, method='gl')
         self.hbond_lines = visuals.Line(parent=self.view.scene, color=(0.8, 0.2, 0.8, 0.5), width=1.5, antialias=True, method='gl')
         self.force_lines = visuals.Line(parent=self.view.scene, color=(1, 0, 0, 0.8), width=2.0, antialias=True, method='gl')
+        self.bond_order_lines = visuals.Line(parent=self.view.scene, color='gray', width=2.0, antialias=True, method='gl')
+        self.bond_order_text = visuals.Text(parent=self.view.scene, color='darkblue', font_size=9, anchor_x='center', anchor_y='center')
         self.atom_markers = visuals.Markers(parent=self.view.scene)
         self.axes = visuals.XYZAxis(parent=self.view.scene)
         self.text_labels = visuals.Text(parent=self.view.scene, color='black', font_size=10, anchor_x='left', anchor_y='bottom')
@@ -202,19 +204,20 @@ class AtomScene(QtCore.QObject):
         self.selection_rect = None
 
         # Enforce z-order when supported
-        for o, v in enumerate((self.radius_markers, self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.atom_markers, self.axes, self.text_labels, self.hover_bond_line, self.hover_ring_lines, self.hover_ring_markers, self.hover_ring_text, self.hover_atom_marker, self.link_line, self.ring_preview_line)):
+        for o, v in enumerate((self.radius_markers, self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.bond_order_lines, self.atom_markers, self.axes, self.text_labels, self.bond_order_text, self.hover_bond_line, self.hover_ring_lines, self.hover_ring_markers, self.hover_ring_text, self.hover_atom_marker, self.link_line, self.ring_preview_line)):
             if hasattr(v, 'order'):
                 v.order = int(o)
 
         # GL state: radius translucent and never blocks other overlays
         try:
             self.radius_markers.set_gl_state('translucent', depth_test=False)
-            for v in (self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.hover_bond_line, self.hover_ring_lines, self.link_line, self.ring_preview_line):
+            for v in (self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.bond_order_lines, self.hover_bond_line, self.hover_ring_lines, self.link_line, self.ring_preview_line):
                 v.set_gl_state('translucent', depth_test=False)
             self.atom_markers.set_gl_state('translucent', depth_test=False)
             self.hover_ring_markers.set_gl_state('translucent', depth_test=False)
             self.hover_atom_marker.set_gl_state('translucent', depth_test=False)
             self.text_labels.set_gl_state('translucent', depth_test=False)
+            self.bond_order_text.set_gl_state('translucent', depth_test=False)
             self.hover_ring_text.set_gl_state('translucent', depth_test=False)
         except Exception:
             pass
@@ -225,6 +228,9 @@ class AtomScene(QtCore.QObject):
         self._bonds = None
         self._forces = None
         self._radius = None
+        self._bond_orders = None        # (m,) pi bond orders for heavy-atom bonds
+        self._bond_order_bonds = None   # (m,2) bond indices matching _bond_orders
+        self._show_bond_order_labels = False
         self._atom_ids = np.zeros((0,), dtype=np.int64)  # Atom._id parallel to _pos
         self._id_to_idx = {}  # Atom._id → array index, rebuilt on set_data
 
@@ -334,6 +340,28 @@ class AtomScene(QtCore.QObject):
     def set_marker_style(self, style='disc'):
         style = str(style)
         self._marker_style = style
+        self._redraw()
+
+    def set_bond_orders(self, bonds, bond_orders, show_labels=False):
+        """Set pi bond orders for visual rendering of double/aromatic bonds.
+
+        Args:
+            bonds: (m,2) int array of bond indices into self._pos
+            bond_orders: (m,) float array of pi bond orders (0=single, 0.5=aromatic, 1=double)
+            show_labels: if True, render bond order values as text at midpoints
+        """
+        if bonds is None or bond_orders is None:
+            self._bond_order_bonds = None
+            self._bond_orders = None
+        else:
+            self._bond_order_bonds = np.asarray(bonds, dtype=np.int32)
+            self._bond_orders = np.asarray(bond_orders, dtype=np.float32)
+        self._show_bond_order_labels = show_labels
+        self._redraw()
+
+    def set_bond_order_labels(self, show):
+        """Toggle bond order label display."""
+        self._show_bond_order_labels = show
         self._redraw()
 
     def set_radius_style(self, style='disc'):
@@ -913,6 +941,70 @@ class AtomScene(QtCore.QObject):
                 self.bond_lines.set_data(np.zeros((0, 3), dtype=np.float32))
         else:
             self.bond_lines.set_data(np.zeros((0, 3), dtype=np.float32))
+
+        # Bond orders: render double bonds as parallel lines, aromatic in green
+        if (self._bond_order_bonds is not None) and (self._bond_orders is not None) and (len(self._bond_orders) > 0):
+            b = self._bond_order_bonds
+            bo = self._bond_orders
+            pos = self._pos
+            # Build segments: single=1 line, aromatic=1 green line, double=2 parallel lines
+            seg_list = []
+            col_list = []
+            mid_list = []
+            label_list = []
+            for ib in range(len(bo)):
+                i, j = b[ib]
+                p0 = pos[i]
+                p1 = pos[j]
+                mid = 0.5 * (p0 + p1)
+                d = p1 - p0
+                dl = np.linalg.norm(d)
+                if dl < 1e-10:
+                    continue
+                d /= dl
+                # perpendicular in xy plane
+                perp = np.array([-d[1], d[0], 0.0], dtype=np.float32)
+                perp /= (np.linalg.norm(perp) + 1e-20)
+                offset = 0.12  # parallel line offset in Angstroms
+                pi_bo = bo[ib]
+                total = 1.0 + pi_bo
+                if abs(total - 1.5) < 0.15:
+                    # aromatic: single green line, medium width
+                    seg_list.append([p0, p1])
+                    col_list.append((0.0, 0.6, 0.0, 0.9))
+                elif total > 1.7:
+                    # double: two parallel lines
+                    seg_list.append([p0 + perp * offset, p1 + perp * offset])
+                    col_list.append((0.2, 0.2, 0.2, 0.9))
+                    seg_list.append([p0 - perp * offset, p1 - perp * offset])
+                    col_list.append((0.2, 0.2, 0.2, 0.9))
+                else:
+                    # single: one thin line
+                    seg_list.append([p0, p1])
+                    col_list.append((0.3, 0.3, 0.3, 0.8))
+                mid_list.append(mid)
+                label_list.append(f"{pi_bo:.2f}")
+            if seg_list:
+                segs = np.array(seg_list, dtype=np.float32).reshape(-1, 3)
+                colors = np.array(col_list, dtype=np.float32)
+                # Repeat colors for each vertex in each segment pair
+                vert_colors = np.repeat(colors, 2, axis=0)
+                self._line_set("bond_orders", self.bond_order_lines, segs, color=vert_colors, width=2.0)
+                self.bond_order_lines.visible = True
+            else:
+                self.bond_order_lines.set_data(np.zeros((0, 3), dtype=np.float32))
+                self.bond_order_lines.visible = False
+            # Bond order labels
+            if self._show_bond_order_labels and mid_list:
+                self.bond_order_text.text = label_list
+                self.bond_order_text.pos = np.array(mid_list, dtype=np.float32)
+                self.bond_order_text.visible = True
+            else:
+                self.bond_order_text.visible = False
+        else:
+            self.bond_order_lines.set_data(np.zeros((0, 3), dtype=np.float32))
+            self.bond_order_lines.visible = False
+            self.bond_order_text.visible = False
 
         # Forces: per-atom line from pos to pos+f*scale
         if self._forces is not None:

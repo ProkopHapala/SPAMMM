@@ -38,7 +38,7 @@ clgff = GridFF_cl()
 def try_load_spff():
     global spff
     if spff is None:
-        from .. import SPFF as spff_
+        from spammm.forcefields.SPFFbuilder import SPFF as spff_
         spff = spff_
 
 

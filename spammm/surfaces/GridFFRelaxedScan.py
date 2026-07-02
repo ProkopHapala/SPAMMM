@@ -25,8 +25,8 @@ import pyopencl as cl
 import importlib.util
 
 from spammm.AtomicSystem import AtomicSystem
-from spammm.forcefields.SPFF import SPFF as SPFF_pyocl
-from spammm.forcefields.MolecularDynamics import MolecularDynamics
+from spammm.forcefields.SPFFbuilder import SPFF as SPFF_pyocl
+from spammm.forcefields.SPFF_cl import SPFF_cl as MolecularDynamics
 from tests.surfaces import ocl_GridFF_new as gff_ocl
 
 

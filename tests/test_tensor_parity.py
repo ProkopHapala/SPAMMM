@@ -33,7 +33,7 @@ _proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _proj_root not in sys.path:
     sys.path.insert(0, _proj_root)
 
-from spammm.forcefields.MolecularDynamics import MolecularDynamics
+from spammm.forcefields.SPFF_cl import SPFF_cl as MolecularDynamics
 from spammm.AtomicSystem import AtomicSystem
 from spammm.surfaces.Ewald2D import Ewald2D
 

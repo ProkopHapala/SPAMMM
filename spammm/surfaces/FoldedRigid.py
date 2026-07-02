@@ -26,7 +26,7 @@ scripts. Plotting functions are in surface_plots.py.
 import os
 import numpy as np
 
-from spammm.forcefields.MolecularDynamics import MolecularDynamics
+from spammm.forcefields.SPFF_cl import SPFF_cl as MolecularDynamics
 from spammm.forcefields.RigidBodyDynamics import RigidBodyDynamics, _guess_mass, compute_mass_properties
 from spammm.topology.FFparams import load_xyz_with_REQs
 from spammm.AtomicSystem import AtomicSystem

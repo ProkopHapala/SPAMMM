@@ -26,4 +26,23 @@
 
 - Forming hydrogen bonds when dragging ?
 
+
+- Interactive relaxation drag constraint:
+  When dragging an atom during interactive MD mode, the dragged atom should be
+  properly constrained to the mouse ray (projection onto the camera plane).
+  Currently the atom has "authority problems" — the MD integrator fights the
+  mouse drag. Need to implement: during drag, pin the dragged atom to a target
+  position that follows the mouse ray (updated each frame), with high K spring.
+  The mouse ray → 3D position mapping should use the VisPy camera projection
+  and intersect with the atom's current depth plane.
+  Status: NOT YET IMPLEMENTED — future task.
+
+
 - Export LAMMPS topology file (or GROMAS?)
+
+- Function to attach selected chemical group anywhere 
+
+- Define fragments, store it into fragment library, figgre out format for subrituting attachmetnd from the fragment library 
+  - easy when it is bonded by just one bond
+  - there can be also gridging groups and vicinal groups - like attaching ataracene to whatever
+

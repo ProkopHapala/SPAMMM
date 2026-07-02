@@ -11,13 +11,12 @@ Key functionality:
   - Bond, angle, torsion, inversion enumeration
   - REQ parameter assignment (RvdW, EvdW, Q, K)
 
-Role in SPAMMM: Topology preparation for UFF.py. Takes a molecule and produces
+Role in SPAMMM: Topology preparation for UFF_cl.py. Takes a molecule and produces
 the flat arrays that UFF.cl expects. Also used standalone for parameter inspection.
 """
 
 import os
 import numpy as np
-from  . import SPFF as spff
 from ..topology import FFparams as mmparams
 from .. import atomicUtils as au
 

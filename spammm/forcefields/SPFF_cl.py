@@ -1,5 +1,5 @@
 """
-MolecularDynamics.py — PyOpenCL molecular dynamics engine (FIRE + velocity Verlet).
+SPFF_cl.py — PyOpenCL runtime harness for SPFF force field (FIRE + velocity Verlet).
 
 Purpose: Run GPU-accelerated molecular dynamics using the SPFFsp3 force field.
 Supports FIRE (fast inertial relaxation engine) and damped velocity Verlet for
@@ -31,11 +31,13 @@ import matplotlib.pyplot as plt
 import time
 
 from ..utils import clUtils as clu
-from .SPFF import SPFF
+from .SPFFbuilder import SPFF
 from ..utils.OpenCLBase import OpenCLBase
 from ..topology.FFparams import load_xyz_with_REQs
 
 REQ_DEFAULT = np.array([1.7, 0.1, 0.0, 0.0], dtype=np.float32)  # R, E, Q, padding
+
+verbosity = 0  # 0=silent, 1=info, 2=debug
 
 FOLDED_BASIS_MAX = 128
 FOLDED_TYPES_MAX = 8
@@ -76,7 +78,7 @@ def half_step_from_coords(cs):
         return 0.0
     return 0.5 * float(ds.min())
 
-class MolecularDynamics(OpenCLBase):
+class SPFF_cl(OpenCLBase):
     """
     Class for molecular dynamics simulations using OpenCL.
     
@@ -132,7 +134,7 @@ class MolecularDynamics(OpenCLBase):
         Reallocate buffers for the given number of systems based on the SPFF template.
         """
         # Store dimensions explicitly to avoid reference issues
-        print(f"MolecularDynamics::realloc() natoms={spff.natoms}, nvecs={spff.nvecs}, nnode={spff.nnode}")
+        if verbosity > 0: print(f"SPFF_cl::realloc() natoms={spff.natoms}, nvecs={spff.nvecs}, nnode={spff.nnode}")
         self.nSystems = nSystems
         self.spff_list = [spff] * nSystems  # Assuming all systems use the same SPFF parameters
         # Recreate command queue to ensure validity after reallocation/resizing
@@ -242,7 +244,7 @@ class MolecularDynamics(OpenCLBase):
         self.nPBC   = nPBC
         self.npbc   = npbc
         
-        print(f"MolecularDynamics::allocate_cl_buffers(): nSystems: {nSystems}  natoms: {natoms}  nvecs: {nvecs} nnode: {nnode} ncap: {ncap}  ntors: {ntors}  nbkng: {nbkng}")
+        if verbosity > 0: print(f"SPFF_cl::allocate_cl_buffers(): nSystems: {nSystems}  natoms: {natoms}  nvecs: {nvecs} nnode: {nnode} ncap: {ncap}  ntors: {ntors}  nbkng: {nbkng}")
         
         if nSystems <= 0 or natoms <= 0 or nvecs <= 0 or nnode <= 0:
             raise ValueError(f"Invalid dimensions for buffer allocation: nSystems={nSystems}, natoms={natoms}, nvecs={nvecs}, nnode={nnode}")
@@ -339,7 +341,7 @@ class MolecularDynamics(OpenCLBase):
 
     def init_with_atoms(self, na=None, atoms=None, REQs=None, REQ_default=REQ_DEFAULT):
         """
-        Initialize MolecularDynamics directly with atom positions and REQ parameters,
+        Initialize SPFF_cl directly with atom positions and REQ parameters,
         without using SPFF object.
         
         Args:
@@ -349,7 +351,7 @@ class MolecularDynamics(OpenCLBase):
             nloc: local workgroup size
             
         Returns:
-            Initialized MolecularDynamics instance
+            Initialized SPFF_cl instance
         """
         float_size = np.float32().itemsize
 
@@ -457,7 +459,7 @@ class MolecularDynamics(OpenCLBase):
         Prepares the kernel arguments for all kernels by parsing their headers.
         Also sets up the work sizes for each kernel.
         """
-        print("MolecularDynamics::setup_kernels()")
+        if verbosity > 0: print("SPFF_cl::setup_kernels()")
         # Get all work sizes at once
         self.get_work_sizes()
         self.init_kernel_params()
@@ -481,7 +483,7 @@ class MolecularDynamics(OpenCLBase):
             if key in warned:
                 return
             warned.add(key)
-            print(f"warning: skipping {kname} because required buffers/params are not initialized: {', '.join(missing)}")
+            if verbosity > 0: print(f"warning: skipping {kname} because required buffers/params are not initialized: {', '.join(missing)}")
                 
         # Generate kernel arguments (only for kernels present in the compiled source)
         # Wrap bonded-force kernels in try/except so init_with_atoms (no SPFF buffers) still works
@@ -608,7 +610,7 @@ class MolecularDynamics(OpenCLBase):
         Initialize a dictionary of standard kernel parameters.
         This provides default values for common parameters used in kernels.
         """
-        print("MolecularDynamics::init_kernel_params()")
+        if verbosity > 0: print("SPFF_cl::init_kernel_params()")
         # Create a dictionary to store kernel parameters
         self.kernel_params = {
             # Common dimension parameters
@@ -1697,6 +1699,61 @@ class MolecularDynamics(OpenCLBase):
         for _ in range(nsteps):
             step_fn(do_nb=do_nb)
         return self.get_total_energy()
+
+    def relax_batch(self, nsteps=100, do_nb=False, use_rot=False):
+        """Run nsteps without per-step queue.finish() — only sync at end. Much faster for batch relaxation.
+        Assumes set_md_params was already called."""
+        prg = self.prg
+        queue = self.queue
+        args_clean = self.kernel_args_cleanForceSPFFf4
+        args_spff = self.kernel_args_getSPFFf4_rot if use_rot else self.kernel_args_getSPFFf4
+        args_update = self.kernel_args_updateAtomsSPFFf4_rot if use_rot else self.kernel_args_updateAtomsSPFFf4
+        sz_na = self.sz_na
+        sz_node = self.sz_node
+        sz_nvec = self.sz_nvec
+        sz_loc = self.sz_loc
+        args_nb = self.kernel_args_getNonBond_ex2 if do_nb else None
+        for _ in range(nsteps):
+            prg.cleanForceSPFFf4(queue, sz_na, sz_loc, *args_clean)
+            if do_nb:
+                prg.getNonBond_ex2(queue, sz_na, sz_loc, *args_nb)
+            prg.getSPFFf4(queue, sz_node, sz_loc, *args_spff)
+            prg.updateAtomsSPFFf4(queue, sz_nvec, sz_loc, *args_update)
+        queue.finish()  # single sync at end
+
+    def relax_serial(self, nsteps=100, dt=0.01, damp=0.95, Flimit=100.0):
+        """Run nsteps entirely on GPU in a single kernel call using local memory.
+        Single workgroup (128 threads). No non-bonded. Only for nSystems=1 and nvec<=128."""
+        import pyopencl as cl
+        WG_SIZE = 128
+        nvec = self.nvecs
+        if nvec > WG_SIZE:
+            raise ValueError(f"relax_serial: nvec={nvec} > WG_SIZE={WG_SIZE}, use relax_batch instead")
+        if self.nSystems != 1:
+            raise ValueError(f"relax_serial: nSystems={self.nSystems} != 1, use relax_batch instead")
+        # Set MD params
+        self.set_md_params(dt=dt, damp=damp, Flimit=Flimit)
+        nDOFs = cltypes.make_int4(self.natoms, self.nnode, nsteps, 0)
+        args = [
+            nDOFs,
+            self.buffer_dict['apos'],
+            self.buffer_dict['avel'],
+            self.buffer_dict['aforce'],
+            self.buffer_dict['neighs'],
+            self.buffer_dict['bkNeighs'],
+            self.buffer_dict['apars'],
+            self.buffer_dict['bLs'],
+            self.buffer_dict['bKs'],
+            self.buffer_dict['Ksp'],
+            self.buffer_dict['Kpp'],
+            self.buffer_dict['constr'],
+            self.buffer_dict['constrK'],
+            self.buffer_dict['MDparams'],
+            self.buffer_dict['REQs'],
+            self.buffer_dict.get('excl', self.buffer_dict['REQs']),  # dummy if no excl
+        ]
+        self.prg.relax_nsteps_serial(self.queue, (WG_SIZE,), (WG_SIZE,), *args)
+        self.queue.finish()
 
     def run_md(self, nsteps=100, dt=0.01, Flimit=1e10, use_rot=False, do_nb=False):
         """NVE molecular dynamics entirely on GPU. Returns final energy."""

@@ -21,14 +21,14 @@ import numpy as np
 import pyopencl as cl
 from ..utils.OpenCLBase import OpenCLBase
 from .UFFbuilder import UFF_Builder
-#from .SPFF import SPFF
+#from .SPFFbuilder import SPFF
 #from . import SPparams as mmparams    # Do we need it here ? Maybe it is enough to use it in UFFBuilder
 
 # Size constants for better readability
 i32sz = 4  # size of int32 in bytes
 f32sz = 4  # size of float32 in bytes
 
-class UFF_CL(OpenCLBase):
+class UFF_cl(OpenCLBase):
     """
     PyOpenCL interface for running UFF calculations on GPU.
     This class is responsible for managing OpenCL buffers and running kernels.
@@ -394,8 +394,8 @@ class UFF_CL(OpenCLBase):
 
         self.kernel_args = {}
 
-        # UFF.cl may contain additional kernels unrelated to UFF_CL (e.g. SPFF MD kernels).
-        # Only prepare argument lists for kernels we actually call from UFF_CL.
+        # UFF.cl may contain additional kernels unrelated to UFF_cl (e.g. SPFF MD kernels).
+        # Only prepare argument lists for kernels we actually call from UFF_cl.
         needed = {
             'clear_fapos_UFF',
             'clear_fint_UFF',

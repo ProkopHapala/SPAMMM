@@ -115,6 +115,8 @@ import numpy as np
 import pyopencl as cl
 from . import clUtils as clu
 
+verbosity = 0  # 0=silent, 1=info (device/compilation), 2=debug (buffer alloc)
+
 
 def print_devices(platforms=None ):
     if platforms is None:
@@ -237,12 +239,12 @@ class OpenCLBase:
         with open(kernel_path, 'r') as f:
             try:
                 kernel_source = f.read()
-                print(f"[OpenCLBase] Starting compilation for {kernel_path}...")
+                if verbosity > 0: print(f"[OpenCLBase] Starting compilation for {kernel_path}...")
                 if build_options is None:
                     self.prg = cl.Program(self.ctx, kernel_source).build()
                 else:
                     self.prg = cl.Program(self.ctx, kernel_source).build(options=build_options)
-                print(f"[OpenCLBase] Compilation complete for {kernel_path}")
+                if verbosity > 0: print(f"[OpenCLBase] Compilation complete for {kernel_path}")
                 # Extract kernel headers automatically
                 if bMakeHeaders:
                     self.kernelheaders = self.extract_kernel_headers(kernel_source)
@@ -283,12 +285,12 @@ class OpenCLBase:
                 source_parts.append(f.read())
         kernel_source = '\n'.join(source_parts)
         try:
-            print(f"[OpenCLBase] Starting compilation for {len(kernel_paths)} files: {[os.path.basename(p) for p in kernel_paths]}")
+            if verbosity > 0: print(f"[OpenCLBase] Starting compilation for {len(kernel_paths)} files: {[os.path.basename(p) for p in kernel_paths]}")
             if build_options is None:
                 self.prg = cl.Program(self.ctx, kernel_source).build()
             else:
                 self.prg = cl.Program(self.ctx, kernel_source).build(options=build_options)
-            print(f"[OpenCLBase] Compilation complete for {len(kernel_paths)} files")
+            if verbosity > 0: print(f"[OpenCLBase] Compilation complete for {len(kernel_paths)} files")
             if bMakeHeaders:
                 self.kernelheaders = self.extract_kernel_headers(kernel_source)
                 if bPrint:
@@ -370,10 +372,10 @@ class OpenCLBase:
         if current_buf is None or current_buf.size < required_size:
             if current_buf: current_buf.release() # Release old buffer if resizing
             if required_size > 0:
-                print(f"OpenCLBase::check_buf() Allocating buffer '{name}' with size {required_size} bytes")
+                if verbosity > 1: print(f"OpenCLBase::check_buf() Allocating buffer '{name}' with size {required_size} bytes")
                 self.buffer_dict[name] = cl.Buffer(self.ctx, flags, size=required_size)
             else:
-                print(f"OpenCLBase::check_buf() Warning: Buffer '{name}' has zero size, skipping allocation.")
+                if verbosity > 1: print(f"OpenCLBase::check_buf() Warning: Buffer '{name}' has zero size, skipping allocation.")
                 self.buffer_dict[name] = None # Handle zero-size case
         # Ensure the buffer exists if size > 0
         elif required_size == 0 and current_buf is not None:
@@ -383,7 +385,7 @@ class OpenCLBase:
             self.buffer_dict[name] = None
         elif self.buffer_dict.get(name) is None and required_size > 0:
             # This case shouldn't happen if the initial check works, but as safety:
-            print(f"OpenCLBase::check_buf() Re-Allocating buffer '{name}' with size {required_size} bytes")
+            if verbosity > 1: print(f"OpenCLBase::check_buf() Re-Allocating buffer '{name}' with size {required_size} bytes")
             self.buffer_dict[name] = cl.Buffer(self.ctx, flags, size=required_size)
 
     def try_make_buff( self, buff_name, sz):

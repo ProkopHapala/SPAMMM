@@ -78,6 +78,9 @@ class KekuleExplorerWindow(BaseGUI):
         self.edit_mode = 'Hex1'  # 'Hex1' (paint), 'Hex2' (toggle), 'Atom', 'Bond', 'pi', 'Select'
         self.label_mode = 'Element+Index'
         self.pick_radius = 0.5  # Distance in Angstroms for atom picking (matches spinbox default)
+        self.bond_orders = None  # pi bond orders array (set by KekuleExtension solver)
+        self.bond_order_bonds = None  # (m,2) heavy-atom bond indices matching bond_orders
+        self.show_bond_order_labels = False
 
         # Output directory for saved images (screenshots, plots)
         _repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -329,7 +332,7 @@ class KekuleExplorerWindow(BaseGUI):
         widget.setLayout(layout)
         
         # Wrap in CollapsibleSection
-        sec = CollapsibleSection("Editors", collapsed=False, parent=self)
+        sec = CollapsibleSection("Editors", collapsed=True, parent=self)
         sec.setContent(widget)
         return sec
 
@@ -386,9 +389,11 @@ class KekuleExplorerWindow(BaseGUI):
         self._ext_edit_modes = {}   # label -> callback
         self._ext_view_modes = {}   # label -> callback
 
+        EXTENSION_TITLES = {'ff': 'Force Field', 'afm': 'AFM', 'dftb': 'DFTB', 'firecore': 'FireCore'}
         for name in self.extensions.enabled_extensions():
             ui = self.extensions.build_ui(name, self)
-            sec = CollapsibleSection(name.capitalize(), collapsed=False, parent=self)
+            title = EXTENSION_TITLES.get(name, name.capitalize())
+            sec = CollapsibleSection(title, collapsed=True, parent=self)
             if ui.panel is not None:
                 sec.setContent(ui.panel)
                 ok = self.extensions.is_loaded(name)
@@ -1442,6 +1447,12 @@ class KekuleExplorerWindow(BaseGUI):
                 self.scene._line_set("H-bonds", self.scene.hbond_lines, hb_segs, color=(0.8, 0.2, 0.8, 0.5), width=1.5)
             else:
                 self.scene.hbond_lines.set_data(np.zeros((0, 3), dtype=np.float32))
+
+            # Bond orders (from Kekule solver)
+            if self.bond_orders is not None and self.bond_order_bonds is not None:
+                self.scene.set_bond_orders(self.bond_order_bonds, self.bond_orders, show_labels=self.show_bond_order_labels)
+            else:
+                self.scene.set_bond_orders(None, None)
 
             # Labels based on label_mode
             lbl_pos, lbl_texts = generate_atom_labels(self.label_mode, pos, sys.enames, self.backend.atom_npi, self.backend, bonds_heavy)

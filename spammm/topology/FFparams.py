@@ -22,6 +22,8 @@ Lepair = 1.5    # Example bond length for electron pairs
 Kepair = 100.0  # Example bond stiffness for electron pairs
 deg2rad = np.pi / 180.0
 
+verbosity = 0  # 0=silent, 1=info
+
 class ElementType:
     """
     Represents the parameters for each element type based on ElementTypes.dat.
@@ -108,7 +110,7 @@ def read_element_types(filepath):
     Returns:
     - dict: Dictionary mapping element names to ElementType objects
     """
-    print("read_element_types() filepath=", filepath)
+    if verbosity > 0: print("read_element_types() filepath=", filepath)
     element_types = {}
     with open(filepath, 'r') as f:
         lines = f.readlines()
@@ -246,9 +248,10 @@ def get_bond_params(bond_types, a, b, order):
     return bond_types[key]
 
 def read_AtomAndElementTypes(path, felement_types='ElementTypes.dat', fatom_types='AtomTypes.dat'):
-    print("read_AtomAndElementTypes() path", path)
-    path1 = path + felement_types; print("path1", path1)
-    path2 = path + fatom_types;    print("path2", path2)
+    if verbosity > 0: print("read_AtomAndElementTypes() path", path)
+    path1 = path + felement_types
+    path2 = path + fatom_types
+    if verbosity > 0: print("path1", path1, "path2", path2)
     element_types = read_element_types(path1)
     atom_types    = read_atom_types   (path2, element_types)
     return element_types, atom_types
