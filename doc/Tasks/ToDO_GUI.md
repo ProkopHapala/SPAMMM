@@ -17,3 +17,11 @@
 - Drawing pentagon, hepagon etc ?
 
 - ASCII-art molecule builder, as well as smiles
+
+- move to 3D viewwe
+
+- Molecular Browser with thumbnails (also with AFM images)
+
+- Kekule Solver ?  - fast estimation of pi-orbitals structures?
+
+- Forming hydrogen bonds when dragging ?

@@ -58,6 +58,7 @@ from spammm.GUI import VispyUtils as vu
 from spammm import elements
 from spammm import atomicUtils as au
 from spammm import elements
+from spammm.topology.PackedMolecule import PackedMolecule, UndoStack, _z_to_ename
 from spammm.GUI.BaseGUI import BaseGUI
 from spammm.GUI.VispyUtils import compute_bond_colors_by_length, generate_atom_labels
 
@@ -98,6 +99,8 @@ class KekuleExplorerWindow(BaseGUI):
         self.scene.sig_drag_state.connect(self.on_drag_state)
         self.scene.sig_rmb_remove.connect(self.on_atom_remove)
         self.scene.sig_camera_changed.connect(self.refresh_view)
+        self.scene.sig_link_bond.connect(self.on_link_bond)
+        self.scene.sig_atom_clicked.connect(self.on_atom_clicked)
         self.refresh_view()
 
     def initUI(self):
@@ -193,7 +196,9 @@ class KekuleExplorerWindow(BaseGUI):
         self.scene.canvas.events.mouse_press.connect(self.on_mouse_press)
         self.scene.canvas.events.mouse_move.connect(self.on_mouse_move)
         self.scene.sig_selection_changed.connect(self.on_selection_changed)
-        self.copied_atoms = None  # (enames, apos) tuple
+        self.copied_packed = None  # PackedMolecule for internal copy/paste
+        self.undo_stack = UndoStack(maxlen=100)
+        self.undo_enabled = True
         self.scene.canvas.events.key_press.connect(self.on_key_press)
         self.create_menus()
         self.error_print = True      # Print to stdout
@@ -301,10 +306,11 @@ class KekuleExplorerWindow(BaseGUI):
         self.debug_btn.setChecked(True)
         layout.addLayout(row3)
         
-        # Export buttons (from Editor)
+        # Export/Import buttons
         row4 = QtWidgets.QHBoxLayout()
-        self.button("Show XYZ", self.show_xyz, layout=row4)
-        self.button("Export XYZ", self.export_xyz, layout=row4)
+        self.button("Show", self.show_xyz, layout=row4)
+        self.button("Export", self.export_structure, layout=row4)
+        self.button("Import", self.import_structure, layout=row4)
         layout.addLayout(row4)
         
         # Wrap layout in QWidget for CollapsibleSection
@@ -651,20 +657,27 @@ class KekuleExplorerWindow(BaseGUI):
         if mode == 'Select':
             self.scene.set_selection_mode(True)
             self.scene.lock_drag = False
+            self.scene._link_mode = False
             self.statusBar().showMessage("LMB: Select/Deselect | RMB: Delete | Scroll: Zoom")
         elif mode == 'Bond':
             self.scene.set_selection_mode(False)
             self.scene.lock_drag = True   # No atom dragging in bond mode
-            self.statusBar().showMessage("LMB: Insert atom into bond | RMB: Collapse bond | Scroll: Zoom")
+            self.scene._link_mode = False
+            self.statusBar().showMessage("LMB: Insert atom (Ctrl: push aside) | RMB: Delete bond (Ctrl: collapse) | Scroll: Zoom")
         elif mode in ('Hex1', 'Hex2'):
             self.scene.set_selection_mode(False)
             self.scene.lock_drag = True   # No atom dragging in hex mode
+            self.scene._link_mode = False
             mode_str = "Hex1 (paint: force add/remove)" if mode == 'Hex1' else "Hex2 (toggle: preserve shared)"
             self.statusBar().showMessage(f"{mode_str}: LMB: Add | RMB: Remove")
         else:
             self.scene.set_selection_mode(False)
             self.scene.lock_drag = False
-            self.statusBar().showMessage("LMB: Add/Toggle | RMB: Remove | Middle-Click: Toggle H | Scroll: Zoom")
+            self.scene._link_mode = (mode == 'Atom')  # Enable Ctrl+drag bond creation in Atom mode
+            if mode == 'Atom':
+                self.statusBar().showMessage("LMB: Add/Change type/Drag move | Ctrl+LMB drag: Create bond | RMB: Delete (Ctrl: bridge neighbors) | Scroll: Zoom")
+            else:
+                self.statusBar().showMessage("LMB: Add/Toggle | RMB: Remove | Middle-Click: Toggle H | Scroll: Zoom")
 
     def set_atom_type(self, atype):
         self.cur_atom_type = atype
@@ -794,11 +807,21 @@ class KekuleExplorerWindow(BaseGUI):
     def on_key_press(self, event):
         """Handle keyboard shortcuts."""
         selected = self.scene.get_selected_ids()
-        if not selected:
-            return
 
         # Check for Control modifier (Vispy uses tuple of strings)
         ctrl_pressed = 'Control' in event.modifiers if isinstance(event.modifiers, (tuple, list)) else False
+
+        # Ctrl-V works even without selection (paste from clipboard)
+        if event.key == 'V' and ctrl_pressed:
+            self.paste_copied_atoms()
+            return
+        # Ctrl-Z works even without selection (undo)
+        if event.key == 'Z' and ctrl_pressed:
+            self.undo()
+            return
+
+        if not selected:
+            return
 
         # Delete key - remove selected atoms
         if event.key == 'Delete':
@@ -806,55 +829,88 @@ class KekuleExplorerWindow(BaseGUI):
         # Ctrl-C - copy selected atoms
         elif event.key == 'C' and ctrl_pressed:
             self.copy_selected_atoms()
-        # Ctrl-V - paste copied atoms
-        elif event.key == 'V' and ctrl_pressed:
-            self.paste_copied_atoms()
 
     def delete_selected_atoms(self):
         """Delete currently selected atoms by Atom._id."""
         ids = list(self.scene.get_selected_ids())
         if not ids:
             return
+        self._push_undo()
         self.backend.remove_atoms_by_id(ids)
         self.scene.clear_selection()
         self.refresh_view()
         debug_print(2, f"Deleted {len(ids)} atoms")
 
     def copy_selected_atoms(self):
-        """Copy currently selected atoms to clipboard."""
+        """Copy selected atoms to internal PackedMolecule + Qt clipboard text."""
         ids = list(self.scene.get_selected_ids())
         if not ids:
             return
-        # Map IDs to current sys indices for array access
-        enames = []
-        apos = []
+        # Map IDs to dense indices
+        indices = []
         for aid in ids:
             idx = self.scene._id_to_idx_safe(aid)
             if idx >= 0:
-                enames.append(self.backend.sys.enames[idx])
-                apos.append(self.backend.sys.apos[idx].copy())
-        self.copied_atoms = (enames, apos)
-        debug_print(2, f"Copied {len(ids)} atoms")
+                indices.append(idx)
+        if not indices:
+            return
+        # Build PackedMolecule from selected atoms (includes internal bonds)
+        self.copied_packed = PackedMolecule.from_graph(self.backend.graph, atom_indices=indices)
+        # Also put text on Qt clipboard for external paste
+        clip_text = self.copied_packed.to_mol_text() if len(self.copied_packed.bonds) > 0 else self.copied_packed.to_xyz_text()
+        QtWidgets.QApplication.clipboard().setText(clip_text)
+        debug_print(2, f"Copied {len(indices)} atoms ({len(self.copied_packed.bonds)} bonds) to clipboard")
 
     def paste_copied_atoms(self):
-        """Paste copied atoms at original position (duplicate in place)."""
-        if self.copied_atoms is None:
-            debug_print(2, "No atoms copied")
+        """Paste atoms from internal PackedMolecule or parse Qt clipboard text."""
+        packed = self.copied_packed
+        if packed is None:
+            # Try parsing Qt clipboard text as .xyz or .mol
+            clip_text = QtWidgets.QApplication.clipboard().text()
+            if clip_text.strip():
+                packed = PackedMolecule.from_text(clip_text)
+                if packed is not None:
+                    debug_print(2, f"Parsed clipboard text: {packed}")
+        if packed is None:
+            debug_print(2, "No atoms to paste")
             return
-        enames, apos_orig = self.copied_atoms
+        self._push_undo()
+        # Add atoms from packed data to graph
         new_atom_ids = []
         new_atoms = []
-        for ename, pos in zip(enames, apos_orig):
-            a = self.backend._append_atom(pos=list(pos.copy()), ename=ename, pin=None,parent=None,subtype=f"{ename}_sp2"  )
+        for i in range(len(packed.etype)):
+            z = int(packed.etype[i])
+            ename = _z_to_ename(z)
+            npi_i = int(packed.npi[i]) if i < len(packed.npi) else 1
+            pos = list(packed.apos[i].copy())
+            a = self.backend._append_atom(pos=pos, ename=ename, pin=None, parent=None, npi=npi_i)
             new_atom_ids.append(a._id)
             new_atoms.append(a)
-        for a in new_atoms:
-            self.backend._create_bond_to_nearest_heavy(a)
+        # Add internal bonds from packed data
+        for col in packed.bonds:
+            i, j = int(col[0]), int(col[1])
+            if 0 <= i < len(new_atoms) and 0 <= j < len(new_atoms):
+                self.backend.graph.add_bond(new_atoms[i], new_atoms[j])
         self.backend.graph.sync_neighbor_lists()
         self.refresh_view()
-        # Select the newly pasted atoms by ID
         self.scene.set_selected_ids(new_atom_ids)
-        debug_print(2, f"Pasted {len(enames)} atoms at original positions")
+        debug_print(2, f"Pasted {len(new_atoms)} atoms ({len(packed.bonds)} bonds)")
+
+    def _push_undo(self):
+        """Push current graph state to undo stack before a mutation."""
+        if not self.undo_enabled: return
+        self.undo_stack.push(PackedMolecule.from_graph(self.backend.graph))
+
+    def undo(self):
+        """Undo last graph mutation by restoring from UndoStack."""
+        packed = self.undo_stack.pop()
+        if packed is None:
+            debug_print(2, "Nothing to undo")
+            return
+        self.backend.graph = packed.to_graph()
+        self.backend._sync_sys()
+        self.refresh_view()
+        debug_print(2, f"Undo: restored {len(packed.etype)} atoms")
 
     def on_drag_state(self, state, atom_id, pos):
         """Handle drag state changes from scene.
@@ -972,8 +1028,34 @@ class KekuleExplorerWindow(BaseGUI):
         """Remove atom by Atom._id and refresh view. Only in Atom/pi/Select modes."""
         if self.edit_mode in ('Hex1', 'Hex2', 'Bond'):
             return   # In Hex/Bond modes, RMB is handled by handle_click (hex removal / bond collapse)
-        debug_print(2, f"[RMB_REMOVE] atom_id={atom_id}")
-        self.backend.remove_atom_by_id(atom_id)
+        debug_print(2, f"[RMB_REMOVE] atom_id={atom_id} ctrl={self.scene._last_ctrl}")
+        self._push_undo()
+        if self.scene._last_ctrl:
+            self.backend.remove_atom_with_bridge(atom_id)
+        else:
+            self.backend.remove_atom_by_id(atom_id)
+        self.refresh_view()
+        self.sig_geometry_changed.emit()
+
+    def on_link_bond(self, from_id, to_id):
+        """Create bond between two atoms (Ctrl+drag in Atom mode)."""
+        debug_print(2, f"[LINK_BOND] from={from_id} to={to_id}")
+        self._push_undo()
+        a = self.backend.graph.atoms.get(from_id)
+        b = self.backend.graph.atoms.get(to_id)
+        if a is not None and b is not None and a.alive and b.alive:
+            self.backend.graph.add_bond(a, b)  # local neighbor update in add_bond
+            if self.backend.auto_h_cap:
+                self.backend.adjust_h()
+            self.backend._sync_sys()
+        self.refresh_view()
+        self.sig_geometry_changed.emit()
+
+    def on_atom_clicked(self, atom_id):
+        """Handle atom click without drag in Atom mode (change atom type)."""
+        debug_print(2, f"[ATOM_CLICKED] atom_id={atom_id}")
+        self._push_undo()
+        self.backend.set_atom_type_by_id(atom_id, self.cur_atom_type)
         self.refresh_view()
         self.sig_geometry_changed.emit()
 
@@ -998,17 +1080,16 @@ class KekuleExplorerWindow(BaseGUI):
         if picked >= 0 and event.button == 1:
             if self.edit_mode == 'Atom':
                 # Change atom type by Atom._id
+                self._push_undo()
                 self.backend.set_atom_type_by_id(picked_id, self.cur_atom_type)
                 self.refresh_view()
                 return
             elif self.edit_mode == 'pi':
-                # Cycle pi orbitals on picked atom
-                subtype = self.backend.atom_subtype[picked]
-                current_npi = self.backend._get_npi_from_subtype(subtype)
+                # Cycle pi orbitals on picked atom: sp3(0) -> sp2(1) -> sp(2) -> sp3(0)
+                self._push_undo()
+                current_npi = self.backend.atom_npi[picked]
                 new_npi = (current_npi + 1) % 3
-                e = self.backend.sys.enames[picked]
-                sp_map = {0: 'sp3', 1: 'sp2', 2: 'sp'}
-                self.backend.set_atom_subtype_by_id(picked_id, f"{e}_{sp_map.get(new_npi, 'sp2')}")
+                self.backend.set_atom_npi_by_id(picked_id, new_npi)
                 if self.backend.auto_h_cap:
                     self.backend.adjust_h()
                 self.refresh_view()
@@ -1017,17 +1098,19 @@ class KekuleExplorerWindow(BaseGUI):
                 # In ring mode, don't allow dragging atoms - ignore atom picks
                 return
 
+        ctrl_pressed = 'Control' in event.modifiers if isinstance(event.modifiers, (tuple, list)) else False
         if event.button == 1: # LMB
-            self.handle_click(event.pos, action='add')
+            self.handle_click(event.pos, action='add', ctrl=ctrl_pressed)
         elif event.button == 2: # RMB
             # Atom/pi/Select modes rely on sig_rmb_remove from VispyUtils;
             # calling handle_click here too would double-fire removal
             if self.edit_mode not in ('Atom', 'pi', 'Select'):
-                self.handle_click(event.pos, action='remove')
+                self.handle_click(event.pos, action='remove', ctrl=ctrl_pressed)
         elif event.button == 3: # Middle / Scroll click
             self.handle_click(event.pos, action='toggle_h')
 
     def reset_offsets(self):
+        self._push_undo()
         self.backend.snap_atoms_to_grid()
         self.refresh_view()
 
@@ -1041,15 +1124,28 @@ class KekuleExplorerWindow(BaseGUI):
         self.button("Close", dialog.accept, layout=layout)
         dialog.exec_()
 
-    def export_xyz(self):
-        """Export current structure to an XYZ file."""
-        fname = self.fileDialog(mode="save", title="Export XYZ", filter_str="XYZ Files (*.xyz)")
+    def export_structure(self):
+        """Export current structure to .xyz, .mol, or .mol2 file."""
+        fname = self.fileDialog(mode="save", title="Export Structure",
+                                filter_str="Molecular Files (*.xyz *.mol *.mol2);;XYZ (*.xyz);;MOL (*.mol);;MOL2 (*.mol2)")
         if fname:
-            self.backend.save_xyz(fname)
+            self.backend.save_structure(fname)
             self.statusBar().showMessage(f"Exported to {fname}")
+            debug_print(2, f"Exported to {fname}")
+
+    def import_structure(self):
+        """Import structure from .xyz, .mol, or .mol2 file."""
+        fname = self.fileDialog(mode="open", title="Import Structure",
+                                filter_str="Molecular Files (*.xyz *.mol *.mol2);;XYZ (*.xyz);;MOL (*.mol);;MOL2 (*.mol2)")
+        if fname:
+            self.backend.load_structure(fname)
+            self.refresh_view()
+            self.statusBar().showMessage(f"Imported from {fname}")
+            debug_print(2, f"Imported from {fname}")
 
     def adjust_h(self):
         """Manually trigger H passivation."""
+        self._push_undo()
         self.backend.adjust_h()
         self.refresh_view()
 
@@ -1058,6 +1154,7 @@ class KekuleExplorerWindow(BaseGUI):
         
         Removes H caps before recalc, then adds H caps based on new topology.
         """
+        self._push_undo()
         # Step 1: Remove all H caps
         self.backend.remove_h_caps()
         
@@ -1070,7 +1167,8 @@ class KekuleExplorerWindow(BaseGUI):
         
         self.refresh_view()
 
-    def handle_click(self, mouse_pos, action='add'):
+    def handle_click(self, mouse_pos, action='add', ctrl=False):
+        self._push_undo()
         # 1. Get world coordinates on z=0 plane
         # Vispy mouse pos is (x, y) from top-left
         # We need to use Vispy's internal ray casting
@@ -1111,17 +1209,14 @@ class KekuleExplorerWindow(BaseGUI):
                     self.backend.add_ring(q, r)
             elif self.edit_mode == 'Bond':
                 if bond is not None:
-                    new_atom = self.backend.insert_atom_into_bond(bond, self.cur_atom_type)
-                    debug_print(2, f"Inserted atom into bond {bond._id}, new atom {new_atom._id}")
+                    new_atom = self.backend.insert_atom_into_bond(bond, self.cur_atom_type, push_aside=ctrl)
+                    debug_print(2, f"Inserted atom into bond {bond._id}, new atom {new_atom._id} (push_aside={ctrl})")
             elif self.edit_mode == 'pi':
-                # Cycle pi orbitals: 0 -> 1 -> 2 -> 0
+                # Cycle pi orbitals: sp3(0) -> sp2(1) -> sp(2) -> sp3(0)
                 if nearest_atom_idx is not None:
-                    subtype = self.backend.atom_subtype[nearest_atom_idx]
-                    current_npi = self.backend._get_npi_from_subtype(subtype)
+                    current_npi = self.backend.atom_npi[nearest_atom_idx]
                     new_npi = (current_npi + 1) % 3
-                    e = self.backend.sys.enames[nearest_atom_idx]
-                    sp_map = {0: 'sp3', 1: 'sp2', 2: 'sp'}
-                    self.backend.set_atom_subtype_by_id(nearest_atom_id, f"{e}_{sp_map.get(new_npi, 'sp2')}")
+                    self.backend.set_atom_npi_by_id(nearest_atom_id, new_npi)
                     if self.backend.auto_h_cap:
                         self.backend.adjust_h()
                     self.refresh_view()
@@ -1131,7 +1226,7 @@ class KekuleExplorerWindow(BaseGUI):
                 self.backend.set_atom_type_by_id(nearest_atom_id, self.cur_atom_type)
             else:
                 # Free placement at exact position
-                self.backend._append_atom(pos=[x, y, 0.0], ename=self.cur_atom_type, pin=None, parent=None, subtype=self.backend._get_element_default_subtype(self.cur_atom_type))
+                self.backend._append_atom(pos=[x, y, 0.0], ename=self.cur_atom_type, pin=None, parent=None, npi=self.backend._get_element_default_npi(self.cur_atom_type))
                 atom_list, *_ = self.backend.graph.to_arrays()
                 if atom_list:
                     new_atom = atom_list[-1]
@@ -1146,8 +1241,12 @@ class KekuleExplorerWindow(BaseGUI):
                     self.backend.remove_ring(q, r)
             elif self.edit_mode == 'Bond':
                 if bond is not None:
-                    survivor = self.backend.collapse_bond(bond, np.array([x, y]))
-                    debug_print(2, f"Collapsed bond {bond._id}, survivor atom {survivor._id}")
+                    if ctrl:
+                        survivor = self.backend.collapse_bond(bond, np.array([x, y]))
+                        debug_print(2, f"Collapsed bond {bond._id}, survivor atom {survivor._id}")
+                    else:
+                        self.backend.delete_bond(bond)
+                        debug_print(2, f"Deleted bond {bond._id}")
             elif nearest_atom_idx is not None:
                 self.backend.remove_atom_by_id(nearest_atom_id)
         elif action == 'toggle_h':
@@ -1264,7 +1363,7 @@ class KekuleExplorerWindow(BaseGUI):
                 self.scene.hbond_lines.set_data(np.zeros((0, 3), dtype=np.float32))
 
             # Labels based on label_mode
-            lbl_pos, lbl_texts = generate_atom_labels(self.label_mode, pos, sys.enames, self.backend.atom_subtype, self.backend, bonds_heavy)
+            lbl_pos, lbl_texts = generate_atom_labels(self.label_mode, pos, sys.enames, self.backend.atom_npi, self.backend, bonds_heavy)
             if lbl_pos:
                 self.scene.text_labels.text = lbl_texts
                 self.scene.text_labels.pos = np.array(lbl_pos, dtype=np.float32)

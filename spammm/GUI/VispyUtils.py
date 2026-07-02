@@ -72,15 +72,15 @@ def compute_bond_colors_by_length(bonds, pos, color_range=(0.0, 1.0)):
     return np.array(bond_segs, dtype=np.float32), np.array(bond_colors, dtype=np.float32)
 
 
-def generate_atom_labels(label_mode, pos, enames, atom_subtype=None, backend=None, bonds=None):
+def generate_atom_labels(label_mode, pos, enames, atom_npi=None, backend=None, bonds=None):
     """Generate text labels for atoms based on label_mode.
     
     Args:
         label_mode: String specifying label type
         pos: (n,3) array of positions
         enames: List/array of element names
-        atom_subtype: Optional list of atom subtypes
-        backend: Optional backend object for subtype queries
+        atom_npi: Optional list of npi values (-1=H_cap, 0=sp3, 1=sp2, 2=sp)
+        backend: Optional backend object
         bonds: Optional list of bonds for bond length labels
     
     Returns:
@@ -96,25 +96,17 @@ def generate_atom_labels(label_mode, pos, enames, atom_subtype=None, backend=Non
                 lbl_pos.append(pos[i])
                 lbl_texts.append(f"{e}{i}")
     elif label_mode == 'Atomic Type':
-        for i, subtype in enumerate(atom_subtype or []):
+        _npi_label = {0: 'sp3', 1: 'sp2', 2: 'sp', -1: 'H_cap'}
+        for i, npi in enumerate(atom_npi or []):
             if enames[i] != 'H':
                 lbl_pos.append(pos[i])
-                if 'sp3' in subtype:
-                    lbl_texts.append('sp3')
-                elif 'sp2' in subtype:
-                    lbl_texts.append('sp2')
-                elif 'sp' in subtype:
-                    lbl_texts.append('sp')
-                else:
-                    lbl_texts.append(subtype)
+                lbl_texts.append(_npi_label.get(npi, str(npi)))
     elif label_mode == 'Pi Orbitals':
         for i in range(len(enames)):
-            if i < len(atom_subtype or []):
-                subtype = atom_subtype[i]
+            if i < len(atom_npi or []):
                 if enames[i] != 'H':
                     lbl_pos.append(pos[i])
-                    npi = backend._get_npi_from_subtype(subtype) if backend else 0
-                    lbl_texts.append(str(npi))
+                    lbl_texts.append(str(atom_npi[i]))
     elif label_mode == 'Z-Height':
         for i, e in enumerate(enames):
             if e != 'H':
@@ -154,6 +146,8 @@ class AtomScene(QtCore.QObject):
     sig_rmb_remove = QtCore.pyqtSignal(int)  # Atom._id to remove
     sig_selection_changed = QtCore.pyqtSignal(object)  # set of selected Atom._ids
     sig_camera_changed = QtCore.pyqtSignal()  # camera changed (zoom/pan/rotate)
+    sig_link_bond = QtCore.pyqtSignal(int, int)  # from_id, to_id — Ctrl+drag bond creation
+    sig_atom_clicked = QtCore.pyqtSignal(int)  # Atom._id — click without drag (for type change)
 
     def __init__(self, *, bgcolor='white', backend=None):
         super().__init__(parent=None)
@@ -198,18 +192,21 @@ class AtomScene(QtCore.QObject):
         self.hover_ring_markers = visuals.Markers(parent=self.view.scene)
         self.hover_ring_text = visuals.Text(parent=self.view.scene, color='cyan', font_size=12, anchor_x='center', anchor_y='center')
         self.hover_atom_marker = visuals.Markers(parent=self.view.scene)
+        # Link line for Ctrl+drag bond creation (rubber-band)
+        self.link_line = visuals.Line(parent=self.view.scene, color=(0.2, 0.8, 0.2, 0.8), width=3.0, antialias=True, method='gl')
+        self.link_line.visible = False
         # Selection rectangle (Line visual) - create lazily to avoid initialization issues
         self.selection_rect = None
 
         # Enforce z-order when supported
-        for o, v in enumerate((self.radius_markers, self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.atom_markers, self.axes, self.text_labels, self.hover_bond_line, self.hover_ring_lines, self.hover_ring_markers, self.hover_ring_text, self.hover_atom_marker)):
+        for o, v in enumerate((self.radius_markers, self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.atom_markers, self.axes, self.text_labels, self.hover_bond_line, self.hover_ring_lines, self.hover_ring_markers, self.hover_ring_text, self.hover_atom_marker, self.link_line)):
             if hasattr(v, 'order'):
                 v.order = int(o)
 
         # GL state: radius translucent and never blocks other overlays
         try:
             self.radius_markers.set_gl_state('translucent', depth_test=False)
-            for v in (self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.hover_bond_line, self.hover_ring_lines):
+            for v in (self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.hover_bond_line, self.hover_ring_lines, self.link_line):
                 v.set_gl_state('translucent', depth_test=False)
             self.atom_markers.set_gl_state('translucent', depth_test=False)
             self.hover_ring_markers.set_gl_state('translucent', depth_test=False)
@@ -283,6 +280,12 @@ class AtomScene(QtCore.QObject):
 
         self._drag_plane_p0 = None
         self._drag_plane_n = None
+
+        # Link mode state — Ctrl+drag to create bonds between atoms
+        self._link_active = False
+        self._link_from_id = -1
+        self._link_mode = False  # Set True externally when in Atom mode (enables Ctrl+drag bond creation)
+        self._last_ctrl = False  # Store Ctrl state from press for RMB bridge removal
 
         self.canvas.events.mouse_press.connect(self._on_mouse_press)
         self.canvas.events.mouse_release.connect(self._on_mouse_release)
@@ -1046,6 +1049,8 @@ class AtomScene(QtCore.QObject):
         return self._idx_to_id(idx), float(np.sqrt(d2))
 
     def _on_mouse_press(self, ev):
+        # Store Ctrl state for RMB bridge removal in GUI
+        self._last_ctrl = 'Control' in ev.modifiers if isinstance(ev.modifiers, (tuple, list)) else False
         if ev.button in (2, 3):
             if self._selection_mode:
                 # Create selection rectangle (Line visual) on first use
@@ -1090,6 +1095,27 @@ class AtomScene(QtCore.QObject):
             return
         if ev.button != 1:
             return
+
+        # Ctrl+LMB in link mode: start bond creation drag (rubber-band line)
+        if self._link_mode and self._last_ctrl:
+            i = self._pick_idx_from_mouse(ev.pos)
+            if i >= 0:
+                atom_id = self._idx_to_id(i)
+                self._link_active = True
+                self._link_from_id = atom_id
+                self._pick_idx = -1  # Prevent GUI on_mouse_press from reading stale pick
+                self._pick_id = -1
+                # Show rubber-band line from atom to current mouse pos
+                r0, rd = self._ray_from_mouse(ev.pos)
+                p = self._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0,0,1]))
+                if p is not None:
+                    start = self._pos[i][:2]
+                    end = p[:2]
+                    self.link_line.set_data(pos=np.array([start, end], dtype=np.float32), color=(0.2, 0.8, 0.2, 0.8))
+                    self.link_line.visible = True
+                ev.handled = True
+                return
+            # Ctrl pressed but no atom under cursor → fall through to normal behavior
 
         # External lock: suppress all drag (e.g. Ring mode)
         if self.lock_drag:
@@ -1184,6 +1210,22 @@ class AtomScene(QtCore.QObject):
             self._cam_print('rmb_up')
             ev.handled = True
             return
+        # Handle link mode release (Ctrl+drag bond creation)
+        if self._link_active:
+            self.link_line.visible = False
+            target_id, _ = self._pick_id_from_mouse(ev.pos, max_dist=self.pick_radius)
+            from_id = self._link_from_id
+            self._link_active = False
+            self._link_from_id = -1
+            self.hover_atom_marker.set_data(pos=np.zeros((0, 3), dtype=np.float32))
+            if target_id >= 0 and target_id != from_id:
+                self.sig_link_bond.emit(from_id, target_id)
+            elif target_id == from_id:
+                # Released on same atom = click → change type
+                self.sig_atom_clicked.emit(from_id)
+            # else: released on empty space → cancel (no action)
+            ev.handled = True
+            return
         self._pick_active = False
         if self._pick_idx >= 0:
             self.sig_drag_state.emit(0, int(self._pick_id), self._pos[int(self._pick_idx)].copy())
@@ -1199,6 +1241,33 @@ class AtomScene(QtCore.QObject):
             del self._selected_initial_pos
 
     def _on_mouse_move(self, ev):
+        if self._link_active:
+            # Update rubber-band line endpoint to mouse world position
+            r0, rd = self._ray_from_mouse(ev.pos)
+            p = self._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0,0,1]))
+            if p is not None:
+                from_idx = self._id_to_idx_safe(self._link_from_id)
+                if from_idx >= 0:
+                    start = self._pos[from_idx][:2]
+                    end = p[:2]
+                    # Check if hovering over a different atom → highlight green
+                    target_id, _ = self._pick_id_from_mouse(ev.pos, max_dist=self.pick_radius)
+                    if target_id >= 0 and target_id != self._link_from_id:
+                        tgt_idx = self._id_to_idx_safe(target_id)
+                        if tgt_idx >= 0:
+                            self.hover_atom_marker.set_data(
+                                pos=self._pos[tgt_idx:tgt_idx+1].astype(np.float32),
+                                symbol='ring', size=18, edge_width=2,
+                                face_color=(0, 0, 0, 0), edge_color=(0.2, 0.8, 0.2, 1.0))
+                            self.link_line.set_data(pos=np.array([start, end], dtype=np.float32), color=(0.2, 0.8, 0.2, 0.9))
+                        else:
+                            self.hover_atom_marker.set_data(pos=np.zeros((0, 3), dtype=np.float32))
+                            self.link_line.set_data(pos=np.array([start, end], dtype=np.float32), color=(0.5, 0.5, 0.5, 0.6))
+                    else:
+                        self.hover_atom_marker.set_data(pos=np.zeros((0, 3), dtype=np.float32))
+                        self.link_line.set_data(pos=np.array([start, end], dtype=np.float32), color=(0.5, 0.5, 0.5, 0.6))
+            ev.handled = True
+            return
         if self._selection_mode and self.selection_rect is not None and self.selection_rect.visible:
             # Update selection rectangle - use same method as picking for consistency
             r0, rd = self._ray_from_mouse(ev.pos)

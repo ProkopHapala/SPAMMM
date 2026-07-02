@@ -1333,27 +1333,39 @@ def loadMol(fname=None, fin=None, bReadN=False, nmax=10000 ):
         na = int(wds[0])
         nb = int(wds[1])
 
-    i_atom0 = i_counts + 1
-    i_bond0 = i_atom0 + na
-    if len(lines) < i_bond0 + nb:
-        raise ValueError(f"loadMol(): file truncated: need >= {i_bond0+nb} lines, have {len(lines)} fname={fname}")
+    # Skip blank lines between counts and atom block (some writers add them)
+    il = i_counts + 1
+    atom_lines = []
+    while il < len(lines) and len(atom_lines) < na:
+        if lines[il].strip():
+            atom_lines.append(lines[il])
+        il += 1
+    if len(atom_lines) < na:
+        raise ValueError(f"loadMol(): not enough atom lines: found {len(atom_lines)}, need {na} fname={fname}")
 
-    for il in range(i_atom0, i_atom0 + na):
-        line = lines[il]
+    for idx, line in enumerate(atom_lines):
         wds = line.split()
         if len(wds) < 4:
-            raise ValueError(f"loadMol(): bad atom line il={il} '{line.strip()}' fname={fname}")
+            raise ValueError(f"loadMol(): bad atom line idx={idx} '{line.strip()}' fname={fname}")
         x = float(wds[0]); y = float(wds[1]); z = float(wds[2])
         sym_raw = wds[3]
         sym = sym_raw.replace('.','_').split('_')[0]
         if sym not in elements.ELEMENT_DICT:
-            raise KeyError(f"loadMol(): unknown element symbol '{sym}' (raw='{sym_raw}') il={il} fname={fname}")
+            raise KeyError(f"loadMol(): unknown element symbol '{sym}' (raw='{sym_raw}') idx={idx} fname={fname}")
         xyzs.append((x,y,z))
         enames.append(sym_raw.replace('.', '_'))
         Zs.append(elements.ELEMENT_DICT[sym][0])
 
-    for il in range(i_bond0, i_bond0 + nb):
-        line = lines[il]
+    # Skip blank lines between atom and bond block
+    bond_lines = []
+    while il < len(lines) and len(bond_lines) < nb:
+        if lines[il].strip():
+            bond_lines.append(lines[il])
+        il += 1
+    if len(bond_lines) < nb:
+        raise ValueError(f"loadMol(): not enough bond lines: found {len(bond_lines)}, need {nb} fname={fname}")
+
+    for idx, line in enumerate(bond_lines):
         wds = line.split()
         a1 = None
         a2 = None
@@ -1377,9 +1389,9 @@ def loadMol(fname=None, fin=None, bReadN=False, nmax=10000 ):
             except Exception:
                 pass
         if a1 is None or a2 is None:
-            raise ValueError(f"loadMol(): bad bond line il={il} '{line.strip()}' fname={fname}")
+            raise ValueError(f"loadMol(): bad bond line idx={idx} '{line.strip()}' fname={fname}")
         if a1 < 0 or a2 < 0 or a1 >= na or a2 >= na:
-            raise ValueError(f"loadMol(): bond index out of range il={il} a1={a1} a2={a2} na={na} fname={fname}")
+            raise ValueError(f"loadMol(): bond index out of range idx={idx} a1={a1} a2={a2} na={na} fname={fname}")
         bonds.append((a1, a2))
 
     xyzs  = np.array(xyzs, dtype=np.float32)
@@ -1825,7 +1837,7 @@ def save_mol(fname, enames, apos, bonds, title="Avogadro", bond_types=None):
             #   x, y, z: each 10.4f (total width 10, with 4 decimal places)
             #   Atom symbol: left aligned in 3 characters
             #   Then 12 fields of 3 characters each set to 0.
-            atom_line = f"{atom_id:>3d} {x:10.4f}{y:10.4f}{z:10.4f} {symbol:<3s}" + "  0"*12
+            atom_line = f"{x:10.4f}{y:10.4f}{z:10.4f} {symbol:<3s}" + "  0"*12
             fout.write(atom_line + "\n")
         
         # --- Bond block ---
@@ -1844,7 +1856,7 @@ def save_mol(fname, enames, apos, bonds, title="Avogadro", bond_types=None):
             a2 = bond[1] + 1
             btyp = int(bond_types_[i]) if (bond_types_ is not None) else 1
             # Bond type then 4 fields of 0.
-            bond_line = f"{bond_id:>3d}{a1:>4d}{a2:>4d}{btyp:>4d}" + "  0"*4
+            bond_line = f"{a1:>3d}{a2:>3d}{btyp:>3d}  0  0  0  0"
             fout.write(bond_line + "\n")
         
         # --- Termination line ---

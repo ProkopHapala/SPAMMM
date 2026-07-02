@@ -127,7 +127,7 @@ class KekuleBackend:
     AtomicGraph contains Atom objects.  Each Atom carries:
         .pin     : (rx,ry) grid node key, or None (optional, invalidatable on grid transform)
         .parent  : Atom object (heavy atom this H belongs to), or None
-        .subtype : 'C_sp2', 'H_cap', etc.
+        .npi     : int, pi-orbital count. -1=H_cap, 0=sp3, 1=sp2 (default), 2=sp
     Rings are stored in graph.rings as {(q,r): Ring(atoms=[Atom,...])}
     """
 
@@ -178,23 +178,23 @@ class KekuleBackend:
         return [idx.get(a.parent._id) if a.parent is not None else None for a in atom_list]
 
     @property
-    def atom_subtype(self):
+    def atom_npi(self):
         atom_list, *_ = self.graph.to_arrays()
-        return [a.subtype for a in atom_list]
+        return [a.npi for a in atom_list]
 
-    @atom_subtype.setter
-    def atom_subtype(self, value):
+    @atom_npi.setter
+    def atom_npi(self, value):
         """Allow list assignment (used by adjust_h legacy path)."""
         atom_list, *_ = self.graph.to_arrays()
         for i, a in enumerate(atom_list):
             if i < len(value):
-                a.subtype = value[i]
+                a.npi = value[i]
 
-    def set_atom_subtype_by_index(self, atom_idx, subtype):
-        """Set subtype of atom at specific index directly."""
+    def set_atom_npi_by_index(self, atom_idx, npi):
+        """Set npi of atom at specific index directly."""
         atom_list, *_ = self.graph.to_arrays()
         if 0 <= atom_idx < len(atom_list):
-            atom_list[atom_idx].subtype = subtype
+            atom_list[atom_idx].npi = npi
 
     @property
     def ring_atoms(self):
@@ -237,14 +237,14 @@ class KekuleBackend:
         # Rebuild sys from graph
         self._sync_sys()
 
-    def _append_atom(self, pos, ename, pin=None, parent=None, subtype=''):
+    def _append_atom(self, pos, ename, pin=None, parent=None, npi=1):
         """Add atom to graph. parent may be int index (legacy) or Atom object."""
         atype = elements.ELEMENT_DICT[ename][0]
         if isinstance(parent, int):
             atom_list, *_ = self.graph.to_arrays()
             parent = atom_list[parent] if 0 <= parent < len(atom_list) else None
         a = self.graph.add_atom(np.array([pos[0], pos[1], pos[2] if len(pos) > 2 else 0.0]),
-                                ename, atype, pin=pin, parent=parent, subtype=subtype)
+                                ename, atype, pin=pin, parent=parent, npi=npi)
         return a  # return Atom object; callers that need int index use graph.to_arrays()
 
     def _sync_sys(self):
@@ -300,24 +300,11 @@ class KekuleBackend:
         """Find ring whose COG is within radius of position. Returns Ring or None."""
         return self.graph.pick_ring(pos, radius)
     
-    def _get_npi_from_subtype(self, subtype):
-        """Extract npi (number of pi bonds) from subtype string."""
-        if 'sp3' in subtype: return 0
-        elif 'sp2' in subtype: return 1
-        elif 'sp' in subtype: return 2
-        else: return 1  # Default to sp2
-
-    def _get_element_default_subtype(self, element):
-        """Return default subtype for a newly added element."""
-        if element == 'C':
-            return 'C_sp2'
-        elif element == 'N':
-            return 'N_sp2'
-        elif element == 'O':
-            return 'O_sp2'
-        elif element == 'H':
-            return 'H_cap'
-        return f'{element}_sp2'
+    def _get_element_default_npi(self, element):
+        """Return default npi for a newly added element. -1=H_cap, 0=sp3, 1=sp2, 2=sp."""
+        if element == 'H':
+            return -1
+        return 1  # sp2 default
     
     def _target_sigma(self, element, npi):
         """Target sigma bonds: nsigma = nval - npi - nepair.
@@ -347,7 +334,7 @@ class KekuleBackend:
             if nk not in n2a:
                 a = self.graph.add_atom(np.array([nk[0], nk[1], 0.0]),
                                         'C', elements.ELEMENT_DICT['C'][0],
-                                        pin=nk, parent=None, subtype='C_sp2')
+                                        pin=nk, parent=None, npi=1)
                 new_atoms.append(a)
         self.hex_tiles.add(key)
         if new_atoms:
@@ -431,12 +418,12 @@ class KekuleBackend:
         if a is not None:
             a.ename   = element
             a.atype   = elements.ELEMENT_DICT[element][0]
-            a.subtype = self._get_element_default_subtype(element)
+            a.npi = self._get_element_default_npi(element)
         else:
             self.graph.add_atom(np.array([node_key[0], node_key[1], 0.0]),
                                 element, elements.ELEMENT_DICT[element][0],
                                 pin=node_key, parent=None,
-                                subtype=self._get_element_default_subtype(element))
+                                npi=self._get_element_default_npi(element))
             # Create bond to nearest heavy atom (not H cap) within cutoff
             a = self.graph._pin_to_atom[node_key]
             self._create_bond_to_nearest_heavy(a)
@@ -453,7 +440,7 @@ class KekuleBackend:
             a = atom_list[atom_idx]
             a.ename = element
             a.atype = elements.ELEMENT_DICT[element][0]
-            a.subtype = self._get_element_default_subtype(element)
+            a.npi = self._get_element_default_npi(element)
             if self.auto_h_cap:
                 self.adjust_h()
             self._sync_sys()
@@ -469,7 +456,7 @@ class KekuleBackend:
         
         # Find nearest heavy atom (not H cap)
         for a in self.graph.atoms.values():
-            if not a.alive or a == atom or a.subtype == 'H_cap':
+            if not a.alive or a == atom or a.npi == -1:
                 continue
             dist = np.linalg.norm(atom.pos - a.pos)
             if dist < min_dist:
@@ -516,8 +503,7 @@ class KekuleBackend:
         """Set npi (pi bond count) for atom at node_key. npi in {0,1,2}."""
         a = self.graph._pin_to_atom.get(node_key)
         if a is None: return
-        sp_map = {0: 'sp3', 1: 'sp2', 2: 'sp'}
-        a.subtype = f"{a.ename}_{sp_map.get(npi, 'sp2')}"
+        a.npi = npi
         if self.auto_h_cap:
             self.adjust_h()
 
@@ -534,7 +520,7 @@ class KekuleBackend:
             ename=element,
             pin=None,  # Not pinned to grid
             parent=None,
-            subtype=f"{element}_sp2" if npi == 1 else f"{element}_sp3"
+            npi=npi
         )
         self.recalc_bonds(skip_sync=True)
         if self.auto_h_cap:
@@ -602,17 +588,17 @@ class KekuleBackend:
             return
         a.ename = element
         a.atype = elements.ELEMENT_DICT[element][0]
-        a.subtype = self._get_element_default_subtype(element)
+        a.npi = self._get_element_default_npi(element)
         if self.auto_h_cap:
             self.adjust_h()
         self._sync_sys()
 
-    def set_atom_subtype_by_id(self, atom_id, subtype):
-        """Set subtype of atom by stable Atom._id."""
+    def set_atom_npi_by_id(self, atom_id, npi):
+        """Set npi of atom by stable Atom._id."""
         a = self.graph.atoms.get(atom_id)
         if a is None or not a.alive:
             return
-        a.subtype = subtype
+        a.npi = npi
 
     def remove_atom_by_index(self, atom_idx):
         """Remove atom at specific index (independent of grid).
@@ -625,16 +611,18 @@ class KekuleBackend:
             self.adjust_h()
         self._sync_sys()
 
-    def insert_atom_into_bond(self, bond, new_ename='C'):
-        """Insert a new atom into the middle of a bond, pushing original atoms aside.
+    def insert_atom_into_bond(self, bond, new_ename='C', push_aside=True):
+        """Insert a new atom into the middle of a bond.
         
         Original bond A-B becomes A-C-B where:
         - C is at the center of original A-B bond
-        - A and B are pushed aside to satisfy A-C and B-C bond lengths
+        - If push_aside=True: A and B are pushed aside to satisfy A-C and B-C bond lengths
+        - If push_aside=False: A and B stay in place (C at center, shorter bonds)
         
         Args:
             bond: Bond object (from graph.pick_bond())
             new_ename: Element name for new atom (default 'C')
+            push_aside: If True, move A and B to maintain bond lengths
         
         Returns:
             The newly created Atom object
@@ -663,16 +651,14 @@ class KekuleBackend:
         # Direction from center to B (opposite)
         dir_b = -dir_a
         
-        # Push A and B aside to satisfy bond lengths
-        new_pos_a = center + dir_a * bl
-        new_pos_b = center + dir_b * bl
-        
-        # Update positions of A and B (in the Atom objects!)
-        atom_a.pos = new_pos_a
-        atom_b.pos = new_pos_b
-        
-        debug_print(1, f"  Moved Atom({atom_a._id}) to {new_pos_a[:2]}")
-        debug_print(1, f"  Moved Atom({atom_b._id}) to {new_pos_b[:2]}")
+        if push_aside:
+            # Push A and B aside to satisfy bond lengths
+            new_pos_a = center + dir_a * bl
+            new_pos_b = center + dir_b * bl
+            atom_a.pos = new_pos_a
+            atom_b.pos = new_pos_b
+            debug_print(1, f"  Moved Atom({atom_a._id}) to {new_pos_a[:2]}")
+            debug_print(1, f"  Moved Atom({atom_b._id}) to {new_pos_b[:2]}")
         
         # Mark original bond as dead (soft delete)
         bond.alive = False
@@ -680,16 +666,13 @@ class KekuleBackend:
         
         # Add new atom C at center (using graph!)
         new_atom = self.graph.add_atom(center, new_ename, elements.ELEMENT_DICT[new_ename][0],
-                                       pin=None, parent=None, subtype=f'{new_ename}_sp2')
+                                       pin=None, parent=None, npi=1)
         debug_print(1, f"  Created new Atom({new_atom._id}) at center {center[:2]}")
         
         # Add new bonds A-C and B-C (using graph!)
         bond_ac = self.graph.add_bond(atom_a, new_atom)
         bond_bc = self.graph.add_bond(atom_b, new_atom)
         debug_print(1, f"  Created new bonds: {bond_ac._id} (A-C), {bond_bc._id} (B-C)")
-        
-        # Sync neighbor lists (new bonds were created)
-        self.graph.sync_neighbor_lists()
         
         # Sync sys from graph
         self._sync_sys()
@@ -810,13 +793,40 @@ class KekuleBackend:
         
         return survivor
 
+    def delete_bond(self, bond):
+        """Delete a bond (soft-delete only, keep both atoms)."""
+        if bond is None or not bond.alive: return
+        self.graph.remove_bond(bond)  # local neighbor update in remove_bond
+        self._sync_sys()
+        self._rings_dirty = True
+        if self.auto_h_cap:
+            self.adjust_h()
+
+    def remove_atom_with_bridge(self, atom_id):
+        """Remove atom and bridge its 2 heavy neighbors with a new bond (inverse of insert_atom_into_bond).
+        Only bridges if exactly 2 heavy neighbors (excluding H caps) and they're not already bonded."""
+        a = self.graph.atoms.get(atom_id)
+        if a is None or not a.alive: return
+        heavy_neighs = [n for n in a.neighbors if n.alive and n.npi != -1]
+        for h in self.graph.h_children(a):
+            self.graph.remove_atom(h)
+        if len(heavy_neighs) == 2:
+            n1, n2 = heavy_neighs
+            already_bonded = any(b.other(n1) is n2 for b in n1.bonds if b.alive)
+            if not already_bonded:
+                self.graph.add_bond(n1, n2)
+        self.graph.remove_atom(a)
+        if self.auto_h_cap:
+            self.adjust_h()
+        self._sync_sys()
+
     def remove_h_caps(self):
         """Soft-delete all H cap atoms (flip alive=False). No compaction.
         
         Dead H caps stay in graph.atoms dict but are filtered by to_arrays().
         cleanup_invalid() is deferred — called only when explicit compaction is needed.
         """
-        for h in [a for a in list(self.graph.atoms.values()) if a.subtype == 'H_cap' and a.alive]:
+        for h in [a for a in list(self.graph.atoms.values()) if a.npi == -1 and a.alive]:
             for b in h.bonds:
                 b.alive = False
             h.alive = False
@@ -834,12 +844,12 @@ class KekuleBackend:
             if not a.alive or a.ename in {'H', 'E'}:
                 continue
             
-            npi = self._get_npi_from_subtype(a.subtype)
+            npi = a.npi
             target = self._target_sigma(a.ename, npi)
             
             # Count heavy atom neighbors (excluding H caps and dead atoms)
             # n.alive filter handles stale neighbor lists after soft-delete — no sync needed
-            heavy_neighbors = [n for n in a.neighbors if n.alive and n.subtype != 'H_cap']
+            heavy_neighbors = [n for n in a.neighbors if n.alive and n.npi != -1]
             current = len(heavy_neighbors)
             n_missing = target - current
             
@@ -858,7 +868,7 @@ class KekuleBackend:
                 h_pos = pos_a + direction * bl
                 # Add H cap to graph with explicit bond
                 h_atom = self.graph.add_atom(h_pos, 'H', elements.ELEMENT_DICT['H'][0],
-                                            pin=None, parent=a, subtype='H_cap')
+                                            pin=None, parent=a, npi=-1)
                 self.graph.add_bond(a, h_atom)  # Explicit bond between heavy atom and H
                 added_h_atoms.append(h_atom)
                 debug_print(3, f"  Added H cap to Atom({a._id}) at {h_pos[:2]}")
@@ -1011,7 +1021,7 @@ class KekuleBackend:
         Call after grid transform changes. Atoms not near any grid node get pin=None."""
         pin_map = {}
         for a in self.graph.atoms.values():
-            if not a.alive or a.ename in ('H', 'E') or a.subtype == 'H_cap':
+            if not a.alive or a.ename in ('H', 'E') or a.npi == -1:
                 pin_map[a] = None
                 continue
             nk = self.grid.snap_to_node(a.pos[0], a.pos[1], tol=0.3)
@@ -1079,6 +1089,81 @@ class KekuleBackend:
         self.graph.update_positions_from_array(self.sys.apos)
         return E, forces, lvs
 
+    def save_structure(self, fname):
+        """Save current structure to file. Dispatch on extension: .xyz, .mol, .mol2."""
+        ext = fname.split('.')[-1].lower()
+        if ext == 'xyz':
+            self.save_xyz(fname)
+        elif ext == 'mol':
+            self._sync_sys()
+            self.sys.save_mol(fname)
+        elif ext == 'mol2':
+            self._sync_sys()
+            self.sys.save_mol2(fname)
+        else:
+            raise ValueError(f"Unknown export format: .{ext}")
+
+    def load_structure(self, fname):
+        """Load structure from file. Dispatch on extension: .xyz, .mol, .mol2."""
+        ext = fname.split('.')[-1].lower()
+        if ext == 'xyz':
+            self.load_xyz(fname)
+        elif ext in ('mol', 'mol2'):
+            self.load_mol(fname)
+        else:
+            raise ValueError(f"Unknown import format: .{ext}")
+
+    def load_mol(self, fname):
+        """Load a system from a .mol or .mol2 file. Uses explicit bonds from file."""
+        self.graph = AtomicGraph()
+        from spammm import atomicUtils as au
+        ext = fname.split('.')[-1].lower()
+        if ext == 'mol':
+            apos, Zs, es, qs, bonds = au.loadMol(fname)
+            lvec = None
+        else:  # mol2
+            tmp = au.loadMol2(fname)
+            apos, Zs, es, qs, bonds, lvec = tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5]
+        # Add heavy atoms
+        atoms_map = {}  # file index → Atom object
+        for i, e in enumerate(es):
+            if e in ('H', 'E'): continue
+            pos = apos[i]
+            nk = self.grid.snap_to_node(pos[0], pos[1], tol=0.3)
+            a = self.graph.add_atom(np.array([pos[0], pos[1], pos[2] if len(pos) > 2 else 0.0]),
+                                    e, elements.ELEMENT_DICT[e][0],
+                                    pin=nk, parent=None,
+                                    npi=self._get_element_default_npi(e))
+            atoms_map[i] = a
+        # Add bonds from file (only between heavy atoms that were added)
+        if bonds is not None and len(bonds) > 0:
+            for col in bonds:
+                i, j = int(col[0]), int(col[1])
+                if i in atoms_map and j in atoms_map:
+                    self.graph.add_bond(atoms_map[i], atoms_map[j])
+        else:
+            # No bonds in file — use distance heuristic
+            heavy_atoms = [a for a in self.graph.atoms.values() if a.alive and a.ename not in ('H', 'E')]
+            for a in heavy_atoms:
+                self._create_bond_to_nearest_heavy(a)
+        self.graph.sync_neighbor_lists()
+        self._guess_rings()
+        # Add H atoms
+        heavy = [a for a in self.graph.atoms.values() if a.ename not in ('H', 'E')]
+        for i, e in enumerate(es):
+            if e != 'H': continue
+            p = apos[i]
+            best_d, best_a = float('inf'), None
+            for a in heavy:
+                d = float(np.linalg.norm(p - a.pos))
+                if d < best_d: best_d = d; best_a = a
+            if best_a is not None and best_d < 1.5:
+                self.graph.add_atom(np.array(p, dtype=np.float64), 'H',
+                                    elements.ELEMENT_DICT['H'][0],
+                                    pin=None, parent=best_a, npi=-1)
+        self.graph.sync_neighbor_lists()
+        self._sync_sys()
+
     def get_xyz_string(self):
         """Return the current system as an XYZ formatted string."""
         s = f"{len(self.sys.apos)}\n"
@@ -1109,7 +1194,7 @@ class KekuleBackend:
             self.graph.add_atom(np.array([pos[0], pos[1], pos[2] if len(pos) > 2 else 0.0]),
                                 e, elements.ELEMENT_DICT[e][0],
                                 pin=nk, parent=None,
-                                subtype=self._get_element_default_subtype(e))
+                                npi=self._get_element_default_npi(e))
         # Create bonds for all heavy atoms (no recalc_bonds!)
         heavy_atoms = [a for a in self.graph.atoms.values() if a.alive and a.ename not in ('H', 'E')]
         for a in heavy_atoms:
@@ -1128,7 +1213,7 @@ class KekuleBackend:
             if best_a is not None and best_d < 1.5:
                 self.graph.add_atom(np.array(p, dtype=np.float64), 'H',
                                     elements.ELEMENT_DICT['H'][0],
-                                    pin=None, parent=best_a, subtype='H_cap')
+                                    pin=None, parent=best_a, npi=-1)
         # Sync after loading H atoms (bonds already created above)
         self.graph.sync_neighbor_lists()
         self._sync_sys()
@@ -1160,7 +1245,7 @@ class KekuleBackend:
         a = atom_list[ia]
         a.ename   = element
         a.atype   = elements.ELEMENT_DICT[element][0]
-        a.subtype = self._get_element_default_subtype(element)
+        a.npi = self._get_element_default_npi(element)
 
     def _add_passivation_h(self, ia, bond_length=1.09):
         """Add a single H atom in the missing bond direction of atom ia."""
@@ -1171,7 +1256,7 @@ class KekuleBackend:
         nb = len(heavy_neighs)
         direction = self.sys._missing_sp2_direction(ia, heavy_neighs, nb, 0)
         h_pos = pos + direction * bond_length
-        self._append_atom(h_pos, 'H', parent=ia, subtype='H_cap')
+        self._append_atom(h_pos, 'H', parent=ia, npi=-1)
 
     def _identify_edge_atoms(self):
         """Identify edge atoms of a ribbon patch.
@@ -1411,7 +1496,7 @@ class KekuleBackend:
                     # Add atom at C_pos + coords (swap x and y for side edges)
                     # y becomes x-direction for side edges
                     pos_new = [pos_C[0] + y * direction, pos_C[1] + x, pos_C[2] + z]
-                    a = self._append_atom(pos_new, elem, subtype='H_cap')
+                    a = self._append_atom(pos_new, elem, npi=-1)
                     # Create bond to nearest heavy atom
                     self._create_bond_to_nearest_heavy(a)
 
@@ -1605,7 +1690,7 @@ class KekuleBackend:
 
             for i in range(length_cells):
                 x = i * x_periodicity + x_shift
-                self._append_atom([x, y, 0.0], 'C', subtype='C_sp2')
+                self._append_atom([x, y, 0.0], 'C', npi=1)
 
                 # Add bonds to previous row
                 if row > 0:
@@ -1689,7 +1774,7 @@ class KekuleBackend:
             else:
                 # Add atom at C_pos + scaled coords
                 pos_new = [pos_C[0] + x, pos_C[1] + y * direction, pos_C[2] + z]
-                self._append_atom(pos_new, elem, subtype='H_cap')
+                self._append_atom(pos_new, elem, npi=-1)
 
     def combine_ribbons(self, backend1, backend2, L_Hb=2.0, shift_x=0.0):
         """Combine two single ribbons into a two-ribbon system with hydrogen-bond gap.
@@ -1884,7 +1969,7 @@ class KekuleBackend:
                 self._set_atom_element(ia, elem)
             else:
                 pos_new = [pos_C[0] + x, pos_C[1] + y * direction, pos_C[2] + z]
-                self._append_atom(pos_new, elem, subtype='H_cap')
+                self._append_atom(pos_new, elem, npi=-1)
 
     def _apply_side_passivation(self, passivation):
         """Apply passivation to side edges (left/right) of the combined two-ribbon system.
@@ -1939,7 +2024,7 @@ class KekuleBackend:
                     # Add atom at C_pos + coords (swap x and y for side edges)
                     # y becomes x-direction for side edges
                     pos_new = [pos_C[0] + y * direction, pos_C[1] + x, pos_C[2] + z]
-                    self._append_atom(pos_new, elem, subtype='H_cap')
+                    self._append_atom(pos_new, elem, npi=-1)
 
     def report_state(self):
         """Print summary of the backend state for debugging."""

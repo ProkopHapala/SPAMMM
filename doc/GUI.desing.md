@@ -24,18 +24,18 @@ Interactive molecular editor for designing carbon-based nanostructures (graphene
 
 ## Edit Modes
 
-| Mode | LMB | RMB | Description |
-|------|-----|-----|-------------|
-| **Hex1** (paint) | Add hex ring | Remove hex ring | Force add/remove; shared atoms between rings are also removed |
-| **Hex2** (toggle) | Add hex ring | Remove hex ring (preserve shared) | Like Hex1 but preserves atoms shared with neighboring rings |
-| **Atom** | Add atom / change type | Delete atom | Free placement at click position; if near existing atom, changes its type |
-| **Bond** | Insert atom into bond | Collapse bond (merge two atoms into one) | Click on a bond to split it with a new atom; RMB to merge |
-| **pi** | Cycle pi-orbital count (0→1→2→0) | Delete atom | Adjust hybridization (sp3→sp2→sp) on clicked atom |
-| **Select** | Drag selected atoms | Rectangle select / Delete | RMB drag = selection box; Delete = remove selected; Ctrl-C/V = copy/paste |
+| Mode | LMB | Ctrl+LMB | RMB | Ctrl+RMB | Description |
+|------|-----|----------|-----|----------|-------------|
+| **Hex1** (paint) | Add hex ring | — | Remove hex ring | — | Force add/remove; shared atoms between rings are also removed |
+| **Hex2** (toggle) | Add hex ring | — | Remove hex ring (preserve shared) | — | Like Hex1 but preserves atoms shared with neighboring rings |
+| **Atom** | Click: change type / Drag: move atom / Empty: add atom | Drag: create bond (rubber-band) | Delete atom | Delete atom + bridge neighbors | Free atom placement, drag-to-bond, type change |
+| **Bond** | Insert atom (no push) | Insert atom (push aside) | Delete bond | Collapse bond (merge atoms) | Edit existing bonds with Ctrl for atom adjustment |
+| **pi** | Cycle pi-orbital count (0→1→2→0) | — | Delete atom | — | Adjust hybridization (sp3→sp2→sp) on clicked atom |
+| **Select** | Drag selected atoms | — | Rectangle select / Delete | — | RMB drag = selection box; Delete = remove selected; Ctrl-C/V = copy/paste |
 
 ### Atom types
 - Available: C, N, O (selectable via combo box)
-- Each atom gets a subtype (e.g. `C_sp2`, `N_sp3`, `H_cap`) inferred from element and bonding
+- Each atom has an `npi` integer field (pi-orbital count): `-1`=H_cap, `0`=sp3, `1`=sp2 (default), `2`=sp
 - H caps auto-added/removed when `Auto H` is enabled (default: on)
 
 ---
@@ -84,7 +84,9 @@ Pre-built nanoribbon generator for quick starts:
 | Button | Action |
 |--------|--------|
 | **LMB** | Mode-dependent (add/toggle/insert — see Edit Modes) |
+| **Ctrl+LMB drag** (Atom mode) | Create bond between two atoms (rubber-band line, green target highlight) |
 | **RMB** | Mode-dependent (remove/collapse/select — see Edit Modes) |
+| **Ctrl+RMB** (Atom mode) | Delete atom + bridge its 2 heavy neighbors with a new bond |
 | **Middle-click** | Toggle H state on nearest atom |
 | **Scroll** | Zoom in/out |
 | **RMB drag** (Select mode) | Rectangle selection |
@@ -96,6 +98,7 @@ Pre-built nanoribbon generator for quick starts:
 | **Delete** | Remove all selected atoms (Select mode) |
 | **Ctrl+C** | Copy selected atoms to clipboard |
 | **Ctrl+V** | Paste copied atoms at original positions (duplicate) |
+| **Ctrl+Z** | Undo last topology change |
 | **Arrow keys** | Pan camera |
 
 ### Picking
@@ -169,9 +172,12 @@ Extensions that fail to load (missing dependency) show a grayed-out panel with t
 | Remove hex ring | `remove_ring(q, r)` | Soft-deletes ring atoms (Hex2 preserves shared) |
 | Add free atom | `_append_atom(pos, ename)` | Places atom at exact position, bonds to nearest heavy |
 | Delete atom | `remove_atom_by_id(id)` | O(1) soft-delete + H cap cleanup + `adjust_h()` |
+| Delete atom + bridge | `remove_atom_with_bridge(id)` | Remove atom + connect its 2 heavy neighbors (inverse of insert) |
 | Batch delete | `remove_atoms_by_id(ids)` | Collect all, soft-delete each, one `_sync_sys()` |
 | Change atom type | `set_atom_type_by_id(id, ename)` | Mutates element, adjusts H caps |
-| Insert into bond | `insert_atom_into_bond(bond, ename)` | Splits bond with new atom |
+| Create bond | `graph.add_bond(a, b)` | Idempotent — returns existing if already bonded. Local neighbor update. |
+| Delete bond | `delete_bond(bond)` | Soft-delete bond only, keep both atoms |
+| Insert into bond | `insert_atom_into_bond(bond, ename, push_aside)` | Splits bond with new atom; `push_aside` controls if A/B move |
 | Collapse bond | `collapse_bond(bond, pos)` | Merges two atoms into one at given position |
 | Adjust H caps | `adjust_h()` | Remove all H caps → re-add based on valency |
 | Recalculate bonds | `recalc_bonds()` | Distance-based bond detection (dangerous: may create spurious bonds) |
@@ -180,7 +186,7 @@ Extensions that fail to load (missing dependency) show a grayed-out panel with t
 
 ### Hydrogen cap management
 - `Auto H` (default on): Automatically adds/removes H atoms to satisfy valency
-- H caps are `Atom` objects with `subtype='H_cap'` and `parent=<heavy_atom>`
+- H caps are `Atom` objects with `npi=-1` and `parent=<heavy_atom>`
 - `adjust_h()` = `remove_h_caps()` + `add_h_caps()` + `_sync_sys()`
 - Removing a heavy atom also removes its H caps
 
@@ -204,11 +210,17 @@ Pre-defined edge terminations for ribbons:
 
 2. **Index vs ID:** Array indices are ephemeral (rebuilt on every `_sync_sys()`). All signals and persistent state use `Atom._id`. Mapping arrays (`_atom_ids`, `_id_to_idx`) bridge the two but are only valid within one render frame.
 
-3. **Soft-delete:** Atoms are marked `alive=False`, not removed from dict. `to_arrays()` filters them out. `cleanup_invalid()` is deferred — not called after every deletion. Neighbor queries must filter by `n.alive`.
+3. **Soft-delete:** Atoms are marked `alive=False`, not removed from dict. `to_arrays()` filters them out. `cleanup_invalid()` is deferred — not called after every deletion. Neighbor queries must filter by `n.alive` and `n.npi != -1` (exclude H caps).
 
-4. **Double event handling:** Both `AtomScene` and `SPAMMM_GUI` handle `mouse_press`. Mode checks prevent conflicts. `ev.handled = True` does NOT stop other callbacks in Vispy.
+4. **Local neighbor updates:** `add_bond` and `remove_bond` update `atom.neighbors` in-place (O(degree)). Global `sync_neighbor_lists()` is only needed for bulk operations (ring add/remove, `collapse_bond`).
 
-5. **`adjust_h()` reorders arrays:** H caps are removed and re-added, completely changing array ordering. This is why ID-based operations are essential — indices before `adjust_h()` are invalid after.
+5. **Double event handling:** Both `AtomScene` and `SPAMMM_GUI` handle `mouse_press`. Mode checks prevent conflicts. `ev.handled = True` does NOT stop other callbacks in Vispy.
+
+6. **`adjust_h()` reorders arrays:** H caps are removed and re-added, completely changing array ordering. This is why ID-based operations are essential — indices before `adjust_h()` are invalid after.
+
+7. **Undo stack:** `UndoStack(maxlen=100)` stores `PackedMolecule` snapshots. `_push_undo()` is called before all graph mutations. Ctrl+Z restores previous state.
+
+8. **Clipboard:** `PackedMolecule` serializes selected atoms + internal bonds. Ctrl+C stores packed + Qt clipboard (MOL/XYZ text). Ctrl+V rebuilds from packed.
 
 See `doc/GUI_topology_edit.desing.md` for detailed internal design and bug history.
 

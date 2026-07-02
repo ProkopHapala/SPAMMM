@@ -201,7 +201,7 @@ class TestChangeHybridization:
 
         snap_after = TopologySnapshot(b.graph)
         a = b.graph._pin_to_atom.get(node_key)
-        assert 'sp3' in a.subtype, f'Expected sp3 subtype, got {a.subtype}'
+        assert a.npi == 0, f'Expected sp3 (npi=0), got npi={a.npi}'
         _maybe_render(visual_output_dir, 'test_06_change_hybridization',
                       graph_before, b,
                       highlight_atoms={heavy[0]._id},
@@ -489,9 +489,9 @@ class TestDetectRings:
         # Add 2 extra atoms bonded to an edge atom (not part of any ring)
         heavy = [a for a in b.graph.atoms.values() if a.alive and a.ename == 'C']
         edge_atom = heavy[0]
-        extra1 = b.graph.add_atom(edge_atom.pos + np.array([0.0, 2.5, 0.0]), 'C', 6, subtype='C_sp2')
+        extra1 = b.graph.add_atom(edge_atom.pos + np.array([0.0, 2.5, 0.0]), 'C', 6, npi=1)
         b.graph.add_bond(edge_atom, extra1)
-        extra2 = b.graph.add_atom(extra1.pos + np.array([1.42, 0.0, 0.0]), 'C', 6, subtype='C_sp2')
+        extra2 = b.graph.add_atom(extra1.pos + np.array([1.42, 0.0, 0.0]), 'C', 6, npi=1)
         b.graph.add_bond(extra1, extra2)
         b.graph.sync_neighbor_lists()
         # Clear any existing rings to show detection creating them

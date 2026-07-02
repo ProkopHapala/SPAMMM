@@ -23,7 +23,7 @@ Design principles:
 
 Public API:
   graph = AtomicGraph()
-  a = graph.add_atom(pos, ename, pin=None, parent=None, subtype='C_sp2')
+  a = graph.add_atom(pos, ename, pin=None, parent=None, npi=1)  # npi: -1=H_cap, 0=sp3, 1=sp2, 2=sp
   graph.remove_atom(a)          # removes a and all its bonds; caller handles rings
   b = graph.add_bond(a1, a2)
   graph.remove_bond(b)
@@ -34,13 +34,15 @@ Public API:
 
 import numpy as np
 
+DEBUG = True  # Set True to enable topology consistency checks
+
 # ─── Atom ───────────────────────────────────────────────────────────────────
 
 class Atom:
-    __slots__ = ('pos', 'ename', 'atype', 'pin', 'parent', 'subtype', 'bonds', 'neighbors', '_id', 'alive')
+    __slots__ = ('pos', 'ename', 'atype', 'pin', 'parent', 'npi', 'bonds', 'neighbors', '_id', 'alive')
     _counter = 0
 
-    def __init__(self, pos, ename, atype, pin=None, parent=None, subtype=''):
+    def __init__(self, pos, ename, atype, pin=None, parent=None, npi=1):
         Atom._counter += 1
         self._id = Atom._counter
         self.alive   = True         # False = marked for deletion, will be cleaned up
@@ -49,7 +51,8 @@ class Atom:
         self.atype   = atype        # integer Z
         self.pin     = pin          # (rx, ry) grid node key or None
         self.parent  = parent       # Atom object (heavy atom this H belongs to) or None
-        self.subtype = subtype      # 'C_sp2', 'N_sp3', 'H_cap', etc.
+        # npi: pi-orbital count. -1=H_cap, 0=sp3, 1=sp2 (default), 2=sp
+        self.npi     = npi
         self.bonds   = []           # list of Bond objects involving this atom
         self.neighbors = []         # list of neighboring Atoms (derived from bonds)
 
@@ -153,8 +156,8 @@ class AtomicGraph:
 
     # ── Atom operations ──────────────────────────────────────────────────────
 
-    def add_atom(self, pos, ename, atype, pin=None, parent=None, subtype='') -> Atom:
-        a = Atom(pos, ename, atype, pin=pin, parent=parent, subtype=subtype)
+    def add_atom(self, pos, ename, atype, pin=None, parent=None, npi=1) -> Atom:
+        a = Atom(pos, ename, atype, pin=pin, parent=parent, npi=npi)
         self.atoms[a._id] = a
         if pin is not None:
             assert pin not in self._pin_to_atom, f"Duplicate pin {pin} (existing={self._pin_to_atom[pin]}, new={a})"
@@ -172,6 +175,10 @@ class AtomicGraph:
             # Also mark all its bonds as dead
             for b in atom.bonds:
                 b.alive = False
+            # Remove from pin cache so dead atoms don't block re-adding at same grid node
+            if atom.pin is not None:
+                self._pin_to_atom.pop(atom.pin, None)
+                atom.pin = None
         else:
             # Hard deletion: immediate removal
             for b in list(atom.bonds):
@@ -222,9 +229,9 @@ class AtomicGraph:
                 bond.b.neighbors.append(bond.a)
 
     def h_children(self, heavy_atom: Atom) -> list:
-        """Return list of H atoms (subtype='H_cap') that have parent=heavy_atom."""
+        """Return list of H cap atoms (npi=-1) that have parent=heavy_atom."""
         return [a for a in self.atoms.values() 
-                if a.alive and a.subtype == 'H_cap' and a.parent is heavy_atom]
+                if a.alive and a.npi == -1 and a.parent is heavy_atom]
 
     def atom_at_pin(self, pin) -> 'Atom | None':
         return self._pin_to_atom.get(pin)
@@ -239,6 +246,8 @@ class AtomicGraph:
         self.bonds[bond._id] = bond
         a.bonds.append(bond)
         b.bonds.append(bond)
+        a.neighbors.append(b)
+        b.neighbors.append(a)
         return bond
 
     def remove_bond(self, bond: Bond):
@@ -247,12 +256,19 @@ class AtomicGraph:
     def _remove_bond_internal(self, bond: Bond, hard=False):
         if bond._id not in self.bonds:
             return
+        # Validate neighbor consistency before removal (debug only)
+        if DEBUG and (bond.b not in bond.a.neighbors or bond.a not in bond.b.neighbors):
+            raise RuntimeError(f"remove_bond: inconsistent topology — bond {bond._id} atoms not in each other's neighbor lists")
         if hard:
             bond.a.bonds = [b for b in bond.a.bonds if b is not bond]
             bond.b.bonds = [b for b in bond.b.bonds if b is not bond]
+            bond.a.neighbors.remove(bond.b)
+            bond.b.neighbors.remove(bond.a)
             del self.bonds[bond._id]
         else:
             bond.alive = False
+            bond.a.neighbors.remove(bond.b)
+            bond.b.neighbors.remove(bond.a)
 
     def get_bond(self, a: Atom, b: Atom) -> 'Bond | None':
         for bond in a.bonds:

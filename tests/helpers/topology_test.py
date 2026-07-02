@@ -34,7 +34,7 @@ class TopologySnapshot:
     """
 
     def __init__(self, graph):
-        self.atoms = {a._id: (a.ename, a.subtype)
+        self.atoms = {a._id: (a.ename, a.npi)
                       for a in graph.atoms.values() if a.alive}
         self.bonds = {frozenset((b.a._id, b.b._id)): b.order
                       for b in graph.bonds.values() if b.alive and b.a.alive and b.b.alive}

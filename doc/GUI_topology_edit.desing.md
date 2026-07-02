@@ -32,9 +32,10 @@ The central design challenge: **topology operations need flexibility (add/remove
 
 - `Atom.alive` (bool) — `True` by default, `False` when soft-deleted.
 - `Bond.alive` and `Ring.alive` — same pattern.
-- `remove_atom(soft=True)` flips `alive=False` and marks all its bonds dead. O(1) + O(degree).
+- `remove_atom(soft=True)` flips `alive=False`, marks all its bonds dead, and **removes the atom from `_pin_to_atom` cache** (sets `atom.pin = None`). O(1) + O(degree).
 - Dead atoms **stay in `atoms` dict** but are filtered out by `to_arrays()`.
 - `cleanup_invalid()` prunes all dead objects from dicts — **deferred, not called after every deletion**.
+- **Pin cache cleanup on soft-delete** ensures dead atoms don't block re-adding live atoms at the same grid node (e.g., add→remove→add ring cycle).
 
 ### Why soft-delete?
 
@@ -58,8 +59,19 @@ The central design challenge: **topology operations need flexibility (add/remove
 
 ### `h_children()` is O(N)
 
-- Iterates all atoms to find children by `parent` attribute.
+- Iterates all atoms to find children by `parent` attribute and `npi == -1` (H_cap).
 - For ~100 atoms this is fine. If it becomes a bottleneck, store a `children: list` on each `Atom`.
+
+### Atom hybridization: `npi` (int, not string)
+
+- `Atom.npi` is an **integer** representing pi-orbital count:
+  - `npi = -1` → H_cap (hydrogen cap, not a hybridization state)
+  - `npi = 0`  → sp3 (tetrahedral, 0 pi orbitals)
+  - `npi = 1`  → sp2 (trigonal planar, 1 pi orbital) — **default**
+  - `npi = 2`  → sp (linear, 2 pi orbitals)
+- **No string subtypes** — the old `subtype` field (e.g., `'C_sp2'`, `'H_cap'`) has been fully replaced by `npi`.
+- H caps are identified by `npi == -1` (not by string matching).
+- `add_atom(pos, ename, atype, pin=None, parent=None, npi=1)` — `npi` parameter replaces old `subtype`.
 
 ---
 
@@ -94,20 +106,24 @@ These are **stale between `_sync_sys()` calls** — but nobody uses them during 
 
 ### `adjust_h()` — H cap management
 
-- `remove_h_caps()` — soft-deletes all H caps (flip `alive=False`). No `cleanup_invalid()`.
-- `add_h_caps()` — appends new H `Atom` objects to graph. Uses `n.alive` filter in neighbor queries to handle stale neighbor lists.
+- `remove_h_caps()` — soft-deletes all H caps (atoms with `npi == -1`, flip `alive=False`). No `cleanup_invalid()`.
+- `add_h_caps()` — appends new H `Atom` objects to graph with `npi=-1`. Uses `n.alive` and `n.npi != -1` filters in neighbor queries to handle stale neighbor lists.
 - `adjust_h()` = `remove_h_caps()` + `add_h_caps()` + `_sync_sys()`.
 - Old dead H caps stay in dict but are filtered by `to_arrays()`.
+- `_get_element_default_npi(element)` — returns `-1` for H, `1` (sp2) for all others. Replaces old `_get_element_default_subtype()`.
+- `atom_npi` property — returns list of `a.npi` for all alive atoms. Replaces old `atom_subtype`.
+- `set_atom_npi_by_id(atom_id, npi)` — sets `npi` directly on atom by stable `_id`. Replaces old `set_atom_subtype_by_id()`.
+- `_target_sigma(element, npi)` — electron counting: `nsigma = nval - npi - nepair`. Uses `npi` directly (no string parsing).
 
 ### Caveat: neighbor queries after soft-delete
 
 After soft-delete, `Atom.neighbors` lists may contain dead atoms. **All neighbor queries must filter by `n.alive`**:
 
 ```python
-heavy_neighbors = [n for n in a.neighbors if n.alive and n.subtype != 'H_cap']
+heavy_neighbors = [n for n in a.neighbors if n.alive and n.npi != -1]
 ```
 
-This is the key insight that allows deferring `sync_neighbor_lists()` — consumers simply skip dead neighbors.
+This is the key insight that allows deferring `sync_neighbor_lists()` — consumers simply skip dead neighbors and H caps by checking `n.alive` and `n.npi != -1`.
 
 ---
 
@@ -237,7 +253,7 @@ After soft-delete (`atom.alive = False`), the atom's neighbors still have it in 
 **All neighbor queries must filter by `n.alive`:**
 
 ```python
-heavy_neighbors = [n for n in a.neighbors if n.alive and n.subtype != 'H_cap']
+heavy_neighbors = [n for n in a.neighbors if n.alive and n.npi != -1]
 ```
 
 This allows deferring `sync_neighbor_lists()` — the O(N+B) global rebuild — until it's actually needed (after bond creation, not after deletion).
@@ -331,3 +347,50 @@ Vispy renders fresh scene
 - [ ] Add hex ring → H caps auto-added → delete atom → H caps adjusted
 - [ ] Change atom type (LMB click on existing atom) → correct atom changed
 - [ ] Copy/paste selection → pasted atoms have new `_id`s
+- [ ] Undo (Ctrl+Z) → graph restored to previous state
+- [ ] Export/Import .xyz/.mol/.mol2 → round-trip preserves atoms, bonds, positions
+- [ ] Pi-mode cycling (sp3→sp2→sp→sp3) → `npi` changes correctly, H caps adjust
+- [ ] Add→remove→add ring cycle → atoms re-created correctly (pin cache not stale)
+
+---
+
+## PackedMolecule — Dense Snapshot for Clipboard & Undo
+
+### Purpose
+
+`PackedMolecule` is a compact, serializable snapshot of an `AtomicGraph` using dense numpy arrays. Used for:
+- **Clipboard** (Ctrl+C/Ctrl+V) — copy selected atoms + internal bonds
+- **Undo stack** (Ctrl+Z) — rolling buffer of graph states
+- **Binary I/O** — `.npz` save/load
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `etype` | `int32[N]` | Atomic numbers (Z) |
+| `apos` | `float32[N,3]` | Positions in Angstrom |
+| `bonds` | `int32[B,2]` | 0-based index pairs |
+| `npi` | `int8[N]` | Pi-orbital count (-1=H_cap, 0=sp3, 1=sp2, 2=sp) |
+
+Memory: ~21 bytes/atom + 8 bytes/bond. 1000 atoms + 2000 bonds ≈ 37 KB.
+
+### Key methods
+
+- `from_graph(graph, atom_indices=None)` — extract all or subset of atoms (with internal bonds only)
+- `to_graph()` — rebuild fresh `AtomicGraph` from packed data (parent reconstructed by distance for H caps)
+- `to_xyz_text()` / `to_mol_text()` — text export for clipboard interoperability
+- `from_text(text)` — parse `.xyz` or `.mol` text (auto-detect format)
+- `save_npz(fname)` / `load_npz(fname)` — binary I/O
+
+### UndoStack
+
+- `UndoStack(maxlen=100)` — rolling `deque` of `PackedMolecule` snapshots
+- `push(packed)` — O(1) append, auto-evicts oldest when full
+- `pop()` — O(1) pop, returns `PackedMolecule` or `None` if empty
+- `enabled` flag — can be disabled to skip pushes during batch operations
+- GUI calls `_push_undo()` before all graph mutations (delete, paste, atom type change, pi cycle, handle_click, reset_offsets, adjust_h, recalc_bonds)
+
+### Clipboard flow
+
+1. **Ctrl+C**: `copy_selected_atoms()` → `PackedMolecule.from_graph(graph, selected_indices)` → store in `self.copied_packed` + put MOL/XYZ text on Qt clipboard
+2. **Ctrl+V**: `paste_copied_atoms()` → use `self.copied_packed` (or parse Qt clipboard via `from_text()`) → `_append_atom(npi=...)` for each atom → re-create internal bonds → select pasted atoms
