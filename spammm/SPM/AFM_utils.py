@@ -186,7 +186,7 @@ def build_orbital_layout(basis_data, enames):
 
 def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
                                  grid_spec=None, step=0.1, margin=4.0, z_extra=6.0,
-                                 verbosity=0, max_shells=None):
+                                 verbosity=0, max_shells=None, projection_basis_ang=None):
     """Get density grids using DFTBcore dense matrix projection (supports d-orbitals).
 
     Uses direct DFTBcore library access (no file parsing) and dense density matrix
@@ -201,6 +201,9 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
         step/margin/z_extra: grid parameters (used if grid_spec is None)
         verbosity: logging level
         max_shells: int (2=sp, 3=spd); auto-detected from basis if None
+        projection_basis_ang: optional species_list to override basis used for projection
+            (SCF still uses original basis; only projection uses override). Enables
+            Slater-tail correction hack.
 
     Returns:
         dict with 'rho_scf', 'rho_na', 'rho_diff', 'V_ES', 'origin', 'ngrid', 'grid_spec'
@@ -245,7 +248,8 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
     }
 
     # Setup projector with max_shells for d-orbital support
-    projector, atoms_dict = dg.setup_gridprojector_from_dftb(dftb_data, basis_ang, verbosity=verbosity, max_shells=max_shells)
+    proj_basis = projection_basis_ang if projection_basis_ang is not None else basis_ang
+    projector, atoms_dict = dg.setup_gridprojector_from_dftb(dftb_data, proj_basis, verbosity=verbosity, max_shells=max_shells)
 
     # Run DFTBcore SCF directly (single molecule - no Fortran state conflicts expected)
     basis_name = os.path.basename(basis_hsd_path).replace('wfc.', '').replace('.hsd', '')
@@ -325,7 +329,7 @@ Hamiltonian = DFTB {{
         'coords_bohr': coords_bohr
     }
     # Use sparse project_neutral_density for rho_na (same as in sparse method)
-    rho_na = dg.project_neutral_density(geo, projector, atoms_dict, grid_spec, basis_ang)
+    rho_na = dg.project_neutral_density(geo, projector, atoms_dict, grid_spec, proj_basis)
 
     rho_diff = (rho_scf - rho_na).astype(np.float32)
 

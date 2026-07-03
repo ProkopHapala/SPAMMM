@@ -937,3 +937,343 @@ f"""
                               pos2[0], pos2[1], pos2[2], bond_width, 
                               bond_clr[0],  bond_clr[1], bond_clr[2]  ))
 
+
+#############################################
+#   Density comparison plotting (1D + 2D)   #
+#############################################
+
+def plot_density_z_profile(ax, z_vals, profiles, labels=None, colors=None, lws=None, lss=None,
+                           ylim=(1e-3, 10), xlim=(0, 3), log=True, xlabel='z above plane (A)',
+                           ylabel='rho (e/A^3)', title=None, legend=True, fontsize=8):
+    """Plot 1D density profile(s) above a point on a log-scale axis.
+
+    Args:
+        ax: matplotlib Axes (created if None)
+        z_vals: (n_z,) z coordinates
+        profiles: list of (n_z,) arrays, or single (n_z,) array
+        labels: list of labels for each profile
+        colors: list of colors for each profile
+        lws: list of linewidths
+        lss: list of linestyle strings
+        ylim, xlim: axis limits
+        log: use log y-scale
+        legend: show legend
+        fontsize: legend font size
+
+    Returns:
+        ax
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5, 4))
+    if not isinstance(profiles, (list, tuple)):
+        profiles = [profiles]
+    n = len(profiles)
+    if labels is None: labels = [None]*n
+    if colors is None: colors = [None]*n
+    if lws is None: lws = [0.5]*n
+    if lss is None: lss = ['-']*n
+    for i, prof in enumerate(profiles):
+        prof = np.maximum(np.asarray(prof), 1e-10)
+        ax.plot(z_vals, prof, color=colors[i], linestyle=lss[i], linewidth=lws[i], label=labels[i])
+    if log: ax.set_yscale('log')
+    ax.set_ylim(*ylim); ax.set_xlim(*xlim)
+    ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+    if title: ax.set_title(title, fontsize=10)
+    if legend and any(l is not None for l in labels): ax.legend(fontsize=fontsize)
+    return ax
+
+
+def plot_density_z_fit(ax, z_vals, rho, fit_lo=0.5, fit_hi=1.5, color='k', label=None, lw=0.5):
+    """Add log-linear fit line + decay constant annotation to an existing axis.
+
+    Fits log(rho) = a*z + b in the [fit_lo, fit_hi] region and plots the fit line.
+
+    Args:
+        ax: matplotlib Axes
+        z_vals: (n_z,) z coordinates
+        rho: (n_z,) density values
+        fit_lo, fit_hi: fit region bounds
+        color: fit line color
+        label: prefix for fit label (e.g. 'GPAW')
+        lw: linewidth
+
+    Returns:
+        a: fitted slope (decay constant), or None if insufficient points
+    """
+    z = np.asarray(z_vals); r = np.maximum(np.asarray(rho), 1e-10)
+    mask = (z >= fit_lo) & (z <= fit_hi) & (r > 1e-10)
+    if mask.sum() < 3: return None
+    a, b = np.polyfit(z[mask], np.log(r[mask]), 1)
+    fit_z = np.linspace(fit_lo, fit_hi, 50)
+    fit_label = f'{label} fit: {a:.2f}/A' if label else f'fit: {a:.2f}/A'
+    ax.plot(fit_z, np.exp(a * fit_z + b), color + '--', linewidth=lw, alpha=0.7, label=fit_label)
+    return a
+
+
+def plot_density_2d_slice(ax, rho_2d, extent, atoms=None, cmap='hot_r', log=True,
+                          vmin=1e-3, vmax=10, title=None, xlabel='x (A)', ylabel='y (A)',
+                          colorbar=True, atom_colors=None, atom_size=8):
+    """Plot 2D density slice with optional atom overlay.
+
+    Args:
+        ax: matplotlib Axes
+        rho_2d: (nx, ny) 2D density slice (will be transposed for imshow)
+        extent: [xmin, xmax, ymin, ymax]
+        atoms: list of (sym, x, y) tuples for overlay markers, or None
+        cmap: colormap name
+        log: use LogNorm
+        vmin, vmax: color scale bounds
+        title: subplot title
+        atom_colors: dict {sym: color} or None (default: cyan for non-H, lime for H)
+        atom_size: marker size
+
+    Returns:
+        im: the imshow image object
+    """
+    from matplotlib.colors import LogNorm
+    data = np.maximum(rho_2d.T, vmin)
+    norm = LogNorm(vmin=vmin, vmax=vmax) if log else None
+    im = ax.imshow(data, origin='lower', extent=extent, cmap=cmap, aspect='equal', norm=norm)
+    if title: ax.set_title(title)
+    ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+    if atoms:
+        if atom_colors is None: atom_colors = {}
+        for sym, x, y in atoms:
+            c = atom_colors.get(sym, 'cyan' if sym != 'H' else 'lime')
+            ax.plot(x, y, '.', color=c, markersize=atom_size)
+    if colorbar: plt.colorbar(im, ax=ax, label='rho (e/A^3)')
+    return im
+
+
+def plot_density_per_element(atoms, z_vals, methods, elem_order=None,
+                             fit_lo=0.5, fit_hi=1.5, ylim=(1e-3, 10), xlim=(0, 3),
+                             suptitle=None, figsize=None, fname=None, dpi=150):
+    """Create per-element subplot grid with multiple methods overlaid.
+
+    Args:
+        atoms: list of (idx, sym, x, y, z) tuples
+        z_vals: (n_z,) z coordinates
+        methods: list of dicts: {'name': str, 'color': str, 'profiles': (n_atoms, n_z) array, 'ls': str, 'fit': bool}
+        elem_order: list of element symbols in display order (default: O,N,C,H)
+        fit_lo, fit_hi: fit region for decay constant annotation
+        ylim, xlim: axis limits
+        suptitle: figure title
+        figsize: (width, height) per subplot
+        fname: save path (if None, returns fig)
+        dpi: save resolution
+
+    Returns:
+        fig
+    """
+    if elem_order is None: elem_order = ['O', 'N', 'C', 'H']
+    seen = {}
+    for i, (idx, sym, x, y, z) in enumerate(atoms):
+        if sym not in seen: seen[sym] = i
+    elem_list = [e for e in elem_order if e in seen]
+    n = len(elem_list)
+    if figsize is None: figsize = (5, 4)
+    fig, axc = plt.subplots(1, n, figsize=(figsize[0]*n, figsize[1]), squeeze=False)
+    if suptitle: fig.suptitle(suptitle, fontsize=14)
+
+    for ei, sym in enumerate(elem_list):
+        ai = seen[sym]
+        ax = axc[0, ei]
+        for m in methods:
+            prof = m['profiles'][ai]
+            plot_density_z_profile(ax, z_vals, prof, labels=[m['name']], colors=[m.get('color')],
+                                   lws=[m.get('lw', 0.5)], lss=[m.get('ls', '-')],
+                                   ylim=ylim, xlim=xlim, title=f"{sym} (atom {atoms[ai][0]})")
+            if m.get('fit', False):
+                plot_density_z_fit(ax, z_vals, prof, fit_lo, fit_hi, color=m.get('color'), label=m['name'])
+        ax.legend(fontsize=7)
+
+    plt.tight_layout()
+    if fname:
+        fig.savefig(fname, dpi=dpi); plt.close(fig)
+    return fig
+
+
+def plot_density_methods_panel(atoms, z_vals, methods, ylim=(1e-3, 10), xlim=(0, 3),
+                               suptitle=None, fname=None, dpi=150):
+    """Side-by-side panels, one per method, all atoms overlaid.
+
+    Args:
+        atoms: list of (idx, sym, x, y, z) tuples
+        z_vals: (n_z,) z coordinates
+        methods: list of dicts: {'name': str, 'profiles': (n_atoms, n_z) array}
+        ylim, xlim: axis limits
+        suptitle: figure title
+        fname: save path
+        dpi: save resolution
+
+    Returns:
+        fig
+    """
+    from spammm.elements import getColor
+    n = len(methods)
+    fig, axes = plt.subplots(1, n, figsize=(7*n, 5), squeeze=False)
+    if suptitle: fig.suptitle(suptitle, fontsize=14)
+
+    for side, m in enumerate(methods):
+        ax = axes[0, side]
+        for ai, (idx, sym, x, y, z) in enumerate(atoms):
+            try: color = getColor(sym, bFloat=False)
+            except: color = f"C{ai}"
+            ls = '-' if sym != 'H' else '--'
+            ax.plot(z_vals, np.maximum(m['profiles'][ai], 1e-10), color=color, ls=ls, lw=1.0, alpha=0.8, label=f"{idx}:{sym}")
+        ax.set_ylim(*ylim); ax.set_xlim(*xlim); ax.set_yscale('log')
+        ax.set_title(m['name'], fontsize=12)
+        ax.set_xlabel("z above plane (A)"); ax.set_ylabel("rho (e/A^3)")
+        ax.legend(fontsize=6, ncol=2)
+
+    plt.tight_layout()
+    if fname:
+        fig.savefig(fname, dpi=dpi); plt.close(fig)
+    return fig
+
+
+def plot_2d_density_panel(methods_2d, suptitle=None, fname=None, dpi=150):
+    """Side-by-side 2D density slices from multiple methods.
+
+    Args:
+        methods_2d: list of dicts: {'name', 'slice_2d', 'extent', 'atoms': [(sym,x,y),...]}
+        suptitle: figure title
+        fname: save path
+        dpi: save resolution
+
+    Returns:
+        fig
+    """
+    n = len(methods_2d)
+    fig, axes = plt.subplots(1, n, figsize=(7*n, 6), squeeze=False)
+    if suptitle: fig.suptitle(suptitle, fontsize=14)
+
+    for i, m in enumerate(methods_2d):
+        ax = axes[0, i]
+        plot_density_2d_slice(ax, m['slice_2d'], m['extent'], atoms=m.get('atoms'), title=m['name'])
+
+    plt.tight_layout()
+    if fname:
+        fig.savefig(fname, dpi=dpi); plt.close(fig)
+    return fig
+
+
+def plot_sa_history(history, title='SA convergence', fname=None, dpi=150):
+    """Plot simulated annealing convergence history.
+
+    Args:
+        history: list of (iteration, current_obj, best_obj) tuples
+        title: plot title
+        fname: save path
+        dpi: save resolution
+
+    Returns:
+        fig
+    """
+    hist = np.array(history)
+    fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+    ax.plot(hist[:,0], hist[:,1], 'b-', lw=0.3, alpha=0.5, label='current')
+    ax.plot(hist[:,0], hist[:,2], 'r-', lw=0.5, label='best')
+    ax.set_xlabel('iteration'); ax.set_ylabel('objective'); ax.set_yscale('log')
+    ax.set_title(title); ax.legend()
+    plt.tight_layout()
+    if fname:
+        fig.savefig(fname, dpi=dpi); plt.close(fig)
+    return fig
+
+
+def plot_density_multi_z(methods, z_heights, suptitle=None, fname=None, dpi=150,
+                         cmap='hot', log=False, figsize_per_panel=(5, 4), margin=2.0):
+    """Grid of 2D density slices: rows = z-heights, cols = methods.
+
+    All panels show the same spatial extent (centered on first method's atoms, +margin).
+    Each panel has its own linear color scale (vmin=0, vmax from that slice's data).
+    z_heights are relative to molecular plane; each method must provide 'z0' for absolute z.
+
+    Args:
+        methods: list of dicts: {'name', 'rho_3d', 'origin', 'step', 'atoms': [(sym,x,y),...], 'z0': float}
+        z_heights: list of relative z values in Angstrom (above molecular plane)
+        suptitle: figure title
+        fname: save path
+        dpi: save resolution
+        cmap: colormap
+        log: use LogNorm (default False = linear)
+        figsize_per_panel: (w, h) per subplot
+        margin: extra Angstroms around atom bounds for the common extent
+
+    Returns:
+        fig
+    """
+    from matplotlib.colors import LogNorm
+    nz = len(z_heights); nm = len(methods)
+    fig, axes = plt.subplots(nz, nm, figsize=(figsize_per_panel[0]*nm, figsize_per_panel[1]*nz), squeeze=False)
+    if suptitle: fig.suptitle(suptitle, fontsize=16)
+
+    # Compute non-square half-widths from first method's atoms
+    atoms0 = methods[0].get('atoms', [])
+    if atoms0:
+        xs0 = [x for _, x, _ in atoms0]; ys0 = [y for _, _, y in atoms0]
+        half_x = (max(xs0)-min(xs0))/2 + margin
+        half_y = (max(ys0)-min(ys0))/2 + margin
+    else:
+        half_x = half_y = 10.0
+
+    # Shrink half_x/half_y so view fits within every method's grid (avoid white areas)
+    for m in methods:
+        step_m = np.atleast_1d(m['step'])
+        if len(step_m) == 1: step_m = np.array([step_m[0]]*3)
+        origin_m = m['origin']; rho_m = m['rho_3d']
+        nx_m, ny_m = rho_m.shape[0], rho_m.shape[1]
+        atoms_m = m.get('atoms', [])
+        if atoms_m:
+            xs_m = [x for _, x, _ in atoms_m]; ys_m = [y for _, _, y in atoms_m]
+            mcx_m = (min(xs_m)+max(xs_m))/2; mcy_m = (min(ys_m)+max(ys_m))/2
+        else:
+            mcx_m = origin_m[0]+nx_m*step_m[0]/2; mcy_m = origin_m[1]+ny_m*step_m[1]/2
+        grid_x0, grid_x1 = origin_m[0], origin_m[0]+(nx_m-1)*step_m[0]
+        grid_y0, grid_y1 = origin_m[1], origin_m[1]+(ny_m-1)*step_m[1]
+        half_x = min(half_x, mcx_m - grid_x0, grid_x1 - mcx_m)
+        half_y = min(half_y, mcy_m - grid_y0, grid_y1 - mcy_m)
+
+    for col, m in enumerate(methods):
+        rho = m['rho_3d']; origin = m['origin']; step = m['step']
+        step = np.atleast_1d(step)
+        if len(step) == 1: step = np.array([step[0]]*3)
+        nx, ny, nz_grid = rho.shape
+        atoms_2d = m.get('atoms')
+        z0 = m.get('z0', origin[2])
+        if atoms_2d:
+            xs = [x for _, x, _ in atoms_2d]; ys = [y for _, _, y in atoms_2d]
+            mcx, mcy = (min(xs)+max(xs))/2, (min(ys)+max(ys))/2
+        else:
+            mcx, mcy = origin[0]+nx*step[0]/2, origin[1]+ny*step[1]/2
+        for row, z_rel in enumerate(z_heights):
+            ax = axes[row, col]
+            z_abs = z0 + z_rel
+            iz = int(np.clip(np.round((z_abs - origin[2]) / step[2]), 0, nz_grid-1))
+            slice_2d = rho[:, :, iz].T
+            vmax = float(np.max(slice_2d))
+            full_extent = [origin[0], origin[0]+(nx-1)*step[0], origin[1], origin[1]+(ny-1)*step[1]]
+            if log:
+                vmin = max(float(np.min(slice_2d)), 1e-10)
+                im = ax.imshow(slice_2d, origin='lower', extent=full_extent, cmap=cmap, aspect='equal',
+                              norm=LogNorm(vmin=vmin, vmax=vmax))
+            else:
+                im = ax.imshow(slice_2d, origin='lower', extent=full_extent, cmap=cmap, aspect='equal',
+                              vmin=0.0, vmax=vmax)
+            ax.set_xlim(mcx-half_x, mcx+half_x)
+            ax.set_ylim(mcy-half_y, mcy+half_y)
+            if atoms_2d:
+                for sym, x, y in atoms_2d:
+                    c = 'cyan' if sym != 'H' else 'lime'
+                    ax.plot(x, y, '.', color=c, markersize=2)
+            if row == 0: ax.set_title(m['name'], fontsize=12)
+            if col == 0: ax.set_ylabel(f'z={z_rel:.1f} A', fontsize=11)
+            ax.set_xlabel('x (A)')
+            plt.colorbar(im, ax=ax, shrink=0.7, label='rho (e/A^3)')
+
+    plt.tight_layout()
+    if fname:
+        fig.savefig(fname, dpi=dpi, bbox_inches='tight'); plt.close(fig)
+    return fig
+

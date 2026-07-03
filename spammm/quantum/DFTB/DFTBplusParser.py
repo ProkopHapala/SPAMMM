@@ -660,6 +660,60 @@ def convert_wfc_to_species_list_ang(basis_data, resolution_bohr=0.04):
     return species_list
 
 
+# Fitted decay constants from GPAW/PySCF density profiles: ζ = -a_fit / 2
+# where a_fit is the slope of log(ρ) vs z in [0.5, 1.5] Å above molecular plane
+SLATER_TAIL_ZETA = {  # 1/Å — calibrated by interpolation to get density slope = a_GPAW
+    # Interpolated from two measurement points (ζ=a/1.7 and ζ=a) per element
+    'H': 2.42, 'C': 2.78, 'N': 3.00, 'O': 3.25,
+}
+
+def make_slater_tail_species_list(species_list_ang, zeta_override=None, cutoff_extend=6.0):
+    """Create modified species_list with single-exponential STOs matching DFT decay.
+
+    Replaces multi-zeta basis with single-exponential per shell (l),
+    using fitted decay constants from GPAW/PySCF density profiles.
+    The DM coefficients from original DFTB SCF are projected with these
+    modified radial functions — an approximation, but captures correct tail decay.
+
+    Args:
+        species_list_ang: original species_list from convert_wfc_to_species_list_ang()
+        zeta_override: dict {element_name: zeta_in_1/Ang} to override defaults
+        cutoff_extend: extended cutoff in Angstrom (default 6.0)
+
+    Returns:
+        new species_list with single-exponential STOs
+    """
+    zeta_map = zeta_override or SLATER_TAIL_ZETA
+    from math import factorial, sqrt
+    new_list = []
+    for sp in species_list_ang:
+        name = sp['name']
+        z = zeta_map.get(name, 3.6)  # default fallback
+        new_orbitals = []
+        for orb in sp['orbitals']:
+            l = orb['l']
+            # Evaluate original multi-zeta STO at r_match to get reference amplitude
+            r_match = 0.7  # Å — cross-over point where DFTB and DFT densities are similar
+            orig_vals = compute_sto_radial(np.array([r_match]), orb['coefficients'], orb['exponents'], l)
+            orig_amp = float(orig_vals[0])
+            # Single-exponential: R(r) = N * r^l * exp(-zeta*r)
+            slater_raw = r_match**l * np.exp(-z * r_match)
+            N = orig_amp / slater_raw if abs(slater_raw) > 1e-30 else 1.0
+            new_orbitals.append({
+                'l': l,
+                'cutoff': cutoff_extend,
+                'exponents': np.array([z]),
+                'coefficients': np.array([[N]]),
+            })
+        new_list.append({
+            'name': sp['name'],
+            'atomic_number': sp['atomic_number'],
+            'orbitals': new_orbitals,
+            'resolution': sp['resolution'],
+        })
+    return new_list
+
+
 def parse_basis_hsd_ang(hsd_path):
     """
     Parse waveplot_in.hsd Basis block and return species_list ready for load_basis_sto().

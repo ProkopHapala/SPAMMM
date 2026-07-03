@@ -181,6 +181,39 @@ class GridProjector(OpenCLBase):
         self.species_nz = all_nz
         return packed_basis
 
+    def update_basis_sto(self, species_list):
+        """Update only the GPU basis buffer with new STO parameters (no kernel recompilation).
+        Much faster than load_basis_sto for iterative optimization.
+        Assumes basis_meta (n_nodes, dr, max_shells, nz_map) is already set by a prior load_basis_sto call.
+        """
+        from .DFTBplusParser import _spline_d2_uniform, compute_sto_radial
+        n_nodes = self.basis_meta['n_nodes']
+        dr = self.basis_meta['dr']
+        max_shells = self.basis_meta['max_shells']
+        nz_map = self.basis_meta['nz_map']
+        sp_by_nz = {sp['atomic_number']: sp for sp in species_list}
+        r = np.arange(n_nodes) * dr
+        packed_basis = np.zeros((len(nz_map), max_shells, n_nodes, 2), dtype=np.float32)
+        for nz, i_spec in nz_map.items():
+            sp = sp_by_nz.get(nz)
+            if sp is None: continue
+            orbs_by_l = {}
+            for orb in sp['orbitals']:
+                l = orb['l']
+                if l not in orbs_by_l: orbs_by_l[l] = orb
+            for ish in range(max_shells):
+                l = ish
+                if l not in orbs_by_l: continue
+                orb = orbs_by_l[l]
+                aa = np.asarray(orb['coefficients'], dtype=np.float64)
+                alpha = np.asarray(orb['exponents'], dtype=np.float64)
+                vals = compute_sto_radial(r, aa, alpha, l).astype(np.float32)
+                d2 = _spline_d2_uniform(vals.astype(np.float64), dr).astype(np.float32)
+                packed_basis[i_spec, ish, :, 0] = vals
+                packed_basis[i_spec, ish, :, 1] = d2
+        self.d_basis = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=packed_basis)
+        return packed_basis
+
     def _load_kernels(self):
         kernel_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../../kernels')
         cl_paths = [
