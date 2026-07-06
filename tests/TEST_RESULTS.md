@@ -200,7 +200,7 @@ All `spammm.OCL.*` and `spammm.FireballOCL.*` imports corrected:
 - [x] **RigidBodyDynamics quaternion→matrix** — exercised implicitly in relaxation tests (`_quat_to_matrix_np` exists)
 - [x] **RigidBodyAFM anchor springs** — `test_manipulation_h2o_nacl`, `test_manipulation_ptcda_nacl` ✅ passing
 - [x] **RigidBodyAFM relaxed scan** — `relaxed_scan()` helper + trail visualization ✅ passing
-- [ ] **Assembly collision** — no test
+- [ ] **Assembly collision** — `testplot_assembly.py` visual demo (L2); no pytest L0 yet (`Assembly.py`, `assembly.cl`)
 
 ### Quantum Backends
 

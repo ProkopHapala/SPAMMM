@@ -14,7 +14,7 @@ Key functionality:
   - XYZ export and screenshot capture
 
 Role in SPAMMM: The central GUI hub. All user interaction flows through here:
-editing commands → KekuleBackend, AFM commands → AFMExtension, rendering → VispyUtils.
+editing commands → MoleculeEditorBackend, AFM commands → AFMExtension, rendering → VispyUtils.
 
 CODE STYLE POLICIES:
 - Strive for concise, general, and reusable code
@@ -40,8 +40,8 @@ from spammm.GUI.EditModeHandlers import (
     EditModeHandler, UnifiedMode, AtomMode, PiMode, BondMode,
     RingMode, Hex1Mode, Hex2Mode, SelectMode,
 )
-from spammm.topology.KekuleBackend import KekuleBackend
-import spammm.topology.KekuleBackend as KB
+from spammm.topology.MoleculeEditorBackend import MoleculeEditorBackend
+import spammm.topology.MoleculeEditorBackend as MEB
 from spammm import atomicUtils as au
 from vispy import scene
 
@@ -69,15 +69,15 @@ from spammm.GUI.VispyUtils import compute_bond_colors_by_length, generate_atom_l
 from spammm.GUI.ExtensionManager import ExtensionManager, ExtensionNotAvailableError
 from spammm.GUI.CollapsibleSection import CollapsibleSection
 
-class KekuleExplorerWindow(BaseGUI):
+class SPAMMMWindow(BaseGUI):
     sig_geometry_changed = QtCore.pyqtSignal()  # Emitted whenever atom geometry changes
 
     def __init__(self, output_dir=None, fdata_path=None, verbosity=None):
-        super().__init__("Kekule Structure Explorer")
+        super().__init__("SPAMMM")
         self.resize(1024, 768)
 
         self.extensions = ExtensionManager()
-        self.backend = KekuleBackend()
+        self.backend = MoleculeEditorBackend()
         self.cur_atom_type = 'C'
         self.edit_mode = 'Unified'  # 'Unified', 'Hex1' (paint), 'Hex2' (toggle), 'Atom', 'Bond', 'Ring', 'pi', 'Select'
         self.label_mode = 'Element+Index'
@@ -547,7 +547,7 @@ class KekuleExplorerWindow(BaseGUI):
             width_chains = self.ribbon_rows_spinbox.value()
             Lx = 2.4
             
-            self.backend = KekuleBackend()
+            self.backend = MoleculeEditorBackend()
             self.backend.build_zigzag_ribbon(width_chains=width_chains, length_cells=length_cells, passivation_bottom=bottom_passivation, passivation_top=top_passivation, scale_x=Lx / (2.0 * 1.42 * np.cos(np.pi / 6)), bPeriodicX=True)
             
             self.scene.backend = self.backend
@@ -588,15 +588,15 @@ class KekuleExplorerWindow(BaseGUI):
             L_Hb = self.ribbon_L_Hb_spinbox.value()
             
             # Build bottom ribbon
-            bottom_ribbon = KekuleBackend()
+            bottom_ribbon = MoleculeEditorBackend()
             bottom_ribbon.build_zigzag_ribbon(width_chains=width_chains1, length_cells=length_cells, passivation_bottom=bottom1_passivation, passivation_top=top1_passivation, scale_x=Lx / (2.0 * 1.42 * np.cos(np.pi / 6)), bPeriodicX=True)
             
             # Build top ribbon
-            top_ribbon = KekuleBackend()
+            top_ribbon = MoleculeEditorBackend()
             top_ribbon.build_zigzag_ribbon(width_chains=width_chains2, length_cells=length_cells, passivation_bottom=bottom2_passivation, passivation_top=top2_passivation,  scale_x=Lx / (2.0 * 1.42 * np.cos(np.pi / 6)), bPeriodicX=True)
             
             # Combine ribbons
-            self.backend = KekuleBackend()
+            self.backend = MoleculeEditorBackend()
             self.backend.combine_ribbons(bottom_ribbon, top_ribbon, L_Hb=L_Hb, shift_x=0.0)
             
             self.scene.backend = self.backend
@@ -1253,6 +1253,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     app = QtWidgets.QApplication(sys.argv)
-    window = KekuleExplorerWindow(output_dir=args.output_dir, fdata_path=args.fdata_path, verbosity=args.verbosity)
+    window = SPAMMMWindow(output_dir=args.output_dir, fdata_path=args.fdata_path, verbosity=args.verbosity)
+
+
+# FireCore / legacy alias
+KekuleExplorerWindow = SPAMMMWindow
     window.show()
     sys.exit(app.exec_())

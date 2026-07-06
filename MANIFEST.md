@@ -106,7 +106,8 @@ SPAMMM/
     │   ├── MolecularDynamics.py  # MD engine: FIRE, velocity Verlet (tightly coupled to SPFF)
     │   ├── RigidBodyDynamics.py  # 6-DOF rigid body dynamics (quaternion → matrix, Rigid.cl)
     │   ├── RigidBodyAFM.py     # High-level AFM scanning via rigid body dynamics
-    │   └── Assembly.py         # Molecular assembly: rigid-body collision between fragments
+    │   ├── Assembly.py         # Hexagonal SAM rigid-body packing search (orchestration + OpenCL)
+    │   └── AssemblyPlot.py     # Assembly top views, clash/strain diagnostics, XYZ export
     │
     ├── surfaces/               # Molecule-surface interactions
     │   ├── GridFF.py           # GridFF_cl: B-spline grid interpolation + sampling

@@ -22,8 +22,14 @@ SPAMMM (Scanning Probe Accelerated Modeling of Microscopy and Manipulation) is a
 
 ## Debugging & Testing
 
-**Fail loud** — crashes with stack traces > masked bugs. Debug prints gated by verbosity. Tests in `tests/` with ref_data regression. Numerical correctness via parity checks vs reference/analytical/physical invariants. See skill:`running-tests`, skill:`visual-debugging`, skill:`gpu-debug`, skill:`numerical-parity`, skill:`forcefield-validation`.
-- **Test scripts**: `tests/` — pytest suite (`pytest -m "not slow"`) + standalone diagnostic scripts. See skill:`running-tests`.
+**Fail loud** — crashes with stack traces > masked bugs. Debug prints gated by verbosity. Tests in `tests/` with ref_data regression. Numerical correctness via parity checks vs reference/analytical/physical invariants. See skill:`running-tests`, skill:`visual-debugging`, skill:`reference-data`, skill:`gpu-debug`, skill:`numerical-parity`, skill:`forcefield-validation`.
+
+**Test system SSOT:** `doc/TEST_DESIGN.md` — three review levels (L0 assert, L1 agent `.out`/`.log`, L2 human `.png`).
+
+- **Routine:** `pytest -m "not slow"` — L0 only, fast regression.
+- **Develop:** `pytest path --develop -s` — L0+L1+L2; agent must read `.out` artifacts and **never filter test stdout** (`| tail`, `| grep`, `&` forbidden).
+- **Artifacts:** `debug/<script>/` (gitignored except `debug/README.md`). Agents read by explicit `REVIEW:` path from stdout.
+- **Test scripts**: `test_*.py` (pytest), `testplot_*.py` (visual demos), `run_*.py` (CLI). See skill:`running-tests`.
 - **Refactoring discipline**: Before refactoring, run each old file, show plots/results to USER for review. Identify useful features from each version. Reproduce carefully. Only delete old files after explicit USER approval. Never delete plots — they are the main results the USER reviews.
 
 ## Performance & Languages

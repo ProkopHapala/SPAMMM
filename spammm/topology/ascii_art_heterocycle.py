@@ -74,12 +74,12 @@ def _resolve_hbond_donor(ia, ib, enames, eo=None):
 def _build_target_valence(atoms, n_pi0):
     """Build target_valence dict for AtomicSystem.add_capping_h_sp2.
 
-    Baseline uses KekuleBackend._target_sigma(element, npi).
+    Baseline uses MoleculeEditorBackend._target_sigma(element, npi).
     This is purely electron-counting from (element, n_pi) and should work for
     both uppercase/lowercase ASCII element symbols.
     """
-    from spammm.topology.KekuleBackend import KekuleBackend
-    kb = KekuleBackend()
+    from spammm.topology.MoleculeEditorBackend import MoleculeEditorBackend
+    kb = MoleculeEditorBackend()
     tv = {}
     for ia, e in enumerate(atoms.enames):
         eu = e.upper()

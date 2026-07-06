@@ -1,14 +1,21 @@
 # tests/SPM/
 
-AFM (Atomic Force Microscopy) and scanning probe simulation tests and diagnostic plots.
+AFM (Atomic Force Microscopy) and scanning probe simulation tests and visual demos.
+
+See `doc/TEST_DESIGN.md` for L0/L1/L2 review levels.
 
 ## Files
 
 | Script | Class | Purpose |
 |--------|-------|---------|
-| `test_afm_morse.py` | 1 | AFM imaging with Morse/LJ + Coulomb: force field grid, raw/relaxed scans, frequency shift |
-| `test_afm_fdbm.py` | 1 | Full Density-Based Model pipeline: DFTB SCF, density projection, Pauli/ES/dispersion, relaxed scan |
-| `plot_density_projection.py` | 2 | Project DFTB+ electron density, save 2D slices + Gaussian `.cub` files |
-| `plot_fdbm_potentials.py` | 2 | Plot FDBM potentials (Pauli, electrostatic, dispersion, total) — XY slices, XZ cross-sections, 1D curves |
-| `plot_fdbm_relax.py` | 2 | Full FDBM pipeline with PP relaxation: Fz forces, frequency shift, tip displacement |
-| `run_afm_morse_visual.py` | 2 | Morse potential AFM visualization: energy slices, Fz maps, df maps for pentacene/PTCDA |
+| `test_afm_morse.py` | pytest | Morse/LJ + Coulomb AFM: force field grid, scans, frequency shift |
+| `test_afm_fdbm.py` | pytest | FDBM pipeline: DFTB SCF, density projection, relaxed scan |
+| `testplot_density_projection.py` | visual | DFTB+ density projection, 2D slices + `.cub` |
+| `testplot_fdbm_potentials.py` | visual | FDBM potential plots (Pauli, ES, dispersion) |
+| `testplot_fdbm_relax.py` | visual | FDBM + PP relaxation: Fz, df, tip displacement |
+| `testplot_afm_morse.py` | visual | Morse AFM energy/Fz/df maps |
+| `testplot_zscan_reference.py` | visual | Z-scan reference curves |
+| `testplot_3ob_basis_tails.py` | visual | 3ob basis tail diagnostics |
+| `testplot_dftb_vs_pyscf_basis.py` | visual | DFTB vs PySCF basis comparison |
+
+Run visual demos: `python tests/SPM/testplot_fdbm_relax.py`

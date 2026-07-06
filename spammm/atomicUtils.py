@@ -13,7 +13,7 @@ Key functionality:
   - Fragment operations: split_by_bond, center_molecule
 
 Role in SPAMMM: Central I/O and geometry module. Every file-loading path
-(AtomicSystem, KekuleBackend, UFFbuilder) and every visualization path
+(AtomicSystem, MoleculeEditorBackend, UFFbuilder) and every visualization path
 (VispyUtils, KekuleExplorerGUI) depends on this module.
 """
 

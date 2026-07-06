@@ -11,7 +11,7 @@ Generates:
   4. 1D Fz vs height above a carbon atom
 
 Usage:
-  python tests/SPM/plot_fdbm_relax.py [--xyz data/xyz/H2O.xyz] [--basis 3ob-3-1] [--outdir debug/fdbm_relax]
+  python tests/SPM/testplot_fdbm_relax.py [--xyz data/xyz/H2O.xyz] [--basis 3ob-3-1] [--outdir debug/testplot_fdbm_relax]
 """
 import os, sys, argparse, numpy as np
 
@@ -57,7 +57,7 @@ def main():
     parser.add_argument('--basis', default='3ob-3-1', help='DFTB basis set')
     parser.add_argument('--step', type=float, default=0.15, help='Grid step [Ang]')
     parser.add_argument('--margin', type=float, default=6.0, help='Grid margin [Ang]')
-    parser.add_argument('--outdir', default='debug/plot_fdbm_relax', help='Output directory')
+    parser.add_argument('--outdir', default='debug/testplot_fdbm_relax', help='Output directory')
     parser.add_argument('--K_LAT', type=float, default=0.5, help='Lateral stiffness [eV/Ang^2]')
     parser.add_argument('--K_RAD', type=float, default=20.0, help='Radial stiffness [eV/Ang^2]')
     parser.add_argument('--bond_length', type=float, default=2.0, help='CO bond length [Ang]')

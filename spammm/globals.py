@@ -8,7 +8,8 @@ performance-sensitive code without side effects.
 Key functionality:
   - VERBOSITY_LEVEL — global int: 0=silent, 1=warnings, 2=info, 3=debug
   - debug_print() — conditional print gated by verbosity
-  - Environment variable overrides (SPAMMM_VERBOSITY)
+  - Environment variable overrides: SPAMMM_VERBOSITY (preferred), AFM_DEBUG_PRINT_LEVEL (legacy)
+  - set_develop_mode() — called by pytest --develop
 
 Role in SPAMMM: Global debug infrastructure. Imported by performance-sensitive
 modules (OpenCL kernels, force field evaluation) for lightweight logging.
@@ -31,9 +32,8 @@ def _get_int_env(name: str, default: int) -> int:
 
 
 # Print verbosity: debug_print(level, msg) will print when DEBUG_PRINT_LEVEL >= level.
-# Default is 0 to avoid changing existing console output unless code explicitly
-# uses debug_print().
-DEBUG_PRINT_LEVEL: int = _get_int_env("AFM_DEBUG_PRINT_LEVEL", 1)
+# Override: SPAMMM_VERBOSITY or AFM_DEBUG_PRINT_LEVEL (legacy).
+DEBUG_PRINT_LEVEL: int = _get_int_env("SPAMMM_VERBOSITY", _get_int_env("AFM_DEBUG_PRINT_LEVEL", 1))
 
 # Controls how much auxiliary data gets written to disk during AFM runs.
 # Default is 2 to preserve current behavior in this codebase, where most debug
@@ -59,6 +59,19 @@ def debug_save_enabled(level: int) -> bool:
 def debug_plot_enabled(level: int) -> bool:
     """Return True if auxiliary plotting should happen."""
     return DEBUG_PLOT_LEVEL >= int(level)
+
+
+def set_develop_mode(on: bool = True) -> None:
+    """Bump verbosity/plot/save levels for pytest --develop runs."""
+    global DEBUG_PRINT_LEVEL, DEBUG_SAVE_LEVEL, DEBUG_PLOT_LEVEL
+    if on:
+        DEBUG_PRINT_LEVEL = max(DEBUG_PRINT_LEVEL, 3)
+        DEBUG_SAVE_LEVEL = max(DEBUG_SAVE_LEVEL, 3)
+        DEBUG_PLOT_LEVEL = max(DEBUG_PLOT_LEVEL, 3)
+    else:
+        DEBUG_PRINT_LEVEL = _get_int_env("SPAMMM_VERBOSITY", _get_int_env("AFM_DEBUG_PRINT_LEVEL", 1))
+        DEBUG_SAVE_LEVEL = _get_int_env("AFM_DEBUG_SAVE_LEVEL", 2)
+        DEBUG_PLOT_LEVEL = _get_int_env("AFM_DEBUG_PLOT_LEVEL", 2)
 
 
 def debug_summarize_array(x: Any, max_len: int = 120) -> str:

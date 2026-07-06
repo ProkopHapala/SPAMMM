@@ -1,47 +1,20 @@
-// ------------------------------------------------------------------
-// local_jacobi_blocks_parallel — refactored
+// lingebra.cl — Batched small symmetric matrix eigendecomposition (parallel Jacobi)
 //
-// Parallel Jacobi eigendecomposition of small symmetric matrices
-// in local memory. One workgroup per matrix (block). All threads
-// collaborate on each Givens rotation: each thread updates its
-// assigned rows of A and V.
+// One workgroup per matrix; threads collaborate on Givens rotations in local memory.
+// Used for inertia tensors, Hessian modes, and other small dense LA on GPU.
 //
-// --- Optimizations vs original ---
+// Kernels:
+//   - local_jacobi_blocks_parallel: Jacobi diagonalization of (batch × m × m) matrices
 //
-//  (1) Inline (c,s) computation: every thread reads A[p*p], A[q*q],
-//      A[p*q] from local memory and computes the Givens angle
-//      independently. Eliminates the thread-0-broadcast barrier
-//      (saves 1 barrier / rotation). Cost: ~10 redundant flops/thread,
-//      negligible vs barrier latency (~100s of cycles on most GPUs).
+// Python: spammm/utils/Lingebra_ocl.py — jacobi_eigh()
+// Self-contained (no common.cl). Tests: tests/test_lingebra.py
 //
-//  (2) Fused 2x2 diagonal update: the thread that processes row k==p
-//      in the row loop also updates A[p*p], A[q*q], A[p*q], A[q*p]
-//      inline. The off-diagonal row loop skips k==p and k==q for A
-//      updates, so the 2x2 block is unmodified when the k==p thread
-//      reaches it. Eliminates the separate diagonal-update barrier
-//      (saves 1 barrier / rotation).
-//      Race-safety: off-diagonal writes touch A[k*m+p], A[k*m+q],
-//      A[p*m+k], A[q*m+k] for k!=p,q — disjoint from the 2x2 block
-//      indices A[p*m+p], A[q*m+q], A[p*m+q], A[q*m+p].
+// --- Implementation notes (local_jacobi_blocks_parallel) ---
+// Parallel Jacobi: each rotation zeros A[p*q]; eigenvectors accumulate in V.
+// Optimizations: inline (c,s) on all threads, fused 2×2 diagonal update, skip |A[pq]|<tol.
+// Net: 1 barrier per rotation (was 3). For m=64: 2016 barriers/sweep.
 //
-//  (3) Skip trivial rotations: when |A[p*q]| < tol, all threads
-//      skip the row update (c=1, s=0 is a no-op). Saves compute
-//      for already-converged off-diagonal elements. Barrier is
-//      still needed (next rotation may read values from prior
-//      rotations), but no writes → barrier is effectively free.
-//
-//  Net: 1 barrier per rotation (down from 3).
-//  For m=64: 2016 barriers/sweep (down from 6048).
-//
-// --- Physics & Numerics ---
-//
-// Jacobi method: diagonalize symmetric A by applying sequence of
-// Givens rotations G(p,q,theta) that zero out A[p*q]. Each rotation
-// is an orthogonal similarity transform A' = G^T A G, preserving
-// eigenvalues. Accumulating rotations into V gives eigenvectors:
-//   A_final = diag(lambda_i),  V_final = G_1 G_2 ... G_k
-//
-// Rotation angle (Golub & Van Loan §8.4, numerically stable):
+// Rotation angle (Golub & Van Loan §8.4):
 //   tau = (A[q*q] - A[p*p]) / (2 A[p*q])
 //   t   = sign(tau) / (|tau| + sqrt(1 + tau^2))
 //   c   = 1 / sqrt(1 + t^2),   s = t * c

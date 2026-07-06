@@ -1,16 +1,15 @@
 """
-test_editing_ops.py — Headless tests for all molecular editing operations.
+test_editing_ops.py — Headless tests for molecular editing operations.
 
-Two-layer testing:
-  L1 (always): TopologySnapshot diff assertions — fast, deterministic, no display
-  L2 (--visual): before/after PNG rendering for human review
+Three review levels (see doc/TEST_DESIGN.md):
+  L0 (always): TopologySnapshot diff assertions
+  L1 (--review / --develop): .out/.log agent artifacts via make_review
+  L2 (--visual / --develop): before/after PNG in debug/test_editing_ops/
 
 Run:
-  pytest tests/topology/test_editing_ops.py                    # L1 only
-  pytest tests/topology/test_editing_ops.py --visual           # L1 + L2
-  pytest tests/topology/test_editing_ops.py --visual -k ring   # filter to ring tests
-
-Visual output goes to: debug/test_editing_ops/
+  pytest tests/topology/test_editing_ops.py -s
+  pytest tests/topology/test_editing_ops.py --develop -s
+  pytest tests/topology/test_editing_ops.py --visual -s
 """
 
 import os
@@ -18,10 +17,13 @@ import pytest
 import numpy as np
 import copy
 
-from spammm.topology.KekuleBackend import KekuleBackend
+from spammm.topology.MoleculeEditorBackend import MoleculeEditorBackend
 from spammm.topology.AtomicGraph import AtomicGraph, Atom, Bond
 from spammm import elements
 from tests.helpers.topology_test import TopologySnapshot, TopologyDiff, render_before_after
+from tests.helpers.review import review_trace
+
+pytestmark = pytest.mark.review
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -36,7 +38,7 @@ def _save_graph_copy(backend):
 def _maybe_render(visual_output_dir, test_name, graph_before, backend,
                   highlight_atoms=None, cursor_pos=None, diff=None,
                   title_before='Before', title_after='After'):
-    """Render before/after PNG if --visual flag is set."""
+    """Render before/after PNG if --visual or --develop."""
     if visual_output_dir is None:
         return
     savepath = os.path.join(visual_output_dir, f'{test_name}.png')
@@ -47,6 +49,27 @@ def _maybe_render(visual_output_dir, test_name, graph_before, backend,
     )
 
 
+def _write_review(make_review, test_name, graph, snap_before, snap_after, diff, intent, checklist=()):
+    """L1 curated .out + trace .log when --review or --develop."""
+    rv = make_review(test_name)
+    with review_trace(rv) as r:
+        r.out_section('Intent')
+        r.out(intent)
+        r.out_section('Counts')
+        r.out(f'before: atoms={snap_before.n_atoms} bonds={snap_before.n_bonds} rings={snap_before.n_rings}')
+        r.out(f'after:  atoms={snap_after.n_atoms} bonds={snap_after.n_bonds} rings={snap_after.n_rings}')
+        r.out(f'diff: {diff!r}')
+        r.out_section('Graph after')
+        r.graph_table(graph, pos=False, neighbors=True)
+        if checklist:
+            r.checklist(*checklist)
+        r.log_section('atoms before')
+        r.log(str(snap_before.atoms))
+        r.log_section('bonds after')
+        r.log(str(snap_after.bonds))
+    rv.finish()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 01. Atom-Level Operations
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -54,13 +77,13 @@ def _maybe_render(visual_output_dir, test_name, graph_before, backend,
 class TestAddAtom:
     """Add atom at grid position / arbitrary position."""
 
-    def test_01_add_atom_at_grid_position(self, visual_output_dir):
+    def test_01_add_atom_at_grid_position(self, visual_output_dir, make_review):
         """Add single C atom at grid origin (0,0).
 
         Demonstrates: set_atom_type on empty grid node creates new atom.
         Before: empty graph. After: 1 C atom at origin.
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         graph_before = _save_graph_copy(b)
         snap_before = TopologySnapshot(b.graph)
@@ -70,6 +93,9 @@ class TestAddAtom:
         snap_after = TopologySnapshot(b.graph)
         diff = snap_before.diff(snap_after)
         diff.assert_counts('add_atom_grid', added_atoms=1, added_bonds=0)
+        _write_review(make_review, 'test_01_add_atom_grid', b.graph, snap_before, snap_after, diff,
+                      'Add C at hex grid origin (0,0) on empty graph; expect 1 atom, 0 bonds.',
+                      ('Exactly one C atom', 'No bonds', 'Atom on grid origin'))
         _maybe_render(visual_output_dir, 'test_01_add_atom_grid',
                       graph_before, b, diff=diff,
                       title_before='Before: empty graph',
@@ -81,7 +107,7 @@ class TestAddAtom:
         Demonstrates: add_atom_at_position creates atom not on hex grid.
         Before: empty graph. After: 1 C atom at (1,2).
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         graph_before = _save_graph_copy(b)
         snap_before = TopologySnapshot(b.graph)
@@ -106,7 +132,7 @@ class TestRemoveAtom:
         Demonstrates: remove_atom deletes atom + its bonds.
         Before: benzene C6 (6 atoms, 6 bonds). After: 5 atoms, 4 bonds (1 atom + 2 bonds removed).
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         heavy = [a for a in b.graph.atoms.values() if a.alive and a.ename == 'C']
@@ -133,7 +159,7 @@ class TestRemoveAtom:
         Demonstrates: remove_atom_by_index removes atom at index 0.
         Before: benzene C6. After: 5 atoms, 4 bonds.
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         graph_before = _save_graph_copy(b)
@@ -159,7 +185,7 @@ class TestChangeElementType:
         Demonstrates: set_atom_type on existing atom changes element, no topology change.
         Before: benzene C6 (all black). After: C5N (one blue N atom at same position).
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         heavy = [a for a in b.graph.atoms.values() if a.alive and a.ename == 'C']
@@ -190,7 +216,7 @@ class TestChangeHybridization:
         Demonstrates: set_atom_valency changes hybridization, H caps adjusted.
         Before: C_sp2 with 1 H cap (CH). After: C_sp3 with 2 H caps (CH2).
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.add_ring(0, 0)  # sp2 with auto H caps
         heavy = [a for a in b.graph.atoms.values() if a.alive and a.ename == 'C']
         node_key = heavy[0].pin
@@ -216,14 +242,14 @@ class TestChangeHybridization:
 class TestInsertAtomIntoBond:
     """Insert atom into bond (A-B → A-C-B)."""
 
-    def test_07_insert_atom_into_bond(self, visual_output_dir):
+    def test_07_insert_atom_into_bond(self, visual_output_dir, make_review):
         """Insert C atom into middle of a C-C bond in benzene.
 
         Demonstrates: insert_atom_into_bond splits bond A-B into A-C-B.
         Before: benzene with 6 C-C bonds. After: 7 atoms, original bond replaced by 2 new bonds.
         The new C atom (green) sits at bond midpoint, original atoms pushed aside.
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         bonds = [bd for bd in b.graph.bonds.values() if bd.alive]
@@ -238,6 +264,9 @@ class TestInsertAtomIntoBond:
         diff.assert_counts('insert_into_bond',
                            added_atoms=1, removed_atoms=0,
                            added_bonds=2, removed_bonds=1)
+        _write_review(make_review, 'test_07_insert_into_bond', b.graph, snap_before, snap_after, diff,
+                      'Insert C into first benzene C-C bond; expect +1 atom, +2 bonds, -1 bond.',
+                      ('New C has degree 2', 'Original ring connectivity preserved', 'No isolated atoms'))
         _maybe_render(visual_output_dir, 'test_07_insert_into_bond',
                       graph_before, b, diff=diff,
                       cursor_pos=tuple((bond.a.pos + bond.b.pos)[:2] / 2.0),
@@ -254,7 +283,7 @@ class TestCollapseBond:
         Demonstrates: collapse_bond merges two atoms into one. Atom farther from mouse survives.
         Before: benzene C6. After: 5 atoms, survivor at bond midpoint, neighbor bonds transferred.
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         bonds = [bd for bd in b.graph.bonds.values() if bd.alive]
@@ -319,7 +348,7 @@ class TestRecalcBonds:
         Demonstrates: recalc_bonds rebuilds bond topology from atom positions.
         Before: 6 C atoms with no bonds (just positions). After: 6 C-C bonds restored.
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         for bd in list(b.graph.bonds.values()):
@@ -353,7 +382,7 @@ class TestAddRing:
         Demonstrates: add_ring creates 6 C atoms in hexagon + 6 H caps + bonds.
         Before: empty graph. After: benzene C6H6 (12 atoms, 12 bonds).
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         graph_before = _save_graph_copy(b)
         snap_before = TopologySnapshot(b.graph)
 
@@ -374,7 +403,7 @@ class TestAddRing:
         Demonstrates: adjacent hex rings share 2 atoms (not duplicated).
         Before: benzene C6 (1 ring). After: naphthalene C10 (2 fused rings, 2 shared atoms).
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.add_ring(0, 0)
         graph_before = _save_graph_copy(b)
         snap_before = TopologySnapshot(b.graph)
@@ -401,7 +430,7 @@ class TestRemoveRing:
         Demonstrates: remove_ring in Hex1 mode removes all atoms at 6 nodes.
         Before: benzene C6. After: empty graph.
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         graph_before = _save_graph_copy(b)
@@ -424,7 +453,7 @@ class TestRemoveRing:
         Demonstrates: Hex2 mode preserves atoms shared with adjacent rings.
         Before: naphthalene C10 (2 rings). After: benzene C6 (shared 2 atoms preserved, 4 removed).
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.hex_mode = 'Hex2'
         b.auto_h_cap = False
         b.add_ring(0, 0)
@@ -452,7 +481,7 @@ class TestToggleRing:
         Demonstrates: toggle_ring adds if absent, removes if present.
         Before: benzene C6 (toggle ON). After: empty (toggle OFF).
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
 
         b.toggle_ring(0, 0)
@@ -482,7 +511,7 @@ class TestDetectRings:
         Before: naphthalene (2 fused rings) + 2 extra C atoms bonded to edge (no ring).
         After: 2 rings detected (magenta hex outlines), extra atoms correctly excluded.
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         b.add_ring(1, 0)
@@ -513,7 +542,7 @@ class TestDetectRings:
 
     def test_19_detect_rings_naphthalene(self):
         """Two adjacent rings → detect >=2 rings."""
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         b.add_ring(1, 0)
@@ -535,7 +564,7 @@ class TestHCaps:
         Demonstrates: add_h_caps adds H atoms to undercoordinated heavy atoms.
         Before: benzene C6 (no H, 6 atoms). After: benzene C6H6 (12 atoms, 6 new H caps).
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         graph_before = _save_graph_copy(b)
@@ -557,7 +586,7 @@ class TestHCaps:
         Demonstrates: remove_h_caps strips all H_cap atoms.
         Before: benzene C6H6 (12 atoms). After: benzene C6 (6 atoms, H removed).
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.add_ring(0, 0)  # auto H caps
         h_before = [a for a in b.graph.atoms.values() if a.alive and a.ename == 'H']
         assert len(h_before) > 0
@@ -580,7 +609,7 @@ class TestHCaps:
         Demonstrates: adjust_h = remove_h_caps + add_h_caps. Fixes missing/displaced H atoms.
         Before: benzene C6H6 with 3 H caps removed (C6H3, undercoordinated). After: C6H6 restored.
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.add_ring(0, 0)  # benzene C6H6 with auto H caps
         # Remove 3 H caps to simulate damaged structure
         h_atoms = [a for a in b.graph.atoms.values() if a.alive and a.ename == 'H']
@@ -617,7 +646,7 @@ class TestPicking:
 
     def test_23_pick_atom(self):
         """Pick atom at its position — returns correct atom."""
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         heavy = [a for a in b.graph.atoms.values() if a.alive and a.ename == 'C'][0]
@@ -627,14 +656,14 @@ class TestPicking:
 
     def test_24_pick_atom_miss(self):
         """Pick at empty position — returns None."""
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.add_ring(0, 0)
         picked = b.pick_atom(np.array([100.0, 100.0, 0.0]), radius=0.5)
         assert picked is None
 
     def test_25_pick_bond(self):
         """Pick bond at its midpoint — returns correct bond."""
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         bonds = [bd for bd in b.graph.bonds.values() if bd.alive]
@@ -646,7 +675,7 @@ class TestPicking:
 
     def test_26_pick_ring(self):
         """Pick ring at its center — returns correct ring."""
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         b._rings_dirty = True
@@ -722,7 +751,7 @@ class TestIO:
         Before: original naphthalene C10H8 (with bonds). After: loaded from XYZ (atoms restored, bonds rebuilt via recalc).
         Shows that the XYZ format preserves atom positions and the graph can be reconstructed.
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         b.add_ring(1, 0)
@@ -733,7 +762,7 @@ class TestIO:
         fname = str(tmp_path / 'test.xyz')
         b.save_xyz(fname)
 
-        b2 = KekuleBackend()
+        b2 = MoleculeEditorBackend()
         b2.load_xyz(fname)
         # load_xyz loads both heavy and H atoms from XYZ
         # recalc_bonds to get full bond topology (load_xyz only creates nearest-heavy bonds)
@@ -768,7 +797,7 @@ class TestRibbonBuilder:
         using the same method as everywhere else (geometry-based, not fixed offsets).
         Before: empty graph. After: finite zigzag ribbon with C atoms + properly oriented H caps.
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         graph_before = _save_graph_copy(b)
         snap_before = TopologySnapshot(b.graph)
@@ -805,7 +834,7 @@ class TestMultiStep:
         Demonstrates: multi-step edit — build structure, then change element.
         Before: naphthalene C10 (all carbon). After: C9N (one C replaced by N, H caps adjusted).
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         b.add_ring(1, 0)
@@ -834,7 +863,7 @@ class TestMultiStep:
         Before: benzene C6 (re-added after remove). After: same benzene C6 (identical counts).
         Shows that the graph correctly handles create/destroy/create cycles.
         """
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
 
         b.add_ring(0, 0)

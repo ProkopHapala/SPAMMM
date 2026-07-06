@@ -259,7 +259,6 @@ def _on_localize(window):
         sym_break = window.kek_symbreak_spin.value()
         seed = window.kek_seed_spin.value()
         rep = localize_kekule(k, Kloc=Kloc, sym_break=sym_break, seed=seed)
-        # Rebuild bo_snap from solver's pi bond orders
         bonds_all = np.asarray(atoms.bonds, dtype=np.int32) if atoms.bonds is not None else np.zeros((0, 2), dtype=np.int32)
         n_pi = k.n_pi
         is_pi = n_pi > 0
@@ -271,9 +270,14 @@ def _on_localize(window):
         _store_bond_orders_on_window(window, atoms, r)
         bo_str = np.round(window.bond_orders, 2).tolist() if window.bond_orders is not None else []
         window.kek_bond_order_label.setText(f"Bond orders: {bo_str}")
-        window.kek_status_label.setText(
-            f"Status: Localized — single={rep['single']} aromatic={rep['aromatic']} double={rep['double']} max_err={rep['max_err']:.2e}"
-        )
+        if not rep.get('valid', True):
+            warn = '; '.join(rep.get('validity', {}).get('issues', []))
+            window.kek_status_label.setText(f"Status: Localized (INVALID) — {warn}")
+        else:
+            window.kek_status_label.setText(
+                f"Status: Localized — single={rep['single']} aromatic={rep['aromatic']} double={rep['double']} "
+                f"max_err={rep['max_err']:.2e} seed={rep.get('localize_seed', seed)} valid=OK"
+            )
         if hasattr(window, 'refresh_view'):
             window.refresh_view()
     except Exception as e:

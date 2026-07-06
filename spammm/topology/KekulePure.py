@@ -498,7 +498,7 @@ def optimize_pi_bonds(system, n_pi=None, pi_atoms=None, bonds=None, dt=0.1,
 # Solver orchestration: two-phase solve, localization, export helpers
 # ---------------------------------------------------------------------------
 
-def run_kekule_solver(atoms, Kval=50.0, Kloc=5.0, Karo=0.5, Kbound=1.0, allow_aromatic=True, solver='linsolve', sym_break=0.0, seed=0, n_pi=None, localize=True):
+def run_kekule_solver(atoms, Kval=50.0, Kloc=5.0, Karo=0.5, Kbound=1.0, allow_aromatic=True, solver='linsolve', sym_break=0.0, seed=0, n_pi=None, localize=True, localize_ntrials=5):
     """Run two-phase Kekulé solver on heavy-atom bonds of an AtomicSystem.
 
     Phase 1: quadratic solve with ``Kloc=0`` (delocalized / aromatic).
@@ -517,6 +517,7 @@ def run_kekule_solver(atoms, Kval=50.0, Kloc=5.0, Karo=0.5, Kbound=1.0, allow_ar
         seed: random seed for sym_break (0 = do not set)
         n_pi: explicit (natoms,) array of pi electron counts. If None, auto-derive from element case.
         localize: if True, run phase 2 (localization). If False, only delocalized phase 1.
+        localize_ntrials: validated symmetry-breaking trials in phase 2 (default 5).
 
     Returns:
         dict with keys ``bo_raw``, ``bo_snap``, ``n_pi``, ``k``, ``err``,
@@ -542,6 +543,12 @@ def run_kekule_solver(atoms, Kval=50.0, Kloc=5.0, Karo=0.5, Kbound=1.0, allow_ar
         print(f"[KEKULE] pi-bonds={bonds_pi.tolist()}")
     err = None
     report = {}
+    pre = analyze_kekule_feasibility(atoms, n_pi)
+    report['feasibility'] = pre
+    if pre['impossible']:
+        _kekule_warn('Skipping localization — ' + '; '.join(pre['reasons']))
+    for w in pre.get('warnings', []):
+        _kekule_warn(w)
     try:
         if solver == 'linsolve':
             k.solve_quadratic(Kloc=0.0)
@@ -560,9 +567,14 @@ def run_kekule_solver(atoms, Kval=50.0, Kloc=5.0, Karo=0.5, Kbound=1.0, allow_ar
             report['aromatic'] = int(np.sum(cls == 1))
             report['double'] = int(np.sum(cls == 2))
         else:
-            _localize_phase2(k, Kloc, sym_break, seed, solver, n_pi, report)
-            bo_snap_h = k.pi_bond_orders().copy()
-            bo_snap[idx_pi] = bo_snap_h
+            if pre['impossible']:
+                bo_snap[:] = bo_raw
+                report['valid'] = False
+                report['validity'] = {'valid': False, 'issues': list(pre['reasons'])}
+            else:
+                _localize_phase2(k, Kloc, sym_break, seed, solver, n_pi, report, ntrials=localize_ntrials)
+                bo_snap_h = k.pi_bond_orders().copy()
+                bo_snap[idx_pi] = bo_snap_h
     except Exception as e:
         err = e
         import traceback
@@ -571,57 +583,290 @@ def run_kekule_solver(atoms, Kval=50.0, Kloc=5.0, Karo=0.5, Kbound=1.0, allow_ar
     return {'bo_raw': bo_raw, 'bo_snap': bo_snap, 'n_pi': n_pi, 'k': k, 'err': err, 'report': report}
 
 
-def localize_kekule(k, Kloc=5.0, sym_break=0.0, seed=0, solver='linsolve'):
-    """Run phase 2 (localization) on an existing KekulePure solver instance.
+# ---------------------------------------------------------------------------
+# Kekule feasibility analysis and chemical validity checks
+# ---------------------------------------------------------------------------
 
-    Forces allow_aromatic=False to snap bond orders to integer (0/1).
-    When sym_break > 0, persistent noise is added to snap targets (not to bo)
-    to break symmetry in degenerate systems.
+def _heavy_bond_edges(system):
+    """Return zero-based (i,j) edges between non-H atoms."""
+    bonds = np.asarray(system.bonds, dtype=np.int32) if system.bonds is not None else np.zeros((0, 2), dtype=np.int32)
+    enames = np.asarray(system.enames, dtype=str)
+    return [(int(i), int(j)) for i, j in bonds if enames[i] != 'H' and enames[j] != 'H']
 
-    Args:
-        k: KekulePure instance (already solved phase 1, k.bo holds delocalized result)
-        Kloc: localization stiffness
-        sym_break: noise amplitude (0 = off)
-        seed: random seed (0 = do not set)
-        solver: 'linsolve' or 'gd'
+
+def kekule_ring_double_counts(system, k, ring_size=6):
+    """Count pi-double bonds (bo>0.5) on each ring of given size in the bond graph."""
+    try:
+        import networkx as nx
+    except ImportError:
+        return []
+    bo = {tuple(sorted((int(i), int(j)))): float(k.pi_bond_orders()[kb])
+          for kb, (i, j) in enumerate(k.bonds)}
+    g = nx.Graph()
+    g.add_edges_from(_heavy_bond_edges(system))
+    counts = []
+    for cycle in nx.cycle_basis(g):
+        if len(cycle) != ring_size:
+            continue
+        ring_edges = [(cycle[i], cycle[(i + 1) % ring_size]) for i in range(ring_size)]
+        counts.append(sum(1 for e in ring_edges if bo.get(tuple(sorted(e)), 0.0) > 0.5))
+    return counts
+
+
+def _pi_site_mask(n_pi):
+    n_pi = np.asarray(n_pi, dtype=float)
+    return n_pi > 0
+
+
+def _build_pi_graph(system, n_pi):
+    """NetworkX graph of pi-active atoms (nodes) and pi-bonds (edges)."""
+    import networkx as nx
+    n_pi = np.asarray(n_pi, dtype=float)
+    is_pi = _pi_site_mask(n_pi)
+    pi_ids = np.nonzero(is_pi)[0]
+    g = nx.Graph()
+    for i in pi_ids:
+        g.add_node(int(i), n_pi=float(n_pi[i]))
+    bonds = np.asarray(system.bonds, dtype=np.int32) if system.bonds is not None else np.zeros((0, 2), dtype=np.int32)
+    for i, j in bonds:
+        i, j = int(i), int(j)
+        if is_pi[i] and is_pi[j]:
+            g.add_edge(i, j)
+    return g, pi_ids
+
+
+def _pi_component_sums(g):
+    """Per connected component: (nodes, sum n_pi)."""
+    import networkx as nx
+    out = []
+    for nodes in nx.connected_components(g):
+        nodes = list(nodes)
+        s = sum(g.nodes[v]['n_pi'] for v in nodes)
+        out.append((nodes, s))
+    return out
+
+
+def _uniform_n_pi_one(g):
+    """True if every pi node has n_pi == 1."""
+    return all(abs(g.nodes[v]['n_pi'] - 1.0) < 1e-9 for v in g.nodes)
+
+
+def _has_b_matching(g):
+    """Necessary check: exists assignment pi in {0,1} with vertex sums = n_pi.
+
+    Exact for uniform n_pi=1 (perfect matching).  For mixed n_pi only checks
+    degree >= n_pi and even component sums (full b-matching is NP-hard in general).
     """
-    n_pi = k.n_pi
-    report = {}
-    k.Kloc = Kloc
-    k.allow_aromatic = False  # force integer bond orders during localization
-    if solver == 'linsolve':
-        k.solve_snap(niter=50, noise=sym_break, seed=seed)
-        F2 = 0.0
+    import networkx as nx
+    if g.number_of_nodes() == 0:
+        return True, None
+    if not _uniform_n_pi_one(g):
+        return None, 'mixed_n_pi: full b-matching not verified (only necessary checks applied)'
+    nodes = list(g.nodes())
+    if len(nodes) % 2 != 0:
+        return False, 'perfect_matching: odd number of pi sites with n_pi=1'
+    matching = nx.max_weight_matching(g, maxcardinality=True)
+    covered = set()
+    if isinstance(matching, dict):
+        covered = set(matching.keys())
     else:
-        if sym_break:
-            if seed:
-                np.random.seed(seed)
-            k.bo = np.clip(k.bo + sym_break * (2.0 * np.random.rand(k.nbond) - 1.0), 0.0, 1.0)
-        F2 = k.relax(dt=0.05, nmax=5000, tol=1e-6)
-    cls = k.classify()
-    report['phase2_F2'] = F2
-    report['phase2_bo'] = k.pi_bond_orders()
-    report['single'] = int(np.sum(cls == 0))
-    report['aromatic'] = int(np.sum(cls == 1))
-    report['double'] = int(np.sum(cls == 2))
+        for e in matching:
+            covered.update(e)
+    if covered != set(nodes):
+        return False, 'perfect_matching: no perfect matching (Kekule dimer cover impossible)'
+    return True, None
+
+
+def analyze_kekule_feasibility(system, n_pi=None):
+    """Graph-theoretic pre-checks before running the Kekule localizer.
+
+    Returns dict with:
+        feasible (bool): all *necessary* conditions pass (solution may still fail)
+        impossible (bool): proven impossible — do not expect a discrete Kekule
+        reasons (list[str]): human-readable blockers when impossible
+        warnings (list[str]): non-fatal concerns
+        checks (dict): individual check name → passed bool or value
+    """
+    if n_pi is None:
+        n_pi = make_n_pi(system)
+    n_pi = np.asarray(n_pi, dtype=float)
+    g, pi_ids = _build_pi_graph(system, n_pi)
+    reasons, warnings, checks = [], [], {}
+
+    total_pi = float(np.sum(n_pi[_pi_site_mask(n_pi)]))
+    checks['total_pi_sum'] = total_pi
+    checks['even_total_pi_sum'] = abs(round(total_pi) - total_pi) < 1e-9 and int(round(total_pi)) % 2 == 0
+    if not checks['even_total_pi_sum']:
+        reasons.append(f'odd_total_pi_sum: sum(n_pi)={total_pi:g} is odd — cannot pair pi electrons on bonds')
+
+    n_sites = int(g.number_of_nodes())
+    checks['n_pi_sites'] = n_sites
+    if n_sites == 0:
+        warnings.append('no_pi_sites: no pi-active atoms')
+        return {'feasible': False, 'impossible': False, 'reasons': reasons, 'warnings': warnings, 'checks': checks}
+
+    if _uniform_n_pi_one(g) and (n_sites % 2) != 0:
+        reasons.append(f'odd_pi_sites: {n_sites} pi sites each with n_pi=1 — no perfect dimer cover exists')
+
+    isolated = [v for v in g.nodes if g.degree(v) == 0]
+    checks['isolated_pi_atoms'] = isolated
+    if isolated:
+        reasons.append(f'isolated_pi_atoms: atoms {isolated} have n_pi>0 but no pi-bonds')
+
+    for v in g.nodes:
+        need, deg = g.nodes[v]['n_pi'], g.degree(v)
+        if need > deg + 1e-9:
+            reasons.append(f'pi_degree_deficit: atom {v} needs n_pi={need:g} but pi-degree={deg}')
+
+    comp_data = _pi_component_sums(g)
+    checks['component_pi_sums'] = [s for _, s in comp_data]
+    for nodes, s in comp_data:
+        si = int(round(s))
+        if abs(s - si) > 1e-9:
+            continue
+        if si % 2 != 0:
+            tag = f'{nodes[:4]}{"..." if len(nodes) > 4 else ""}'
+            reasons.append(f'odd_component_pi_sum: component {tag} sum(n_pi)={s:g} is odd')
+
+    bm_ok, bm_msg = _has_b_matching(g)
+    checks['b_matching'] = bm_ok
+    if bm_ok is False:
+        reasons.append(bm_msg)
+    elif bm_ok is None and bm_msg:
+        warnings.append(bm_msg)
+
+    impossible = len(reasons) > 0
+    feasible = not impossible
+    return {'feasible': feasible, 'impossible': impossible, 'reasons': reasons, 'warnings': warnings, 'checks': checks}
+
+
+def validate_kekule_solution(system, k, n_pi=None, valence_tol=1e-6, discrete_tol=0.15,
+                           ring_size=6, min_ring_doubles=2, max_ring_doubles=3):
+    """Check whether a localized Kekule assignment is chemically consistent.
+
+    Returns dict with:
+        valid (bool): all checks pass
+        issues (list[str]): failed checks
+        valence_max_err, ring_doubles, min_ring_doubles, max_ring_doubles, discrete (bool)
+    """
+    if n_pi is None:
+        n_pi = k.n_pi
+    n_pi = np.asarray(n_pi, dtype=float)
+    issues = []
+    is_pi = _pi_site_mask(n_pi)
+    err2 = (k._A @ k.bo - n_pi)[is_pi]
+    valence_max_err = float(np.max(np.abs(err2))) if err2.size else 0.0
+    if valence_max_err > valence_tol:
+        issues.append(f'valence: max|A@bo-n_pi|={valence_max_err:.3e} > {valence_tol:g}')
+
+    bo = k.pi_bond_orders()
+    if np.any(bo < -1e-9) or np.any(bo > 1.0 + 1e-9):
+        issues.append(f'bounds: pi bond orders outside [0,1]: min={bo.min():g} max={bo.max():g}')
+
+    mid = (bo > discrete_tol) & (bo < 1.0 - discrete_tol)
+    discrete = not np.any(mid)
+    if not discrete:
+        issues.append(f'discrete: {int(np.sum(mid))} bonds have fractional pi (not snapped to 0/1)')
+
+    ring_doubles = kekule_ring_double_counts(system, k, ring_size=ring_size)
+    min_rd = min(ring_doubles) if ring_doubles else None
+    max_rd = max(ring_doubles) if ring_doubles else None
+    if ring_doubles:
+        for i, nd in enumerate(ring_doubles):
+            if nd < min_ring_doubles:
+                issues.append(f'ring_{i}: {ring_size}-ring has {nd} double bonds (min {min_ring_doubles})')
+            if nd > max_ring_doubles:
+                issues.append(f'ring_{i}: {ring_size}-ring has {nd} double bonds (max {max_ring_doubles})')
+
+    return {
+        'valid': len(issues) == 0,
+        'issues': issues,
+        'valence_max_err': valence_max_err,
+        'ring_doubles': ring_doubles,
+        'min_ring_doubles': min_rd,
+        'max_ring_doubles': max_rd,
+        'discrete': discrete,
+    }
+
+
+def _kekule_warn(msg):
+    from spammm.globals import debug_print
+    debug_print(1, f'[KEKULE] WARNING: {msg}')
+
+
+def _localize_score(system, k, n_pi):
+    """Higher is better: prioritize valid ring Kekule, then valence accuracy."""
+    ring_nd = kekule_ring_double_counts(system, k, ring_size=6)
+    min_ring = min(ring_nd) if ring_nd else 99
     err2 = (k._A @ k.bo - n_pi)[n_pi > 0]
-    report['max_err'] = float(np.max(np.abs(err2))) if err2.size else 0.0
-    return report
+    max_err = float(np.max(np.abs(err2))) if err2.size else 0.0
+    return (min_ring, -max_err, ring_nd)
 
 
-def _localize_phase2(k, Kloc, sym_break, seed, solver, n_pi, report):
-    """Internal: run phase 2 and fill report dict in-place."""
+def _localize_single_trial(k, Kloc, sym_break, seed, solver, bo_start):
+    """One localization attempt from delocalized bo_start."""
+    k.bo = bo_start.copy()
     k.Kloc = Kloc
     k.allow_aromatic = False
     if solver == 'linsolve':
         k.solve_snap(niter=50, noise=sym_break, seed=seed)
-        F2 = 0.0
-    else:
-        if sym_break:
-            if seed:
-                np.random.seed(seed)
-            k.bo = np.clip(k.bo + sym_break * (2.0 * np.random.rand(k.nbond) - 1.0), 0.0, 1.0)
-        F2 = k.relax(dt=0.05, nmax=5000, tol=1e-6)
+        return 0.0
+    if sym_break:
+        if seed:
+            np.random.seed(seed)
+        k.bo = np.clip(k.bo + sym_break * (2.0 * np.random.rand(k.nbond) - 1.0), 0.0, 1.0)
+    return k.relax(dt=0.05, nmax=5000, tol=1e-6)
+
+
+def localize_kekule(k, Kloc=5.0, sym_break=0.0, seed=0, solver='linsolve', ntrials=5, validate=True):
+    """Run phase 2 (localization) on an existing KekulePure solver instance.
+
+    Tries up to ``ntrials`` symmetry-breaking seeds (default 5).  Stops at the
+    first chemically **valid** Kekule pattern (see ``validate_kekule_solution``).
+    If none pass, keeps the best-scoring trial and emits a warning.
+
+    Args:
+        k: KekulePure instance (already solved phase 1)
+        Kloc, sym_break, seed, solver: localization parameters
+        ntrials: max localization attempts with seed, seed+1, ...
+        validate: if True, use ``validate_kekule_solution`` to accept/reject trials
+    """
+    n_pi = k.n_pi
+    report = {}
+    pre = analyze_kekule_feasibility(k.system, n_pi)
+    report['feasibility'] = pre
+    if pre['impossible']:
+        _kekule_warn('Structure likely has no discrete Kekule form: ' + '; '.join(pre['reasons']))
+        report['valid'] = False
+        report['validity'] = {'valid': False, 'issues': list(pre['reasons'])}
+        return report
+
+    bo_start = k.bo.copy()
+    best_bo = bo_start.copy()
+    best_score = (-1, -1e300, [])
+    best_seed = seed
+    best_validity = None
+    found_valid = False
+    F2 = 0.0
+    ntry = max(1, int(ntrials))
+    t = 0
+    for t in range(ntry):
+        trial_seed = (seed + t) if seed else t
+        F2 = _localize_single_trial(k, Kloc, sym_break, trial_seed, solver, bo_start)
+        score = _localize_score(k.system, k, n_pi)
+        validity = validate_kekule_solution(k.system, k, n_pi) if validate else {'valid': True, 'issues': []}
+        if score > best_score:
+            best_score = score
+            best_bo = k.bo.copy()
+            best_seed = trial_seed
+            best_validity = validity
+        if validate and validity['valid']:
+            found_valid = True
+            best_bo = k.bo.copy()
+            best_seed = trial_seed
+            best_validity = validity
+            break
+    k.bo = best_bo
     cls = k.classify()
     report['phase2_F2'] = F2
     report['phase2_bo'] = k.pi_bond_orders()
@@ -630,6 +875,25 @@ def _localize_phase2(k, Kloc, sym_break, seed, solver, n_pi, report):
     report['double'] = int(np.sum(cls == 2))
     err2 = (k._A @ k.bo - n_pi)[n_pi > 0]
     report['max_err'] = float(np.max(np.abs(err2))) if err2.size else 0.0
+    report['ring_doubles'] = best_score[2]
+    report['min_ring_doubles'] = int(best_score[0]) if best_score[2] else None
+    report['localize_seed'] = int(best_seed)
+    report['localize_trials'] = t + 1 if found_valid else ntry
+    report['validity'] = best_validity or validate_kekule_solution(k.system, k, n_pi)
+    report['valid'] = bool(report['validity']['valid'])
+    if validate and not found_valid:
+        _kekule_warn(
+            f'No valid Kekule after {ntry} localization attempt(s) (seeds {seed}..{seed + ntry - 1 if seed else ntry - 1}). '
+            f'Best trial seed={best_seed} issues: {"; ".join(report["validity"].get("issues", []))}. '
+            f'Structure may have no discrete Kekule form or needs more trials.'
+        )
+    return report
+
+
+def _localize_phase2(k, Kloc, sym_break, seed, solver, n_pi, report, ntrials=5):
+    """Internal: run phase 2 and fill report dict in-place."""
+    rep = localize_kekule(k, Kloc=Kloc, sym_break=sym_break, seed=seed, solver=solver, ntrials=ntrials)
+    report.update(rep)
 
 
 def mol_bond_types(atoms, bo_snap=None, allow_aromatic=True, kekule=False):

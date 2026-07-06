@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-test_tensor_parity.py — Verify GPU tensor kernels match CPU numpy reference.
+testplot_tensor_parity.py — Verify GPU tensor kernels match CPU numpy reference.
 
-Builds directly on test_folded_surface_scan.py:
+Builds directly on testplot_folded_surface_scan.py:
   - Same coordinate system (Z_SURF_TOP = -3.25, z_rel relative to surface)
   - Same reference generation (GPU brute-force for Morse, Ewald2D for Coulomb)
   - Same z-scan range, fit range, alphas, sites, probes
@@ -18,9 +18,9 @@ Strategy:
      - Coulomb only (pauli/london coeffs = 0)
      - Combined (all 3 components)
   5. Plot z-scans with brute-force reference + CPU fit + GPU tensor, matching
-     the style of test_folded_surface_scan.py plots.
+     the style of testplot_folded_surface_scan.py plots.
 
-Run:  python tests/test_tensor_parity.py
+Run:  python tests/testplot_tensor_parity.py
 """
 
 import os, sys
@@ -38,11 +38,11 @@ from spammm.AtomicSystem import AtomicSystem
 from spammm.surfaces.Ewald2D import Ewald2D
 
 # =============================================================================
-# Configuration — MUST match test_folded_surface_scan.py exactly
+# Configuration — MUST match testplot_folded_surface_scan.py exactly
 # =============================================================================
 
 NACL_SUBSTRATE = os.path.join(_proj_root, 'data', 'substrates', 'NaCl_1x1_L3.xyz')
-PLOT_DIR = os.path.join(_proj_root, 'debug', 'test_tensor_parity')
+PLOT_DIR = os.path.join(_proj_root, 'debug', 'testplot_tensor_parity')
 
 R_O = 1.7500; SQRT_E_O = np.sqrt(0.00260184625)
 PROBE_REQ = np.array([[R_O, SQRT_E_O, -0.5, 0.0]], dtype=np.float32)
@@ -60,10 +60,10 @@ FIT_NZ_SAMP = 60
 MORSE_NPBC = (4, 4, 0)
 MORSE_ALPHA = 1.8
 
-# Z-basis alphas (from test_folded_surface_scan.py)
+# Z-basis alphas (from testplot_folded_surface_scan.py)
 MORSE_ALPHAS = np.array([1.0, 1.8, 2.7, 3.6, 5.0], dtype=np.float32)  # /Å
 
-# Poly basis config (from test_folded_surface_scan.py)
+# Poly basis config (from testplot_folded_surface_scan.py)
 POLY_R = 14.0  # cutoff [Å]
 # Kernel uses SEQUENTIAL powers: m_start, m_start+1, ..., m_start+Nz-1
 # (unlike scan test which used arbitrary powers [4,8,16,32,64])
@@ -139,7 +139,7 @@ def cpu_eval_force(uvz, basis_params, coeff4, lvec2d):
 
 
 # =============================================================================
-# Reference generation — same as test_folded_surface_scan.py
+# Reference generation — same as testplot_folded_surface_scan.py
 # =============================================================================
 
 def _make_transforms(positions):
@@ -271,7 +271,7 @@ def _eval_gpu_2d(md, z_abs, nxy, chunk_size=256):
 
 
 # =============================================================================
-# Plotting — matching test_folded_surface_scan.py style
+# Plotting — matching testplot_folded_surface_scan.py style
 # =============================================================================
 
 def _safe_name(s):
@@ -297,7 +297,7 @@ def _z_basis_values(z_rel, alphas):
 
 def plot_zscan(z_rel, E_ref, E_cpu, E_gpu, F_cpu, F_gpu, label, site, save_dir, alphas=None):
     """Plot E(z) + Fz(z) + z-basis functions: Reference + CPU fit + GPU tensor.
-    Style matches test_folded_surface_scan.py: top=energy, middle=force, bottom=basis."""
+    Style matches testplot_folded_surface_scan.py: top=energy, middle=force, bottom=basis."""
     if alphas is None:
         alphas = MORSE_ALPHAS
     fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=True,

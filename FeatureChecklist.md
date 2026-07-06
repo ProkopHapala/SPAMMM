@@ -149,7 +149,7 @@
 - **RigidBody folded basis** — `init_folded()` / `run_folded()` for folded atomic function surface interaction, implemented, untested
 
 ### 🔲 Planned
-- **Assembly collision** — rigid-body collision between fragments (`Assembly.py`, `assembly.cl`), no test
+- **Assembly collision** — `testplot_assembly.py` visual demo + XYZ/diag artifacts (`Assembly.py`, `AssemblyPlot.py`, `assembly.cl`); pytest L0 pending
 
 ---
 

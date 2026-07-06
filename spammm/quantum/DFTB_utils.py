@@ -607,7 +607,7 @@ def run_dftb_for_density(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz'
         cwd = os.getcwd()
         os.chdir(work_dir)
         try:
-            ret = os.system('dftb+ > OUT 2> ERR')
+            ret = os.system(f'{DFTB_EXE} > OUT 2> ERR')
             if ret != 0:
                 raise RuntimeError(f"DFTB+ failed in {work_dir}, see ERR file")
             from spammm.DFTB.DFTBplusParser import parse_detailed_xml_custom, parse_eigenvec_bin_custom
@@ -629,22 +629,24 @@ def run_dftb_for_density(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz'
     return res   # (geo, evecs)
 
 
-def run_dftb_sp(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz'):
+def run_dftb_sp(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz', maxscc=200, restart_charges_from=None):
     """Run DFTB+ single-point calculation in work_dir.
 
     Returns energy in Ha.  Raises RuntimeError on failure.
     """
-    import os
+    import os, shutil
     from spammm import atomicUtils as au
     os.makedirs(work_dir, exist_ok=True)
     xyz_path = os.path.join(work_dir, xyz_fname)
     hsd_path = os.path.join(work_dir, 'dftb_in.hsd')
     au.save_xyz(xyz_path, enames, apos)
-    write_dftb_input_sp(enames, xyz_path, hsd_path, sk_prefix)
+    write_dftb_input_sp(enames, xyz_path, hsd_path, sk_prefix, maxscc=maxscc)
+    if restart_charges_from and os.path.isfile(restart_charges_from):
+        shutil.copy(restart_charges_from, os.path.join(work_dir, 'charges.bin'))
     cwd = os.getcwd()
     os.chdir(work_dir)
     try:
-        ret = os.system('dftb+ > OUT 2> ERR')
+        ret = os.system(f'{DFTB_EXE} > OUT 2> ERR')
         if ret != 0:
             raise RuntimeError(f"DFTB+ failed in {work_dir}")
         return parse_energy_out('OUT')

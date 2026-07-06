@@ -4,7 +4,7 @@ description: Use when touching anything related to molecular topology, bond orde
 trigger:
   glob:
     - "**/AtomicGraph.py"
-    - "**/KekuleBackend.py"
+    - "**/MoleculeEditorBackend.py"
     - "**/KekuleExtension.py"
     - "**/SPAMMM_GUI.py"
     - "**/VispyUtils.py"
@@ -25,7 +25,7 @@ trigger:
 | Layer | Class | Data format | Role | Direction |
 |-------|-------|-------------|------|-----------|
 | **Authoritative** | `AtomicGraph` | Object graph (dicts of `Atom`/`Bond`/`Ring` with stable `_id`) | Editable topology, bond orders, hybridization | Read/write here |
-| **Bridge** | `KekuleBackend` | Dense numpy arrays + ephemeral ID mappings | Syncs graph → arrays for rendering/FF/export | Graph → arrays only |
+| **Bridge** | `MoleculeEditorBackend` | Dense numpy arrays + ephemeral ID mappings | Syncs graph → arrays for rendering/FF/export | Graph → arrays only |
 | **Rendering** | `AtomScene` (Vispy) | Dense arrays, picks emit `Atom._id` | 3D visualization, mouse interaction | Read-only consumer |
 | **I/O** | `AtomicSystem` | Dense arrays (`apos`, `enames`, `bonds`) | File export/import, FF computation | Read-only consumer |
 | **Solver** | `KekulePure` | Pi-bond order arrays | Kekule bond order optimization | Writes results back to graph |
@@ -35,12 +35,12 @@ trigger:
 ```
 AtomicGraph (authoritative)
     │
-    ├── KekuleBackend._sync_sys()  →  AtomicSystem (dense arrays for rendering/export)
+    ├── MoleculeEditorBackend._sync_sys()  →  AtomicSystem (dense arrays for rendering/export)
     │                                    _atom_ids, _bond_ids (ephemeral mappings)
     │
-    ├── KekuleBackend.get_graph_bond_orders()  →  Vispy rendering (reads Bond.order)
+    ├── MoleculeEditorBackend.get_graph_bond_orders()  →  Vispy rendering (reads Bond.order)
     │
-    ├── KekuleBackend._graph_bond_types_mol()  →  MOL/MOL2 export (reads Bond.order)
+    ├── MoleculeEditorBackend._graph_bond_types_mol()  →  MOL/MOL2 export (reads Bond.order)
     │
     └── KekuleExtension._store_bond_orders_on_graph()  →  writes Bond.order after solving
 ```
@@ -78,7 +78,7 @@ AtomicGraph (authoritative)
 | File | Role |
 |------|------|
 | `spammm/topology/AtomicGraph.py` | `Atom`, `Bond`, `Ring` classes, `to_arrays()`, `add_bond(order=...)` |
-| `spammm/topology/KekuleBackend.py` | `_sync_sys()`, `get_graph_bond_orders()`, `_graph_bond_types_mol()`, `save_structure()` |
+| `spammm/topology/MoleculeEditorBackend.py` | `_sync_sys()`, `get_graph_bond_orders()`, `_graph_bond_types_mol()`, `save_structure()` |
 | `spammm/GUI/SPAMMM_GUI.py` | `refresh_view()` — reads bond orders from graph via backend |
 | `spammm/GUI/KekuleExtension.py` | `_store_bond_orders_on_graph()` — writes solver results to `Bond.order` |
 | `spammm/AtomicSystem.py` | `save_mol(bond_types=...)`, `save_mol2(bond_types=...)` — pass-through to atomicUtils |

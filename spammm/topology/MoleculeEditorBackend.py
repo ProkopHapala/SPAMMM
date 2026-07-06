@@ -1,7 +1,7 @@
 """
-KekuleBackend.py — Backend logic for the Kekule Structure Explorer (molecular editor).
+MoleculeEditorBackend.py — Backend logic for the SPAMMM molecular editor.
 
-Purpose: Implement all editing operations for the KekuleExplorerGUI — atom addition,
+Purpose: Implement all editing operations for SPAMMM_GUI — atom addition,
 deletion, bond creation/breaking, ring insertion/removal, passivation groups,
 hexagonal grid snapping, and auto hydrogen capping.
 
@@ -13,9 +13,12 @@ Key functionality:
   - Hybridization inference (sp, sp2, sp3) and pi-orbital tracking
   - _sync_sys() — propagate AtomicGraph changes to AtomicSystem for rendering
 
-Role in SPAMMM: The editing engine. KekuleExplorerGUI sends user actions here;
+Role in SPAMMM: The editing engine. SPAMMM_GUI sends user actions here;
 the backend mutates AtomicGraph and emits signals for GUI refresh. This is the
 bridge between user interaction and molecular state.
+
+Historical note: formerly ``MoleculeEditorBackend`` (FireCore / KekuleExplorerGUI era).
+Kekule bond-order assignment lives in ``KekulePure.py``, not here.
 """
 
 import sys
@@ -27,7 +30,7 @@ from spammm.topology.HexGrid import HexGrid, snap_to_grid
 from spammm import elements
 from spammm import atomicUtils as au
 
-# Global verbosity level for debug prints (sync with KekuleExplorerGUI)
+# Global verbosity level for debug prints (sync with SPAMMM_GUI)
 # 0: Only exceptions and explicit prints
 # 1: Warnings and complex operation reports
 # 2: Click and action prints (default)
@@ -68,7 +71,7 @@ def snap_to_grid(pos_xy, a_CC=1.42, tol=0.15):
     decimals = 4
     return (round(float(pos_xy[0]), decimals), round(float(pos_xy[1]), decimals))
 
-# ============ KekuleBackend class ============
+# ============ MoleculeEditorBackend class ============
 
 # Passivation group definitions: list of (element, x, y, z) coordinates relative to C atom
 # First atom at (0,0,0) replaces the C atom; others are added at C_pos + coords
@@ -117,7 +120,7 @@ def parse_passivation_string(s):
     return result
 
 bond_length_cutoff = 2.0  # Slightly larger than typical C-C bond (1.42)
-class KekuleBackend:
+class MoleculeEditorBackend:
     """Manages molecular editing state on a hexagonal grid.
 
     Authoritative state: self.graph (AtomicGraph) — object graph, no integer indices.
@@ -1987,9 +1990,9 @@ class KekuleBackend:
 
         Parameters
         ----------
-        backend1 : KekuleBackend
+        backend1 : MoleculeEditorBackend
             Bottom ribbon.
-        backend2 : KekuleBackend
+        backend2 : MoleculeEditorBackend
             Top ribbon.
         L_Hb : float
             Hydrogen-bond separation between ribbons (Angstrom).
@@ -2079,12 +2082,12 @@ class KekuleBackend:
             length_cells = len(bottom_passivation)
 
         # Build bottom ribbon
-        backend1 = KekuleBackend(a_CC=self.a_CC)
+        backend1 = MoleculeEditorBackend(a_CC=self.a_CC)
         backend1.build_zigzag_ribbon(width_chains, length_cells, passivation_bottom=bottom_passivation, passivation_top=bottom_passivation,
                                      scale_x=Lx / (2.0 * self.a_CC * np.cos(np.pi / 6)), bPeriodicX=bPeriodicX, side_passivation=side_passivation if not bPeriodicX else None)
 
         # Build top ribbon
-        backend2 = KekuleBackend(a_CC=self.a_CC)
+        backend2 = MoleculeEditorBackend(a_CC=self.a_CC)
         backend2.build_zigzag_ribbon(width_chains, length_cells, passivation_bottom=top_passivation, passivation_top=top_passivation,
                                      scale_x=Lx / (2.0 * self.a_CC * np.cos(np.pi / 6)), bPeriodicX=bPeriodicX, side_passivation=side_passivation if not bPeriodicX else None)
 
@@ -2234,7 +2237,7 @@ class KekuleBackend:
 
     def report_state(self):
         """Print summary of the backend state for debugging."""
-        debug_print(2, "=== KekuleBackend State ===")
+        debug_print(2, "=== MoleculeEditorBackend State ===")
         debug_print(2, f"  rings={self.rings}")
         debug_print(2, f"  natoms={len(self.sys.apos)}")
         if len(self.sys.apos) > 0:
@@ -2272,7 +2275,7 @@ def build_ribbon(passivation, width_chains, length_cells, Lx, a_CC=1.42):
     elems : list of str
         Element symbols.
     """
-    backend = KekuleBackend(a_CC=a_CC)
+    backend = MoleculeEditorBackend(a_CC=a_CC)
     xa_nom = a_CC * np.cos(np.pi / 6)
     scale_x = Lx / (2.0 * xa_nom)
     backend.build_zigzag_ribbon(width_chains=width_chains, length_cells=length_cells,
@@ -2314,8 +2317,8 @@ def build_two_ribbon_cell(width_chains=4, length_cells=1, Lx=2.4, a_CC=1.42, L_H
     lvs : np.ndarray, shape (3, 3)
         Lattice vectors.
     """
-    backend1 = KekuleBackend(a_CC=a_CC)
-    backend2 = KekuleBackend(a_CC=a_CC)
+    backend1 = MoleculeEditorBackend(a_CC=a_CC)
+    backend2 = MoleculeEditorBackend(a_CC=a_CC)
     xa_nom = a_CC * np.cos(np.pi / 6)
     scale_x = Lx / (2.0 * xa_nom)
     backend1.build_zigzag_ribbon(width_chains, length_cells, passivation='N', scale_x=scale_x, bPeriodicX=False)

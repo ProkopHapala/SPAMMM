@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_folded_surface_scan.py — Fit folded basis to NaCl surface potential.
+testplot_folded_surface_scan.py — Fit folded basis to NaCl surface potential.
 
 Morse (Pauli+London) and Coulomb are INDEPENDENT problems, fit and plotted separately.
   - Morse is charge-independent → only 2 combinations (Na site, Cl site)
@@ -11,7 +11,7 @@ All fitting, evaluation, and plotting is done in pure Python/numpy.
 
 Each plot: top = reference + fit + error (residual), bottom = basis functions.
 
-Run:  python tests/test_folded_surface_scan.py
+Run:  python tests/testplot_folded_surface_scan.py
 """
 
 import os, sys
@@ -33,7 +33,7 @@ from spammm.surfaces.Ewald2D import Ewald2D
 # =============================================================================
 
 NACL_SUBSTRATE = os.path.join(_proj_root, 'data', 'substrates', 'NaCl_1x1_L3.xyz')
-PLOT_DIR = os.path.join(_proj_root, 'debug', 'test_folded_surface_scan')
+PLOT_DIR = os.path.join(_proj_root, 'debug', 'testplot_folded_surface_scan')
 
 R_O = 1.7500; SQRT_E_O = np.sqrt(0.00260184625)
 PROBES = {

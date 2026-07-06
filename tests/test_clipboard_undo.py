@@ -15,7 +15,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from spammm.topology.AtomicGraph import AtomicGraph
-from spammm.topology.KekuleBackend import KekuleBackend
+from spammm.topology.MoleculeEditorBackend import MoleculeEditorBackend
 from spammm.topology.PackedMolecule import PackedMolecule, UndoStack, _z_to_ename
 
 DEBUG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'debug', 'test_clipboard_undo')
@@ -23,7 +23,7 @@ os.makedirs(DEBUG_DIR, exist_ok=True)
 
 
 def build_benzene_backend():
-    kb = KekuleBackend()
+    kb = MoleculeEditorBackend()
     a_CC = 1.42
     angles = np.arange(6) * (np.pi / 3.0)
     carbons = []

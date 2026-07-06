@@ -364,6 +364,8 @@ These topics have been migrated from FireCore's Python/PyOpenCL code into SPAMMM
 |--------------|-------------|--------|
 | `pyBall/OCL/Assembly.py` | `spammm/forcefields/Assembly.py` | **Migrated** |
 | `cl/Assembly.cl` | `kernels/assembly.cl` | **Migrated** |
+| `tests/tMMFF/test_assembly.py` (driver) | `tests/testplot_assembly.py` | **Migrated** (orchestration + diagnostics) |
+| — | `spammm/forcefields/AssemblyPlot.py` | **SPAMMM** (plotting/diagnostics; split from driver) |
 
 ## 9. GridFF (Grid Force Field — B-spline Substrate Potential)
 

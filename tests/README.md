@@ -1,37 +1,54 @@
 # tests/
 
-Test suite for SPAMMM. Three classes of scripts:
+Test suite for SPAMMM. See **`doc/TEST_DESIGN.md`** (SSOT).
 
-- **Class 1 — Pytest tests**: `def test_*` with `assert`, run via `pytest`
-- **Class 2 — Standalone scripts**: `python tests/<script>.py`, produce plots/metrics for visual review
-- **Class 3 — Utility modules**: helpers imported by Class 1 & 2, never run directly
+## Review levels
 
-## Files
+| Level | Mechanism |
+|-------|-----------|
+| L0 | `assert` / `TopologyDiff` / `ref_data/` |
+| L1 | `.out` + `.log` in `debug/<script>/` (`--review` or `--develop`) |
+| L2 | `.png` (`--visual` or `--develop`) |
 
-| Script | Class | Purpose |
-|--------|-------|---------|
-| `conftest.py` | 3 | Pytest fixtures: data paths, molecule loader, `--update-refs` |
-| `test_topology.py` | 1 | Bond/angle/hybridization/atom-type assignment |
-| `test_forcefield.py` | 1 | UFF/SPFF geometry optimization, NVE invariants, force-energy correspondence |
-| `test_surface.py` | 1 | Ewald2D vs brute-force, surface GridFF, lateral scans |
-| `test_folded_relax.py` | 1 | Rigid body relaxation + manipulation on folded basis (NaCl substrate) |
-| `test_lingebra.py` | 1 | Linear algebra: eigenvalue decomposition parity |
-| `test_integration.py` | 1 | Relaxed scan stubs (molecule on substrate) — TODO |
-| `test_afm.py` | 3 | Re-exports pointer to `SPM/test_afm_morse.py` |
-| `test_folded_surface_scan.py` | 2 | Fit folded basis to NaCl surface potential, plot fits + residuals |
-| `test_tensor_parity.py` | 2 | GPU tensor kernel vs CPU numpy reference for Morse/Coulomb |
-| `run_manipulation.py` | 2 | CLI: run relaxed scan, export `.xyz` trajectory movie |
-| `TEST_RESULTS.md` | — | Human-readable test results log |
-| `ref_data/` | — | Git-tracked reference files (`.ref.json`, `.ref.xyz`) for regression tests |
+## File classes
+
+| Pattern | pytest? | Purpose |
+|---------|---------|---------|
+| `test_*.py` | Yes | Automatic tests (+ optional L1/L2 flags) |
+| `testplot_*.py` | No | Visual demos: `python tests/...` |
+| `run_*.py` | No | CLI utilities |
+| `helpers/` | No | Shared utilities |
+
+## Run
+
+```bash
+pytest -m "not slow"                                    # routine
+pytest tests/topology/test_editing_ops.py --develop -s  # new feature debug
+```
+
+## Key files
+
+| Script | Purpose |
+|--------|---------|
+| `conftest.py` | Fixtures, `--develop`/`--review`/`--visual` flags |
+| `test_topology.py` | Bond/angle/hybridization/type assignment |
+| `test_forcefield.py` | UFF/SPFF optimization, NVE |
+| `test_surface.py` | Ewald, GridFF, folded function |
+| `test_folded_relax.py` | Rigid body relax + manipulation |
+| `topology/test_editing_ops.py` | Molecular editing (L0+L1+L2 pilot) |
+| `testplot_tensor_parity.py` | GPU tensor kernel parity plots |
+| `testplot_folded_surface_scan.py` | Folded basis fitting plots |
+| `testplot_assembly.py` | Hexagonal SAM assembly search, clash/strain maps, XYZ export |
+| `testplot_contact_surface.py` | GPU contact surface vs brute Morse (separable + PIC) |
+| `SPM/test_afm_*.py` | AFM pytest tests |
+| `SPM/testplot_*.py` | AFM visual diagnostics |
+| `ref_data/` | Git-tracked regression references |
 
 ## Subfolders
 
 | Folder | Purpose |
 |--------|---------|
-| `SPM/` | AFM / scanning probe microscopy tests and diagnostic plots |
-| `helpers/` | Shared utility modules (parity, geometry, scan, folded rigid body) |
-| `surfaces/` | Surface GridFF construction and sampling utilities |
-| `forcefields/` | Forcefield-specific tests (empty — placeholder) |
-| `integration/` | Integration tests (empty — placeholder) |
-| `quantum/` | Quantum method tests (empty — placeholder) |
-| `topology/` | Topology tests (empty — placeholder) |
+| `topology/` | Editing, Kekule, ascii art |
+| `SPM/` | Scanning probe microscopy |
+| `surfaces/` | GridFF utilities, contact-surface demo |
+| `helpers/` | parity, geometry, review, topology_test |

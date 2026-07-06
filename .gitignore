@@ -218,7 +218,8 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Debug output (generated test plots, .xyz cluster files)
-debug/
+debug/**
+!debug/README.md
 
 # GUI output (screenshots, saved plots)
 output/

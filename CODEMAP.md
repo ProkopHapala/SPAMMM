@@ -18,12 +18,12 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 
 ### spammm/topology/ — Molecular Topology (SSOT: AtomicGraph)
 - `AtomicGraph.py` — `Atom`, `Bond`, `Ring` classes; `to_arrays()`. **Authoritative** molecular structure (see skill:`molecular-structure-sync`)
-- `KekuleBackend.py` — bridge: graph ↔ dense arrays; `_sync_sys()`, `save_structure()`, export
-- `KekulePure.py` — Kekule pi-bond order solver; writes results back to `Bond.order`
+- `MoleculeEditorBackend.py` — molecular editor backend: graph ↔ dense arrays; hex grid, editing ops, `_sync_sys()`, export
+- `KekulePure.py` — Kekule pi-bond order solver; feasibility precheck, multi-seed localization, 6-ring validation; writes results back to `Bond.order`
 - `PackedMolecule.py` — compact molecule representation
 - `FFparams.py` — forcefield parameter assignment from topology
 - `HexGrid.py` — hexagonal grid for graphene/2D structures
-- `ascii_art_heterocycle.py` — ASCII art rendering of heterocycles
+- `ascii_art_heterocycle.py` — ASCII art heterocycle builder; `:` H-bond marks, `resolve_hbond_pairs()`, `ASCII_EXAMPLES`
 - `heterocycle_generator.py` — heterocycle structure generation
 
 ### spammm/forcefields/ — Interatomic Force Fields
@@ -34,11 +34,13 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `UFFbuilder.py` — UFF topology/buffer builder
 - `RigidBodyDynamics.py` — rigid body dynamics integrator
 - `RigidBodyAFM.py` — rigid body AFM tip dynamics
-- `Assembly.py` — force assembly from kernel outputs
+- `Assembly.py` — hexagonal SAM rigid-body packing search (orchestration + `AssemblyOCL`)
+- `AssemblyPlot.py` — assembly top views, clash/strain diagnostics, XYZ export
 - `QEq.py` — charge equilibration
 
 ### spammm/surfaces/ — Surface Interactions
 - `GridFF.py` — grid force field (B-spline interpolation)
+- `ContactSurface.py` — GPU quasi-2D contact surface (separable B-spline×poly + radial PIC); brute Morse reference, CG fit, h₀ height map
 - `GridFFRelaxedScan.py` — relaxed scan over surface grid
 - `FoldedRigid.py` — folded basis rigid body relaxation
 - `Ewald2D.py` — 2D Ewald summation for surfaces
@@ -59,7 +61,8 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `DFTB/DFTBplusParser.py` — DFTB+ output parser
 - `DFTB/Grid_dftb.py` — DFTB orbital grid projection (OpenCL)
 - `DFTB/basis_optimizer.py` — DFTB basis set optimization
-- `DFTB_utils.py` — DFTB utility functions
+- `DFTB_utils.py` — DFTB utility functions (`run_dftb_sp`, `save_xyz_movie`, constrained scan helpers)
+- `hbond_scan.py` — rigid DFTB H-bond proton-transfer scan for ASCII `:` systems (0.1 Å path grid)
 - `pySCF_utils.py` — pySCF integration utilities
 
 ### spammm/GUI/ — Graphical User Interface (VisPy)
@@ -74,6 +77,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `ThumbnailCache.py` — thumbnail caching for browser
 - `ExtensionManager.py` — plugin/extension manager
 - `KekuleExtension.py` — Kekule solver GUI extension
+- `AsciiArtExtension.py` — ASCII art → molecule + Kekule + H-bond resolution GUI
 - `AFMExtension.py` — AFM simulation GUI extension
 - `FFExtension.py` — forcefield GUI extension
 - `QEqExtension.py` — QEq GUI extension
@@ -101,15 +105,16 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `AFM.cl` — AFM simulation kernels
 - `gridFF.cl` — grid force field kernels
 - `surface.cl` — surface interaction kernels
+- `contact_surface.cl` — contact-surface brute reference, separable fit/eval, PIC tiled eval
 - `rigid.cl` — rigid body dynamics kernels
-- `assembly.cl` — force assembly kernels
+- `assembly.cl` — rigid-body SAM packing: `emit_configuration_xyz`, `evaluate_packing_3d`
 - `nonbonded.cl` — non-bonded interaction kernels
 - `nonbonded_grid.cl` — grid-based non-bonded kernels
 - `LCAO_STM.cl` — LCAO STM simulation kernels
 - `LCAO_grid.cl` — LCAO orbital grid projection kernels
 - `lingebra.cl` — linear algebra kernels
 - `common.cl` — shared OpenCL utilities
-- `INVENTORY.md` — kernel inventory documentation
+- `README.md` — OpenCL kernel index and composition rules
 
 ## tests/ — Test Suite
 - `conftest.py` — pytest fixtures (data paths, molecule loader, `--update-refs`)
@@ -118,8 +123,10 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `test_surface.py` — Ewald vs brute, GridFF, folded function
 - `test_folded_relax.py` — rigid body relaxation + manipulation
 - `test_lingebra.py` — linear algebra eigenvalue tests
-- `test_tensor_parity.py` — GPU vs CPU tensor kernel parity (Class 2)
-- `test_folded_surface_scan.py` — folded basis fitting + plots (Class 2)
+- `testplot_tensor_parity.py` — GPU vs CPU tensor kernel parity (visual demo)
+- `testplot_folded_surface_scan.py` — folded basis fitting + plots (visual demo)
+- `testplot_assembly.py` — hexagonal SAM assembly search + clash/strain diagnostics (visual demo; Class 2)
+- `testplot_contact_surface.py` — GPU contact-surface vs brute Morse (separable + PIC); visual demo
 - `test_export_import.py` — MOL/MOL2/XYZ round-trip
 - `test_clipboard_undo.py` — clipboard/undo operations
 - `test_packed_molecule.py` — packed molecule representation
@@ -132,7 +139,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `ref_data/` — git-tracked reference files (`.ref.json`, `.ref.xyz`)
 - `helpers/` — test utility modules (`parity.py`, `geometry.py`, `scan.py`, `folded_rigid.py`, `topology_test.py`)
 - `SPM/` — AFM/STM tests and plots
-- `topology/` — topology editing, Kekule, heterocycle tests
+- `topology/` — topology editing, Kekule (`test_kekule.py`), H-bond DFTB scan (`test_hbond_scan.py`, `testplot_hbond_scan.py`)
 - `surfaces/` — surface-specific tests
 - `forcefields/` — forcefield-specific tests
 - `quantum/` — quantum integration tests

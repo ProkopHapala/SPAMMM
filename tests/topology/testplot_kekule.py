@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Visual test script: render ASCII art molecules + Kekule solver results to PNG.
+"""Visual demo: ASCII art molecules + Kekule solver → PNG.
 
-Outputs go to debug/visual_kekule/*.png
-Run: python tests/topology/visual_kekule.py
+Outputs: debug/testplot_kekule/*.png
+Run: python tests/topology/testplot_kekule.py
 """
 import os
 import sys
@@ -22,7 +22,7 @@ from spammm.topology.ascii_art_heterocycle import (
 )
 from spammm.topology.heterocycle_generator import EXAMPLES as GRID_EXAMPLES, build_atomic_system
 
-OUT_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'debug', 'visual_kekule')
+OUT_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'debug', 'testplot_kekule')
 os.makedirs(OUT_DIR, exist_ok=True)
 
 

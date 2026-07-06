@@ -61,16 +61,32 @@ This **is** a supplement to:
 - **Audit Document:** [molecular_topology_types.md](molecular_topology_types.md)
 
 ### 1c. Kekule Bond Order Solver
-- Pi-bond order optimization, aromatic detection
-- **Key files:** `spammm/topology/KekulePure.py`, `spammm/topology/KekuleBackend.py`
-- **Tests:** `tests/topology/test_kekule_pure.py`, `tests/topology/test_editing_ops.py`
+- Pi-bond order optimization, aromatic detection, feasibility precheck, multi-seed localization with 6-ring validation
+- **Key files:** `spammm/topology/KekulePure.py`, `spammm/topology/MoleculeEditorBackend.py`, `spammm/GUI/KekuleExtension.py`
+- **Tests:** `tests/topology/test_kekule.py`, `tests/topology/test_editing_ops.py`, `tests/topology/testplot_kekule.py`
+- **Artifacts:** `debug/test_kekule/` (develop-mode PNGs)
+- **Caveats:** default seed can yield valence-valid but chemically invalid patterns — use `localize_kekule(validate=True, ntrials=5)`; some ASCII examples impossible (odd π count)
 
-### 1d. Heterocycle Generation
-- Heterocycle structure generation and ASCII art rendering
-- **Key files:** `spammm/topology/heterocycle_generator.py`, `spammm/topology/ascii_art_heterocycle.py`
-- **Tests:** `tests/topology/test_heterocycle_generator.py`, `tests/topology/test_ascii_art.py`
+### 1d. Heterocycle Generation & ASCII Art
+- Heterocycle structure generation and ASCII art → 2D geometry; `:` H-bond markers
+- **Key files:** `spammm/topology/heterocycle_generator.py`, `spammm/topology/ascii_art_heterocycle.py`, `spammm/GUI/AsciiArtExtension.py`
+- **Tests:** `tests/topology/test_heterocycle_generator.py`, `tests/topology/test_ascii_art.py`, `tests/topology/test_kekule.py`
 
-### 1e. Editors & GUI
+### 1e. H-Bond Proton Transfer (DFTB rigid scan)
+- Move bridging H along donor→acceptor axis; DFTB+ single-point energy profile
+- **Key files:** `spammm/quantum/hbond_scan.py`, `spammm/quantum/DFTB_utils.py` (`run_dftb_sp`, `save_xyz_movie`)
+- **Topology deps:** `resolve_hbond_pairs()`, `build_ascii_hbond_system()` from ASCII examples with `:`
+- **Tests:** `tests/topology/test_hbond_scan.py` (L0 + slow DFTB), `tests/topology/testplot_hbond_scan.py`
+- **Artifacts:** `debug/test_hbond_scan/hbond_*.{png,xyz}` — XYZ comment: `s=… f=… E=… dE=…`
+- **Caveats:** 0.1 Å path grid default; rigid geometry; SCC failures skipped; uses `$DFTB_EXE` not PATH `dftb+`
+
+### 1f. Molecular Editor (GUI backend)
+- Hex-grid editing, passivation, ring ops — **not** the Kekule bond-order solver
+- **Key files:** `spammm/topology/MoleculeEditorBackend.py`, `spammm/GUI/SPAMMM_GUI.py` (`SPAMMMWindow`)
+- **Legacy alias:** `KekuleExplorerWindow` → `SPAMMMWindow`
+- **Tests:** `tests/topology/test_editing_ops.py`, `tests/test_export_import.py`
+
+### 1g. Editors & GUI
 - Interactive molecular editor: VisPy-based GUI with topology editing
 - **Key files:** `spammm/GUI/SPAMMM_GUI.py`, `spammm/GUI/VispyUtils.py`, `spammm/GUI/KekuleExtension.py`
 - **Audit Document:** [molecular_topology_editors.md](molecular_topology_editors.md)
@@ -82,7 +98,7 @@ This **is** a supplement to:
 - UFF (universal), SPFF (sp3 with pi-orbital nodes), rigid body dynamics
 - **Key files:** `spammm/forcefields/UFF_cl.py`, `spammm/forcefields/SPFF_cl.py`, `spammm/forcefields/UFFbuilder.py`, `spammm/forcefields/SPFFbuilder.py`, `spammm/forcefields/RigidBodyDynamics.py`
 - **Kernels:** `kernels/UFF.cl`, `kernels/SPFF.cl`, `kernels/rigid.cl`
-- **Controller:** `spammm/forcefields/FFController.py`, `spammm/forcefields/Assembly.py`
+- **Controller:** `spammm/forcefields/FFController.py`
 - **Audit Documents:** [forcefields_overview.md](forcefields_overview.md), [intramolecular_forcefields.md](intramolecular_forcefields.md)
 - **Tests:** `tests/test_forcefield.py`
 
@@ -95,6 +111,15 @@ This **is** a supplement to:
 - QEq charge transfer method
 - **Key files:** `spammm/forcefields/QEq.py`, `spammm/GUI/QEqExtension.py`
 
+### 2d. On-Surface Assembly (Rigid SAM)
+- Rigid-body packing on a fixed hexagonal unit cell: 6 C6 orientations/cell, GPU clash scoring
+- **Key files:** `spammm/forcefields/Assembly.py`, `spammm/forcefields/AssemblyPlot.py`
+- **Kernel:** `kernels/assembly.cl`
+- **Driver:** `tests/testplot_assembly.py` → `debug/testplot_assembly/`
+- **FireCore reference:** `pyBall/OCL/Assembly.py`, `tests/tMMFF/test_assembly.py`
+- **Caveats:** `radius=1.0` Å default (softened for rigid search); `align_flat` pre-aligns to surface; rotation dedup CPU-only, off by default
+- **Tests:** visual demo only (`testplot_assembly.py`); no pytest L0 yet
+
 ## 3. Surface Interactions
 
 ### 3a. GridFF & Surface Potentials
@@ -104,6 +129,14 @@ This **is** a supplement to:
 - **Audit Document:** [surface_interactions.md](surface_interactions.md)
 - **Consolidation needed:** `GridFF.py` vs `GridFFRelaxedScan.py` — overlapping functionality
 - **Tests:** `tests/test_surface.py`, `tests/test_folded_relax.py`, `tests/surfaces/ocl_GridFF_new.py`
+
+### 3b. Contact Surface (quasi-2D static AFM)
+- Compact alternative to 3D GridFF for aperiodic rigid samples: separable B-spline×poly + radial PIC
+- **Key files:** `spammm/surfaces/ContactSurface.py`
+- **Kernel:** `kernels/contact_surface.cl` (with `common.cl` + `Forces.cl`)
+- **Design:** [Topics/AFM/ContactSurface_Static.md](Topics/AFM/ContactSurface_Static.md)
+- **Caveats:** h₀ height map on B-spline grid; poly doubling powers `t^(m_start·2^k)`; fit needs multi-z samples near scan plane for `Fz`; `F=∇E` convention; not wired to `AFMulator` yet
+- **Tests:** visual demo `tests/testplot_contact_surface.py` → `debug/testplot_contact_surface/` (no pytest L0 yet)
 
 ## 4. AFM/STM Simulation
 
@@ -123,10 +156,10 @@ This **is** a supplement to:
 
 ## 5. QM Integration (DFTB+)
 
-- DFTB+ integration: subprocess, C-API, parsers, OpenCL grid projection
-- **Key files:** `spammm/quantum/DFTB/DFTBcore.py`, `spammm/quantum/DFTB/DFTBplusParser.py`, `spammm/quantum/DFTB/Grid_dftb.py`, `spammm/quantum/DFTB/basis_optimizer.py`, `spammm/quantum/DFTB_utils.py`, `spammm/quantum/pySCF_utils.py`
+- DFTB+ integration: subprocess, C-API, parsers, OpenCL grid projection, constrained scans
+- **Key files:** `spammm/quantum/DFTB/DFTBcore.py`, `spammm/quantum/DFTB/DFTBplusParser.py`, `spammm/quantum/DFTB/Grid_dftb.py`, `spammm/quantum/DFTB/basis_optimizer.py`, `spammm/quantum/DFTB_utils.py`, `spammm/quantum/hbond_scan.py`, `spammm/quantum/pySCF_utils.py`
 - **Audit Document:** [afm_stm_simulation.md](afm_stm_simulation.md) (DFTB sections)
-- **Tests:** `tests/SPM/plot_dftb_vs_pyscf_basis.py`, `tests/SPM/plot_3ob_basis_tails.py`
+- **Tests:** `tests/SPM/plot_dftb_vs_pyscf_basis.py`, `tests/SPM/plot_3ob_basis_tails.py`, `tests/topology/test_hbond_scan.py`
 
 ## 6. GUI & Visualization
 
@@ -157,6 +190,7 @@ This **is** a supplement to:
   │ Intra FF (2a)│ │ Non-Bond(2b)│ │ Surface (3)     │
   │ UFF, SPFF   │ │ LJ, Morse   │ │ GridFF, Ewald2D │
   │ RigidBody   │ │ Coulomb     │ │ FoldedRigid     │
+  │             │ │             │ │ ContactSurface  │
   └──────┬──────┘ └──────┬──────┘ └──────┬──────────┘
          │               │               │
          └───────────────┼───────────────┘
@@ -188,6 +222,7 @@ This **is** a supplement to:
 | Topic | Issue | Related Files | Priority |
 |-------|-------|---------------|----------|
 | **GridFF variants** | `GridFF.py` vs `GridFFRelaxedScan.py` — overlapping functionality, needs consolidation | `spammm/surfaces/GridFF.py`, `spammm/surfaces/GridFFRelaxedScan.py` | Medium |
+| **Contact surface** | Prototype in `ContactSurface.py`; no AFMulator integration; single-z fit underdetermines `Fz` | `spammm/surfaces/ContactSurface.py`, `kernels/contact_surface.cl` | Medium |
 | **Substrate builder** | `SubstrateBuilder.py` is minimal — no CIF parsing, lattice replication, or slab cutting | `spammm/surfaces/SubstrateBuilder.py` | Low |
 | **File I/O** | XYZ, MOL2 parsing in `atomicUtils.py` — no CIF or extended XYZ with Lattice support | `spammm/atomicUtils.py` | Low |
 | **Linear algebra** | `Lingebra_ocl.py` wrapper exists but may overlap with NumPy functionality | `spammm/utils/Lingebra_ocl.py`, `kernels/lingebra.cl` | Low |

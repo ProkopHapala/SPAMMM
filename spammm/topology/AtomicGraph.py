@@ -11,8 +11,8 @@ Key functionality:
   - to_arrays() — export to NumPy arrays for force field evaluation and rendering
   - from_arrays() — import from NumPy arrays
 
-Role in SPAMMM: Canonical molecular representation for the editor (KekuleBackend).
-AtomicGraph is the "authoritative state" that KekuleExplorerGUI edits directly.
+Role in SPAMMM: Canonical molecular representation for the editor (MoleculeEditorBackend).
+AtomicGraph is the "authoritative state" that SPAMMM_GUI edits directly.
 It is periodically synced to AtomicSystem for rendering and force field computation.
 
 Design principles:
@@ -737,6 +737,47 @@ class AtomicGraph:
             if ring.alive and np.linalg.norm(ring.cog - pos) < radius:
                 return ring
         return None
+
+    def format_table(self, pos=False, neighbors=True, bond_orders=False, charge=False, hyb=True, alive_only=True):
+        """Compact one-line-per-atom table for L1 agent review. uid elem [hyb npi] [neighs] [x y z]."""
+        _hyb = {-1: 'cap', 0: 'sp3', 1: 'sp2', 2: 'sp'}
+        cols = ['uid', 'elem']
+        if hyb:
+            cols += ['hyb', 'npi']
+        if neighbors:
+            cols.append('neighs')
+        if bond_orders:
+            cols.append('bonds')
+        if charge:
+            cols.append('charge')
+        if pos:
+            cols += ['x', 'y', 'z']
+        lines = ['# ' + '  '.join(cols)]
+        for a in sorted(self.atoms.values(), key=lambda x: x._id):
+            if alive_only and not a.alive:
+                continue
+            row = [str(a._id), a.ename]
+            if hyb:
+                row += [_hyb.get(a.npi, '?'), str(a.npi)]
+            if neighbors:
+                nids = sorted(n._id for n in a.neighbors if (not alive_only or n.alive))
+                row.append(','.join(str(i) for i in nids) if nids else '-')
+            if bond_orders:
+                parts = []
+                for b in a.bonds:
+                    if not b.alive:
+                        continue
+                    other = b.other(a)
+                    if alive_only and not other.alive:
+                        continue
+                    parts.append(f'{other._id}:{b.order:g}')
+                row.append(';'.join(parts) if parts else '-')
+            if charge:
+                row.append(f'{a.charge:.4f}')
+            if pos:
+                row += [f'{a.pos[0]:.4f}', f'{a.pos[1]:.4f}', f'{a.pos[2]:.4f}']
+            lines.append('  '.join(row))
+        return '\n'.join(lines)
 
     def __repr__(self):
         return f"AtomicGraph(atoms={len(self.atoms)}, bonds={len(self.bonds)}, rings={len(self.rings)})"

@@ -13,14 +13,14 @@ Run:
 
 import pytest
 import numpy as np
-from spammm.topology.KekuleBackend import KekuleBackend
+from spammm.topology.MoleculeEditorBackend import MoleculeEditorBackend
 
 
 class TestCycleAtomType:
     """Test cycle_atom_type: C→N→O→C."""
 
     def test_cycle_C_to_N(self):
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         c_atom = [a for a in b.graph.atoms.values() if a.alive and a.ename == 'C'][0]
@@ -28,7 +28,7 @@ class TestCycleAtomType:
         assert c_atom.ename == 'N'
 
     def test_cycle_N_to_O(self):
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         c_atom = [a for a in b.graph.atoms.values() if a.alive and a.ename == 'C'][0]
@@ -37,7 +37,7 @@ class TestCycleAtomType:
         assert c_atom.ename == 'O'
 
     def test_cycle_O_back_to_C(self):
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         c_atom = [a for a in b.graph.atoms.values() if a.alive and a.ename == 'C'][0]
@@ -47,7 +47,7 @@ class TestCycleAtomType:
         assert c_atom.ename == 'C'
 
     def test_cycle_full_loop(self):
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         c_atom = [a for a in b.graph.atoms.values() if a.alive and a.ename == 'C'][0]
@@ -57,7 +57,7 @@ class TestCycleAtomType:
         assert c_atom.ename == original
 
     def test_cycle_dead_atom_noop(self):
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         c_atom = [a for a in b.graph.atoms.values() if a.alive and a.ename == 'C'][0]
@@ -71,7 +71,7 @@ class TestCycleBondOrder:
 
     def test_cycle_aromatic_to_double(self):
         """add_ring creates sp2 atoms → bonds default to order=1.5 (aromatic)."""
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         bond = [bd for bd in b.graph.bonds.values() if bd.alive][0]
@@ -80,7 +80,7 @@ class TestCycleBondOrder:
         assert bond.order == 2.0
 
     def test_cycle_double_to_triple(self):
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         bond = [bd for bd in b.graph.bonds.values() if bd.alive][0]
@@ -89,7 +89,7 @@ class TestCycleBondOrder:
         assert bond.order == 3.0
 
     def test_cycle_triple_back_to_aromatic(self):
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         bond = [bd for bd in b.graph.bonds.values() if bd.alive][0]
@@ -101,7 +101,7 @@ class TestCycleBondOrder:
 
     def test_cycle_from_single(self):
         """Test cycling starting from a single bond (order=1.0)."""
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         bond = [bd for bd in b.graph.bonds.values() if bd.alive][0]
@@ -110,7 +110,7 @@ class TestCycleBondOrder:
         assert bond.order == 1.5
 
     def test_cycle_dead_bond_noop(self):
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         bond = [bd for bd in b.graph.bonds.values() if bd.alive][0]
@@ -145,7 +145,7 @@ class TestResolveUnifiedTarget:
 
     def test_pick_atom_over_bond(self):
         """When cursor is on an atom that's also near a bond midpoint, atom wins."""
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         atom = [a for a in b.graph.atoms.values() if a.alive and a.ename == 'C'][0]
@@ -155,7 +155,7 @@ class TestResolveUnifiedTarget:
 
     def test_pick_bond_when_no_atom(self):
         """When cursor is on bond midpoint (not near any atom), bond wins."""
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         bond = [bd for bd in b.graph.bonds.values() if bd.alive][0]
@@ -166,7 +166,7 @@ class TestResolveUnifiedTarget:
 
     def test_pick_hex_when_no_atom_no_bond(self):
         """When cursor is far from atoms/bonds but near hex center, hex wins."""
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         # Hex center is at the cog of the ring — find it
@@ -182,7 +182,7 @@ class TestResolveUnifiedTarget:
         """When cursor is far from any hex center, empty wins.
         The hex grid tiles all of 2D space, so 'far' means between hex centers
         (e.g. at a vertex position that's > a_CC*0.5 from any center)."""
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         # Position (1.0, 0.0) is at a hexagon vertex — ~1.0 Å from nearest center
@@ -199,7 +199,7 @@ class TestSimulatedUnifiedClicks:
     """
 
     def _setup(self):
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         b.add_ring(0, 0)
         return b
@@ -283,7 +283,7 @@ class TestSimulatedUnifiedClicks:
 
     def test_full_unified_workflow(self):
         """End-to-end: add ring → cycle atom → cycle bond → add atom → delete bond."""
-        b = KekuleBackend()
+        b = MoleculeEditorBackend()
         b.auto_h_cap = False
         # 1. Add hex ring
         b.add_ring(0, 0)

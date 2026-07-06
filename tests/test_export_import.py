@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Headless test for multi-format export/import via KekuleBackend.
+Headless test for multi-format export/import via MoleculeEditorBackend.
 
 Builds a benzene-like molecule in AtomicGraph, exports to .xyz/.mol/.mol2,
 then imports each back and verifies topology matches.
@@ -14,7 +14,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from spammm.topology.KekuleBackend import KekuleBackend
+from spammm.topology.MoleculeEditorBackend import MoleculeEditorBackend
 from spammm.topology.AtomicGraph import AtomicGraph
 
 DEBUG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'debug', 'test_export_import')
@@ -22,8 +22,8 @@ os.makedirs(DEBUG_DIR, exist_ok=True)
 
 
 def build_benzene_backend():
-    """Build a KekuleBackend with a benzene-like structure."""
-    kb = KekuleBackend()
+    """Build a MoleculeEditorBackend with a benzene-like structure."""
+    kb = MoleculeEditorBackend()
     a_CC = 1.42
     angles = np.arange(6) * (np.pi / 3.0)
     carbons = []
@@ -57,7 +57,7 @@ def test_xyz_export_import():
     kb.save_structure(fname)
     print(f"Saved to {fname} ({os.path.getsize(fname)} bytes)")
 
-    kb2 = KekuleBackend()
+    kb2 = MoleculeEditorBackend()
     kb2.load_structure(fname)
     n1, nb1, es1, pos1, bonds1 = get_topology_summary(kb2)
     print(f"Loaded: {n1} atoms, {nb1} bonds")
@@ -82,7 +82,7 @@ def test_mol_export_import():
         print("  File contents (first 300 chars):")
         print(f.read()[:300])
 
-    kb2 = KekuleBackend()
+    kb2 = MoleculeEditorBackend()
     kb2.load_structure(fname)
     n1, nb1, es1, pos1, bonds1 = get_topology_summary(kb2)
     print(f"Loaded: {n1} atoms, {nb1} bonds, enames={es1}")
@@ -114,7 +114,7 @@ def test_mol2_export_import():
         print("  File contents (first 400 chars):")
         print(f.read()[:400])
 
-    kb2 = KekuleBackend()
+    kb2 = MoleculeEditorBackend()
     kb2.load_structure(fname)
     n1, nb1, es1, pos1, bonds1 = get_topology_summary(kb2)
     print(f"Loaded: {n1} atoms, {nb1} bonds, enames={es1}")
@@ -138,7 +138,7 @@ def test_plot():
     # Export to MOL and re-import
     fname = os.path.join(DEBUG_DIR, 'plot_test.mol')
     kb.save_structure(fname)
-    kb2 = KekuleBackend()
+    kb2 = MoleculeEditorBackend()
     kb2.load_structure(fname)
     _, es1, pos1, _, bonds1, _, _ = kb2.graph.to_arrays()
 
