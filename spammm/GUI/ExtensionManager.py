@@ -73,14 +73,14 @@ class UIComponents:
 #   build_ui     – name of a function in the module returning UIComponents
 EXTENSION_REGISTRY = {
     'firecore': dict(
-        module='spammm.FireCore', class_name=None,
+        module='spammm.GUI.FireCoreExtension', class_name=None,
         dependencies=[], req_paths=['fdata_dir'],
-        build_ui='build_fireball_ui',
+        build_ui='build_ui',
     ),
     'dftb': dict(
-        module='spammm.quantum.DFTB_utils', class_name=None,
+        module='spammm.GUI.DFTBExtension', class_name=None,
         dependencies=[], req_paths=[],
-        build_ui='build_dftb_ui',
+        build_ui='build_ui',
     ),
     'afm': dict(
         module='spammm.GUI.AFMExtension', class_name=None,
@@ -127,6 +127,21 @@ EXTENSION_REGISTRY = {
         dependencies=[], req_paths=[],
         build_ui='build_ui',
     ),
+    'ascii': dict(
+        module='spammm.GUI.AsciiArtExtension', class_name=None,
+        dependencies=[], req_paths=[],
+        build_ui='build_ui',
+    ),
+    'qeq': dict(
+        module='spammm.GUI.QEqExtension', class_name=None,
+        dependencies=[], req_paths=[],
+        build_ui='build_ui',
+    ),
+    'fragments': dict(
+        module='spammm.GUI.FragmentExtension', class_name=None,
+        dependencies=[], req_paths=[],
+        build_ui='build_ui',
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -144,6 +159,9 @@ DEFAULT_CONFIG = {
     'moldyn':   dict(enabled=False),  # TODO: update to SPFF_cl import
     'povray':   dict(enabled=False),
     'kekule':   dict(enabled=True),
+    'ascii':    dict(enabled=True),
+    'qeq':      dict(enabled=True),
+    'fragments': dict(enabled=True),
 }
 
 # ---------------------------------------------------------------------------
@@ -266,12 +284,6 @@ class ExtensionManager:
         meta = EXTENSION_REGISTRY.get(name, {})
         builder_name = meta.get('build_ui', 'build_ui')
         try:
-            # Check if builder is a function in this module (for extensions with UI here)
-            if builder_name == 'build_fireball_ui':
-                return build_fireball_ui(window)
-            elif builder_name == 'build_dftb_ui':
-                return build_dftb_ui(window)
-            # Otherwise, import from the extension module
             mod = importlib.import_module(meta['module'])
             builder = getattr(mod, builder_name, None)
             if builder is None:
@@ -289,88 +301,4 @@ class ExtensionManager:
             error_layout.addWidget(QtWidgets.QLabel(f"Extension '{name}' Error:"))
             error_layout.addWidget(error_text)
             return UIComponents(panel=error_panel)
-
-
-# ---------------------------------------------------------------------------
-# Extension UI builders (built-in extensions)
-# ---------------------------------------------------------------------------
-
-def build_fireball_ui(window):
-    """Build Fireball panel for KekuleExplorerGUI.
-    Returns ExtensionManager.UIComponents.
-    """
-    from PyQt5 import QtWidgets
-    import numpy as np
-    from spammm import elements
-
-    panel = QtWidgets.QWidget()
-    layout = QtWidgets.QVBoxLayout(panel)
-    layout.setSpacing(3)
-    layout.setContentsMargins(2, 2, 2, 2)
-
-    scf_btn = QtWidgets.QPushButton("Compute SCF")
-    scf_btn.clicked.connect(window.compute_orbitals)
-    layout.addWidget(scf_btn)
-
-    window.orbital_info_label = QtWidgets.QLabel("Orbitals: Not computed")
-    window.orbital_info_label.setWordWrap(True)
-    layout.addWidget(window.orbital_info_label)
-
-    row1 = QtWidgets.QHBoxLayout()
-    row1.addWidget(QtWidgets.QLabel("Z:"))
-    window.z_height_spinbox = window.spinBox(2.0, 0.5, vmin=-10.0, vmax=20.0)
-    row1.addWidget(window.z_height_spinbox)
-    row1.addWidget(QtWidgets.QLabel("Orb:"))
-    window.orbital_spinbox = window.spinBox(0, vmin=0, vmax=999, enabled=False, callback=window.update_orbital_energy_label, int_mode=True)
-    row1.addWidget(window.orbital_spinbox)
-    layout.addLayout(row1)
-
-    row2 = QtWidgets.QHBoxLayout()
-    window.plot_orb_btn = QtWidgets.QPushButton("Plot Orb")
-    window.plot_orb_btn.setEnabled(False)
-    window.plot_orb_btn.clicked.connect(window.plot_orbital_from_spinbox)
-    row2.addWidget(window.plot_orb_btn)
-    window.plot_density_btn = QtWidgets.QPushButton("Plot Dens")
-    window.plot_density_btn.setEnabled(False)
-    window.plot_density_btn.clicked.connect(window.plot_density)
-    row2.addWidget(window.plot_density_btn)
-    window.plot_delta_btn = QtWidgets.QPushButton("Plot Delta")
-    window.plot_delta_btn.setEnabled(False)
-    window.plot_delta_btn.clicked.connect(window.plot_delta_rho)
-    row2.addWidget(window.plot_delta_btn)
-    layout.addLayout(row2)
-
-    fdata_btn = QtWidgets.QPushButton("Set Fdata")
-    fdata_btn.clicked.connect(window.set_fdata_path)
-    layout.addWidget(fdata_btn)
-
-    view_modes = [
-        ('Molecular Orbital', lambda: window.set_view_mode('orbital')),
-        ('Density',           lambda: window.set_view_mode('density')),
-        ('Delta-Rho',         lambda: window.set_view_mode('delta_rho')),
-    ]
-    return UIComponents(panel=panel, view_modes=view_modes)
-
-
-def build_dftb_ui(window):
-    """Build DFTB+ panel for KekuleExplorerGUI.
-    Returns ExtensionManager.UIComponents.
-    """
-    from PyQt5 import QtWidgets
-
-    panel = QtWidgets.QWidget()
-    layout = QtWidgets.QVBoxLayout(panel)
-    layout.setSpacing(3)
-    layout.setContentsMargins(2, 2, 2, 2)
-
-    relax_btn = QtWidgets.QPushButton("Relax (DFTB+)")
-    relax_btn.clicked.connect(window.run_relaxation)
-    layout.addWidget(relax_btn)
-
-    window.dftb_status_label = QtWidgets.QLabel("Status: Ready")
-    window.dftb_status_label.setWordWrap(True)
-    layout.addWidget(window.dftb_status_label)
-
-    return UIComponents(panel=panel)
-
 

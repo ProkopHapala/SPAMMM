@@ -15,9 +15,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from spammm.AtomicSystem import AtomicSystem
 from spammm import plotUtils as pu
-from spammm.topology.KekulePure import KekulePure, make_n_pi, make_pi_mask
+from spammm.topology.KekulePure import KekulePure, make_n_pi, make_pi_mask, run_kekule_solver, mol_bond_types
 from spammm.topology.ascii_art_heterocycle import (
-    parse_ascii_art, run_kekule_solver, ASCII_EXAMPLES, mol_bond_types,
+    parse_ascii_art, ASCII_EXAMPLES,
     resolve_hbond_pairs, _build_target_valence, jacobi_relax_bond_lengths,
 )
 from spammm.topology.heterocycle_generator import EXAMPLES as GRID_EXAMPLES, build_atomic_system

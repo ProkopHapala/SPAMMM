@@ -197,6 +197,18 @@ class KekuleBackend:
             atom_list[atom_idx].npi = npi
 
     @property
+    def atom_charges(self):
+        """List of partial charges per atom (in electrons), in to_arrays() order."""
+        atom_list, *_ = self.graph.to_arrays()
+        return [a.charge for a in atom_list]
+
+    def set_atom_charges(self, charges):
+        """Set partial charges on graph atoms from array (in to_arrays() order)."""
+        atom_list, *_ = self.graph.to_arrays()
+        for i, a in enumerate(atom_list):
+            a.charge = float(charges[i]) if i < len(charges) else 0.0
+
+    @property
     def ring_atoms(self):
         """Dict {ring_id: [int indices]} for geometry rings."""
         atom_list, *_ = self.graph.to_arrays()
@@ -593,6 +605,15 @@ class KekuleBackend:
             self.adjust_h()
         self._sync_sys()
 
+    def cycle_atom_type(self, atom_id):
+        """Cycle atom element C→N→O→C by stable Atom._id."""
+        a = self.graph.atoms.get(atom_id)
+        if a is None or not a.alive: return
+        cycle = {'C': 'N', 'N': 'O', 'O': 'C'}
+        next_elem = cycle.get(a.ename, 'C')
+        print(f"[CYCLE_TYPE] atom_id={atom_id} {a.ename}→{next_elem}")
+        self.set_atom_type_by_id(atom_id, next_elem)
+
     def set_atom_npi_by_id(self, atom_id, npi):
         """Set npi of atom by stable Atom._id."""
         a = self.graph.atoms.get(atom_id)
@@ -945,6 +966,15 @@ class KekuleBackend:
         if self.auto_h_cap:
             self.adjust_h()
 
+    _BOND_ORDER_CYCLE = [1.0, 1.5, 2.0, 3.0]
+    def cycle_bond_order(self, bond):
+        """Cycle bond.order through [1.0, 1.5, 2.0, 3.0]. No H cap adjustment needed."""
+        if bond is None or not bond.alive: return
+        cycle = self._BOND_ORDER_CYCLE
+        idx = next((i for i, v in enumerate(cycle) if abs(v - bond.order) < 0.01), 0)
+        bond.order = cycle[(idx + 1) % len(cycle)]
+        self._sync_sys()
+
     def remove_atom_with_bridge(self, atom_id):
         """Remove atom and bridge its 2 heavy neighbors with a new bond (inverse of insert_atom_into_bond).
         Only bridges if exactly 2 heavy neighbors (excluding H caps) and they're not already bonded."""
@@ -1239,12 +1269,45 @@ class KekuleBackend:
             self.save_xyz(fname)
         elif ext == 'mol':
             self._sync_sys()
-            self.sys.save_mol(fname)
+            bt = self._graph_bond_types_mol()
+            self.sys.save_mol(fname, bond_types=bt)
         elif ext == 'mol2':
             self._sync_sys()
-            self.sys.save_mol2(fname)
+            bt = self._graph_bond_types_mol()
+            self.sys.save_mol2(fname, bond_types=bt)
         else:
             raise ValueError(f"Unknown export format: .{ext}")
+
+    def _graph_bond_types_mol(self):
+        """Build MOL V2000 bond-type array from Bond.order values on the graph.
+
+        Bond.order is total order (1.0=single, 1.5=aromatic, 2.0=double).
+        Returns (nbond,) int array or None if no bonds.
+        """
+        if self._bond_list is None or len(self._bond_list) == 0:
+            return None
+        bt = np.ones(len(self._bond_list), dtype=int)
+        for i, bond in enumerate(self._bond_list):
+            o = bond.order
+            if o > 1.75:
+                bt[i] = 2
+            elif o > 1.25:
+                bt[i] = 4
+            else:
+                bt[i] = 1
+        return bt
+
+    def get_graph_bond_orders(self):
+        """Return (pi_bonds, pi_orders) for rendering, from Bond.order on the graph."""
+        if self._bond_list is None or len(self._bond_list) == 0:
+            self._sync_sys()
+        if self._bond_list is None or len(self._bond_list) == 0 or self.sys.bonds is None:
+            return None, None
+        orders = np.array([b.order for b in self._bond_list], dtype=float)
+        pi = np.abs(orders - 1.0) > 0.01
+        if not np.any(pi):
+            return None, None
+        return np.asarray(self.sys.bonds, dtype=np.int32)[pi], (orders[pi] - 1.0)
 
     def load_structure(self, fname):
         """Load structure from file. Dispatch on extension: .xyz, .mol, .mol2."""

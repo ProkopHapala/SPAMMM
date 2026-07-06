@@ -1,3 +1,62 @@
+"""
+---
+type: Module
+title: plotUtils — Matplotlib Plotting Utilities
+description: Pure-matplotlib 1D/2D plotting functions for scientific visualization (energies, forces, orbitals, densities, ESP, geometry). No PyQt dependency — usable from CLI scripts and GUI extensions alike.
+tags: [plotting, matplotlib, visualization]
+---
+
+# plotUtils.py
+
+Pure-matplotlib plotting utilities for SPAMMM. No Qt/GUI dependency.
+
+## Contents
+
+### 1D Plotting
+- `plotEF` — energy/force vs coordinate
+- `plot_scan_profile` — scan profile with optional min annotation
+- `plot1d` / `plot1d_zip` — multi-curve 1D plots with analytical + numerical derivatives
+- `plot_func` / `plot_funcs` — generic function visualization with derivatives
+- `plot_compare_1d` — two-curve comparison (linear/log)
+- `plot_density_comparison` / `plot_pauli_comparison` — specialized comparison wrappers
+
+### 2D Scalar Fields
+- `compute_grid_extent` — non-square grid origin/size from atomic positions (preserves aspect ratio)
+- `make_2d_grid` — generate (x,y,z) grid points for 2D projection at given height
+- `plot_2d_scalar` — heatmap with diverging/symmetric colormap, colorbar, atom overlay
+- `overlay_atoms` — scatter atom positions with element colors + optional labels
+- `plot_field_slice` / `plot_field_panel` — 2D slices of 3D fields at multiple z-heights
+- `plot_cube_slice` — read and plot .cube file slices
+- `plot_comparison_2d` — side-by-side orbital comparison (libwaveplot vs OpenCL)
+
+### Molecular Geometry
+- `plotAtoms` / `plotBonds` / `plotAngles` — individual element rendering
+- `plotSystem` — full system plot (atoms, bonds, H-bonds, labels)
+- `plotGeometry` — geometry with bonds, periodic replication, unit cell box
+- `plotGeometryWithForces` — geometry + force arrows + scan path
+- `plotTrj` — trajectory frame sequence to PNG
+
+### Rendering
+- `render_POVray` — POV-Ray scene export
+
+## Usage
+
+CLI (standalone):
+```python
+from spammm.plotUtils import plot_2d_scalar, compute_grid_extent, make_2d_grid
+```
+
+GUI (via re-export in `spammm/GUI/plotutils.py`):
+```python
+from spammm.GUI.plotutils import plot_2d_scalar, show_in_plot_window
+```
+
+## Related
+- `spammm/GUI/plotutils.py` — Qt-specific wrapper (re-exports + `show_in_plot_window`)
+- `spammm/GUI/AFMExtension.py` — AFM/STM plot functions using these utilities
+- `spammm/GUI/QEqExtension.py` — ESP plotting using these utilities
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 from   matplotlib import collections  as mc
@@ -1275,5 +1334,118 @@ def plot_density_multi_z(methods, z_heights, suptitle=None, fname=None, dpi=150,
     plt.tight_layout()
     if fname:
         fig.savefig(fname, dpi=dpi, bbox_inches='tight'); plt.close(fig)
+    return fig
+
+
+#############################
+#   2D scalar field plotting (shared with GUI)   #
+#############################
+
+ELEM_COLOR_2D = {'H': 'white', 'C': 'gray', 'N': 'blue', 'O': 'red', 'S': 'yellow', 'F': 'green', 'Cl': 'green', 'Br': 'brown', 'I': 'purple'}
+
+def compute_grid_extent(apos, padding_factor=0.15, default_size=14.0):
+    """Compute grid origin, sizes (per-axis), and center_z from atomic positions.
+
+    Preserves the molecule's aspect ratio (non-square grid).
+
+    Returns:
+        grid_origin: (2,) array — (x_min, y_min) of grid
+        size_xy: (2,) array — (width, height) of grid
+        center_z: float — mean z of atoms
+    """
+    if len(apos) == 0:
+        raise ValueError("Cannot compute grid extent: no atoms.")
+    apos_2d = apos[:, :2]
+    min_pos = apos_2d.min(axis=0)
+    max_pos = apos_2d.max(axis=0)
+    center_z = apos[:, 2].mean()
+    padding = (max_pos - min_pos) * padding_factor
+    grid_origin = min_pos - padding
+    size_xy = max_pos - min_pos + 2 * padding
+    return grid_origin, size_xy, center_z
+
+def make_2d_grid(grid_origin, size_xy, center_z, z_height, n=200):
+    """Generate 2D grid points for projection (non-square, fits molecule).
+
+    Returns:
+        points: (n_total, 3) array of (x, y, z) grid points
+        extent: [xmin, xmax, ymin, ymax]
+        nx, ny: grid dimensions
+    """
+    w, h = size_xy[0], size_xy[1]
+    if w >= h:
+        nx = n
+        ny = max(1, int(round(n * h / w)))
+    else:
+        ny = n
+        nx = max(1, int(round(n * w / h)))
+    xs = np.linspace(grid_origin[0], grid_origin[0] + w, nx)
+    ys = np.linspace(grid_origin[1], grid_origin[1] + h, ny)
+    X, Y = np.meshgrid(xs, ys)  # indexing='xy': X.shape = (ny, nx)
+    Z = np.full_like(X, center_z + z_height)
+    points = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
+    extent = [xs[0], xs[-1], ys[0], ys[-1]]
+    return points, extent, nx, ny
+
+def overlay_atoms(ax, apos, enames, xs=None, ys=None, label_heavy=True):
+    """Overlay atom positions on a matplotlib axes.
+
+    Args:
+        ax: matplotlib axes
+        apos: (n,3) atomic positions
+        enames: list of element name strings
+        xs, ys: optional grid axes for bounds checking
+        label_heavy: if True, annotate non-H atoms with element+index
+    """
+    for i, (p, e) in enumerate(zip(apos, enames)):
+        x, y = p[0], p[1]
+        if xs is not None and ys is not None:
+            if not (xs[0] <= x <= xs[-1] and ys[0] <= y <= ys[-1]):
+                continue
+        c = ELEM_COLOR_2D.get(e, 'magenta')
+        ax.plot(x, y, 'o', color=c, markersize=5, markeredgecolor='k', markeredgewidth=0.5, zorder=5)
+        if label_heavy and e != 'H':
+            ax.annotate(f"{e}{i}", (x, y), fontsize=7, ha='left', va='bottom', color='black')
+
+def plot_2d_scalar(data_2d, extent, title, z_label='', cmap='seismic', symmetric=True,
+                   apos=None, enames=None, label_heavy=True):
+    """Create a matplotlib Figure with a 2D scalar field heatmap.
+
+    Args:
+        data_2d: 2D array (ny, nx) where data[i,j] corresponds to (xs[j], ys[i])
+        extent: [xmin, xmax, ymin, ymax]
+        title: plot title
+        z_label: colorbar label
+        cmap: colormap name
+        symmetric: if True, vmin=-vmax (diverging colormap)
+        apos: optional (n,3) atom positions for overlay
+        enames: optional element names for overlay coloring
+        label_heavy: if True, annotate non-H atoms
+
+    Returns:
+        matplotlib Figure
+    """
+    from matplotlib.figure import Figure
+    data = np.asarray(data_2d, dtype=np.float64)
+    if symmetric:
+        vmax = max(abs(np.min(data)), abs(np.max(data)))
+        if vmax < 1e-30: vmax = 1.0
+        vmin = -vmax
+    else:
+        vmin, vmax = np.min(data), np.max(data)
+        if vmax - vmin < 1e-30: vmax = vmin + 1.0
+    fig = Figure(figsize=(7, 6), dpi=100)
+    ax = fig.add_subplot(111)
+    im = ax.imshow(data, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax,
+                   extent=extent, aspect='equal')
+    ax.set_title(title)
+    ax.set_xlabel('x (Å)')
+    ax.set_ylabel('y (Å)')
+    fig.colorbar(im, ax=ax, label=z_label)
+    if apos is not None and enames is not None:
+        xs = np.linspace(extent[0], extent[1], data.shape[1])
+        ys = np.linspace(extent[2], extent[3], data.shape[0])
+        overlay_atoms(ax, apos, enames, xs=xs, ys=ys, label_heavy=label_heavy)
+    fig.tight_layout()
     return fig
 

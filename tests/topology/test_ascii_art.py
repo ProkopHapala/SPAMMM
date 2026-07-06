@@ -1,7 +1,8 @@
 """Tests for ascii_art_heterocycle: ASCII art -> AtomicSystem + Kekule solver."""
 import numpy as np
 import pytest
-from spammm.topology.ascii_art_heterocycle import parse_ascii_art, run_kekule_solver, ASCII_EXAMPLES, mol_bond_types
+from spammm.topology.ascii_art_heterocycle import parse_ascii_art, ASCII_EXAMPLES
+from spammm.topology.KekulePure import run_kekule_solver, mol_bond_types
 
 
 class TestParseAsciiArt:

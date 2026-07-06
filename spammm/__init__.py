@@ -2,6 +2,6 @@
 """
 spammm — SPAMMM Python package.
 
-SPAMMM: Scientific Python AFM/MM Molecular Manipulator.
+SPAMMM: Scanning Probe Accelerated Modeling of Microscopy and Manipulation.
 Integrated environment for molecular editing, assembly, and AFM/STM simulations.
 """

@@ -122,12 +122,12 @@ class AtomicSystem( ):
     def save_mol(self, fname, title="Avogadro", bond_types=None):
         au.save_mol(fname, self.enames, self.apos, self.bonds, title=title, bond_types=bond_types)
 
-    def save_mol2(self, fname, comment="", simple_names=False):
+    def save_mol2(self, fname, comment="", simple_names=False, bond_types=None):
         es = self.enames
         if simple_names and (es is not None):
             es = [ e.split('_')[0] for e in es ]
         atom_types = getattr(self, 'atom_types', None)
-        au.save_mol2(fname, es, self.apos, self.bonds, comment=comment, lvec=self.lvec, atom_types=atom_types)
+        au.save_mol2(fname, es, self.apos, self.bonds, comment=comment, lvec=self.lvec, atom_types=atom_types, bond_types=bond_types)
 
     def toLines(self):
         #lines = []

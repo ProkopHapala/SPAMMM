@@ -144,9 +144,12 @@ This is the key insight that allows deferring `sync_neighbor_lists()` — consum
 |--------|---------|-------------|
 | `sig_rmb_remove` | `int` (Atom._id) | RMB click on atom → request deletion |
 | `sig_atom_picked` | `int` (Atom._id) | LMB click on atom |
-| `sig_drag_state` | `(int, int, object)` | (active 0/1, Atom._id, pos3) |
+| `sig_drag_state` | `(int, int, object)` | (active 0/1, Atom._id, pos3) — emitted on drag end |
 | `sig_atom_moved` | `(int, object)` | (Atom._id, pos3) during drag |
 | `sig_selection_changed` | `set[int]` | set of Atom._ids |
+| `sig_link_bond` | `(int, int)` | (from_id, to_id) — Ctrl+drag from atom to atom: create bond |
+| `sig_link_to_pos` | `(int, float, float)` | (from_id, x, y) — Ctrl+drag from atom to empty space: create new atom + bond |
+| `sig_atom_clicked` | `int` (Atom._id) | LMB click on atom without drag → cycle atom type |
 
 ### ID ↔ index conversion helpers
 
@@ -280,12 +283,30 @@ Both `AtomScene._on_mouse_press` and `SPAMMM_GUI.on_mouse_press` are connected t
 
 ### How it's handled
 
-- For RMB in Atom/pi/Select modes: scene handler picks atom and emits `sig_rmb_remove`. GUI handler checks `if self.edit_mode not in ('Atom', 'pi', 'Select')` before calling `handle_click` — so no double-fire.
-- For LMB: scene handler starts drag, GUI handler calls `handle_click` for atom type changes. This is intentional — both operate on the same picked atom.
+The GUI handler (`SPAMMM_GUI.on_mouse_press`) explicitly checks `event.handled` at the top and returns early if the scene already handled the event. This prevents double-fire.
+
+**Event flow for LMB on atom (Unified/Atom mode):**
+1. `AtomScene._on_mouse_press` picks atom (within `pick_radius`), sets `ev.handled = True`, starts drag state
+2. `SPAMMM_GUI.on_mouse_press` sees `event.handled = True` → returns early (no double-fire)
+3. On release: `AtomScene._on_mouse_release` differentiates click vs drag:
+   - **Click** (mouse moved < 3px): emits `sig_atom_clicked(atom_id)` → `on_atom_clicked` → `EditModeHandler.on_atom_click` → `cycle_atom_type`
+   - **Drag** (mouse moved ≥ 3px): emits `sig_drag_state(0, atom_id, pos)` → `on_drag_state` → sync positions / merge
+
+**Event flow for LMB on empty space / bond / hex (Unified mode):**
+1. `AtomScene._on_mouse_press` finds no atom within `pick_radius` → does NOT set `ev.handled`, returns
+2. `SPAMMM_GUI.on_mouse_press` runs → `EditModeHandler.on_press` → `resolve_target` → dispatch to bond/hex/empty action
+
+**Event flow for Ctrl+LMB on atom (Unified/Atom mode):**
+1. `AtomScene._on_mouse_press` sees `_link_mode and _last_ctrl` → picks atom, starts link mode, sets `ev.handled = True`
+2. `SPAMMM_GUI.on_mouse_press` sees `event.handled = True` → returns early
+3. On release: `AtomScene._on_mouse_release` checks link target:
+   - **On another atom**: emits `sig_link_bond(from_id, to_id)` → `on_link_bond` → `EditModeHandler.on_link` → `create_bond`
+   - **On empty space**: emits `sig_link_to_pos(from_id, x, y)` → `on_link_to_pos` → create new atom at (x,y) + bond to source
+   - **On same atom**: emits `sig_atom_clicked(from_id)` → cycle type
 
 ### Lesson
 
-When multiple handlers are connected to the same event, ensure they don't conflict. Use mode checks or `ev.handled` flags to prevent double actions.
+When multiple handlers are connected to the same event, ensure they don't conflict. The GUI must explicitly check `event.handled` since Vispy does not enforce it.
 
 ---
 
@@ -338,8 +359,9 @@ Vispy renders fresh scene
 |------|------|
 | `spammm/topology/AtomicGraph.py` | Authoritative topology: `Atom`, `Bond`, `Ring` classes, soft-delete, `to_arrays()`, `cleanup_invalid()`, `sync_neighbor_lists()`, local neighbor updates in `add_bond`/`remove_bond` |
 | `spammm/topology/KekuleBackend.py` | Bridge: `_sync_sys()` (export + 4 mappings), `remove_atom_by_id()`, `adjust_h()`, `add_h_caps()`, `merge_atoms()`, `add_adjacent_ring()`, `compute_adjacent_ring_positions()` |
-| `spammm/GUI/VispyUtils.py` | Rendering: `AtomScene` class, picking, drag, selection, signals (all emit `Atom._id`) |
-| `spammm/GUI/SPAMMM_GUI.py` | Controller: signal handlers, `on_atom_remove()`, `refresh_view()`, `handle_click()` |
+| `spammm/GUI/VispyUtils.py` | Rendering: `AtomScene` class, picking, drag, selection, click-vs-drag detection, link mode, signals (all emit `Atom._id`) |
+| `spammm/GUI/SPAMMM_GUI.py` | Controller: signal handlers, mode handler registry, `on_atom_clicked()`, `on_link_to_pos()`, `refresh_view()` |
+| `spammm/GUI/EditModeHandlers.py` | `EditModeHandler` class hierarchy: `UnifiedMode`, `AtomMode`, `BondMode`, `HexMode`, `PiMode`, `SelectMode`, `RingMode` |
 
 ---
 
@@ -362,9 +384,16 @@ Vispy renders fresh scene
 - [ ] Drag-to-merge: drag atom onto another → target survives, bonds transfer (no duplicates)
 - [ ] Drag-to-merge: H caps readjusted after merge
 - [ ] Drag-to-merge: undo (Ctrl+Z) reverts merge
-- [ ] Ctrl+LMB drag (Atom mode): rubber-band bond creation between two atoms
-- [ ] Ctrl+RMB (Atom mode): remove atom + bridge 2 heavy neighbors
-- [ ] Bond mode: LMB insert (no push), Ctrl+LMB insert (push aside), RMB delete, Ctrl+RMB collapse
+- [x] Ctrl+LMB drag (Unified/Atom mode): rubber-band bond creation between two atoms
+- [x] Ctrl+LMB drag to empty (Unified/Atom mode): create new atom at release position + bond to source
+- [x] Ctrl+RMB (Unified/Atom mode): remove atom + bridge 2 heavy neighbors
+- [x] Bond mode: LMB insert (no push), Ctrl+LMB insert (push aside), RMB delete, Ctrl+RMB collapse
+- [x] Unified mode: click atom → cycle type C→N→O→C (via click-vs-drag detection)
+- [x] Unified mode: drag atom → move (via click-vs-drag detection)
+- [x] Unified mode: click bond → cycle order
+- [x] Unified mode: click hex → add ring
+- [x] Unified mode: click empty → add free atom
+- [x] Unified mode: Ctrl+drag atom to empty → new atom + bond
 
 ---
 
@@ -408,3 +437,85 @@ Memory: ~21 bytes/atom + 8 bytes/bond. 1000 atoms + 2000 bonds ≈ 37 KB.
 
 1. **Ctrl+C**: `copy_selected_atoms()` → `PackedMolecule.from_graph(graph, selected_indices)` → store in `self.copied_packed` + put MOL/XYZ text on Qt clipboard
 2. **Ctrl+V**: `paste_copied_atoms()` → use `self.copied_packed` (or parse Qt clipboard via `from_text()`) → `_append_atom(npi=...)` for each atom → re-create internal bonds → select pasted atoms
+
+---
+
+## Unified Mode — Combined Hex/Atom/Bond Editing (Implemented)
+
+### Motivation
+
+The GUI has 8 edit modes (Unified, Hex1, Hex2, Atom, Bond, Ring, pi, Select). Unified mode combines the most frequent operations into a single context-sensitive mode, reducing mode-switching friction. It is the default mode.
+
+### Architecture
+
+Unified mode is implemented as `UnifiedMode(EditModeHandler)` in `spammm/GUI/EditModeHandlers.py`. It uses `resolve_target(p_world)` to determine what's under the cursor (atom > bond > hex > empty priority) and dispatches accordingly.
+
+**Key design**: Atom interactions (click, drag, Ctrl+drag) are handled by `AtomScene` via signals. Bond/hex/empty interactions are handled by the GUI handler (`on_mouse_press` → `UnifiedMode.on_press`). This split is necessary because the scene manages low-level mouse state (pick, drag, link) while the GUI handler manages high-level topology operations.
+
+### Target Resolution
+
+```
+def resolve_target(p_world):
+    1. atom = backend.pick_atom(p_world, radius=pick_radius)
+       if atom: return ('atom', atom)
+    2. bond = backend.pick_bond(p_world, radius=pick_radius)
+       if bond: return ('bond', bond)
+    3. q, r = backend.snap_to_ring(p_world[0], p_world[1])
+       if near hex center: return ('hex', (q, r))
+    4. return ('empty', p_world)
+```
+
+### Action Dispatch
+
+| Target | LMB | Ctrl+LMB | RMB | Ctrl+RMB |
+|--------|-----|----------|-----|----------|
+| **Atom** | Click: cycle type (C→N→O→C) / Drag: move | Drag to atom: bond / Drag to empty: new atom+bond | Delete | Delete + bridge |
+| **Bond** | Cycle order (1→1.5→2→3→1) | Insert atom (push aside) | Delete | Collapse |
+| **Hex** | Add ring | — | Remove ring (preserve shared) | — |
+| **Empty** | Add free atom | — | — | — |
+
+### Signal Flow (LMB on atom)
+
+1. `AtomScene._on_mouse_press`: picks atom within `pick_radius`, stores `_press_pos`, sets `ev.handled = True`
+2. `SPAMMM_GUI.on_mouse_press`: sees `event.handled = True` → returns (no double-fire)
+3. `AtomScene._on_mouse_release`: differentiates click vs drag:
+   - **Click** (moved < 3px): `sig_atom_clicked(atom_id)` → `on_atom_clicked` → `UnifiedMode.on_atom_click` → `cycle_atom_type`
+   - **Drag** (moved ≥ 3px): `sig_drag_state(0, atom_id, pos)` → `on_drag_state` → sync positions / merge
+
+### Signal Flow (Ctrl+LMB on atom)
+
+1. `AtomScene._on_mouse_press`: `_link_mode and _last_ctrl` → starts link mode, sets `ev.handled = True`
+2. `SPAMMM_GUI.on_mouse_press`: sees `event.handled = True` → returns
+3. `AtomScene._on_mouse_release`: checks link target:
+   - **Another atom**: `sig_link_bond(from_id, to_id)` → `on_link_bond` → `UnifiedMode.on_link` → `create_bond`
+   - **Empty space**: `sig_link_to_pos(from_id, x, y)` → `on_link_to_pos` → create new atom at (x,y) + bond to source
+   - **Same atom**: `sig_atom_clicked(from_id)` → cycle type
+
+### Signal Flow (LMB on bond/hex/empty)
+
+1. `AtomScene._on_mouse_press`: no atom within `pick_radius` → does NOT set `ev.handled`, returns
+2. `SPAMMM_GUI.on_mouse_press`: runs → `UnifiedMode.on_press` → `resolve_target` → bond/hex/empty action
+
+### Click-vs-Drag Detection
+
+`AtomScene._on_mouse_press` stores `_press_pos` (pixel coordinates). On `_on_mouse_release`, if the mouse moved less than 3 pixels, it's a click (`sig_atom_clicked`); otherwise it's a drag (`sig_drag_state`). This is what enables atom type cycling on click while preserving drag-to-move on the same button.
+
+### Mode Handler Registration
+
+`set_edit_mode(mode)` syncs scene flags from the handler's class attributes:
+- `scene._link_mode = handler.link_mode` — enables Ctrl+drag bond creation
+- `scene.lock_drag = handler.lock_drag` — suppresses atom dragging (Bond mode)
+- `scene.selection_mode = handler.selection_mode` — enables RMB rectangle selection
+
+**Important**: `set_edit_mode` must be called during init (after signal connections) to sync the default mode's flags. Without this, `_link_mode` stays `False` even though `UnifiedMode.link_mode = True`.
+
+### Hover Highlighting
+
+`UnifiedMode.on_move(p_world)` calls `resolve_target` and shows:
+
+| Target | Hover visual | Status bar |
+|--------|-------------|------------|
+| **Atom** | Yellow ring | `"Atom {ename}→{next} (LMB) | Drag: Move | Ctrl+Drag: Bond | RMB: Delete | Ctrl+RMB: Bridge"` |
+| **Bond** | Lime line | `"Bond {current}→{next} (LMB) | RMB: Delete | Ctrl+LMB: Insert | Ctrl+RMB: Collapse"` |
+| **Hex** | Orange hexagon outline | `"Hex ring (q,r) — LMB: Add | RMB: Remove (preserve shared)"` |
+| **Empty** | Red cross cursor | `"Empty — LMB: Add {cur_atom_type} atom | RMB: Nothing"` |

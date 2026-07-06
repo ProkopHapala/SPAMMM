@@ -1,4 +1,4 @@
-# SPAMMM — Scientific Python AFM/MM Molecular Manipulator
+# SPAMMM — Scanning Probe Accelerated Modeling of Microscopy and Manipulation
 
 > Scanning Probe Accelerated Modeling of Microscopy and Manipulation
 

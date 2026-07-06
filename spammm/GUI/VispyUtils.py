@@ -22,6 +22,10 @@ import numpy as np
 
 from PyQt5 import QtCore
 import vispy
+
+_VERBOSE = 2
+def debug_print(level, msg):
+    if _VERBOSE >= level: print(msg)
 vispy.use('pyqt5')
 from vispy import scene
 from vispy.scene import visuals
@@ -113,10 +117,11 @@ def generate_atom_labels(label_mode, pos, enames, atom_npi=None, backend=None, b
                 lbl_pos.append(pos[i])
                 lbl_texts.append(f"{pos[i, 2]:.2f}")
     elif label_mode == 'Charge':
-        for i, e in enumerate(enames):
-            if e != 'H':
-                lbl_pos.append(pos[i])
-                lbl_texts.append("0")
+        charges = backend.atom_charges if backend is not None else None
+        for i in range(len(enames)):
+            lbl_pos.append(pos[i])
+            q = charges[i] if charges is not None and i < len(charges) else 0.0
+            lbl_texts.append(f"{q:+.3f}")
     elif label_mode == 'Bond Lengths':
         if bonds:
             for b in bonds:
@@ -147,6 +152,7 @@ class AtomScene(QtCore.QObject):
     sig_selection_changed = QtCore.pyqtSignal(object)  # set of selected Atom._ids
     sig_camera_changed = QtCore.pyqtSignal()  # camera changed (zoom/pan/rotate)
     sig_link_bond = QtCore.pyqtSignal(int, int)  # from_id, to_id — Ctrl+drag bond creation
+    sig_link_to_pos = QtCore.pyqtSignal(int, float, float)  # from_id, x, y — Ctrl+drag to empty space (create atom + bond)
     sig_atom_clicked = QtCore.pyqtSignal(int)  # Atom._id — click without drag (for type change)
 
     def __init__(self, *, bgcolor='white', backend=None):
@@ -202,16 +208,21 @@ class AtomScene(QtCore.QObject):
         self.ring_preview_line.visible = False
         # Selection rectangle (Line visual) - create lazily to avoid initialization issues
         self.selection_rect = None
+        # Fragment highlight visuals (dedicated — not shared with hex grid)
+        self.frag_lines = visuals.Line(parent=self.view.scene, color=(1.0, 0.5, 0.0, 0.9), width=5.0, antialias=True, method='gl')
+        self.frag_bbox_lines = visuals.Line(parent=self.view.scene, color=(0.2, 0.8, 0.2, 0.6), width=1.5, antialias=True, method='gl')
+        self.frag_lines.visible = False
+        self.frag_bbox_lines.visible = False
 
         # Enforce z-order when supported
-        for o, v in enumerate((self.radius_markers, self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.bond_order_lines, self.atom_markers, self.axes, self.text_labels, self.bond_order_text, self.hover_bond_line, self.hover_ring_lines, self.hover_ring_markers, self.hover_ring_text, self.hover_atom_marker, self.link_line, self.ring_preview_line)):
+        for o, v in enumerate((self.radius_markers, self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.bond_order_lines, self.atom_markers, self.axes, self.text_labels, self.bond_order_text, self.hover_bond_line, self.hover_ring_lines, self.hover_ring_markers, self.hover_ring_text, self.hover_atom_marker, self.link_line, self.ring_preview_line, self.frag_lines, self.frag_bbox_lines)):
             if hasattr(v, 'order'):
                 v.order = int(o)
 
         # GL state: radius translucent and never blocks other overlays
         try:
             self.radius_markers.set_gl_state('translucent', depth_test=False)
-            for v in (self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.bond_order_lines, self.hover_bond_line, self.hover_ring_lines, self.link_line, self.ring_preview_line):
+            for v in (self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.bond_order_lines, self.hover_bond_line, self.hover_ring_lines, self.link_line, self.ring_preview_line, self.frag_lines, self.frag_bbox_lines):
                 v.set_gl_state('translucent', depth_test=False)
             self.atom_markers.set_gl_state('translucent', depth_test=False)
             self.hover_ring_markers.set_gl_state('translucent', depth_test=False)
@@ -261,6 +272,12 @@ class AtomScene(QtCore.QObject):
         self._port_target_segs = None
         self._dpos_segs = None
         self._dpos_neigh_segs = None
+
+        # Fragment highlight data (persists across _redraw calls)
+        self._frag_bond_segs = None       # (2*m, 3) array of bond segment endpoints
+        self._frag_bond_colors = None     # (2*m, 4) RGBA per vertex
+        self._frag_bbox_segs = None       # (2*k, 3) AABB edge segments
+        self._frag_bbox_colors = None     # (2*k, 4) RGBA per vertex
 
         self._label_mode = 'none'  # none|global|local|pair|radius
         self._labels_text = None
@@ -524,6 +541,24 @@ class AtomScene(QtCore.QObject):
             raise ValueError(f"AtomScene.set_bboxes: bmin.shape={bmin.shape} bmax.shape={bmax.shape} expected (ng,4)")
         self._bboxes_min = bmin
         self._bboxes_max = bmax
+        self._redraw()
+
+    def set_frag_highlights(self, bond_segs=None, bond_colors=None, bbox_segs=None, bbox_colors=None):
+        """Set fragment highlight overlays. Pass None to clear.
+        bond_segs: (2*m, 3) array of bond segment endpoints
+        bond_colors: (2*m, 4) RGBA per vertex, or single tuple for all
+        bbox_segs: (2*k, 3) array of AABB edge segments
+        bbox_colors: (2*k, 4) RGBA per vertex, or single tuple for all"""
+        self._frag_bond_segs = _as_f32(bond_segs) if bond_segs is not None else None
+        self._frag_bbox_segs = _as_f32(bbox_segs) if bbox_segs is not None else None
+        if bond_colors is not None and not isinstance(bond_colors, tuple):
+            self._frag_bond_colors = np.asarray(bond_colors, dtype=np.float32)
+        else:
+            self._frag_bond_colors = bond_colors
+        if bbox_colors is not None and not isinstance(bbox_colors, tuple):
+            self._frag_bbox_colors = np.asarray(bbox_colors, dtype=np.float32)
+        else:
+            self._frag_bbox_colors = bbox_colors
         self._redraw()
 
     def set_label_mode(self, mode):
@@ -972,6 +1007,14 @@ class AtomScene(QtCore.QObject):
                     # aromatic: single green line, medium width
                     seg_list.append([p0, p1])
                     col_list.append((0.0, 0.6, 0.0, 0.9))
+                elif total > 2.5:
+                    # triple: three parallel lines
+                    seg_list.append([p0, p1])
+                    col_list.append((0.2, 0.2, 0.2, 0.9))
+                    seg_list.append([p0 + perp * offset, p1 + perp * offset])
+                    col_list.append((0.2, 0.2, 0.2, 0.9))
+                    seg_list.append([p0 - perp * offset, p1 - perp * offset])
+                    col_list.append((0.2, 0.2, 0.2, 0.9))
                 elif total > 1.7:
                     # double: two parallel lines
                     seg_list.append([p0 + perp * offset, p1 + perp * offset])
@@ -1071,6 +1114,22 @@ class AtomScene(QtCore.QObject):
                 self.text_labels.text = self._labels_text
                 self.text_labels.pos = (self._pos[idx] + np.array([0.02, 0.02, 0.02], dtype=np.float32)[None, :]).astype(np.float32)
                 self.text_labels.visible = True
+
+        # Fragment highlight bonds (dedicated visual — persists across redraws)
+        if self._frag_bond_segs is not None and self._frag_bond_segs.size > 0:
+            self._line_set("frag_bonds", self.frag_lines, self._frag_bond_segs, color=self._frag_bond_colors, width=5.0)
+            self.frag_lines.visible = True
+        else:
+            self.frag_lines.set_data(np.zeros((0, 3), dtype=np.float32))
+            self.frag_lines.visible = False
+
+        # Fragment bounding boxes (dedicated visual)
+        if self._frag_bbox_segs is not None and self._frag_bbox_segs.size > 0:
+            self._line_set("frag_bboxes", self.frag_bbox_lines, self._frag_bbox_segs, color=self._frag_bbox_colors, width=1.5)
+            self.frag_bbox_lines.visible = True
+        else:
+            self.frag_bbox_lines.set_data(np.zeros((0, 3), dtype=np.float32))
+            self.frag_bbox_lines.visible = False
 
         self.canvas.update()
 
@@ -1192,9 +1251,11 @@ class AtomScene(QtCore.QObject):
             return
 
         # Ctrl+LMB in link mode: start bond creation drag (rubber-band line)
+        debug_print(2, f"[SCENE_PRESS] link_mode={self._link_mode} ctrl={self._last_ctrl} button={ev.button}")
         if self._link_mode and self._last_ctrl:
-            i = self._pick_idx_from_mouse(ev.pos)
-            if i >= 0:
+            i, d2 = self._pick_idx_with_dist(ev.pos)
+            debug_print(2, f"[SCENE_PRESS] ctrl+link check: idx={i} d2={d2:.3f} radius²={self.pick_radius**2:.3f}")
+            if i >= 0 and d2 <= self.pick_radius ** 2:
                 atom_id = self._idx_to_id(i)
                 self._link_active = True
                 self._link_from_id = atom_id
@@ -1240,10 +1301,16 @@ class AtomScene(QtCore.QObject):
             ev.handled = True
             return
 
-        i = self._pick_idx_from_mouse(ev.pos)
-        if i < 0:
+        i, d2 = self._pick_idx_with_dist(ev.pos)
+        if i < 0 or d2 > self.pick_radius ** 2:
+            # No atom within pick radius — clear stale pick state and let GUI handler run
+            debug_print(2, f"[SCENE_PRESS] no atom within radius (best_d2={d2:.3f} radius²={self.pick_radius**2:.3f}) — falling through to GUI")
+            self._pick_idx = -1
+            self._pick_id = -1
             return
         atom_id = self._idx_to_id(i)
+        self._press_pos = np.array(ev.pos, dtype=np.float32)  # for click-vs-drag detection
+        debug_print(2, f"[SCENE_PRESS] picked atom_id={atom_id} idx={i} d={np.sqrt(d2):.3f} — starting drag")
 
         # If atoms are selected and we click on one of them, drag all selected
         if self._selected_ids and atom_id in self._selected_ids:
@@ -1314,16 +1381,30 @@ class AtomScene(QtCore.QObject):
             self._link_from_id = -1
             self.hover_atom_marker.set_data(pos=np.zeros((0, 3), dtype=np.float32))
             if target_id >= 0 and target_id != from_id:
+                debug_print(2, f"[LINK_RELEASE] bond from={from_id} to={target_id}")
                 self.sig_link_bond.emit(from_id, target_id)
             elif target_id == from_id:
                 # Released on same atom = click → change type
                 self.sig_atom_clicked.emit(from_id)
-            # else: released on empty space → cancel (no action)
+            else:
+                # Released on empty space → create new atom at release position + bond
+                r0, rd = self._ray_from_mouse(ev.pos)
+                p = self._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0,0,1]))
+                if p is not None:
+                    debug_print(2, f"[LINK_RELEASE] new atom from={from_id} at=({p[0]:.2f},{p[1]:.2f})")
+                    self.sig_link_to_pos.emit(from_id, float(p[0]), float(p[1]))
             ev.handled = True
             return
         self._pick_active = False
         if self._pick_idx >= 0:
-            self.sig_drag_state.emit(0, int(self._pick_id), self._pos[int(self._pick_idx)].copy())
+            # Click-vs-drag: if mouse barely moved, treat as click (emit sig_atom_clicked)
+            moved = np.linalg.norm(np.array(ev.pos, dtype=np.float32) - getattr(self, '_press_pos', np.array([1e9, 1e9])))
+            if moved < 3:
+                debug_print(2, f"[SCENE_RELEASE] click (moved={moved:.1f}px) → sig_atom_clicked atom_id={self._pick_id}")
+                self.sig_atom_clicked.emit(int(self._pick_id))
+            else:
+                debug_print(2, f"[SCENE_RELEASE] drag (moved={moved:.1f}px) → sig_drag_state atom_id={self._pick_id}")
+                self.sig_drag_state.emit(0, int(self._pick_id), self._pos[int(self._pick_idx)].copy())
             if int(self._cam_debug) > 0:
                 i = int(self._pick_idx)
                 print(f"[DRAG] up id={self._pick_id} pos=({self._pos[i,0]:.3f},{self._pos[i,1]:.3f},{self._pos[i,2]:.3f})")

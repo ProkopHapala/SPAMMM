@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ASCII art heterocycle builder.
+ascii_art_heterocycle.py — ASCII art heterocycle builder.
 
 Supports two ASCII input formats:
 
@@ -38,7 +38,7 @@ import matplotlib.pyplot as plt
 
 from spammm.AtomicSystem import AtomicSystem
 from spammm import elements as _elements
-from spammm.topology.KekulePure import KekulePure, make_n_pi
+from spammm.topology.KekulePure import KekulePure, make_n_pi, run_kekule_solver, localize_kekule, mol_bond_types, export_mol
 from spammm.topology.heterocycle_generator import plot_system, plot_kekule_phases
 
 A_CC = 1.42
@@ -141,148 +141,8 @@ def resolve_hbond_pairs(atoms):
     return hb_ascii
 
 
-def run_kekule_solver(atoms, Kval=50.0, Kloc=5.0, Karo=0.5, Kbound=1.0, allow_aromatic=True, solver='linsolve', sym_break=0.0, seed=0, n_pi=None):
-    """Run two-phase Kekulé solver on heavy-atom bonds of an AtomicSystem.
-
-    Phase 1: quadratic solve with ``Kloc=0`` (delocalized / aromatic).
-    Phase 2: localization with ``Kloc>0`` and optional symmetry-breaking noise.
-
-    Args:
-        atoms: AtomicSystem with bonds, enames, apos
-        Kval: atom-sum stiffness
-        Kloc: snap / localization stiffness (used only in phase 2)
-        Karo: aromatization stiffness
-        Kbound: hard [0,1] bound stiffness
-        allow_aromatic: whether aromatic (0.5) bond orders are permitted
-        solver: ``'linsolve'`` (quadratic) or ``'gd'`` (gradient descent)
-        sym_break: symmetry-breaking noise amplitude (0 = off)
-        seed: random seed for sym_break (0 = do not set)
-        n_pi: explicit (natoms,) array of pi electron counts. If None, auto-derive from element case.
-
-    Returns:
-        dict with keys ``bo_raw``, ``bo_snap``, ``n_pi``, ``k``, ``err``,
-        and ``report`` (diagnostic sub-dict).
-    """
-    bonds_all = np.asarray(atoms.bonds, dtype=np.int32) if (atoms.bonds is not None) else np.zeros((0, 2), dtype=np.int32)
-    if n_pi is None:
-        n_pi = make_n_pi(atoms)
-    else:
-        n_pi = np.asarray(n_pi, dtype=float)
-    # Only include bonds where both atoms have pi electrons (n_pi > 0)
-    is_pi = n_pi > 0
-    pi_mask = is_pi[bonds_all[:, 0]] & is_pi[bonds_all[:, 1]] if len(bonds_all) else np.zeros(0, dtype=bool)
-    bonds_pi = bonds_all[pi_mask]
-    idx_pi = np.nonzero(pi_mask)[0]
-    bo_raw = np.zeros(len(bonds_all), dtype=float)
-    bo_snap = np.zeros(len(bonds_all), dtype=float)
-    k = KekulePure(atoms, n_pi=n_pi, bonds=bonds_pi, Kval=Kval, Kloc=0.0, Karo=Karo,
-                   Kbound=Kbound, allow_aromatic=allow_aromatic)
-    # Debug: print solver input
-    print(f"[KEKULE] Solving: natoms={atoms.natoms} nbonds_all={len(bonds_all)} nbonds_pi={len(bonds_pi)}")
-    print(f"[KEKULE] n_pi={list(n_pi)}  enames={list(atoms.enames)}")
-    if len(bonds_pi):
-        print(f"[KEKULE] pi-bonds={bonds_pi.tolist()}")
-    err = None
-    report = {}
-    try:
-        if solver == 'linsolve':
-            k.solve_quadratic(Kloc=0.0)
-            F2 = 0.0
-        else:
-            F2 = k.relax(dt=0.05, nmax=5000, tol=1e-6)
-        bo_raw_h = k.pi_bond_orders()
-        bo_raw[idx_pi] = bo_raw_h
-        report['phase1_F2'] = F2
-        report['phase1_bo'] = bo_raw_h
-        report['n_pi'] = n_pi
-        # Phase 2: localization
-        k.Kloc = Kloc
-        if sym_break:
-            if seed:
-                np.random.seed(seed)
-            k.bo = np.clip(k.bo + sym_break * (np.random.rand(k.nbond) - 0.5), 0.0, 1.0)
-        if solver == 'linsolve':
-            k.solve_snap(niter=50)
-            F2 = 0.0
-        else:
-            F2 = k.relax(dt=0.05, nmax=5000, tol=1e-6)
-        cls = k.classify()
-        report['phase2_F2'] = F2
-        report['phase2_bo'] = k.pi_bond_orders()
-        report['single'] = int(np.sum(cls == 0))
-        report['aromatic'] = int(np.sum(cls == 1))
-        report['double'] = int(np.sum(cls == 2))
-        err2 = (k._A @ k.bo - n_pi)[n_pi > 0]
-        report['max_err'] = float(np.max(np.abs(err2))) if err2.size else 0.0
-        bo_snap_h = k.pi_bond_orders().copy()
-        bo_snap[idx_pi] = bo_snap_h
-    except Exception as e:
-        err = e
-        import traceback
-        report['err'] = str(err)
-        report['traceback'] = traceback.format_exc()
-    return {'bo_raw': bo_raw, 'bo_snap': bo_snap, 'n_pi': n_pi, 'k': k, 'err': err, 'report': report}
-
-
-def mol_bond_types(atoms, bo_snap=None, allow_aromatic=True, kekule=False):
-    """Map Kekulé pi bond orders to MOL V2000 bond-type integers.
-
-    Args:
-        atoms: AtomicSystem with bonds and enames
-        bo_snap: np.ndarray of pi bond orders (length = len(atoms.bonds))
-        allow_aromatic: if True, classify ~0.5 as aromatic (type 4)
-        kekule: if False, all bonds are type 1 (single)
-
-    Returns:
-        np.ndarray of int or None: bond type per bond (1=single, 2=double,
-        4=aromatic), or *None* if the system has no bonds.
-    """
-    if atoms.bonds is None:
-        return None
-    bonds = np.asarray(atoms.bonds, dtype=int)
-    bond_types = np.ones(len(bonds), dtype=int)
-    if not kekule or bo_snap is None:
-        return bond_types
-    bo_pi = np.asarray(bo_snap, dtype=float)
-    for ib, (i, j) in enumerate(bonds):
-        if (atoms.enames[i] == 'H') or (atoms.enames[j] == 'H'):
-            bond_types[ib] = 1
-            continue
-        x = float(bo_pi[ib]) if ib < len(bo_pi) else 0.0
-        if allow_aromatic and (abs(x - 0.5) < 0.2):
-            bond_types[ib] = 4
-        elif x > 0.75:
-            bond_types[ib] = 2
-        else:
-            bond_types[ib] = 1
-    return bond_types
-
-
-def export_mol(atoms, mol_opt='auto', out_path='/tmp/kekule/heterocycle.svg',
-               title='molecule', bond_types=None):
-    """Export an AtomicSystem to a MOL file unless disabled.
-
-    Args:
-        atoms: AtomicSystem
-        mol_opt: ``'auto'``, ``'off'``, or an explicit file path
-        out_path: base output path (used when ``mol_opt='auto'`` to derive
-                  the ``.mol`` filename)
-        title: MOL title line
-        bond_types: np.ndarray of int per bond, or *None* for all-single
-
-    Returns:
-        str or None: path to the saved MOL file, or *None* if export is off
-    """
-    mol_opt = str(mol_opt).strip().lower() if (mol_opt is not None) else 'auto'
-    if mol_opt in ('off', '0', 'none', ''):
-        return None
-    if mol_opt == 'auto':
-        root, _ = os.path.splitext(os.path.abspath(out_path))
-        mol_fname = root + '.mol'
-    else:
-        mol_fname = mol_opt
-    atoms.save_mol(mol_fname, title=title, bond_types=bond_types)
-    return mol_fname
+# Solver orchestration functions (run_kekule_solver, localize_kekule, mol_bond_types, export_mol)
+# have been moved to KekulePure.py — imported above.
 
 
 # ---------------------------------------------------------------------------

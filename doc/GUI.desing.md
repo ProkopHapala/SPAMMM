@@ -26,13 +26,27 @@ Interactive molecular editor for designing carbon-based nanostructures (graphene
 
 | Mode | LMB | Ctrl+LMB | RMB | Ctrl+RMB | Description |
 |------|-----|----------|-----|----------|-------------|
+| **Unified** | Atom: click=cycle type / drag=move; Bond: cycle order; Hex: add ring; Empty: add atom | Atom: drag to atom=bond / drag to empty=new atom+bond; Bond: insert atom (push aside) | Atom: delete; Bond: delete; Hex: remove ring (preserve shared) | Atom: delete+bridge; Bond: collapse | Context-sensitive: target determined by cursor position (atom > bond > hex > empty). Default mode. |
 | **Hex1** (paint) | Add hex ring | — | Remove hex ring | — | Force add/remove; shared atoms between rings are also removed |
 | **Hex2** (toggle) | Add hex ring | — | Remove hex ring (preserve shared) | — | Like Hex1 but preserves atoms shared with neighboring rings |
-| **Atom** | Click: change type / Drag: move atom / Empty: add atom | Drag: create bond (rubber-band) | Delete atom | Delete atom + bridge neighbors | Free atom placement, drag-to-bond, type change |
+| **Atom** | Click: change type / Drag: move atom / Empty: add atom | Drag to atom: create bond / Drag to empty: new atom + bond | Delete atom | Delete atom + bridge neighbors | Free atom placement, drag-to-bond, type change |
 | **Bond** | Insert atom (no push) | Insert atom (push aside) | Delete bond | Collapse bond (merge atoms) | Edit existing bonds with Ctrl for atom adjustment |
 | **Ring** | Add n-gon ring on bond | — | Delete bond | — | Click bond to create n-membered ring (default 5) sharing that bond; ring size spinbox + numpad +/- in side panel; ghost preview on hover shows ring on mouse side |
-| **pi** | Cycle pi-orbital count (0→1→2→0) | — | Delete atom | — | Adjust hybridization (sp3→sp2→sp) on clicked atom |
+| **pi** | Click: cycle pi-orbital count (0→1→2→0) / Empty: add atom | — | Delete atom | — | Adjust hybridization (sp3→sp2→sp) on clicked atom |
 | **Select** | Drag selected atoms | — | Rectangle select / Delete | — | RMB drag = selection box; Delete = remove selected; Ctrl-C/V = copy/paste |
+
+### Mode handler architecture
+
+Each edit mode is implemented as an `EditModeHandler` subclass in `spammm/GUI/EditModeHandlers.py`. The base class defines overridable methods (`on_press`, `on_move`, `on_atom_click`, `on_link`, `on_rmb_atom`, `on_activate`) and class attributes (`link_mode`, `lock_drag`, `selection_mode`, `ring_size_visible`, `status_msg`). The GUI controller (`KekuleExplorerWindow`) dispatches signals to the active handler via a `mode_handlers` dict. Extensions register minimal `EditModeHandler` instances.
+
+**Key class attributes set by each mode:**
+
+| Mode | `link_mode` | `lock_drag` | `selection_mode` |
+|------|-----------|-----------|-----------------|
+| Unified | True | False | False |
+| Atom | True | False | False |
+| Bond | False | True | False |
+| Select | False | False | True |
 
 ### Atom types
 - Available: C, N, O (selectable via combo box)
@@ -85,13 +99,14 @@ Pre-built nanoribbon generator for quick starts:
 | Button | Action |
 |--------|--------|
 | **LMB** | Mode-dependent (add/toggle/insert — see Edit Modes) |
-| **Ctrl+LMB drag** (Atom mode) | Create bond between two atoms (rubber-band line, green target highlight) |
+| **Ctrl+LMB drag** (Unified/Atom mode) | Drag from atom to atom: create bond (rubber-band line, green target highlight). Drag from atom to empty: create new atom at release position + bond to source atom. |
 | **RMB** | Mode-dependent (remove/collapse/select — see Edit Modes) |
-| **Ctrl+RMB** (Atom mode) | Delete atom + bridge its 2 heavy neighbors with a new bond |
+| **Ctrl+RMB** (Unified/Atom mode) | Delete atom + bridge its 2 heavy neighbors with a new bond |
 | **Middle-click** | Toggle H state on nearest atom |
 | **Scroll** | Zoom in/out |
 | **RMB drag** (Select mode) | Rectangle selection |
-| **LMB drag** (Atom/Select mode) | Drag atom(s) to new position. Drop atom on top of another → merge (target survives, bonds transfer) |
+| **LMB drag** (Unified/Atom/Select mode) | Drag atom(s) to new position. Drop atom on top of another → merge (target survives, bonds transfer) |
+| **LMB click** (Unified/Atom/Pi mode) | Click atom without dragging: cycle atom type (C→N→O→C) or cycle pi orbitals |
 
 ### Keyboard
 | Key | Action |
@@ -218,7 +233,7 @@ Pre-defined edge terminations for ribbons:
 
 4. **Local neighbor updates:** `add_bond` and `remove_bond` update `atom.neighbors` in-place (O(degree)). `add_bond` is idempotent — if a dead bond exists between the pair, it revives it instead of creating a duplicate. Global `sync_neighbor_lists()` is only needed for bulk operations (ring add/remove, `collapse_bond`).
 
-5. **Double event handling:** Both `AtomScene` and `SPAMMM_GUI` handle `mouse_press`. Mode checks prevent conflicts. `ev.handled = True` does NOT stop other callbacks in Vispy.
+5. **Double event handling:** Both `AtomScene` and `SPAMMM_GUI` handle `mouse_press`. The GUI handler checks `event.handled` and skips if the scene already handled it (e.g. atom picked, link mode active). `ev.handled = True` does NOT stop other callbacks in Vispy — the GUI must explicitly check it.
 
 6. **`adjust_h()` reorders arrays:** H caps are removed and re-added, completely changing array ordering. This is why ID-based operations are essential — indices before `adjust_h()` are invalid after.
 
@@ -238,8 +253,9 @@ See `doc/GUI_topology_edit.desing.md` for detailed internal design and bug histo
 
 | File | Role |
 |------|------|
-| `spammm/GUI/SPAMMM_GUI.py` | Main window, side panel, signal dispatch, mode handling |
-| `spammm/GUI/VispyUtils.py` | Vispy `AtomScene`: rendering, picking, drag, selection, camera |
+| `spammm/GUI/SPAMMM_GUI.py` | Main window, side panel, signal dispatch, mode handler registry |
+| `spammm/GUI/VispyUtils.py` | Vispy `AtomScene`: rendering, picking, drag, selection, camera, click-vs-drag detection |
+| `spammm/GUI/EditModeHandlers.py` | `EditModeHandler` class hierarchy: per-mode logic (Unified, Atom, Bond, Hex, Pi, Select, Ring) |
 | `spammm/GUI/BaseGUI.py` | PyQt5 widget factory base class (buttons, spinboxes, etc.) |
 | `spammm/GUI/ExtensionManager.py` | Dynamic extension loading and UI integration |
 | `spammm/GUI/CollapsibleSection.py` | Collapsible side panel sections |

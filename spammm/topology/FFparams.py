@@ -1,5 +1,5 @@
 """
-SPparams.py — Force field parameter parsing for SPFF and UFF.
+FFparams.py — Force field parameter parsing for SPFF and UFF.
 
 Purpose: Load canonical .dat parameter files (ElementTypes, AtomTypes, BondTypes,
 AngleTypes, DihedralTypes) and provide lookup classes for force field parameters.

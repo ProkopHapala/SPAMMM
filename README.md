@@ -1,6 +1,6 @@
 # SPAMMM — FireCore
 
-**Scientific Python AFM/MM Molecular Manipulator**
+**Scanning Probe Accelerated Modeling of Microscopy and Manipulation**
 
 SPAMMM (Scanning Probe Accelerated Modeling of Microscopy and Manipulation) is the integrated SPM simulation platform also known as **FireCore**. It is designed for high-throughput, end-to-end simulation of bond-resolved atomic force microscopy (BR-AFM) and scanning tunneling microscopy (BR-STM), from molecular structure preparation and relaxation to image generation and surface manipulation.
 

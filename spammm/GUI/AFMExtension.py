@@ -614,32 +614,8 @@ def _get_z_slice(grid_spec, step, z_height):
 
 def _show_in_plot_window(window, fig, title="AFM Plot"):
     """Show a matplotlib Figure in a reusable Qt dialog window."""
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-    if not hasattr(window, '_afm_plot_window') or window._afm_plot_window is None:
-        window._afm_plot_window = QtWidgets.QDialog(window)
-        window._afm_plot_window.setWindowTitle(title)
-        window._afm_plot_layout = QtWidgets.QVBoxLayout(window._afm_plot_window)
-        window._afm_plot_window.resize(700, 600)
-        def on_closed():
-            window._afm_plot_window = None
-        window._afm_plot_window.finished.connect(on_closed)
-        window._afm_plot_window.show()
-    else:
-        while window._afm_plot_layout.count():
-            item = window._afm_plot_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-    canvas = FigureCanvas(fig)
-    if hasattr(window, 'install_mpl_canvas_screenshot_menu'):
-        try:
-            window.install_mpl_canvas_screenshot_menu(canvas, fig, default_name=f"{title.replace(' ','_')}.png")
-        except Exception:
-            pass
-    window._afm_plot_layout.addWidget(canvas)
-    window._afm_plot_window.setWindowTitle(title)
-    window._afm_plot_window.show()
-    window._afm_plot_window.raise_()
-    window._afm_plot_window.activateWindow()
+    from .plotutils import show_in_plot_window as _show
+    _show(window, fig, title=title, attr='_afm_plot_window')
 
 
 def _overlay_atoms(ax, window, xs, ys):
@@ -648,13 +624,8 @@ def _overlay_atoms(ax, window, xs, ys):
         return
     if not hasattr(window, 'backend') or window.backend.sys is None:
         return
-    apos = window.backend.sys.apos
-    enames = window.backend.sys.enames
-    ELEM_COLOR = {'H': 'white', 'C': 'gray', 'N': 'blue', 'O': 'red', 'S': 'yellow'}
-    for i, (pos, e) in enumerate(zip(apos, enames)):
-        if xs[0] <= pos[0] <= xs[-1] and ys[0] <= pos[1] <= ys[-1]:
-            c = ELEM_COLOR.get(e, 'magenta')
-            ax.plot(pos[0], pos[1], '.', color=c, markersize=4, markeredgecolor='k', markeredgewidth=0.3)
+    from .plotutils import overlay_atoms
+    overlay_atoms(ax, window.backend.sys.apos, window.backend.sys.enames, xs=xs, ys=ys, label_heavy=False)
 
 
 def plot_afm_slice(window):

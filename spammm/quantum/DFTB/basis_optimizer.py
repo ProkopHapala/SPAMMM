@@ -1,6 +1,8 @@
-"""Optimize Slater-tail projection basis parameters against reference density.
+"""basis_optimizer.py — Fit single-exponential Slater-tail basis to reference electron density.
 
-Uses project_density_dense_points kernel for fast evaluation at z-profile points only,
+Uses simulated annealing to optimize (amplitude N, decay zeta) per element,
+matching log-density profiles in the 0.5–1.5 Å fit region above each atom.
+Evaluated via **project_density_dense_points** kernel at z-profile points only,
 avoiding full 3D grid projection during optimization iterations.
 """
 import time, numpy as np

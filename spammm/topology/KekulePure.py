@@ -1,6 +1,7 @@
+
 #!/usr/bin/env python3
 """
-Pure-Python NumPy Kekule bond-order optimizer.
+KekulePure.py — Pure-Python NumPy Kekule bond-order optimizer.
 
 Optimizes pi-bond orders for sp2 atoms using a flat-array, vectorized
 relaxation.  The sigma skeleton is taken from AtomicSystem.bonds; only
@@ -14,6 +15,7 @@ Algorithm:
     4. Gradient-descent relaxation.
 """
 
+import os
 import numpy as np
 
 
@@ -341,12 +343,28 @@ class KekulePure:
             print(f"[KekulePure] WARNING: atom-sum constraint not satisfied, max|A@bo-n_pi|={max_err:.3e} (returning best-effort solution)")
         return self.bo
 
-    def solve_snap(self, niter=25, Karo=None, Kloc=None):
-        """Alternating constrained solve: update snap targets, then solve QP."""
+    def solve_snap(self, niter=25, Karo=None, Kloc=None, noise=0.0, seed=0):
+        """Alternating constrained solve: update snap targets, then solve QP.
+
+        When noise > 0, random noise is added to bo for target computation
+        only (not to bo itself).  Noise is annealed: full strength in early
+        iterations to break symmetry, then faded to zero for clean convergence.
+        """
         if Karo is None: Karo = self.Karo
         if Kloc is None: Kloc = self.Kloc
-        for _ in range(niter):
-            target = self._localization_target(self.bo)
+        if noise:
+            if seed:
+                np.random.seed(seed)
+            noise_arr = noise * (2.0 * np.random.rand(self.nbond) - 1.0)
+        else:
+            noise_arr = np.zeros(self.nbond)
+        n_noise = max(1, niter // 3)  # apply noise for first 1/3 of iterations
+        for it in range(niter):
+            if noise and it < n_noise:
+                scale = 1.0 - float(it) / n_noise
+                target = self._localization_target(self.bo + scale * noise_arr)
+            else:
+                target = self._localization_target(self.bo)
             self.solve_constrained(target=target, Karo=Karo, Kloc=Kloc)
         return self.bo
 
@@ -474,3 +492,202 @@ def optimize_pi_bonds(system, n_pi=None, pi_atoms=None, bonds=None, dt=0.1,
                    Kval=Kval, Kloc=Kloc, Karo=Karo, Kbound=Kbound)
     k.relax(dt=dt, nmax=nmax, tol=tol)
     return k
+
+
+# ---------------------------------------------------------------------------
+# Solver orchestration: two-phase solve, localization, export helpers
+# ---------------------------------------------------------------------------
+
+def run_kekule_solver(atoms, Kval=50.0, Kloc=5.0, Karo=0.5, Kbound=1.0, allow_aromatic=True, solver='linsolve', sym_break=0.0, seed=0, n_pi=None, localize=True):
+    """Run two-phase Kekulé solver on heavy-atom bonds of an AtomicSystem.
+
+    Phase 1: quadratic solve with ``Kloc=0`` (delocalized / aromatic).
+    Phase 2: localization with ``Kloc>0`` and optional symmetry-breaking noise.
+    When ``localize=False``, only phase 1 runs and ``bo_snap`` equals ``bo_raw``.
+
+    Args:
+        atoms: AtomicSystem with bonds, enames, apos
+        Kval: atom-sum stiffness
+        Kloc: snap / localization stiffness (used only in phase 2)
+        Karo: aromatization stiffness
+        Kbound: hard [0,1] bound stiffness
+        allow_aromatic: whether aromatic (0.5) bond orders are permitted
+        solver: ``'linsolve'`` (quadratic) or ``'gd'`` (gradient descent)
+        sym_break: symmetry-breaking noise amplitude (0 = off)
+        seed: random seed for sym_break (0 = do not set)
+        n_pi: explicit (natoms,) array of pi electron counts. If None, auto-derive from element case.
+        localize: if True, run phase 2 (localization). If False, only delocalized phase 1.
+
+    Returns:
+        dict with keys ``bo_raw``, ``bo_snap``, ``n_pi``, ``k``, ``err``,
+        and ``report`` (diagnostic sub-dict).
+    """
+    bonds_all = np.asarray(atoms.bonds, dtype=np.int32) if (atoms.bonds is not None) else np.zeros((0, 2), dtype=np.int32)
+    if n_pi is None:
+        n_pi = make_n_pi(atoms)
+    else:
+        n_pi = np.asarray(n_pi, dtype=float)
+    # Only include bonds where both atoms have pi electrons (n_pi > 0)
+    is_pi = n_pi > 0
+    pi_mask = is_pi[bonds_all[:, 0]] & is_pi[bonds_all[:, 1]] if len(bonds_all) else np.zeros(0, dtype=bool)
+    bonds_pi = bonds_all[pi_mask]
+    idx_pi = np.nonzero(pi_mask)[0]
+    bo_raw = np.zeros(len(bonds_all), dtype=float)
+    bo_snap = np.zeros(len(bonds_all), dtype=float)
+    k = KekulePure(atoms, n_pi=n_pi, bonds=bonds_pi, Kval=Kval, Kloc=0.0, Karo=Karo,
+                   Kbound=Kbound, allow_aromatic=allow_aromatic)
+    print(f"[KEKULE] Solving: natoms={atoms.natoms} nbonds_all={len(bonds_all)} nbonds_pi={len(bonds_pi)}")
+    print(f"[KEKULE] n_pi={list(n_pi)}  enames={list(atoms.enames)}")
+    if len(bonds_pi):
+        print(f"[KEKULE] pi-bonds={bonds_pi.tolist()}")
+    err = None
+    report = {}
+    try:
+        if solver == 'linsolve':
+            k.solve_quadratic(Kloc=0.0)
+            F2 = 0.0
+        else:
+            F2 = k.relax(dt=0.05, nmax=5000, tol=1e-6)
+        bo_raw_h = k.pi_bond_orders()
+        bo_raw[idx_pi] = bo_raw_h
+        report['phase1_F2'] = F2
+        report['phase1_bo'] = bo_raw_h
+        report['n_pi'] = n_pi
+        if not localize:
+            bo_snap[:] = bo_raw
+            cls = k.classify()
+            report['single'] = int(np.sum(cls == 0))
+            report['aromatic'] = int(np.sum(cls == 1))
+            report['double'] = int(np.sum(cls == 2))
+        else:
+            _localize_phase2(k, Kloc, sym_break, seed, solver, n_pi, report)
+            bo_snap_h = k.pi_bond_orders().copy()
+            bo_snap[idx_pi] = bo_snap_h
+    except Exception as e:
+        err = e
+        import traceback
+        report['err'] = str(err)
+        report['traceback'] = traceback.format_exc()
+    return {'bo_raw': bo_raw, 'bo_snap': bo_snap, 'n_pi': n_pi, 'k': k, 'err': err, 'report': report}
+
+
+def localize_kekule(k, Kloc=5.0, sym_break=0.0, seed=0, solver='linsolve'):
+    """Run phase 2 (localization) on an existing KekulePure solver instance.
+
+    Forces allow_aromatic=False to snap bond orders to integer (0/1).
+    When sym_break > 0, persistent noise is added to snap targets (not to bo)
+    to break symmetry in degenerate systems.
+
+    Args:
+        k: KekulePure instance (already solved phase 1, k.bo holds delocalized result)
+        Kloc: localization stiffness
+        sym_break: noise amplitude (0 = off)
+        seed: random seed (0 = do not set)
+        solver: 'linsolve' or 'gd'
+    """
+    n_pi = k.n_pi
+    report = {}
+    k.Kloc = Kloc
+    k.allow_aromatic = False  # force integer bond orders during localization
+    if solver == 'linsolve':
+        k.solve_snap(niter=50, noise=sym_break, seed=seed)
+        F2 = 0.0
+    else:
+        if sym_break:
+            if seed:
+                np.random.seed(seed)
+            k.bo = np.clip(k.bo + sym_break * (2.0 * np.random.rand(k.nbond) - 1.0), 0.0, 1.0)
+        F2 = k.relax(dt=0.05, nmax=5000, tol=1e-6)
+    cls = k.classify()
+    report['phase2_F2'] = F2
+    report['phase2_bo'] = k.pi_bond_orders()
+    report['single'] = int(np.sum(cls == 0))
+    report['aromatic'] = int(np.sum(cls == 1))
+    report['double'] = int(np.sum(cls == 2))
+    err2 = (k._A @ k.bo - n_pi)[n_pi > 0]
+    report['max_err'] = float(np.max(np.abs(err2))) if err2.size else 0.0
+    return report
+
+
+def _localize_phase2(k, Kloc, sym_break, seed, solver, n_pi, report):
+    """Internal: run phase 2 and fill report dict in-place."""
+    k.Kloc = Kloc
+    k.allow_aromatic = False
+    if solver == 'linsolve':
+        k.solve_snap(niter=50, noise=sym_break, seed=seed)
+        F2 = 0.0
+    else:
+        if sym_break:
+            if seed:
+                np.random.seed(seed)
+            k.bo = np.clip(k.bo + sym_break * (2.0 * np.random.rand(k.nbond) - 1.0), 0.0, 1.0)
+        F2 = k.relax(dt=0.05, nmax=5000, tol=1e-6)
+    cls = k.classify()
+    report['phase2_F2'] = F2
+    report['phase2_bo'] = k.pi_bond_orders()
+    report['single'] = int(np.sum(cls == 0))
+    report['aromatic'] = int(np.sum(cls == 1))
+    report['double'] = int(np.sum(cls == 2))
+    err2 = (k._A @ k.bo - n_pi)[n_pi > 0]
+    report['max_err'] = float(np.max(np.abs(err2))) if err2.size else 0.0
+
+
+def mol_bond_types(atoms, bo_snap=None, allow_aromatic=True, kekule=False):
+    """Map Kekulé pi bond orders to MOL V2000 bond-type integers.
+
+    Args:
+        atoms: AtomicSystem with bonds and enames
+        bo_snap: np.ndarray of pi bond orders (length = len(atoms.bonds))
+        allow_aromatic: if True, classify ~0.5 as aromatic (type 4)
+        kekule: if False, all bonds are type 1 (single)
+
+    Returns:
+        np.ndarray of int or None: bond type per bond (1=single, 2=double,
+        4=aromatic), or *None* if the system has no bonds.
+    """
+    if atoms.bonds is None:
+        return None
+    bonds = np.asarray(atoms.bonds, dtype=int)
+    bond_types = np.ones(len(bonds), dtype=int)
+    if not kekule or bo_snap is None:
+        return bond_types
+    bo_pi = np.asarray(bo_snap, dtype=float)
+    for ib, (i, j) in enumerate(bonds):
+        if (atoms.enames[i] == 'H') or (atoms.enames[j] == 'H'):
+            bond_types[ib] = 1
+            continue
+        x = float(bo_pi[ib]) if ib < len(bo_pi) else 0.0
+        if allow_aromatic and (abs(x - 0.5) < 0.2):
+            bond_types[ib] = 4
+        elif x > 0.75:
+            bond_types[ib] = 2
+        else:
+            bond_types[ib] = 1
+    return bond_types
+
+
+def export_mol(atoms, mol_opt='auto', out_path='/tmp/kekule/heterocycle.svg',
+               title='molecule', bond_types=None):
+    """Export an AtomicSystem to a MOL file unless disabled.
+
+    Args:
+        atoms: AtomicSystem
+        mol_opt: ``'auto'``, ``'off'``, or an explicit file path
+        out_path: base output path (used when ``mol_opt='auto'`` to derive
+                  the ``.mol`` filename)
+        title: MOL title line
+        bond_types: np.ndarray of int per bond, or *None* for all-single
+
+    Returns:
+        str or None: path to the saved MOL file, or *None* if export is off
+    """
+    mol_opt = str(mol_opt).strip().lower() if (mol_opt is not None) else 'auto'
+    if mol_opt in ('off', '0', 'none', ''):
+        return None
+    if mol_opt == 'auto':
+        root, _ = os.path.splitext(os.path.abspath(out_path))
+        mol_fname = root + '.mol'
+    else:
+        mol_fname = mol_opt
+    atoms.save_mol(mol_fname, title=title, bond_types=bond_types)
+    return mol_fname

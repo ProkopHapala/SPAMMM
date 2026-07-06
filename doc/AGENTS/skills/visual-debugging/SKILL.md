@@ -6,8 +6,6 @@ trigger:
     - "**/tests/**/*"
     - "**/*test*.py"
     - "**/*debug*.py"
-    - "**/test_*.sh"
-    - "**/run_*.sh"
     - "**/*benchmark*.py"
 ---
 
@@ -43,7 +41,7 @@ trigger:
 
 ## Headless Visual Testing for Molecular Editing
 
-**Full design doc:** `doc/HowTo/VisualDEbugging.md`
+**Full design doc:** `doc/HowTo/VisualDebugging.md`
 
 Molecular editing features are visual (clicks, selections, buttons). Test them headlessly:
 

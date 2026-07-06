@@ -39,7 +39,7 @@ DEBUG = True  # Set True to enable topology consistency checks
 # ─── Atom ───────────────────────────────────────────────────────────────────
 
 class Atom:
-    __slots__ = ('pos', 'ename', 'atype', 'pin', 'parent', 'npi', 'bonds', 'neighbors', '_id', 'alive')
+    __slots__ = ('pos', 'ename', 'atype', 'pin', 'parent', 'npi', 'bonds', 'neighbors', '_id', 'alive', 'charge')
     _counter = 0
 
     def __init__(self, pos, ename, atype, pin=None, parent=None, npi=1):
@@ -55,6 +55,7 @@ class Atom:
         self.npi     = npi
         self.bonds   = []           # list of Bond objects involving this atom
         self.neighbors = []         # list of neighboring Atoms (derived from bonds)
+        self.charge  = 0.0          # partial charge (e.g. from QEq), in electrons
 
     def __repr__(self):
         status = "" if self.alive else "[DEAD]"
@@ -67,7 +68,7 @@ class Bond:
     __slots__ = ('a', 'b', 'order', '_id', 'alive')
     _counter = 0
 
-    def __init__(self, a: Atom, b: Atom, order=1):
+    def __init__(self, a: Atom, b: Atom, order=1.0):
         Bond._counter += 1
         self._id   = Bond._counter
         self.alive = True           # False = marked for deletion, will be cleaned up
@@ -238,7 +239,7 @@ class AtomicGraph:
 
     # ── Bond operations ──────────────────────────────────────────────────────
 
-    def add_bond(self, a: Atom, b: Atom, order=1) -> Bond:
+    def add_bond(self, a: Atom, b: Atom, order=None) -> Bond:
         for bond in a.bonds:
             if bond.other(a) is b:
                 if not bond.alive:
@@ -246,6 +247,8 @@ class AtomicGraph:
                     a.neighbors.append(b)
                     b.neighbors.append(a)
                 return bond   # already exists (now alive)
+        if order is None:
+            order = 1.5 if (a.npi > 0 and b.npi > 0) else 1.0
         bond = Bond(a, b, order)
         self.bonds[bond._id] = bond
         a.bonds.append(bond)
@@ -416,6 +419,295 @@ class AtomicGraph:
 
     def neighbors(self, atom: Atom):
         return [b.other(atom) for b in atom.bonds if b.alive]
+
+    # ── Graph analysis: fragmentation ─────────────────────────────────────────
+
+    def find_connected_components(self):
+        """Return list of lists of alive Atom objects, one per connected component.
+        Components are found by BFS over alive bonds."""
+        alive = [a for a in self.atoms.values() if a.alive]
+        visited = set()
+        components = []
+        for atom in alive:
+            if atom._id in visited:
+                continue
+            comp = []
+            stack = [atom]
+            visited.add(atom._id)
+            while stack:
+                a = stack.pop()
+                comp.append(a)
+                for b in a.bonds:
+                    if not b.alive:
+                        continue
+                    nb = b.other(a)
+                    if nb.alive and nb._id not in visited:
+                        visited.add(nb._id)
+                        stack.append(nb)
+            components.append(comp)
+        return components
+
+    def find_bridges(self, heavy_only=True):
+        """Return list of alive Bond objects that are bridges.
+        A bridge is a bond whose removal disconnects the graph.
+        If heavy_only=True (default), only consider bonds between non-H atoms —
+        C-H bonds are never bridges.
+        Uses Tarjan's bridge-finding algorithm (DFS with disc/low times)."""
+        if heavy_only:
+            alive = self.heavy_atoms()
+            def is_valid_edge(b, u):
+                return b.alive and b.other(u).alive and b.other(u).ename != 'H'
+        else:
+            alive = [a for a in self.atoms.values() if a.alive]
+            def is_valid_edge(b, u):
+                return b.alive and b.other(u).alive
+        disc, low = {}, {}
+        timer = [0]
+        visited = set()
+        bridges = []
+
+        def dfs(u, parent_id):
+            visited.add(u._id)
+            disc[u._id] = low[u._id] = timer[0]; timer[0] += 1
+            for b in u.bonds:
+                if not is_valid_edge(b, u): continue
+                v = b.other(u)
+                if v._id == parent_id: continue
+                if v._id in visited:
+                    low[u._id] = min(low[u._id], disc[v._id])
+                else:
+                    dfs(v, u._id)
+                    low[u._id] = min(low[u._id], low[v._id])
+                    if low[v._id] > disc[u._id]:
+                        bridges.append(b)
+
+        for atom in alive:
+            if atom._id not in visited:
+                dfs(atom, -1)
+        return bridges
+
+    def find_articulation_points(self):
+        """Return list of alive Atom objects whose removal disconnects the graph.
+        Uses Tarjan's articulation point algorithm."""
+        alive = [a for a in self.atoms.values() if a.alive]
+        disc, low = {}, {}
+        timer = [0]
+        visited = set()
+        aps = []
+
+        def dfs(u, parent_id, is_root):
+            visited.add(u._id)
+            disc[u._id] = low[u._id] = timer[0]; timer[0] += 1
+            children = 0
+            for b in u.bonds:
+                if not b.alive: continue
+                v = b.other(u)
+                if not v.alive: continue
+                if v._id == parent_id: continue
+                if v._id in visited:
+                    low[u._id] = min(low[u._id], disc[v._id])
+                else:
+                    children += 1
+                    dfs(v, u._id, False)
+                    low[u._id] = min(low[u._id], low[v._id])
+                    if not is_root and low[v._id] >= disc[u._id]:
+                        aps.append(u)
+            if is_root and children > 1:
+                aps.append(u)
+
+        for atom in alive:
+            if atom._id not in visited:
+                dfs(atom, -1, True)
+        return aps
+
+    def find_local_bridges(self, max_dist=3):
+        """Return list of alive Bond objects that are local bridges of order max_dist.
+        A local bridge is a bond (u,v) where removing it makes the shortest
+        path between u and v > max_dist. Unlike global bridges, the graph may
+        remain connected through longer paths.
+        For max_dist=2: bonds where endpoints share no common neighbor (not in any triangle).
+        For max_dist=3: bonds where no alternate path of length <= 3 exists."""
+        alive_bonds = [b for b in self.bonds.values() if b.alive and b.a.alive and b.b.alive]
+        local_bridges = []
+        for bond in alive_bonds:
+            u, v = bond.a, bond.b
+            depth = {u._id: 0}
+            queue = [u]
+            found = False
+            while queue and not found:
+                a = queue.pop(0)
+                d = depth[a._id]
+                if d >= max_dist: continue
+                for b in a.bonds:
+                    if not b.alive: continue
+                    nb = b.other(a)
+                    if not nb.alive: continue
+                    if b is bond: continue
+                    if nb._id not in depth:
+                        depth[nb._id] = d + 1
+                        if nb._id == v._id:
+                            found = True
+                            break
+                        queue.append(nb)
+            if not found:
+                local_bridges.append(bond)
+        return local_bridges
+
+    def find_biconnected_components(self, heavy_only=True):
+        """Return list of (atoms, bonds) tuples, one per biconnected component (block).
+        A block is either a maximal 2-connected subgraph (ring system) or a single
+        bridge bond. If heavy_only=True (default), only consider non-H atoms.
+        Uses DFS with edge stack."""
+        if heavy_only:
+            alive = self.heavy_atoms()
+            def is_valid_edge(b, u):
+                return b.alive and b.other(u).alive and b.other(u).ename != 'H'
+        else:
+            alive = [a for a in self.atoms.values() if a.alive]
+            def is_valid_edge(b, u):
+                return b.alive and b.other(u).alive
+        disc, low = {}, {}
+        timer = [0]
+        visited = set()
+        edge_stack = []
+        blocks = []
+
+        def dfs(u, parent_id):
+            visited.add(u._id)
+            disc[u._id] = low[u._id] = timer[0]; timer[0] += 1
+            children = 0
+            for b in u.bonds:
+                if not is_valid_edge(b, u): continue
+                v = b.other(u)
+                if v._id == parent_id: continue
+                if v._id not in visited:
+                    children += 1
+                    edge_stack.append(b)
+                    dfs(v, u._id)
+                    low[u._id] = min(low[u._id], low[v._id])
+                    if (parent_id == -1 and children > 1) or (parent_id != -1 and low[v._id] >= disc[u._id]):
+                        block_bonds = []
+                        while True:
+                            eb = edge_stack.pop()
+                            block_bonds.append(eb)
+                            if eb is b: break
+                        block_atoms = set()
+                        for bb in block_bonds:
+                            block_atoms.add(bb.a)
+                            block_atoms.add(bb.b)
+                        blocks.append((list(block_atoms), block_bonds))
+                elif disc[v._id] < disc[u._id]:
+                    edge_stack.append(b)
+                    low[u._id] = min(low[u._id], disc[v._id])
+
+        for atom in alive:
+            if atom._id not in visited:
+                dfs(atom, -1)
+                if edge_stack:
+                    block_bonds = list(edge_stack)
+                    edge_stack.clear()
+                    block_atoms = set()
+                    for bb in block_bonds:
+                        block_atoms.add(bb.a)
+                        block_atoms.add(bb.b)
+                    blocks.append((list(block_atoms), block_bonds))
+        return blocks
+
+    def find_fragments(self, min_size=2):
+        """Split molecule into fragments by cutting heavy-atom bridges.
+
+        Returns (fragments, cut_bridges) where:
+          fragments   = list of lists of Atom objects (including H atoms assigned
+                        to their parent heavy atom's fragment)
+          cut_bridges = list of Bond objects that separate the fragments
+
+        Fragments with fewer than min_size heavy atoms are merged back into the
+        largest adjacent fragment (their bridge is restored and not counted as a cut).
+        """
+        heavy = self.heavy_atoms()
+        heavy_ids = {a._id for a in heavy}
+        bridges = self.find_bridges(heavy_only=True)
+        bridge_set = {frozenset((b.a._id, b.b._id)) for b in bridges}
+
+        # Connected components on heavy atoms, excluding bridge bonds
+        visited = set()
+        comps = []
+        for atom in heavy:
+            if atom._id in visited: continue
+            comp = []
+            stack = [atom]
+            visited.add(atom._id)
+            while stack:
+                a = stack.pop()
+                comp.append(a)
+                for b in a.bonds:
+                    if not b.alive: continue
+                    nb = b.other(a)
+                    if nb._id not in heavy_ids or nb._id in visited: continue
+                    if frozenset((a._id, nb._id)) in bridge_set: continue  # skip bridge
+                    visited.add(nb._id)
+                    stack.append(nb)
+            comps.append(comp)
+
+        # Build adjacency via bridges: comp_idx -> list of (other_comp_idx, bridge_bond)
+        comp_of = {}
+        for i, comp in enumerate(comps):
+            for a in comp:
+                comp_of[a._id] = i
+        bridge_adj = [[] for _ in range(len(comps))]
+        for b in bridges:
+            i, j = comp_of[b.a._id], comp_of[b.b._id]
+            bridge_adj[i].append((j, b))
+            bridge_adj[j].append((i, b))
+
+        # Merge fragments smaller than min_size into largest neighbor
+        merged = [False] * len(comps)
+        merge_map = list(range(len(comps)))  # comp_idx -> representative comp_idx
+
+        def find(x):
+            while merge_map[x] != x:
+                merge_map[x] = merge_map[merge_map[x]]
+                x = merge_map[x]
+            return x
+
+        # Process smallest first
+        order = sorted(range(len(comps)), key=lambda i: len(comps[i]))
+        for i in order:
+            if len(comps[i]) >= min_size: continue
+            # Find largest adjacent component
+            best_j, best_size = None, 0
+            for j, b in bridge_adj[i]:
+                rj = find(j)
+                if rj == find(i): continue  # already same
+                if len(comps[rj]) > best_size:
+                    best_size = len(comps[rj])
+                    best_j = rj
+            if best_j is not None:
+                merge_map[find(i)] = best_j
+
+        # Collect final fragments
+        final_comps = {}
+        for i in range(len(comps)):
+            r = find(i)
+            final_comps.setdefault(r, []).extend(comps[i])
+
+        # Determine which bridges are actual cuts (between different final fragments)
+        cut_bridges = []
+        for b in bridges:
+            if comp_of.get(b.a._id) is not None and comp_of.get(b.b._id) is not None:
+                if find(comp_of[b.a._id]) != find(comp_of[b.b._id]):
+                    cut_bridges.append(b)
+
+        # Assign H atoms to their parent's fragment
+        fragments = []
+        for r, heavy_atoms in final_comps.items():
+            frag = list(heavy_atoms)
+            for a in heavy_atoms:
+                for h in self.h_children(a):
+                    frag.append(h)
+            fragments.append(frag)
+
+        return fragments, cut_bridges
 
     # ── Picking helpers ────────────────────────────────────────────────────────
 

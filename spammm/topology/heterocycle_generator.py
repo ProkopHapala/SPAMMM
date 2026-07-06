@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Heterocycle generator from a sparse rectangular-grid description of a hexagonal lattice.
+heterocycle_generator.py — Heterocycle generator from a sparse rectangular-grid description of a hexagonal lattice.
 
 Rows are either E (edge) layers or D (dimer) layers:
     E layers: first and last row, single atom per unit cell

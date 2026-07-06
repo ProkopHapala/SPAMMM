@@ -36,6 +36,10 @@ import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 from spammm.GUI.BaseGUI import BaseGUI
 from spammm.GUI.VispyUtils import AtomScene
+from spammm.GUI.EditModeHandlers import (
+    EditModeHandler, UnifiedMode, AtomMode, PiMode, BondMode,
+    RingMode, Hex1Mode, Hex2Mode, SelectMode,
+)
 from spammm.topology.KekuleBackend import KekuleBackend
 import spammm.topology.KekuleBackend as KB
 from spammm import atomicUtils as au
@@ -75,7 +79,7 @@ class KekuleExplorerWindow(BaseGUI):
         self.extensions = ExtensionManager()
         self.backend = KekuleBackend()
         self.cur_atom_type = 'C'
-        self.edit_mode = 'Hex1'  # 'Hex1' (paint), 'Hex2' (toggle), 'Atom', 'Bond', 'pi', 'Select'
+        self.edit_mode = 'Unified'  # 'Unified', 'Hex1' (paint), 'Hex2' (toggle), 'Atom', 'Bond', 'Ring', 'pi', 'Select'
         self.label_mode = 'Element+Index'
         self.pick_radius = 0.5  # Distance in Angstroms for atom picking (matches spinbox default)
         self.bond_orders = None  # pi bond orders array (set by KekuleExtension solver)
@@ -97,13 +101,17 @@ class KekuleExplorerWindow(BaseGUI):
         self.fdata_path = fdata_path or self.settings.value("fdata_path", "/home/prokop/Fireball/Fdata_HCNOS")
         # Sync fdata_path into ExtensionManager config so FireCore/Grid can find it
         self.extensions.set_config('firecore', 'fdata_dir', self.fdata_path)
+        self.mode_handlers = {}
+        self._init_mode_handlers()
         self.initUI()
         # Scene drag signal: update AtomicGraph and sys.apos after drag end
         self.scene.sig_drag_state.connect(self.on_drag_state)
         self.scene.sig_rmb_remove.connect(self.on_atom_remove)
         self.scene.sig_camera_changed.connect(self.refresh_view)
         self.scene.sig_link_bond.connect(self.on_link_bond)
+        self.scene.sig_link_to_pos.connect(self.on_link_to_pos)
         self.scene.sig_atom_clicked.connect(self.on_atom_clicked)
+        self.set_edit_mode('Unified')  # Sync scene flags with default mode
         self.refresh_view()
 
     def initUI(self):
@@ -195,7 +203,7 @@ class KekuleExplorerWindow(BaseGUI):
 
         # Help / Status
         self.statusBar().showMessage("LMB: Add/Toggle | RMB: Remove | Middle-Click: Toggle H | Scroll: Zoom | Arrow Keys: Pan")
-        self.scene.lock_drag = True   # Default mode is Ring, no dragging
+        self.scene.lock_drag = False  # Default mode is Unified, allow dragging
         self.scene.canvas.events.mouse_press.connect(self.on_mouse_press)
         self.scene.canvas.events.mouse_move.connect(self.on_mouse_move)
         self.scene.sig_selection_changed.connect(self.on_selection_changed)
@@ -264,7 +272,7 @@ class KekuleExplorerWindow(BaseGUI):
         
         # Edit Mode (from Builder)
         self.label("Edit Mode:", layout=layout)
-        self.mode_combo = self.comboBox(["Hex1", "Hex2", "Atom", "Bond", "Ring", "pi", "Select"], self.set_edit_mode, layout=layout)
+        self.mode_combo = self.comboBox(["Unified", "Hex1", "Hex2", "Atom", "Bond", "Ring", "pi", "Select"], self.set_edit_mode, layout=layout)
         
         # Atom type and auto h-cap (from Builder)
         row = QtWidgets.QHBoxLayout()
@@ -389,7 +397,7 @@ class KekuleExplorerWindow(BaseGUI):
         self._ext_edit_modes = {}   # label -> callback
         self._ext_view_modes = {}   # label -> callback
 
-        EXTENSION_TITLES = {'ff': 'Force Field', 'afm': 'AFM', 'dftb': 'DFTB', 'firecore': 'FireCore'}
+        EXTENSION_TITLES = {'ff': 'Force Field', 'afm': 'AFM', 'dftb': 'DFTB', 'firecore': 'FireCore', 'qeq': 'QEq Charges', 'kekule': 'Kekule Solver', 'ascii': 'ASCII Builder', 'fragments': 'Fragments'}
         for name in self.extensions.enabled_extensions():
             ui = self.extensions.build_ui(name, self)
             title = EXTENSION_TITLES.get(name, name.capitalize())
@@ -411,6 +419,8 @@ class KekuleExplorerWindow(BaseGUI):
             for label, cb in ui.edit_modes:
                 self._ext_edit_modes[label] = cb
                 self.mode_combo.addItem(label)
+                # Register a minimal handler — extension uses its own callback via _ext_edit_modes
+                self.register_mode_handler(label, EditModeHandler(self))
             for label, cb in ui.view_modes:
                 self._ext_view_modes[label] = cb
 
@@ -607,49 +617,50 @@ class KekuleExplorerWindow(BaseGUI):
     def create_menus(self):
         # Settings Menu
         self.settings_menu = self.menuBar().addMenu("Settings")
-        # Fdata path is now in Fireball section, but keep menu for convenience
-        self.settings_menu.addAction("Set Fdata Path", self.set_fdata_path)
 
-    def update_orbital_energy_label(self, value):
-        """Update orbital energy label when spinbox value changes."""
-        if hasattr(self, '_eigen'):
-            idx = int(value)
-            if 0 <= idx < len(self._eigen):
-                self.orbital_info_label.setText(f"Orbital {idx} E: {self._eigen[idx]:.3f} eV")
-            else:
-                self.orbital_info_label.setText("Orbital: Invalid index")
+    def _init_mode_handlers(self):
+        """Instantiate handler objects for each built-in edit mode."""
+        self.mode_handlers = {
+            'Unified': UnifiedMode(self),
+            'Atom':    AtomMode(self),
+            'pi':      PiMode(self),
+            'Bond':    BondMode(self),
+            'Ring':    RingMode(self),
+            'Hex1':    Hex1Mode(self),
+            'Hex2':    Hex2Mode(self),
+            'Select':  SelectMode(self),
+        }
 
-    def plot_orbital_from_spinbox(self):
-        """Plot orbital at the index selected in spinbox."""
-        if not hasattr(self, '_eigen'):
-            msg = "Please run Compute SCF first."
-            debug_print(1, f"INFO: {msg}")
-            QtWidgets.QMessageBox.information(self, "Info", msg)
-            return
-        mo_idx = self.orbital_spinbox.value()
-        if mo_idx < 0 or mo_idx >= len(self._eigen):
-            msg = f"Invalid orbital index: {mo_idx}"
-            debug_print(1, f"WARNING: {msg}")
-            QtWidgets.QMessageBox.warning(self, "Warning", msg)
-            return
-        z_height = self.z_height_spinbox.value()
-        self.statusBar().showMessage(f"Projecting MO {mo_idx + 1}...")
-        QtWidgets.QApplication.processEvents()
-        try:
-            apos = self.backend.sys.apos
-            grid_origin, size, center_z = self._compute_extent_from_geometry(apos)
-            points, extent, n = self._make_2d_grid(grid_origin, size, center_z, z_height)
-            flat_data = self._evaluate_on_grid(points, 'orbital', orb_index=mo_idx)
-            data_2d = np.asarray(flat_data, dtype=np.float64).reshape(n, n)
-            E = self._eigen[mo_idx]
-            pos = apos.astype(np.float32)
-            enames = self.backend.sys.enames
-            self._plot_2d_projection(data_2d, extent, title=f"MO {mo_idx + 1} E={E:+.3f} eV  z={z_height:.1f}Å", cmap='bwr', symmetric=True, atom_pos=pos, atom_types=enames)
-            msg = f"Plotted MO {mo_idx + 1}"
-            debug_print(1, msg)
-            self.statusBar().showMessage(msg)
-        except Exception as e:
-            self._raise(f"Plot FAILED: {e}", title="Plot Error")
+    def register_mode_handler(self, name, handler):
+        """Register an EditModeHandler instance for an extension-defined edit mode."""
+        self.mode_handlers[name] = handler
+
+    # ── Common helpers (used by on_mouse_move preamble) ─────────────────────
+
+    def _clear_hover(self):
+        self.scene.hover_bond_line.set_data(pos=np.zeros((0,3)))
+        self.scene.hover_ring_lines.set_data(pos=np.zeros((0,3)))
+        self.scene.hover_ring_markers.set_data(pos=np.zeros((0,3)))
+        self.scene.hover_ring_text.text = ''
+        self.scene.hover_atom_marker.set_data(pos=np.zeros((0,3)))
+        self.hover_markers.visible = False
+        self.scene.ring_preview_line.visible = False
+
+    def _add_free_atom(self, p_world):
+        """Add a free atom at world position, bond to nearest heavy, sync."""
+        debug_print(2, f"[ADD_FREE_ATOM] type={self.cur_atom_type} pos=({p_world[0]:.2f},{p_world[1]:.2f})")
+        self._push_undo()
+        self.backend._append_atom(pos=[p_world[0], p_world[1], 0.0], ename=self.cur_atom_type, pin=None, parent=None, npi=self.backend._get_element_default_npi(self.cur_atom_type))
+        atom_list, *_ = self.backend.graph.to_arrays()
+        if atom_list:
+            new_atom = atom_list[-1]
+            self.backend._create_bond_to_nearest_heavy(new_atom)
+            self.backend.graph.sync_neighbor_lists()
+        if self.backend.auto_h_cap:
+            self.backend.adjust_h()
+        self.backend._sync_sys()
+        self.refresh_view()
+        self.sig_geometry_changed.emit()
 
     def set_edit_mode(self, mode):
         # Dispatch to extension edit mode callbacks first
@@ -661,59 +672,17 @@ class KekuleExplorerWindow(BaseGUI):
             return
         self.edit_mode = mode
         debug_print(2, f"Edit Mode: {mode}")
-        # Sync backend hex_mode when switching Hex1/Hex2
-        if mode == 'Hex1':
-            self.backend.hex_mode = 'Hex1'
-        elif mode == 'Hex2':
-            self.backend.hex_mode = 'Hex2'
-        # Auto-switch label mode to Pi Orbitals when in pi mode
-        if mode == 'pi':
-            self.set_label_mode('Pi Orbitals')
-        # Scene and UI settings
-        if mode == 'Select':
-            self.scene.set_selection_mode(True)
-            self.scene.lock_drag = False
-            self.scene._link_mode = False
-            self.ring_size_label.setVisible(False)
-            self.ring_size_spinbox.setVisible(False)
-            self.scene.ring_preview_line.visible = False
-            self.statusBar().showMessage("LMB: Select/Deselect | RMB: Delete | Scroll: Zoom")
-        elif mode == 'Bond':
-            self.scene.set_selection_mode(False)
-            self.scene.lock_drag = True   # No atom dragging in bond mode
-            self.scene._link_mode = False
-            self.ring_size_label.setVisible(False)
-            self.ring_size_spinbox.setVisible(False)
-            self.scene.ring_preview_line.visible = False
-            self.statusBar().showMessage("LMB: Insert atom (Ctrl: push aside) | RMB: Delete bond (Ctrl: collapse) | Scroll: Zoom")
-        elif mode == 'Ring':
-            self.scene.set_selection_mode(False)
-            self.scene.lock_drag = True   # No atom dragging in ring mode
-            self.scene._link_mode = False
-            self.ring_size_label.setVisible(True)
-            self.ring_size_spinbox.setVisible(True)
-            self.scene.ring_preview_line.visible = False
-            self.statusBar().showMessage("LMB: Add n-gon ring on bond | RMB: Delete bond | Numpad +/-: Ring size | Scroll: Zoom")
-        elif mode in ('Hex1', 'Hex2'):
-            self.scene.set_selection_mode(False)
-            self.scene.lock_drag = True   # No atom dragging in hex mode
-            self.scene._link_mode = False
-            self.ring_size_label.setVisible(False)
-            self.ring_size_spinbox.setVisible(False)
-            self.scene.ring_preview_line.visible = False
-            mode_str = "Hex1 (paint: force add/remove)" if mode == 'Hex1' else "Hex2 (toggle: preserve shared)"
-            self.statusBar().showMessage(f"{mode_str}: LMB: Add | RMB: Remove")
-        else:
-            self.scene.set_selection_mode(False)
-            self.scene.lock_drag = False
-            self.scene._link_mode = (mode == 'Atom')  # Enable Ctrl+drag bond creation in Atom mode
-            self.ring_size_label.setVisible(False)
-            self.ring_size_spinbox.setVisible(False)
-            self.scene.ring_preview_line.visible = False
-            if mode == 'Atom':
-                self.statusBar().showMessage("LMB: Add/Change type/Drag move | Ctrl+LMB drag: Create bond | RMB: Delete (Ctrl: bridge neighbors) | Scroll: Zoom")
-            else:
-                self.statusBar().showMessage("LMB: Add/Toggle | RMB: Remove | Middle-Click: Toggle H | Scroll: Zoom")
+        h = self.mode_handlers.get(mode)
+        if h is None: return
+        self.scene.set_selection_mode(h.selection_mode)
+        self.scene.lock_drag = h.lock_drag
+        self.scene._link_mode = h.link_mode
+        self.ring_size_label.setVisible(h.ring_size_visible)
+        self.ring_size_spinbox.setVisible(h.ring_size_visible)
+        self.scene.ring_preview_line.visible = False
+        if h.status_msg:
+            self.statusBar().showMessage(h.status_msg)
+        h.on_activate()
 
     def set_atom_type(self, atype):
         self.cur_atom_type = atype
@@ -1012,182 +981,68 @@ class KekuleExplorerWindow(BaseGUI):
             debug_print(2, f"Drag end: synced {len(atom_list)} atom positions to graph and sys")
 
     def on_mouse_move(self, event):
-        """Update cursor cross position on mouse move and highlight atom/bond/ring on hover."""
+        """Update cursor cross + dispatch to mode handler for hover highlighting."""
         r0, rd = self.scene._ray_from_mouse(event.pos)
         p_world = self.scene._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0,0,1]))
-        if p_world is not None:
-            self.cursor_markers.set_data(pos=np.array([p_world]),symbol='cross',edge_width=2,edge_color='red',face_color='transparent',size=10 )
-
-            # Detect geometry rings before picking
-            self.backend.detect_geometry_rings()
-
-            # Picking: atom, bond, ring (in priority order)
-            hovered_atom = self.backend.pick_atom(p_world, radius=self.pick_radius)
-            hovered_bond = self.backend.pick_bond(p_world, radius=0.5)
-            hovered_ring = self.backend.pick_ring(p_world, radius=1.0)
-
-            # Clear hover visuals
-            self.scene.hover_bond_line.set_data(pos=np.zeros((0,3)))
-            self.scene.hover_ring_lines.set_data(pos=np.zeros((0,3)))
-            self.scene.hover_ring_markers.set_data(pos=np.zeros((0,3)))
-            self.scene.hover_ring_text.text = ''
-            self.scene.hover_atom_marker.set_data(pos=np.zeros((0,3)))
-
-            # Mode-specific hover highlighting
-            if self.edit_mode in ('Atom', 'pi', 'Select'):
-                # Atom modes: highlight atoms only
-                if hovered_atom:
-                    self.scene.hover_atom_marker.set_data(
-                        pos=np.array([hovered_atom.pos], dtype=np.float32),
-                        symbol='disc', edge_width=3, edge_color='yellow', 
-                        face_color='transparent', size=20
-                    )
-                    debug_print(3, f"Hovered atom: {hovered_atom}")
-            elif self.edit_mode in ('Bond', 'Ring'):
-                # Bond/Ring modes: highlight bonds only
-                if hovered_bond:
-                    pos_a = hovered_bond.a.pos
-                    pos_b = hovered_bond.b.pos
-                    self.scene.hover_bond_line.set_data(pos=np.array([pos_a, pos_b], dtype=np.float32))
-                    debug_print(3, f"Hovered bond: {hovered_bond}")
-                # Ring mode: show ghost n-gon preview on mouse side of bond
-                if self.edit_mode == 'Ring' and hovered_bond:
-                    n = int(self.ring_size_spinbox.value())
-                    side = self.backend.compute_ring_side(hovered_bond, p_world)
-                    verts = self.backend.compute_adjacent_ring_positions(hovered_bond, n, side)
-                    # Close the loop for visualization
-                    closed = np.vstack([verts, verts[:1]]).astype(np.float32)
-                    self.scene.ring_preview_line.set_data(pos=closed, color=(0.2, 0.8, 0.8, 0.6))
-                    self.scene.ring_preview_line.visible = True
-                else:
-                    self.scene.ring_preview_line.visible = False
-            elif self.edit_mode in ('Hex1', 'Hex2'):
-                # Hex modes: highlight rings only (existing hex highlighting below)
-                pass
-            else:
-                # Other modes: no hover highlighting
-                pass
-
-            # Highlight hovered ring (polygon + CoG lines + atom count) - only in hex modes
-            if self.edit_mode in ('Hex1', 'Hex2') and hovered_ring:
-                # Draw polygon around ring
-                ring_pos = np.array([a.pos for a in hovered_ring.atoms] + [hovered_ring.atoms[0].pos], dtype=np.float32)
-                self.scene.hover_ring_lines.set_data(pos=ring_pos)
-                # Draw lines from CoG to each atom
-                cog_lines = []
-                for atom in hovered_ring.atoms:
-                    cog_lines.append(hovered_ring.cog)
-                    cog_lines.append(atom.pos)
-                self.scene.hover_ring_markers.set_data(pos=np.array(cog_lines, dtype=np.float32))
-                # Show atom count at CoG
-                self.scene.hover_ring_text.pos = hovered_ring.cog
-                self.scene.hover_ring_text.text = str(len(hovered_ring.atoms))
-                debug_print(3, f"Hovered ring: {hovered_ring} (n={len(hovered_ring.atoms)})")
-
-            # Highlight hexagon under mouse if in hex mode
-            if self.edit_mode in ('Hex1', 'Hex2') and hasattr(self.backend, 'snap_to_ring'):
-                from spammm.topology.HexGrid import snap_to_grid
-                q, r = self.backend.snap_to_ring(p_world[0], p_world[1])
-                ring_nodes = self.backend.grid.ring_nodes(q, r)
-                hover_pos = []
-                for node in ring_nodes:
-                    nk = snap_to_grid(node)
-                    hover_pos.append([nk[0], nk[1], -0.08])
-                if hover_pos:
-                    self.hover_markers.set_data(
-                        pos=np.array(hover_pos, dtype=np.float32),
-                        symbol='disc', edge_width=2, edge_color='orange', face_color='transparent', size=12
-                    )
-                    self.hover_markers.visible = True
-                else:
-                    self.hover_markers.visible = False
-            else:
-                self.hover_markers.visible = False
+        if p_world is None: return
+        self.cursor_markers.set_data(pos=np.array([p_world]), symbol='cross', edge_width=2, edge_color='red', face_color='transparent', size=10)
+        self.backend.detect_geometry_rings()
+        self._clear_hover()
+        h = self.mode_handlers.get(self.edit_mode)
+        if h and h.on_move:
+            h.on_move(p_world)
 
     def on_atom_remove(self, atom_id):
-        """Remove atom by Atom._id and refresh view. Only in Atom/pi/Select modes."""
-        if self.edit_mode in ('Hex1', 'Hex2', 'Bond'):
-            return   # In Hex/Bond modes, RMB is handled by handle_click (hex removal / bond collapse)
-        debug_print(2, f"[RMB_REMOVE] atom_id={atom_id} ctrl={self.scene._last_ctrl}")
-        self._push_undo()
-        if self.scene._last_ctrl:
-            self.backend.remove_atom_with_bridge(atom_id)
-        else:
-            self.backend.remove_atom_by_id(atom_id)
-        self.refresh_view()
-        self.sig_geometry_changed.emit()
+        """Signal callback: RMB on atom dispatched to mode handler."""
+        h = self.mode_handlers.get(self.edit_mode)
+        if h and h.on_rmb_atom:
+            h.on_rmb_atom(atom_id, self.scene._last_ctrl)
 
     def on_link_bond(self, from_id, to_id):
-        """Create bond between two atoms (Ctrl+drag in Atom mode)."""
-        debug_print(2, f"[LINK_BOND] from={from_id} to={to_id}")
+        """Signal callback: Ctrl+drag bond creation dispatched to mode handler."""
+        h = self.mode_handlers.get(self.edit_mode)
+        if h and h.on_link:
+            h.on_link(from_id, to_id)
+
+    def on_link_to_pos(self, from_id, x, y):
+        """Signal callback: Ctrl+drag to empty space — create new atom at (x,y) + bond to from_id."""
+        debug_print(2, f"[ON_LINK_TO_POS] from={from_id} pos=({x:.2f},{y:.2f}) type={self.cur_atom_type}")
         self._push_undo()
-        a = self.backend.graph.atoms.get(from_id)
-        b = self.backend.graph.atoms.get(to_id)
-        if a is not None and b is not None and a.alive and b.alive:
-            self.backend.graph.add_bond(a, b)  # local neighbor update in add_bond
-            if self.backend.auto_h_cap:
-                self.backend.adjust_h()
-            self.backend._sync_sys()
+        self.backend._append_atom(pos=[x, y, 0.0], ename=self.cur_atom_type, pin=None, parent=None, npi=self.backend._get_element_default_npi(self.cur_atom_type))
+        atom_list, *_ = self.backend.graph.to_arrays()
+        if atom_list:
+            new_atom = atom_list[-1]
+            # Bond to source atom
+            src = self.backend.graph.atoms.get(from_id)
+            if src is not None and src.alive:
+                self.backend.graph.add_bond(src, new_atom)
+            self.backend.graph.sync_neighbor_lists()
+        if self.backend.auto_h_cap:
+            self.backend.adjust_h()
+        self.backend._sync_sys()
         self.refresh_view()
         self.sig_geometry_changed.emit()
 
     def on_atom_clicked(self, atom_id):
-        """Handle atom click without drag in Atom mode (change atom type)."""
-        debug_print(2, f"[ATOM_CLICKED] atom_id={atom_id}")
-        self._push_undo()
-        self.backend.set_atom_type_by_id(atom_id, self.cur_atom_type)
-        self.refresh_view()
-        self.sig_geometry_changed.emit()
+        """Signal callback: atom click without drag dispatched to mode handler."""
+        debug_print(2, f"[ON_ATOM_CLICKED] atom_id={atom_id} mode={self.edit_mode}")
+        h = self.mode_handlers.get(self.edit_mode)
+        if h and h.on_atom_click:
+            h.on_atom_click(atom_id)
 
     def on_mouse_press(self, event):
-        # In Select mode, let Vispy handle everything (RMB selection, LMB drag)
-        if self.edit_mode == 'Select':
+        """Dispatch mouse press to mode handler."""
+        if getattr(event, 'handled', False):
+            debug_print(2, f"[GUI_PRESS] SKIPPED (event.handled=True) mode={self.edit_mode}")
             return
-
-        # In Hex/Ring/Bond modes, prevent dragging - we only want add/remove operations
-        if self.edit_mode in ('Hex1', 'Hex2', 'Ring', 'Bond'):
-            # Continue to handle_click for operations, but don't let Vispy handle drag
-            pass
-        else:
-            # For non-ring modes, if atoms are selected and LMB, let Vispy handle dragging
-            selected = self.scene.get_selected_ids()
-            if selected and event.button == 1:
-                return
-
-        # If atom picked and LMB in atom/pi mode, handle atom change instead of drag
-        picked = self.scene._pick_idx
-        picked_id = self.scene._pick_id
-        if picked >= 0 and event.button == 1:
-            if self.edit_mode == 'Atom':
-                # Change atom type by Atom._id
-                self._push_undo()
-                self.backend.set_atom_type_by_id(picked_id, self.cur_atom_type)
-                self.refresh_view()
-                return
-            elif self.edit_mode == 'pi':
-                # Cycle pi orbitals on picked atom: sp3(0) -> sp2(1) -> sp(2) -> sp3(0)
-                self._push_undo()
-                current_npi = self.backend.atom_npi[picked]
-                new_npi = (current_npi + 1) % 3
-                self.backend.set_atom_npi_by_id(picked_id, new_npi)
-                if self.backend.auto_h_cap:
-                    self.backend.adjust_h()
-                self.refresh_view()
-                return
-            elif self.edit_mode == 'Ring':
-                # In ring mode, don't allow dragging atoms - ignore atom picks
-                return
-
-        ctrl_pressed = 'Control' in event.modifiers if isinstance(event.modifiers, (tuple, list)) else False
-        if event.button == 1: # LMB
-            self.handle_click(event.pos, action='add', ctrl=ctrl_pressed)
-        elif event.button == 2: # RMB
-            # Atom/pi/Select modes rely on sig_rmb_remove from VispyUtils;
-            # calling handle_click here too would double-fire removal
-            if self.edit_mode not in ('Atom', 'pi', 'Select'):
-                self.handle_click(event.pos, action='remove', ctrl=ctrl_pressed)
-        elif event.button == 3: # Middle / Scroll click
-            self.handle_click(event.pos, action='toggle_h')
+        h = self.mode_handlers.get(self.edit_mode)
+        if h is None or h.on_press is None: return
+        ctrl = 'Control' in event.modifiers if isinstance(event.modifiers, (tuple, list)) else False
+        r0, rd = self.scene._ray_from_mouse(event.pos)
+        p_world = self.scene._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0,0,1]))
+        if p_world is None: return
+        debug_print(2, f"[GUI_PRESS] mode={self.edit_mode} pos=({p_world[0]:.2f},{p_world[1]:.2f}) ctrl={ctrl}")
+        h.on_press(event, p_world, ctrl)
 
     def reset_offsets(self):
         self._push_undo()
@@ -1246,101 +1101,6 @@ class KekuleExplorerWindow(BaseGUI):
             self.backend.add_h_caps()
         
         self.refresh_view()
-
-    def handle_click(self, mouse_pos, action='add', ctrl=False):
-        self._push_undo()
-        # 1. Get world coordinates on z=0 plane
-        # Vispy mouse pos is (x, y) from top-left
-        # We need to use Vispy's internal ray casting
-        # ray = self.scene._ray_from_mouse(mouse_pos)
-        # intersect = self.scene._intersect_ray_plane(ray[0], ray[1], np.zeros(3), np.array([0,0,1]))
-        
-        # Helper to get world pos
-        r0, rd = self.scene._ray_from_mouse(mouse_pos)
-        p_world = self.scene._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0,0,1]))
-        
-        if p_world is None: return
-        x, y = p_world[0], p_world[1]
-        pos_2d = np.array([x, y])
-
-        # 2. Mode-specific target resolution
-        if self.edit_mode in ('Hex1', 'Hex2'):
-            # Hex modes: use grid snapping for ring placement
-            q, r = self.backend.snap_to_ring(x, y)
-            nearest_atom_idx = None
-            nearest_atom_id = None
-        elif self.edit_mode in ('Bond', 'Ring'):
-            # Bond/Ring modes: pick bond
-            bond = self.backend.pick_bond(p_world)
-            nearest_atom_idx = None
-            nearest_atom_id = None
-            q, r = (None, None)
-        else:
-            # Atom/pi/Select modes: position-based atom picking, no grid snapping
-            nearest_atom_idx = self.find_nearest_atom_index(p_world, self.pick_radius)
-            nearest_atom_id = self.find_nearest_atom_id(p_world, self.pick_radius)
-            q, r = (None, None)
-            debug_print(2, f"Click at ({x:.2f}, {y:.2f}) -> Mode={self.edit_mode} AtomIdx={nearest_atom_idx} | Action: {action}")
-
-        # 3. Modify backend
-        if action == 'add':
-            if self.edit_mode in ('Hex1', 'Hex2'):
-                if q is not None and r is not None:
-                    self.backend.add_ring(q, r)
-            elif self.edit_mode == 'Bond':
-                if bond is not None:
-                    new_atom = self.backend.insert_atom_into_bond(bond, self.cur_atom_type, push_aside=ctrl)
-                    debug_print(2, f"Inserted atom into bond {bond._id}, new atom {new_atom._id} (push_aside={ctrl})")
-            elif self.edit_mode == 'Ring':
-                if bond is not None:
-                    n = int(self.ring_size_spinbox.value())
-                    side = self.backend.compute_ring_side(bond, p_world)
-                    new_atoms = self.backend.add_adjacent_ring(bond, n_members=n, ename=self.cur_atom_type, side=side)
-                    debug_print(2, f"Added {n}-ring on bond {bond._id} side={side}, {len(new_atoms)} new atoms")
-            elif self.edit_mode == 'pi':
-                # Cycle pi orbitals: sp3(0) -> sp2(1) -> sp(2) -> sp3(0)
-                if nearest_atom_idx is not None:
-                    current_npi = self.backend.atom_npi[nearest_atom_idx]
-                    new_npi = (current_npi + 1) % 3
-                    self.backend.set_atom_npi_by_id(nearest_atom_id, new_npi)
-                    if self.backend.auto_h_cap:
-                        self.backend.adjust_h()
-                    self.refresh_view()
-                    return
-            elif nearest_atom_idx is not None:
-                # Change atom type by Atom._id
-                self.backend.set_atom_type_by_id(nearest_atom_id, self.cur_atom_type)
-            else:
-                # Free placement at exact position
-                self.backend._append_atom(pos=[x, y, 0.0], ename=self.cur_atom_type, pin=None, parent=None, npi=self.backend._get_element_default_npi(self.cur_atom_type))
-                atom_list, *_ = self.backend.graph.to_arrays()
-                if atom_list:
-                    new_atom = atom_list[-1]
-                    self.backend._create_bond_to_nearest_heavy(new_atom)
-                    self.backend.graph.sync_neighbor_lists()
-                if self.backend.auto_h_cap:
-                    self.backend.adjust_h()
-                self.backend._sync_sys()
-        elif action == 'remove':
-            if self.edit_mode in ('Hex1', 'Hex2'):
-                if q is not None and r is not None:
-                    self.backend.remove_ring(q, r)
-            elif self.edit_mode in ('Bond', 'Ring'):
-                if bond is not None:
-                    if ctrl and self.edit_mode == 'Bond':
-                        survivor = self.backend.collapse_bond(bond, np.array([x, y]))
-                        debug_print(2, f"Collapsed bond {bond._id}, survivor atom {survivor._id}")
-                    else:
-                        self.backend.delete_bond(bond)
-                        debug_print(2, f"Deleted bond {bond._id}")
-            elif nearest_atom_idx is not None:
-                self.backend.remove_atom_by_id(nearest_atom_id)
-        elif action == 'toggle_h':
-            if nearest_atom_idx is not None:
-                self.backend.toggle_h_state(nearest_atom_idx)
-        
-        self.refresh_view()
-        self.sig_geometry_changed.emit()
 
     def refresh_view(self):
         # 0. Update Guide Grid
@@ -1401,6 +1161,14 @@ class KekuleExplorerWindow(BaseGUI):
         colors = np.array(colors, dtype=np.float32)
         sizes = np.array(sizes, dtype=np.float32)
         
+        # Fragment extension: component coloring
+        if getattr(self, '_frag_component_colors', None):
+            idx_map = getattr(self.backend, '_atom_idx_map', {})
+            for aid, color in self._frag_component_colors.items():
+                i = idx_map.get(aid)
+                if i is not None and i < len(colors):
+                    colors[i] = color
+        
         # Bonds
         if sys.bonds is not None:
             is_heavy = np.array([sys.enames[i] != 'H' for i in range(len(sys.enames))])
@@ -1448,9 +1216,17 @@ class KekuleExplorerWindow(BaseGUI):
             else:
                 self.scene.hbond_lines.set_data(np.zeros((0, 3), dtype=np.float32))
 
-            # Bond orders (from Kekule solver)
-            if self.bond_orders is not None and self.bond_order_bonds is not None:
-                self.scene.set_bond_orders(self.bond_order_bonds, self.bond_orders, show_labels=self.show_bond_order_labels)
+            # Fragment extension: bond + bbox highlights via dedicated visuals
+            frag_data = getattr(self, '_frag_overlay', None)
+            if frag_data:
+                self.scene.set_frag_highlights(**frag_data)
+            else:
+                self.scene.set_frag_highlights()
+
+            # Bond orders (from Bond.order on AtomicGraph — authoritative store)
+            bo_bonds, bo_vals = self.backend.get_graph_bond_orders()
+            if bo_bonds is not None:
+                self.scene.set_bond_orders(bo_bonds, bo_vals, show_labels=self.show_bond_order_labels)
             else:
                 self.scene.set_bond_orders(None, None)
 
@@ -1467,208 +1243,6 @@ class KekuleExplorerWindow(BaseGUI):
         # Force immediate canvas update to avoid async rendering lag
         self.scene.canvas.update()
         QtWidgets.QApplication.processEvents()
-
-    def run_relaxation(self):
-        self.dftb_status_label.setText("Status: Relaxing...")
-        self.statusBar().showMessage("Relaxing... please wait")
-        QtWidgets.QApplication.processEvents()
-
-        try:
-            E, forces, lvs = self.backend.run_relaxation(workdir='gui_relax')
-            msg = f"Relaxation done. E = {E:.4f} eV"
-            self.statusBar().showMessage(msg)
-            self.dftb_status_label.setText(f"Status: Done\nE = {E:.4f} eV")
-            self.refresh_view()
-        except Exception as e:
-            msg = f"Relaxation FAILED: {e}"
-            self.statusBar().showMessage(msg)
-            self.dftb_status_label.setText(f"Status: FAILED\n{e}")
-            self._raise(msg, title="Relaxation Error")
-
-    def compute_orbitals(self):
-        if len(self.backend.sys.apos) == 0:
-            msg = "No atoms to compute orbitals for."
-            debug_print(1, f"WARNING: {msg}")
-            QtWidgets.QMessageBox.warning(self, "Warning", msg)
-            return
-
-        # Setup Fdata symlink (needed by FireCore)
-        _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-        FDATA_DIR = os.path.join(_THIS_DIR, "Fdata")
-        FDATA_TARGET = self.fdata_path
-
-        if not os.path.exists(FDATA_DIR):
-            if os.path.exists(FDATA_TARGET):
-                os.symlink(FDATA_TARGET, FDATA_DIR)
-                debug_print(1, f"Created symlink: {FDATA_DIR} -> {FDATA_TARGET}")
-            else:
-                msg = f"Neither {FDATA_DIR} nor {FDATA_TARGET} exists. Please download Fdata_HC_minimal from fireball-qmd.github.io"
-                print(f"ERROR: {msg}")
-                QtWidgets.QMessageBox.critical(self, "Fdata Error", msg)
-                return
-
-        self.statusBar().showMessage("Running FireCore SCF...")
-        QtWidgets.QApplication.processEvents()
-        try:
-            atypes = np.array([elements.ELEMENT_DICT[e][0] for e in self.backend.sys.enames], dtype=np.int32)
-            apos = np.array(self.backend.sys.apos, dtype=np.float64)
-            fc = self.extensions.require('firecore')
-            fc.setVerbosity(0)
-            fc.initialize(atomType=atypes, atomPos=apos)
-            fc.evalForce(apos, nmax_scf=200)
-            dims = fc.get_HS_dims()
-            norb = int(dims.norbitals)
-            self._eigen = fc.get_eigen(ikp=1, norb=norb)
-            self._wfcoef = fc.get_wfcoef(norb=norb)
-            self._norb = norb
-            occ = np.where(self._eigen < 0.0)[0]
-            self._homo = int(occ[-1]) if len(occ) > 0 else len(self._eigen) // 2 - 1
-            self._lumo = self._homo + 1
-
-            # Calculate total valence electrons
-            valence_dict = {'H': 1, 'C': 4, 'N': 5, 'O': 6}
-            total_electrons = sum([valence_dict.get(e, 0) for e in self.backend.sys.enames])
-            occupied_orbitals = total_electrons // 2
-
-            # Update orbital info label
-            info_text = (f"Total Orbitals: {norb}\n"
-                        f"HOMO: {self._homo + 1} (E={self._eigen[self._homo]:.3f} eV)\n"
-                        f"LUMO: {self._lumo + 1} (E={self._eigen[self._lumo]:.3f} eV)\n"
-                        f"Occupied: {occupied_orbitals} (e-/2)")
-            self.orbital_info_label.setText(info_text)
-
-            # Enable orbital controls
-            self.orbital_spinbox.setEnabled(True)
-            self.setSpinBox(self.orbital_spinbox, vmin=0, vmax=norb-1, value=self._homo)
-            self.plot_orb_btn.setEnabled(True)
-            self.plot_density_btn.setEnabled(True)
-            self.plot_delta_btn.setEnabled(True)
-
-            # Update orbital energy label for current selection
-            self.update_orbital_energy_label(self._homo)
-
-            msg = f"SCF done. HOMO={self._homo + 1} E={self._eigen[self._homo]:.3f} eV  LUMO={self._lumo + 1} E={self._eigen[self._lumo]:.3f} eV"
-            debug_print(1, msg)
-            self.statusBar().showMessage(msg)
-            QtWidgets.QMessageBox.information(self, "SCF Done", f"HOMO={self._homo + 1} E={self._eigen[self._homo]:.3f} eV\nLUMO={self._lumo + 1} E={self._eigen[self._lumo]:.3f} eV")
-        except Exception as e:
-            self._raise(f"SCF FAILED: {e}", title="SCF Error")
-
-    def _compute_extent_from_geometry(self, apos, padding_factor=0.1, default_size=14.0):
-        """Compute grid extent and origin from atomic positions."""
-        if len(apos) > 0:
-            apos_2d = apos[:, :2]  # Only x,y
-            min_pos = apos_2d.min(axis=0)
-            max_pos = apos_2d.max(axis=0)
-            center_z = apos[:, 2].mean()
-            # Add padding
-            padding = (max_pos - min_pos) * padding_factor
-            grid_origin = min_pos - padding
-            size = (max_pos - min_pos + 2 * padding).max()
-        else:
-            # No atoms - cannot compute extent from geometry
-            # This should not happen in normal usage (plotting requires atoms)
-            raise ValueError("Cannot compute grid extent: no atoms in system. Add atoms first.")
-        return grid_origin, size, center_z
-
-    def _make_2d_grid(self, grid_origin, size, center_z, z_height, n=100):
-        """Generate 2D grid points for projection."""
-        xs = np.linspace(grid_origin[0], grid_origin[0] + size, n)
-        ys = np.linspace(grid_origin[1], grid_origin[1] + size, n)
-        X, Y = np.meshgrid(xs, ys)
-        Z = np.zeros_like(X) + (center_z + z_height)
-        points = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
-        extent = [grid_origin[0], grid_origin[0] + size, grid_origin[1], grid_origin[1] + size]
-        return points, extent, n
-
-    def _evaluate_on_grid(self, points, what, orb_index=None):
-        """Call Fortran evaluator on grid points.
-        
-        Args:
-            points: (npoints, 3) array of grid points
-            what: 'orbital', 'density', or 'delta_rho'
-            orb_index: orbital index (1-based, required for 'orbital')
-        
-        Returns:
-            flat array of evaluated values
-        """
-        fc = self.extensions.require('firecore')
-        points_f64 = points.astype(np.float64)
-        if what == 'orbital':
-            if orb_index is None:
-                raise ValueError("orb_index required for orbital evaluation")
-            return fc.orb2points(points_f64, iMO=int(orb_index + 1), ikpoint=1)
-        elif what == 'density':
-            return fc.dens2points(points_f64, f_den=1.0, f_den0=0.0)
-        elif what == 'delta_rho':
-            return fc.dens2points(points_f64, f_den=1.0, f_den0=-1.0)
-        else:
-            raise ValueError(f"Unknown what={what}, expected 'orbital', 'density', or 'delta_rho'")
-
-    def _plot_2d_projection(self, data_2d, extent, title, cmap, symmetric, atom_pos, atom_types):
-        """Plot 2D projection using VisPy heatmap."""
-        canvas, view = vu.create_heatmap_window(data_2d, extent, title=title,  cmap=cmap,  symmetric=symmetric, atom_pos=atom_pos, atom_types=atom_types )
-        return canvas, view
-
-    def plot_density(self):
-        if not hasattr(self, '_eigen'):
-            msg = "Please run Compute SCF first."
-            debug_print(1, f"INFO: {msg}")
-            QtWidgets.QMessageBox.information(self, "Info", msg)
-            return
-        self.statusBar().showMessage("Computing electron density...")
-        QtWidgets.QApplication.processEvents()
-        try:
-            apos = self.backend.sys.apos
-            z_height = self.z_height_spinbox.value()
-            grid_origin, size, center_z = self._compute_extent_from_geometry(apos)
-            points, extent, n = self._make_2d_grid(grid_origin, size, center_z, z_height)
-            flat_data = self._evaluate_on_grid(points, 'density')
-            data_2d = np.asarray(flat_data, dtype=np.float64).reshape(n, n)
-            pos = apos.astype(np.float32)
-            enames = list(self.backend.sys.enames)
-            self._plot_2d_projection( data_2d, extent,title=f"Electron Density (z={z_height:.1f}Å)",cmap='bwr',   symmetric=False,  atom_pos=pos, atom_types=enames  )
-            msg = "Density plotted"
-            debug_print(1, msg)
-            self.statusBar().showMessage(msg)
-        except Exception as e:
-            self._raise(f"Density plot FAILED: {e}", title="Plot Error")
-
-    def plot_delta_rho(self):
-        if not hasattr(self, '_eigen'):
-            msg = "Please run Compute SCF first."
-            debug_print(1, f"INFO: {msg}")
-            QtWidgets.QMessageBox.information(self, "Info", msg)
-            return
-        self.statusBar().showMessage("Computing delta-rho (rho_SCF - rho_NA)...")
-        QtWidgets.QApplication.processEvents()
-        try:
-            apos = self.backend.sys.apos
-            z_height = self.z_height_spinbox.value()
-            grid_origin, size, center_z = self._compute_extent_from_geometry(apos)
-            points, extent, n = self._make_2d_grid(grid_origin, size, center_z, z_height)
-            flat_data = self._evaluate_on_grid(points, 'delta_rho')
-            data_2d = np.asarray(flat_data, dtype=np.float64).reshape(n, n)
-            pos = apos.astype(np.float32)
-            enames = list(self.backend.sys.enames)
-            self._plot_2d_projection(data_2d, extent, title=f"Delta-Rho (z={z_height:.1f}Å)", cmap='bwr', symmetric=True, atom_pos=pos, atom_types=enames)
-            msg = "Delta-rho plotted"
-            debug_print(1, msg)
-            self.statusBar().showMessage(msg)
-        except Exception as e:
-            self._raise(f"Delta-rho plot FAILED: {e}", title="Plot Error")
-
-    def set_fdata_path(self):
-        """Open dialog to set Fdata path and save to settings."""
-        selected = self.fileDialog(mode="directory", title="Select Fdata Directory", start_dir=self.fdata_path)
-        if selected:
-            self.fdata_path = selected
-            self.settings.setValue("fdata_path", selected)
-            self.extensions.set_config('firecore', 'fdata_dir', selected)
-            self.extensions.save_config()
-            debug_print(2, f"Set Fdata path to: {selected}")
-            self.statusBar().showMessage(f"Fdata path set to: {selected}")
-            QtWidgets.QMessageBox.information(self, "Settings Saved", f"Fdata path set to:\n{selected}")
 
 if __name__ == "__main__":
     import argparse

@@ -1863,7 +1863,7 @@ def save_mol(fname, enames, apos, bonds, title="Avogadro", bond_types=None):
         fout.write("M  END\n")
 
 
-def save_mol2( fname, enames, apos, bonds, qs=None, comment="", lvec=None, atom_types=None):
+def save_mol2( fname, enames, apos, bonds, qs=None, comment="", lvec=None, atom_types=None, bond_types=None):
     """
     Save the current AtomicSystem in MOL2 format.
 
@@ -1925,14 +1925,13 @@ def save_mol2( fname, enames, apos, bonds, qs=None, comment="", lvec=None, atom_
         # Write the BOND section.
         fout.write("@<TRIPOS>BOND\n")
         if bonds is not None:
+            bond_types_ = np.asarray(bond_types, dtype=int) if bond_types is not None else None
             for i, bond in enumerate(bonds):
                 bond_id = i + 1
-                # bond is assumed to be a tuple (i, j) with 0-based indices.
-                # Convert to 1-based indices.
                 a1 = bond[0] + 1
                 a2 = bond[1] + 1
-                bond_type = 1
-                fout.write("{:>6d} {:>5d} {:>5d} {:>4d}\n".format(bond_id, a1, a2, bond_type ))
+                bond_type = int(bond_types_[i]) if (bond_types_ is not None) else 1
+                fout.write("{:>6d} {:>5d} {:>5d} {:>4d}\n".format(bond_id, a1, a2, bond_type))
 
 def save_xyz(fname, enames, apos, comment="Generated"):
     """Write XYZ file.
