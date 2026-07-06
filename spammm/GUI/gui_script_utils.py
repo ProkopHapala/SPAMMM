@@ -37,6 +37,7 @@ def set_spin_value(spin, value):
 
 
 def set_slider_value(slider, value):
-    slider.blockSignals(False)
+    slider.blockSignals(True)
     slider.setValue(int(value))
+    slider.blockSignals(False)
     process_events()

@@ -49,6 +49,7 @@ def build_ui(window):
     window.rc_all_hbonds_chk = QtWidgets.QCheckBox("All H-bonds (symmetric)")
     window.rc_all_hbonds_chk.setChecked(True)
     window.rc_all_hbonds_chk.setToolTip("Move all detected H-bonds together (shared control u)")
+    window.rc_all_hbonds_chk.stateChanged.connect(lambda _: refresh_hbonds(window))
     row_hb.addWidget(window.rc_all_hbonds_chk)
     layout.addLayout(row_hb)
 
@@ -145,16 +146,28 @@ def import_from_graph(window):
     window.rc_status.setText(f"Imported {backend.sys.natoms} atoms")
 
 
+def _n_scan_hbonds(window):
+    """Number of H-bonds in the active scan (matches `_scan_hbonds()` length)."""
+    n = len(window.rc_hbonds)
+    if n == 0:
+        return 0
+    if getattr(window, 'rc_all_hbonds_chk', None) and window.rc_all_hbonds_chk.isChecked():
+        return n
+    return 1
+
+
 def refresh_hbonds(window):
     """Detect H-bonds on current backend.sys (Refresh H-bonds button)."""
     window.rc_hbonds = find_hbonds_graph(window.backend, bPrint=False)
     n = len(window.rc_hbonds)
     window.rc_hbond_spin.setMaximum(max(0, n - 1))
-    n_scan = n if (getattr(window, 'rc_all_hbonds_chk', None) and window.rc_all_hbonds_chk.isChecked() and n > 0) else max(1, n)
-    window.rc_mapping = default_mapping(n_scan if n_scan > 1 else max(1, n), m=1)
+    n_scan = _n_scan_hbonds(window)
+    window.rc_mapping = default_mapping(n_scan, m=1) if n_scan > 0 else []
     label = f"H-bonds: {n} detected"
-    if n > 1 and getattr(window, 'rc_all_hbonds_chk', None) and window.rc_all_hbonds_chk.isChecked():
+    if n_scan > 1:
         label += f" (scan all, mapping={window.rc_mapping})"
+    elif n == 1:
+        label += f" (mapping={window.rc_mapping})"
     window.rc_hbond_label.setText(label)
     if n == 0:
         window.rc_status.setText("No H-bonds found")

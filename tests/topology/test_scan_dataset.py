@@ -23,6 +23,18 @@ def test_controls_to_fractions_shared():
     assert np.allclose(f, [0.4, 0.4])
 
 
+def test_single_hbond_scan_mapping_length():
+    """One selected H-bond uses mapping length 1 (not padded to all detected)."""
+    mapping = default_mapping(1, m=1)
+    assert mapping == [0]
+    hb = HbondRecord(0, 1, 2)
+    f = controls_to_fractions([0.5], mapping)
+    assert len(f) == 1
+    apo0 = np.array([[0., 0., 0.], [1., 0., 0.], [2., 0., 0.]])
+    apo = build_frame(apo0, [hb], [0.5], mapping)
+    assert apo.shape == apo0.shape
+
+
 def test_build_frame_moves_h_only():
     atoms = build_ascii_hbond_system('2Quinolone')
     atoms.neighs()
