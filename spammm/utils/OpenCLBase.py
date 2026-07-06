@@ -193,16 +193,21 @@ class OpenCLBase:
         return np.require(arr, dtype=np.int32, requirements=('C',)) # .view(np.int32).ravel()
 
 
-    def __init__(self, nloc=32, device_index=0, preferred_vendor='nvidia', bPrint=True):
+    def __init__(self, nloc=32, device_index=0, preferred_vendor='nvidia', bPrint=True, ctx=None, queue=None):
         """
         Initialize the OpenCL environment.
         
         Args:
             nloc (int): Local work group size
             device_index (int): Index of the device to use (default: 0)
+            ctx: Optional existing OpenCL context (reuse with queue)
+            queue: Optional existing command queue (requires ctx)
         """
         self.nloc = nloc
-        self.ctx, self.queue = select_device(preferred_vendor=preferred_vendor, bPrint=bPrint, device_index=device_index, return_queue=True)
+        if ctx is not None and queue is not None:
+            self.ctx, self.queue = ctx, queue
+        else:
+            self.ctx, self.queue = select_device(preferred_vendor=preferred_vendor, bPrint=bPrint, device_index=device_index, return_queue=True)
             
         self.buffer_dict = {}
         self.kernelheaders = {}

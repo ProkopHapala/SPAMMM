@@ -1,10 +1,192 @@
+---
+type: TopicalDoc
+title: AFM Contact Surface — Static (Rigid Sample)
+description: Quasi-2D field replacing 3D img_FF for PP-AFM — separable B-spline×poly and radial PIC
+tags: [afm, contact-surface, surfaces, opencl, morse]
+timestamp: 2026-07-06
+---
+
 # AFM Contact Surface — Static (Rigid Sample, Classical FF)
 
-**Status:** Prototype implemented (`spammm/surfaces/ContactSurface.py`, `kernels/contact_surface.cl`)  
-**Scope:** Memory- and performance-efficient representation for **non-density** AFM simulation where the sample is treated as **rigid** (fixed nuclei, classical Morse/LJ/Coulomb).  
-**Goal:** Replace or complement the full 3D force-field grid (`AFMulator.make_forcefield`, GridFF) with a compact quasi-2D representation suitable for PP-AFM relaxation and ND (non-density) pipelines.
+**Status:** Prototype implemented and wired to `AFMulator`  
+**Scope:** Memory-efficient **field representation** for rigid classical AFM (Morse/LJ); evaluated during PP relaxation, not a scan-image format.  
+**Pitfalls:** [Takeways.md](../../Takeways.md) · **Module index:** [spammm/surfaces/README.md](../../../spammm/surfaces/README.md)
 
-**Related:** [ContactSurface_Elastic.md](ContactSurface_Elastic.md) (flexible sample, stiffness enrichment) · [../../surface_interactions.md](../../surface_interactions.md) · [../../afm_stm_simulation.md](../../afm_stm_simulation.md) · FireCore brainstorm [IndentationForce2D.chat.md](file:///home/prokophapala/git/FireCore/doc/Topics/AFM/IndentationForce2D.chat.md)
+**Related:** [ContactSurface_Elastic.md](ContactSurface_Elastic.md) · [../../surface_interactions.md](../../surface_interactions.md) · [../../afm_stm_simulation.md](../../afm_stm_simulation.md)
+
+---
+
+## Summary
+
+PP-AFM today precomputes a dense 3D texture (`img_FF`) and samples it each relaxation step.
+The contact surface compresses the contact-relevant potential into either:
+
+1. **Separable B-spline × poly** — lateral corrugation on a knot grid × few z-modes above `h₀(x,y)`
+2. **Radial PIC** — compact per-atom radial modes summed via particle-in-cell buckets
+
+Both paths share GPU brute Morse reference, matrix-free CG fitting, and `run_scan_*` APIs that
+mirror legacy `run_scan` geometry while swapping `interpFE` for `cs_eval_*_fe_at`.
+
+```mermaid
+flowchart LR
+  subgraph fit [Offline fit once]
+    brute[Brute Morse queries]
+    brute --> sepCG[Separable CG]
+    brute --> picCG[PIC CG]
+    sepCG --> coeffsA[coeffs + h₀]
+    picCG --> coeffsB[atom coeffs + buckets]
+  end
+  subgraph scan [PP-AFM scan]
+    coeffsA --> relaxA[relaxStrokesTiltedContact]
+    coeffsB --> relaxB[relaxStrokesTiltedPIC]
+    relaxA --> imgA[FEs nx×ny×nz]
+    relaxB --> imgB[FEs nx×ny×nz]
+  end
+  imgFF[3D img_FF reference] --> relax3d[relaxStrokesTilted]
+  relax3d --> img3d[FEs reference]
+  imgA -. parity .-> img3d
+  imgB -. parity .-> img3d
+```
+
+---
+
+## Tutorial — separable and PIC
+
+### Prerequisites
+
+- `AFMulator(use_morse=True)` with molecule loaded and `assign_params()`
+- Fit samples at **probe** z (`zmax + offset`), not tip z — see [Takeways § z alignment](../../Takeways.md)
+
+### Separable (recommended first)
+
+```python
+afm.fit_contact_surface(
+    margin=4.0,
+    bspl_dx=0.2,           # B-spline knot spacing [Å] — same grid for h₀ and coeffs
+    poly_R=5.0, poly_z0=1.0, m_start=4, nz=6,
+    fit_z_adaptive=(1.0, 6.0, 0.1, 1.0),  # z above zmax: lo, hi, dz_lo, dz_hi
+    fit_dx=0.2, fit_dy=0.2,
+    fit_boltzmann=True,
+    fit_force_weight=1.0,  # E + Fx,Fy,Fz with RMS equalization
+    n_iter=120,
+)
+afm.setup_grid(...)       # only if comparing to 3D reference scan
+afm.make_forcefield()     # 3D reference only
+FEs_cs, _ = afm.run_scan_contact(nxy=(99, 75), nz=25, dtip=-0.15, scan_p0=..., ...)
+FEs_3d, _ = afm.run_scan(...)  # parity
+```
+
+### PIC (atom-centric)
+
+```python
+pic = afm.fit_pic_contact_surface(
+    margin=4.0,
+    poly_R=5.0, m_start=4, nz=5, cell_size=10.0,
+    z_local=1.2, xy_radius=14.0,   # select_contact_atoms
+    reg=1e-2,                      # required — 1e-4 diverges
+    fit_z_adaptive=(1.0, 6.0, 0.1, 1.0),
+    fit_dx=0.2,
+    # Boltzmann logged but not applied to PIC CG
+)
+FEs_pic, _ = afm.run_scan_pic(...)  # relaxStrokesTiltedPIC
+```
+
+### Visual review pipeline
+
+```bash
+pytest tests/SPM/test_afm_contact_surface.py -q          # L0 GPU
+RUN_CONTACT_PP=1 python tests/testplot_contact_surface.py  # L1+L2
+```
+
+Artifacts: `debug/testplot_contact_surface/` — fit weights, z-basis, close parity, z-alignment,
+`contact_surface_pic_atoms.png`, `pp_afm_parity_Fz_*_relaxed.png`.
+
+---
+
+## API reference
+
+### AFMulator (`spammm/SPM/AFM.py`)
+
+| Method | Role |
+|--------|------|
+| `fit_contact_surface(...)` | Build `SeparableParams`, brute reference, `fit_separable_cg`, `setup_contact_surface` |
+| `setup_contact_surface(sep)` | Upload separable coeffs + h₀ to `_cl` buffers |
+| `run_scan_contact(...)` | PP scan via `relaxStrokesTiltedContact` |
+| `get_raw_FE_contact(...)` | Unrelaxed FE along scan (diagnostics) |
+| `fit_pic_contact_surface(...)` | Build `PICParams`, `fit_pic_cg`, `setup_pic_contact` |
+| `setup_pic_contact(pic)` | Upload PIC atoms, buckets, coeffs |
+| `run_scan_pic(...)` | PP scan via `relaxStrokesTiltedPIC` |
+
+Shared lazy GPU helper: `_cs_fit_helper()` → `ContactSurfaceCL` (reuse zeros `AtAp` between fits).
+
+### ContactSurfaceCL (`spammm/surfaces/ContactSurface.py`)
+
+| Function / class | Role |
+|------------------|------|
+| `SeparableParams` | B-spline grid metadata, `h₀`, coeffs layout `ic = ix + ncx*(iy + ncy*kz)` |
+| `PICParams` | Contact atom indices, buckets, radial coeffs `nat×nmodes` |
+| `select_contact_atoms` | Local z-shell + xy neighborhood filter |
+| `build_pic_buckets` | Particle-in-cell atom lists (`cell_size > 2·Rc`) |
+| `build_contact_height_map` | Per-knot max atom z within `r_xy` |
+| `fit_separable_cg` | Weighted CG + optional force rows |
+| `fit_pic_cg` | Unweighted CG + Tikhonov `reg` on diagonal |
+| `eval_separable` / `eval_pic` | Point queries → `(E, F)` |
+| `eval_pic_grid` | Tiled 16×16 PIC eval on regular xy grid |
+
+### OpenCL kernels (`kernels/contact_surface.cl`)
+
+| Kernel group | Separable | PIC |
+|--------------|-----------|-----|
+| Brute reference | `cs_brute_plqh_points`, `cs_brute_afm_morse_c_points` | (same reference) |
+| Fit operators | `cs_sep_Av`, `cs_sep_Atv`, `cs_sep_Atv_w`, `cs_sep_Av_f`, `cs_sep_Atv_f_w` | `cs_pic_Av`, `cs_pic_Atv`, `cs_pic_Atv_w` |
+| Eval | `evalSeparableBsplinePoly`, `cs_eval_separable_fe_at` | `evalRadialPIC`, `cs_pic_eval_tile16`, `cs_eval_pic_fe_at` |
+| PP relaxation | `relaxStrokesTiltedContact` (in `contact_surface.cl`) | `relaxStrokesTiltedPIC` |
+| CG helpers | `dot_wg`, `addMul`, `cs_zero`, `cs_copy` | shared |
+
+Program build: `common.cl` + `Forces.cl` + `contact_surface.cl` (+ `AFM.cl` when embedded in AFMulator).
+
+---
+
+## Parity status (PTCDA Morse, 2026-07)
+
+| Check | Separable | PIC | Test |
+|-------|-----------|-----|------|
+| Force stencil vs eval | ✓ < 1e-4 | — | `test_contact_surface_force_stencil_parity` |
+| Fit RMSE (E) | ~7 meV | ~28 meV | `testplot_contact_surface` stdout |
+| Close E @ z+1.2 Å | ~8 meV | ~32 meV | `contact_surface_close_parity.png` |
+| PP relaxed mean Fz RMSE | ~14 meV/Å | ~20 meV/Å | `pp_afm_parity_Fz_*_relaxed.png` |
+
+Fit config: `bspl_dx=0.2 Å`, `poly_R=5 Å`, `poly_z0=1 Å`, adaptive z fit 1–6 Å above `zmax`.
+Basis and fit-region tuning still open — current quality is usable, not optimal.
+
+---
+
+## 0. Primary deliverable (read this first)
+
+| | Legacy 3D path | Quasi-2D path (this work) |
+|--|----------------|---------------------------|
+| **Precompute** | `make_forcefield()` → `img_FF` (nx×ny×nz×float4) | `fit_contact_surface()` → coeffs + h₀ (~ncx×ncy×nz_modes floats) |
+| **Relaxation kernel** | `relaxStrokesTilted` + `interpFE(img_FF, pos)` | `relaxStrokesTiltedContact` + `cs_eval_separable_fe_at(pos)` |
+| **Scan API** | `run_scan()` | `run_scan_contact()` — **identical scan geometry**, different field evaluator |
+| **Validation** | Reference | Relaxed Fz / df images must match 3D within tolerance (`tests/SPM/testplot_afm_contact_surface.py`) |
+
+The whole point: **do PP-AFM without allocating or sampling a dense 3D voxel texture.**
+
+### Curved / envelope scanning (common use case)
+
+For **3D molecules** and **STM-feedback AFM**, the tip does not follow a flat horizontal plane. The scan trajectory is often a **smooth low-frequency envelope** in z:
+
+```
+z_tip(x, y) = z_ref + S(x, y)        S smooth (e.g. from STM current feedback)
+z_probe = z_tip + offset_bond
+```
+
+The quasi-2D model separates:
+
+- **`h(x, y)`** — high-frequency **molecular contact height** (corrugation, B-spline field h₀)
+- **`S(x, y)`** — slow scan-surface / feedback envelope (specified per scan pixel in `scan_p0` + lateral grid; can vary z along `(x,y)`)
+
+Interaction uses `dz = max(z_probe − h(x,y), 0)`. The separable form is natural: lateral B-splines capture corrugation; a few z-modes capture the short-range wall above `h`. The feedback envelope is **orthogonal** — it lives in the scan path, not in the fitted coeffs. Future: `scan_p0`/`scan_da`/`scan_db` with per-pixel tip z from `S(x,y)` (tilted or curved strokes).
 
 ---
 
@@ -12,14 +194,15 @@
 
 ### Current bottleneck
 
-The LJ/Morse AFM path precomputes a **3D** potential/force texture:
+The LJ/Morse AFM path precomputes a **3D** potential/force texture and samples it at every PP relaxation step:
 
 ```
-evalLJC_QZs_toImg  →  img_FF (nx × ny × nz × float4)
-relaxStrokesTilted   →  trilinear interpFE per PP step
+evalMorseC_QZs_toImg  →  img_FF (nx × ny × nz × float4)   ← FIELD REPRESENTATION (large)
+relaxStrokesTilted      →  interpFE(img_FF, pos) per MD step
+run_scan                →  nx_scan × ny_scan × nz heights    ← AFM IMAGE OUTPUT (separate)
 ```
 
-For a 20×20×10 Å box at 0.1 Å spacing: ~200³ voxels × 16 B ≈ **100 MB** per field, plus `IMAGE3D_MAX_*` device limits and bandwidth cost during relaxation (`spammm/SPM/AFM.py`, `kernels/AFM.cl`).
+The memory problem is **`img_FF`**, not the scan image. The quasi-2D replacement keeps the same `run_scan` geometry but swaps the middle row for `cs_eval_separable_fe_at(coeffs, h₀, pos)`.
 
 GridFF for substrates has the same scaling (`spammm/surfaces/GridFF.py`, `kernels/gridFF.cl` — tricubic B-spline, 64 neighbor reads per sample).
 
@@ -55,10 +238,11 @@ This is the quasi-2D **contact surface** abstraction: compress the z dimension i
 
 **Key insight:** FAF and Ewald2D already exploit **separable bases** (lateral × vertical). Ewald2D uses **sin/cos** because the substrate is periodic. For **aperiodic molecules**, lateral **B-splines** replace plane waves — same tensor-product logic, different lateral basis.
 
-**FAF poly z-basis** (`kernels/contact_surface.cl`, `tests/testplot_folded_surface_scan.py`): finite-support polynomial with **doubling exponents**
+**FAF poly z-basis** (`kernels/contact_surface.cl`, `tests/testplot_folded_surface_scan.py`): finite-support polynomial with **doubling exponents**. For contact-surface fitting, the polynomial coordinate is shifted by the lower fit offset `z_poly0` and scaled by the fit span `Rc`:
 
 ```
-t = 1 - min(dz/Rc, 1)
+dz = z - h(x,y)
+t = 1 - clamp((dz - z_poly0)/Rc, 0, 1)
 φ_0 = t^m_start
 φ_{k+1} = φ_k²   (powers m_start, 2·m_start, 4·m_start, …)
 ```
@@ -73,7 +257,15 @@ dz = max(z - h(x,y), 0)
 V = Σ c_{ijk} B_i(x) B_j(y) φ_k(dz)
 ```
 
-Forces use chain rule through `∂h/∂x`, `∂h/∂y`. Dense xy knot spacing **0.2–0.4 Å** (not fit-sample spacing — both should be sub-Å for contact accuracy).
+Forces use chain rule through `∂h/∂x`, `∂h/∂y`. Dense xy knot spacing **0.2–0.4 Å** (not fit-sample spacing — both should be sub-Å for contact accuracy). Current PTCDA diagnostic uses `z_poly0=1 Å`, `Rc=5 Å`, so the basis spans the fit interval `1..6 Å` rather than wasting dynamic range below/above it.
+
+Fit objective can include energy and all force components:
+
+```
+loss = Σ_i w_i (V_fit - V_ref)² + λ_F Σ_{α=x,y,z} w_i (F_α,fit - F_α,ref)²
+```
+
+The force rows use the same B-spline/φ stencil with `F = -∇V` (including ∂h/∂x, ∂h/∂y chain rule), so they regularize lateral and vertical derivatives without a second representation. Global `fit_separable_cg` uses `λ_F=0` by default; tiled fit uses Tikhonov `reg=1e-2` on the diagonal.
 
 ---
 
@@ -93,7 +285,7 @@ V_c(x,y,z) = Σ_{i,j,k}  c_{ijk} · B_i(x) · B_j(y) · φ_k(max(0, z - h(x,y)))
 
 - `B_i`, `B_j` — cubic B-spline basis on a **non-periodic** xy grid (same `basis()` / `Bspline_basis` as GridFF); knot step **0.2–0.4 Å**.
 - `h(x,y)` — contact height from B-spline field `h₀` on the same xy grid (max local atom z).
-- `φ_k(dz)` — compact-support polynomial modes with doubling powers `t^(m_start·2^k)`, `t = 1 - min(dz/Rc, 1)`.
+- `φ_k(dz)` — compact-support polynomial modes with doubling powers `t^(m_start·2^k)`, `t = 1 - clamp((dz-z_poly0)/Rc, 0, 1)`.
 
 Morse/LJ potentials are already sums of exponentials in r; after separation/coordinate choice, the **z-direction** near a flat or slowly varying surface is well approximated by a handful of exponentials (as in FAF z-basis, typically 4–8 modes).
 
@@ -264,26 +456,30 @@ For Phase 1 static AFM, the height map is primarily a **diagnostic and cross-che
 
 - [x] `ContactSurfaceCL` in `spammm/surfaces/ContactSurface.py` (OpenCLBase patterns).
 - [x] Reference sampler: brute pairwise Morse/PLQH at arbitrary (x,y,z) — `cs_brute_plqh_points`.
-- [ ] Parity harness vs GridFF / `AFMulator` 3D grid (`tests/SPM/`).
+- [x] Parity harness vs 3D grid relaxed images — `tests/SPM/testplot_afm_contact_surface.py`.
 
 ### Phase 1b — Option A (separable B-spline × poly)
 
 - [x] GPU CG fitter: B-spline xy grid + doubling poly z modes (`fit_separable_cg`).
 - [x] GPU eval kernel: `evalSeparableBsplinePoly` in `kernels/contact_surface.cl` (GridFF B-spline knot convention, h₀ chain rule).
 - [x] Resolution sweep on PTCDA: dx=0.4 Å, Nz=5, powers [4,8,16,32,64]; diagnostic plot at 0.1 Å.
-- [ ] Wire into `AFMulator` as alternative to `make_forcefield` (3D image).
+- [x] Wire into `AFMulator` as alternative to `make_forcefield` (3D image): `fit_contact_surface` + `run_scan_contact`.
 
 ### Phase 1c — Option B (radial fold + PIC)
 
 - [x] Top-atom selector + bucket builder (`select_contact_atoms`, `build_pic_buckets`).
-- [x] GPU CG fitter: radial poly coefficients per atom (`fit_pic_cg`).
-- [x] GPU eval kernel: PIC lookup + radial sum (`cs_pic_eval_tile16`, `evalRadialPIC` in `contact_surface.cl`).
-- [ ] Benchmark: N_atoms vs GridFF memory and scan time.
+- [x] GPU CG fitter: radial poly coefficients per atom (`fit_pic_cg`, `reg=1e-2`).
+- [x] GPU eval + PP relaxation: `evalRadialPIC`, `relaxStrokesTiltedPIC`, `run_scan_pic`.
+- [x] Atom-selection diagnostic plot (`contact_surface_pic_atoms.png`).
+- [ ] PIC force-loss rows; benchmark vs separable on large assemblies.
 
 ### Phase 1d — Integration
 
-- [ ] `relaxStrokesTilted` / FDBM path: replace `interpFE` 3D with contact surface evaluator callback.
-- [ ] ND pipeline flag: `--contact-surface {separable,radial,grid3d}`.
+- [x] `relaxStrokesTiltedContact` / `relaxStrokesTiltedPIC` replace `interpFE` in PP loop.
+- [x] `testplot_contact_surface.py` — separable + PIC fit, z-alignment, PP parity (`RUN_CONTACT_PP=1`).
+- [x] L0 pytest `tests/SPM/test_afm_contact_surface.py`.
+- [x] Fit z = `zmax + offset` with adaptive multi-z stack (not tip scan height).
+- [ ] ND pipeline flag: `--contact-surface {separable,pic,grid3d}`.
 
 ---
 
@@ -293,10 +489,10 @@ Per `doc/TEST_DESIGN.md`:
 
 | Level | Test | Pass criterion |
 |-------|------|----------------|
-| L0 | F(z) at 20 fixed (x,y) vs 3D GridFF reference | <5% max relative error in 0–3 Å indentation |
-| L0 | AFM constant-height image RMS | <2% vs 3D grid |
-| L1 | `.out` log of fit residuals, memory, eval time | Agent-readable |
-| L2 | Overlay plots: h(x,y), F(z) curves | Human review |
+| L0 | `test_afm_contact_surface.py` — stencil parity, scan smoke | Force stencil RMSE < 1e-4; scan returns finite FEs |
+| L0 | PP-relaxed Fz / df vs 3D `run_scan` on same grid | RMS Fz ~10–20 meV/Å (PTCDA prototype) |
+| L1 | `.out` logs + `REVIEW:` paths in testplot stdout | Agent-readable metrics |
+| L2 | `debug/testplot_contact_surface/*.png` | Human review: fit, z-alignment, PIC atoms, PP maps |
 
 Test systems: CaF₂(111) slab (periodic, compare Ewald2D Coulomb), pentacene (aperiodic), single benzene (minimal).
 
@@ -318,8 +514,9 @@ Test systems: CaF₂(111) slab (periodic, compare Ewald2D Coulomb), pentacene (a
 |------|------|
 | `spammm/surfaces/ContactSurface.py` | **Implemented:** `ContactSurfaceCL`, fit/eval API, h₀ builder |
 | `kernels/contact_surface.cl` | **Implemented:** brute, separable Av/Atv/eval, PIC fit/eval |
-| `tests/testplot_contact_surface.py` | Visual demo: PTCDA, separable vs PIC vs brute |
-| `spammm/SPM/AFM.py` | `AFMulator.make_forcefield`, `run_scan` |
+| `tests/testplot_contact_surface.py` | Fit-quality demo: separable vs PIC vs brute (single-z slice) |
+| `tests/SPM/testplot_afm_contact_surface.py` | **Phase 2:** PP-relaxed AFM images — 3D img_FF vs quasi-2D replacement |
+| `spammm/SPM/AFM.py` | `fit_contact_surface`, `run_scan_contact` (replacement FE path) |
 | `kernels/AFM.cl` | `interpFE`, `relaxStrokesTilted` |
 | `kernels/surface.cl` | `getSurfFolded_tensor_exp/poly`, `getSurfMorse` |
 | `spammm/forcefields/SPFF_cl.py` | `fit_folded_surface_basis`, `_folded_basis_matrix` |
@@ -328,11 +525,12 @@ Test systems: CaF₂(111) slab (periodic, compare Ewald2D Coulomb), pentacene (a
 | `tests/testplot_folded_surface_scan.py` | Fitting / basis visualization patterns |
 | `tests/test_surface.py` | GridFF parity |
 
-### PTCDA prototype results (2026-03, Morse-only, z_scan=3 Å)
+### PTCDA prototype results (2026-07, Morse-only, adaptive z fit 1–6 Å above zmax)
 
-| Metric | Separable CG | PIC |
-|--------|-------------|-----|
-| Fit RMSE (E) | 1.5×10⁻⁴ eV | 5.1×10⁻⁴ eV |
-| Slice Fz RMSE @ 0.1 Å | 4.2×10⁻⁴ eV/Å | 2.0×10⁻³ eV/Å |
+| Metric | Separable (+ force loss) | PIC (`reg=1e-2`) |
+|--------|--------------------------|------------------|
+| Fit RMSE (E) | ~7 meV | ~28 meV |
+| Close E @ z+1.2 Å | ~8 meV | ~32 meV |
+| PP relaxed mean Fz RMSE | ~14 meV/Å | ~20 meV/Å |
 
-Fit config: bbox +2 Å, B-spline 0.4 Å, z fit range `z_scan±0.2` Å dz=0.2 Å, poly_R=10 Å, powers [4,8,16,32,64].
+Fit config: `bspl_dx=0.2 Å`, `poly_R=5 Å`, `poly_z0=1 Å`, `m_start=4`, `nz=5–6`, Boltzmann + force equalization (separable only). Basis/fit-region tuning still open — see [Takeways.md](../../Takeways.md).

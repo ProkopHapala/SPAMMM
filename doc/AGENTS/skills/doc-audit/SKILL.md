@@ -137,3 +137,4 @@ Bad body excerpt:
 ## Related Skills
 - `doc-read-navigate` — check existing implementations before writing
 - `doc-task-summary` — quick doc updates after implementation
+- `doc/Takeways.md` — cross-cutting pitfalls (blit, external calculators, GUI vs test paths)

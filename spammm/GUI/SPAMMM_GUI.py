@@ -396,12 +396,15 @@ class SPAMMMWindow(BaseGUI):
         # Register edit/view mode lists for dynamic dispatch
         self._ext_edit_modes = {}   # label -> callback
         self._ext_view_modes = {}   # label -> callback
+        self._extension_sections = {}  # extension key / panel title -> CollapsibleSection
 
-        EXTENSION_TITLES = {'ff': 'Force Field', 'afm': 'AFM', 'dftb': 'DFTB', 'firecore': 'FireCore', 'qeq': 'QEq Charges', 'kekule': 'Kekule Solver', 'ascii': 'ASCII Builder', 'fragments': 'Fragments'}
+        EXTENSION_TITLES = {'ff': 'Force Field', 'afm': 'AFM', 'dftb': 'DFTB', 'firecore': 'FireCore', 'qeq': 'QEq Charges', 'kekule': 'Kekule Solver', 'ascii': 'ASCII Builder', 'fragments': 'Fragments', 'reaction_coord': 'Reaction coordinate', 'vibrations': 'Vibrations'}
         for name in self.extensions.enabled_extensions():
             ui = self.extensions.build_ui(name, self)
             title = EXTENSION_TITLES.get(name, name.capitalize())
             sec = CollapsibleSection(title, collapsed=True, parent=self)
+            self._extension_sections[name] = sec
+            self._extension_sections[title] = sec
             if ui.panel is not None:
                 sec.setContent(ui.panel)
                 ok = self.extensions.is_loaded(name)
@@ -1244,19 +1247,28 @@ class SPAMMMWindow(BaseGUI):
         self.scene.canvas.update()
         QtWidgets.QApplication.processEvents()
 
+# FireCore / legacy alias
+KekuleExplorerWindow = SPAMMMWindow
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description='SPAMMM GUI — Molecular editor and AFM simulation')
     parser.add_argument('--output-dir', '-o', type=str, default=None, help='Directory for saved images (default: <repo>/output)')
     parser.add_argument('--fdata-path', '-f', type=str, default=None, help='Path to Fdata directory')
     parser.add_argument('--verbosity', '-v', type=int, default=None, choices=[0, 1, 2, 3], help='Verbosity level 0-3 (default: 2)')
-    args = parser.parse_args()
+    parser.add_argument('--script', '-s', type=str, default=None, metavar='PATH', help='GUI control script (must define run(window, argv)); args after -- go to script')
+    args, script_argv = parser.parse_known_args()
 
     app = QtWidgets.QApplication(sys.argv)
     window = SPAMMMWindow(output_dir=args.output_dir, fdata_path=args.fdata_path, verbosity=args.verbosity)
-
-
-# FireCore / legacy alias
-KekuleExplorerWindow = SPAMMMWindow
     window.show()
+    QtWidgets.QApplication.processEvents()
+    if args.script:
+        from spammm.GUI.gui_script_runner import run_gui_script
+        script_argv = list(script_argv)
+        if script_argv and script_argv[0] == '--':
+            script_argv = script_argv[1:]
+        print(f"[GUI] Running control script: {args.script} argv={script_argv}")
+        run_gui_script(window, args.script, script_argv)
+        QtWidgets.QApplication.processEvents()
     sys.exit(app.exec_())

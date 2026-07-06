@@ -103,10 +103,11 @@ class AFMulator(OpenCLBase):
             os.path.join(cl_src_dir, 'common.cl'),
             os.path.join(cl_src_dir, 'Forces.cl'),
             os.path.join(cl_src_dir, 'AFM.cl'),
+            os.path.join(cl_src_dir, 'contact_surface.cl'),
         ]
         print(f"AFMulator: compiling {kernel_paths}")
         self.load_program_multi(kernel_paths, build_options=build_options)
-        print(f"AFMulator: AFM.cl compiled OK (use_fire={use_fire})")
+        print(f"AFMulator: AFM.cl + contact_surface.cl compiled OK (use_fire={use_fire})")
         # State
         self.mol = self.elem_types = None
         self.atoms_arr = self.cLJs_arr = None
@@ -133,6 +134,12 @@ class AFMulator(OpenCLBase):
         self.fdbm_origin  = None   # (3,) grid origin [Ang]
         self.fdbm_step    = None   # grid spacing [Ang]
         self.fdbm_shape   = None   # (nx,ny,nz)
+        # Contact-surface state (fit_contact_surface / run_scan_contact; no 3D img_FF)
+        self.sep = None
+        self.pic = None
+        self._cs_fit = None
+        self.cs_meta = self.cs_origin_step = self.cs_dy_rc = self.cs_invRc_mstart = None
+        self.cs_pic_meta = self.cs_pic_bmeta = None
 
     # ── buffer management ─────────────────────────────────────────────────────
 
@@ -432,10 +439,11 @@ class AFMulator(OpenCLBase):
 
     # ── grid setup ────────────────────────────────────────────────────────────
 
-    def setup_grid(self, n=(100,100,60), L=None, margin=3.0, z_top=12.0):
+    def setup_grid(self, n=(100,100,60), L=None, margin=3.0, z_top=12.0, shift_atoms=True):
         """
-        Set up 3D force-field grid. Molecule is shifted so grid occupies [0,L] in all dims,
-        making dot(pos, dinv) in [0,1] for normalized image sampling.
+        Set up 3D force-field grid.
+        shift_atoms=True (default): shift molecule so grid origin is (0,0,0), dinv without offset.
+        shift_atoms=False: keep world coords (matches ContactSurface fit bbox); dinv includes -p0/L.
         n: (nx,ny,nz)  L: (Lx,Ly,Lz) Ang  margin: xy pad  z_top: extra z above molecule.
         """
         assert self.atoms_arr is not None, "call assign_params() first"
@@ -449,17 +457,22 @@ class AFMulator(OpenCLBase):
             L = np.array(L, dtype=np.float32)
         self.n = np.array(n, dtype=np.int32)
         nx,ny,nz = n
-        # Shift atoms so grid origin is at (0,0,0)
         p0_raw = np.array([mn[0]-margin, mn[1]-margin, mn[2]-margin/2], dtype=np.float32)
-        self.mol_shift = -p0_raw
-        self.atoms_arr[:,:3] += self.mol_shift
-        self.p0    = np.zeros(4, dtype=np.float32)          # grid origin = (0,0,0)
-        self.dA    = np.array([L[0]/nx, 0., 0., 0.], dtype=np.float32)  # per-voxel step
+        if shift_atoms:
+            self.mol_shift = -p0_raw
+            self.atoms_arr[:,:3] += self.mol_shift
+            self.p0 = np.zeros(4, dtype=np.float32)
+            ox, oy, oz = 0., 0., 0.
+        else:
+            self.mol_shift = np.zeros(3, dtype=np.float32)
+            self.p0 = np.array([p0_raw[0], p0_raw[1], p0_raw[2], 0.], dtype=np.float32)
+            ox, oy, oz = float(p0_raw[0]), float(p0_raw[1]), float(p0_raw[2])
+        self.dA    = np.array([L[0]/nx, 0., 0., 0.], dtype=np.float32)
         self.dB    = np.array([0., L[1]/ny, 0., 0.], dtype=np.float32)
         self.dC    = np.array([0., 0., L[2]/nz, 0.], dtype=np.float32)
-        self.dinvA = np.array([1./L[0], 0., 0., 0.], dtype=np.float32)  # for sampler_1
-        self.dinvB = np.array([0., 1./L[1], 0., 0.], dtype=np.float32)
-        self.dinvC = np.array([0., 0., 1./L[2], 0.], dtype=np.float32)
+        self.dinvA = np.array([1./L[0], 0., 0., -ox/L[0]], dtype=np.float32)
+        self.dinvB = np.array([0., 1./L[1], 0., -oy/L[1]], dtype=np.float32)
+        self.dinvC = np.array([0., 0., 1./L[2], -oz/L[2]], dtype=np.float32)
         self.L = L
         grid_bytes = int(nx*ny*nz*4*4)  # float4 image
         if not hasattr(self, '_vram_bytes'): self._vram_bytes = 0
@@ -634,6 +647,372 @@ class AFMulator(OpenCLBase):
         FEs = FEs_h.reshape(nx_s, ny_s, nz, 4)
         print(f"AFMulator.run_scan: done FEs.shape={FEs.shape}")
         return FEs, pts[:,:3].reshape(nx_s, ny_s, 3)
+
+    # ── contact surface (memory-efficient Morse PP-AFM) ───────────────────────
+
+    def _cs_fit_helper(self):
+        """Lazy ContactSurfaceCL on shared ctx/queue (fit CG only)."""
+        if self._cs_fit is None:
+            from spammm.surfaces.ContactSurface import ContactSurfaceCL
+            self._cs_fit = ContactSurfaceCL(ctx=self.ctx, queue=self.queue, nloc=64, bPrint=False)
+        return self._cs_fit
+
+    @staticmethod
+    def cMs_to_plqh_reqs(atoms_arr, cMs_arr):
+        """Tip-atom Morse (R0,E0 from cMs) as REQ for getMorsePLQH / cs_brute_plqh_points."""
+        reqs = np.zeros((len(atoms_arr), 4), dtype=np.float32)
+        reqs[:, 0] = cMs_arr[:, 0]
+        reqs[:, 1] = cMs_arr[:, 1]
+        reqs[:, 2] = atoms_arr[:, 3]
+        return reqs
+
+    def _brute_plqh_queries(self, queries, plqh=(1.0, 1.0, 0.0, 0.0), alpha_morse=1.8, r_damp=0.1):
+        """GPU Morse PLQH reference (matches ContactSurfaceCL.eval_brute with tip-atom cMs as REQ)."""
+        assert self.use_morse and self.atoms_arr is not None
+        queries = np.ascontiguousarray(queries, dtype=np.float32).reshape(-1, 3)
+        nq = len(queries)
+        na = len(self.atoms_arr)
+        nG = self._roundup(nq, 32)
+        reqs = self.cMs_to_plqh_reqs(self.atoms_arr, self.cLJs_arr)
+        self.try_make_buffers({'cs_queries': nG * 3 * 4, 'cs_out_fe': nG * 16, 'cs_reqs': na * 16}, suffix='_cl')
+        self.realloc_forcefield_buffers(na)
+        self.toGPU_(self.atoms_cl, self.atoms_arr)
+        self.toGPU_(self.cs_reqs_cl, reqs)
+        self.toGPU_(self.cs_queries_cl, queries.reshape(-1))
+        gff = np.array([r_damp, alpha_morse, 0.0, 0.0], dtype=np.float32)
+        plqh_v = np.array(plqh, dtype=np.float32)
+        self.prg.cs_brute_plqh_points(self.queue, (nG,), (32,), np.int32(na), self.atoms_cl, self.cs_reqs_cl, self.cs_queries_cl, self.cs_out_fe_cl, np.int32(nq), gff, plqh_v)
+        self.queue.finish()
+        out = np.zeros((nq, 4), dtype=np.float32)
+        cl.enqueue_copy(self.queue, out, self.cs_out_fe_cl)
+        return out[:, 3], out[:, :3]
+
+    def _brute_afm_morse_c_queries(self, queries):
+        """GPU reference matching evalMorseC_QZs_toImg at arbitrary points."""
+        assert self.use_morse and self.atoms_arr is not None and self.cLJs_arr is not None
+        queries = np.ascontiguousarray(queries, dtype=np.float32).reshape(-1, 3)
+        nq = len(queries)
+        na = len(self.atoms_arr)
+        nG = self._roundup(nq, 32)
+        self.try_make_buffers({'cs_queries': nG * 3 * 4, 'cs_out_fe': nG * 16}, suffix='_cl')
+        self.realloc_forcefield_buffers(na)
+        self.toGPU_(self.atoms_cl, self.atoms_arr)
+        self.toGPU_(self.cLJs_cl, self.cLJs_arr)
+        self.toGPU_(self.cs_queries_cl, queries.reshape(-1))
+        self.prg.cs_brute_afm_morse_c_points(self.queue, (nG,), (32,), np.int32(na), self.atoms_cl, self.cLJs_cl, self.cs_queries_cl, self.cs_out_fe_cl, np.int32(nq), self.tipQs, self.tipQZs)
+        self.queue.finish()
+        out = np.zeros((nq, 4), dtype=np.float32)
+        cl.enqueue_copy(self.queue, out, self.cs_out_fe_cl)
+        return out[:, 3], out[:, :3]
+
+    def fit_contact_surface(self, margin=2.0, bspl_dx=0.4, poly_R=10.0, poly_z0=0.0, m_start=4, nz=5, z_offset=1.2, fit_z_half=0.4, fit_z_stack=None, fit_z_adaptive=None, fit_dx=None, fit_dy=None, fit_dz=0.15, fit_boltzmann=True, fit_boltzmann_T=None, fit_force_weight=0.0, n_iter=80, plqh=(1.0, 1.0, 0.0, 0.0), brute_ref='afm', sep=None, bPrint=True):
+        """
+        Fit quasi-2D separable field to replace img_FF for PP relaxation.
+        Default reference matches evalMorseC_QZs_toImg (same cMs, tip charges, and force convention).
+        fit_z_adaptive=(z_lo,z_hi,dz_lo,dz_hi): offsets above z_max, dz ramps linearly dz_lo→dz_hi.
+        poly_z0/poly_R: basis coordinate is (z - h0 - poly_z0) / poly_R.
+        fit_boltzmann: diagonal weights w=exp(-(E-E_min)/T) emphasizing low-energy (vdW-well) samples.
+        fit_force_weight: optional Fx,Fy,Fz row weight in loss (1.0 = equal to E rows).
+        Pass pre-fitted sep to only upload coeffs.
+        """
+        assert self.use_morse, "fit_contact_surface requires use_morse=True"
+        assert self.atoms_arr is not None, "call assign_params() first"
+        from spammm.surfaces.ContactSurface import SeparableParams, make_fit_grid, make_fit_grid_zstack, make_fit_z_planes_adaptive, boltzmann_fit_weights, bspline_n_intervals
+        apos = self.atoms_arr[:, :3]
+        if sep is not None and sep.coeffs is not None:
+            self.sep = sep
+            self.setup_contact_surface(sep)
+            print(f"AFMulator.fit_contact_surface: reused sep n_coeff={sep.n_coeff}")
+            return sep
+        x0f = float(apos[:, 0].min()) - margin
+        x1f = float(apos[:, 0].max()) + margin
+        y0f = float(apos[:, 1].min()) - margin
+        y1f = float(apos[:, 1].max()) + margin
+        zmax = float(apos[:, 2].max())
+        fit_dx = bspl_dx if fit_dx is None else fit_dx
+        fit_dy = bspl_dx if fit_dy is None else fit_dy
+        if fit_z_adaptive is not None:
+            z_lo, z_hi, dz_lo, dz_hi = fit_z_adaptive
+            z_planes = zmax + make_fit_z_planes_adaptive(z_lo, z_hi, dz_lo, dz_hi)
+            fit_pts = make_fit_grid_zstack(x0f, x1f, y0f, y1f, z_planes, fit_dx, fit_dy)
+            z_fit_lo, z_fit_hi = float(z_planes.min()), float(z_planes.max())
+        elif fit_z_stack is not None:
+            z_planes = zmax + np.asarray(fit_z_stack, dtype=np.float64)
+            fit_pts = make_fit_grid_zstack(x0f, x1f, y0f, y1f, z_planes, fit_dx, fit_dy)
+            z_fit_lo, z_fit_hi = float(z_planes.min()), float(z_planes.max())
+        else:
+            z_scan = zmax + float(z_offset)
+            z0_fit, z1_fit = z_scan - fit_z_half, z_scan + fit_z_half
+            fit_pts = make_fit_grid(x0f, x1f, y0f, y1f, z0_fit, z1_fit, fit_dx, fit_dy, fit_dz)
+            z_fit_lo, z_fit_hi = z0_fit, z1_fit
+        bspl_nx = bspline_n_intervals(x1f - x0f, bspl_dx)
+        bspl_ny = bspline_n_intervals(y1f - y0f, bspl_dx)
+        coeff_n = bspl_nx * bspl_ny * nz
+        print(f"AFMulator.fit_contact_surface: fit_pts={len(fit_pts)} z=[{z_fit_lo:.2f},{z_fit_hi:.2f}] bspl={bspl_nx}x{bspl_ny} nz={nz} coeffs={coeff_n}")
+        if brute_ref == 'afm':
+            E_ref, F_ref = self._brute_afm_morse_c_queries(fit_pts)
+        elif brute_ref == 'plqh':
+            E_ref, F_ref = self._brute_plqh_queries(fit_pts, plqh=plqh)
+        else:
+            raise ValueError(f"unknown contact-surface brute_ref={brute_ref!r}")
+        sample_weights = None
+        T = None
+        if fit_boltzmann:
+            sample_weights, T, E_shift = boltzmann_fit_weights(E_ref, T=fit_boltzmann_T)
+            if bPrint:
+                print(f"AFMulator.fit_contact_surface: Boltzmann weights T={T:.4f} eV  E_shift={E_shift:.4f} eV  w∈[{float(sample_weights.min()):.3e},{float(sample_weights.max()):.3e}]")
+        sep = SeparableParams(x0f, y0f, bspl_dx, bspl_dx, bspl_nx, bspl_ny, poly_R=poly_R, poly_z0=poly_z0, m_start=m_start, nz=nz, apos=apos)
+        F_ref_pass = F_ref if fit_force_weight > 0.0 else None
+        rmse = self._cs_fit_helper().fit_separable_cg(sep, fit_pts, E_ref, F_ref=F_ref_pass, apos=apos, n_iter=n_iter, sample_weights=sample_weights, force_weight=fit_force_weight, bPrint=bPrint)
+        if fit_z_adaptive is not None or fit_z_stack is not None:
+            sep.fit_z_offsets = np.asarray(z_planes - zmax, dtype=np.float64)
+        else:
+            sep.fit_z_offsets = None
+        sep.fit_E_ref = np.asarray(E_ref, dtype=np.float64)
+        sep.fit_sample_weights = sample_weights
+        sep.fit_boltzmann_T = T
+        sep.fit_force_weight = float(fit_force_weight)
+        sep.fit_pts_z = fit_pts[:, 2].astype(np.float64)
+        self.sep = sep
+        self.setup_contact_surface(sep)
+        print(f"AFMulator.fit_contact_surface: done RMSE={rmse:.4e}")
+        return sep
+
+    def fit_pic_contact_surface(self, margin=2.0, poly_R=10.0, m_start=4, nz=4, cell_size=10.0, z_local=1.2, xy_radius=14.0, fit_z_stack=None, fit_z_adaptive=None, fit_dx=None, fit_dy=None, fit_dz=0.15, fit_boltzmann=True, fit_boltzmann_T=None, n_iter=80, reg=1e-2, brute_ref='afm', pic=None, bPrint=True):
+        """Fit radial PIC field on selected contact atoms; replaces img_FF via run_scan_pic."""
+        assert self.use_morse, "fit_pic_contact_surface requires use_morse=True"
+        assert self.atoms_arr is not None, "call assign_params() first"
+        from spammm.surfaces.ContactSurface import PICParams, select_contact_atoms, make_fit_grid, make_fit_grid_zstack, make_fit_z_planes_adaptive, boltzmann_fit_weights
+        apos = self.atoms_arr[:, :3]
+        if pic is not None and pic.coeffs is not None:
+            self.pic = pic
+            self.setup_pic_contact(pic)
+            print(f"AFMulator.fit_pic_contact_surface: reused pic nat={pic.nat}")
+            return pic
+        x0f = float(apos[:, 0].min()) - margin
+        x1f = float(apos[:, 0].max()) + margin
+        y0f = float(apos[:, 1].min()) - margin
+        y1f = float(apos[:, 1].max()) + margin
+        zmax = float(apos[:, 2].max())
+        fit_dx = 0.4 if fit_dx is None else fit_dx
+        fit_dy = fit_dx if fit_dy is None else fit_dy
+        if fit_z_adaptive is not None:
+            z_lo, z_hi, dz_lo, dz_hi = fit_z_adaptive
+            z_planes = zmax + make_fit_z_planes_adaptive(z_lo, z_hi, dz_lo, dz_hi)
+            fit_pts = make_fit_grid_zstack(x0f, x1f, y0f, y1f, z_planes, fit_dx, fit_dy)
+            z_fit_lo, z_fit_hi = float(z_planes.min()), float(z_planes.max())
+        elif fit_z_stack is not None:
+            z_planes = zmax + np.asarray(fit_z_stack, dtype=np.float64)
+            fit_pts = make_fit_grid_zstack(x0f, x1f, y0f, y1f, z_planes, fit_dx, fit_dy)
+            z_fit_lo, z_fit_hi = float(z_planes.min()), float(z_planes.max())
+        else:
+            raise ValueError("fit_pic_contact_surface needs fit_z_adaptive or fit_z_stack")
+        contact_idx = select_contact_atoms(apos, z_local=z_local, xy_radius=xy_radius)
+        pic = PICParams(apos, contact_idx, poly_R=poly_R, m_start=m_start, nz=nz, cell_size=cell_size, bounds=(x0f, y0f, x1f, y1f))
+        pic.contact_indices_full = contact_idx
+        print(f"AFMulator.fit_pic_contact_surface: fit_pts={len(fit_pts)} z=[{z_fit_lo:.2f},{z_fit_hi:.2f}] PIC atoms={pic.nat}/{len(apos)} nmodes={nz} coeffs={pic.nat * nz}")
+        if brute_ref == 'afm':
+            E_ref, _ = self._brute_afm_morse_c_queries(fit_pts)
+        elif brute_ref == 'plqh':
+            E_ref, _ = self._brute_plqh_queries(fit_pts)
+        else:
+            raise ValueError(f"unknown brute_ref={brute_ref!r}")
+        sample_weights = None
+        if fit_boltzmann:
+            sample_weights, T, E_shift = boltzmann_fit_weights(E_ref, T=fit_boltzmann_T)
+            if bPrint:
+                print(f"AFMulator.fit_pic_contact_surface: Boltzmann T={T:.4f} eV  w∈[{float(sample_weights.min()):.3e},{float(sample_weights.max()):.3e}]  (PIC fit: unweighted CG; weights logged only)")
+        rmse = self._cs_fit_helper().fit_pic_cg(pic, fit_pts, E_ref, n_iter=n_iter, reg=reg, bPrint=bPrint)
+        if fit_z_adaptive is not None:
+            pic.fit_z_offsets = np.asarray(z_planes - zmax, dtype=np.float64)
+        pic.fit_E_ref = np.asarray(E_ref, dtype=np.float64)
+        self.pic = pic
+        self.setup_pic_contact(pic)
+        print(f"AFMulator.fit_pic_contact_surface: done RMSE={rmse:.4e}")
+        return pic
+
+    def scan_bbox(self, margin=4.0, dx=0.2, z_clearance=5.0):
+        """Scan grid covering molecule bbox + margin [Å], same frame as atoms_arr."""
+        apos = self.atoms_arr[:, :3]
+        mn, mx = apos.min(axis=0), apos.max(axis=0)
+        x0 = float(mn[0] - margin)
+        y0 = float(mn[1] - margin)
+        Lx = float((mx[0] - mn[0]) + 2 * margin)
+        Ly = float((mx[1] - mn[1]) + 2 * margin)
+        nx_s = max(2, int(np.ceil(Lx / dx)))
+        ny_s = max(2, int(np.ceil(Ly / dx)))
+        z0_tip = float(mx[2]) + z_clearance + abs(float(self.dpos0[2]))
+        scan_p0 = np.array([x0, y0, z0_tip], dtype=np.float32)
+        scan_da = np.array([dx, 0., 0.], dtype=np.float32)
+        scan_db = np.array([0., dx, 0.], dtype=np.float32)
+        extent = [x0, x0 + (nx_s - 1) * dx, y0, y0 + (ny_s - 1) * dx]
+        return (nx_s, ny_s), scan_p0, scan_da, scan_db, extent, float(mx[2])
+
+    def setup_contact_surface(self, sep=None):
+        """Upload fitted SeparableParams (coeffs + h0) for run_scan_contact."""
+        from spammm.surfaces.ContactSurface import separable_cl_args
+        sep = sep or self.sep
+        assert sep is not None and sep.coeffs is not None, "call fit_contact_surface() first"
+        self.sep = sep
+        n_h0, nc = sep.ncx * sep.ncy, sep.n_coeff
+        self.try_make_buffers({'cs_h0': n_h0 * 4, 'cs_coeffs': nc * 4}, suffix='_cl')
+        self.toGPU_(self.cs_h0_cl, np.ascontiguousarray(sep.h0_map, dtype=np.float32))
+        self.toGPU_(self.cs_coeffs_cl, np.ascontiguousarray(sep.coeffs, dtype=np.float32))
+        self.cs_meta, self.cs_origin_step, self.cs_dy_rc, self.cs_invRc_mstart = separable_cl_args(sep)
+        print(f"AFMulator.setup_contact_surface: coeffs={nc} h0={n_h0} bbox=({sep.x0:.1f},{sep.y0:.1f}) step={sep.dx:.2f}Å")
+
+    def setup_pic_contact(self, pic=None):
+        """Upload fitted PICParams for run_scan_pic."""
+        pic = pic or self.pic
+        assert pic is not None and pic.coeffs is not None, "call fit_pic_contact_surface() first"
+        self.pic = pic
+        nat, nm = pic.nat, pic.nmodes
+        nc = nat * nm
+        self.try_make_buffers({'cs_pic_atoms': nat * 16, 'cs_pic_coeffs': nc * 4, 'cs_pic_buckets': max(len(pic.bucket_atoms), 1) * 4, 'cs_pic_offsets': max(len(pic.bucket_offsets), 1) * 4}, suffix='_cl')
+        atoms4 = np.zeros((nat, 4), dtype=np.float32)
+        atoms4[:, :3] = pic.atom_pos.astype(np.float32)
+        self.toGPU_(self.cs_pic_atoms_cl, atoms4)
+        self.toGPU_(self.cs_pic_coeffs_cl, np.ascontiguousarray(pic.coeffs, dtype=np.float32))
+        self.toGPU_(self.cs_pic_buckets_cl, np.ascontiguousarray(pic.bucket_atoms, dtype=np.int32))
+        self.toGPU_(self.cs_pic_offsets_cl, np.ascontiguousarray(pic.bucket_offsets, dtype=np.int32))
+        self.cs_pic_meta, self.cs_pic_bmeta = self._cs_fit_helper()._pic_cl_meta(pic)
+        print(f"AFMulator.setup_pic_contact: nat={nat} nmodes={nm} buckets={pic.nbx}x{pic.nby} cell={pic.cell_size:.1f}Å Rc={pic.poly_R:.1f}Å")
+
+    def _scan_grid_auto(self, nxy, clearance=5.0):
+        """Default tilted scan grid from atom bbox (kernel-space coords)."""
+        apos = self.atoms_arr[:, :3]
+        mn, mx = apos.min(axis=0), apos.max(axis=0)
+        nx_s, ny_s = nxy
+        x0 = mn[0] + (mx[0] - mn[0]) * 0.05
+        y0 = mn[1] + (mx[1] - mn[1]) * 0.05
+        z0 = float(mx[2]) + clearance + abs(float(self.dpos0[2]))
+        scan_p0 = np.array([x0, y0, z0], dtype=np.float32)
+        scan_da = np.array([(mx[0] - mn[0]) * 0.9 / max(nx_s - 1, 1), 0., 0.], dtype=np.float32)
+        scan_db = np.array([0., (mx[1] - mn[1]) * 0.9 / max(ny_s - 1, 1), 0.], dtype=np.float32)
+        return scan_p0, scan_da, scan_db
+
+    def run_scan_contact(self, nxy=(50, 50), nz=60, dtip=-0.1, scan_p0=None, scan_da=None, scan_db=None, bAlloc=True):
+        """
+        PP-AFM scan using quasi-2D field (relaxStrokesTiltedContact) instead of img_FF.
+        Same scan geometry and outputs as run_scan(); field evaluator is cs_eval_separable_fe_at.
+        Requires fit_contact_surface() first.
+        """
+        assert self.sep is not None and self.cs_coeffs_cl is not None, "call fit_contact_surface() first"
+        nx_s, ny_s = nxy
+        n_scan = nx_s * ny_s
+        if scan_p0 is None:
+            scan_p0, scan_da, scan_db = self._scan_grid_auto(nxy)
+        print(f"AFMulator.run_scan_contact: nxy={nxy} nz={nz} dtip={dtip}")
+        print(f"  scan_p0={scan_p0}  da={scan_da}  db={scan_db}")
+        pts = np.zeros((n_scan, 4), dtype=np.float32)
+        k = 0
+        for ix in range(nx_s):
+            for iy in range(ny_s):
+                pts[k, :3] = scan_p0 + scan_da * ix + scan_db * iy
+                k += 1
+        FEs_bytes = n_scan * nz * 4 * 4
+        if FEs_bytes > self._max_alloc:
+            raise MemoryError(f"run_scan_contact: FEs buffer needs {FEs_bytes} bytes ({_bytes_to_gb(FEs_bytes):.3f} GB) > device max_alloc {_bytes_to_gb(self._max_alloc):.3f} GB")
+        if bAlloc:
+            self.realloc_scan_buffers(n_scan, nz)
+        self.toGPU_(self.scan_pts_cl, pts)
+        FEs_h = np.zeros((n_scan * nz, 4), dtype=np.float32)
+        tipC = self.tipC.copy(); tipC[3] = np.float32(dtip)
+        gs = (self._roundup(n_scan, 1),)
+        ls = (1,)
+        self.prg.relaxStrokesTiltedContact(self.queue, gs, ls, self.cs_coeffs_cl, self.cs_h0_cl, self.cs_meta, self.cs_origin_step, self.cs_dy_rc, self.cs_invRc_mstart, self.scan_pts_cl, self.scan_FEs_cl, self.tipA, self.tipB, tipC, self.stiffness, self.dpos0, self.relax_pars, self.surfFF, np.int32(nz))
+        self.queue.finish()
+        self.fromGPU_(self.scan_FEs_cl, FEs_h)
+        self.queue.finish()
+        FEs = FEs_h.reshape(nx_s, ny_s, nz, 4)
+        print(f"AFMulator.run_scan_contact: done FEs.shape={FEs.shape}")
+        return FEs, pts[:, :3].reshape(nx_s, ny_s, 3)
+
+    def get_raw_FE_contact(self, nxy=(60, 60), nz=21, dtip=-0.2, scan_p0=None, scan_da=None, scan_db=None, bAlloc=True):
+        """Sample contact surface WITHOUT PP relaxation (getFEinStrokesTiltedContact)."""
+        assert self.sep is not None, "call fit_contact_surface() first"
+        nx_s, ny_s = nxy
+        n_scan = nx_s * ny_s
+        if scan_p0 is None:
+            scan_p0, scan_da, scan_db = self._scan_grid_auto(nxy)
+        print(f"AFMulator.get_raw_FE_contact: nxy={nxy} nz={nz} dtip={dtip}")
+        pts = np.zeros((n_scan, 4), dtype=np.float32)
+        k = 0
+        for ix in range(nx_s):
+            for iy in range(ny_s):
+                pts[k, :3] = scan_p0 + scan_da * ix + scan_db * iy
+                k += 1
+        if bAlloc:
+            self.realloc_scan_buffers(n_scan, nz)
+        self.toGPU_(self.scan_pts_cl, pts)
+        FEs_h = np.zeros((n_scan * nz, 4), dtype=np.float32)
+        dTip = np.array([0., 0., dtip, 0.], dtype=np.float32)
+        gs = (self._roundup(n_scan, 1),)
+        ls = (1,)
+        self.prg.getFEinStrokesTiltedContact(self.queue, gs, ls, self.cs_coeffs_cl, self.cs_h0_cl, self.cs_meta, self.cs_origin_step, self.cs_dy_rc, self.cs_invRc_mstart, self.scan_pts_cl, self.scan_FEs_cl, self.tipA, self.tipB, self.tipC, dTip, self.dpos0, np.int32(nz))
+        self.queue.finish()
+        self.fromGPU_(self.scan_FEs_cl, FEs_h)
+        FEs = FEs_h.reshape(nx_s, ny_s, nz, 4)
+        print(f"AFMulator.get_raw_FE_contact: done FEs.shape={FEs.shape}")
+        return FEs, pts[:, :3].reshape(nx_s, ny_s, 3)
+
+    def run_scan_pic(self, nxy=(50, 50), nz=60, dtip=-0.1, scan_p0=None, scan_da=None, scan_db=None, bAlloc=True):
+        """PP-AFM scan using radial PIC field (relaxStrokesTiltedPIC) instead of img_FF."""
+        assert self.pic is not None and self.cs_pic_coeffs_cl is not None, "call fit_pic_contact_surface() first"
+        nx_s, ny_s = nxy
+        n_scan = nx_s * ny_s
+        if scan_p0 is None:
+            scan_p0, scan_da, scan_db = self._scan_grid_auto(nxy)
+        print(f"AFMulator.run_scan_pic: nxy={nxy} nz={nz} dtip={dtip} PIC nat={self.pic.nat}")
+        print(f"  scan_p0={scan_p0}  da={scan_da}  db={scan_db}")
+        pts = np.zeros((n_scan, 4), dtype=np.float32)
+        k = 0
+        for ix in range(nx_s):
+            for iy in range(ny_s):
+                pts[k, :3] = scan_p0 + scan_da * ix + scan_db * iy
+                k += 1
+        FEs_bytes = n_scan * nz * 4 * 4
+        if FEs_bytes > self._max_alloc:
+            raise MemoryError(f"run_scan_pic: FEs buffer needs {FEs_bytes} bytes")
+        if bAlloc:
+            self.realloc_scan_buffers(n_scan, nz)
+        self.toGPU_(self.scan_pts_cl, pts)
+        FEs_h = np.zeros((n_scan * nz, 4), dtype=np.float32)
+        tipC = self.tipC.copy(); tipC[3] = np.float32(dtip)
+        gs = (self._roundup(n_scan, 1),)
+        self.prg.relaxStrokesTiltedPIC(self.queue, gs, (1,), self.cs_pic_atoms_cl, self.cs_pic_coeffs_cl, self.cs_pic_buckets_cl, self.cs_pic_offsets_cl, self.cs_pic_meta, self.cs_pic_bmeta, np.float32(self.pic.m_start), self.scan_pts_cl, self.scan_FEs_cl, self.tipA, self.tipB, tipC, self.stiffness, self.dpos0, self.relax_pars, self.surfFF, np.int32(nz))
+        self.queue.finish()
+        self.fromGPU_(self.scan_FEs_cl, FEs_h)
+        FEs = FEs_h.reshape(nx_s, ny_s, nz, 4)
+        print(f"AFMulator.run_scan_pic: done FEs.shape={FEs.shape}")
+        return FEs, pts[:, :3].reshape(nx_s, ny_s, 3)
+
+    def get_raw_FE_pic(self, nxy=(60, 60), nz=21, dtip=-0.2, scan_p0=None, scan_da=None, scan_db=None, bAlloc=True):
+        """Sample PIC field without PP relaxation."""
+        assert self.pic is not None, "call fit_pic_contact_surface() first"
+        nx_s, ny_s = nxy
+        n_scan = nx_s * ny_s
+        if scan_p0 is None:
+            scan_p0, scan_da, scan_db = self._scan_grid_auto(nxy)
+        print(f"AFMulator.get_raw_FE_pic: nxy={nxy} nz={nz} dtip={dtip}")
+        pts = np.zeros((n_scan, 4), dtype=np.float32)
+        k = 0
+        for ix in range(nx_s):
+            for iy in range(ny_s):
+                pts[k, :3] = scan_p0 + scan_da * ix + scan_db * iy
+                k += 1
+        if bAlloc:
+            self.realloc_scan_buffers(n_scan, nz)
+        self.toGPU_(self.scan_pts_cl, pts)
+        FEs_h = np.zeros((n_scan * nz, 4), dtype=np.float32)
+        dTip = np.array([0., 0., dtip, 0.], dtype=np.float32)
+        gs = (self._roundup(n_scan, 1),)
+        self.prg.getFEinStrokesTiltedPIC(self.queue, gs, (1,), self.cs_pic_atoms_cl, self.cs_pic_coeffs_cl, self.cs_pic_buckets_cl, self.cs_pic_offsets_cl, self.cs_pic_meta, self.cs_pic_bmeta, np.float32(self.pic.m_start), self.scan_pts_cl, self.scan_FEs_cl, self.tipA, self.tipB, self.tipC, dTip, self.dpos0, np.int32(nz))
+        self.queue.finish()
+        self.fromGPU_(self.scan_FEs_cl, FEs_h)
+        FEs = FEs_h.reshape(nx_s, ny_s, nz, 4)
+        print(f"AFMulator.get_raw_FE_pic: done FEs.shape={FEs.shape}")
+        return FEs, pts[:, :3].reshape(nx_s, ny_s, 3)
 
     # ── raw FF (no PP relaxation) ─────────────────────────────────────────────
 

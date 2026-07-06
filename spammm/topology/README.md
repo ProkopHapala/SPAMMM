@@ -23,6 +23,9 @@ See also: `kernels/README.md` (GPU force fields consume topology via `AtomicSyst
 | `HexGrid.py` | Hexagonal grid snapping and transforms |
 | `heterocycle_generator.py` | Build heterocycles from rectangular hex-lattice specs |
 | `ascii_art_heterocycle.py` | ASCII art → 2D geometry; `:` H-bond marks; `resolve_hbond_pairs()` |
+| `hbond_utils.py` | H-bond records on synced graphs; RC control→fraction mapping |
+| `scan_dataset.py` | `ScanDataset` `.npz` trajectories (geometry, charges, optional ESP) |
+| `scan_kekule.py` | C–C bond length vs control along scan paths |
 
 ## Data flow
 
@@ -56,10 +59,19 @@ pytest tests/topology/test_editing_ops.py --develop -s   # + .out/.log + PNG
 
 Artifacts: `debug/test_editing_ops/`
 
-## ASCII H-bonds & proton transfer
+| `ascii_art_heterocycle.py` | ASCII art → 2D geometry; `:` H-bond marks; `resolve_hbond_pairs()` |
+| `hbond_utils.py` | H-bond records on synced graphs; RC control→fraction mapping |
+| `scan_dataset.py` | `ScanDataset` `.npz` trajectories (geometry, charges, optional ESP) |
+| `scan_kekule.py` | C–C bond length vs control along scan paths |
+
+## Reaction-coordinate scan
+
+Graph-backed H-bond scans: **`find_hbonds_graph`** + **`ScanDataset`**. Topical doc: `doc/Topics/ReactionCoordinateScan.md`. Tests: `tests/topology/test_scan_dataset.py`.
+
+## ASCII H-bonds & proton transfer (legacy)
 
 `spammm/quantum/hbond_scan.py` — see `spammm/quantum/README.md`  
-**Tests:** `tests/topology/test_ascii_art.py`, `tests/topology/test_hbond_scan.py` (if present)
+**Tests:** `tests/topology/test_ascii_art.py`, `tests/topology/test_hbond_scan.py`
 
 ## OpenCL kernels (downstream)
 

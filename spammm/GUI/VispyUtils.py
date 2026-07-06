@@ -76,6 +76,19 @@ def compute_bond_colors_by_length(bonds, pos, color_range=(0.0, 1.0)):
     return np.array(bond_segs, dtype=np.float32), np.array(bond_colors, dtype=np.float32)
 
 
+def compute_bond_colors_by_delta(bonds, pos, delta, scale=0.08):
+    """Bond colors from Δlength vs reference frame [Å]. Blue=shortened, red=elongated."""
+    bond_segs, bond_colors = [], []
+    scale = max(float(scale), 1e-6)
+    for i, b in enumerate(bonds):
+        ia, ja = int(b[0]), int(b[1])
+        bond_segs.extend([pos[ia], pos[ja]])
+        t = float(np.clip(delta[i] / scale, -1.0, 1.0))
+        f = 0.5 + 0.5 * t
+        bond_colors.extend([[f, 0.25, 1.0 - f, 1.0], [f, 0.25, 1.0 - f, 1.0]])
+    return np.array(bond_segs, dtype=np.float32), np.array(bond_colors, dtype=np.float32)
+
+
 def generate_atom_labels(label_mode, pos, enames, atom_npi=None, backend=None, bonds=None):
     """Generate text labels for atoms based on label_mode.
     

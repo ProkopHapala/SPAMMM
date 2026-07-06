@@ -153,17 +153,46 @@ Helpers: `macro_phi_rect_*`, `folded_eval_basis/grad`, `getR4repulsion`.
 
 ## contact_surface.cl
 
-Quasi-2D contact surface for static AFM. See `doc/Topics/AFM/ContactSurface_Static.md`.
+Quasi-2D contact field for **aperiodic rigid PP-AFM** — replaces `interpFE(img_FF)` during
+relaxation. Two representations share brute Morse reference and CG helpers.
+Spec: `doc/Topics/AFM/ContactSurface_Static.md` · pitfalls: `doc/Takeways.md`
+
+### Separable (B-spline × poly)
 
 | Kernel | Role |
 |--------|------|
-| `cs_brute_plqh_points` | Brute Morse+PLQH reference |
-| `evalSeparableBsplinePoly` | Separable B-spline × poly eval |
-| `cs_sep_Av`, `cs_sep_Atv*` | Separable fit operators |
-| `cs_pic_*`, `evalRadialPIC` | PIC fit/eval |
-| `dot_wg`, `addMul`, `cs_zero`, `cs_copy` | CG helpers |
+| `cs_eval_separable_fe_at` | Inline E,F at probe position (h₀ chain rule) |
+| `evalSeparableBsplinePoly` | Batch eval on query list |
+| `cs_sep_Av`, `cs_sep_Atv` | Matrix-free fit operators |
+| `cs_sep_Atv_w`, `cs_sep_Atv_f_w` | Weighted Atv (Boltzmann + force rows) |
+| `cs_sep_Av_f` | Force stencil for fit (`fcomp` = Fx/Fy/Fz) |
+| `cs_sep_stencil`, `cs_sep_stencil_f` | Basis stencil assembly |
+| `relaxStrokesTiltedContact` | PP-AFM relaxation using separable field |
 
-**Driver:** `python tests/testplot_contact_surface.py` → `debug/testplot_contact_surface/`
+### PIC (radial atom-centric)
+
+| Kernel | Role |
+|--------|------|
+| `cs_eval_pic_fe_at` | Inline E,F — shared by eval and PP relaxation |
+| `evalRadialPIC` | Point-list PIC eval |
+| `cs_pic_eval_tile16` | 16×16 tiled eval with cooperative atom preload |
+| `cs_pic_Av`, `cs_pic_Atv`, `cs_pic_Atv_w` | Matrix-free PIC fit |
+| `relaxStrokesTiltedPIC` | PP-AFM relaxation using PIC field |
+
+### Reference & helpers
+
+| Kernel | Role |
+|--------|------|
+| `cs_brute_plqh_points` | Brute Morse+PLQH at query points |
+| `poly_z_doubling_modes` | Compact z/radial basis `t^(m·2^k)` |
+| `dot_wg`, `addMul`, `cs_zero`, `cs_copy` | CG vector ops |
+
+**Build:** `common` + `Forces` + `contact_surface` (standalone `ContactSurfaceCL`);
+AFMulator adds `AFM.cl` for full scan stack.
+
+**Drivers:**
+- `pytest tests/SPM/test_afm_contact_surface.py` — L0
+- `RUN_CONTACT_PP=1 python tests/testplot_contact_surface.py` → `debug/testplot_contact_surface/`
 
 ---
 

@@ -142,6 +142,16 @@ EXTENSION_REGISTRY = {
         dependencies=[], req_paths=[],
         build_ui='build_ui',
     ),
+    'reaction_coord': dict(
+        module='spammm.GUI.ReactionCoordinateExtension', class_name=None,
+        dependencies=[], req_paths=[],
+        build_ui='build_ui',
+    ),
+    'vibrations': dict(
+        module='spammm.GUI.VibrationExtension', class_name=None,
+        dependencies=[], req_paths=[],
+        build_ui='build_ui',
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -162,6 +172,8 @@ DEFAULT_CONFIG = {
     'ascii':    dict(enabled=True),
     'qeq':      dict(enabled=True),
     'fragments': dict(enabled=True),
+    'reaction_coord': dict(enabled=True),
+    'vibrations': dict(enabled=True),
 }
 
 # ---------------------------------------------------------------------------

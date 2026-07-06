@@ -147,6 +147,7 @@ class MoleculeEditorBackend:
         self._rings_dirty = True  # flag to re-detect geometry rings
         self.auto_h_cap = True  # auto-adjust hydrogen caps when structure changes
         self.auto_recalc_bonds = False  # auto-recalculate bonds based on distance (DANGEROUS - can create spurious bonds)
+        self.constraint_set = set()  # Atom._id pinned in space (RC scan, DFTB relax, FF)
 
     @property
     def a_CC(self):
@@ -287,6 +288,34 @@ class MoleculeEditorBackend:
         # Store bond_list and ring_list for picking/visualization
         self._bond_list = bond_list
         self._ring_list = ring_list
+
+    def ensure_sys(self):
+        """Sync graph→sys when graph has atoms; keep sys when loaded externally (e.g. ASCII)."""
+        if self.graph.atoms:
+            self._sync_sys()
+
+    def toggle_constraint(self, atom_id):
+        """Toggle spatial pin by Atom._id. Returns True if now constrained."""
+        if atom_id in self.constraint_set:
+            self.constraint_set.discard(atom_id)
+            return False
+        self.constraint_set.add(atom_id)
+        return True
+
+    def toggle_constraint_by_index(self, idx):
+        self.ensure_sys()
+        return self.toggle_constraint(int(self._atom_ids[idx]))
+
+    def constraint_mask(self):
+        self.ensure_sys()
+        return np.array([aid in self.constraint_set for aid in self._atom_ids], dtype=bool)
+
+    def fixed_atom_indices(self):
+        """Dense atom indices for DFTB MovedAtoms / constrained relax."""
+        return np.where(self.constraint_mask())[0].tolist()
+
+    def clear_constraints(self):
+        self.constraint_set.clear()
 
     def detect_geometry_rings(self, max_ring_size=8):
         """Detect geometry rings from bond graph and store them in graph.rings.
@@ -1302,9 +1331,10 @@ class MoleculeEditorBackend:
 
     def get_graph_bond_orders(self):
         """Return (pi_bonds, pi_orders) for rendering, from Bond.order on the graph."""
-        if self._bond_list is None or len(self._bond_list) == 0:
-            self._sync_sys()
-        if self._bond_list is None or len(self._bond_list) == 0 or self.sys.bonds is None:
+        if not getattr(self, '_bond_list', None):
+            if self.graph.atoms:
+                self._sync_sys()
+        if not getattr(self, '_bond_list', None) or len(self._bond_list) == 0 or self.sys.bonds is None:
             return None, None
         orders = np.array([b.order for b in self._bond_list], dtype=float)
         pi = np.abs(orders - 1.0) > 0.01

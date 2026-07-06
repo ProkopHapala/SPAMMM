@@ -1,26 +1,35 @@
 # quantum/
 
-Quantum chemistry integration for electron density computation and constrained scans. Densities feed into the FDBM AFM method in `SPM/`.
+Quantum chemistry integration: DFTB+ scans, Hessians for vibrations, electron densities for FDBM AFM.
 
-- **DFTB_utils.py** — DFTB+ integration: input generation, output parsing, SK parameter management; `run_dftb_sp`, `save_xyz_movie`, `constrained_scan`, H-transfer helpers (`identify_hbond_transfer`, `make_axis_path`)
-- **hbond_scan.py** — Rigid DFTB proton-transfer scan for ASCII `:` H-bond systems: H slides along donor→acceptor axis at **0.1 Å** steps (default); PNG + multi-frame XYZ with `s`, `f`, `E`, `dE` in comment lines
-- **pySCF_utils.py** — pySCF RHF/DFT calculations for electron densities on 3D grids (alternative to DFTB for higher accuracy)
-- **DFTB/** — DFTB+ ctypes wrapper, basis parser, GPU density projection, basis optimizer
+- **DFTB_utils.py** — DFTB+ I/O, `run_dftb_sp` / `run_dftb_relax`, Mulliken parse, Hessian, `clean_dftb_workdir`, failure diagnostics
+- **coordinate_scan.py** — Reaction-coordinate engine: control grids, pm-NEB (endpoint relax + all-atom interp), Mulliken charges per frame → `ScanDataset`
+- **esp_grid.py** — Precompute Coulomb ESP stacks `[nframes, ny, nx]` from charges (KE/r, same as QEq)
+- **hbond_scan.py** — Legacy ASCII rigid proton-transfer scan (0.1 Å axis steps); kept for existing tests
+- **pySCF_utils.py** — pySCF RHF/DFT grid densities
+- **DFTB/** — ctypes wrapper, basis parser, GPU density projection, basis optimizer
 
-## H-bond proton-transfer scan
+## Reaction-coordinate scan (graph / GUI)
 
-**Pipeline:** `build_ascii_hbond_system(name)` → `identify_hbond_from_ascii()` → `run_hbond_transfer_scan(ds=0.1)` → `save_hbond_scan_artifacts()`
+**SSOT:** `coordinate_scan.py` + `topology/scan_dataset.py`. Topical doc: `doc/Topics/ReactionCoordinateScan.md`.
 
-**Requires:** `DFTB_EXE`, `DFTB_SK_PATH` (validated at import of `DFTB_utils`).
-
-**Run:**
 ```bash
-python tests/topology/testplot_hbond_scan.py --name 2Quinolone --step 0.1
-pytest tests/topology/test_hbond_scan.py::test_hbond_scan_2quinolone -s   # slow, coarse grid
+PYTHONPATH=. python3 spammm/GUI/gui_scripts/rc_scan_offline.py
+pytest tests/topology/test_scan_dataset.py::test_pm_neb_relaxed_dftb -s
+./run_gui.sh --script spammm/GUI/gui_scripts/rc_scan_review.py
 ```
 
-**Artifacts:** `debug/test_hbond_scan/hbond_{name}_p{pair}.{png,xyz}` + per-point DFTB dirs `{name}_p{pair}/pt_*`
+**Requires:** `DFTB_EXE`, `DFTB_SK_PATH`.
 
-**Caveats:** rigid scan (heavy atoms fixed); DFTB SCC may fail near acceptor — `on_fail='skip'`; charge restart from previous converged point.
+**Caveats:** GUI geometry must use `build_ascii_hbond_system` (see `doc/Takeways.md`); pm-NEB relaxed runs Mulliken SP on every interpolated frame.
 
-**Topology input:** `spammm/topology/ascii_art_heterocycle.py` — see `topology/README.md`.
+## H-bond proton-transfer scan (ASCII legacy)
+
+**Pipeline:** `build_ascii_hbond_system(name)` → `run_hbond_transfer_scan(ds=0.1)` → `save_hbond_scan_artifacts()`
+
+```bash
+python tests/topology/testplot_hbond_scan.py --name 2Quinolone --step 0.1
+pytest tests/topology/test_hbond_scan.py -s
+```
+
+**Artifacts:** `debug/test_hbond_scan/hbond_*.{png,xyz}`

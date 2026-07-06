@@ -6,7 +6,7 @@
 //
 // Kernels:
 //   - cs_brute_plqh_points: Brute Morse+PLQH reference at query points (validation)
-//   - evalSeparableBsplinePoly: Separable field eval; F = ∇E
+//   - evalSeparableBsplinePoly: Separable field eval; F = -∇E (AFM force convention)
 //   - cs_sep_Av / cs_sep_Atv / cs_sep_Atv_masked: Matrix-free separable fit operators
 //   - cs_pic_Av / cs_pic_Atv / cs_pic_eval_tile16 / evalRadialPIC: PIC fit and eval
 //   - CG helpers: dot_wg, addMul, setLinear, cs_zero, cs_copy
@@ -123,7 +123,7 @@ inline float poly_z_basis(float dz, float invRc, float power, float* dphi_dz) {
 inline void poly_z_doubling_modes(float dist, float invRc, int m_start, int nz, float* phi, float* dphi) {
     float x = fmin(fmax(dist, 0.0f) * invRc, 1.0f);
     float t = 1.0f - x;
-    bool active = (dist > 0.0f) && (x < 1.0f);
+    bool active = (dist >= 0.0f) && (x < 1.0f);
     float tpow = 1.0f;
     for (int i = 0; i < m_start; i++) { tpow *= t; }
     float dtpow = 0.0f;
@@ -187,7 +187,7 @@ inline void cs_interp_h0_grad(float4 Bx, float4 dBx, float4 By, float4 dBy, int 
 }
 
 inline void cs_sep_stencil(float x, float y, float z,
-    int ncx, int ncy, int nz, float x0, float y0, float dx, float dy, float invRc, int m_start,
+    int ncx, int ncy, int nz, float x0, float y0, float z_start, float dx, float dy, float invRc, int m_start,
     __global const float* h0, int* out_n, int* out_ic, float* out_w) {
     float ux = (x - x0) / dx;
     float uy = (y - y0) / dy;
@@ -198,7 +198,7 @@ inline void cs_sep_stencil(float x, float y, float z,
     bspline4(tx, &Bx, &dBx);
     bspline4(ty, &By, &dBy);
     float z0b = cs_interp_h0(Bx, By, ix, iy, ncx, ncy, h0);
-    float dz = fmax(z - z0b, 0.0f);
+    float dz = fmax(z - z0b - z_start, 0.0f);
     float bx[4] = {Bx.x, Bx.y, Bx.z, Bx.w};
     float by[4] = {By.x, By.y, By.z, By.w};
     float phi[8];
@@ -214,6 +214,60 @@ inline void cs_sep_stencil(float x, float y, float z,
                 if (ixk < 0 || ixk >= ncx) continue;
                 int ic = ixk + ncx * (jy + ncy * kz);
                 float w = bx[ii] * by[j] * phi[kz];
+                if (fabs(w) < 1e-20f) continue;
+                out_ic[n] = ic;
+                out_w[n] = w;
+                n++;
+            }
+        }
+    }
+    *out_n = n;
+}
+
+// fcomp: 0=Fx, 1=Fy, 2=Fz  (F = -∇E, same as cs_eval_separable_fe_at)
+inline void cs_sep_stencil_f(float x, float y, float z,
+    int ncx, int ncy, int nz, float x0, float y0, float z_start, float dx, float dy, float invRc, int m_start,
+    __global const float* h0, int fcomp, int* out_n, int* out_ic, float* out_w) {
+    float ux = (x - x0) / dx;
+    float uy = (y - y0) / dy;
+    float tx, ty;
+    int ix = cs_bspline_cell(ux, &tx);
+    int iy = cs_bspline_cell(uy, &ty);
+    float4 Bx, dBx, By, dBy;
+    bspline4(tx, &Bx, &dBx);
+    bspline4(ty, &By, &dBy);
+    float z0b = cs_interp_h0(Bx, By, ix, iy, ncx, ncy, h0);
+    float dz0_dx = 0.0f;
+    float dz0_dy = 0.0f;
+    cs_interp_h0_grad(Bx, dBx, By, dBy, ix, iy, ncx, ncy, dx, dy, h0, &dz0_dx, &dz0_dy);
+    float dz = fmax(z - z0b - z_start, 0.0f);
+    float bx[4] = {Bx.x, Bx.y, Bx.z, Bx.w};
+    float by[4] = {By.x, By.y, By.z, By.w};
+    float dbx[4] = {dBx.x, dBx.y, dBx.z, dBx.w};
+    float dby[4] = {dBy.x, dBy.y, dBy.z, dBy.w};
+    float phi[8];
+    float dphi[8];
+    poly_z_doubling_modes(dz, invRc, m_start, nz, phi, dphi);
+    int n = 0;
+    for (int kz = 0; kz < nz; kz++) {
+        for (int j = 0; j < 4; j++) {
+            int jy = iy - 1 + j;
+            if (jy < 0 || jy >= ncy) continue;
+            for (int ii = 0; ii < 4; ii++) {
+                int ixk = ix - 1 + ii;
+                if (ixk < 0 || ixk >= ncx) continue;
+                int ic = ixk + ncx * (jy + ncy * kz);
+                float bxy = bx[ii] * by[j];
+                float dbxy_dx = dbx[ii] * by[j] / dx;
+                float dbxy_dy = bx[ii] * dby[j] / dy;
+                float w;
+                if (fcomp == 0) {
+                    w = -(dbxy_dx * phi[kz] - bxy * dphi[kz] * dz0_dx);
+                } else if (fcomp == 1) {
+                    w = -(dbxy_dy * phi[kz] - bxy * dphi[kz] * dz0_dy);
+                } else {
+                    w = -bxy * dphi[kz];
+                }
                 if (fabs(w) < 1e-20f) continue;
                 out_ic[n] = ic;
                 out_w[n] = w;
@@ -242,10 +296,13 @@ __kernel void cs_brute_plqh_points(
     const int iq = get_global_id(0);
     const int iL = get_local_id(0);
     const int nL = get_local_size(0);
-    if (iq >= nq) return;
+    const bool active_q = (iq < nq);
     const float K = -GFFParams.y;
     const float R2damp = GFFParams.x * GFFParams.x;
-    float3 pos = (float3)(queries[iq * 3 + 0], queries[iq * 3 + 1], queries[iq * 3 + 2]);
+    float3 pos = (float3)(0.0f, 0.0f, 0.0f);
+    if (active_q) {
+        pos = (float3)(queries[iq * 3 + 0], queries[iq * 3 + 1], queries[iq * 3 + 2]);
+    }
     float4 fe = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
     for (int j0 = 0; j0 < natoms; j0 += nL) {
         int j = j0 + iL;
@@ -260,38 +317,32 @@ __kernel void cs_brute_plqh_points(
         barrier(CLK_LOCAL_MEM_FENCE);
         for (int jl = 0; jl < nL; jl++) {
             int ja = jl + j0;
-            if (ja < natoms) {
+            if (active_q && ja < natoms) {
                 float3 dp = pos - LATOMS[jl].xyz;
                 float4 fej = getMorsePLQH(dp, LREQS[jl], PLQH, K, R2damp);
-                fe.xyz += fej.xyz;
+                fe.xyz -= fej.xyz;
                 fe.w += fej.w;
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    out_fe[iq] = fe;
+    if (active_q) out_fe[iq] = fe;
 }
 
 // ===================== separable eval =====================
 
-__kernel void evalSeparableBsplinePoly(
-    __global const float* queries,
-    __global float4* out_fe,
+inline float4 cs_eval_separable_fe_at(
+    float x, float y, float z,
     __global const float* coeffs,
     __global const float* h0,
     const int4 meta,
     const float4 origin_step,
     const float2 dy_rc,
-    const float2 invRc_mstart,
-    const int nq
+    const float2 invRc_mstart
 ) {
-    int i = get_global_id(0);
-    if (i >= nq) return;
-    float x = queries[i * 3 + 0];
-    float y = queries[i * 3 + 1];
-    float z = queries[i * 3 + 2];
     float x0 = origin_step.x;
     float y0 = origin_step.y;
+    float z_start = origin_step.z;
     float dx = origin_step.w;
     float dy = dy_rc.x;
     float invRc = invRc_mstart.x;
@@ -311,7 +362,7 @@ __kernel void evalSeparableBsplinePoly(
     float dz0_dx = 0.0f;
     float dz0_dy = 0.0f;
     cs_interp_h0_grad(Bx, dBx, By, dBy, ix, iy, ncx, ncy, dx, dy, h0, &dz0_dx, &dz0_dy);
-    float dz = fmax(z - z0b, 0.0f);
+    float dz = fmax(z - z0b - z_start, 0.0f);
     float phi[8];
     float dphi[8];
     poly_z_doubling_modes(dz, invRc, m_start, nz, phi, dphi);
@@ -344,7 +395,26 @@ __kernel void evalSeparableBsplinePoly(
             }
         }
     }
-    out_fe[i] = (float4)(dEdx, dEdy, dEdz, E);
+    return (float4)(-dEdx, -dEdy, -dEdz, E);
+}
+
+__kernel void evalSeparableBsplinePoly(
+    __global const float* queries,
+    __global float4* out_fe,
+    __global const float* coeffs,
+    __global const float* h0,
+    const int4 meta,
+    const float4 origin_step,
+    const float2 dy_rc,
+    const float2 invRc_mstart,
+    const int nq
+) {
+    int i = get_global_id(0);
+    if (i >= nq) return;
+    float x = queries[i * 3 + 0];
+    float y = queries[i * 3 + 1];
+    float z = queries[i * 3 + 2];
+    out_fe[i] = cs_eval_separable_fe_at(x, y, z, coeffs, h0, meta, origin_step, dy_rc, invRc_mstart);
 }
 
 __kernel void cs_sep_Av(
@@ -368,14 +438,51 @@ __kernel void cs_sep_Av(
     int nz = meta.z;
     float x0 = origin_step.x;
     float y0 = origin_step.y;
+    float z_start = origin_step.z;
     float dx = origin_step.w;
     float dy = dy_rc.x;
     float invRc = invRc_mstart.x;
     int m_start = (int)invRc_mstart.y;
-    int ic[80];
-    float w[80];
+    int ic[128];
+    float w[128];
     int nn = 0;
-    cs_sep_stencil(x, y, z, ncx, ncy, nz, x0, y0, dx, dy, invRc, m_start, h0, &nn, ic, w);
+    cs_sep_stencil(x, y, z, ncx, ncy, nz, x0, y0, z_start, dx, dy, invRc, m_start, h0, &nn, ic, w);
+    float acc = 0.0f;
+    for (int k = 0; k < nn; k++) { acc += coeffs[ic[k]] * w[k]; }
+    out_y[is] = acc;
+}
+
+__kernel void cs_sep_Av_f(
+    __global const float* queries,
+    __global const float* coeffs,
+    __global float* out_y,
+    __global const float* h0,
+    const int4 meta,
+    const float4 origin_step,
+    const float2 dy_rc,
+    const float2 invRc_mstart,
+    const int ns,
+    const int fcomp
+) {
+    int is = get_global_id(0);
+    if (is >= ns) return;
+    float x = queries[is * 3 + 0];
+    float y = queries[is * 3 + 1];
+    float z = queries[is * 3 + 2];
+    int ncx = meta.x;
+    int ncy = meta.y;
+    int nz = meta.z;
+    float x0 = origin_step.x;
+    float y0 = origin_step.y;
+    float z_start = origin_step.z;
+    float dx = origin_step.w;
+    float dy = dy_rc.x;
+    float invRc = invRc_mstart.x;
+    int m_start = (int)invRc_mstart.y;
+    int ic[128];
+    float w[128];
+    int nn = 0;
+    cs_sep_stencil_f(x, y, z, ncx, ncy, nz, x0, y0, z_start, dx, dy, invRc, m_start, h0, fcomp, &nn, ic, w);
     float acc = 0.0f;
     for (int k = 0; k < nn; k++) { acc += coeffs[ic[k]] * w[k]; }
     out_y[is] = acc;
@@ -402,15 +509,93 @@ __kernel void cs_sep_Atv(
     int nz = meta.z;
     float x0 = origin_step.x;
     float y0 = origin_step.y;
+    float z_start = origin_step.z;
     float dx = origin_step.w;
     float dy = dy_rc.x;
     float invRc = invRc_mstart.x;
     int m_start = (int)invRc_mstart.y;
-    int ic[80];
-    float w[80];
+    int ic[128];
+    float w[128];
     int nn = 0;
-    cs_sep_stencil(x, y, z, ncx, ncy, nz, x0, y0, dx, dy, invRc, m_start, h0, &nn, ic, w);
+    cs_sep_stencil(x, y, z, ncx, ncy, nz, x0, y0, z_start, dx, dy, invRc, m_start, h0, &nn, ic, w);
     float vy = vec_y[is];
+    for (int k = 0; k < nn; k++) {
+        atomic_add_f(&out_x[ic[k]], w[k] * vy);
+    }
+}
+
+__kernel void cs_sep_Atv_w(
+    __global const float* queries,
+    __global const float* vec_y,
+    __global float* out_x,
+    __global const float* h0,
+    __global const float* sample_w,
+    const int4 meta,
+    const float4 origin_step,
+    const float2 dy_rc,
+    const float2 invRc_mstart,
+    const int ns,
+    const float row_scale
+) {
+    int is = get_global_id(0);
+    if (is >= ns) return;
+    float x = queries[is * 3 + 0];
+    float y = queries[is * 3 + 1];
+    float z = queries[is * 3 + 2];
+    int ncx = meta.x;
+    int ncy = meta.y;
+    int nz = meta.z;
+    float x0 = origin_step.x;
+    float y0 = origin_step.y;
+    float z_start = origin_step.z;
+    float dx = origin_step.w;
+    float dy = dy_rc.x;
+    float invRc = invRc_mstart.x;
+    int m_start = (int)invRc_mstart.y;
+    int ic[128];
+    float w[128];
+    int nn = 0;
+    cs_sep_stencil(x, y, z, ncx, ncy, nz, x0, y0, z_start, dx, dy, invRc, m_start, h0, &nn, ic, w);
+    float vy = vec_y[is] * sample_w[is] * row_scale;
+    for (int k = 0; k < nn; k++) {
+        atomic_add_f(&out_x[ic[k]], w[k] * vy);
+    }
+}
+
+__kernel void cs_sep_Atv_f_w(
+    __global const float* queries,
+    __global const float* vec_y,
+    __global float* out_x,
+    __global const float* h0,
+    __global const float* sample_w,
+    const int4 meta,
+    const float4 origin_step,
+    const float2 dy_rc,
+    const float2 invRc_mstart,
+    const int ns,
+    const int fcomp,
+    const float force_weight
+) {
+    int is = get_global_id(0);
+    if (is >= ns) return;
+    float x = queries[is * 3 + 0];
+    float y = queries[is * 3 + 1];
+    float z = queries[is * 3 + 2];
+    int ncx = meta.x;
+    int ncy = meta.y;
+    int nz = meta.z;
+    float x0 = origin_step.x;
+    float y0 = origin_step.y;
+    float z_start = origin_step.z;
+    float dx = origin_step.w;
+    float dy = dy_rc.x;
+    float invRc = invRc_mstart.x;
+    int m_start = (int)invRc_mstart.y;
+    int ic[128];
+    float w[128];
+    int nn = 0;
+    cs_sep_stencil_f(x, y, z, ncx, ncy, nz, x0, y0, z_start, dx, dy, invRc, m_start, h0, fcomp, &nn, ic, w);
+    float vy = vec_y[is] * sample_w[is] * force_weight;
     for (int k = 0; k < nn; k++) {
         atomic_add_f(&out_x[ic[k]], w[k] * vy);
     }
@@ -439,14 +624,15 @@ __kernel void cs_sep_Atv_masked(
     int nz = meta.z;
     float x0 = origin_step.x;
     float y0 = origin_step.y;
+    float z_start = origin_step.z;
     float dx = origin_step.w;
     float dy = dy_rc.x;
     float invRc = invRc_mstart.x;
     int m_start = (int)invRc_mstart.y;
-    int ic[80];
-    float w[80];
+    int ic[128];
+    float w[128];
     int nn = 0;
-    cs_sep_stencil(x, y, z, ncx, ncy, nz, x0, y0, dx, dy, invRc, m_start, h0, &nn, ic, w);
+    cs_sep_stencil(x, y, z, ncx, ncy, nz, x0, y0, z_start, dx, dy, invRc, m_start, h0, &nn, ic, w);
     float vy = vec_y[is];
     for (int k = 0; k < nn; k++) {
         if (ic[k] >= coeff_i0 && ic[k] < coeff_i1) {
@@ -564,9 +750,9 @@ __kernel void cs_pic_eval_tile16(
             E += c * phi[m];
             if (r > 1e-8f) {
                 float dE_dr = c * dphi_dr[m];
-                Fx += dE_dr * (dxp / r);
-                Fy += dE_dr * (dyp / r);
-                Fz += dE_dr * (dzp / r);
+                Fx -= dE_dr * (dxp / r);
+                Fy -= dE_dr * (dyp / r);
+                Fz -= dE_dr * (dzp / r);
             }
         }
     }
@@ -693,12 +879,12 @@ __kernel void cs_pic_Atv(
     }
 }
 
-// legacy 1D PIC eval (fallback for irregular query lists)
-__kernel void evalRadialPIC(
+__kernel void cs_pic_Atv_w(
     __global const float* queries,
-    __global float4* out_fe,
+    __global const float* vec_y,
+    __global float* out_c,
+    __global const float* sample_w,
     __global const float4* atoms,
-    __global const float* atom_coeffs,
     __global const int* bucket_atoms,
     __global const int* bucket_offsets,
     const int4 meta,
@@ -711,6 +897,59 @@ __kernel void evalRadialPIC(
     float x = queries[i * 3 + 0];
     float y = queries[i * 3 + 1];
     float z = queries[i * 3 + 2];
+    float vy = vec_y[i] * sample_w[i];
+    int nat = meta.x;
+    int nmodes = meta.y;
+    int nbuckets = meta.z;
+    int nbx = meta.w;
+    int nby = (nbuckets + nbx - 1) / nbx;
+    float x0 = bucket_meta.x;
+    float y0 = bucket_meta.y;
+    float cell = bucket_meta.z;
+    float invRc = bucket_meta.w;
+    int bx = (int)floor((x - x0) / cell);
+    int by = (int)floor((y - y0) / cell);
+    for (int dyb = -1; dyb <= 1; dyb++) {
+        for (int dxb = -1; dxb <= 1; dxb++) {
+            int bix = bx + dxb;
+            int biy = by + dyb;
+            if (bix < 0 || biy < 0 || bix >= nbx || biy >= nby) continue;
+            int bid = biy * nbx + bix;
+            if (bid < 0 || bid >= nbuckets) continue;
+            int i0 = bucket_offsets[bid];
+            int i1 = bucket_offsets[bid + 1];
+            for (int ia = i0; ia < i1; ia++) {
+                int at = bucket_atoms[ia];
+                if (at < 0 || at >= nat) continue;
+                float4 ap = atoms[at];
+                float dxp = x - ap.x;
+                float dyp = y - ap.y;
+                float dzp = z - ap.z;
+                float r = sqrt(dxp * dxp + dyp * dyp + dzp * dzp + 1e-20f);
+                if (r >= 1.0f / invRc) continue;
+                float phi[8];
+                float dphi[8];
+                int ms = (int)m_start;
+                poly_z_doubling_modes(r, invRc, ms, nmodes, phi, dphi);
+                for (int m = 0; m < nmodes; m++) {
+                    atomic_add_f(&out_c[at * nmodes + m], phi[m] * vy);
+                }
+            }
+        }
+    }
+}
+
+// PIC field at one point (shared by evalRadialPIC and PP-AFM relaxation)
+inline float4 cs_eval_pic_fe_at(
+    float x, float y, float z,
+    __global const float4* atoms,
+    __global const float* atom_coeffs,
+    __global const int* bucket_atoms,
+    __global const int* bucket_offsets,
+    const int4 meta,
+    const float4 bucket_meta,
+    const float m_start
+) {
     float x0 = bucket_meta.x;
     float y0 = bucket_meta.y;
     float cell = bucket_meta.z;
@@ -754,13 +993,270 @@ __kernel void evalRadialPIC(
                     E += c * phi[m];
                     if (r > 1e-8f) {
                         float dE_dr = c * dphi_dr[m];
-                        Fx += dE_dr * (dxp / r);
-                        Fy += dE_dr * (dyp / r);
-                        Fz += dE_dr * (dzp / r);
+                        Fx -= dE_dr * (dxp / r);
+                        Fy -= dE_dr * (dyp / r);
+                        Fz -= dE_dr * (dzp / r);
                     }
                 }
             }
         }
     }
-    out_fe[i] = (float4)(Fx, Fy, Fz, E);
+    return (float4)(Fx, Fy, Fz, E);
 }
+
+// legacy 1D PIC eval (fallback for irregular query lists)
+__kernel void evalRadialPIC(
+    __global const float* queries,
+    __global float4* out_fe,
+    __global const float4* atoms,
+    __global const float* atom_coeffs,
+    __global const int* bucket_atoms,
+    __global const int* bucket_offsets,
+    const int4 meta,
+    const float4 bucket_meta,
+    const float m_start,
+    const int nq
+) {
+    int i = get_global_id(0);
+    if (i >= nq) return;
+    float x = queries[i * 3 + 0];
+    float y = queries[i * 3 + 1];
+    float z = queries[i * 3 + 2];
+    out_fe[i] = cs_eval_pic_fe_at(x, y, z, atoms, atom_coeffs, bucket_atoms, bucket_offsets, meta, bucket_meta, m_start);
+}
+
+// ===================== AFMulator integration (requires AFM.cl before this file) =====================
+#ifndef AFM_STANDALONE
+
+__attribute__((reqd_work_group_size(CS_ATOM_TILE, 1, 1)))
+__kernel void cs_brute_afm_morse_c_points(
+    const int natoms,
+    __global const float4* atoms,
+    __global const float4* cMs,
+    __global const float* queries,
+    __global float4* out_fe,
+    const int nq,
+    float4 Qs,
+    float4 QZs
+) {
+    __local float4 LATOMS[CS_ATOM_TILE];
+    __local float4 LCMS[CS_ATOM_TILE];
+    const int iq = get_global_id(0);
+    const int iL = get_local_id(0);
+    const int nL = get_local_size(0);
+    const bool active_q = (iq < nq);
+    float3 pos = (float3)(0.0f, 0.0f, 0.0f);
+    if (active_q) {
+        pos = (float3)(queries[iq * 3 + 0], queries[iq * 3 + 1], queries[iq * 3 + 2]);
+    }
+    float4 fe = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+    Qs *= COULOMB_CONST;
+    for (int j0 = 0; j0 < natoms; j0 += nL) {
+        int j = j0 + iL;
+        float4 ap = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 cm = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+        if (j < natoms) {
+            ap = atoms[j];
+            cm = cMs[j];
+        }
+        LATOMS[iL] = ap;
+        LCMS[iL] = cm;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int jl = 0; jl < nL; jl++) {
+            int ja = jl + j0;
+            if (active_q && ja < natoms) {
+                float4 xyzq = LATOMS[jl];
+                float3 dp = pos - xyzq.xyz;
+                fe += getMorse(dp, LCMS[jl].xyz);
+                fe += getCoulombAFM(xyzq, pos + (float3)(0.0f, 0.0f, QZs.x)) * Qs.x;
+                fe += getCoulombAFM(xyzq, pos + (float3)(0.0f, 0.0f, QZs.y)) * Qs.y;
+                fe += getCoulombAFM(xyzq, pos + (float3)(0.0f, 0.0f, QZs.z)) * Qs.z;
+                fe += getCoulombAFM(xyzq, pos + (float3)(0.0f, 0.0f, QZs.w)) * Qs.w;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (active_q) out_fe[iq] = fe;
+}
+
+__kernel void getFEinStrokesTiltedContact(
+    __global const float* coeffs,
+    __global const float* h0,
+    const int4 meta,
+    const float4 origin_step,
+    const float2 dy_rc,
+    const float2 invRc_mstart,
+    __global float4* points,
+    __global float4* FEs,
+    float4 tipA,
+    float4 tipB,
+    float4 tipC,
+    float4 dTip,
+    float4 dpos0,
+    int nz
+) {
+    float4 dpos0_ = dpos0;
+    dpos0_.xyz = rotMatT(dpos0_.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+    float3 tipPos = points[get_global_id(0)].xyz;
+    float3 pos = tipPos.xyz + dpos0_.xyz;
+    for (int iz = 0; iz < nz; iz++) {
+        float4 fe = cs_eval_separable_fe_at(pos.x, pos.y, pos.z, coeffs, h0, meta, origin_step, dy_rc, invRc_mstart);
+        float4 fe_;
+        fe_.xyz = rotMat(fe.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+        fe_.w = fe.w;
+        FEs[get_global_id(0) * nz + iz] = fe_;
+        tipPos += dTip.xyz;
+        pos += dTip.xyz;
+    }
+}
+
+__kernel void relaxStrokesTiltedContact(
+    __global const float* coeffs,
+    __global const float* h0,
+    const int4 meta,
+    const float4 origin_step,
+    const float2 dy_rc,
+    const float2 invRc_mstart,
+    __global float4* points,
+    __global float4* FEs,
+    float4 tipA,
+    float4 tipB,
+    float4 tipC,
+    float4 stiffness,
+    float4 dpos0,
+    float4 relax_params,
+    float4 surfFF,
+    int nz
+) {
+    const float3 dTip = tipC.xyz * tipC.w;
+    float4 dpos0_ = dpos0;
+    dpos0_.xyz = rotMatT(dpos0_.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+    float3 tipPos = points[get_global_id(0)].xyz;
+    float3 pos = tipPos.xyz + dpos0_.xyz;
+    float dt = relax_params.x;
+    float damp = relax_params.y;
+    float dtmax = dt;
+    float dtmin = dtmax * 0.1f;
+    float damp0 = damp;
+    for (int iz = 0; iz < nz; iz++) {
+        float4 fe;
+        float3 v = (float3)(0.0f, 0.0f, 0.0f);
+        for (int i = 0; i < N_RELAX_STEP_MAX; i++) {
+            fe = cs_eval_separable_fe_at(pos.x, pos.y, pos.z, coeffs, h0, meta, origin_step, dy_rc, invRc_mstart);
+            float3 f = fe.xyz;
+            float3 dpos = pos - tipPos;
+            float3 dpos_ = rotMat(dpos, tipA.xyz, tipB.xyz, tipC.xyz);
+            float3 ftip = tipForce(dpos_, stiffness, dpos0);
+            f += rotMatT(ftip, tipA.xyz, tipB.xyz, tipC.xyz);
+            f += tipC.xyz * surfFF.x;
+            #if OPT_FIRE
+            v = update_FIRE(f, v, &dt, &damp, dtmin, dtmax, damp0);
+            #else
+            v *= (1.0f - damp);
+            #endif
+            v += f * dt;
+            pos.xyz += v * dt;
+            if (dot(f, f) < F2CONV) break;
+        }
+        fe = cs_eval_separable_fe_at(pos.x, pos.y, pos.z, coeffs, h0, meta, origin_step, dy_rc, invRc_mstart);
+        float4 fe_;
+        fe_.xyz = rotMat(fe.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+        fe_.w = fe.w;
+        FEs[get_global_id(0) * nz + iz] = fe_;
+        tipPos += dTip.xyz;
+        pos += dTip.xyz;
+    }
+}
+
+__kernel void getFEinStrokesTiltedPIC(
+    __global const float4* pic_atoms,
+    __global const float* pic_coeffs,
+    __global const int* bucket_atoms,
+    __global const int* bucket_offsets,
+    const int4 pic_meta,
+    const float4 pic_bucket_meta,
+    const float m_start,
+    __global float4* points,
+    __global float4* FEs,
+    float4 tipA,
+    float4 tipB,
+    float4 tipC,
+    float4 dTip,
+    float4 dpos0,
+    int nz
+) {
+    float4 dpos0_ = dpos0;
+    dpos0_.xyz = rotMatT(dpos0_.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+    float3 tipPos = points[get_global_id(0)].xyz;
+    float3 pos = tipPos.xyz + dpos0_.xyz;
+    for (int iz = 0; iz < nz; iz++) {
+        float4 fe = cs_eval_pic_fe_at(pos.x, pos.y, pos.z, pic_atoms, pic_coeffs, bucket_atoms, bucket_offsets, pic_meta, pic_bucket_meta, m_start);
+        float4 fe_;
+        fe_.xyz = rotMat(fe.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+        fe_.w = fe.w;
+        FEs[get_global_id(0) * nz + iz] = fe_;
+        tipPos += dTip.xyz;
+        pos += dTip.xyz;
+    }
+}
+
+__kernel void relaxStrokesTiltedPIC(
+    __global const float4* pic_atoms,
+    __global const float* pic_coeffs,
+    __global const int* bucket_atoms,
+    __global const int* bucket_offsets,
+    const int4 pic_meta,
+    const float4 pic_bucket_meta,
+    const float m_start,
+    __global float4* points,
+    __global float4* FEs,
+    float4 tipA,
+    float4 tipB,
+    float4 tipC,
+    float4 stiffness,
+    float4 dpos0,
+    float4 relax_params,
+    float4 surfFF,
+    int nz
+) {
+    const float3 dTip = tipC.xyz * tipC.w;
+    float4 dpos0_ = dpos0;
+    dpos0_.xyz = rotMatT(dpos0_.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+    float3 tipPos = points[get_global_id(0)].xyz;
+    float3 pos = tipPos.xyz + dpos0_.xyz;
+    float dt = relax_params.x;
+    float damp = relax_params.y;
+    float dtmax = dt;
+    float dtmin = dtmax * 0.1f;
+    float damp0 = damp;
+    for (int iz = 0; iz < nz; iz++) {
+        float4 fe;
+        float3 v = (float3)(0.0f, 0.0f, 0.0f);
+        for (int i = 0; i < N_RELAX_STEP_MAX; i++) {
+            fe = cs_eval_pic_fe_at(pos.x, pos.y, pos.z, pic_atoms, pic_coeffs, bucket_atoms, bucket_offsets, pic_meta, pic_bucket_meta, m_start);
+            float3 f = fe.xyz;
+            float3 dpos = pos - tipPos;
+            float3 dpos_ = rotMat(dpos, tipA.xyz, tipB.xyz, tipC.xyz);
+            float3 ftip = tipForce(dpos_, stiffness, dpos0);
+            f += rotMatT(ftip, tipA.xyz, tipB.xyz, tipC.xyz);
+            f += tipC.xyz * surfFF.x;
+            #if OPT_FIRE
+            v = update_FIRE(f, v, &dt, &damp, dtmin, dtmax, damp0);
+            #else
+            v *= (1.0f - damp);
+            #endif
+            v += f * dt;
+            pos.xyz += v * dt;
+            if (dot(f, f) < F2CONV) break;
+        }
+        fe = cs_eval_pic_fe_at(pos.x, pos.y, pos.z, pic_atoms, pic_coeffs, bucket_atoms, bucket_offsets, pic_meta, pic_bucket_meta, m_start);
+        float4 fe_;
+        fe_.xyz = rotMat(fe.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+        fe_.w = fe.w;
+        FEs[get_global_id(0) * nz + iz] = fe_;
+        tipPos += dTip.xyz;
+        pos += dTip.xyz;
+    }
+}
+
+#endif // AFM_STANDALONE

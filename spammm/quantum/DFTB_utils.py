@@ -569,6 +569,41 @@ def write_dftb_input_sp(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxs
     _write_dftb_input_base(enames, xyz_path, out_path, sk_prefix, scctol, maxscc, analysis_block="")
 
 
+def write_dftb_input_relax(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxscc=400, max_steps=1000, grad_elem=1e-4):
+    """Write gas-phase DFTB+ geometry optimization input (same Hamiltonian as SP, no D3)."""
+    if not sk_prefix.endswith('/'):
+        sk_prefix = sk_prefix + '/'
+    species = sorted(set(enames))
+    max_ang = {s: '"s"' if s == 'H' else '"p"' for s in species}
+    max_ang_str = '\n    '.join([f'{s} = {max_ang[s]}' for s in species])
+    hsd = f"""Geometry = xyzFormat {{
+  <<< "{os.path.basename(xyz_path)}"
+}}
+Driver = GeometryOptimization {{
+  Optimizer = LBFGS {{ Memory = 20 }}
+  MovedAtoms = 1:-1
+  MaxSteps = {max_steps}
+  OutputPrefix = "geom.out"
+  Convergence {{ GradElem = {grad_elem} }}
+}}
+Hamiltonian = DFTB {{
+  SCC = Yes
+  SlaterKosterFiles = Type2FileNames {{
+    Prefix = "{sk_prefix}"
+    Separator = "-"
+    Suffix = ".skf"
+  }}
+  MaxAngularMomentum {{
+    {max_ang_str}
+  }}
+  SCCTolerance = {scctol}
+  MaxSccIterations = {maxscc}
+}}
+"""
+    with open(out_path, 'w') as f:
+        f.write(hsd)
+
+
 def write_dftb_input_for_density(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxscc=200):
     """Write DFTB+ input for density projection (adds WriteEigenvectors + WriteDetailedXml)."""
     _write_dftb_input_base(enames, xyz_path, out_path, sk_prefix, scctol, maxscc,  analysis_block="  WriteEigenvectors = Yes", options_block="  WriteDetailedXml = Yes")
@@ -629,7 +664,69 @@ def run_dftb_for_density(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz'
     return res   # (geo, evecs)
 
 
-def run_dftb_sp(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz', maxscc=200, restart_charges_from=None):
+_DFTB_STALE = ('OUT', 'ERR', 'dftb_in.hsd', 'geom.xyz', 'charges.bin', 'detailed.out', 'geom.out.gen', 'geom.out.xyz', 'band.out', 'mu.dat', 'eigenvec.bin', 'detailed.xml')
+
+
+def clean_dftb_workdir(work_dir):
+    """Remove stale DFTB+ artifacts so a failed run cannot poison the next attempt."""
+    os.makedirs(work_dir, exist_ok=True)
+    for fn in _DFTB_STALE:
+        p = os.path.join(work_dir, fn)
+        if os.path.isfile(p):
+            os.remove(p)
+
+
+def dftb_failure_summary(work_dir, tail=10):
+    """Short diagnostic string from DFTB+ OUT/ERR after a non-zero exit."""
+    parts = []
+    for label, fname in (('OUT', 'OUT'), ('ERR', 'ERR')):
+        path = os.path.join(work_dir, fname)
+        if not os.path.isfile(path):
+            continue
+        with open(path) as f:
+            lines = [ln.rstrip() for ln in f.readlines() if ln.strip()]
+        if not lines:
+            continue
+        err_hits = [ln for ln in lines if 'ERROR' in ln or 'SCC is NOT' in ln or 'Stop' in ln or 'Geometry step' in ln]
+        if err_hits:
+            parts.append(f"{label} error: {err_hits[-1]}")
+        parts.append(f"{label} tail:\n" + '\n'.join(f"      {ln}" for ln in lines[-tail:]))
+    return '\n    '.join(parts) if parts else f"no OUT/ERR in {work_dir}"
+
+
+def parse_mulliken_charges(fname='detailed.out', natoms=None):
+    """Parse last Mulliken gross-charge block from DFTB+ detailed.out."""
+    with open(fname) as f:
+        lines = f.readlines()
+    blocks = []
+    i = 0
+    while i < len(lines):
+        if 'Atom           Charge' in lines[i]:
+            charges, j = [], i + 1
+            while j < len(lines):
+                ws = lines[j].split()
+                if len(ws) >= 2:
+                    try:
+                        charges.append(float(ws[1]))
+                        j += 1
+                        continue
+                    except ValueError:
+                        pass
+                break
+            if charges:
+                blocks.append(np.array(charges, dtype=np.float64))
+            i = j
+        else:
+            i += 1
+    if not blocks:
+        raise ValueError(f"No Mulliken charges found in {fname}")
+    q = blocks[-1]
+    if natoms is not None and len(q) != natoms:
+        raise ValueError(f"Expected {natoms} Mulliken charges, got {len(q)} in {fname}")
+    return q
+
+
+def run_dftb_sp(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz', maxscc=200, restart_charges_from=None, return_charges=False):
     """Run DFTB+ single-point calculation in work_dir.
 
     Returns energy in Ha.  Raises RuntimeError on failure.
@@ -649,7 +746,61 @@ def run_dftb_sp(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz', maxscc=
         ret = os.system(f'{DFTB_EXE} > OUT 2> ERR')
         if ret != 0:
             raise RuntimeError(f"DFTB+ failed in {work_dir}")
-        return parse_energy_out('OUT')
+        e_ha = parse_energy_out('OUT')
+        if return_charges:
+            detailed = os.path.join(work_dir, 'detailed.out')
+            q = parse_mulliken_charges(detailed, natoms=len(enames))
+            return e_ha, q
+        return e_ha
+    finally:
+        os.chdir(cwd)
+
+
+def run_dftb_relax(work_dir, enames, apos, sk_set=None, xyz_fname='geom.xyz', restart_charges_from=None, verbose=True, on_fail='raise', clean=True, sp_warmup=True, maxscc=400):
+    """Gas-phase DFTB+ geometry optimization. Returns (E_ha, apos_relaxed)."""
+    import shutil
+    if clean:
+        clean_dftb_workdir(work_dir)
+    else:
+        os.makedirs(work_dir, exist_ok=True)
+    enames = list(enames)
+    apos = np.asarray(apos, dtype=float)
+    sk_prefix = get_sk_path(sk_set)
+    xyz_path = os.path.join(work_dir, xyz_fname)
+    hsd_path = os.path.join(work_dir, 'dftb_in.hsd')
+    au.save_xyz(xyz_path, enames, apos)
+    charges_path = os.path.join(work_dir, 'charges.bin')
+    if restart_charges_from and os.path.isfile(restart_charges_from):
+        shutil.copy(restart_charges_from, charges_path)
+    elif sp_warmup:
+        try:
+            run_dftb_sp(work_dir, enames, apos, sk_prefix, xyz_fname=xyz_fname, maxscc=maxscc, restart_charges_from=restart_charges_from)
+        except RuntimeError as exc:
+            if verbose:
+                print(f"    WARN: SP warmup failed ({exc}); continuing relax without charges")
+            if os.path.isfile(charges_path):
+                os.remove(charges_path)
+    write_dftb_input_relax(enames, xyz_path, hsd_path, sk_prefix, maxscc=maxscc)
+    if verbose:
+        print(f"  DFTB relax: {work_dir}  ({len(enames)} atoms)")
+    cwd = os.getcwd()
+    os.chdir(work_dir)
+    try:
+        ret = os.system(f'{DFTB_EXE} > OUT 2> ERR')
+        if ret != 0:
+            diag = dftb_failure_summary(work_dir)
+            msg = f"DFTB+ relax failed in {work_dir}\n    {diag}"
+            if on_fail == 'skip':
+                if verbose:
+                    print(f"    SKIP: DFTB+ relax failed in {work_dir}")
+                    print(f"    {diag}")
+                return np.nan, apos.copy()
+            raise RuntimeError(msg)
+        e_ha = parse_energy_out('OUT')
+        apos_out = read_relaxed_geometry(apos, do_relax=True)
+        if verbose:
+            print(f"    E = {e_ha * 27.211386245988:.4f} eV")
+        return e_ha, apos_out
     finally:
         os.chdir(cwd)
 

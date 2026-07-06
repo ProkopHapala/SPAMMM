@@ -1,18 +1,28 @@
 """
-Essence: GPU quasi-2D contact-surface fit/eval for static AFM (aperiodic rigid sample).
+ContactSurface.py — GPU quasi-2D contact field replacing 3D img_FF for static PP-AFM.
 
-Design: separable B-spline(xy) × poly(dz) with h₀ height map; radial PIC alternative.
-Brute Morse+PLQH reference, matrix-free CG on normal equations (Av/Atv).
-Coeff layout: ic = ix + ncx*(iy + ncy*kz). B-spline knots ix-1..ix+2 (GridFF convention).
-Force output F = ∇E (same as getMorsePLQH).
+Motivation: dense Morse/LJ voxel grids scale as nx×ny×nz; molecules need compact
+aperiodic fields evaluated every PP relaxation step. Two representations share the
+same brute reference and AFMulator scan API: separable B-spline(xy)×poly(dz) and
+radial atom-centric PIC.
+
+Design:
+- **Separable:** coeffs on B-spline xy grid × doubling poly modes in dz = z−h₀−poly_z0;
+  matrix-free CG (cs_sep_Av/Atv); optional Boltzmann weights + Fx,Fy,Fz force rows.
+- **PIC:** per-atom radial modes + particle-in-cell buckets; CG with Tikhonov reg≈1e-2.
+- **h₀(x,y):** max atom z in r_xy neighborhood per B-spline node (chain rule in forces).
+- **F = −∇E** throughout; F_ref GPU upload is planar [Fx…][Fy…][Fz…] not interleaved.
 
 Open issues:
-- Fit single-z slice matches E but not Fz; use z_stack around z_scan (see testplot).
-- Tile CG (`fit_separable_tiles`) still experimental; global CG preferred.
-- PIC tiled eval caps local atom preload (`CS_PIC_LOCAL_MAX`); large tiles may truncate.
-- Not integrated with AFMulator / RigidBodyAFM yet.
+- Basis/fit-region tuning open (PTCDA ~14–20 meV/Å PP Fz RMSE — workable, not optimal).
+- PIC: no force-loss rows yet; Boltzmann weights hurt close contact (fit unweighted).
+- Tile CG (`fit_separable_tiles`) experimental; global CG preferred.
+- PIC tiled eval caps local preload (`CS_PIC_LOCAL_MAX`).
+- Zero `cs_AtAp_buff` before each Atv when reusing ContactSurfaceCL across fits.
 
-Design doc: doc/Topics/AFM/ContactSurface_Static.md
+AFMulator: fit_contact_surface / run_scan_contact (separable);
+fit_pic_contact_surface / run_scan_pic (PIC).
+Design: doc/Topics/AFM/ContactSurface_Static.md · pitfalls: doc/Takeways.md
 """
 
 import os
@@ -91,13 +101,14 @@ def bspline_n_intervals(length_ang, dx):
 
 
 class SeparableParams:
-    """B-spline(xy) × poly(z - h0(x,y)) with doubling powers t^(m_start*2^k)."""
+    """B-spline(xy) × poly(z - h0(x,y) - poly_z0) with doubling powers t^(m_start*2^k)."""
 
-    def __init__(self, x0, y0, dx, dy, ncx, ncy, poly_R=10.0, m_start=4, nz=5, h0_map=None, apos=None, h0_r_xy=8.0):
+    def __init__(self, x0, y0, dx, dy, ncx, ncy, poly_R=10.0, m_start=4, nz=5, poly_z0=0.0, h0_map=None, apos=None, h0_r_xy=8.0):
         self.x0 = float(x0); self.y0 = float(y0)
         self.dx = float(dx); self.dy = float(dy)
         self.ncx = int(ncx); self.ncy = int(ncy)
         self.poly_R = float(poly_R)
+        self.poly_z0 = float(poly_z0)
         self.m_start = int(m_start)
         self.nz = int(nz)
         self.poly_powers = np.array([m_start * (2 ** k) for k in range(nz)], dtype=np.float32)
@@ -112,6 +123,15 @@ class SeparableParams:
     @property
     def n_coeff(self):
         return self.ncx * self.ncy * self.nz
+
+
+def separable_cl_args(sep: SeparableParams):
+    """OpenCL int4/float4 metadata for separable eval/fit kernels."""
+    meta = np.array([sep.ncx, sep.ncy, sep.nz, 0], dtype=np.int32)
+    origin_step = np.array([sep.x0, sep.y0, sep.poly_z0, sep.dx], dtype=np.float32)
+    dy_rc = np.array([sep.dy, sep.poly_R], dtype=np.float32)
+    invRc_mstart = np.array([1.0 / sep.poly_R, float(sep.m_start)], dtype=np.float32)
+    return meta, origin_step, dy_rc, invRc_mstart
 
 
 class PICParams:
@@ -143,14 +163,14 @@ class PICParams:
 class ContactSurfaceCL(OpenCLBase):
     """GPU contact surface: brute reference, separable CG/tile fit, PIC (pure OpenCL)."""
 
-    def __init__(self, nloc=64, **kw):
-        super().__init__(nloc=nloc, **kw)
+    def __init__(self, nloc=64, ctx=None, queue=None, **kw):
+        super().__init__(nloc=nloc, ctx=ctx, queue=queue, **kw)
         kernel_paths = [
             os.path.join(_KERNEL_DIR, 'common.cl'),
             os.path.join(_KERNEL_DIR, 'Forces.cl'),
             os.path.join(_KERNEL_DIR, 'contact_surface.cl'),
         ]
-        self.load_program_multi(kernel_paths, bPrint=False, build_options='-DDBG_UFF=0')
+        self.load_program_multi(kernel_paths, bPrint=False, build_options=['-DDBG_UFF=0', '-D', 'AFM_STANDALONE=1'])
         self._natoms = 0
         self._nq_max = 0
         self._ns_max = 0
@@ -169,11 +189,7 @@ class ContactSurfaceCL(OpenCLBase):
         return int((int(n) + int(loc) - 1) // int(loc) * int(loc))
 
     def _sep_cl_args(self, sep: SeparableParams):
-        meta = np.array([sep.ncx, sep.ncy, sep.nz, 0], dtype=np.int32)
-        origin_step = np.array([sep.x0, sep.y0, 0.0, sep.dx], dtype=np.float32)
-        dy_rc = np.array([sep.dy, sep.poly_R], dtype=np.float32)
-        invRc_mstart = np.array([1.0 / sep.poly_R, float(sep.m_start)], dtype=np.float32)
-        return meta, origin_step, dy_rc, invRc_mstart
+        return separable_cl_args(sep)
 
     def setup_separable(self, sep: SeparableParams, apos=None):
         self.sep = sep
@@ -217,7 +233,7 @@ class ContactSurfaceCL(OpenCLBase):
         ns = int(ns)
         if ns > self._ns_max:
             self._ns_max = self._roundup(ns, self.nloc)
-            self.try_make_buffers({'cs_samples': self._ns_max * 3 * 4, 'cs_Eref': self._ns_max * 4, 'cs_Ap': self._ns_max * 4}, suffix='_buff')
+            self.try_make_buffers({'cs_samples': self._ns_max * 3 * 4, 'cs_Eref': self._ns_max * 4, 'cs_Fref': self._ns_max * 3 * 4, 'cs_Ap': self._ns_max * 4, 'cs_AFp': self._ns_max * 4, 'cs_sample_w': self._ns_max * 4}, suffix='_buff')
 
     def _ensure_coeffs(self, nc):
         nc = int(nc)
@@ -253,22 +269,66 @@ class ContactSurfaceCL(OpenCLBase):
             return out[:, 3], out[:, :3]
         return None
 
-    def upload_samples(self, xyz, E_ref):
+    def upload_samples(self, xyz, E_ref, F_ref=None, sample_weights=None):
         xyz = np.ascontiguousarray(xyz, dtype=np.float32).reshape(-1, 3)
         E_ref = np.ascontiguousarray(E_ref, dtype=np.float32).reshape(-1)
         ns = len(xyz)
         self._ensure_samples(ns)
         self.toGPU_(self.cs_samples_buff, xyz.reshape(-1))
         self.toGPU_(self.cs_Eref_buff, E_ref)
+        self._use_force_loss = F_ref is not None
+        if self._use_force_loss:
+            F_ref = np.ascontiguousarray(F_ref, dtype=np.float32).reshape(-1, 3)
+            assert len(F_ref) == ns
+            # GPU layout: [Fx0..Fx_{ns-1}, Fy0.., Fz0..] for get_sub_region per component
+            self.toGPU_(self.cs_Fref_buff, np.concatenate([F_ref[:, c] for c in range(3)]))
+        self._use_sample_weights = (sample_weights is not None) or self._use_force_loss
+        if self._use_sample_weights:
+            w = np.ones(ns, dtype=np.float32) if sample_weights is None else np.ascontiguousarray(sample_weights, dtype=np.float32).reshape(-1)
+            assert len(w) == ns
+            self.toGPU_(self.cs_sample_w_buff, w)
 
-    def _cg_step_sep(self, ns, nc, meta, origin_step, dy_rc, invRc_mstart, masked_range=None, reg=0.0):
+    def _loss_row_weights(self, E_ref, F_ref, force_weight, force_equalize=True):
+        """Per-row-type weights so E and Fx,Fy,Fz contribute comparably (unit-aware equal weight)."""
+        if force_weight <= 0.0:
+            return 1.0, np.zeros(3, dtype=np.float32)
+        E_ref = np.asarray(E_ref, dtype=np.float64)
+        F_ref = np.asarray(F_ref, dtype=np.float64)
+        if not force_equalize:
+            return 1.0, np.full(3, force_weight, dtype=np.float32)
+        sE = max(float(np.sqrt(np.mean(E_ref * E_ref))), 1e-6)
+        sF = np.array([max(float(np.sqrt(np.mean(F_ref[:, c] * F_ref[:, c]))), 1e-6) for c in range(3)], dtype=np.float64)
+        return float(1.0 / (sE * sE)), (force_weight / (sF * sF)).astype(np.float32)
+
+    def _sep_atv(self, nG, ns, vec_y_buf, out_buf, meta, origin_step, dy_rc, invRc_mstart, row_scale=1.0):
+        if getattr(self, '_use_sample_weights', False):
+            self.prg.cs_sep_Atv_w(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, vec_y_buf, out_buf, self.cs_h0_buff, self.cs_sample_w_buff, meta, origin_step, dy_rc, invRc_mstart, np.int32(ns), np.float32(row_scale))
+        else:
+            self.prg.cs_sep_Atv(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, vec_y_buf, out_buf, self.cs_h0_buff, meta, origin_step, dy_rc, invRc_mstart, np.int32(ns))
+
+    def _fref_buf(self, ns, fcomp):
+        return self.cs_Fref_buff.get_sub_region(int(fcomp) * ns * 4, ns * 4)
+
+    def _sep_atv_f(self, nG, ns, fcomp, vec_y_buf, out_buf, meta, origin_step, dy_rc, invRc_mstart, force_weight):
+        self.prg.cs_sep_Atv_f_w(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, vec_y_buf, out_buf, self.cs_h0_buff, self.cs_sample_w_buff, meta, origin_step, dy_rc, invRc_mstart, np.int32(ns), np.int32(fcomp), np.float32(force_weight))
+
+    def _add_force_normal(self, nG, ns, nc, nGc, vec_y_buf, out_buf, meta, origin_step, dy_rc, invRc_mstart, force_weight, fcomp, coeffs_buf=None):
+        cbuf = self.cs_p_buff if coeffs_buf is None else coeffs_buf
+        self.prg.cs_sep_Av_f(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, cbuf, self.cs_AFp_buff, self.cs_h0_buff, meta, origin_step, dy_rc, invRc_mstart, np.int32(ns), np.int32(fcomp))
+        self._sep_atv_f(nG, ns, fcomp, self.cs_AFp_buff, out_buf, meta, origin_step, dy_rc, invRc_mstart, force_weight)
+
+    def _cg_step_sep(self, ns, nc, meta, origin_step, dy_rc, invRc_mstart, masked_range=None, reg=0.0, force_weight=0.0, wE=1.0, wF=None):
         """One CG iteration on normal equations (matrix-free Av/Atv)."""
+        wF = np.zeros(3, dtype=np.float32) if wF is None else wF
         nG = self._roundup(ns, self.nloc)
         nGc = self._roundup(nc, self.nloc)
         self.prg.cs_zero(self.queue, (nGc,), (self.nloc,), np.int32(nc), self.cs_AtAp_buff)
         self.prg.cs_sep_Av(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, self.cs_p_buff, self.cs_Ap_buff, self.cs_h0_buff, meta, origin_step, dy_rc, invRc_mstart, np.int32(ns))
         if masked_range is None:
-            self.prg.cs_sep_Atv(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, self.cs_Ap_buff, self.cs_AtAp_buff, self.cs_h0_buff, meta, origin_step, dy_rc, invRc_mstart, np.int32(ns))
+            self._sep_atv(nG, ns, self.cs_Ap_buff, self.cs_AtAp_buff, meta, origin_step, dy_rc, invRc_mstart, row_scale=wE)
+            if getattr(self, '_use_force_loss', False) and force_weight > 0.0:
+                for fcomp in range(3):
+                    self._add_force_normal(nG, ns, nc, nGc, None, self.cs_AtAp_buff, meta, origin_step, dy_rc, invRc_mstart, float(wF[fcomp]), fcomp)
         else:
             i0, i1 = masked_range
             self.prg.cs_sep_Atv_masked(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, self.cs_Ap_buff, self.cs_AtAp_buff, self.cs_h0_buff, meta, origin_step, dy_rc, invRc_mstart, np.int32(ns), np.int32(i0), np.int32(i1))
@@ -289,25 +349,35 @@ class ContactSurfaceCL(OpenCLBase):
             self.prg.cs_zero_outside(self.queue, (nGc,), (self.nloc,), np.int32(nc), self.cs_p_buff, np.int32(i0), np.int32(i1))
         return np.sqrt(rsnew / max(nc, 1))
 
-    def fit_separable_cg(self, sep: SeparableParams, xyz, E_ref, apos=None, n_iter=80, tol=1e-5, bPrint=False):
-        """Global GPU CG fit (matrix-free, no dense lstsq)."""
+    def fit_separable_cg(self, sep: SeparableParams, xyz, E_ref, F_ref=None, apos=None, n_iter=80, tol=1e-5, sample_weights=None, force_weight=0.0, force_equalize=True, bPrint=False):
+        """Global GPU CG fit. Optional WLS plus Fx,Fy,Fz rows; force_weight=1 equalizes RMS(E) vs RMS(Fα)."""
         self.setup_separable(sep, apos=apos)
-        self.upload_samples(xyz, E_ref)
+        self.upload_samples(xyz, E_ref, F_ref=F_ref if force_weight > 0.0 else None, sample_weights=sample_weights)
+        wE, wF = self._loss_row_weights(E_ref, F_ref, force_weight, force_equalize=force_equalize)
+        if bPrint and force_weight > 0.0:
+            print(f'  fit loss row weights: wE={wE:.3e}  wFx={wF[0]:.3e}  wFy={wF[1]:.3e}  wFz={wF[2]:.3e}  (equalize={force_equalize})')
         ns = len(xyz)
         nc = sep.n_coeff
         meta, origin_step, dy_rc, invRc_mstart = self._sep_cl_args(sep)
         nGc = self._roundup(nc, self.nloc)
         nG = self._roundup(ns, self.nloc)
         self.prg.cs_zero(self.queue, (nGc,), (self.nloc,), np.int32(nc), self.cs_Atb_buff)
-        self.prg.cs_sep_Atv(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, self.cs_Eref_buff, self.cs_Atb_buff, self.cs_h0_buff, meta, origin_step, dy_rc, invRc_mstart, np.int32(ns))
+        self._sep_atv(nG, ns, self.cs_Eref_buff, self.cs_Atb_buff, meta, origin_step, dy_rc, invRc_mstart, row_scale=wE)
+        if getattr(self, '_use_force_loss', False):
+            for fcomp in range(3):
+                self._sep_atv_f(nG, ns, fcomp, self._fref_buf(ns, fcomp), self.cs_Atb_buff, meta, origin_step, dy_rc, invRc_mstart, float(wF[fcomp]))
         self.prg.cs_copy(self.queue, (nGc,), (self.nloc,), np.int32(nc), self.cs_Atb_buff, self.cs_r_buff)
         self.prg.cs_sep_Av(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, self.cs_coeffs_buff, self.cs_Ap_buff, self.cs_h0_buff, meta, origin_step, dy_rc, invRc_mstart, np.int32(ns))
-        self.prg.cs_sep_Atv(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, self.cs_Ap_buff, self.cs_AtAp_buff, self.cs_h0_buff, meta, origin_step, dy_rc, invRc_mstart, np.int32(ns))
+        self.prg.cs_zero(self.queue, (nGc,), (self.nloc,), np.int32(nc), self.cs_AtAp_buff)
+        self._sep_atv(nG, ns, self.cs_Ap_buff, self.cs_AtAp_buff, meta, origin_step, dy_rc, invRc_mstart, row_scale=wE)
+        if getattr(self, '_use_force_loss', False):
+            for fcomp in range(3):
+                self._add_force_normal(nG, ns, nc, nGc, None, self.cs_AtAp_buff, meta, origin_step, dy_rc, invRc_mstart, float(wF[fcomp]), fcomp, coeffs_buf=self.cs_coeffs_buff)
         self.prg.addMul(self.queue, (nGc,), (self.nloc,), np.int32(nc), self.cs_r_buff, self.cs_AtAp_buff, np.float32(-1.0))
         self.prg.cs_copy(self.queue, (nGc,), (self.nloc,), np.int32(nc), self.cs_r_buff, self.cs_p_buff)
         t0 = time.perf_counter()
         for it in range(n_iter):
-            Ftot = self._cg_step_sep(ns, nc, meta, origin_step, dy_rc, invRc_mstart)
+            Ftot = self._cg_step_sep(ns, nc, meta, origin_step, dy_rc, invRc_mstart, force_weight=force_weight, wE=wE, wF=wF)
             if bPrint and (it % 20 == 0):
                 print(f'  sep_CG[{it}] |F|={Ftot:.3e}')
             if Ftot < tol:
@@ -319,9 +389,27 @@ class ContactSurfaceCL(OpenCLBase):
         self.prg.cs_sep_Av(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, self.cs_coeffs_buff, self.cs_Ap_buff, self.cs_h0_buff, meta, origin_step, dy_rc, invRc_mstart, np.int32(ns))
         pred = np.zeros(ns, dtype=np.float32)
         cl.enqueue_copy(self.queue, pred, self.cs_Ap_buff)
-        rmse = float(np.sqrt(np.mean((pred - np.asarray(E_ref, dtype=np.float32)) ** 2)))
+        E_ref = np.asarray(E_ref, dtype=np.float32)
+        err = pred - E_ref
+        if sample_weights is not None:
+            w = np.asarray(sample_weights, dtype=np.float64)
+            wsum = max(float(w.sum()), 1e-16)
+            rmse = float(np.sqrt(np.sum(w * err.astype(np.float64) ** 2) / wsum))
+        else:
+            rmse = float(np.sqrt(np.mean(err ** 2)))
         if bPrint:
             print(f'  fit_separable_cg: {it+1} iters, {time.perf_counter()-t0:.2f}s, RMSE={rmse:.4e}')
+            if getattr(self, '_use_force_loss', False):
+                w = np.asarray(sample_weights, dtype=np.float64) if sample_weights is not None else np.ones(ns, dtype=np.float64)
+                wsum = max(float(w.sum()), 1e-16)
+                F_ref = np.asarray(F_ref, dtype=np.float64)
+                for fcomp, label in enumerate(('Fx', 'Fy', 'Fz')):
+                    self.prg.cs_sep_Av_f(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, self.cs_coeffs_buff, self.cs_AFp_buff, self.cs_h0_buff, meta, origin_step, dy_rc, invRc_mstart, np.int32(ns), np.int32(fcomp))
+                    pred_f = np.zeros(ns, dtype=np.float32)
+                    cl.enqueue_copy(self.queue, pred_f, self.cs_AFp_buff)
+                    f_err = pred_f.astype(np.float64) - F_ref[:, fcomp]
+                    f_rmse = float(np.sqrt(np.sum(w * f_err * f_err) / wsum))
+                    print(f'  fit_separable_cg: weighted {label}_RMSE={f_rmse:.4e}  force_weight={force_weight:.3g}')
         return rmse
 
     def _tile_coeff_ranges(self, sep: SeparableParams, tile_ang, x0f, x1f, y0f, y1f):
@@ -424,27 +512,34 @@ class ContactSurfaceCL(OpenCLBase):
         self.toGPU_(self.cs_pic_offsets_buff, off)
         self.prg.cs_zero(self.queue, (self._roundup(nc, self.nloc),), (self.nloc,), np.int32(nc), self.cs_coeffs_buff)
 
-    def fit_pic_cg(self, pic: PICParams, xyz, E_ref, n_iter=60, tol=1e-5, reg=1e-4, bPrint=False):
+    def _pic_atv(self, nG, ns, vec_y_buf, out_buf, meta, bmeta, pic, m_start):
+        if getattr(self, '_use_sample_weights', False):
+            self.prg.cs_pic_Atv_w(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, vec_y_buf, out_buf, self.cs_sample_w_buff, self.cs_pic_atoms_buff, self.cs_pic_buckets_buff, self.cs_pic_offsets_buff, meta, bmeta, np.float32(m_start), np.int32(ns))
+        else:
+            self.prg.cs_pic_Atv(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, vec_y_buf, out_buf, self.cs_pic_atoms_buff, self.cs_pic_buckets_buff, self.cs_pic_offsets_buff, meta, bmeta, np.float32(m_start), np.int32(ns))
+
+    def fit_pic_cg(self, pic: PICParams, xyz, E_ref, n_iter=60, tol=1e-5, reg=1e-2, sample_weights=None, bPrint=False):
         """GPU CG fit for radial PIC coefficients (Tikhonov reg on diagonal)."""
         self.setup_pic(pic)
-        self.upload_samples(xyz, E_ref)
+        self.upload_samples(xyz, E_ref, sample_weights=sample_weights)
         ns = len(xyz)
         nc = pic.nat * pic.nmodes
         meta, bmeta = self._pic_cl_meta(pic)
         nGc = self._roundup(nc, self.nloc)
         nG = self._roundup(ns, self.nloc)
         self.prg.cs_zero(self.queue, (nGc,), (self.nloc,), np.int32(nc), self.cs_Atb_buff)
-        self.prg.cs_pic_Atv(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, self.cs_Eref_buff, self.cs_Atb_buff, self.cs_pic_atoms_buff, self.cs_pic_buckets_buff, self.cs_pic_offsets_buff, meta, bmeta, np.float32(pic.m_start), np.int32(ns))
+        self._pic_atv(nG, ns, self.cs_Eref_buff, self.cs_Atb_buff, meta, bmeta, pic, pic.m_start)
         self.prg.cs_copy(self.queue, (nGc,), (self.nloc,), np.int32(nc), self.cs_Atb_buff, self.cs_r_buff)
         self.prg.cs_pic_Av(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, self.cs_coeffs_buff, self.cs_Ap_buff, self.cs_pic_atoms_buff, self.cs_pic_buckets_buff, self.cs_pic_offsets_buff, meta, bmeta, np.float32(pic.m_start), np.int32(ns))
-        self.prg.cs_pic_Atv(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, self.cs_Ap_buff, self.cs_AtAp_buff, self.cs_pic_atoms_buff, self.cs_pic_buckets_buff, self.cs_pic_offsets_buff, meta, bmeta, np.float32(pic.m_start), np.int32(ns))
+        self.prg.cs_zero(self.queue, (nGc,), (self.nloc,), np.int32(nc), self.cs_AtAp_buff)
+        self._pic_atv(nG, ns, self.cs_Ap_buff, self.cs_AtAp_buff, meta, bmeta, pic, pic.m_start)
         self.prg.addMul(self.queue, (nGc,), (self.nloc,), np.int32(nc), self.cs_r_buff, self.cs_AtAp_buff, np.float32(-1.0))
         self.prg.cs_copy(self.queue, (nGc,), (self.nloc,), np.int32(nc), self.cs_r_buff, self.cs_p_buff)
         t0 = time.perf_counter()
         for it in range(n_iter):
             self.prg.cs_zero(self.queue, (nGc,), (self.nloc,), np.int32(nc), self.cs_AtAp_buff)
             self.prg.cs_pic_Av(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, self.cs_p_buff, self.cs_Ap_buff, self.cs_pic_atoms_buff, self.cs_pic_buckets_buff, self.cs_pic_offsets_buff, meta, bmeta, np.float32(pic.m_start), np.int32(ns))
-            self.prg.cs_pic_Atv(self.queue, (nG,), (self.nloc,), self.cs_samples_buff, self.cs_Ap_buff, self.cs_AtAp_buff, self.cs_pic_atoms_buff, self.cs_pic_buckets_buff, self.cs_pic_offsets_buff, meta, bmeta, np.float32(pic.m_start), np.int32(ns))
+            self._pic_atv(nG, ns, self.cs_Ap_buff, self.cs_AtAp_buff, meta, bmeta, pic, pic.m_start)
             if reg > 0.0:
                 self.prg.addMul(self.queue, (nGc,), (self.nloc,), np.int32(nc), self.cs_AtAp_buff, self.cs_p_buff, np.float32(reg))
             pAp = self.dot_gpu(self.cs_p_buff, self.cs_AtAp_buff, nc)
@@ -575,6 +670,76 @@ def make_fit_grid(x0, x1, y0, y1, z0, z1, dx, dy, dz):
     zs = np.arange(z0, z1 + 1e-9, dz)
     X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
     return np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
+
+
+def make_fit_grid_zstack(x0, x1, y0, y1, z_planes, dx, dy):
+    """Sample xy grid on multiple z planes (contact z-stack for Fz-constrained fit)."""
+    chunks = [make_fit_grid(x0, x1, y0, y1, float(z), float(z), dx, dy, dx) for z in z_planes]
+    return np.vstack(chunks)
+
+
+def make_fit_z_planes_adaptive(z_lo, z_hi, dz_lo=0.1, dz_hi=1.0):
+    """Non-uniform z sample offsets: dz grows linearly from dz_lo at z_lo to dz_hi at z_hi."""
+    z = float(z_lo)
+    z_hi = float(z_hi)
+    span = max(z_hi - z_lo, 1e-12)
+    planes = [z]
+    while z < z_hi - 1e-9:
+        frac = (z - z_lo) / span
+        dz = float(dz_lo) + (float(dz_hi) - float(dz_lo)) * frac
+        z = min(z + dz, z_hi)
+        if z > planes[-1] + 1e-9:
+            planes.append(z)
+    if planes[-1] < z_hi - 1e-9:
+        planes.append(z_hi)
+    return np.asarray(planes, dtype=np.float64)
+
+
+def poly_z_doubling_modes(dz, poly_R=10.0, m_start=4, nz=6, poly_z0=0.0):
+    """Z radial basis φ_k(dz) matching contact_surface.cl poly_z_doubling_modes.
+
+    dz = z - h0 [Å].  Rc = poly_R.  x = clip((dz-poly_z0)/Rc, 0, 1), t = 1-x.
+    φ_0 = t^m_start, φ_{k+1} = φ_k^2  (powers m_start·2^k).
+    Returns phi (n, nz), dphi_dz (n, nz), t, x.
+    """
+    dz = np.asarray(dz, dtype=np.float64).reshape(-1)
+    invRc = 1.0 / float(poly_R)
+    dist = dz - float(poly_z0)
+    x = np.clip(dist * invRc, 0.0, 1.0)
+    t = 1.0 - x
+    n = len(dz)
+    phi = np.zeros((n, int(nz)), dtype=np.float64)
+    dphi = np.zeros((n, int(nz)), dtype=np.float64)
+    for i in range(n):
+        di, xi, ti = float(dist[i]), float(x[i]), float(t[i])
+        active = (di >= 0.0) and (xi < 1.0)
+        tpow = ti ** int(m_start) if m_start > 0 else 1.0
+        dtpow = (-float(m_start) * invRc * (ti ** (int(m_start) - 1))) if active and m_start > 0 else 0.0
+        for k in range(int(nz)):
+            phi[i, k] = tpow
+            dphi[i, k] = dtpow if active else 0.0
+            if k + 1 < int(nz):
+                tp_n = tpow
+                tpow = tpow * tpow
+                dtpow = 2.0 * tp_n * dtpow
+    return phi, dphi, t, x
+
+
+def poly_z_mode_powers(m_start=4, nz=6):
+    """Exponent of t for each z mode: m_start * 2^k."""
+    return [int(m_start) * (2 ** k) for k in range(int(nz))]
+
+
+def boltzmann_fit_weights(E_ref, T=None, E_shift=None):
+    """Boltzmann weights w=exp(-(E-E_shift)/T), normalized to max 1. Emphasizes low-energy (vdW-well) samples."""
+    E = np.asarray(E_ref, dtype=np.float64).reshape(-1)
+    E_shift = float(E.min() if E_shift is None else E_shift)
+    if T is None:
+        spread = float(np.percentile(E, 95) - E_shift)
+        T = max(spread / 3.0, 0.05)
+    w = np.exp(-(E - E_shift) / float(T))
+    w /= max(float(w.max()), 1e-16)
+    return w.astype(np.float32), float(T), E_shift
 
 
 def eval_slice_map_gpu(ocl, eval_fn, x0, x1, y0, y1, z_scan, dx, dy):

@@ -3,6 +3,7 @@
 GPU-accelerated force field implementations and molecular dynamics. All OpenCL modules inherit from `utils/OpenCLBase.py`.
 
 - **FFController.py** — Pure-logic orchestrator: bridges AtomicSystem → forcefield build → GPU relaxation → positions/forces download (no Qt dependency)
+- **FFEvaluator.py** — Single-point UFF/SPFF `eval_fn(pos)→(E,F)` for finite-difference Hessians (`dynamics/Vibrations.py`)
 - **UFF_cl.py** — PyOpenCL UFF runtime: bonds, angles, torsions, inversions, LJ + electrostatic non-bonded (FIRE + velocity Verlet)
 - **UFFbuilder.py** — Converts AtomicSystem to UFF topology arrays (atom types, bonds, angles, torsions, inversions, exclusions)
 - **SPFF_cl.py** — PyOpenCL SPFFsp3 runtime with pi-orbital DOFs (FIRE + damped velocity Verlet)

@@ -169,6 +169,9 @@ Extensions are dynamically loaded and add collapsible panels + custom edit/view 
 | **FireCore** | Fireball DFT calculations (SCF, forces, relaxation) | `fdata_dir` |
 | **DFTB** | DFTB+ tight-binding calculations | — |
 | **AFM** | AFM/STM image simulation (OpenCL) | `pyopencl` |
+| **FF** (`ff`) | SPFF/UFF GPU relaxation panel | `pyopencl` |
+| **Vibrations** (`vibrations`) | Normal modes: DFTB or UFF/SPFF Hessian, clickable mode table + plot | `pyopencl` for FF; `DFTB_EXE` for DFTB |
+| **QEq** (`qeq`) | Charge equilibration (Cholesky/LU) | — |
 | **SPFF** | Simple Pair Force Field (classical MD) | — |
 | **Grid** | OpenCL grid projector for electron density | `pyopencl`, `fdata_dir` |
 | **Psi4** | Psi4 quantum chemistry integration | `psi4` |

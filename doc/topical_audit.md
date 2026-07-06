@@ -73,12 +73,23 @@ This **is** a supplement to:
 - **Tests:** `tests/topology/test_heterocycle_generator.py`, `tests/topology/test_ascii_art.py`, `tests/topology/test_kekule.py`
 
 ### 1e. H-Bond Proton Transfer (DFTB rigid scan)
-- Move bridging H along donor→acceptor axis; DFTB+ single-point energy profile
+- Move bridging H along donor→acceptor axis; DFTB+ single-point energy profile (ASCII pipeline)
 - **Key files:** `spammm/quantum/hbond_scan.py`, `spammm/quantum/DFTB_utils.py` (`run_dftb_sp`, `save_xyz_movie`)
 - **Topology deps:** `resolve_hbond_pairs()`, `build_ascii_hbond_system()` from ASCII examples with `:`
 - **Tests:** `tests/topology/test_hbond_scan.py` (L0 + slow DFTB), `tests/topology/testplot_hbond_scan.py`
 - **Artifacts:** `debug/test_hbond_scan/hbond_*.{png,xyz}` — XYZ comment: `s=… f=… E=… dE=…`
 - **Caveats:** 0.1 Å path grid default; rigid geometry; SCC failures skipped; uses `$DFTB_EXE` not PATH `dftb+`
+- **Superseded for graph/GUI work by:** §1h Reaction-coordinate scan
+
+### 1h. Reaction-Coordinate Scan (graph + GUI + pm-NEB)
+- Multi-H-bond control grids, `ScanDataset` trajectories, DFTB relax at endpoints, Mulliken charges, ESP animation
+- **Key files:** `spammm/quantum/coordinate_scan.py`, `spammm/topology/scan_dataset.py`, `spammm/topology/hbond_utils.py`, `spammm/quantum/esp_grid.py`, `spammm/GUI/ReactionCoordinateExtension.py`, `spammm/GUI/rc_esp_view.py`, `spammm/GUI/mpl_blit.py`
+- **DFTB:** `run_dftb_relax`, `run_dftb_sp(return_charges=True)`, `parse_mulliken_charges`, `clean_dftb_workdir`
+- **GUI scripts:** `spammm/GUI/gui_scripts/rc_scan_review.py`, `rc_scan_offline.py`; launcher `./run_gui.sh --script …`
+- **Audit document:** [Topics/ReactionCoordinateScan.md](Topics/ReactionCoordinateScan.md)
+- **Tests:** `tests/topology/test_scan_dataset.py`, `tests/GUI/test_rc_scan_gui_script.py`
+- **Artifacts:** `debug/rc_scan/`, `debug/testplot_rc_scan_gui/*.npz`, `debug/rc_scan_offline/`
+- **Caveats:** GUI molecule build must match `build_ascii_hbond_system` (not `.strip()` ASCII alone); `endpoints_relaxed` false if DFTB skip; blit rules in [Takeways.md](Takeways.md) and `mpl_blit.py`
 
 ### 1f. Molecular Editor (GUI backend)
 - Hex-grid editing, passivation, ring ops — **not** the Kekule bond-order solver
@@ -88,9 +99,10 @@ This **is** a supplement to:
 
 ### 1g. Editors & GUI
 - Interactive molecular editor: VisPy-based GUI with topology editing
-- **Key files:** `spammm/GUI/SPAMMM_GUI.py`, `spammm/GUI/VispyUtils.py`, `spammm/GUI/KekuleExtension.py`
+- **Key files:** `spammm/GUI/SPAMMM_GUI.py`, `spammm/GUI/VispyUtils.py`, `spammm/GUI/KekuleExtension.py`, `spammm/GUI/ReactionCoordinateExtension.py`, `spammm/GUI/mpl_blit.py`
 - **Audit Document:** [molecular_topology_editors.md](molecular_topology_editors.md)
 - **Feature audit:** [gui_audit.md](gui_audit.md)
+- **Developer notes:** [Takeways.md](Takeways.md) (matplotlib blit, GUI vs test geometry)
 
 ## 2. Force Fields
 
@@ -120,6 +132,14 @@ This **is** a supplement to:
 - **Caveats:** `radius=1.0` Å default (softened for rigid search); `align_flat` pre-aligns to surface; rotation dedup CPU-only, off by default
 - **Tests:** visual demo only (`testplot_assembly.py`); no pytest L0 yet
 
+### 2e. Vibrational Analysis (normal modes)
+- Hessian → rigid-mode projection → frequencies and in-plane/out-of-plane classification
+- **Key files:** `spammm/dynamics/Vibrations.py`, `spammm/dynamics/VibrationPlot.py`, `spammm/forcefields/FFEvaluator.py`, `spammm/GUI/VibrationExtension.py`
+- **DFTB Hessian:** `spammm/quantum/DFTB_utils.py` (`write_dftb_input_hessian`, `read_hessian`)
+- **Audit Document:** [Topics/Vibrations.md](Topics/Vibrations.md)
+- **Tests:** `tests/test_vibrations.py` → `debug/test_vibrations/`
+- **Caveats:** UFF/SPFF absolute frequencies not calibrated; SPFF freezes pi-orbitals in FD; phonon/PBC not implemented
+
 ## 3. Surface Interactions
 
 ### 3a. GridFF & Surface Potentials
@@ -131,12 +151,27 @@ This **is** a supplement to:
 - **Tests:** `tests/test_surface.py`, `tests/test_folded_relax.py`, `tests/surfaces/ocl_GridFF_new.py`
 
 ### 3b. Contact Surface (quasi-2D static AFM)
-- Compact alternative to 3D GridFF for aperiodic rigid samples: separable B-spline×poly + radial PIC
-- **Key files:** `spammm/surfaces/ContactSurface.py`
-- **Kernel:** `kernels/contact_surface.cl` (with `common.cl` + `Forces.cl`)
-- **Design:** [Topics/AFM/ContactSurface_Static.md](Topics/AFM/ContactSurface_Static.md)
-- **Caveats:** h₀ height map on B-spline grid; poly doubling powers `t^(m_start·2^k)`; fit needs multi-z samples near scan plane for `Fz`; `F=∇E` convention; not wired to `AFMulator` yet
-- **Tests:** visual demo `tests/testplot_contact_surface.py` → `debug/testplot_contact_surface/` (no pytest L0 yet)
+
+Compact alternative to 3D `img_FF` for aperiodic rigid PP-AFM: **separable B-spline×poly**
+(global corrugation) and **radial PIC** (per-atom compact support).
+
+**Design:** [Topics/AFM/ContactSurface_Static.md](Topics/AFM/ContactSurface_Static.md)  
+**Pitfalls:** [Takeways.md](Takeways.md) (z alignment, F_ref layout, reg, weighting, GPU buffer reuse)  
+**Module README:** [spammm/surfaces/README.md](../spammm/surfaces/README.md)
+
+| Location | Status | Notes |
+|----------|--------|-------|
+| `spammm/surfaces/ContactSurface.py` | active | `ContactSurfaceCL`, `SeparableParams`, `PICParams`, CG fit/eval |
+| `kernels/contact_surface.cl` | active | Brute, separable Av/Atv, PIC, PP relaxation kernels |
+| `spammm/SPM/AFM.py` | active | `fit_contact_surface`, `run_scan_contact`, `fit_pic_contact_surface`, `run_scan_pic` |
+| `kernels/AFM.cl` | active | Legacy `interpFE` + `relaxStrokesTilted` (3D reference) |
+| `spammm/surfaces/GridFF.py` | active | Dense 3D reference for periodic substrates (different use case) |
+
+**Parity (PTCDA Morse):** separable PP Fz RMSE ~14 meV/Å; PIC ~20 meV/Å vs 3D `run_scan`.
+L0: `tests/SPM/test_afm_contact_surface.py`. L2: `tests/testplot_contact_surface.py`.
+
+**Open issues:** basis/fit-region tuning; PIC force loss; pipeline flag `{separable,pic,grid3d}`;
+no GUI integration yet.
 
 ## 4. AFM/STM Simulation
 
@@ -158,6 +193,7 @@ This **is** a supplement to:
 
 - DFTB+ integration: subprocess, C-API, parsers, OpenCL grid projection, constrained scans
 - **Key files:** `spammm/quantum/DFTB/DFTBcore.py`, `spammm/quantum/DFTB/DFTBplusParser.py`, `spammm/quantum/DFTB/Grid_dftb.py`, `spammm/quantum/DFTB/basis_optimizer.py`, `spammm/quantum/DFTB_utils.py`, `spammm/quantum/hbond_scan.py`, `spammm/quantum/pySCF_utils.py`
+- **Hessian (vibrations):** `DFTB_utils.write_dftb_input_hessian` — used by `dynamics/Vibrations.py`
 - **Audit Document:** [afm_stm_simulation.md](afm_stm_simulation.md) (DFTB sections)
 - **Tests:** `tests/SPM/plot_dftb_vs_pyscf_basis.py`, `tests/SPM/plot_3ob_basis_tails.py`, `tests/topology/test_hbond_scan.py`
 
@@ -165,7 +201,7 @@ This **is** a supplement to:
 
 - Main GUI: VisPy-based molecular editor with extension plugins
 - **Key files:** `spammm/GUI/SPAMMM_GUI.py`, `spammm/GUI/BaseGUI.py`, `spammm/GUI/GLGUI.py`, `spammm/GUI/VispyUtils.py`, `spammm/GUI/MoleculeViewer.py`, `spammm/GUI/MolecularBrowser.py`, `spammm/GUI/ExtensionManager.py`
-- **Extensions:** `KekuleExtension.py`, `AFMExtension.py`, `FFExtension.py`, `QEqExtension.py`
+- **Extensions:** `KekuleExtension.py`, `AFMExtension.py`, `FFExtension.py`, `QEqExtension.py`, `VibrationExtension.py`
 - **Design docs:** [GUI.desing.md](GUI.desing.md), [GUI_FF_Relaxation.md](GUI_FF_Relaxation.md), [GUI_topology_edit.desing.md](GUI_topology_edit.desing.md)
 - **Audit Document:** [molecular_topology_editors.md](molecular_topology_editors.md), [gui_audit.md](gui_audit.md)
 
@@ -222,10 +258,10 @@ This **is** a supplement to:
 | Topic | Issue | Related Files | Priority |
 |-------|-------|---------------|----------|
 | **GridFF variants** | `GridFF.py` vs `GridFFRelaxedScan.py` — overlapping functionality, needs consolidation | `spammm/surfaces/GridFF.py`, `spammm/surfaces/GridFFRelaxedScan.py` | Medium |
-| **Contact surface** | Prototype in `ContactSurface.py`; no AFMulator integration; single-z fit underdetermines `Fz` | `spammm/surfaces/ContactSurface.py`, `kernels/contact_surface.cl` | Medium |
+| **Contact surface** | Separable + PIC wired; PP parity ~14–20 meV/Å Fz (PTCDA); basis tuning open | [ContactSurface_Static.md](Topics/AFM/ContactSurface_Static.md), [Takeways.md](Takeways.md) | Medium |
 | **Substrate builder** | `SubstrateBuilder.py` is minimal — no CIF parsing, lattice replication, or slab cutting | `spammm/surfaces/SubstrateBuilder.py` | Low |
 | **File I/O** | XYZ, MOL2 parsing in `atomicUtils.py` — no CIF or extended XYZ with Lattice support | `spammm/atomicUtils.py` | Low |
-| **Linear algebra** | `Lingebra_ocl.py` wrapper exists but may overlap with NumPy functionality | `spammm/utils/Lingebra_ocl.py`, `kernels/lingebra.cl` | Low |
+| **Vibrations** | Absolute UFF/DFTB frequencies vs experiment not calibrated; phonon bands unported | `dynamics/Vibrations.py`, `doc/FireCore_migration_codemap.md` | Low |
 
 ---
 
