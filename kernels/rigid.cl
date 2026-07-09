@@ -1,22 +1,124 @@
 // rigid.cl - 6-DOF rigid body dynamics with quaternion integration
+// ====================================================================
 //
-// Implements rigid-body molecular dynamics using quaternion rotations.
-// Each rigid body has position (CoM), orientation (quaternion), linear and
-// angular momentum. Integration uses symplectic Euler with Taylor-series
-// quaternion exponentials for numerical stability at small rotations.
+// RIGID BODY MOLECULAR DYNAMICS ON GPU
+// ====================================
 //
-// Kernels:
-//   - rigid_body_dynamics_kernel: MD step for rigid bodies with pairwise
-//     forces (LJ/Morse/Coulomb) between atoms, integrating both translation
-//     and rotation. Supports PBC and multiple systems.
-//   - rigid_body_gridff_kernel: MD step using precomputed GridFF (B-spline
-//     interpolated force field) for molecule-substrate interactions instead
-//     of pairwise atom-atom evaluation.
-//   - rigid_body_folded_kernel: MD step using analytic folded basis expansion
-//     (cos(kx*u)*cos(ky*v)*exp(-az*z)) for molecule-substrate interactions.
-//     Forces are computed analytically from the basis gradients — no grid
-//     precomputation needed. Coefficients are pre-fitted by
-//     fit_folded_surface_basis() to encode Pauli+London+Coulomb(Ewald).
+// This file implements rigid-body molecular dynamics (RBMD) for simulating
+// molecules adsorbed on surfaces (e.g. AFM tip manipulation). Each rigid
+// body has 6 degrees of freedom: 3 translational (CoM position) + 3
+// rotational (quaternion orientation). Forces and torques are accumulated
+// from per-atom interactions and integrated via symplectic Euler.
+//
+// --- Physics Summary ---
+//
+// State variables (per rigid body, stored in body frame):
+//   pos    = (x, y, z, mass)          — CoM position and total mass
+//   qrot   = (qx, qy, qz, qw)         — unit quaternion, body→world rotation
+//   vpos   = (vx, vy, vz, 0)          — linear velocity (NOT momentum)
+//   vrot   = (ωx, ωy, ωz, 0)         — angular velocity in BODY frame
+//   I_body = 3×3 inertia tensor (body frame, constant)
+//   Iinv   = inverse of I_body
+//
+// Equations of motion (symplectic Euler, body-frame angular velocity):
+//
+//   Translation (Newton):
+//     v += (F / m) * dt
+//     x += v * dt
+//
+//   Rotation (Euler's rigid body equation):
+//     I·ω̇ + ω × (I·ω) = τ
+//   => ω̇ = I⁻¹·(τ_body - ω × I·ω)
+//   => ω += α * dt       where α = I⁻¹·(τ_body - ω × L_body)
+//                                  L_body = I·ω
+//
+//   The gyroscopic term ω × (I·ω) is the Coriolis-like coupling that arises
+//   from expressing angular velocity in the rotating body frame. For a
+//   symmetric top (I = diag(I,I,I₃)) this produces the familiar precession.
+//   OMITTING this term causes energy drift and incorrect tumbling for
+//   asymmetric molecules (e.g. H₂O). See: Goldstein, Classical Mechanics,
+//   Ch. 4; or Landau & Lifshitz, Mechanics, §33–35.
+//
+//   Quaternion update (right-multiply = body-frame increment):
+//     q' = q ⊗ δq(ω·dt)
+//   where δq(θ) = (θ·sinc(|θ|/2), cos(|θ|/2))  is the quaternion exponential.
+//   We use a Taylor-series approximation for sinc and cos (see below).
+//   Right multiplication ensures δq is expressed in the body frame.
+//
+// --- Integration Scheme ---
+//
+//   Symplectic (semi-implicit) Euler with per-step damping:
+//     1. Compute F, τ from current positions/orientations
+//     2. Damp:  v *= damp;  ω *= damp
+//     3. Kick:  v += (F/m)·dt;  ω += α·dt
+//     4. Drift: x += v·dt;     q = normalize(q ⊗ δq(ω·dt))
+//
+//   Damping: v *= damp is equivalent to viscous drag with γ = -ln(damp)/dt.
+//   For physical (conservative) simulations set damp = 1.0.
+//   For relaxation set damp < 1 (e.g. 0.95) to dissipate energy.
+//
+//   CAVEAT: Per-step damping is NOT time-step invariant. Changing dt changes
+//   the effective friction. For reproducible physics use damp = exp(-γ·dt)
+//   and control γ, not damp directly.
+//
+// --- Validation Invariants ---
+//
+//   With F=0, τ=0, damp=1.0 (free rigid body):
+//     • |q| = 1            (quaternion norm)
+//     • R^T·R = I           (rotation orthogonality)
+//     • |v| = const         (linear momentum conservation)
+//     • L_world = R·(I·ω) = const  (angular momentum in world frame)
+//     • T_rot = ½·ω^T·I·ω = const  (rotational kinetic energy)
+//
+//   Any drift in these signals a physics bug (e.g. missing gyro term,
+//   wrong frame for torque, inconsistent I/I⁻¹).
+//
+// --- Three Kernel Variants ---
+//
+//   1. rigid_body_dynamics_kernel:
+//      Generic forces from E-field + anchor springs. No substrate potential.
+//      Used for testing and E-field-driven dynamics.
+//
+//   2. rigid_body_gridff_kernel:
+//      Forces from precomputed B-spline GridFF (3D grid of PLQ coefficients).
+//      Samples the grid at each atom's world position via tricubic B-spline
+//      interpolation with periodic boundary conditions in x,y.
+//      Grid must be pre-generated by SurfaceFF.
+//
+//   3. rigid_body_folded_kernel:
+//      Forces from analytic folded basis expansion:
+//        E(x,y,z) = Σ_{i,b} c_{i,b} · cos(2π·k_u·u) · cos(2π·k_v·v) · exp(-α·(z-z₀))
+//      where (u,v) are fractional surface-lattice coordinates.
+//      Coefficients c_{i,b} are pre-fitted per atom type by
+//      fit_folded_surface_basis() to encode Pauli+London+Coulomb(Ewald).
+//      No grid needed — fully analytic, differentiable, and fast.
+//
+//   4. rigid_body_folded_replicas_kernel:
+//      Same physics as (3) but specialized for many replicas of the SAME
+//      molecule at different positions/orientations. 1 thread = 1 replica,
+//      1 workgroup = REPLICAS_WG (128) replicas. Shared molecule data
+//      (apos_body, inertia, basis) in __local; per-replica state in registers.
+//      NO barriers inside the step loop — each thread is fully independent.
+//      Eliminates the tree reduction and barriers of kernel (3), which are
+//      wasteful for small molecules (e.g. 3-5 atoms with 32-thread WG).
+//
+// --- GPU Parallelization ---
+//
+//   Kernels 1-3: Each rigid body → one workgroup (WORKGROUP_SIZE threads).
+//   Atoms within a body are distributed across threads (ATOMS_PER_THREAD per
+//   thread). Force/torque accumulation uses tree reduction in local memory.
+//   Only thread 0 performs the integration step; results are broadcast via
+//   shared local variables and barriers.
+//
+//   Kernel 4: Each replica → one thread. No reduction, no barriers in loop.
+//   Shared molecule data loaded cooperatively to __local once.
+//
+// --- Anchor Springs (Mouse Picking) ---
+//
+//   When anchors[ia].w > 0, atom ia is pulled toward anchors[ia].xyz by a
+//   harmonic spring:  F = -k·(p_atom - p_anchor),  E = ½·k·|p_atom - p_anchor|²
+//   This models mouse-drag manipulation in the GUI. The spring contributes
+//   to both force, torque, and energy (included in atom_force.w).
 //
 // Helper functions: quat_mult, make_qrot, qrot_omega, quat_to_a/b/c,
 // sinc_div_r2_taylor, quat_factors_taylor (Taylor series for sin/cos).
@@ -26,9 +128,16 @@
 #define RIGID_DBG 0
 #endif
 
-// --- Helper Functions ---
+// ==================================================================
+//  Helper Functions
+// ==================================================================
 
-// Multiplies two quaternions (q2 * q1). No changes needed.
+// Quaternion multiplication: q_out = q1 ⊗ q2 (Hamilton product).
+// Convention: (x, y, z, w) where w is the scalar part.
+// This represents the composition of rotations: applying q1 then q2
+// corresponds to q_out = q2 ⊗ q1 (note the order).
+// In our kernels we use right-multiplication q' = q ⊗ δq to apply
+// a body-frame rotation increment.
 inline float4 quat_mult(float4 q1, float4 q2) {
     return (float4)(
         q1.w * q2.x + q1.x * q2.w + q1.y * q2.z - q1.z * q2.y,
@@ -38,8 +147,12 @@ inline float4 quat_mult(float4 q1, float4 q2) {
     );
 }
 
+// Taylor series for sin(r)/r and (1-cos(r))/r², accurate to r^6.
+// Used by the axis-angle quaternion exponential (make_qrot).
+// CAVEAT: For |r| > ~0.5 rad the O(r^8) truncation error becomes
+// non-negligible. In practice ω·dt is small (< 0.1 rad/step) so
+// this is safe. For large rotations use make_qrot (trigonometric).
 float2 sinc_div_r2_taylor(float r2){
-    // series up to r^6 terms (i.e. up to r2^3)
     // s = sin(r)/r      = 1   - r^2/6  + r^4/120 - r^6/5040
     // c = (1-cos r)/r^2 = 1/2 - r^2/24 + r^4/720 - r^6/40320
     const float s = 1.0f + r2 * ( (-1.0f/6.0f)  + r2 * ( (1.0f/120.0f) + r2 * (-1.0f/5040.0f  ) ) );
@@ -47,8 +160,13 @@ float2 sinc_div_r2_taylor(float r2){
     return (float2){s, c};
 }
 
+// Taylor series for sin(r/2)/r and cos(r/2), accurate to r^6.
+// These are the scalar/vector factors of the quaternion exponential:
+//   δq(θ) = (θ · sin(|θ|/2)/|θ|,  cos(|θ|/2))
+// where θ = ω·dt is the body-frame rotation vector.
+// Input r2 = |θ|² = dot(θ,θ).
+// CAVEAT: Same accuracy limit as sinc_div_r2_taylor — keep |ω·dt| < 0.5.
 inline float2 quat_factors_taylor(float r2){
-    // Series up to r^6 terms (i.e., up to r2^3)
     // s = sin(r/2)/r = 1/2 - r2/48 + r2^2/3840 - r2^3/645120
     // c = cos(r/2)   = 1   - r2/8  + r2^2/384  - r2^3/46080
     const float s = 0.5f + r2 * ((-1.0f/48.0f)  + r2 * ((1.0f/3840.0f) + r2 * (-1.0f/645120.0f)));
@@ -56,18 +174,26 @@ inline float2 quat_factors_taylor(float r2){
     return (float2)(s, c);
 }
 
+// Update quaternion by body-frame angular velocity ω over time dt:
+//   q' = q ⊗ δq(ω·dt)
+// Uses Taylor-series quaternion exponential (fast, accurate for small ω·dt).
 float4 qrot_omega_taylor( float4 qrot, float3 omega){
     const float r2 = dot(omega,omega);
     const float2 sc = quat_factors_taylor(r2);
     return quat_mult(qrot, (float4)(omega * sc.x, sc.y) );
 }
 
+// Build quaternion exponential δq from rotation vector θ = ω·dt:
+//   δq = (θ · sin(|θ|/2)/|θ|,  cos(|θ|/2))
+// Taylor-series version (fast path, used in all kernels).
 float4 make_qrot_taylor(  float3 omega){
     const float r2 = dot(omega,omega);
     const float2 sc = quat_factors_taylor(r2);
     return (float4)(omega * sc.x, sc.y);
 }
 
+// Build quaternion exponential δq from rotation vector θ = ω·dt.
+// Trigonometric version (exact, used for validation/large angles).
 inline float4 make_qrot(float3 omega){
     const float angle = length(omega);
     if(angle < 1e-12f) return (float4)(0.0f, 0.0f, 0.0f, 1.0f);
@@ -77,6 +203,7 @@ inline float4 make_qrot(float3 omega){
     return (float4)(axis * s, c);
 }
 
+// Update quaternion by body-frame angular velocity (trigonometric version).
 float4 qrot_omega( float4 qrot, float3 omega){
     const float4 dq  = make_qrot(omega);
     return quat_mult(qrot, dq);
@@ -84,7 +211,9 @@ float4 qrot_omega( float4 qrot, float3 omega){
 
 
 
-// Rotates a vector by a matrix, using the cl_Mat3 structure.
+// Rotate vector v by rotation matrix R: v' = R·v  (body→world transform).
+// R is stored as cl_Mat3 with rows (a, b, c) = (x-axis, y-axis, z-axis)
+// of the body frame expressed in world coordinates.
 inline float3 rotate_vec_by_matrix(const float3 v, __local const cl_Mat3* R) {
     return (float3)(
         dot(R->a.xyz, v.xyz),
@@ -93,12 +222,23 @@ inline float3 rotate_vec_by_matrix(const float3 v, __local const cl_Mat3* R) {
     );
 }
 
+// Rotate vector v by R^T: v' = R^T·v  (world→body transform).
+// Used to convert world-frame torque to body-frame torque.
 inline float3 rotate_vec_by_matrix_T(const float3 v, __local const cl_Mat3* R) {  return R->a.xyz*v.x + R->b.xyz*v.y + R->c.xyz*v.z;}
 
+// Extract body-frame axis vectors (columns of R) from quaternion q.
+// These are the rows of the rotation matrix R that maps body→world:
+//   R = [ a | b | c ]   (a = x-axis, b = y-axis, c = z-axis)
+// Standard quaternion→rotation-matrix formula (Goldstein Eq. 4.46).
 inline float3 quat_to_a( float4 q ){  return(float3)(1.0f-2.0f*(q.y*q.y + q.z*q.z),      2.0f*(q.x*q.y - q.z*q.w),      2.0f*(q.x*q.z + q.y*q.w));}
 inline float3 quat_to_b( float4 q ){  return(float3)(     2.0f*(q.x*q.y + q.z*q.w), 1.0f-2.0f*(q.x*q.x + q.z*q.z),      2.0f*(q.y*q.z - q.x*q.w));}
 inline float3 quat_to_c( float4 q ){  return(float3)(     2.0f*(q.x*q.z - q.y*q.w),      2.0f*(q.y*q.z + q.x*q.w), 1.0f-2.0f*(q.x*q.x + q.y*q.y));}
 
+// Matrix-vector products for cl_Mat3.
+//   mat3_dot(M, v)   = M·v   (rows of M dotted with v)
+//   mat3_dot_T(M, v) = M^T·v (columns of M dotted with v)
+// Used for: I·ω (inertia×angular velocity), I⁻¹·τ (inverse inertia×torque),
+//           R^T·τ_world (world→body torque transform).
 inline float3 mat3_dot(const cl_Mat3 M, const float3 v){
     return (float3)( dot(M.a.xyz, v), dot(M.b.xyz, v), dot(M.c.xyz, v) );
 }
@@ -200,10 +340,45 @@ inline float4 fe3d_pbc_comb(const float3 u, const int3 n, __global const float4*
     );
 }
 
+// ==================================================================
+//  Constants
+// ==================================================================
+// WORKGROUP_SIZE: compile-time max for local-memory arrays. The actual
+//   workgroup size (lsize) is set at kernel launch and may differ.
+//   Atom loops use lsize (runtime), NOT WORKGROUP_SIZE, for correctness.
+// ATOMS_PER_THREAD: each thread processes up to this many atoms per step.
+//   With WORKGROUP_SIZE=32 and ATOMS_PER_THREAD=4, max atoms = 128.
+// CAVEAT: If na > WORKGROUP_SIZE*ATOMS_PER_THREAD, excess atoms are
+//   silently skipped. Ensure na ≤ 128 or increase these constants.
 #define WORKGROUP_SIZE     32
 #define MAX_ATOMS_PER_BODY 128
 #define ATOMS_PER_THREAD   4
 
+// ==================================================================
+//  Kernel 1: rigid_body_dynamics_kernel (generic E-field + anchors)
+// ==================================================================
+//
+//  Simplest kernel: forces come from a uniform E-field (acting on atom
+//  charges stored in apos_body.w) plus optional anchor springs.
+//  No substrate potential. Used for testing and E-field-driven dynamics.
+//
+//  Arguments:
+//    mols[gid+1]-mols[gid] = number of atoms in body gid
+//    poss[gid]  = (x, y, z, mass)
+//    qrots[gid] = (qx, qy, qz, qw)  unit quaternion
+//    vposs[gid] = (vx, vy, vz, 0)   linear velocity
+//    vrots[gid] = (ωx, ωy, ωz, 0)  angular velocity (BODY frame)
+//    I_body_inv[gid] = I⁻¹ (body frame, 3×3)
+//    I_body[gid]     = I   (body frame, 3×3, needed for gyroscopic term)
+//    apos_body[ia]   = (x, y, z, q)  atom position in body frame, q=charge
+//    anchors[ia]     = (ax, ay, az, k)  anchor target + spring constant
+//                     k > 0: active spring; k < 0: no anchor
+//    md_params = (lin_damp, ang_damp, force_scale, torque_scale)
+//    Efield = (Ex, Ey, Ez, 0)
+//
+//  Physics: F_atom = q·E + F_anchor;  τ = Σ r_i × F_i
+//           Euler:  α = I⁻¹·(τ_body - ω × I·ω)
+//
 __kernel
 void rigid_body_dynamics_kernel(
     __global const int*      mols,
@@ -212,12 +387,14 @@ void rigid_body_dynamics_kernel(
     __global       float4*   vposs,
     __global       float4*   vrots,
     __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
     __global const float4*   apos_body,
     __global       float4*   apos_world,
     __global const float4*   anchors,
     const int   natoms,
     const int   niter,
     const float dt,
+    const float4             md_params,
     const float3  Efield
 ) {
     const int gid   = get_group_id(0);
@@ -230,6 +407,7 @@ void rigid_body_dynamics_kernel(
     __local float  inv_mass;
     __local cl_Mat3 R;
     __local cl_Mat3 Iinv_body;
+    __local cl_Mat3 Ibody;
     __local float4 Ltorq [WORKGROUP_SIZE];
     __local float4 Lforce[WORKGROUP_SIZE];
     const int ia0 = mols[gid];
@@ -243,6 +421,9 @@ void rigid_body_dynamics_kernel(
         Iinv_body.a = I_body_inv[gid].a;
         Iinv_body.b = I_body_inv[gid].b;
         Iinv_body.c = I_body_inv[gid].c;
+        Ibody.a     = I_body[gid].a;
+        Ibody.b     = I_body[gid].b;
+        Ibody.c     = I_body[gid].c;
     }
     for (int step = 0; step < niter; ++step) {
         if      (lid == 0) R.a = (float4){ quat_to_a(qrot), 0.f };
@@ -271,36 +452,58 @@ void rigid_body_dynamics_kernel(
         }
         Ltorq [lid] = total_torque;
         Lforce[lid] = total_force;
-        const int stride = WORKGROUP_SIZE/4;
         barrier(CLK_LOCAL_MEM_FENCE);
-        const int lid_ = lid & (stride-1);
-        if ( lid_==0 ){
-            float4 tq = Ltorq[lid+1];
-            for(int i=2; i<stride; i++){ tq+=Ltorq[lid+i]; }
-            Ltorq[lid]+=tq;
-        }else if ( lid_==1 ) {
-            const int id=lid-1;
-            float4 f = Lforce[id];
-            for(int i=2; i<stride; i++){ f+=Lforce[id+i]; }
-            Lforce[id]+=f;
+        for (int stride = WORKGROUP_SIZE >> 1; stride > 0; stride >>= 1) {
+            if (lid < stride) {
+                Ltorq[lid]  += Ltorq [lid + stride];
+                Lforce[lid] += Lforce[lid + stride];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
         }
-        barrier(CLK_LOCAL_MEM_FENCE);
         if ( lid == 0 ){
-            float3 f = (Lforce[0]+Lforce[stride]+Lforce[stride*2]+Lforce[stride*3]).xyz;
-            float3 tq_world = (Ltorq[0]+Ltorq[stride]+Ltorq[stride*2]+Ltorq[stride*3]).xyz;
+            // --- Integration step (thread 0 only) ---
+            //
+            // 1. Transform world-frame torque to body frame:
+            //    τ_body = R^T · τ_world
+            //
+            // 2. Compute angular momentum in body frame:
+            //    L_body = I · ω
+            //
+            // 3. Gyroscopic (Coriolis) term:
+            //    gyro = ω × L_body = ω × (I·ω)
+            //
+            // 4. Angular acceleration (Euler's equation):
+            //    α = I⁻¹ · (τ_body - gyro)
+            //
+            //    CAVEAT: The gyroscopic term MUST be inside the I⁻¹
+            //    multiplication, not subtracted from α afterwards.
+            //    Wrong:  α = I⁻¹·τ;  ω += (α - gyro)·dt  ← dimensionally inconsistent
+            //    Right:  α = I⁻¹·(τ - gyro);  ω += α·dt
+            //
+            float3 f = Lforce[0].xyz;
+            float3 tq_world = Ltorq[0].xyz;
             float3 tq_body  = mat3_dot_T(R, tq_world);
-            float3 alpha_body  = mat3_dot(Iinv_body, tq_body);
-            float3 alpha_world = mat3_dot(R, alpha_body);
-            vpos.xyz *= 0.90f;
-            vrot.xyz *= 0.90f;
+            float3 L_body    = mat3_dot(Ibody, vrot.xyz);
+            float3 gyro      = cross(vrot.xyz, L_body);
+            float3 alpha_body = mat3_dot(Iinv_body, tq_body - gyro);
+            // 5. Damping (viscous): v *= damp; ω *= damp
+            //    CAVEAT: Not time-step invariant. See file header.
+            const float lin_damp = md_params.x;
+            const float ang_damp = md_params.y;
+            vpos.xyz *= lin_damp;
+            vrot.xyz *= ang_damp;
+            // 6. Kick (velocity update)
             vpos.xyz += f * (dt * inv_mass);
-            vrot.xyz += alpha_world * dt;
+            vrot.xyz += alpha_body * dt;
+            // 7. Drift (position/orientation update)
             pos.xyz  += vpos.xyz * dt;
+            //    Quaternion: right-multiply by δq(ω·dt) = body-frame increment
             float4 dq = make_qrot_taylor(vrot.xyz * dt);
             qrot = normalize(quat_mult(qrot, dq));
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
+    // --- Write back final state and world positions ---
     if      (lid == 0) R.a = (float4){ quat_to_a(qrot), 0.f };
     else if (lid == 1) R.b = (float4){ quat_to_b(qrot), 0.f };
     else if (lid == 2) R.c = (float4){ quat_to_c(qrot), 0.f };
@@ -310,7 +513,7 @@ void rigid_body_dynamics_kernel(
         if(atom_idx >= na){ break; }
         int ia = ia0+atom_idx;
         float4 p_body  = apos_body[ia];
-        float3 p_world = pos.xyz + rotate_vec_by_matrix(p_body.xyz, &R); 
+        float3 p_world = pos.xyz + rotate_vec_by_matrix(p_body.xyz, &R);
         apos_world[ia] = (float4){p_world, 0.f};
     }
     if (lid == 0) {
@@ -321,6 +524,21 @@ void rigid_body_dynamics_kernel(
     }
 }
 
+// ==================================================================
+//  Kernel 2: rigid_body_gridff_kernel (B-spline GridFF substrate)
+// ==================================================================
+//
+//  Forces from a precomputed 3D B-spline grid of PLQ coefficients.
+//  The grid stores (dE/dx, dE/dy, dE/dz, E) at each grid point.
+//  Tricubic B-spline interpolation with PBC in x,y is used to sample
+//  at each atom's world position. Force = -∇E = -fe.xyz * inv_dg.
+//
+//  Same integration physics as Kernel 1 (Euler's equation with gyro).
+//  Additionally outputs per-atom force and energy for diagnostics.
+//
+//  Grid layout: Es[nx*ny*nz] with index = iz + nz*(iy + ny*ix)
+//  PLQ per atom: atom_PLQ[ia] = (cP, cL, Q, cH) from REQ conversion
+//
 __kernel
 void rigid_body_gridff_kernel(
     __global const int*      mols,
@@ -329,6 +547,7 @@ void rigid_body_gridff_kernel(
     __global       float4*   vposs,
     __global       float4*   vrots,
     __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
     __global const float4*   apos_body,
     __global       float4*   apos_world,
     __global const float4*   atom_PLQ,
@@ -346,6 +565,7 @@ void rigid_body_gridff_kernel(
 ) {
     const int gid   = get_group_id(0);
     const int lid   = get_local_id(0);
+    const int lsize = get_local_size(0);
     __local float4 pos;
     __local float4 qrot;
     __local float4 vpos;
@@ -353,6 +573,7 @@ void rigid_body_gridff_kernel(
     __local float  inv_mass;
     __local cl_Mat3 R;
     __local cl_Mat3 Iinv_body;
+    __local cl_Mat3 Ibody;
     __local float4 Ltorq [WORKGROUP_SIZE];
     __local float4 Lforce[WORKGROUP_SIZE];
     __local int4 xqs[4];
@@ -370,6 +591,9 @@ void rigid_body_gridff_kernel(
         Iinv_body.a = I_body_inv[gid].a;
         Iinv_body.b = I_body_inv[gid].b;
         Iinv_body.c = I_body_inv[gid].c;
+        Ibody.a     = I_body[gid].a;
+        Ibody.b     = I_body[gid].b;
+        Ibody.c     = I_body[gid].c;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     const float3 inv_dg = grid_invStep.xyz;
@@ -381,7 +605,7 @@ void rigid_body_gridff_kernel(
         float4 total_torque = (float4)(0.0f);
         float4 total_force  = (float4)(0.0f);
         for (int i=0; i<ATOMS_PER_THREAD; i++) {
-            const int atom_idx = lid + i*WORKGROUP_SIZE;
+            const int atom_idx = lid + i*lsize;
             if(atom_idx >= na) break;
             const int ia = ia0 + atom_idx;
             const float4 p_body = apos_body[ia];
@@ -389,15 +613,17 @@ void rigid_body_gridff_kernel(
             const float3 p_world = pos.xyz + r_world;
             const float4 fe = fe3d_pbc_comb((p_world - grid_p0.xyz) * inv_dg, grid_ns.xyz, BsplinePLQ, atom_PLQ[ia], xqs, yqs);
             float3 f = fe.xyz * (-inv_dg);
+            float E_atom = fe.w;
             float4 anchor = anchors[ia];
             if(anchor.w > 0.0f){
                 float3 d = p_world - anchor.xyz;
                 f += d * -anchor.w;
+                E_atom += 0.5f * anchor.w * dot(d, d);
             }
             total_force.xyz += f;
             total_torque.xyz += cross(r_world, f);
-            apos_world[ia] = (float4)(p_world, fe.w);
-            atom_force[ia] = (float4)(f, fe.w);
+            apos_world[ia] = (float4)(p_world, E_atom);
+            atom_force[ia] = (float4)(f, E_atom);
 #if RIGID_DBG
             if((gid==0)&&(step==0)&&(atom_idx<4)){
                 printf("RIGID_DBG atom %i p(%g,%g,%g) PLQ(%g,%g,%g,%g) fe(%g,%g,%g,%g)\n", atom_idx, p_world.x,p_world.y,p_world.z, atom_PLQ[ia].x,atom_PLQ[ia].y,atom_PLQ[ia].z,atom_PLQ[ia].w, f.x,f.y,f.z,fe.w);
@@ -428,24 +654,28 @@ void rigid_body_gridff_kernel(
                 printf("RIGID_DBG body f(%g,%g,%g) tq(%g,%g,%g) pos(%g,%g,%g)\n", f.x,f.y,f.z, tq_world.x,tq_world.y,tq_world.z, pos.x,pos.y,pos.z);
             }
 #endif
+            // --- Integration step (same physics as Kernel 1, see above) ---
             const float3 tq_body  = mat3_dot_T(R, tq_world);
-            const float3 alpha_body  = mat3_dot(Iinv_body, tq_body);
-            const float3 alpha_world = mat3_dot(R, alpha_body);
+            const float3 L_body    = mat3_dot(Ibody, vrot.xyz);
+            const float3 gyro      = cross(vrot.xyz, L_body);
+            const float3 alpha_body = mat3_dot(Iinv_body, tq_body - gyro);
+            //    α = I⁻¹·(τ_body - ω×Iω)   [Euler's rigid body equation]
             vpos.xyz *= lin_damp;
             vrot.xyz *= ang_damp;
             vpos.xyz += f * (dt * inv_mass);
-            vrot.xyz += alpha_world * dt;
+            vrot.xyz += alpha_body * dt;
             pos.xyz  += vpos.xyz * dt;
             qrot = normalize(quat_mult(qrot, make_qrot_taylor(vrot.xyz * dt)));
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
+    // --- Write back final state and world positions ---
     if      (lid == 0) R.a = (float4){ quat_to_a(qrot), 0.f };
     else if (lid == 1) R.b = (float4){ quat_to_b(qrot), 0.f };
     else if (lid == 2) R.c = (float4){ quat_to_c(qrot), 0.f };
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int i=0; i<ATOMS_PER_THREAD; i++) {
-        const int atom_idx = lid + i*WORKGROUP_SIZE;
+        const int atom_idx = lid + i*lsize;
         if(atom_idx >= na) break;
         const int ia = ia0 + atom_idx;
         const float4 p_body = apos_body[ia];
@@ -460,19 +690,42 @@ void rigid_body_gridff_kernel(
     }
 }
 
-// ============================================================
-//  Folded Basis Rigid Body Dynamics (rigid_body_folded_kernel)
-// ============================================================
+// ==================================================================
+//  Kernel 3: rigid_body_folded_kernel (analytic folded basis)
+// ==================================================================
 //
-//  Same integration structure as rigid_body_gridff_kernel, but evaluates
-//  surface forces from an analytic folded basis expansion:
-//    E(x,y,z) = Sum_ib  c_ib * cos(2*pi*ku*u) * cos(2*pi*kv*v) * exp(-az*(z-z0))
-//  where (u,v) are fractional coordinates w.r.t. the 2D surface lattice.
+//  Surface forces from an analytic folded basis expansion:
+//    E(x,y,z) = Σ_{i,b} c_{i,b} · cos(2π·k_u·u) · cos(2π·k_v·v) · exp(-α·(z-z₀))
 //
-//  The folded coefficients c_ib are pre-fitted (by fit_folded_surface_basis)
-//  to encode Pauli + London + Coulomb(2D Ewald) interactions per atom type.
+//  where (u,v) are fractional coordinates w.r.t. the 2D surface lattice:
+//    u = (b_y·x - b_x·y) / det    (fractional coordinate along lattice vector a)
+//    v = (-a_y·x + a_x·y) / det   (fractional coordinate along lattice vector b)
+//  with det = a_x·b_y - b_x·a_y.
 //
-//  Requires: common.cl + Forces.cl + rigid.cl  (self-contained, no surface.cl needed)
+//  The inverse lattice matrix is:
+//    [ du/dx  du/dy ]   [  b_y/det  -b_x/det ]
+//    [ dv/dx  dv/dy ] = [ -a_y/det   a_x/det ]
+//  stored as invLvec2d = (du/dx, du/dy, dv/dx, dv/dy).
+//
+//  CAVEAT: For non-orthogonal (sheared) lattices, the off-diagonal terms
+//  (du/dy, dv/dx) are non-zero and MUST be correctly assigned. Swapping
+//  them produces wrong forces for sheared cells (invisible for diagonal
+//  lattices like NaCl where off-diagonal = 0).
+//
+//  Gradient (chain rule through fractional coordinates):
+//    dE/dx = dE/du · du/dx + dE/dv · dv/dx
+//    dE/dy = dE/du · du/dy + dE/dv · dv/dy
+//    dE/dz = -α · E_basis   (for z > z₀)
+//
+//  Force on atom: F = -∇E = -Σ_b c_b · ∇basis_b
+//
+//  Same integration physics as Kernels 1 and 2 (Euler's equation with gyro).
+//
+//  Coefficients c_{i,b} are pre-fitted per atom type by
+//  fit_folded_surface_basis() to encode Pauli+London+Coulomb(Ewald).
+//  No grid precomputation needed — fully analytic and differentiable.
+//
+//  Requires: common.cl + Forces.cl + rigid.cl (self-contained)
 
 #ifndef FOLDED_BASIS_MAX_RIGID
 #define FOLDED_BASIS_MAX_RIGID 128
@@ -481,6 +734,8 @@ void rigid_body_gridff_kernel(
 #define FOLDED_TYPES_MAX_RIGID 8
 #endif
 
+// Evaluate single basis function: B(u,v,z) = cos(2π·k_u·u) · cos(2π·k_v·v) · exp(-α·max(0, z-z₀))
+// prm = (k_u, k_v, α, z₀)
 inline float folded_eval_basis_rigid(float u, float v, float z, float4 prm){
     float bx = cos( (2.0f*M_PI_F) * prm.x * u );
     float by = cos( (2.0f*M_PI_F) * prm.y * v );
@@ -489,6 +744,11 @@ inline float folded_eval_basis_rigid(float u, float v, float z, float4 prm){
     return bx * by * bz;
 }
 
+// Gradient of single basis function w.r.t. world coordinates (x, y, z).
+// Uses chain rule: dE/dx = dE/du·du/dx + dE/dv·dv/dx, etc.
+// invLvec2d = (du/dx, du/dy, dv/dx, dv/dy) — inverse 2D lattice matrix.
+// CAVEAT: du/dy and dv/dx are the off-diagonal terms. For orthogonal
+// lattices (bx=ay=0) they are zero, but for sheared cells they matter.
 inline float3 folded_eval_grad_rigid(float u, float v, float z, float4 prm, float4 invLvec2d){
     float phix = (2.0f*M_PI_F) * prm.x;
     float phiy = (2.0f*M_PI_F) * prm.y;
@@ -502,8 +762,8 @@ inline float3 folded_eval_grad_rigid(float u, float v, float z, float4 prm, floa
     float dEdv = -phiy * cu * sv * bz;
     float dEdz = (z > prm.w) ? (-prm.z * cu * cv * bz) : 0.0f;
     float dudx = invLvec2d.x;
-    float dudy = invLvec2d.z;
-    float dvdx = invLvec2d.y;
+    float dudy = invLvec2d.y;
+    float dvdx = invLvec2d.z;
     float dvdy = invLvec2d.w;
     return (float3)( dEdu*dudx + dEdv*dvdx, dEdu*dudy + dEdv*dvdy, dEdz );
 }
@@ -516,6 +776,7 @@ void rigid_body_folded_kernel(
     __global       float4*   vposs,            // 4
     __global       float4*   vrots,            // 5
     __global const cl_Mat3*  I_body_inv,       // 6
+    __global const cl_Mat3*  I_body,           // 6b
     __global const float4*   apos_body,        // 7
     __global       float4*   apos_world,       // 8
     __global       float4*   atom_force,       // 9
@@ -541,6 +802,7 @@ void rigid_body_folded_kernel(
     __local float  inv_mass;
     __local cl_Mat3 R;
     __local cl_Mat3 Iinv_body;
+    __local cl_Mat3 Ibody;
     __local float4 Ltorq [WORKGROUP_SIZE];
     __local float4 Lforce[WORKGROUP_SIZE];
     __local float4 LBASIS[FOLDED_BASIS_MAX_RIGID];
@@ -559,6 +821,9 @@ void rigid_body_folded_kernel(
         Iinv_body.a = I_body_inv[gid].a;
         Iinv_body.b = I_body_inv[gid].b;
         Iinv_body.c = I_body_inv[gid].c;
+        Ibody.a     = I_body[gid].a;
+        Ibody.b     = I_body[gid].b;
+        Ibody.c     = I_body[gid].c;
     }
     // Cooperative load of basis params and coefficients into local memory
     for (int j = lid; j < nbasis; j += lsize) {
@@ -569,7 +834,11 @@ void rigid_body_folded_kernel(
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Precompute inverse 2D lattice
+    // Precompute inverse 2D lattice matrix.
+    // Surface lattice: a = (ax, ay), b = (bx, by)  [stored as (ax, bx, ay, by)]
+    // Inverse:  [du/dx  du/dy] = [ by/det  -bx/det]
+    //           [dv/dx  dv/dy]   [-ay/det   ax/det]
+    // invLvec2d = (du/dx, du/dy, dv/dx, dv/dy)
     float ax = folded_lvec2d.x;
     float bx = folded_lvec2d.y;
     float ay = folded_lvec2d.z;
@@ -585,13 +854,16 @@ void rigid_body_folded_kernel(
         float4 total_torque = (float4)(0.0f);
         float4 total_force  = (float4)(0.0f);
         for (int i = 0; i < ATOMS_PER_THREAD; i++) {
-            const int atom_idx = lid + i*WORKGROUP_SIZE;
+            const int atom_idx = lid + i*lsize;
             if (atom_idx >= na) break;
             const int ia = ia0 + atom_idx;
             const float4 p_body = apos_body[ia];
             const float3 r_world = rotate_vec_by_matrix(p_body.xyz, &R);
             const float3 p_world = pos.xyz + r_world;
-            // Compute fractional coordinates (u,v) from world (x,y)
+            // Compute fractional coordinates (u,v) from world (x,y):
+            //   u = (du/dx)·x + (du/dy)·y
+            //   v = (dv/dx)·x + (dv/dy)·y
+            // Then wrap to [0,1) for periodicity.
             float u = invLvec2d.x*p_world.x + invLvec2d.y*p_world.y;
             float v = invLvec2d.z*p_world.x + invLvec2d.w*p_world.y;
             u = u - floor(u);
@@ -611,11 +883,14 @@ void rigid_body_folded_kernel(
                     f -= c * g;
                 }
             }
-            // Anchor spring
+            // Anchor spring (mouse picking): F = -k·(p - anchor), E = ½·k·|p-anchor|²
+            // k = anchors[ia].w; k > 0 means active, k < 0 means no anchor.
+            // Spring energy is included in E for diagnostics/conservation checks.
             float4 anchor = anchors[ia];
             if (anchor.w > 0.0f) {
                 float3 d = p_world - anchor.xyz;
                 f += d * -anchor.w;
+                E += 0.5f * anchor.w * dot(d, d);
             }
             total_force.xyz  += f;
             total_torque.xyz += cross(r_world, f);
@@ -633,6 +908,9 @@ void rigid_body_folded_kernel(
             barrier(CLK_LOCAL_MEM_FENCE);
         }
         if (lid == 0) {
+            // --- Integration step (same physics as Kernels 1 & 2) ---
+            // See rigid_body_dynamics_kernel for full derivation.
+            // α = I⁻¹·(τ_body - ω×Iω)   [Euler's rigid body equation]
             const float lin_damp    = md_params.x;
             const float ang_damp    = md_params.y;
             const float force_scale = md_params.z;
@@ -642,12 +920,13 @@ void rigid_body_folded_kernel(
             body_force [gid] = (float4)(f, 0.0f);
             body_torque[gid] = (float4)(tq_world, 0.0f);
             const float3 tq_body    = mat3_dot_T(R, tq_world);
-            const float3 alpha_body = mat3_dot(Iinv_body, tq_body);
-            const float3 alpha_world= mat3_dot(R, alpha_body);
+            const float3 L_body      = mat3_dot(Ibody, vrot.xyz);
+            const float3 gyro        = cross(vrot.xyz, L_body);
+            const float3 alpha_body  = mat3_dot(Iinv_body, tq_body - gyro);
             vpos.xyz *= lin_damp;
             vrot.xyz *= ang_damp;
             vpos.xyz += f * (dt * inv_mass);
-            vrot.xyz += alpha_world * dt;
+            vrot.xyz += alpha_body * dt;
             pos.xyz  += vpos.xyz * dt;
             qrot = normalize(quat_mult(qrot, make_qrot_taylor(vrot.xyz * dt)));
         }
@@ -659,7 +938,7 @@ void rigid_body_folded_kernel(
     else if (lid == 2) R.c = (float4){ quat_to_c(qrot), 0.f };
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int i = 0; i < ATOMS_PER_THREAD; i++) {
-        const int atom_idx = lid + i*WORKGROUP_SIZE;
+        const int atom_idx = lid + i*lsize;
         if (atom_idx >= na) break;
         const int ia = ia0 + atom_idx;
         const float4 p_body = apos_body[ia];
@@ -672,4 +951,208 @@ void rigid_body_folded_kernel(
         vposs[gid] = vpos;
         vrots[gid] = vrot;
     }
+}
+
+// ======================================================================
+//                     rigid_body_folded_replicas_kernel()
+// ======================================================================
+// Specialized kernel for many replicas of the SAME molecule at different
+// positions/orientations on a folded-basis substrate.
+//
+// 1 thread = 1 replica.  1 workgroup = REPLICAS_WG replicas.
+// Shared molecule data (apos_body, atom_type, inertia, basis) loaded once
+// to __local.  Per-replica state (pos, qrot, vpos, vrot) in registers.
+// NO barriers inside the step loop — each thread is fully independent.
+//
+// Workgroup size: REPLICAS_WG (default 128).
+// Max atoms: MAX_ATOMS_PER_BODY (128, shared in local).
+// ======================================================================
+#ifndef REPLICAS_WG
+#define REPLICAS_WG 128
+#endif
+
+__kernel
+void rigid_body_folded_replicas_kernel(
+    __global       float4*   poss,             // 1  [n_replicas]
+    __global       float4*   qrots,            // 2  [n_replicas]
+    __global       float4*   vposs,            // 3  [n_replicas]
+    __global       float4*   vrots,            // 4  [n_replicas]
+    __global const cl_Mat3*  I_body_inv,       // 5  [1] shared
+    __global const cl_Mat3*  I_body,           // 6  [1] shared
+    __global const float4*   apos_body,        // 7  [na] shared
+    __global       float4*   apos_world,       // 8  [n_replicas * na]
+    __global       float4*   atom_force,       // 9  [n_replicas * na]
+    __global       float4*   body_force,       // 10 [n_replicas]
+    __global       float4*   body_torque,      // 11 [n_replicas]
+    __global const float4*   anchors,          // 12 [n_replicas * na]
+    __global const float*    folded_coeffs,    // 13 [ntypes * nbasis]
+    __global const float4*   folded_kxyz,      // 14 [nbasis]
+    __global const int*      folded_atom_type, // 15 [na] shared
+    const int4               folded_meta,      // 16 (nbasis, ntypes, na, n_replicas)
+    const float4             folded_lvec2d,    // 17 (ax, bx, ay, by)
+    const float              dt,               // 18
+    const float4             md_params,        // 19 (lin_damp, ang_damp, force_scale, torque_scale)
+    const int                niter             // 20
+) {
+    const int tid = get_global_id(0);
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    const int nbasis = folded_meta.x;
+    const int ntypes = folded_meta.y;
+    const int na     = folded_meta.z;
+    const int n_rep  = folded_meta.w;
+
+    // ---- Local memory: shared molecule data (loaded once) ----
+    __local float4 s_apos_body[MAX_ATOMS_PER_BODY];
+    __local int    s_atom_type[MAX_ATOMS_PER_BODY];
+    __local cl_Mat3 s_Iinv;
+    __local cl_Mat3 s_Ibody;
+    __local float4 LBASIS[FOLDED_BASIS_MAX_RIGID];
+    __local float  LCOEFFS[FOLDED_TYPES_MAX_RIGID * FOLDED_BASIS_MAX_RIGID];
+
+    // ---- Cooperative load of shared data ----
+    for (int i = lid; i < na;     i += lsize) s_apos_body[i]  = apos_body[i];
+    for (int i = lid; i < na;     i += lsize) s_atom_type[i]  = folded_atom_type[i];
+    for (int j = lid; j < nbasis; j += lsize) LBASIS[j]       = folded_kxyz[j];
+    for (int j = lid; j < nbasis * ntypes; j += lsize) LCOEFFS[j] = folded_coeffs[j];
+    if (lid == 0) {
+        s_Iinv.a  = I_body_inv[0].a;  s_Iinv.b  = I_body_inv[0].b;  s_Iinv.c  = I_body_inv[0].c;
+        s_Ibody.a = I_body[0].a;      s_Ibody.b = I_body[0].b;      s_Ibody.c = I_body[0].c;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Extra threads (n_rep not multiple of REPLICAS_WG) exit after load
+    if (tid >= n_rep) return;
+
+    // ---- Per-thread state (registers) ----
+    float4 pos  = poss[tid];
+    float4 qrot = normalize(qrots[tid]);
+    float4 vpos = vposs[tid];
+    float4 vrot = vrots[tid];
+    float  inv_mass = (pos.w > 1e-8f) ? (1.0f / pos.w) : 1.0f;
+
+    // Cache inertia tensors in registers (read from local once)
+    float3 I_a  = s_Ibody.a.xyz,  I_b  = s_Ibody.b.xyz,  I_c  = s_Ibody.c.xyz;
+    float3 Ii_a = s_Iinv.a.xyz,   Ii_b = s_Iinv.b.xyz,   Ii_c = s_Iinv.c.xyz;
+
+    // Precompute inverse 2D lattice
+    float ax = folded_lvec2d.x, bx = folded_lvec2d.y;
+    float ay = folded_lvec2d.z, by = folded_lvec2d.w;
+    float det = ax*by - bx*ay;
+    float4 invLvec2d = (float4)( by/det, -bx/det, -ay/det, ax/det );
+
+    const float lin_damp    = md_params.x;
+    const float ang_damp    = md_params.y;
+    const float force_scale = md_params.z;
+    const float torque_scale= md_params.w;
+
+    // ---- Main iteration loop (NO barriers!) ----
+    for (int step = 0; step < niter; ++step) {
+        float3 Ra = quat_to_a(qrot);
+        float3 Rb = quat_to_b(qrot);
+        float3 Rc = quat_to_c(qrot);
+
+        float3 total_force  = (float3)(0.0f);
+        float3 total_torque = (float3)(0.0f);
+
+        for (int ia = 0; ia < na; ia++) {
+            float4 p_body = s_apos_body[ia];
+            float3 r_world = (float3)(dot(Ra, p_body.xyz), dot(Rb, p_body.xyz), dot(Rc, p_body.xyz));
+            float3 p_world = pos.xyz + r_world;
+
+            float u = invLvec2d.x * p_world.x + invLvec2d.y * p_world.y;
+            float v = invLvec2d.z * p_world.x + invLvec2d.w * p_world.y;
+            u = u - floor(u);
+            v = v - floor(v);
+
+            float3 f = (float3)(0.0f);
+            int ityp = s_atom_type[ia];
+            if (ityp >= 0 && ityp < ntypes) {
+                int ioff = ityp * nbasis;
+                for (int ib = 0; ib < nbasis; ib++) {
+                    float c = LCOEFFS[ioff + ib];
+                    float4 prm = LBASIS[ib];
+                    float3 g = folded_eval_grad_rigid(u, v, p_world.z, prm, invLvec2d);
+                    f -= c * g;
+                }
+            }
+
+            float4 anchor = anchors[tid * na + ia];
+            if (anchor.w > 0.0f) {
+                float3 d = p_world - anchor.xyz;
+                f += d * -anchor.w;
+            }
+
+            total_force  += f;
+            total_torque += cross(r_world, f);
+        }
+
+        // Integration (symplectic Euler, all in registers)
+        float3 f        = total_force * force_scale;
+        float3 tq_world = total_torque * torque_scale;
+        float3 tq_body  = Ra * tq_world.x + Rb * tq_world.y + Rc * tq_world.z;
+        float3 L_body   = (float3)(dot(I_a, vrot.xyz), dot(I_b, vrot.xyz), dot(I_c, vrot.xyz));
+        float3 gyro     = cross(vrot.xyz, L_body);
+        float3 rhs      = tq_body - gyro;
+        float3 alpha    = (float3)(dot(Ii_a, rhs), dot(Ii_b, rhs), dot(Ii_c, rhs));
+
+        vpos.xyz *= lin_damp;
+        vrot.xyz *= ang_damp;
+        vpos.xyz += f * (dt * inv_mass);
+        vrot.xyz += alpha * dt;
+        pos.xyz  += vpos.xyz * dt;
+        qrot = normalize(quat_mult(qrot, make_qrot_taylor(vrot.xyz * dt)));
+    }
+
+    // ---- Write final state ----
+    poss [tid] = pos;
+    qrots[tid] = qrot;
+    vposs[tid] = vpos;
+    vrots[tid] = vrot;
+
+    // ---- Recompute forces at final position for diagnostics ----
+    float3 Ra = quat_to_a(qrot);
+    float3 Rb = quat_to_b(qrot);
+    float3 Rc = quat_to_c(qrot);
+    float3 final_force  = (float3)(0.0f);
+    float3 final_torque = (float3)(0.0f);
+    float  E_tot = 0.0f;
+
+    for (int ia = 0; ia < na; ia++) {
+        float4 p_body = s_apos_body[ia];
+        float3 r_world = (float3)(dot(Ra, p_body.xyz), dot(Rb, p_body.xyz), dot(Rc, p_body.xyz));
+        float3 p_world = pos.xyz + r_world;
+        float u = invLvec2d.x * p_world.x + invLvec2d.y * p_world.y;
+        float v = invLvec2d.z * p_world.x + invLvec2d.w * p_world.y;
+        u = u - floor(u);
+        v = v - floor(v);
+
+        float E = 0.0f;
+        float3 f = (float3)(0.0f);
+        int ityp = s_atom_type[ia];
+        if (ityp >= 0 && ityp < ntypes) {
+            int ioff = ityp * nbasis;
+            for (int ib = 0; ib < nbasis; ib++) {
+                float c = LCOEFFS[ioff + ib];
+                float4 prm = LBASIS[ib];
+                float  b = folded_eval_basis_rigid(u, v, p_world.z, prm);
+                float3 g = folded_eval_grad_rigid (u, v, p_world.z, prm, invLvec2d);
+                E += c * b;
+                f -= c * g;
+            }
+        }
+        float4 anchor = anchors[tid * na + ia];
+        if (anchor.w > 0.0f) {
+            float3 d = p_world - anchor.xyz;
+            f += d * -anchor.w;
+            E += 0.5f * anchor.w * dot(d, d);
+        }
+        final_force  += f;
+        final_torque += cross(r_world, f);
+        E_tot += E;
+        apos_world[tid * na + ia] = (float4)(p_world, E);
+        atom_force [tid * na + ia] = (float4)(f, E);
+    }
+    body_force [tid] = (float4)(final_force * force_scale, E_tot);
+    body_torque[tid] = (float4)(final_torque * torque_scale, 0.0f);
 }

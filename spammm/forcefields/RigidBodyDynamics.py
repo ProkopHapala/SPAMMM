@@ -229,6 +229,7 @@ class RigidBodyDynamics(OpenCLBase):
         self.debug = bool(debug)
         self.max_atoms_per_body = max_atoms
         self.n_bodies = 0
+        self.n_replicas = 0
         self.num_atoms = 0
         self.total_atoms = 0
         self.atom_counts = None
@@ -244,12 +245,14 @@ void rigid_body_dynamics_kernel(
     __global float4*         vposs,
     __global float4*         vrots,
     __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
     __global const float4*   apos_body,
     __global float4*         apos_world,
     __global const float4*   anchors,
     const int   natoms,
     const int   niter,
     const float dt,
+    const float4             md_params,
     const float3  Efield
 )""",
             "rigid_body_gridff_kernel": """__kernel
@@ -260,6 +263,7 @@ void rigid_body_gridff_kernel(
     __global float4*         vposs,
     __global float4*         vrots,
     __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
     __global const float4*   apos_body,
     __global float4*         apos_world,
     __global const float4*   atom_PLQ,
@@ -283,6 +287,30 @@ void rigid_body_folded_kernel(
     __global       float4*   vposs,
     __global       float4*   vrots,
     __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
+    __global const float4*   apos_body,
+    __global       float4*   apos_world,
+    __global       float4*   atom_force,
+    __global       float4*   body_force,
+    __global       float4*   body_torque,
+    __global const float4*   anchors,
+    __global const float*    folded_coeffs,
+    __global const float4*   folded_kxyz,
+    __global const int*      folded_atom_type,
+    const int4               folded_meta,
+    const float4             folded_lvec2d,
+    const float              dt,
+    const float4             md_params,
+    const int                niter
+)""",
+            "rigid_body_folded_replicas_kernel": """__kernel
+void rigid_body_folded_replicas_kernel(
+    __global       float4*   poss,
+    __global       float4*   qrots,
+    __global       float4*   vposs,
+    __global       float4*   vrots,
+    __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
     __global const float4*   apos_body,
     __global       float4*   apos_world,
     __global       float4*   atom_force,
@@ -304,6 +332,8 @@ void rigid_body_folded_kernel(
         self.kernel_args = None
         self.gridff_args = None
         self.folded_args = None
+        self.replicas_args = None
+        self.krnl_folded_replicas = None
         self.grid_shape = None
         self.grid_data = None
         self.grid_p0 = None
@@ -321,6 +351,7 @@ void rigid_body_folded_kernel(
         self.atom_body_host = None
         self.mass_total = None
         self.inertia_inv_host = None
+        self.inertia_host = None
 
     def realloc(self, n_bodies, num_atoms):
         if num_atoms > self.max_atoms_per_body:
@@ -342,6 +373,7 @@ void rigid_body_folded_kernel(
         self.create_buffer('vposs',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('vrots',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('I_body_inv', self.n_bodies * mat3_size,      mf.READ_ONLY)
+        self.create_buffer('I_body',     self.n_bodies * mat3_size,      mf.READ_ONLY)
         self.create_buffer('anchors', self.total_atoms * 4 * float_size, mf.READ_ONLY)
 
         total_atom_bytes = self.total_atoms * 4 * float_size
@@ -364,11 +396,86 @@ void rigid_body_folded_kernel(
             'niter': np.int32(1),
             'dt': np.float32(0.01),
             'Efield': np.zeros(4, dtype=np.float32),
+            'md_params': np.array([0.92, 0.88, 1.0, 1.0], dtype=np.float32),
         }
         self.kernel_args = self.generate_kernel_args("rigid_body_dynamics_kernel")
         self.gridff_args = None
 
-    def upload_state(self, pos, quats, lin_mom, ang_mom, mass, inv_mass, inertia_inv, atom_pos_body, anchors=None, atom_PLQ=None):
+    def realloc_replicas(self, n_replicas, num_atoms):
+        """Allocate buffers for the replicas kernel (many copies of same molecule).
+
+        Reuses the standard buffer names but with different semantics:
+        - poss/qrots/vposs/vrots: [n_replicas] per-replica state
+        - apos_body: [num_atoms] shared body-frame positions (not [n_replicas * na])
+        - I_body_inv/I_body: [1] shared inertia (not [n_replicas])
+        - folded_atom_type: [num_atoms] shared (not [n_replicas * na])
+        - anchors: [n_replicas * num_atoms] per-replica spring targets
+        """
+        # Reuse standard realloc with n_bodies=n_replicas, then override sizes
+        # that differ. The buffers are oversized for shared data but that's harmless.
+        self.realloc(n_bodies=n_replicas, num_atoms=num_atoms)
+        self.n_replicas = n_replicas
+
+    def upload_replicas_state(self, pos, quats, lin_mom, ang_mom, mass, inertia_inv, atom_pos_body, anchors=None, inertia=None):
+        """Upload per-replica state + shared molecule data for the replicas kernel.
+
+        Args:
+            pos:  (n_replicas, 4) float32 — CoM position + mass
+            quats: (n_replicas, 4) float32
+            lin_mom: (n_replicas, 4) float32
+            ang_mom: (n_replicas, 4) float32
+            mass: float (used for pos.w, same for all replicas)
+            inertia_inv: (3, 3) float32 — single shared inverse inertia
+            atom_pos_body: (num_atoms, 3/4) float32 — shared body-frame positions
+            anchors: (n_replicas, num_atoms, 4) or None
+            inertia: (3, 3) float32 — single shared inertia (optional)
+        """
+        pos_in   = _ensure_float4(pos)
+        quats_in = _ensure_float4(quats)
+        lin_in   = _ensure_float4(lin_mom)
+        ang_in   = _ensure_float4(ang_mom)
+        n_rep = self.n_replicas
+        na = self.num_atoms
+
+        # Per-replica state
+        self.toGPU('poss',  pos_in)
+        self.toGPU('qrots', quats_in)
+        self.toGPU('vposs', lin_in)
+        self.toGPU('vrots', ang_in)
+
+        # Shared inertia (upload as [1] cl_Mat3, buffer is [n_rep] but kernel reads [0])
+        Iinv_cl = _ensure_cl_mat3(inertia_inv[None, :, :], 1)
+        self.toGPU('I_body_inv', Iinv_cl)
+        if inertia is not None:
+            I_cl = _ensure_cl_mat3(inertia[None, :, :], 1)
+            self.toGPU('I_body', I_cl)
+
+        # Shared body-frame atom positions (upload [na], buffer is [n_rep*na] but kernel reads [na])
+        atoms = np.asarray(atom_pos_body, dtype=np.float32)
+        if atoms.ndim == 3:
+            atoms = atoms[0]  # take first molecule if (1, na, 3/4)
+        if atoms.shape[1] == 3:
+            atoms = np.concatenate([atoms, np.zeros((atoms.shape[0], 1), dtype=np.float32)], axis=1)
+        atoms_flat = atoms[:na]  # just the first na atoms
+        self.atom_body_host = atoms_flat.copy()
+        self.toGPU('apos_body', atoms_flat)
+
+        # Anchors (per-replica)
+        if anchors is not None:
+            anc = np.asarray(anchors, dtype=np.float32).reshape(n_rep * na, 4)
+        else:
+            anc = np.zeros((n_rep * na, 4), dtype=np.float32)
+            anc[:, 3] = -1.0
+        self.toGPU('anchors', anc)
+
+        # Zero output buffers
+        self.toGPU('apos_world',   np.zeros((n_rep * na, 4), dtype=np.float32))
+        self.toGPU('atom_force',   np.zeros((n_rep * na, 4), dtype=np.float32))
+        self.toGPU('body_force',   np.zeros((n_rep, 4), dtype=np.float32))
+        self.toGPU('body_torque',  np.zeros((n_rep, 4), dtype=np.float32))
+        self.queue.finish()
+
+    def upload_state(self, pos, quats, lin_mom, ang_mom, mass, inv_mass, inertia_inv, atom_pos_body, anchors=None, atom_PLQ=None, inertia=None):
         if self.n_bodies == 0:
             raise RuntimeError("Call realloc() before uploading state")
 
@@ -391,6 +498,18 @@ void rigid_body_folded_kernel(
         self.atom_body_host = atoms_body.copy()
         self.mass_total = float(pos_in[0, 3]) if len(pos_in) else None
         self.inertia_inv_host = inertia_inv.copy()
+        if inertia is not None:
+            inertia_cl = _ensure_cl_mat3(inertia, self.n_bodies)
+            self.inertia_host = inertia_cl.copy()
+            for b in range(self.n_bodies):
+                Iinv_b = inertia_inv[b, :, :3]
+                I_b = inertia_cl[b, :, :3]
+                prod = Iinv_b @ I_b
+                err = float(np.max(np.abs(prod - np.eye(3, dtype=np.float32))))
+                if err > 1e-4:
+                    raise ValueError(f"I_body_inv @ I_body != I for body {b}: max error {err:.2e}. Ensure I_body and I_body_inv are consistent.")
+        else:
+            self.inertia_host = None
 
         mols = np.arange(0, self.total_atoms + 1, self.num_atoms, dtype=np.int32)
 
@@ -400,6 +519,8 @@ void rigid_body_folded_kernel(
         self.toGPU('vposs', lin_in)
         self.toGPU('vrots', ang_in)
         self.toGPU('I_body_inv', inertia_inv)
+        if self.inertia_host is not None:
+            self.toGPU('I_body', self.inertia_host)
         self.toGPU('apos_body', atoms_body)
         if atom_PLQ is not None:
             plq = _ensure_float4(atom_PLQ)
@@ -461,12 +582,13 @@ void rigid_body_folded_kernel(
         self.gridff_args = self.generate_kernel_args("rigid_body_gridff_kernel")
         self.krnl_gridff = cl.Kernel(self.prg, "rigid_body_gridff_kernel")
 
-    def run(self, num_steps, dt, efield=None):
+    def run(self, num_steps, dt, efield=None, lin_damp=0.92, ang_damp=0.88):
         if self.kernel_args is None:
             raise RuntimeError("Kernel arguments not initialized; call realloc() first")
 
         self.kernel_params['niter'] = np.int32(num_steps)
         self.kernel_params['dt'] = np.float32(dt)
+        self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, 1.0], dtype=np.float32)
         if efield is not None:
             self.kernel_params['Efield'] = _pack_float3(efield)
         self.kernel_args = self.generate_kernel_args("rigid_body_dynamics_kernel")
@@ -548,6 +670,69 @@ void rigid_body_folded_kernel(
         global_size = (self.roundUpGlobalSize(self.n_bodies * self.nloc),)
         local_size = (self.nloc,)
         self.krnl_folded(self.queue, global_size, local_size, *self.folded_args)
+        self.queue.finish()
+
+    def init_replicas(self, n_replicas, folded_coeffs, folded_kxyz, folded_atom_type, folded_lvec2d, folded_meta=None):
+        """Initialize the replicas kernel for many copies of the same molecule.
+
+        Unlike init_folded(), this kernel uses 1 thread per replica (no workgroup
+        per body). Shared molecule data (apos_body, inertia, basis) is loaded to
+        local memory once per workgroup. Per-replica state stays in registers.
+
+        Args:
+            n_replicas: number of rigid body replicas
+            folded_coeffs: (ntypes, nbasis) float32
+            folded_kxyz: (nbasis, 4) float32
+            folded_atom_type: (natoms,) int32 — type index per atom (shared)
+            folded_lvec2d: (4,) float32 — (ax, bx, ay, by)
+            folded_meta: (4,) int32 — (nbasis, ntypes, na, n_replicas). If None, inferred.
+        """
+        if self.n_bodies == 0:
+            raise RuntimeError("Call realloc() before init_replicas()")
+        coeffs = np.asarray(folded_coeffs, dtype=np.float32)
+        kxyz   = np.asarray(folded_kxyz,   dtype=np.float32)
+        atype  = np.asarray(folded_atom_type, dtype=np.int32)
+        lvec2d = np.asarray(folded_lvec2d, dtype=np.float32)
+        ntypes, nbasis = coeffs.shape
+        na = atype.shape[0]
+        if kxyz.shape[0] < nbasis:
+            raise ValueError(f"folded_kxyz has {kxyz.shape[0]} basis params but coeffs expects {nbasis}")
+        if folded_meta is None:
+            folded_meta = np.array([nbasis, ntypes, na, n_replicas], dtype=np.int32)
+        else:
+            folded_meta = np.asarray(folded_meta, dtype=np.int32)
+        FOLDED_BASIS_MAX = 128
+        FOLDED_TYPES_MAX = 8
+        if nbasis > FOLDED_BASIS_MAX:
+            raise ValueError(f"nbasis={nbasis} exceeds FOLDED_BASIS_MAX={FOLDED_BASIS_MAX}")
+        if ntypes > FOLDED_TYPES_MAX:
+            raise ValueError(f"ntypes={ntypes} exceeds FOLDED_TYPES_MAX={FOLDED_TYPES_MAX}")
+        coeff_pad = np.zeros(FOLDED_TYPES_MAX * FOLDED_BASIS_MAX * 4, dtype=np.float32)
+        coeff_flat = np.asarray(coeffs, dtype=np.float32).reshape(ntypes, -1)[:, :nbasis]
+        coeff_pad[:ntypes * nbasis] = coeff_flat.flatten()
+        kxyz_pad = np.zeros((FOLDED_BASIS_MAX, 4), dtype=np.float32)
+        kxyz_pad[:nbasis, :] = kxyz[:nbasis]
+        self.toGPU('folded_coeffs',    coeff_pad)
+        self.toGPU('folded_kxyz',      kxyz_pad)
+        self.toGPU('folded_atom_type', atype)
+        self.kernel_params['folded_meta']   = folded_meta
+        self.kernel_params['folded_lvec2d'] = lvec2d
+        self.kernel_params['md_params']     = np.array([0.92, 0.88, 1.0, 1.0], dtype=np.float32)
+        self.replicas_args = self.generate_kernel_args("rigid_body_folded_replicas_kernel")
+        self.krnl_folded_replicas = cl.Kernel(self.prg, "rigid_body_folded_replicas_kernel")
+        self.n_replicas = n_replicas
+
+    def run_folded_replicas(self, num_steps, dt, lin_damp=0.92, ang_damp=0.88, force_scale=1.0, torque_scale=1.0):
+        if self.replicas_args is None:
+            raise RuntimeError("Replicas kernel not initialized; call init_replicas(...) first")
+        self.kernel_params['dt'] = np.float32(dt)
+        self.kernel_params['niter'] = np.int32(num_steps)
+        self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, force_scale, torque_scale], dtype=np.float32)
+        self.replicas_args = self.generate_kernel_args("rigid_body_folded_replicas_kernel")
+        REPLICAS_WG = 128
+        global_size = (int(np.ceil(self.n_replicas / REPLICAS_WG) * REPLICAS_WG),)
+        local_size = (REPLICAS_WG,)
+        self.krnl_folded_replicas(self.queue, global_size, local_size, *self.replicas_args)
         self.queue.finish()
 
     def download_outputs(self):
@@ -655,7 +840,7 @@ void rigid_body_folded_kernel(
         apos = np.asarray(apos, dtype=np.float32)
         com0 = (apos * masses[:, None]).sum(axis=0) / masses.sum()
         rel = apos - com0[None, :]
-        mtot, _, Iinv = compute_mass_properties(rel, masses)
+        mtot, I, Iinv = compute_mass_properties(rel, masses)
         mass_trans = float(mass_trans)
         if mass_trans <= 0.0:
             raise ValueError(f"mass_trans must be > 0, got {mass_trans}")
@@ -665,6 +850,7 @@ void rigid_body_folded_kernel(
         if mass_rot <= 0.0:
             raise ValueError(f"mass_rot must be > 0, got {mass_rot}")
         Iinv_relax = Iinv * (mtot / mass_rot)
+        I_relax = I * (mass_rot / mtot)
         if body_positions is None:
             body_positions = np.repeat(com0[None, :], n_bodies, axis=0).astype(np.float32)
         else:
@@ -731,7 +917,7 @@ void rigid_body_folded_kernel(
         rbd.mass_trans = mass_trans
         rbd.mass_rot = mass_rot
         rbd.atom_PLQ = atom_plq.copy()
-        rbd.upload_state(pos4, quat4, zero4, zero4, mass_trans, 1.0 / mass_trans, np.repeat(Iinv_relax[None, :, :], n_bodies, axis=0), atom_body, atom_PLQ=atom_plq)
+        rbd.upload_state(pos4, quat4, zero4, zero4, mass_trans, 1.0 / mass_trans, np.repeat(Iinv_relax[None, :, :], n_bodies, axis=0), atom_body, atom_PLQ=atom_plq, inertia=np.repeat(I_relax[None, :, :], n_bodies, axis=0))
         rbd.init_gridff(grid, grid_p0=grid_p0, grid_step=grid_step)
         return rbd
 
@@ -754,6 +940,7 @@ void rigid_body_folded_kernel(
             self.inertia_inv_host[:, :, :3],
             self.atom_body_host.reshape(self.n_bodies, self.num_atoms, 4)[:, :, :3],
             atom_PLQ=self.atom_PLQ,
+            inertia=self.inertia_host[:, :, :3] if self.inertia_host is not None else None,
         )
 
     def update_anchors(self, anchors_world):

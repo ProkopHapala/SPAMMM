@@ -1,36 +1,113 @@
 // uff.cl - UFF force field: bonding interactions + simplified MD integrator
+// ====================================================================
+//
+// UNIVERSAL FORCE FIELD (UFF) FOR GPU MOLECULAR DYNAMICS
+// ======================================================
 //
 // Implements the Universal Force Field (UFF) for molecular dynamics without
-// pi-orbital degrees of freedom. Bonding includes harmonic bonds, cosine-based
-// angles, torsions (cosine periodic), and inversions. The integrator is
-// simplified compared to SPFF — no recoil assembly, no pi-orbital normalization.
+// pi-orbital degrees of freedom. UFF is a general-purpose all-atom force
+// field parameterized for all elements of the periodic table.
 //
-// Execution flow (one MD step):
+// Reference: Rappé et al., "UFF, a full periodic table force field for
+// molecular mechanics and molecular dynamics simulations",
+// J. Am. Chem. Soc. 114, 10024 (1992).
+//
+// --- Physics Overview ---
+//
+// The UFF force field includes the following interaction terms:
+//
+//   1. Bond stretching (harmonic):
+//      V_bond = K * (r - r0)^2
+//      F_bond = -2K * (r - r0) * r_hat
+//      Note: UFF uses 2K convention (force = 2K*dl, energy = K*dl^2).
+//
+//   2. Angle bending (Fourier cosine series):
+//      V_angle = K * (c0 + c1*cos(theta) + c2*cos(2*theta) + c3*cos(3*theta))
+//      This is a general Fourier expansion up to n=3, allowing both
+//      harmonic-like (small n) and multi-well (large n) angular potentials.
+//      The force is derived analytically via complex multiplication recursion
+//      for cos(n*theta) and sin(n*theta).
+//
+//   3. Torsion (dihedral, cosine periodic):
+//      V_tors = V * (1 + d * cos(n*phi))
+//      where V = barrier height, d = cos(n*phi0) (phase), n = periodicity.
+//      Force is derived via chain rule through the dihedral angle phi,
+//      computed from cross products of bond vectors.
+//
+//   4. Inversion (improper torsion):
+//      V_inv = K * (c0 + c1*cos(w) + c2*cos(2*w))
+//      where w is the angle between the plane of three substituents and
+//      the bond to the central atom. Enforces planarity at sp2 centers.
+//
+//   5. Non-bonded (LJ + Coulomb, in nonbonded.cl):
+//      V_LJ = 4*eps*((sigma/r)^12 - (sigma/r)^6)
+//      V_Coul = q_i*q_j / (4*pi*eps0*r)
+//      Excluded for 1-2 and 1-3 pairs; 1-4 pairs scaled by SubNBTorsionFactor.
+//
+// --- Architecture: Interaction-Centric vs Atom-Centric ---
+//
+// Unlike SPFF (which is atom-centric: 1 thread per atom, loop over neighbors),
+// UFF uses an interaction-centric approach for angles/dihedrals/inversions:
+//   - 1 thread per interaction (angle, dihedral, or inversion)
+//   - Each thread computes forces on ALL atoms involved (2, 3, or 4)
+//   - Forces are stored in a per-interaction array (fint), NOT directly on atoms
+//   - A final assembleForces_UFF kernel scatters fint -> fapos via index mapping
+//
+// Bonds use a hybrid approach: atom-centric (1 thread per atom, loop neighbors)
+// with forces written directly to fapos. This avoids the need for a separate
+// bond assembly step.
+//
+// The hneigh array (precomputed bond direction vectors) is shared between
+// kernels: evalBondsAndHNeigh_UFF computes and stores them, then
+// evalAngles/dihedrals/inversions read them for geometric calculations.
+//
+// --- Execution Flow (one MD step) ---
+//
 //   1. clear_fapos_UFF / clear_fint_UFF — zero force/energy buffers
-//   2. evalBondsAndHNeigh_UFF — evaluate bond stretches + store H-neighbor vectors
-//   3. evalAngles_UFF — evaluate angular bending forces
-//   4. evalDihedrals_UFF — evaluate torsional forces
-//   5. evalInversions_UFF — evaluate inversion forces
-//   6. assembleForces_UFF — accumulate per-interaction forces onto atoms
-//   7. getNonBond_ex2 (in nonbonded.cl) — evaluate non-bonded LJ/Coulomb forces
+//   2. evalBondsAndHNeigh_UFF — bond forces -> fapos; bond vectors -> hneigh
+//   3. evalAngles_UFF — angle forces -> fint (3 force pieces per angle)
+//   4. evalDihedrals_UFF — torsion forces -> fint (4 force pieces per dihedral)
+//   5. evalInversions_UFF — inversion forces -> fint (4 force pieces per inv)
+//   6. assembleForces_UFF — scatter fint -> fapos using a2f index mapping
+//   7. getNonBond_ex2 (in nonbonded.cl) — add non-bonded LJ/Coulomb to fapos
 //   8. updateAtomsSPFFf4 — integrate positions/velocities (simplified, no recoil)
+//
+// --- Key Caveats ---
+//
+//   CAVEAT 1: The 1-2 and 1-3 non-bonded subtraction is done INSIDE the bond
+//   and angle kernels (bSubtractBondNonBond, bSubtractAngleNonBond flags),
+//   not in the non-bonded kernel. This is because the non-bonded kernel uses
+//   a neighbor list that may include 1-2/1-3 pairs, so they must be subtracted
+//   out explicitly. The 1-4 subtraction is handled in the dihedral kernel
+//   with a scaling factor (SubNBTorsionFactor).
+//
+//   CAVEAT 2: The assembleForces_UFF kernel uses an a2f (atom-to-force) index
+//   mapping: a2f_offsets[ia], a2f_counts[ia], a2f_indices[]. This is a CSR-like
+//   format. The indices point into the fint array. If bClearForce=1, fapos is
+//   set (overwritten); if bClearForce=0, fapos is accumulated (+=).
+//
+//   CAVEAT 3: The angle force computation uses complex multiplication recursion
+//   for cos(n*theta)/sin(n*theta), same technique as Ewald2D in surface.cl.
+//   This is O(n) per angle vs O(n^2) for direct evaluation.
+//
+//   CAVEAT 4: The dihedral force calculation uses the approach from UFF.h
+//   (evalDihedral_Prokop), computing forces via cross products of bond
+//   normals. Degenerate cases (collinear bonds, n123_2 < 1e-30) produce
+//   zero forces to avoid NaN.
+//
+//   CAVEAT 5: The updateAtomsSPFFf4 kernel here is a SIMPLIFIED version of
+//   the one in SPFF.cl — no recoil gather, no pi-orbitals, no bounding box.
+//   It does include a Langevin thermostat (TDrive) for thermal driving.
 //
 // Kernels:
 //   - clear_fapos_UFF: Zero the atomic force array.
 //   - clear_fint_UFF: Zero the per-interaction force array.
-//   - evalBondsAndHNeigh_UFF: Evaluate harmonic bond stretching forces and
-//     store normalized H-neighbor direction vectors for angle/torsion use.
-//     1 thread = 1 bond.
-//   - evalAngles_UFF: Evaluate angular bending forces using cosine-squared
-//     potential. 1 thread = 1 angle.
-//   - evalDihedrals_UFF: Evaluate torsional forces using cosine periodic
-//     potential with multiple Fourier terms. 1 thread = 1 dihedral.
-//   - evalInversions_UFF: Evaluate inversion (improper torsion) forces using
-//     cosine-squared potential. 1 thread = 1 inversion.
-//   - assembleForces_UFF: Scatter per-interaction forces (from fint) onto
-//     atomic force array (fapos) using index mapping. 1 thread = 1 atom.
-//   - updateAtomsSPFFf4: Simplified MD integrator — apply forces, constraints,
-//     damping, update velocities and positions. No pi-orbital handling.
+//   - evalBondsAndHNeigh_UFF: Bond forces + hneigh vectors. 1 thread = 1 atom.
+//   - evalAngles_UFF: Angle bending forces. 1 thread = 1 angle.
+//   - evalDihedrals_UFF: Torsional forces. 1 thread = 1 dihedral.
+//   - evalInversions_UFF: Inversion forces. 1 thread = 1 inversion.
+//   - assembleForces_UFF: Scatter fint -> fapos via a2f mapping. 1 thread = 1 atom.
+//   - updateAtomsSPFFf4: Simplified MD integrator with Langevin thermostat.
 //
 // Requires: common.cl + Forces.cl to be concatenated before this file.
 
@@ -58,23 +135,60 @@
 #endif
 //#define IDBG_SYS   (8)    // system index to trace
 
-// ---- Clear kernels ----
-// --- Clear kernels: zero force/energy buffers ---
+// ==================================================================
+//  Clear Kernels
+// ==================================================================
+//
+//  Zero force/energy buffers before force evaluation.
+//  Simple parallel kernels: 1 thread per array element.
+//
+
+// Zero atomic force array fapos[natoms*nSystems].
 __kernel void clear_fapos_UFF(const int n, __global float4* fapos){
     int i = get_global_id(0);
     if(i>=n) return;
     fapos[i] = (float4)(0.f,0.f,0.f,0.f);
 }
 
+// Zero per-interaction force array fint[nf_per_system*nSystems].
 __kernel void clear_fint_UFF(const int n, __global float4* fint){
     int i = get_global_id(0);
     if(i>=n) return;
     fint[i] = (float4)(0.f,0.f,0.f,0.f);
 }
 
-// ---- evalBondsAndHNeigh_UFF ----
-// --- Kernel 1: Evaluate Bonds and Calculate H-Neigh vectors (Atom-Centric) ---
-// Corresponds to the loop calling C++ evalAtomBonds
+// ======================================================================
+//                          evalBondsAndHNeigh_UFF()
+// ======================================================================
+//
+//  Atom-centric bond evaluation. 1 thread per atom, loops over up to 4 neighbors.
+//  Two outputs:
+//    1. fapos[ia] = (F_bond_total, E_bond_total) — bond forces written directly
+//    2. hneigh[ia*4+in] = (h_x, h_y, h_z, 1/L) — normalized bond direction vectors
+//       stored for reuse by angle/dihedral/inversion kernels.
+//
+//  Physics:
+//    V_bond = K * (r - r0)^2
+//    F_bond = 2K * (r - r0) * h_hat    (force along bond direction)
+//    Force on atom ia: +F_bond (toward neighbor if stretched)
+//    Force on neighbor: -F_bond (Newton's 3rd law)
+//
+//  The hneigh vectors are critical: they encode the molecular geometry
+//  (bond directions and inverse lengths) that angle/dihedral/inversion
+//  kernels need without re-reading global memory for positions.
+//
+//  CAVEAT: Bond forces are written directly to fapos (=, not +=) because
+//  this kernel runs first. Subsequent kernels (angles, dihedrals, etc.)
+//  accumulate via assembleForces_UFF with bClearForce=1.
+//
+//  CAVEAT: The 1-2 non-bonded subtraction (bSubtractBondNonBond) removes
+//  the LJ+Coulomb interaction between bonded pairs, since the non-bonded
+//  kernel's neighbor list may include them. The subtraction uses the same
+//  dp vector as the bond, so no extra position reads are needed.
+//
+//  CAVEAT: l2 is clamped to 1e-16 to avoid division by zero for coincident
+//  atoms. This introduces a large but finite force that helps separate them.
+//
 __kernel void evalBondsAndHNeigh_UFF(
     const int        natoms,
     const int        npbc,
@@ -258,8 +372,42 @@ __kernel void evalBondsAndHNeigh_UFF(
 }
 
 
-// ---- evalAngles_UFF ----
-// --- Kernel 2: Evaluate Angles (Interaction-Centric, Inlined) ---
+// ======================================================================
+//                          evalAngles_UFF()
+// ======================================================================
+//
+//  Interaction-centric angle evaluation. 1 thread per angle.
+//  Computes forces on all 3 atoms (i, j, k) and stores them in fint.
+//
+//  Physics:
+//    V_angle = K * (c0 + c1*cos(theta) + c2*cos(2*theta) + c3*cos(3*theta))
+//    where theta is the angle i-j-k (j is central).
+//
+//  The force is derived by differentiating V w.r.t. atom positions.
+//  The key mathematical technique is complex multiplication recursion:
+//    cos(n*theta) + i*sin(n*theta) = (cos(theta) + i*sin(theta))^n
+//  This allows O(n) evaluation of the Fourier series (n <= 3 here).
+//
+//  Force assembly (matching C++ UFF.h::evalAngle_Prokop):
+//    fpi = fic*qij - fi*qkj       (force on atom i)
+//    fpk = -fk*qij + fkc*qkj      (force on atom k)
+//    fpj = (fk-fic)*qij + (fi-fkc)*qkj  (force on central atom j, by Newton's 3rd law)
+//  where fi = fmag * qij.w (1/L_ji), fk = fmag * qkj.w (1/L_jk),
+//        fic = fi*cos(theta), fkc = fk*cos(theta).
+//
+//  The hneigh vectors (qij, qkj) are precomputed by evalBondsAndHNeigh_UFF.
+//  cos(theta) is computed from h = qij + qkj: c = 0.5*(|h|^2 - 2).
+//
+//  CAVEAT: The 1-3 non-bonded subtraction (bSubtractAngleNonBond) removes
+//  LJ+Coulomb between atoms i and k. The dp_ik vector is reconstructed from
+//  hneigh vectors: dp_ik = qij/qij.w - qkj/qkj.w = ji/|ji| * |ji| - kj/|kj| * |kj|.
+//  PBC shifts are applied by looking up cell indices for i and k relative to j.
+//  CAVEAT: The PBC shift lookup for 1-3 subtraction uses linear search over
+//  neighbor slots (O(4) per atom), which is acceptable for max 4 neighbors.
+//
+//  Output: fint[i0f + i0ang + iang*3 + {0,1,2}] = (F_i, F_j, F_k, E/3)
+//  Energy is divided by 3 so each atom gets 1/3 of the angle energy.
+//
 __kernel void evalAngles_UFF(
     const int        nangles,
     const int        i0ang,       // Offset for angle forces in fint array
@@ -438,8 +586,46 @@ __kernel void evalAngles_UFF(
 }
 
 
-// ---- evalDihedrals_UFF ----
-// --- Kernel 3: Evaluate Dihedrals (Interaction-Centric, Inlined) ---
+// ======================================================================
+//                          evalDihedrals_UFF()
+// ======================================================================
+//
+//  Interaction-centric dihedral (torsion) evaluation. 1 thread per dihedral.
+//  Computes forces on all 4 atoms (i, j, k, l) and stores them in fint.
+//
+//  Physics:
+//    V_tors = V * (1 + d * cos(n*phi))
+//    where phi is the dihedral angle i-j-k-l,
+//          V = barrier height, d = cos(n*phi0) (phase), n = periodicity.
+//
+//  The dihedral angle is computed from normals to the two planes:
+//    n123 = cross(h_ji, h_kj)   (normal to plane i-j-k)
+//    n234 = cross(h_lk, h_kj)   (normal to plane j-k-l)
+//    cos(phi) = dot(n123, n234) / (|n123| * |n234|)
+//    sin(phi) = -dot(n123, h_lk) / (|n123| * |n234|)
+//
+//  Force derivation (matching C++ UFF.h::evalDihedral_Prokop):
+//    f = -V * d * n * sin(n*phi)
+//    Forces on end atoms (i, l) are along the plane normals:
+//      F_i = n123 * (-f / |n123|^2 * 1/L_ji)
+//      F_l = n234 * ( f / |n234|^2 * 1/L_lk)
+//    Recoil on axis atoms (j, k) by Newton's 3rd law with geometric projection:
+//      F_k = F_i * (-c123) + F_l * (-c432 - 1)
+//      F_j = F_i * ( c123 - 1) + F_l * ( c432)
+//    where c123 = cos(angle_jkj) * (L_jk/L_ji), c432 = cos(angle_jkl) * (L_jk/L_lk).
+//
+//  CAVEAT: Degenerate cases (collinear bonds, |n123| or |n234| < 1e-30)
+//  produce zero forces to avoid NaN from division by near-zero normals.
+//
+//  CAVEAT: The 1-4 non-bonded subtraction uses SubNBTorsionFactor to scale
+//  the LJ+Coulomb interaction between atoms i and l. The dp_il vector is
+//  reconstructed from hneigh: dp_il = ji/|ji| - lk/|lk| - kj/|kj|.
+//  CAVEAT: PBC shifts for 1-4 subtraction are NOT fully implemented —
+//  the lookup code is commented out (lines ~583-585). This may produce
+//  wrong 1-4 forces for periodic systems with bonds across cell boundaries.
+//
+//  Output: fint[i0f + i0dih + id*4 + {0,1,2,3}] = (F_i, F_j, F_k, F_l, E/4)
+//
 __kernel void evalDihedrals_UFF(
     const int        ndihedrals,
     const int        i0dih,       // Offset for dihedral forces in fint array
@@ -608,8 +794,41 @@ __kernel void evalDihedrals_UFF(
 }
 
 
-// ---- evalInversions_UFF ----
-// --- Kernel 4: Evaluate Inversions (Interaction-Centric, Inlined) ---
+// ======================================================================
+//                          evalInversions_UFF()
+// ======================================================================
+//
+//  Interaction-centric inversion (improper torsion) evaluation.
+//  1 thread per inversion. Computes forces on all 4 atoms and stores in fint.
+//
+//  Physics:
+//    V_inv = K * (c0 + c1*cos(w) + c2*cos(2*w))
+//    where w is the inversion angle: the angle between the plane (j,i,k)
+//    and the bond (i->l). Atom i is the central atom.
+//
+//  The inversion angle w is computed as:
+//    n_ijk = normalize(cross(ij, ik))   (normal to plane j-i-k)
+//    sin(w) = -dot(n_ijk, h_il)         (angle between normal and bond i->l)
+//    cos(w) = sqrt(1 - sin^2(w))        (w in [0, pi/2] by convention)
+//
+//  Force derivation (matching C++ evalInversion_Prokop):
+//    dE/dw = -K * (c1*sin(w) + 2*c2*sin(2*w))
+//    f_term = dE/dw / cos(w)            (chain rule: dw/d(position) involves 1/cos(w))
+//    F_l = f_term/L_il * n_ijk + sin(w) * f_term/L_il * h_il
+//    F_j = cross(ik, tq) * 1/L_ij       (tq = intermediate torque-like vector)
+//    F_k = cross(tq, ij) * 1/L_ik
+//    F_i = -(F_j + F_k + F_l)            (central atom by Newton's 3rd law)
+//
+//  CAVEAT: When cos(w) -> 0 (planar configuration), f_term -> 0 to avoid
+//  division by zero. This means the force vanishes at the equilibrium
+//  planar geometry, which is correct for sp2 centers.
+//
+//  CAVEAT: No non-bonded subtraction is performed for inversions.
+//  The 1-3 and 1-4 non-bonded interactions are handled by the bond/angle/
+//  dihedral kernels respectively.
+//
+//  Output: fint[i0f + i0inv + ii*4 + {0,1,2,3}] = (F_i, F_j, F_k, F_l, E/4)
+//
 __kernel void evalInversions_UFF(
     const int        ninversions,
     const int        i0inv,       // Offset for inversion forces in fint array
@@ -734,10 +953,30 @@ __kernel void evalInversions_UFF(
 }
 
 
-// ---- assembleForces_UFF ----
-// --- Kernel 5: Assemble Forces (Atom-Centric) ---
-// Assumes C++ `a2f`-like map is provided.
-// NOW needs to handle the directly accumulated bond forces as well.
+// ======================================================================
+//                          assembleForces_UFF()
+// ======================================================================
+//
+//  Scatters per-interaction forces from fint onto the atomic force array fapos.
+//  1 thread per atom. Uses CSR-like index mapping (a2f_offsets, a2f_counts,
+//  a2f_indices) to find which fint entries contribute to each atom.
+//
+//  Data flow:
+//    For atom ia:
+//      offset = a2f_offsets[ia], count = a2f_counts[ia]
+//      F_local = sum(fint[a2f_indices[offset..offset+count-1]].xyz)
+//      E_local = sum(fint[...].w)
+//    If bClearForce=1: fapos[ia] = (bond_force + F_local, bond_energy + E_local)
+//    If bClearForce=0: fapos[ia] += (F_local, E_local)
+//
+//  The a2f mapping is precomputed on the CPU and encodes which angle/dihedral/
+//  inversion force pieces contribute to each atom. Each interaction stores
+//  3 (angle) or 4 (dihedral/inversion) force pieces in fint, and each piece
+//  references the atoms it acts on via the a2f mapping.
+//
+//  CAVEAT: The a2f_indices values are per-system local indices into fint.
+//  The per-system base offset (i0f) must be added when accessing fint.
+//
 __kernel void assembleForces_UFF(
     const int natoms,
     // --- Input force pieces ---
@@ -820,8 +1059,41 @@ __kernel void assembleForces_UFF(
 
 
 
-// ---- updateAtomsSPFFf4 (UFF simplified: no recoil, no pi-orbitals) ----
-// Assemble recoil forces from neighbors and  update atoms positions and velocities
+// ======================================================================
+//                          updateAtomsSPFFf4()  (UFF simplified)
+// ======================================================================
+//
+//  Simplified MD integrator for UFF — no recoil gather, no pi-orbitals,
+//  no bounding box. One thread per atom, one system per dim-1.
+//
+//  Steps per atom:
+//    1. Read force from aforce[iaa]
+//    2. Apply force limiting (Flimit) if enabled
+//    3. Apply constraints (harmonic springs to fixed positions)
+//    4. Apply Langevin thermostat (TDrive) if gamma > 0
+//    5. Integrate: v *= damp; v += F*dt/m; r += v*dt
+//
+//  Integration scheme: Damped semi-implicit (symplectic) Euler:
+//    v_new = damp * v_old + F * dt / m
+//    r_new = r_old + v_new * dt
+//  When damp=1.0, this is pure symplectic Euler (NVE).
+//  When damp<1.0, velocity is scaled (non-conservative, energy dissipating).
+//
+//  Langevin thermostat:
+//    F_thermostat = -gamma * v + sqrt(2*kB*T*gamma/dt) * xi
+//    where xi is a uniform random number in [-1, 1] generated from integer
+//    hashing of (atom_index, seed). This is a crude RNG — sufficient for
+//    thermalization but not for precise canonical sampling.
+//    Reference: Bussi & Parrinello, PRL 99, 020603 (2007) for Langevin methods.
+//
+//  CAVEAT: The RNG uses integer multiplication with 2654435761 (Knuth's
+//  multiplicative hash) and sin() for mapping to [-1,1]. This is NOT a
+//  high-quality RNG — correlations may exist. For production MD, consider
+//  using a proper GPU RNG (Philox, Threefry).
+//
+//  CAVEAT: No bounding box constraint (unlike SPFF.cl version). If spatial
+//  confinement is needed, use the SPFF.cl updateAtomsSPFFf4 instead.
+//
 //__attribute__((reqd_work_group_size(1,1,1)))
 __kernel void updateAtomsSPFFf4(
     const int4        n,            // 1 // (natoms,nnode) dimensions of the system

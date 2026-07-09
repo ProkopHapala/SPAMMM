@@ -1,15 +1,113 @@
-// nonbonded_grid.cl - GridFF-augmented non-bonded kernels + spatial bucketing
+// nonbonded_grid.cl - GridFF-augmented non-bonded kernels
+// ====================================================================
 //
-// Kernels:
-//   - getNonBond_GridFF_Bspline_ex2: LJ/Coulomb + GridFF B-spline substrate forces
-//   - getNonBond_GridFF_Bspline_tex: Same with texture-based GridFF sampling
-//   - getShortRangeBuckets / getShortRangeBuckets2 / sortAtomsToBucketOverlaps
+// GRIDFF-AUGMENTED NON-BONDED INTERACTIONS FOR GPU MD
+// ===================================================
+//
+// Combines molecule-molecule non-bonded forces (LJ + Coulomb + H-bond)
+// with molecule-substrate forces from a precomputed GridFF (B-spline
+// interpolated 3D potential grid). This avoids the expensive O(N_surface)
+// loop over substrate atoms by sampling a precomputed grid instead.
+//
+// --- Physics Overview ---
+//
+// Two force contributions are computed per atom:
+//
+//   1. Molecule-molecule non-bonded (same as nonbonded.cl):
+//      V_LJ = 4*eps*((sigma/r)^12 - (sigma/r)^6)
+//      V_Coul = q_i*q_j / (4*pi*eps0*r)
+//      With PBC image sum and exclusion list for bonded pairs.
+//
+//   2. Molecule-substrate via GridFF (B-spline interpolation):
+//      The substrate potential is precomputed on a 3D grid and stored as
+//      B-spline coefficients (BsplinePLQ). For each atom, the potential
+//      and its gradient are evaluated by tricubic B-spline interpolation.
+//
+//      The GridFF stores 4 channels per grid point:
+//        P = Pauli repulsion field
+//        L = London dispersion field
+//        Q = Coulomb electrostatic field
+//        H = H-bond field (optional)
+//
+//      The atom-specific combination uses the factorized Morse form:
+//        ej = exp(alphaMorse * RvdW_i)
+//        PLQH = (ej^2 * EvdW_i, ej * EvdW_i, Q_i, 0)
+//      This factorization separates the substrate geometry (grid) from
+//      atom-specific parameters (RvdW, EvdW, Q), allowing the same grid
+//      to be reused for different atom types.
+//
+//      Force: F = -dE/dx = -(dE/du) * (du/dx) = -fg.xyz * grid_invStep.xyz
+//      where u = (pos - grid_p0) * grid_invStep are grid coordinates.
+//
+// --- Two Variants ---
+//
+//   - getNonBond_GridFF_Bspline_ex2: Uses __global buffer for B-spline data
+//     with 2nd-neighbor exclusion list (same format as nonbonded.cl).
+//     More portable, works on all OpenCL devices.
+//
+//   - getNonBond_GridFF_Bspline_tex: Uses __read_only image3d_t (texture)
+//     for B-spline data with neighbor-list exclusion (neighs/neighCell).
+//     Texture hardware provides cached interpolation + repeat wrapping.
+//     Loops over full -nPBC..+nPBC range in all 3 dimensions.
+//
+// --- Key Caveats ---
+//
+//   CAVEAT 1: The GridFF B-spline interpolation (fe3d_pbc_comb / _tex)
+//   requires gridFF.cl to be concatenated before this file. The functions
+//   make_inds_pbc, fe3d_pbc_comb, fe3d_pbc_comb_tex are defined there.
+//
+//   CAVEAT 2: The PBC index patterns (xqs, yqs) are precomputed in
+//   __local memory by the first 8 threads. These encode wrapped indices
+//   for grid boundary handling (periodic grid in x, y).
+//
+//   CAVEAT 3: The _ex2 variant uses the same packed exclusion list as
+//   nonbonded.cl (excl array with (pbc_cell << 24) | j_index format).
+//   The _tex variant uses the older neighs/neighCell approach (checking
+//   each neighbor slot). The exclusion logic differs between variants.
+//
+//   CAVEAT 4: The force is written with = (not +=) to forces[iav],
+//   meaning this kernel should be the first force kernel in the pipeline.
+//   If accumulation is needed, change to +=.
 //
 // Requires: common.cl + Forces.cl + gridFF.cl + surface.cl before this file.
 // (make_inds_pbc, fe3d_pbc_comb, fe3d_pbc_comb_tex from gridFF.cl;
 //  getR4repulsion from surface.cl)
 
-// ---- getNonBond_GridFF_Bspline_ex2: non-bonded + GridFF B-spline ----
+// ======================================================================
+//                          getNonBond_GridFF_Bspline_ex2()
+// ======================================================================
+//
+//  Non-bonded forces + GridFF substrate forces (buffer-based B-spline).
+//  1 thread = 1 atom, 1 system per dim-1. Local-memory tiling (32 atoms).
+//
+//  Two phases per atom:
+//
+//  Phase 1 — Molecule-molecule non-bonded (same as getNonBond_ex2):
+//    Local-memory tiling over atom chunks. For each pair (i, j):
+//    - Apply mixing rules (R_add, E_mul, Q_mul)
+//    - Walk packed exclusion list (sorted, parallel to j-loop)
+//    - PBC: 3x3 image sum (hardcoded ix=0..2, iy=0..2)
+//    - Accumulate: fe += getLJQH(dp, REQK, R2damp)
+//
+//  Phase 2 — GridFF substrate interaction (B-spline buffer):
+//    - Precompute PBC index patterns (xqs, yqs) in __local memory
+//    - Compute atom-specific PLQH coefficients from REQKi:
+//        ej = exp(alphaMorse * RvdW_i)
+//        P = ej^2 * EvdW_i  (Pauli repulsion prefactor)
+//        L = ej   * EvdW_i  (London dispersion prefactor)
+//        Q = Q_i             (Coulomb charge)
+//    - Evaluate grid gradient: fg = fe3d_pbc_comb(u, grid_ns, BsplinePLQ, PLQH, xqs, yqs)
+//    - Convert to Cartesian: fg.xyz *= -grid_invStep.xyz
+//    - Accumulate: fe += fg
+//
+//  The GridFF approach replaces the O(N_substrate) sum over surface atoms
+//  with O(1) B-spline interpolation, a massive speedup for large substrates.
+//
+//  CAVEAT: The `if(iG>=natoms) return` check is placed AFTER the non-bonded
+//  loop, not at the beginning. This is because all threads must participate
+//  in the local-memory tiling (even extra threads beyond natoms) to avoid
+//  out-of-bounds reads and barrier deadlocks.
+//
 __kernel void getNonBond_GridFF_Bspline_ex2(
     const int4 ns,                  // 1 // dimensions of the system (natoms,nnode,nvec)
     // Dynamical
@@ -190,7 +288,35 @@ __kernel void getNonBond_GridFF_Bspline_ex2(
 
 
 
-// ---- getNonBond_GridFF_Bspline_tex: texture-based GridFF variant ----
+// ======================================================================
+//                          getNonBond_GridFF_Bspline_tex()
+// ======================================================================
+//
+//  Non-bonded forces + GridFF substrate forces (texture-based B-spline).
+//  1 thread = 1 atom, 1 system per dim-1. Local-memory tiling (32 atoms).
+//
+//  Differences from _ex2 variant:
+//    1. Exclusion: Uses neighs/neighCell arrays (neighbor-list approach)
+//       instead of packed excl array. Each neighbor slot is checked:
+//         bBonded = (ja==ng.x || ja==ng.y || ja==ng.z || ja==ng.w)
+//       For PBC, both atom index AND PBC cell must match to exclude.
+//    2. PBC: Full 3D loop over -nPBC..+nPBC in x, y, z (not hardcoded 3x3).
+//       shift0 = +nPBC.x*a + nPBC.y*b + nPBC.z*c (positive corner)
+//       Inner loop: dp -= shift0, then increment by lvec.a/b/c.
+//    3. GridFF: Uses image3d_t texture (BsplinePLQH_tex) with hardware
+//       caching and CLK_ADDRESS_REPEAT wrapping. The fe3d_pbc_comb_tex
+//       function reads from the texture instead of a global buffer.
+//
+//  The texture variant may be faster on GPUs with dedicated texture units,
+//  but requires OpenCL image support (not all devices).
+//
+//  CAVEAT: The PBC loop iterates (2*nPBC+1)^3 images, which can be expensive
+//  for large PBC ranges. For typical surface simulations, nPBC=(1,1,0) gives
+//  3*3*1 = 9 images, same as the _ex2 hardcoded 3x3.
+//
+//  CAVEAT: Same as _ex2: the `if(iG>=natoms) return` is after the non-bonded
+//  loop to ensure all threads participate in tiling barriers.
+//
 __kernel void getNonBond_GridFF_Bspline_tex( // Renamed kernel to distinguish from buffer version
     const int4 ns,                  // 1 // dimensions of the system (natoms,nnode,nvec)
     // Dynamical

@@ -23,6 +23,7 @@ from vispy import scene as vscene
 from .ExtensionManager import UIComponents
 from .EditModeHandlers import EditModeHandler
 from .CollapsibleSection import CollapsibleSection
+from .VispyUtils import make_grid_mesh_data, colormap_rgba
 from spammm.surfaces import FoldedRigid
 from spammm.topology.FFparams import load_xyz_with_REQs
 
@@ -197,6 +198,87 @@ def _toggle_substrate(window, checked=None):
         window.fr_substrate_markers.visible = False
 
 
+def _get_potential_type_idx(window):
+    """Get atom type index for potential slice from combo box."""
+    fit = getattr(window, 'fr_fit_result', None)
+    if fit is None:
+        return 0
+    unique_REQs = fit.get('unique_REQs')
+    if unique_REQs is None:
+        return 0
+    idx = window.fr_potential_type_combo.currentIndex()
+    if idx < 0 or idx >= len(unique_REQs):
+        idx = 0
+    return idx
+
+
+def _update_potential_overlay(window):
+    """Create/update the vispy potential slice mesh in the main scene (XY plane at current z)."""
+    fit = getattr(window, 'fr_fit_result', None)
+    if fit is None:
+        raise ValueError("No fit loaded — Load Fit first")
+    ityp = _get_potential_type_idx(window)
+    z = FoldedRigid.Z_SURF_TOP + float(window.fr_z_spin.value())
+    span = float(window.fr_potential_span_spin.value())
+    n = int(window.fr_potential_n_spin.value())
+    a, b, E = FoldedRigid.eval_folded_potential_slice(fit, ityp, plane='xy', fixed_val=z, extent=(-span, span, -span, span), n=n)
+    rgba, vmin, vmax = colormap_rgba(E, cmap='bwr', symmetric=True, alpha=0.6)
+    xs, ys = a, b
+    zs = np.full((n, n), z, dtype=np.float32)
+    verts, faces, cols = make_grid_mesh_data(xs, ys, zs, colors=rgba)
+    if not hasattr(window, 'fr_potential_mesh'):
+        window.fr_potential_mesh = vscene.visuals.Mesh(parent=window.scene.view.scene)
+        window.fr_potential_mesh.set_gl_state('translucent', depth_test=False)
+        window.fr_potential_mesh.order = -1
+    window.fr_potential_mesh.set_data(vertices=verts, faces=faces, vertex_colors=cols)
+    window.fr_potential_mesh.visible = getattr(window, 'fr_show_potential', False)
+
+
+def _toggle_potential(window, checked=None):
+    """Toggle potential slice overlay visibility."""
+    if checked is None:
+        checked = not getattr(window, 'fr_show_potential', False)
+    window.fr_show_potential = checked
+    if checked:
+        try:
+            _update_potential_overlay(window)
+            _status(window, "Potential slice shown")
+        except Exception as e:
+            _status(window, f"Potential overlay failed: {e}")
+            traceback.print_exc()
+            window.fr_show_potential = False
+    elif hasattr(window, 'fr_potential_mesh'):
+        window.fr_potential_mesh.visible = False
+
+
+def _on_potential_type_changed(window, idx):
+    """Refresh potential overlay when atom type combo changes."""
+    if getattr(window, 'fr_show_potential', False):
+        try:
+            _update_potential_overlay(window)
+        except Exception as e:
+            _status(window, f"Potential update failed: {e}")
+
+
+def _populate_potential_type_combo(window, fit):
+    """Populate the atom type combo from fit's unique_REQs."""
+    combo = window.fr_potential_type_combo
+    combo.blockSignals(True)
+    combo.clear()
+    unique_REQs = fit.get('unique_REQs')
+    enames = fit.get('enames', [])
+    atom_type_ids = fit.get('atom_type_ids', [])
+    if unique_REQs is not None:
+        for i, req in enumerate(unique_REQs):
+            R, E, Q = req[0], req[1], req[2]
+            label = f"type{i} R={R:.2f} Q={Q:+.2f}"
+            if i < len(atom_type_ids):
+                count = int(np.sum(atom_type_ids == i))
+                label += f" ({count}x)"
+            combo.addItem(label)
+    combo.blockSignals(False)
+
+
 # ---------------------------------------------------------------------------
 # Workflow callbacks
 # ---------------------------------------------------------------------------
@@ -215,6 +297,8 @@ def _on_fit(window):
         cache_path = os.path.join(_fit_cache_dir(), f"{key}.npz")
         if os.path.isfile(cache_path):
             window.fr_fit_result = FoldedRigid.load_fit(cache_path)
+            _populate_potential_type_combo(window, window.fr_fit_result)
+            _on_setup(window)
             _status(window, f"Loaded cached fit: {window.fr_fit_result['coeffs'].shape}")
             return
         mol_file = _export_molecule_to_temp(window)
@@ -230,6 +314,7 @@ def _on_fit(window):
         )
         window.fr_fit_result = fit
         FoldedRigid.save_fit(fit, cache_path)
+        _populate_potential_type_combo(window, fit)
         _on_setup(window)
         _status(window, f"Fit complete: {fit['coeffs'].shape} (cached)")
     except Exception as e:
@@ -363,6 +448,7 @@ def _on_save_fit(window):
 def _load_fit_path(window, fname):
     """Load fit result from a .npz file and set up the rigid body."""
     window.fr_fit_result = FoldedRigid.load_fit(fname)
+    _populate_potential_type_combo(window, window.fr_fit_result)
     _on_setup(window)
     _status(window, f"Loaded fit: {window.fr_fit_result['coeffs'].shape}")
 
@@ -555,6 +641,77 @@ def _plot_scan_dialog(window, scan):
         traceback.print_exc()
 
 
+def _on_xz_slice(window):
+    """Compute and plot XZ side-view potential slice."""
+    _plot_side_slice(window, 'xz')
+
+
+def _on_yz_slice(window):
+    """Compute and plot YZ side-view potential slice."""
+    _plot_side_slice(window, 'yz')
+
+
+def _plot_side_slice(window, plane):
+    """Compute and plot a side-view (XZ or YZ) potential slice in a matplotlib dialog."""
+    try:
+        fit = getattr(window, 'fr_fit_result', None)
+        if fit is None:
+            raise ValueError("No fit loaded — Load Fit first")
+        ityp = _get_potential_type_idx(window)
+        fixed_val = float(window.fr_x_spin.value()) if plane == 'xz' else float(window.fr_y_spin.value())
+        span_xy = float(window.fr_potential_span_spin.value())
+        z_min = FoldedRigid.Z_SURF_TOP + float(window.fr_zmin_spin.value()) - 1.0
+        z_max = FoldedRigid.Z_SURF_TOP + float(window.fr_zmax_spin.value()) + 2.0
+        n = int(window.fr_potential_n_spin.value())
+        a, b, E = FoldedRigid.eval_folded_potential_slice(fit, ityp, plane=plane, fixed_val=fixed_val, extent=(-span_xy, span_xy, z_min, z_max), n=n)
+        _plot_potential_slice_dialog(window, a, b, E, plane, fixed_val, ityp, fit)
+    except Exception as e:
+        _status(window, f"Slice failed: {e}")
+        traceback.print_exc()
+
+
+def _plot_potential_slice_dialog(window, a, b, E, plane, fixed_val, ityp, fit):
+    """Show a 2D potential slice in a matplotlib dialog."""
+    try:
+        import matplotlib
+        matplotlib.use('Qt5Agg')
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.figure import Figure
+
+        unique_REQs = fit.get('unique_REQs')
+        type_label = f'type {ityp}'
+        if unique_REQs is not None and ityp < len(unique_REQs):
+            req = unique_REQs[ityp]
+            type_label = f'R={req[0]:.2f} E={req[1]:.4f} Q={req[2]:.2f}'
+
+        fig = Figure(figsize=(8, 6), dpi=100)
+        ax = fig.subplots(1, 1)
+        A, B = np.meshgrid(a, b, indexing='ij')
+        im = ax.pcolormesh(A, B, E, shading='auto', cmap='bwr', vmin=-max(abs(E.min()), abs(E.max())), vmax=max(abs(E.min()), abs(E.max())))
+        ax.set_aspect('equal')
+        fixed_label = 'y' if plane == 'xz' else 'x'
+        h_label = 'x' if plane == 'xz' else 'y'
+        ax.set_xlabel(f'{h_label} [Å]')
+        ax.set_ylabel('z [Å]')
+        ax.set_title(f'Potential slice {plane} at {fixed_label}={fixed_val:.2f} ({type_label})')
+        ax.axhline(y=FoldedRigid.Z_SURF_TOP, color='gray', linestyle='--', alpha=0.5, label='surface top')
+        fig.colorbar(im, ax=ax, label='Energy [eV]')
+        fig.tight_layout()
+        canvas = FigureCanvas(fig)
+        plot_window = QtWidgets.QDialog(window)
+        plot_window.setWindowTitle(f'Potential {plane.upper()} Slice')
+        layout = QtWidgets.QVBoxLayout(plot_window)
+        layout.addWidget(canvas)
+        plot_window.resize(800, 600)
+        plot_window.show()
+        if not hasattr(window, '_fr_plot_windows'):
+            window._fr_plot_windows = []
+        window._fr_plot_windows.append(plot_window)
+    except Exception as e:
+        _status(window, f"Potential plot failed: {e}")
+        traceback.print_exc()
+
+
 # ---------------------------------------------------------------------------
 # Edit mode handlers
 # ---------------------------------------------------------------------------
@@ -677,6 +834,7 @@ def build_ui(window):
     window.fr_scan_result = None
     window.fr_relaxed_scan_traj = None
     window.fr_show_substrate = False
+    window.fr_show_potential = False
     window._fr_pin_idx = 0
     window._fr_pin_atom_id = -1
     window._fr_plot_windows = []
@@ -735,12 +893,48 @@ def build_ui(window):
 
     # Overlay / energy
     overlay_row = QtWidgets.QHBoxLayout()
-    window.fr_show_substrate_chk = QtWidgets.QCheckBox("Show substrate")
+    window.fr_show_substrate_chk = QtWidgets.QCheckBox("Substrate")
     window.fr_show_substrate_chk.setChecked(False)
     window.fr_show_substrate_chk.stateChanged.connect(lambda state: _toggle_substrate(window, state == QtCore.Qt.Checked))
     overlay_row.addWidget(window.fr_show_substrate_chk)
+
+    window.fr_show_potential_chk = QtWidgets.QCheckBox("Potential")
+    window.fr_show_potential_chk.setChecked(False)
+    window.fr_show_potential_chk.stateChanged.connect(lambda state: _toggle_potential(window, state == QtCore.Qt.Checked))
+    overlay_row.addWidget(window.fr_show_potential_chk)
     overlay_row.addStretch()
     layout.addLayout(overlay_row)
+
+    # Potential slice controls
+    pot_row = QtWidgets.QHBoxLayout()
+    pot_row.addWidget(QtWidgets.QLabel("type:"))
+    window.fr_potential_type_combo = QtWidgets.QComboBox()
+    window.fr_potential_type_combo.setMaximumWidth(120)
+    window.fr_potential_type_combo.addItem("O (q=-0.4)")
+    window.fr_potential_type_combo.addItem("H (q=+0.2)")
+    window.fr_potential_type_combo.currentIndexChanged.connect(lambda idx: _on_potential_type_changed(window, idx))
+    pot_row.addWidget(window.fr_potential_type_combo)
+
+    window.fr_potential_span_spin = QtWidgets.QDoubleSpinBox(); window.fr_potential_span_spin.setRange(1.0, 50.0); window.fr_potential_span_spin.setSingleStep(0.5); window.fr_potential_span_spin.setValue(8.0); window.fr_potential_span_spin.setMaximumWidth(60)
+    window.fr_potential_n_spin = QtWidgets.QSpinBox(); window.fr_potential_n_spin.setRange(8, 256); window.fr_potential_n_spin.setValue(64); window.fr_potential_n_spin.setMaximumWidth(50)
+    pot_row.addWidget(QtWidgets.QLabel("span:")); pot_row.addWidget(window.fr_potential_span_spin)
+    pot_row.addWidget(QtWidgets.QLabel("n:")); pot_row.addWidget(window.fr_potential_n_spin)
+    pot_row.addStretch()
+    layout.addLayout(pot_row)
+
+    # Slice buttons
+    slice_row = QtWidgets.QHBoxLayout()
+    window.fr_xz_slice_btn = QtWidgets.QPushButton("XZ Slice")
+    window.fr_xz_slice_btn.setToolTip("Plot XZ side-view potential slice at current y")
+    window.fr_xz_slice_btn.clicked.connect(lambda: _on_xz_slice(window))
+    slice_row.addWidget(window.fr_xz_slice_btn)
+
+    window.fr_yz_slice_btn = QtWidgets.QPushButton("YZ Slice")
+    window.fr_yz_slice_btn.setToolTip("Plot YZ side-view potential slice at current x")
+    window.fr_yz_slice_btn.clicked.connect(lambda: _on_yz_slice(window))
+    slice_row.addWidget(window.fr_yz_slice_btn)
+    slice_row.addStretch()
+    layout.addLayout(slice_row)
 
     window.fr_energy_label = QtWidgets.QLabel("E: ---  |F|: ---  |T|: ---")
     window.fr_energy_label.setWordWrap(True)
@@ -846,6 +1040,7 @@ def build_ui(window):
     ]
     view_modes = [
         ('Show Substrate', lambda: _toggle_substrate(window)),
+        ('Show Potential', lambda: _toggle_potential(window)),
     ]
     help_text = {
         'Load Fit': 'Load a pre-fitted .npz file and set up the rigid body.',
@@ -858,7 +1053,13 @@ def build_ui(window):
         'Fconv': 'Stop Run when total body force magnitude is below this.',
         'ld': 'Linear damping factor (0 = no damping, 1 = frozen).',
         'ad': 'Angular damping factor.',
-        'Show substrate': 'Toggle the substrate overlay in the 3D scene.',
+        'Substrate': 'Toggle the substrate overlay in the 3D scene.',
+        'Potential': 'Toggle the XY potential slice overlay (at current z) in the 3D scene.',
+        'type': 'Atom type for potential slice (O = type 0, H = type 1).',
+        'span': 'Half-width of the potential slice grid in Å.',
+        'n': 'Grid resolution for potential slice.',
+        'XZ Slice': 'Plot XZ side-view potential at current y (matplotlib dialog).',
+        'YZ Slice': 'Plot YZ side-view potential at current x (matplotlib dialog).',
         'Fitting & Scans': 'Advanced: fit basis, save/load .npz, and run lateral/pinned scans.',
     }
 

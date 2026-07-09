@@ -247,12 +247,12 @@ def setup_rigid_folded(mol_file, fit_result, z_init=3.0, xy_init=(0.0, 0.0), qua
     else:
         apos_mol, reqs, enames, _, _ = load_xyz_with_REQs(mol_file)
     apos_mol = np.asarray(apos_mol, dtype=np.float32)
-    masses = _guess_mass(enames)
+    masses = np.ones(len(enames), dtype=np.float32)
     com0 = (apos_mol * masses[:, None]).sum(axis=0) / masses.sum()
     rel = apos_mol - com0[None, :]
     mtot, I, Iinv = compute_mass_properties(rel, masses)
     I_mean = float(np.mean(np.diag(I)))
-    Iinv = Iinv * (mtot / max(mass_trans, 1e-9)) * 0.5
+    mass_trans = mtot
 
     n_bodies = 1
     n_atoms = len(enames)
@@ -280,6 +280,7 @@ def setup_rigid_folded(mol_file, fit_result, z_init=3.0, xy_init=(0.0, 0.0), qua
         mass_trans, 1.0 / mass_trans,
         np.repeat(Iinv[None, :, :], n_bodies, axis=0),
         atom_body,
+        inertia=np.repeat(I[None, :, :], n_bodies, axis=0),
     )
 
     coeffs = fit_result['coeffs']
@@ -328,6 +329,201 @@ def relax_folded(rbd, n_steps=2000, dt=0.01, lin_damp=0.95, ang_damp=0.90, recor
         'quaternions': np.array(quaternions),
         'atom_positions': atom_positions_list,
     }
+
+
+def relax_folded_diag(rbd, n_steps=5000, dt=0.02, lin_damp=0.95, ang_damp=0.90, record_interval=10):
+    """Run relaxation with comprehensive diagnostics for debugging rotation dynamics.
+
+    Records thinned trajectory of: energy, |force|, |torque|, COM, quaternion,
+    angular velocity (vrot), linear velocity (vpos), per-atom forces, tilt angle,
+    rotation angle per step, and atom positions.
+
+    Returns dict with arrays of shape (n_record, ...).
+    """
+    from spammm.forcefields.RigidBodyDynamics import _quat_to_matrix_np
+    n_record = max(1, n_steps // record_interval)
+    recs = {
+        'step': np.zeros(n_record, dtype=np.int32),
+        'E': np.zeros(n_record, dtype=np.float64),
+        'Fmag': np.zeros(n_record, dtype=np.float64),
+        'Tmag': np.zeros(n_record, dtype=np.float64),
+        'com': np.zeros((n_record, 3), dtype=np.float64),
+        'quat': np.zeros((n_record, 4), dtype=np.float64),
+        'vpos': np.zeros((n_record, 3), dtype=np.float64),
+        'vrot': np.zeros((n_record, 3), dtype=np.float64),
+        'vrot_mag': np.zeros(n_record, dtype=np.float64),
+        'rot_per_step': np.zeros(n_record, dtype=np.float64),
+        'tilt': np.zeros(n_record, dtype=np.float64),
+        'atom_pos': np.zeros((n_record, rbd.num_atoms, 3), dtype=np.float64),
+        'atom_force': np.zeros((n_record, rbd.num_atoms, 4), dtype=np.float64),
+        'body_force': np.zeros((n_record, 4), dtype=np.float64),
+        'body_torque': np.zeros((n_record, 4), dtype=np.float64),
+    }
+    body_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    surf_normal = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    irec = 0
+    for i in range(0, n_steps, record_interval):
+        steps = min(record_interval, n_steps - i)
+        rbd.run_folded(steps, dt, lin_damp=lin_damp, ang_damp=ang_damp)
+        out = rbd.download_outputs()
+        atom_pos = out['atom_positions'][0]
+        atom_f = out['atom_force'][0]
+        E = float(atom_pos[:, 3].sum())
+        f = out['body_force'][0][:3]
+        tq = out['body_torque'][0][:3]
+        pos = out['pos'][0][:3]
+        quat = out['quats'][0]
+        vpos = out['lin_mom'][0][:3]
+        vrot = out['ang_mom'][0][:3]
+        R = _quat_to_matrix_np(quat)
+        body_z_world = R @ body_axis
+        tilt = float(np.arccos(np.clip(np.dot(body_z_world, surf_normal), -1, 1)))
+        rot_angle = float(np.linalg.norm(vrot) * dt * steps)
+        recs['step'][irec] = i + steps
+        recs['E'][irec] = E
+        recs['Fmag'][irec] = float(np.linalg.norm(f))
+        recs['Tmag'][irec] = float(np.linalg.norm(tq))
+        recs['com'][irec] = pos
+        recs['quat'][irec] = quat
+        recs['vpos'][irec] = vpos
+        recs['vrot'][irec] = vrot
+        recs['vrot_mag'][irec] = float(np.linalg.norm(vrot))
+        recs['rot_per_step'][irec] = rot_angle
+        recs['tilt'][irec] = tilt
+        recs['atom_pos'][irec] = atom_pos[:, :3]
+        recs['atom_force'][irec] = atom_f
+        recs['body_force'][irec] = out['body_force'][0]
+        recs['body_torque'][irec] = out['body_torque'][0]
+        irec += 1
+    return recs
+
+
+def plot_relax_diag(recs, title="Relaxation Diagnostics", save_path=None):
+    """Plot diagnostic relaxation data as a multi-panel summary.
+
+    Panels: Energy, |F| & |T|, COM z, tilt angle, |vrot| & rot/step, quaternion components.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    steps = recs['step']
+    fig, axes = plt.subplots(3, 2, figsize=(14, 12), sharex=True)
+    fig.suptitle(title, fontsize=14)
+
+    ax = axes[0, 0]
+    ax.plot(steps, recs['E'], 'b-', lw=0.8)
+    ax.set_ylabel('Energy [eV]')
+    ax.set_title('Total Energy')
+
+    ax = axes[0, 1]
+    ax.plot(steps, recs['Fmag'], 'r-', lw=0.8, label='|F|')
+    ax.plot(steps, recs['Tmag'], 'g-', lw=0.8, label='|T|')
+    ax.set_ylabel('Force / Torque')
+    ax.set_title('|Force| & |Torque|')
+    ax.legend()
+    ax.set_yscale('log')
+
+    ax = axes[1, 0]
+    ax.plot(steps, recs['com'][:, 2], 'b-', lw=0.8, label='z')
+    ax.plot(steps, recs['com'][:, 0], 'r-', lw=0.5, label='x')
+    ax.plot(steps, recs['com'][:, 1], 'g-', lw=0.5, label='y')
+    ax.set_ylabel('Position [Å]')
+    ax.set_title('COM Position')
+    ax.legend()
+
+    ax = axes[1, 1]
+    ax.plot(steps, np.degrees(recs['tilt']), 'm-', lw=0.8)
+    ax.set_ylabel('Tilt [deg]')
+    ax.set_title('Tilt angle (body z vs surface normal)')
+
+    ax = axes[2, 0]
+    ax.plot(steps, recs['vrot_mag'], 'r-', lw=0.8, label='|vrot|')
+    ax.plot(steps, recs['rot_per_step'], 'b-', lw=0.5, label='rot/record')
+    ax.set_ylabel('Angular velocity / rotation')
+    ax.set_title('Angular velocity magnitude')
+    ax.legend()
+    ax.set_yscale('log')
+
+    ax = axes[2, 1]
+    for j, c in enumerate('xyzw'):
+        ax.plot(steps, recs['quat'][:, j], lw=0.5, label=f'q{j}({c})')
+    ax.set_ylabel('Quaternion')
+    ax.set_title('Quaternion components')
+    ax.legend()
+    ax.set_xlabel('Step')
+
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+        print(f"[plot_relax_diag] Saved to {save_path}")
+    plt.close(fig)
+    return fig
+
+
+# =============================================================================
+# Folded potential evaluation (for debugging / visualization)
+# =============================================================================
+
+def eval_folded_potential(fit_result, atom_type_idx, xyz):
+    """Evaluate folded basis potential for a single atom type at arbitrary positions.
+
+    Args:
+        fit_result: dict from fit_folded_for_molecule / load_fit
+        atom_type_idx: index into coeffs rows (0 = first unique REQ type)
+        xyz: (N, 3) array of world coordinates
+
+    Returns: (N,) array of potential energy values
+    """
+    coeffs = np.asarray(fit_result['coeffs'], dtype=np.float64)
+    kxyz = np.asarray(fit_result['basis_params'], dtype=np.float64)
+    lvec2d = np.asarray(fit_result['folded_lvec2d'], dtype=np.float64)
+    ax, bx, ay, by = lvec2d
+    det = ax * by - bx * ay
+    invLvec = np.array([by / det, -bx / det, -ay / det, ax / det])
+    xyz = np.asarray(xyz, dtype=np.float64)
+    u = invLvec[0] * xyz[:, 0] + invLvec[1] * xyz[:, 1]
+    v = invLvec[2] * xyz[:, 0] + invLvec[3] * xyz[:, 1]
+    u = u - np.floor(u)
+    v = v - np.floor(v)
+    z = xyz[:, 2]
+    ku = kxyz[None, :, 0]
+    kv = kxyz[None, :, 1]
+    az = kxyz[None, :, 2]
+    z0 = kxyz[None, :, 3]
+    bx_ = np.cos(2.0 * np.pi * ku * u[:, None])
+    by_ = np.cos(2.0 * np.pi * kv * v[:, None])
+    bz_ = np.exp(-az * np.maximum(0.0, z[:, None] - z0))
+    basis = bx_ * by_ * bz_
+    c = coeffs[atom_type_idx, :basis.shape[1]]
+    return (basis * c[None, :]).sum(axis=1)
+
+
+def eval_folded_potential_slice(fit_result, atom_type_idx, plane='xy', fixed_val=0.0, extent=(-8, 8, -8, 8), n=64):
+    """Evaluate folded basis potential for a single atom type on a 2D grid.
+
+    Args:
+        fit_result: dict from fit_folded_for_molecule / load_fit
+        atom_type_idx: index into coeffs rows
+        plane: 'xy' (top view), 'xz' or 'yz' (side views)
+        fixed_val: value of the fixed coordinate (z for 'xy', y for 'xz', x for 'yz')
+        extent: (min1, max1, min2, max2) for the two varying coordinates
+        n: grid resolution (n x n)
+
+    Returns: (c1, c2, E) where c1, c2 are 1D coordinate arrays and E is (n, n) potential matrix
+    """
+    a = np.linspace(extent[0], extent[1], n)
+    b = np.linspace(extent[2], extent[3], n)
+    A, B = np.meshgrid(a, b, indexing='ij')
+    if plane == 'xy':
+        xyz = np.stack([A.ravel(), B.ravel(), np.full(A.size, fixed_val)], axis=1)
+    elif plane == 'xz':
+        xyz = np.stack([A.ravel(), np.full(A.size, fixed_val), B.ravel()], axis=1)
+    elif plane == 'yz':
+        xyz = np.stack([np.full(A.size, fixed_val), A.ravel(), B.ravel()], axis=1)
+    else:
+        raise ValueError(f"plane must be 'xy', 'xz', or 'yz', got {plane!r}")
+    E = eval_folded_potential(fit_result, atom_type_idx, xyz).reshape(n, n)
+    return a, b, E
 
 
 # =============================================================================

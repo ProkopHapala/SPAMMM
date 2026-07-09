@@ -1,4 +1,8 @@
 // lcao_grid.cl - LCAO density and orbital projection onto real-space grids
+// ====================================================================
+//
+// LCAO BASIS PROJECTION FOR GPU ELECTRONIC STRUCTURE
+// ===================================================
 //
 // Projects atomic orbital basis functions (LCAO: Linear Combination of Atomic
 // Orbitals) and density matrices onto 3D real-space grids. Supports any LCAO
@@ -6,32 +10,112 @@
 // orbitals. Used for electron density visualization, charge analysis, and
 // as input for STM/Dyson calculations (lcao_stm.cl).
 //
-// Kernels:
-//   - project_density_sparse: Project sparse density matrix onto grid using task-based parallelism (1 task = 1 atom-pair-orbital block).
-//   - count_atoms_per_block: Count atoms per spatial block (for task sorting).
-//   - fill_task_atoms: Fill atom indices into task lists.
-//   - compact_tasks: Compact sparse task list (remove empty tasks).
-//   - project_density_sparse_tiled: Tiled version of density projection with shared-memory atom caching for better performance.
-//   - project_orbital: Project a single molecular orbital onto grid.
-//   - project_orbital_points_exp: Project orbital at arbitrary points (exponential radial functions).
-//   - mo_overlap_points_exp_sk: Compute overlap integrals between molecular orbitals at discrete points (with SK-type overlap).
-//   - mo_overlap_points_exp_sk_2mol: Same for two-molecule overlap (STM).
-//   - project_orbital_points: Project orbital at arbitrary grid points.
-//   - project_orbital_dense_points: Project orbital at points (dense matrix).
-//   - project_orbital_dense_points_exp: Same with exponential radial functions.
-//   - project_density_dense_points: Project dense density matrix at points.
-//   - project_orbital_dense: Project orbital onto grid (dense matrix variant).
-//   - project_density_dense: Project density onto grid (dense matrix variant).
+// --- Physics Overview ---
 //
-// Helper functions: evaluate_radial (radial orbital evaluation),
-// eval_angular_dense (spherical harmonic Y_lm), eval_atom_orbitals (full
-// orbital evaluation at a point), sk_contract_sp (SK-type overlap contraction),
-// quat_rotate3 (quaternion rotation for orbital orientation).
+// In LCAO methods, the electron density is:
+//   rho(r) = Σ_{i,j} Σ_{mu,nu} D_{mu_i, nu_j} * phi_mu(r - R_i) * phi_nu(r - R_j)
+// where D is the density matrix, phi are atomic orbital basis functions,
+// and R_i, R_j are atomic positions.
+//
+// Each basis function is a product of radial and angular parts:
+//   phi_{l,m}(r) = R_l(r) * Y_l^m(r_hat)
+// where Y_l^m are real spherical harmonics (tesseral harmonics).
+//
+// Supported angular momenta:
+//   l=0 (s): 1 orbital,  Y_00 = 1/sqrt(4*pi)
+//   l=1 (p): 3 orbitals, Y_1m ~ (x,y,z)/r * sqrt(3/(4*pi))
+//   l=2 (d): 5 orbitals, Y_2m ~ xy, yz, 3z^2-r^2, xz, x^2-y^2
+//
+// Radial functions:
+//   - Spline-based: Cubic B-spline interpolation from tabulated radial data
+//     (Fireball/DFTB numerical basis). Stored as (wf, d2wf) pairs for
+//     second-derivative interpolation.
+//   - Exponential: f(r) = exp(-beta*(r - r0)) for vacuum/STM region.
+//     Simpler, no tabulated basis needed, used for STM tip orbitals.
+//
+// --- Orbital Ordering Convention ---
+//
+// Two conventions are used in this codebase:
+//   - Fortran (Fireball): [s, py, pz, px]  (used in density matrix rho)
+//   - OpenCL:             [px, py, pz, s]  (used in MO coefficients)
+// The swizzle .wyzx converts between them. See DFT/utils.py convCoefs().
+//
+// --- GPU Parallelization: Task-Based Block Decomposition ---
+//
+// The 3D grid is divided into 8x8x8 voxel blocks (512 voxels per block).
+// Each block becomes a "task" handled by one workgroup:
+//   1. count_atoms_per_block: Count which atoms overlap each block (sphere-AABB test)
+//   2. fill_task_atoms: Fill atom indices into per-block lists (atomic_inc for slot)
+//   3. compact_tasks: Remove empty blocks (prefix-sum compaction)
+//   4. project_density_sparse[_tiled]: Evaluate density for each voxel in the block
+//
+// This approach avoids iterating over all atoms for all voxels — only atoms
+// whose orbital cutoff overlaps the block are considered.
+//
+// --- Sparse vs Dense Density Matrix ---
+//
+// Sparse variant: rho[iatom][ineigh][nu][mu] — only nonzero neighbor pairs stored.
+//   Requires neighbor list (neigh_j) to find the ineigh index for each (i,j) pair.
+//   Used with Fireball/DFTB sparse density matrices.
+//
+// Dense variant: dm[mu_total][nu_total] — full norb_total × norb_total matrix.
+//   No neighbor list needed. Used for small systems or when full matrix is available.
+//
+// --- Key Caveats ---
+//
+//   CAVEAT 1: The sparse density projection uses a linear search over neigh_max
+//   to find the neighbor index ineigh_ij for each (i,j) pair. This is O(neigh_max)
+//   per pair and can be a bottleneck for systems with many neighbors.
+//
+//   CAVEAT 2: The tiled variant (project_density_sparse_tiled) uses atomic_add
+//   to accumulate into out_grid, which requires the grid to be zeroed first.
+//   The non-tiled variant writes directly (=, not +=).
+//
+//   CAVEAT 3: The orbital ordering swizzle .wyzx in the tiled kernel converts
+//   from OpenCL [px,py,pz,s] to Fortran [s,py,pz,px] for the rho matrix dot
+//   product. Getting this wrong produces silently incorrect densities.
+//
+//   CAVEAT 4: The exponential radial variants (project_orbital_*_exp) have NO
+//   cutoff — they evaluate at all distances. This is intentional for STM
+//   where the vacuum decay is the physics of interest, but it means the
+//   kernel is O(natoms) per point with no early exit.
+//
+// Kernels:
+//   - project_density_sparse: Sparse density -> grid. 1 workgroup = 1 task block.
+//   - count_atoms_per_block: Count atoms overlapping each block. 1 thread = 1 atom.
+//   - fill_task_atoms: Fill atom indices into block lists. 1 thread = 1 atom.
+//   - compact_tasks: Remove empty blocks via prefix sum. 1 thread = 1 block.
+//   - project_density_sparse_tiled: Tiled sparse density with __local atom cache.
+//   - project_orbital: Single MO -> grid. 1 workgroup = 1 task block.
+//   - project_orbital_points_exp: MO at arbitrary points with exp radial. 1 thread = 1 point.
+//   - mo_overlap_points_exp_sk: MO overlap with SK angular. 1 thread = 1 scan point.
+//   - mo_overlap_points_exp_sk_2mol: Same, explicit two-molecule interface.
+//   - project_orbital_points: MO at points with spline radial. 1 thread = 1 point.
+//   - project_orbital_dense_points: Dense MO at points (s,p,d support). 1 thread = 1 point.
+//   - project_orbital_dense_points_exp: Dense MO at points, exp radial. 1 thread = 1 point.
+//   - project_density_dense_points: Dense density at points. 1 thread = 1 point.
+//   - project_orbital_dense: Dense MO -> grid. 1 workgroup = 1 task block.
+//   - project_density_dense: Dense density -> grid. 1 workgroup = 1 task block.
+//
+// Helper functions: evaluate_radial (cubic B-spline radial interpolation),
+// eval_angular_dense (real spherical harmonics Y_lm for l=0,1,2),
+// eval_atom_orbitals (full orbital evaluation at a point, s/p/d),
+// sk_contract_sp (Slater-Koster overlap contraction for s-p basis),
+// quat_rotate3 (quaternion rotation for tip orbital orientation).
 // Self-contained (own types: GridSpec, AtomData, TaskData).
 
+// ======================================================================
+//                          Data Types
+// ======================================================================
+//
+// GridSpec: 3D grid definition (origin, 3 lattice vectors, dimensions).
+// AtomData: Per-atom info (position, cutoff radius, type index, orbital range).
+// TaskData: Spatial block descriptor (block indices, atom count, j-split).
+//
+// Memory layout (originally Fortran column-major):
+// rho(imu, inu, ineigh, iatom) -> rho[iatom][ineigh][inu][imu] in C-order
+//
 // OpenCL kernel for projecting sparse density matrix to a real-space grid.
-// Data layout in memory (originally Fortran column-major):
-// rho(imu, inu, ineigh, iatom) -> rho[iatom][ineigh][inu][imu] in C-order indexing
 
 #ifndef DEBUG_EARLY_EXIT
 #define DEBUG_EARLY_EXIT 0
@@ -77,15 +161,39 @@ typedef struct {
     int pad2;
 } TaskData;
 
-// Real spherical harmonic normalization prefactors (same as myprog.cl)
-// Y_00 = pref_s, Y_1m = pref_p * (x,y,z)/r
+// ======================================================================
+//  Real Spherical Harmonic (Tesseral Harmonic) Prefactors
+// ======================================================================
+//
+//  Y_00 = pref_s = 1/sqrt(4*pi)
+//  Y_1m = pref_p * (x,y,z)/r  = sqrt(3/(4*pi)) * r_hat
+//  Y_2m = pref_d * (xy, yz, xz)  or  pref_d_z2 * (3z^2-r^2)  or  pref_d_x2y2 * (x^2-y^2)
+//
+//  These are the normalization constants for real (tesseral) spherical
+//  harmonics, which are the angular part of atomic orbitals.
+//
 #define PREF_S 0.28209479f   // 1/sqrt(4*pi)
 #define PREF_P 0.48860251f   // sqrt(3/(4*pi))
 #define PREF_D 1.09254843f   // sqrt(15/(4*pi))
-#define PREF_D_Z2 0.31539157f // for 3z^2-r^2
-#define PREF_D_X2Y2 0.54627422f // for x^2-y^2
+#define PREF_D_Z2 0.31539157f // sqrt(5/(16*pi)) for 3z^2-r^2
+#define PREF_D_X2Y2 0.54627422f // sqrt(15/(16*pi)) for x^2-y^2
 
-// Cubic B-spline interpolation for radial part
+// ======================================================================
+//  evaluate_radial() — Cubic B-spline interpolation of tabulated radial functions
+// ======================================================================
+//
+//  Interpolates the radial part R_l(r) of atomic orbitals from tabulated
+//  numerical basis data (e.g. Fireball pseudoatomic orbitals).
+//
+//  The basis_data array stores (wf, d2wf) pairs per radial node, where
+//  d2wf is the second derivative precomputed for cubic spline interpolation.
+//
+//  Formula (matching Fortran getpsi()):
+//    psi = a*ylo + b*yhi + ((a^3-a)*d2lo + (b^3-b)*d2hi) * h^2/6
+//  where a = 1-t, b = t, t = fractional position in [i, i+1].
+//
+//  Returns 0.0 if r is beyond the tabulated range or indices are invalid.
+//
 float evaluate_radial(
     float r, 
     int ityp, int ish, 
@@ -121,10 +229,24 @@ float evaluate_radial(
 // ============================================================================
 // Dense-matrix orbital/density projection helpers with d-orbital support
 // ============================================================================
+//
+// These helpers support arbitrary angular momenta (s, p, d) via the
+// shell index = angular momentum convention (ish = l for STO basis).
+//
 
-// Evaluate real spherical harmonic (tesseral) for given (l, mm) and unit vector rhat.
-// mm ranges from -l to +l, following Fortran realTessY ordering.
-// For l=2 (d orbitals): mm=-2(xy), -1(yz), 0(z2), 1(xz), 2(x2-y2)
+// ======================================================================
+//  eval_angular_dense() — Real spherical harmonic Y_l^m(r_hat)
+// ======================================================================
+//
+//  Evaluates the angular part of atomic orbitals for l=0,1,2.
+//  mm ranges from -l to +l, following Fortran realTessY ordering.
+//
+//  l=0 (s):  Y_00 = pref_s
+//  l=1 (p):  Y_1,-1 = py = pref_p * y_hat,  Y_1,0 = pz = pref_p * z_hat,
+//            Y_1,+1 = px = pref_p * x_hat
+//  l=2 (d):  Y_2,-2 = d_xy,  Y_2,-1 = d_yz,  Y_2,0 = d_z2,
+//            Y_2,+1 = d_xz,  Y_2,+2 = d_x2-y2
+//
 inline float eval_angular_dense(int l, int mm, float3 rhat) {
     switch(l) {
     case 0:
@@ -149,8 +271,17 @@ inline float eval_angular_dense(int l, int mm, float3 rhat) {
     return 0.0f;
 }
 
-// Evaluate all basis functions for one atom at a point, returning psi values into out_buf.
-// out_buf must have at least norb slots. Returns number of orbitals written.
+// ======================================================================
+//  eval_atom_orbitals() — Evaluate all basis functions for one atom at a point
+// ======================================================================
+//
+//  Computes phi_mu(r) = R_l(r) * Y_l^m(r_hat) for all orbitals of one atom.
+//  Iterates over shells (ish = l = 0,1,2,...) and m = -l..+l.
+//  Returns the number of orbitals written into out_buf (0 if outside cutoff).
+//
+//  Supports s, p, d orbitals via the shell-index = angular-momentum convention.
+//  out_buf must have at least ad.norb slots (max 9 for spd).
+//
 inline int eval_atom_orbitals(
     float3 r_vox,
     AtomData ad,
@@ -179,6 +310,39 @@ inline int eval_atom_orbitals(
     return iorb;
 }
 
+// ======================================================================
+//                          project_density_sparse()
+// ======================================================================
+//
+//  Projects sparse density matrix onto 3D grid. 1 workgroup = 1 task block
+//  (8x8x8 = 512 voxels). Each thread processes multiple voxels via striding.
+//
+//  Physics:
+//    rho(r) = Σ_{i,j} Σ_{mu,nu} D_{mu_i, nu_j} * phi_mu(r - R_i) * phi_nu(r - R_j)
+//
+//  The sparse density matrix is indexed as:
+//    rho[iatom][ineigh][nu][imu]  (Fortran column-major -> C-order)
+//  where ineigh is the neighbor index of atom j in atom i's neighbor list.
+//  The neighbor list neigh_j[iatom*neigh_max + k] = j_atom + 1 (1-based).
+//
+//  For each voxel, the kernel:
+//    1. Computes real-space position r_vox from grid indices
+//    2. For each atom pair (i, j) in the task block:
+//       a. Evaluates 4 orbitals (s, px, py, pz) at r_vox for each atom
+//       b. Finds the neighbor index ineigh_ij via linear search
+//       c. Loads the 4x4 density sub-block rho_ij
+//       d. Computes den += dot(psi_i, rho_ij · psi_j) (4x4 matrix-vector)
+//    3. Writes den to out_grid[g_idx]
+//
+//  Diagonal blocks (nj < 0): i interacts with j >= i (symmetric, pairsym=2 for off-diag).
+//  Off-diagonal blocks (nj >= 0): i in [0, nj), j in [nj, na).
+//
+//  CAVEAT: Only s and p orbitals are supported (4 per atom). The 4x4 block
+//  is hardcoded. For d-orbital support, use project_density_dense instead.
+//
+//  CAVEAT: The neighbor search is O(neigh_max) per pair — a linear scan.
+//  For systems with large neighbor lists this is a bottleneck.
+//
 __kernel void project_density_sparse(
     __global const GridSpec* grid,
     const int n_tasks,
@@ -364,6 +528,18 @@ typedef struct {
     int pad1, pad2;
 } TaskData_local;
 
+// ======================================================================
+//                          count_atoms_per_block()
+// ======================================================================
+//
+//  Counts how many atoms overlap each spatial block. 1 thread = 1 atom.
+//  Uses sphere-AABB intersection test: for each block in the atom's cutoff
+//  radius, check if the atom's sphere intersects the block's bounding box.
+//  Uses atomic_inc to increment the per-block counter.
+//
+//  This is the first pass of the task-based block decomposition:
+//    count_atoms_per_block -> fill_task_atoms -> compact_tasks -> project_*
+//
 __kernel void count_atoms_per_block(
     __global const GridSpec* grid,
     const int natoms,
@@ -412,6 +588,17 @@ __kernel void count_atoms_per_block(
     }
 }
 
+// ======================================================================
+//                          fill_task_atoms()
+// ======================================================================
+//
+//  Fills atom indices into per-block lists. 1 thread = 1 atom.
+//  Same sphere-AABB test as count_atoms_per_block, but writes the atom
+//  index into task_atoms[block * nMaxAtom + slot] using atomic_inc for slot.
+//  If slot >= nMaxAtom, the atom is silently dropped (overflow).
+//
+//  Requires block_offsets to be initialized from block_counts (prefix sum).
+//
 __kernel void fill_task_atoms(
     __global const GridSpec* grid,
     const int natoms,
@@ -458,6 +645,14 @@ __kernel void fill_task_atoms(
     }
 }
 
+// ======================================================================
+//                          compact_tasks()
+// ======================================================================
+//
+//  Compacts the sparse task list by removing empty blocks. 1 thread = 1 block.
+//  Uses task_offsets (prefix sum of non-empty blocks) to write compacted
+//  TaskData and task_atoms arrays. Only blocks with na > 0 are kept.
+//
 __kernel void compact_tasks(
     const int n_blocks_x,
     const int n_blocks_y,
@@ -492,7 +687,28 @@ __kernel void compact_tasks(
     }
 }
 
-// Tiled kernel to avoid atomic adds and minimize global reads
+// ======================================================================
+//                          project_density_sparse_tiled()
+// ======================================================================
+//
+//  Tiled variant of project_density_sparse with __local memory caching.
+//  1 workgroup = 1 task block. Atoms and rho blocks are loaded into
+//  __local memory in TILE_ATOMS × TILE_ATOMS tiles to reduce global reads.
+//
+//  Key difference from non-tiled:
+//    - AtomData and rho sub-blocks cached in __local (l_atom_i, l_atom_j, l_rho)
+//    - Uses atomic_add to accumulate into out_grid (requires zeroing first)
+//    - Ortega orbital convention swizzle: .wyzx converts [px,py,pz,s] -> [s,py,pz,px]
+//    - pairsym = 2.0 for off-diagonal pairs (i != j), 1.0 for diagonal (i == j)
+//
+//  CAVEAT: The output grid is zeroed at the start of the kernel, then
+//  accumulated with += across tiles. This is correct but means the kernel
+//  cannot be run concurrently on overlapping blocks.
+//
+//  CAVEAT: The orbital swizzle .wyzx is critical — it converts from OpenCL
+//  [px,py,pz,s] to Fortran [s,py,pz,px] order for the rho matrix. Getting
+//  this wrong produces silently incorrect densities.
+//
 #ifndef TILE_ATOMS
 #define TILE_ATOMS 8
 #endif
@@ -696,17 +912,22 @@ __kernel void project_density_sparse_tiled(
 */
 }
 
-// ============================================================================
-// Orbital projection kernel (simpler than density projection)
-// Computes ψ(r) = Σ_i C_i φ_i(r) where C_i are MO coefficients
-// This is for projecting a single orbital, not density
-// 
-// IMPORTANT: Coeffs must be in OpenCL order [s, px, py, pz] (remapped from Fortran [s, py, pz, px])
-// Angular dependence: psi_s = R_s(r) * Y_00
-//                     psi_px = R_p(r) * (x/r) * PREF_P  [Y_1,+1]
-//                     psi_py = R_p(r) * (y/r) * PREF_P  [Y_1,-1]  
-//                     psi_pz = R_p(r) * (z/r) * PREF_P  [Y_1,0]
-// ============================================================================
+// ======================================================================
+//                          project_orbital()
+// ======================================================================
+//
+//  Projects a single molecular orbital onto 3D grid. 1 workgroup = 1 task.
+//  Computes psi(r) = Σ_i C_i · phi_i(r) where C_i are MO coefficients.
+//
+//  Simpler than density projection: no pairwise sum, just a linear
+//  combination of basis functions evaluated at each voxel.
+//
+//  IMPORTANT: Coeffs must be in OpenCL order [px, py, pz, s] (remapped
+//  from Fortran [s, py, pz, px] by convCoefs() in DFT/utils.py).
+//
+//  Only s and p orbitals supported (4 per atom, hardcoded as float4).
+//  For d-orbital support, use project_orbital_dense instead.
+//
 __kernel void project_orbital(
     __global const GridSpec* grid,
     const int n_tasks,
@@ -793,13 +1014,19 @@ __kernel void project_orbital(
     }
 }
 
-// ============================================================================
-// Orbital projection at arbitrary points with exponential (vacuum) radial decay
-// Computes ψ(p_k) = Σ_atoms Σ_orb C_{atom,orb} φ_{atom,orb}(p_k)
-// Radial part is replaced by exp(-beta*(r-r0)) instead of Fireball basis tables.
-// Coeff convention: [px, py, pz, s] per atom (float4)
-// Angular part: cartesian p: rhat.x/y/z (same as project_orbital_points)
-// ============================================================================
+// ======================================================================
+//                          project_orbital_points_exp()
+// ======================================================================
+//
+//  Projects a single MO at arbitrary points with exponential radial decay.
+//  1 thread = 1 point. No grid structure needed — evaluates at any 3D point.
+//
+//  Radial part: f(r) = exp(-beta*(r - r0)) instead of spline basis tables.
+//  This is used for STM vacuum region where orbitals decay exponentially.
+//
+//  CAVEAT: No distance cutoff — all atoms within rcut are evaluated.
+//  The cutoff is from AtomData.pos_rcut.w, not from the exponential itself.
+//
 __kernel void project_orbital_points_exp(
     const int n_points,
     __global const float4* points,    // [n_points] xyz
@@ -847,19 +1074,39 @@ __kernel void project_orbital_points_exp(
     out_psi[ip] = psi;
 }
 
-// ============================================================================
-// MO overlap for molecular tip vs molecular sample using exponential radial + SK angular
-// Each work-item corresponds to one tip-center position (scan pixel).
+// ======================================================================
+//  sk_contract_sp() — Slater-Koster overlap contraction for s-p basis
+// ======================================================================
 //
-// For given tip center R_tip, tip atoms are at R_tip + tip_pos_rel[ia].
-// We compute overlap amplitude:
-//   t(R_tip) = Σ_{ia∈tip} Σ_{ja∈smp}  cT(ia)^T  S_ij(R_ij)  cS(ja)
-// where S_ij is a 4x4 (s,px,py,pz) SK-like block with radial f=exp(-beta*(r-r0)).
-// Coeff convention on input: float4 per atom in order [px,py,pz,s].
-// Output:
-//   out_t[ip]  = signed amplitude (float)
-//   out_I[ip]  = |t|^2 (float)
+//  Computes the 4×4 overlap matrix element between two atoms' orbitals
+//  (s, px, py, pz) using the Slater-Koster two-center approximation:
+//
+//    t = cT^T · S(l,m,n) · cS
+//
+//  where (l,m,n) is the unit vector along the interatomic axis, and
+//  S contains the SK hopping integrals:
+//    t_ss = sT * Vss * sS
+//    t_sp = sT * Vsp * (l*pxS + m*pyS + n*pzS)
+//    t_ps = (l*pxT + m*pyT + n*pzT) * Vps * sS
+//    t_pp = Vpp_pi * (pT·pS) + (Vpp_sig - Vpp_pi) * (pT·u) * (pS·u)
+//
+//  The last term decomposes the p-p interaction into sigma (along axis)
+//  and pi (perpendicular) components via the projection (p·u).
+//
+//  Coeff convention: float4 [px, py, pz, s] per atom (OpenCL order).
+//
 // ============================================================================
+//  MO overlap for molecular tip vs molecular sample
+// ============================================================================
+//
+//  Each work-item computes the overlap amplitude for one tip-center position:
+//    t(R_tip) = Σ_{ia∈tip} Σ_{ja∈smp} cT(ia)^T · S_ij(R_ij) · cS(ja)
+//
+//  The tip can be rotated per-pixel via a quaternion (tip_quat), which is
+//  applied to both the tip atom positions and the p-orbital coefficients.
+//
+//  Output: out_t = signed amplitude, out_I = |t|^2 (intensity).
+//
 inline float sk_contract_sp(
     const float4 cT_pxpy_pz_s,
     const float4 cS_pxpy_pz_s,
@@ -889,6 +1136,18 @@ inline float sk_contract_sp(
     return t_ss + t_sp + t_ps + t_pp;
 }
 
+// ======================================================================
+//  quat_rotate3() — Rotate vector v by unit quaternion q = (x,y,z,w)
+// ======================================================================
+//
+//  Uses the optimized quaternion rotation formula:
+//    v' = v + 2*w*(qv × v) + 2*qv × (qv × v)
+//  where qv = (q.x, q.y, q.z). This is equivalent to the standard
+//  rotation matrix but requires fewer operations (no trig functions).
+//
+//  Used to rotate tip atom positions and p-orbital coefficients for
+//  arbitrary tip orientations in STM scan kernels.
+//
 inline float3 quat_rotate3( const float4 q, const float3 v ){
     // q = (x,y,z,w), unit quaternion; rotate v by q
     const float3 qv = (float3)(q.x,q.y,q.z);
@@ -896,6 +1155,26 @@ inline float3 quat_rotate3( const float4 q, const float3 v ){
     return v + q.w*t + cross(qv, t);
 }
 
+// ======================================================================
+//                          mo_overlap_points_exp_sk()
+// ======================================================================
+//
+//  Computes MO overlap amplitude between a molecular tip and sample at each
+//  scan point. 1 thread = 1 scan point (pixel).
+//
+//  Physics:
+//    t(R_tip) = Σ_{ia∈tip} Σ_{ja∈smp} cT(ia)^T · S_SK(R_ij) · cS(ja)
+//    I(R_tip) = |t|^2
+//
+//  The tip is positioned at tip_centers[ip] with optional rotation tip_quat[ip].
+//  Tip atom positions are relative to the tip center and rotated by the quaternion.
+//  The p-orbital coefficients are also rotated to match the tip orientation.
+//
+//  SK parameters use a simplified exponential model:
+//    Vss = Vsp = Vps = Vpp_sig = -f,  Vpp_pi = +f
+//  where f = exp(-beta*(r - r0)). The sign convention ensures correct
+//  bonding/antibonding phase for sigma and pi interactions.
+//
 __kernel void mo_overlap_points_exp_sk(
     // Scan grid: each work-item computes overlap for one tip-center position
     const int n_points,                       // number of scan points (pixels)
@@ -950,6 +1229,14 @@ __kernel void mo_overlap_points_exp_sk(
     out_I[ip] = t*t;
 }
 
+// ======================================================================
+//                          mo_overlap_points_exp_sk_2mol()
+// ======================================================================
+//
+//  Same as mo_overlap_points_exp_sk but with explicit two-molecule interface.
+//  Implementation is identical — separate entry point for self-documenting
+//  call sites when tip and sample are different molecules.
+//
 __kernel void mo_overlap_points_exp_sk_2mol(
     // Explicit two-molecule entrypoint (tip and sample may be different molecules)
     // NOTE: Implementation is identical to mo_overlap_points_exp_sk; we keep it separate
@@ -1002,9 +1289,17 @@ __kernel void mo_overlap_points_exp_sk_2mol(
     out_t[ip] = t;
     out_I[ip] = t*t;
 }
-// Coeff convention: [px, py, pz, s] per atom (float4)
-// basis_data: packed as float2 per node (wf, wf_spline second derivative)
-// ============================================================================
+// ======================================================================
+//                          project_orbital_points()
+// ======================================================================
+//
+//  Projects a single MO at arbitrary points using spline-based radial functions.
+//  1 thread = 1 point. Same as project_orbital but for arbitrary points
+//  (not on a regular grid). Uses evaluate_radial() for the radial part.
+//
+//  Coeff convention: [px, py, pz, s] per atom (float4).
+//  basis_data: packed as float2 per node (wf, wf_spline second derivative).
+//
 __kernel void project_orbital_points(
     const int n_points,
     __global const float4* points,    // [n_points] xyz
@@ -1054,11 +1349,17 @@ __kernel void project_orbital_points(
 
 
 
-// ============================================================================
-// Orbital projection at arbitrary points using dense MO coefficient vector.
-// Computes psi(p) = sum_{atoms} sum_{mu} coeffs[i0orb+mu] * phi_mu(p)
-// Supports arbitrary number of orbitals per atom (s, p, d) via i0orb/norb.
-// ============================================================================
+// ======================================================================
+//                          project_orbital_dense_points()
+// ======================================================================
+//
+//  Projects a single MO at arbitrary points using dense coefficient vector.
+//  1 thread = 1 point. Supports s, p, d orbitals via eval_atom_orbitals().
+//
+//  Unlike project_orbital_points, this uses a dense coefficient vector
+//  indexed by i0orb + orbital_index, allowing arbitrary numbers of orbitals
+//  per atom (not limited to 4). Uses spline-based radial functions.
+//
 __kernel void project_orbital_dense_points(
     const int n_points,
     __global const float4* points,
@@ -1103,14 +1404,20 @@ __kernel void project_orbital_dense_points(
     out_psi[ip] = psi;
 }
 
-// ============================================================================
-// Orbital projection at arbitrary points using dense MO coefficient vector
-// with exponential radial decay (for STM at large distances).
-// Computes psi(p) = sum_{atoms} sum_{mu} coeffs[i0orb+mu] * phi_mu(p)
-// Uses f(r) = exp(-beta*(r - r0)) instead of spline basis.
-// NO CUTOFF - truly long-range for STM simulation.
-// Supports arbitrary number of orbitals per atom (s, p, d) via i0orb/norb.
-// ============================================================================
+// ======================================================================
+//                          project_orbital_dense_points_exp()
+// ======================================================================
+//
+//  Dense MO projection at points with exponential radial decay.
+//  1 thread = 1 point. Supports s, p, d orbitals.
+//
+//  Uses f(r) = exp(-beta*(r - r0)) for the radial part — no tabulated
+//  basis needed. NO CUTOFF: all atoms are evaluated regardless of distance.
+//  This is intentional for STM simulation where vacuum decay is the physics.
+//
+//  CAVEAT: O(natoms) per point with no early exit. For large systems,
+//  call with smaller point batches or use a cutoff-based variant.
+//
 __kernel void project_orbital_dense_points_exp(
     const int n_points,
     __global const float4* points,
@@ -1153,12 +1460,23 @@ __kernel void project_orbital_dense_points_exp(
     out_psi[ip] = psi;
 }
 
-// ============================================================================
-// Density projection at arbitrary points using dense density matrix.
-// Computes rho(p) = sum_{i,j} sum_{mu,nu} coeffs[i0_i+mu] * coeffs[i0_j+nu] * phi_mu(p) * phi_nu(p)
-// For diagonal density matrix (MO occupancy): dm is a 1D vector of diagonal elements
-// For full density matrix: dm is a 2D matrix flattened as [norb_total][norb_total]
-// ============================================================================
+// ======================================================================
+//                          project_density_dense_points()
+// ======================================================================
+//
+//  Projects dense density matrix at arbitrary points. 1 thread = 1 point.
+//  Computes rho(r) = Σ_{i,j} Σ_{mu,nu} D_{mu_i,nu_j} * phi_mu(r) * phi_nu(r)
+//
+//  Supports full density matrix (dm is norb_total × norb_total) with
+//  s, p, d orbitals via eval_atom_orbitals(). Uses pairsym=2 for i!=j
+//  to account for the symmetric density matrix.
+//
+//  CAVEAT: O(natoms^2) per point. The inner loop evaluates all atom pairs.
+//  For large systems, use the sparse variant or the grid-based approach.
+//
+//  CAVEAT: Private arrays phi_i[9], phi_j[9] limit to 9 orbitals per atom
+//  (1 s + 3 p + 5 d = 9). For f-orbitals (l=3), this would overflow.
+//
 __kernel void project_density_dense_points(
     const int n_points,
     __global const float4* points,
@@ -1212,10 +1530,15 @@ __kernel void project_density_dense_points(
     out_rho[ip] = density;
 }
 
-// ============================================================================
-// Orbital projection onto 3D grid using dense MO coefficient vector.
-// Same execution model as project_orbital: one workgroup per 8x8x8 task block.
-// ============================================================================
+// ======================================================================
+//                          project_orbital_dense()
+// ======================================================================
+//
+//  Projects a single MO onto 3D grid using dense coefficient vector.
+//  1 workgroup = 1 task block (8x8x8 voxels). Supports s, p, d orbitals.
+//  Same execution model as project_orbital but with dense coefficients
+//  and full angular momentum support via eval_angular_dense().
+//
 __kernel void project_orbital_dense(
     __global const GridSpec* grid,
     const int n_tasks,
@@ -1278,10 +1601,18 @@ __kernel void project_orbital_dense(
     }
 }
 
-// ============================================================================
-// Density projection onto 3D grid using dense density matrix.
-// Same execution model as project_density_sparse: one workgroup per 8x8x8 task block.
-// ============================================================================
+// ======================================================================
+//                          project_density_dense()
+// ======================================================================
+//
+//  Projects dense density matrix onto 3D grid. 1 workgroup = 1 task block.
+//  Computes rho(r) = Σ_{i,j} Σ_{mu,nu} D_{mu_i,nu_j} * phi_mu(r) * phi_nu(r)
+//  with full s, p, d support via eval_atom_orbitals().
+//
+//  Same execution model as project_density_sparse but with dense dm matrix.
+//  No neighbor list needed — all pairs within the task block are evaluated.
+//  Uses pairsym=2 for off-diagonal atom pairs.
+//
 __kernel void project_density_dense(
     __global const GridSpec* grid,
     const int n_tasks,

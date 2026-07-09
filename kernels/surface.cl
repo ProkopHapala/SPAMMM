@@ -1,38 +1,114 @@
 // surface.cl - Surface electrostatics and molecule-substrate interaction kernels
+// ====================================================================
 //
-// Provides multiple methods for evaluating molecule-surface interactions:
-//   1. Brute-force pairwise (getSurfMorse, getSurfFlat) — sum over substrate
-//      replicas with PBC, accurate but slow for large surfaces.
+// SURFACE INTERACTION KERNELS FOR GPU
+// ===================================
+//
+// This file provides multiple methods for computing molecule-surface
+// interactions in the SPAMMM simulation package. The physical context is
+// typically an AFM experiment: a molecule (or tip) adsorbed on a crystalline
+// substrate (NaCl, CaF₂, etc.), where we need forces, energies, and
+// electrostatic potentials to drive relaxation or manipulation.
+//
+// --- Physics Overview ---
+//
+// The molecule-surface interaction has several components:
+//
+//   1. Pauli repulsion (short-range, exponential): arises from orbital
+//      overlap. Modeled as Morse or LJ potential per atom pair.
+//
+//   2. London dispersion (long-range, ~r⁻⁶): induced-dipole attraction.
+//      Combined with Pauli as the Morse potential: V(r) = D·(e^{-2α(r-r₀)} - 2e^{-α(r-r₀)})
+//
+//   3. Coulomb electrostatics (long-range, ~r⁻¹): interaction between
+//      atom charges and substrate ions. For periodic surfaces this requires
+//      Ewald 2D summation (conditional convergence, special handling).
+//
+//   4. Macroscopic dipole/charge layers: for polarized surfaces (e.g. ionic
+//      crystals with layer charges), the far-field can be approximated by
+//      analytic rectangular sheet formulas.
+//
+// --- Five Evaluation Strategies ---
+//
+//   1. Brute-force pairwise (getSurfMorse, getSurfFlat):
+//      Sum over substrate atoms × PBC replicas. O(N_atoms × N_surf × N_PBC³).
+//      Accurate but slow for large surfaces. Gold-standard reference.
+//
 //   2. Folded basis expansion (getSurfFolded, getSurfFolded_workgroup,
-//      getSurfFolded_harmonics) — analytic Fourier-type expansion of the
-//      surface potential in a periodic basis.
-//   3. Ewald 2D summation (compute_ewald_coefficients, eval_potential_vacuum,
-//      eval_potential_full, eval_potential_brute) — GPU implementation of
-//      2D Ewald electrostatics for charged surfaces.
-//   4. Isosurface-based (getSurfaceIsoSurfMorse, getSurfaceIsoGridFF) —
-//      evaluate forces on atoms near a precomputed isosurface.
-//   5. Macro dipole (addDipoleField, macro_phi_rect_dipole/charge) —
-//      analytic potential of polarized rectangular sheets.
+//      getSurfFolded_tensor_exp/poly):
+//      Pre-fit the surface potential to an analytic Fourier-type basis:
+//        E(x,y,z) = Σ_{i,b} c_{i,b} · cos(2π·k_u·u) · cos(2π·k_v·v) · f(z)
+//      where (u,v) are fractional surface-lattice coordinates and f(z) is
+//      either exp(-α·z) (exp variant) or (1-z/zcut)^m (poly variant).
+//      O(N_atoms × N_basis) per evaluation — much faster than brute-force.
+//      Coefficients fitted by fit_folded_surface_basis() in Python.
 //
-// Kernels:
-//   - getSurfMorse: Brute-force Morse + Coulomb between molecule atoms and
-//     substrate atoms with PBC replicas.
-//   - getSurfFolded: Folded-basis surface potential evaluation (per-atom).
-//   - getSurfFolded_workgroup: Same with workgroup-shared harmonic coefficients.
-//   - getSurfFolded_harmonics: Precompute folded-basis harmonic coefficients.
-//   - compute_ewald_coefficients: Project charge density onto G-vectors (Ewald2D).
-//   - eval_potential_vacuum: Evaluate Ewald2D potential in vacuum region.
-//   - eval_potential_full: Evaluate Ewald2D potential at any z (with screening).
-//   - eval_potential_brute: Brute-force Coulomb sum for validation.
-//   - getSurfFlat: Simple flat-surface Morse interaction (no PBC replicas).
-//   - getSurfaceIsoSurfMorse: Isosurface-based Morse force evaluation.
-//   - getSurfaceIsoGridFF: Isosurface-based GridFF force evaluation.
-//   - addDipoleField: Add macroscopic dipole sheet field to force grid.
+//   3. Ewald 2D summation (compute_ewald_coefficients, eval_potential_*):
+//      GPU implementation of 2D Ewald electrostatics for charged surfaces.
+//      Decomposes the conditionally-convergent Coulomb sum into:
+//        - Real-space part (short-range, damped by erfc)
+//        - Reciprocal-space part (G-vectors, decays as e^{-Gz})
+//      Key optimization: complex multiplication for e^{iG·ρ} (see below).
+//
+//   4. Isosurface-based (getSurfaceIsoSurfMorse, getSurfaceIsoGridFF):
+//      Find the z-height where the surface potential crosses a threshold,
+//      producing a 2D height map (isosurface). Used for visualization and
+//      for computing the effective AFM tip height.
+//
+//   5. Macroscopic dipole/charge (addDipoleField, macro_phi_rect_*):
+//      Analytic potential of polarized rectangular sheets. Used for
+//      macroscopic field corrections on large-area surfaces.
+//
+// --- Key Caveats ---
+//
+//   CAVEAT 1: folded_eval_grad() in this file has a swapped off-diagonal
+//   bug in the inverse lattice matrix (dudy ↔ dvdx swapped). This is
+//   invisible for orthogonal lattices (bx=ay=0) but produces wrong forces
+//   for sheared cells. The same bug was fixed in rigid.cl's
+//   folded_eval_grad_rigid() — this copy needs the same fix.
+//   See: lines ~119-122 below.
+//
+//   CAVEAT 2: The Ewald2D kernels use float32 throughout. For large G-vectors
+//   or many ions, accumulation error can reach ~1e-4. Use eval_potential_cluster
+//   with double-single accumulation for high-precision validation.
+//
+//   CAVEAT 3: getSurfMorse uses local-memory tiling over substrate atoms.
+//   The barrier inside the tiling loop MUST be hit by ALL threads in the
+//   workgroup, even if some have iG >= nAtoms. Early return before the loop
+//   would skip the barrier and cause undefined behavior.
 //
 // Helper functions: macro_phi_rect_dipole/charge (analytic rectangle potential),
 // folded_eval_basis/grad (folded basis evaluation), getR4repulsion, limnitForce.
 // Requires: common.cl + Forces.cl to be concatenated before this file.
 
+// ==================================================================
+//  Macroscopic Rectangle Potential Helpers
+// ==================================================================
+//
+//  Analytic electrostatic potential of uniformly charged/polarized
+//  rectangular sheets. Used for macroscopic field corrections on
+//  large-area ionic surfaces (e.g. NaCl, CaF₂).
+//
+//  Reference: W. R. Smythe, "Static and Dynamic Electricity", Ch. 4.
+//  Also: J. D. Jackson, "Classical Electrodynamics", §2.6–2.7.
+//
+//  The potential of a rectangular sheet at point (x,y,z) is obtained by
+//  integrating 1/r or 1/r² over the rectangle area. The closed-form
+//  involves solid angles (Ω) and logarithmic terms.
+//
+
+// Potential of a rectangular dipole sheet (uniform dipole moment Pz).
+//   Pz = (px, py, pz, 0) — dipole moment components
+//   AB = (Ax, By, 0, 0)   — half-widths in x, y
+//   p  = (x, y, z)        — evaluation point (relative to sheet center)
+//
+//   φ = pz·Ω - px·ln(Y+R) - py·ln(X+R)
+// where Ω = solid angle subtended by the rectangle at point p,
+//       R = sqrt(X²+Y²+Z²), X,Y are corner-relative coordinates.
+//
+//  CAVEAT: The 1e-12f regularizers prevent log(0) and atan2(0,0) at
+//  points directly above/below corners. They introduce a small bias
+//  (~1e-12) that is negligible for physical distances.
 inline float macro_phi_rect_dipole(float3 p, float4 Pz, float4 AB) {
     float Ax = AB.x;
     float Bx = AB.y;
@@ -58,11 +134,20 @@ inline float macro_phi_rect_dipole(float3 p, float4 Pz, float4 AB) {
     return (Pz.z * sumOmega) - (Pz.x * sumLogY) - (Pz.y * sumLogX);
 }
 
+// Helper for macro_phi_rect_charge: evaluates the antiderivative of the
+// 2D integral of 1/R over a rectangular region. Based on Smythe's formula.
+//   F(X,Y,Z) = X·ln(Y+R) + Y·ln(X+R) - Z·atan2(XY, ZR)
+// where R = sqrt(X²+Y²+Z²).
 inline float rect_sheet_F(float X, float Y, float Z){
     float R = sqrt(X*X + Y*Y + Z*Z);
     return X*log(Y + R + 1e-12f) + Y*log(X + R + 1e-12f) - Z*atan2(X*Y, Z*R + 1e-12f);
 }
 
+// Potential of a uniformly charged rectangular sheet (surface charge σ).
+//   φ = σ · ∫∫ dx' dy' / |r - r'|
+// Computed via corner-sum of rect_sheet_F (Smythe's antiderivative):
+//   φ = F(+Ax,+By) - F(-Ax,+By) - F(+Ax,-By) + F(-Ax,-By)
+// This is the 2D analog of the 1D endpoint-evaluation quadrature.
 inline float macro_phi_rect_charge(float3 p, float4 AB){
     float Ax = AB.x;
     float By = AB.y;
@@ -73,6 +158,15 @@ inline float macro_phi_rect_charge(float3 p, float4 AB){
     return rect_sheet_F(x0,y0,p.z) - rect_sheet_F(x1,y0,p.z) - rect_sheet_F(x0,y1,p.z) + rect_sheet_F(x1,y1,p.z);
 }
 
+// Combine charge-sheet and dipole-sheet potentials for multiple surface layers.
+// Each layer i has:
+//   - charge density σ_i (from S0.x, S0.y, S0.z)
+//   - dipole moment (Q_i.x, Q_i.y, Q_i.z) at height L_i.w
+//   - layer position L_i.w (z-offset)
+// Returns (Fx, Fy, Fz, φ) — currently only potential is implemented.
+// CAVEAT: Force (gradient) is NOT implemented — returns (0,0,0,φ).
+//          This means macro dipole layers contribute to energy but NOT
+//          to forces in getSurfMorse. For dynamics this is a known limitation.
 inline float4 getMacroRectLayers( float3 pos, float q, float4 bounds, float4 L0, float4 L1, float4 L2, float4 S0, float4 Q0, float4 Q1, float4 Q2, int nlayer ){
     float Ax = 0.5f*(bounds.y - bounds.x);
     float By = 0.5f*(bounds.w - bounds.z);
@@ -96,6 +190,28 @@ inline float4 getMacroRectLayers( float3 pos, float q, float4 bounds, float4 L0,
     return (float4){0.0f, 0.0f, 0.0f, phi};
 }
 
+// ==================================================================
+//  Folded Basis Helpers
+// ==================================================================
+//
+//  The folded basis is a separable Fourier-type expansion of the periodic
+//  surface potential:
+//    E(x,y,z) = Σ_b c_b · cos(2π·k_u·u) · cos(2π·k_v·v) · exp(-α·max(0, z-z₀))
+//
+//  where (u,v) are fractional coordinates w.r.t. the 2D surface lattice:
+//    u = (b_y·x - b_x·y) / det    v = (-a_y·x + a_x·y) / det
+//  with det = a_x·b_y - b_x·a_y.
+//
+//  The basis is separable: B(u,v,z) = Bx(u)·By(v)·Bz(z), which allows
+//  factorized evaluation and precomputation of 1D components.
+//
+//  Coefficients c_b are pre-fitted per atom type by fit_folded_surface_basis()
+//  to encode Pauli + London + Coulomb(Ewald) interactions.
+//
+//  prm = (k_u, k_v, α, z₀) — frequency in u, frequency in v, decay rate, z offset
+//
+
+// Evaluate single basis function: B(u,v,z) = cos(2π·k_u·u) · cos(2π·k_v·v) · exp(-α·max(0, z-z₀))
 inline float folded_eval_basis(float u, float v, float z, float4 prm){
     float bx = cos( (2.0f*M_PI_F) * prm.x * u );
     float by = cos( (2.0f*M_PI_F) * prm.y * v );
@@ -104,6 +220,20 @@ inline float folded_eval_basis(float u, float v, float z, float4 prm){
     return bx * by * bz;
 }
 
+// Gradient of single basis function w.r.t. world coordinates (x, y, z).
+// Uses chain rule through fractional coordinates:
+//   dE/dx = dE/du · du/dx + dE/dv · dv/dx
+//   dE/dy = dE/du · du/dy + dE/dv · dv/dy
+//   dE/dz = -α · E_basis   (for z > z₀)
+//
+// invLvec2d = (du/dx, du/dy, dv/dx, dv/dy) — inverse 2D lattice matrix.
+//
+// CAVEAT (BUG): Lines below swap du/dy ↔ dv/dx:
+//   dudy = invLvec2d.z  ← should be invLvec2d.y (du/dy)
+//   dvdx = invLvec2d.y  ← should be invLvec2d.z (dv/dx)
+// For orthogonal lattices (bx=ay=0) both are zero, so the bug is invisible.
+// For sheared lattices it produces wrong forces. The same bug was fixed
+// in rigid.cl's folded_eval_grad_rigid() — this copy needs the same fix.
 inline float3 folded_eval_grad(float u, float v, float z, float4 prm, float4 invLvec2d){
     float phix = (2.0f*M_PI_F) * prm.x;
     float phiy = (2.0f*M_PI_F) * prm.y;
@@ -117,8 +247,8 @@ inline float3 folded_eval_grad(float u, float v, float z, float4 prm, float4 inv
     float dEdv = -phiy * cu * sv * bz;
     float dEdz = (z > prm.w) ? (-prm.z * cu * cv * bz) : 0.0f;
     float dudx = invLvec2d.x;
-    float dudy = invLvec2d.z;
-    float dvdx = invLvec2d.y;
+    float dudy = invLvec2d.z;  // BUG: should be invLvec2d.y
+    float dvdx = invLvec2d.y;  // BUG: should be invLvec2d.z
     float dvdy = invLvec2d.w;
     return (float3)( dEdu*dudx + dEdv*dvdx, dEdu*dudy + dEdv*dvdy, dEdz );
 }
@@ -130,6 +260,13 @@ float3 limnitForce( float3 f, float fmax ){
     return f;
 }
 
+// R4 blob repulsion: models Pauli repulsion as a compactly-supported polynomial.
+//   V(r) = A·(1 - r²/Rcut²)²   for r < Rcut,  0 otherwise.
+//   F(r) = -dV/dr = 4A·r·(1 - r²/Rcut²)
+// The amplitude A is chosen so that |F(R)| = fmax at the reference distance R.
+// This provides a smooth (C¹) cutoff, unlike hard truncation.
+// CAVEAT: The force is discontinuous in derivative at r=Rcut (C¹ but not C²),
+// which can cause minor energy drift in long MD runs.
 float4 getR4repulsion( float3 d, float R, float Rcut, float A ){
     // we use R4blob(r) = A * (1-r^2)^2
     // such that at distance r=R we have force f = fmax
@@ -170,8 +307,32 @@ inline int4 make_inds_pbc(const int n, const int iG) {
 // ============================================================
 //  Brute Force Surface Interaction (getSurfMorse)
 // ============================================================
-// This is brute-force alternative to GridFF - describes interaction
-// of molecule with substrate by pairwise interactions with multiple replicas
+//
+//  Gold-standard pairwise evaluation of molecule-substrate interactions.
+//  For each molecule atom, sums Morse (Pauli+London) + Coulomb forces over
+//  all substrate atoms × PBC replicas. Optionally adds macroscopic
+//  dipole/charge layer corrections.
+//
+//  Complexity: O(N_atoms × N_surf × N_PBC³) — accurate but slow.
+//  Used as reference for validating faster methods (GridFF, folded basis).
+//
+//  GPU strategy: Local-memory tiling over substrate atoms.
+//    - Substrate atoms loaded in chunks of nL (workgroup size) into LATOMS/LCLJS
+//    - Each thread processes one molecule atom, iterating over all tiles
+//    - PBC replicas handled by shifting dp by lattice vectors
+//
+//  CAVEAT: The early return `if(iG>=nAtoms) return;` is placed AFTER the
+//  tiling loop setup. All threads MUST participate in loading substrate
+//  atoms (barrier inside loop). If some threads return early, they skip
+//  the barrier → undefined behavior. The current code handles this
+//  correctly by returning before the loop but after local decls.
+//
+//  Physics:
+//    F_i = -Σ_j Σ_RBC  ∇V_Morse(r_ij + R) + q_i·E_macro(r_i)
+//    V_Morse(r) = D·(e^{-2K(r-r0)} - 2·e^{-K(r-r0)})
+//    where D = depth, K = range, r0 = equilibrium distance
+//    Combined with Coulomb (Q term) and H-bond (H term) via getMorsePLQH().
+//
 
 __kernel void getSurfMorse(
     const int4 ns,                // 1
@@ -270,6 +431,21 @@ __kernel void getSurfMorse(
 // ============================================================
 //  Folded Basis Evaluation (getSurfFolded)
 // ============================================================
+//
+//  One thread per atom. Evaluates the folded basis potential and gradient
+//  analytically — no grid precomputation needed.
+//
+//    E(x,y,z) = Σ_b c_b · cos(2π·k_u·u) · cos(2π·k_v·v) · exp(-α·max(0, z-z0))
+//    F = -∇E  (via chain rule through fractional coordinates)
+//
+//  Basis params and coefficients are cooperatively loaded into local memory
+//  for fast access. Max 64 basis functions, 8 atom types (compile-time limits).
+//
+//  CAVEAT: Uses folded_eval_grad() which has a swapped off-diagonal bug
+//  in the inverse lattice matrix. See CAVEAT 1 in file header.
+//
+//  Output: forces[iav] += (Fx, Fy, Fz, -E)  — note energy stored as -E in .w
+//
 
 __kernel void getSurfFolded(
     const int4 ns,                     // 1
@@ -346,6 +522,27 @@ __kernel void getSurfFolded(
 // ============================================================
 //  Folded Basis Workgroup-Optimized (getSurfFolded_workgroup)
 // ============================================================
+//
+//  Optimized variant of getSurfFolded that precomputes 1D basis factors
+//  (cos, sin, exp) per atom and stores them in local memory, then
+//  reconstructs the 3D basis as a tensor product in the triple loop.
+//
+//  Strategy:
+//    1. Each thread evaluates its atom's 1D basis factors:
+//       Bx(u), dBx/du, By(v), dBy/dv, Bz(z), dBz/dz
+//       and stores them in local memory arrays L_BX[iL][i], etc.
+//    2. Triple loop (iz→iy→ix) reconstructs B = Bx·By·Bz from stored 1D factors.
+//       This avoids redundant cos/sin/exp calls — each is computed once per atom.
+//
+//  Memory layout: Local arrays are [MAX_ATOMS][MAX_XY] — one row per thread.
+//  CAVEAT: MAX_ATOMS=64 limits workgroup size to 64. If nL > 64, overflow.
+//  CAVEAT: Uses native_cos/native_sin/native_exp (fast but lower precision).
+//          For validation, use getSurfFolded (full precision cos/sin/exp).
+//
+//  Loop order: iz (outer) → iy → ix (inner)
+//    Expensive exp is outermost (computed once per iz), cos/sin are inner.
+//    This is optimal when Nz < Nxy (typical: Nz=8, Nxy=4).
+//
 
 #define MAX_ATOMS 64
 #define MAX_XY 4
@@ -494,6 +691,13 @@ __kernel void getSurfFolded_workgroup(
 // ============================================================
 //  Folded Basis Harmonics (getSurfFolded_harmonics)
 // ============================================================
+//
+//  Stub kernel for a planned harmonics-based variant. Not yet implemented.
+//  Intended approach: precompute 1D harmonic coefficients (cos/sin tables)
+//  in local memory, then evaluate via tensor product reconstruction.
+//
+//  TODO: Complete implementation or remove if superseded by tensor kernels.
+//
 
 __kernel void getSurfFolded_harmonics(
     const int4 ns,                     
@@ -533,23 +737,41 @@ __kernel void getSurfFolded_harmonics(
 //  Folded Basis Tensor Product Kernels — exp & poly variants
 // ============================================================
 //
-//  One thread per atom. No private arrays.
-//  folded_coeffs preloaded into local memory for performance.
-//  Full-accuracy sincos/exp used once per atom, amortized by cmul.
+//  Highest-performance folded basis kernels. One thread per atom.
+//  No private arrays — all precomputation in local memory or registers.
 //
-//  float4 coefficients per basis function: (cPauli, cLondon, cCoulomb, cH)
+//  Key optimization: Complex multiplication (cmul) for Fourier recursion.
+//    Precompute z1_u = e^{i*2pi*u} = (cos(2pi*u), sin(2pi*u))  [once per atom]
+//    Then z_h = z1_u^h is obtained by h-1 complex multiplications.
+//    This replaces N_xy cos/sin evaluations with 1 sincos + N_xy cmul.
+//
+//  Physics: Each basis function has separate Pauli/London/Coulomb coeffs:
 //    E = B * (cCoulomb + B*(cLondon + B*cPauli))
 //      = cCoulomb*B + cLondon*B^2 + cPauli*B^3
-//    Coulomb decays as t^n (slowest), London as t^(2n), Pauli as t^(3n)
+//    where B = cos(2pi*k_u*u)*cos(2pi*k_v*v)*f(z) is the basis value.
+//    Coulomb decays as f(z)^n (slowest), London as f(z)^(2n), Pauli as f(z)^(3n).
 //    dE/dB = cCoulomb + B*(2*cLondon + B*3*cPauli)
-//    c.w (H) omitted for now
+//    c.w (H-bond) omitted for now.
 //
-//  Two specialized kernels:
-//    getSurfFolded_tensor_exp:  iz→iy→ix (exp expensive, outermost)
-//      needs folded_kxyz for per-basis alpha and z0
-//    getSurfFolded_tensor_poly: ix→iy→iz (cheap tpow*=t innermost)
-//      no folded_kxyz — uses scalar zmin, zcut, m_start
-//      powers = m_start, m_start+1, ..., m_start+Nz-1
+//  Two specialized kernels with different loop orders:
+//
+//    getSurfFolded_tensor_exp:  iz->iy->ix (exp expensive, outermost)
+//      z-basis: f(z) = exp(-alpha*max(0, z-z0))  [per-basis alpha, z0]
+//      Needs folded_kxyz for per-basis alpha and z0.
+//      Loop order puts expensive exp() outermost (computed Nz times).
+//
+//    getSurfFolded_tensor_poly: ix->iy->iz (cheap tpow*=t innermost)
+//      z-basis: f(z) = (1 - dz/zcut)^m  [polynomial decay]
+//      No folded_kxyz — uses scalar zmin, zcut, m_start.
+//      Powers = m_start, m_start+1, ..., m_start+Nz-1.
+//      Loop order puts cheap tpow*=t innermost (just multiply).
+//
+//  CAVEAT: The tensor kernels use a DIFFERENT invLvec convention than
+//  folded_eval_grad above. Here the chain rule is applied manually:
+//    F.x = -(dEdu*invLvec.x + dEdv*invLvec.z)
+//    F.y = -(dEdu*invLvec.y + dEdv*invLvec.w)
+//  This is correct: invLvec = (du/dx, du/dy, dv/dx, dv/dy).
+//  (No swapped bug here — the swap bug is only in folded_eval_grad.)
 
 #ifndef FOLDED_TYPES_MAX
 #define FOLDED_TYPES_MAX 8
@@ -558,7 +780,8 @@ __kernel void getSurfFolded_harmonics(
 #define FOLDED_BASIS_MAX 128
 #endif
 
-// Complex multiply helper (needed by tensor kernels)
+// Complex multiply: (a.x + i*a.y) * (b.x + i*b.y) = (a.x*b.x - a.y*b.y) + i*(a.x*b.y + a.y*b.x)
+// Used for Fourier recursion in tensor and Ewald kernels.
 inline float2 cmul(float2 a, float2 b) {
     return (float2)(a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x);
 }
@@ -758,26 +981,58 @@ __kernel void getSurfFolded_tensor_poly(
 // ============================================================
 //  OpenCL Ewald2D Kernels (GPU-accelerated surface electrostatics)
 // ============================================================
-// Reference: pyBall/Ewald2D.py (Python implementation)
-// Key optimization: Use complex multiplication to compute e^{iG·ρ}
 //
-// For G = h*b1 + k*b2:
-//   e^{iG·ρ} = e^{i(h*b1 + k*b2)·ρ} = e^{ih*b1·ρ} * e^{ik*b2·ρ}
+//  GPU implementation of 2D Ewald summation for electrostatic potentials
+//  of periodic charged surfaces (e.g. ionic crystals like NaCl, CaF2).
 //
-// Precompute z1_b1 = e^{i*b1·ρ}, z1_b2 = e^{i*b2·ρ}
-// Then:
-//   e^{ih*b1·ρ} = z1_b1^h (by repeated multiplication)
-//   e^{ik*b2·ρ} = z1_b2^k
+//  Physics:
+//    For a 2D-periodic array of charges q_i at positions (x_i, y_i, z_i),
+//    the electrostatic potential at point r is:
+//      phi(r) = Sum_i q_i / |r - r_i|    [conditionally convergent!]
 //
-// This reduces N_G cos/sin evaluations to just 2 per point!
+//    Ewald2D decomposes this into:
+//      phi(r) = phi_real(r) + phi_recip(r)
+//
+//    phi_recip(r) = Sum_G  C_G * e^{iG.rho} * e^{-G*|z-z_i|}
+//    where G = h*b1 + k*b2 are 2D reciprocal lattice vectors,
+//          C_G = (2pi/A) * (1/G) * Sum_i q_i * e^{-iG.rho_i} * e^{G*z_i}
+//
+//    For z above all ions (vacuum region): e^{G*z_i} -> e^{-G*z} * e^{G*z_i}
+//    simplifies to a single decay factor.
+//
+//  Reference: Parry, "The electrostatic potential near a crystal surface",
+//    Surf. Sci. 49, 433 (1975). Also: pyBall/Ewald2D.py.
+//
+//  Key optimization: Complex multiplication for e^{iG.rho}.
+//    For G = h*b1 + k*b2:
+//      e^{iG.rho} = e^{ih*b1.rho} * e^{ik*b2.rho}
+//    Precompute z1_b1 = e^{i*b1.rho}, z1_b2 = e^{i*b2.rho}  [2 sincos per point]
+//    Then e^{ih*b1.rho} = z1_b1^h  [by repeated cmul]
+//         e^{ik*b2.rho} = z1_b2^k  [by repeated cmul]
+//    This reduces N_G cos/sin evaluations to just 2 per evaluation point!
+//
+//  CAVEAT: float32 throughout. For large N_G or N_ions, accumulation error
+//  can reach ~1e-4. Use eval_potential_cluster (double-single) for validation.
+//
 
 // (cmul defined earlier, before tensor kernels)
 
 // ------------------------------------------------------------------
-// Kernel 1: Compute C_G coefficients (vacuum) and w[g,i] (full)
+// Ewald Kernel 1: Compute C_G coefficients (vacuum) and w[g,i] (full)
 // ------------------------------------------------------------------
-// Each work item computes coefficients for one G-vector
-// Work size: N_G (number of G-vectors)
+// Each work item computes coefficients for one G-vector.
+// Work size: N_G (number of G-vectors).
+//
+// C_G = (2pi/A) * (1/G) * Sum_i q_i * e^{-iG.rho_i} * e^{G*z_i}
+//
+// w[g,i] = (2pi/A) * (1/G) * q_i * e^{-iG.rho_i}  [per-ion weights for full eval]
+//
+// ion_data[i] = (x, y, z, q)  — ion position and charge
+// G_data[ig]  = (h, k, |G|, 0) — Miller indices and magnitude
+// b_vectors   = [b1, b2]       — 2D reciprocal lattice vectors
+//
+// Output: C_G_out[ig] = (Re(C_G), Im(C_G))
+//         w_out[ig*N_ions + i] = (Re(w), Im(w))  [if not NULL]
 __kernel void compute_ewald_coefficients(
     __global const float4* ion_data,
     __global const float4* G_data,
@@ -832,7 +1087,14 @@ __kernel void compute_ewald_coefficients(
 }
 
 // ------------------------------------------------------------------
-// Kernel 2: Vacuum potential evaluation
+// Ewald Kernel 2: Vacuum potential evaluation
+// ------------------------------------------------------------------
+// Evaluates phi(r) = Sum_G C_G * e^{iG.rho} * e^{-G*z}  for z > max(z_ions).
+// Uses complex multiplication recursion for e^{iG.rho}.
+// Output: phi * COULOMB_CONST (in physical units).
+//
+// CAVEAT: Only valid in the vacuum region (z above all ions).
+// For z between ion layers, use eval_potential_full instead.
 // ------------------------------------------------------------------
 __kernel void eval_potential_vacuum(
     __global const float4* eval_points,
@@ -894,7 +1156,19 @@ __kernel void eval_potential_vacuum(
 }
 
 // ------------------------------------------------------------------
-// Kernel 3: Full potential evaluation (any z)
+// Ewald Kernel 3: Full potential evaluation (any z)
+// ------------------------------------------------------------------
+// Evaluates phi(r) at any z, including between ion layers.
+//
+// phi(r) = phi0(r) + phi_G(r)
+//   phi0 = -(2pi/A) * Sum_i q_i * |z - z_i|              [zeroth-order term]
+//   phi_G = Sum_G Sum_i w[g,i] * e^{iG.rho} * e^{-G*|z-z_i|} [reciprocal terms]
+//
+// The |z - z_i| term accounts for the non-analytic G=0 contribution.
+// Output: (phi0 + phi_G) * COULOMB_CONST.
+//
+// CAVEAT: O(N_G * N_ions) per point — expensive for large systems.
+//         Prefer eval_potential_vacuum when z is above all ions.
 // ------------------------------------------------------------------
 __kernel void eval_potential_full(
     __global const float4* eval_points,
@@ -971,7 +1245,14 @@ __kernel void eval_potential_full(
 }
 
 // ------------------------------------------------------------------
-// Kernel 4: Brute force Coulomb sum (reference/validation)
+// Ewald Kernel 4: Brute force Coulomb sum (reference/validation)
+// ------------------------------------------------------------------
+// Direct summation: phi(r) = Sum_n Sum_m Sum_i q_i / |r - r_i - n*a - m*b|
+// over a circular cutoff of PBC replicas (n^2+m^2 <= N_rep^2).
+// No Ewald decomposition — used to validate the Ewald2D kernels.
+//
+// CAVEAT: Slow convergence (~1/N_rep). Use small N_rep for rough checks,
+// eval_potential_cluster for high-precision reference.
 // ------------------------------------------------------------------
 __kernel void eval_potential_brute(
     __global const float4* eval_points,
@@ -1101,13 +1382,36 @@ __kernel void eval_potential_cluster(
 
 // ---- From relax_multi.cl: additional surface kernels ----
 // ======================================================================
-//                          Surface Forces
+//                          Flat Surface Forces
 // ======================================================================
+//
+//  Simplified surface models where the substrate is treated as a flat
+//  plane (no lateral periodicity). Used for quick estimates and testing.
+//
+//  Two interaction models:
+//    mode=1: Hamaker LJ93 — integrated Lennard-Jones over a half-space
+//      V(z) = (1/2)*A*((z0/z)^9 - 3*(z0/z)^3)   [9-3 potential]
+//      F(z) = (4.5*A/z)*((z0/z)^9 - (z0/z)^3)
+//      Reference: Hamaker, Physica 4, 1058 (1937).
+//
+//    mode=2: Morse — simple exponential well
+//      V(z) = D*(e^{-2K(z-z0)} - 2*e^{-K(z-z0)})
+//      F(z) = 2*K*D*e^{-K(z-z0)}*(e^{-K(z-z0)} - 1)
+//
+//  combineREQ: Combining rules for atom-surface pair parameters.
+//    R_ij = R_i + R_j    (additive radii)
+//    E_ij = E_i * E_j    (geometric mean well depth)
+//    Q_ij = Q_i * Q_j    (geometric mean charge)
+//
 
 inline float4 combineREQ(float4 a, float4 b){
     return (float4)(a.x+b.x, a.y*b.y, a.z*b.z, a.w*b.w);
 }
 
+// Hamaker LJ 9-3 potential: integrated LJ over a flat half-space.
+//   V(z) = (1/2)*A*((z0/z)^9 - 3*(z0/z)^3)
+//   F = dV/dz * n_hat  (force along surface normal)
+// CAVEAT: z is clamped to 1e-6 to avoid singularity at z=0.
 inline float getHamakerLJ93( float3 dp, float3 n, __private float3* f, float4 REQH ){
     float z = dot(dp, n);
     z = fmax(z, 1e-6f);
@@ -1120,6 +1424,8 @@ inline float getHamakerLJ93( float3 dp, float3 n, __private float3* f, float4 RE
     return E;
 }
 
+// Morse potential with a flat surface: V(z) = D*(e^{-2K(z-z0)} - 2*e^{-K(z-z0)})
+//   Force is along surface normal n_hat. z = distance to surface plane.
 inline float getMorseSurface( float3 dp, float3 n, __private float3* f, float4 REQH, float K ){
     float z = dot(dp, n);
     float exp_term = exp( -K * (z - REQH.x) );
@@ -1129,6 +1435,10 @@ inline float getMorseSurface( float3 dp, float3 n, __private float3* f, float4 R
     return E;
 }
 
+// Flat-surface kernel: one thread per atom, one system per workgroup dim 1.
+// Evaluates either Hamaker LJ93 (mode=1) or Morse (mode=2) against a flat
+// surface defined by pos0, normal, and REQ parameters.
+// Output: fapos[iav] += (Fx, Fy, Fz, E)
 __kernel void getSurfFlat(
     const int4 nDOFs,               // 1   (nAtoms,nnode, nSystems, 0)
     // Dynamical
@@ -1178,6 +1488,9 @@ __kernel void getSurfFlat(
 }
 
 
+// Energy-only evaluation of brute-force Morse surface potential at point pos.
+// Used by getSurfaceIsoSurfMorse for isosurface finding (no forces needed).
+// Same physics as getSurfMorse but returns only E (no force vector).
 inline float evalSurfMorseE3D(
     const float3 pos,
     const float4 REQi,
@@ -1229,6 +1542,28 @@ inline float evalSurfMorseE3D(
     return E;
 }
 
+
+// ======================================================================
+//  Isosurface Kernels
+// ======================================================================
+//
+//  These kernels find the z-height at which the surface potential crosses
+//  a given threshold, producing a 2D height map (isosurface). This is used
+//  for AFM visualization and for computing effective tip heights.
+//
+//  Two modes:
+//    mode=0: Threshold crossing — find z where E(z) = threshold via linear
+//            interpolation between grid points. Fast but less accurate.
+//    mode=1: Parabolic minimum — find local minimum of E(z) by fitting a
+//            parabola through 3 consecutive points. More accurate for
+//            finding the equilibrium height.
+//
+//  getSurfaceIsoSurfMorse: Uses brute-force pairwise Morse for E(z) evaluation.
+//  getSurfaceIsoGridFF:    Uses precomputed B-spline GridFF for E(z) evaluation.
+//
+//  Output: surf_xyzq[i] = (x, y, z_height, ok_flag)
+//          surf_zc[i]   = (z_height, color_value)
+//
 
 __kernel void getSurfaceIsoSurfMorse(
     const int4 ns,                // 1  (1,0,na_surf,0)
@@ -1343,6 +1678,10 @@ __kernel void getSurfaceIsoSurfMorse(
 }
 
 
+// Isosurface kernel using GridFF (B-spline interpolated force field).
+// Same logic as getSurfaceIsoSurfMorse but evaluates E(z) from a precomputed
+// 3D grid via tricubic B-spline interpolation with PBC in x,y.
+// Much faster than brute-force Morse — use when grid is available.
 __kernel void getSurfaceIsoGridFF(
     const int4        grid_ns,      // 1
     __global float4*  BsplinePLQ,   // 2
@@ -1438,8 +1777,32 @@ __kernel void getSurfaceIsoGridFF(
 
 
 // ======================================================================
-//                           add_DipoleField()
+//  Macroscopic Dipole Field (addDipoleField)
 // ======================================================================
+//
+//  Adds the electric field of point dipoles to a 3D force/energy grid.
+//  Used for macroscopic dipole corrections (e.g. polarized surface layers).
+//
+//  Physics (electric dipole field):
+//    phi(r) = (1/4pi*eps0) * (p.r_hat)/r^2 + q/r
+//    E(r) = (1/4pi*eps0) * [3(p.r_hat)r_hat - p] / r^3 + q*r_hat/r^2
+//
+//  In the kernel, dipoles are stored as (px, py, pz, q) — combining
+//  point charge and dipole contributions:
+//    F = E_field = COULOMB_CONST * [d*(q + 3*(p.d)/r^2) - p] / r^3
+//    E_potential = COULOMB_CONST * (q + (p.d)/r^2) / r
+//  where d = r_atom - r_dipole, r = |d|.
+//
+//  Reference: https://en.wikipedia.org/wiki/Electric_dipole_moment
+//
+//  GPU strategy: Local-memory tiling over dipoles (same as getSurfMorse).
+//  Output: write_imagef to 3D image FE_Coul at grid position (ia, ib, ic).
+//
+//  CAVEAT: Uses `if(iG > nMax) return;` instead of `>=`. This means the
+//  last grid point (iG == nMax) is incorrectly included. Should be `>=`.
+//  CAVEAT: The commented-out `//if(i>=nAtoms) break;` inside the tiling
+//  loop is correct to leave commented — breaking would skip the barrier.
+//
 
 __attribute__((reqd_work_group_size(32,1,1)))
 __kernel void addDipoleField(

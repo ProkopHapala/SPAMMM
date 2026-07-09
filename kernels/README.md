@@ -45,109 +45,135 @@ Concatenation order matters. Typical stacks:
 
 ## common.cl
 
-Shared foundation — concatenated **first** for all multi-file builds.
+Shared foundation — concatenated **first** for all multi-file builds. No `__kernel` functions; only types, constants, and inline helpers.
 
-- Types: `cl_Mat3`
-- Constants: `COULOMB_CONST`, `R2SAFE`, `EXCL_MAX`
-- Math: `modulo`, `udiv_cmplx`, `rotMat`, `mixREQ_arithmetic`, `clampForce`
-- No `__kernel` functions
+- **Types:** `cl_Mat3` (3×3 row-major matrix)
+- **Constants:** `COULOMB_CONST` (1/4πϵ₀ in MD units), `R2SAFE` (minimum r² to avoid singularity), `EXCL_MAX` (max exclusions per atom)
+- **Mixing rules:** `mixREQ_arithmetic` — Lorentz-Berthelot: R_ij = R_i + R_j, E_ij = √(E_i·E_j), Q_ij = Q_i·Q_j
+- **Math:** `modulo` (PBC wrap), `udiv_cmplx` (complex division), `rotMat` (rotation matrix from quaternion), `clampForce` (force capping for stability)
 
 ---
 
 ## Forces.cl
 
-Inline pairwise functions (not standalone kernels). Returns `float4 (Fx, Fy, Fz, E)`.
+Inline pairwise potential functions (not standalone kernels). All return `float4 (Fx, Fy, Fz, E)`. Called from nonbonded, surface, AFM, and GridFF kernels.
 
-- `getLJQH`, `getMorseQH`, `getMorsePLQH`, `getCoulomb`
-- Energy/decomposition macros: `MODEL_LJQH2_PAIR`, `MODEL_MorseQ_PAIR`, `ENERGY_*`, `*_DECOMP`
-- Used by nonbonded, surface, AFM, GridFF builders
+| Function | Potential |
+|----------|-----------|
+| `getLJQH` | Lennard-Jones + Coulomb + H-bond: V = 4ε[(σ/r)¹²−(σ/r)⁶] + q_iq_j/r + H-bond term |
+| `getMorseQH` | Morse + Coulomb + H-bond: V = D[e^{−2α(r−r₀)}−2e^{−α(r−r₀)}] + q/r + H |
+| `getMorsePLQH` | Factorized Morse (Pauli/London/Coulomb/H-bond channels for GridFF) |
+| `getCoulomb` | Bare Coulomb: V = q_iq_j/(4πϵ₀r) |
+
+Macros: `MODEL_LJQH2_PAIR`, `MODEL_MorseQ_PAIR` (compile-time model selection); `ENERGY_*`, `*_DECOMP` (energy decomposition channels).
 
 ---
 
 ## SPFF.cl
 
-SPFFsp3 force field: bonds, angles, torsions, π–π alignment, H-bond; MD integrator with π-orbital recoil.
+SPFFsp3 force field for sp3 systems: harmonic bonds, cosine angle bending, torsions, π–π alignment, π–σ orthogonalization, H-bond. Includes MD integrator with π-orbital recoil.
 
 **MD step:** `getSPFFf4` → `getNonBond_ex2` → `cleanForceSPFFf4` → `updateAtomsSPFFf4`
 
 | Kernel | Role |
 |--------|------|
-| `getSPFFf4` | Bonding forces (1 thread = 1 node atom) |
-| `updateGroups`, `groupForce` | Rigid group kinematics |
-| `updateAtomsSPFFf4` | Integrator: recoil gather, constraints, π normalization |
-| `cleanForceSPFFf4` | Zero force buffers |
+| `getSPFFf4` | All bonding forces: bonds (E=kΔr²), angles (cosθ), torsions (cos3φ), π-alignment, H-bond. 1 thread = 1 node atom |
+| `getSPFFf4_rot` | Same with torque-based group rotation variant |
+| `updateGroups`, `groupForce` | Rigid group kinematics: gather atomic forces → group COM force + torque |
+| `updateAtomsSPFFf4` | Integrator: velocity-Verlet + π-orbital recoil, bond constraints, π-vector normalization |
+| `updateAtomsSPFFf4_rot` | Integrator with quaternion-based group rotation |
+| `cleanForceSPFFf4` | Zero force buffers (run before force kernels) |
+| `relax_nsteps_serial` | Serial FIRE relaxation (damping + line search) |
+
+**Caveat:** π-orbital vectors are normalized each step; if constraints fight normalization, energy can drift. FIRE damping factor resets on direction change.
 
 ---
 
 ## UFF.cl
 
-Universal Force Field without π DOFs. Per-interaction eval + scatter pattern.
+Universal Force Field (Rappé et al.): harmonic bonds, cosine angle bending, torsional dihedrals, inversion (improper) terms. No π-orbital DOFs. Uses eval-then-scatter pattern (compute per-interaction forces into `fint`, then scatter to `fapos`).
 
 | Kernel | Role |
 |--------|------|
-| `evalBondsAndHNeigh_UFF` | Harmonic bonds + H-neighbor vectors |
-| `evalAngles_UFF`, `evalDihedrals_UFF`, `evalInversions_UFF` | Valence terms |
-| `assembleForces_UFF` | Scatter `fint` → `fapos` |
-| `clear_fapos_UFF`, `clear_fint_UFF` | Buffer reset |
-| `updateAtomsSPFFf4` | Simplified integrator (no recoil) |
+| `evalBondsAndHNeigh_UFF` | Harmonic bonds (E=k(r−r₀)²) + H-neighbor direction vectors for angle terms |
+| `evalAngles_UFF` | Cosine angle bending: E=k(cosθ−cosθ₀)². Uses UFF small-angle harmonic variant |
+| `evalDihedrals_UFF` | Torsional: E=V_n[1+cos(nφ−φ₀)] with n=1,2,3 |
+| `evalInversions_UFF` | Inversion (improper): Wilson–Morse form V=A(r_inv−r₀)² |
+| `assembleForces_UFF` | Scatter per-interaction `fint` → per-atom `fapos` (Newton's 3rd law) |
+| `clear_fapos_UFF`, `clear_fint_UFF` | Zero force buffers |
+| `updateAtomsSPFFf4` | Simplified velocity-Verlet integrator (no π-recoil) |
+
+**Caveat:** Force scattering uses atomic_add — race-free but non-deterministic accumulation order.
 
 ---
 
 ## nonbonded.cl
 
-Molecule–molecule nonbonded with **2nd-neighbor exclusion** (`excl`, `EXCL_MAX`).
+Molecule–molecule nonbonded (LJ/Coulomb/H-bond) with **2nd-neighbor exclusion** — skips 1-2 (bonded) and 1-3 (angle) pairs via packed sorted exclusion list (`excl` array, `EXCL_MAX` per atom). PBC: hardcoded 3×3 image sum in xy. Local-memory tiling (32 atoms per tile) for cache efficiency.
 
 | Kernel | Role |
 |--------|------|
-| `getNonBond_ex2` | LJ/Morse/Coulomb + PBC; local-memory tiling |
+| `getNonBond_ex2` | LJ/Coulomb/H-bond pairwise. 1 thread = 1 atom, 1 system per dim-1. Walks sorted `excl` list in parallel with j-loop. PBC: 3×3 images (ix=0..2, iy=0..2) |
+| `getShortRangeBuckets` | Spatial bucketing: assigns atoms to grid buckets via R4 repulsion overlap. 1 thread = 1 bucket |
+| `getShortRangeBuckets2` | Same with precomputed overlap lists + PBC cell encoding. **Known bug:** lvec.a used where lvec.b intended in PBC shift |
+| `sortAtomsToBucketOverlaps` | Sort atoms into bucket overlap list (CSR format). Checks PBC image overlap |
 
-GridFF-augmented variants live in `nonbonded_grid.cl`.
+**Caveat:** Exclusion list is sorted by j-index and walked in lockstep with the j-loop — O(EXCL_MAX) per atom. Inverted BB comparisons in bucket kernels are intentional (overlap test).
 
 ---
 
 ## nonbonded_grid.cl
 
+Combines molecule–molecule nonbonded (LJ/Coulomb) with molecule–substrate forces from a **precomputed GridFF** (B-spline interpolated 3D potential). Replaces O(N_surface) loop with O(1) grid sampling. Two variants: buffer-based (`_ex2`, portable) and texture-based (`_tex`, hardware-cached `image3d_t` with repeat wrapping).
+
+GridFF stores 4 channels: P=Pauli, L=London, Q=Coulomb, H=H-bond. Atom-specific combination via factorized Morse: ej=exp(α·RvdW), PLQH=(ej²·EvdW, ej·EvdW, Q, 0).
+
 | Kernel | Role |
 |--------|------|
-| `getNonBond_GridFF_Bspline_ex2` | Nonbonded + substrate GridFF (buffer) |
-| `getNonBond_GridFF_Bspline_tex` | Same with texture sampling |
-| `getShortRangeBuckets*` | Spatial bucketing |
+| `getNonBond_GridFF_Bspline_ex2` | Nonbonded tiling + GridFF B-spline (buffer). Packed `excl` exclusion. 3×3 PBC. 1 thread = 1 atom |
+| `getNonBond_GridFF_Bspline_tex` | Same with `image3d_t` texture + neighs/neighCell exclusion. Full (2·nPBC+1)³ PBC loop |
+| `getShortRangeBuckets*` | Spatial bucketing (same as nonbonded.cl) |
 | `sortAtomsToBucketOverlaps` | Atom sort into buckets |
 
-Requires: `common` + `Forces` + `gridFF` + `surface` (for `getR4repulsion`, `fe3d_pbc_comb`).
+**Requires:** `common` + `Forces` + `gridFF` + `surface` (for `getR4repulsion`, `fe3d_pbc_comb`).
+
+**Caveat:** Force written with `=` (not `+=`) — must be first force kernel in pipeline. `if(iG>=natoms) return` is after non-bonded loop (all threads must reach barriers).
 
 ---
 
 ## gridFF.cl
 
-3D B-spline force-field grids: build, convolve, Poisson, sample.
+3D B-spline force-field grids: build from substrate atoms, convolve, solve Poisson, sample at arbitrary points. The GridFF precomputes substrate potential on a grid so that MD kernels can sample O(1) instead of summing O(N_surface) atoms.
 
-Key groups:
-- **Sampling:** `sample3D*`, `sample1D_pbc`, `sampleGridFF_Bspline_points`
-- **Convolution:** `BsplineConv3D*`, `Convolution3D_General`
-- **Build:** `make_MorseFF*`, `make_Coulomb_points`, `make_GridFF`
-- **Projection:** `project_atom_on_grid_cubic_pbc`, `project_atoms_on_grid_quintic_pbc`
-- **Poisson:** `poissonW*`, `laplace_real_pbc`, `slabPotential*`
-- **Utilities:** `addMul`, `dot_wg`, `setLinear`, `move`, `setMul`
+| Group | Key kernels |
+|-------|-------------|
+| **Sampling** | `sample3D*`, `sample1D_pbc`, `sampleGridFF_Bspline_points` — tricubic B-spline interpolation with PBC wrapping |
+| **Convolution** | `BsplineConv3D*`, `Convolution3D_General` — separable 1D convolutions along x/y/z |
+| **Build** | `make_MorseFF*`, `make_Coulomb_points`, `make_GridFF` — project pairwise potentials onto grid |
+| **Projection** | `project_atom_on_grid_cubic_pbc`, `project_atoms_on_grid_quintic_pbc` — deposit atomic density onto grid |
+| **Poisson** | `poissonW*`, `laplace_real_pbc`, `slabPotential*` — FFT-based Poisson solver with 2D PBC + slab correction |
+| **Utilities** | `addMul`, `dot_wg`, `setLinear`, `move`, `setMul` — CG vector ops |
 
-Inline: `make_inds_pbc`, `fe3d_pbc_comb` (B-spline PBC interpolation).
+Inline helpers: `make_inds_pbc` (wrapped index pattern), `fe3d_pbc_comb` (B-spline gradient evaluation with PBC).
 
 ---
 
 ## surface.cl
 
-Molecule–substrate interactions: brute, folded basis, Ewald2D, isosurface.
+Molecule–substrate interactions: brute pairwise, folded analytic basis (Fourier decomposition of periodic surface), 2D Ewald electrostatics, isosurface-based forces, macroscopic dipole sheet.
 
 | Kernel | Role |
 |--------|------|
-| `getSurfMorse`, `getSurfFlat` | Brute pairwise Morse |
-| `getSurfFolded*`, `getSurfFolded_harmonics` | Folded analytic basis |
-| `compute_ewald_coefficients`, `eval_potential_*` | 2D Ewald electrostatics |
-| `eval_potential_brute` | Validation |
-| `getSurfaceIsoSurfMorse`, `getSurfaceIsoGridFF` | Isosurface forces |
-| `addDipoleField` | Macro dipole sheet |
+| `getSurfMorse`, `getSurfFlat` | Brute-force pairwise Morse/Coulomb over all substrate atoms. O(N_surface) per atom |
+| `getSurfFolded*`, `getSurfFolded_harmonics` | Folded analytic basis: surface potential expanded in Fourier components, evaluated via `folded_eval_basis/grad`. O(N_harmonics) per atom |
+| `compute_ewald_coefficients`, `eval_potential_*` | 2D Ewald summation for electrostatics of periodic slab. Precomputes K-space coefficients, then evaluates at atom positions |
+| `eval_potential_brute` | Direct real-space sum for validation against Ewald |
+| `getSurfaceIsoSurfMorse`, `getSurfaceIsoGridFF` | Isosurface-based forces: probe feels force from nearest isosurface point |
+| `addDipoleField` | Macroscopic dipole sheet correction (analytic φ for rectangular dipole sheet) |
 
-Helpers: `macro_phi_rect_*`, `folded_eval_basis/grad`, `getR4repulsion`.
+Helpers: `macro_phi_rect_*` (analytic dipole potential), `folded_eval_basis/grad` (Fourier basis + gradient), `getR4repulsion` (R⁻4 dispersion).
+
+**Caveat:** `folded_eval_grad` has swapped off-diagonal elements (known bug, same class as rigid.cl gyroscopic term).
 
 ---
 
@@ -198,26 +224,28 @@ AFMulator adds `AFM.cl` for full scan stack.
 
 ## rigid.cl
 
-6-DOF rigid-body MD with quaternion integration.
+6-DOF rigid-body MD: 3 translational + 3 rotational (quaternion) DOFs per body. Substrate forces from GridFF (B-spline) or folded analytic basis. Quaternion integration uses exact exponential map with Taylor-series `sinc`/`cosc` for small-angle stability.
 
 | Kernel | Role |
 |--------|------|
-| `rigid_body_dynamics_kernel` | Pairwise forces + quaternion step |
-| `rigid_body_gridff_kernel` | GridFF B-spline substrate forces |
-| `rigid_body_folded_kernel` | Folded-basis analytic substrate forces |
+| `rigid_body_dynamics_kernel` | Pairwise inter-body forces (LJ/Coulomb) + quaternion integration step. 1 thread = 1 body |
+| `rigid_body_gridff_kernel` | Substrate forces via GridFF B-spline sampling + quaternion step |
+| `rigid_body_folded_kernel` | Substrate forces via folded analytic basis (Fourier) + quaternion step |
 
-Helpers: `quat_mult`, `sinc_div_r2_taylor`, `quat_factors_taylor`.
+Helpers: `quat_mult` (Hamilton product), `sinc_div_r2_taylor` (sin(x)/x² Taylor expansion for small x), `quat_factors_taylor` (quaternion-to-rotation Taylor factors).
+
+**Caveat:** Gyroscopic term ω×(I·ω) must use body-frame inertia tensor. WORKGROUP_SIZE assumption in atom loops can cause issues if local size ≠ expected.
 
 ---
 
 ## assembly.cl
 
-Rigid-body multi-molecule packing. **Self-contained** (no `common.cl`).
+Rigid-body multi-molecule packing: apply transforms to molecular fragments and score steric clashes. **Self-contained** (no `common.cl` dependency).
 
 | Kernel | Role |
 |--------|------|
-| `emit_configuration_xyz` | Apply transforms → assembled coords |
-| `evaluate_packing_3d` | Steric clash scoring |
+| `emit_configuration_xyz` | Apply rigid transforms (rotation + translation) to fragment atoms → assembled XYZ coordinates |
+| `evaluate_packing_3d` | Steric clash scoring: counts atom pairs closer than vdW sum. Penalty ∝ overlap depth |
 
 **Driver:** `python tests/testplot_assembly.py` → `debug/testplot_assembly/`
 
@@ -225,48 +253,78 @@ Rigid-body multi-molecule packing. **Self-contained** (no `common.cl`).
 
 ## AFM.cl
 
-AFM probe-particle relaxation and image generation.
+AFM probe-particle relaxation and image generation. Simulates the oscillating AFM tip by relaxing a probe particle in the sample force field, then computing frequency shift (Δf) images.
 
-Flow: build Z-slices → sample field → `relaxPoints`/`relaxStrokes*` → isosurface → `convolveZ` → `izoZ`.
+**Flow:** build Z-slices → sample field at probe positions → `relaxPoints`/`relaxStrokes*` (FIRE relaxation) → isosurface extraction → `convolveZ` (tip oscillation convolution) → `izoZ` (Δf image).
 
-Key kernels: `getFEinPoints*`, `relaxPoints`, `relaxStrokesTilted*`, `getZisoTilted*`, `evalLJC_QZs_toImg`, `evalMorseC_QZs_toImg`, `evalDispersion_toImg`, `gradient_central_diff`.
+| Kernel | Role |
+|--------|------|
+| `getFEinPoints*` | Sample force field (LJ/Morse/Coulomb) at probe positions. Trilinear interpolation from grid |
+| `relaxPoints`, `relaxStrokesTilted*` | FIRE relaxation of probe particle in force field. Tilted variant for non-vertical tip |
+| `getZisoTilted*` | Isosurface extraction (z-height where force = threshold) |
+| `evalLJC_QZs_toImg`, `evalMorseC_QZs_toImg` | Compute Δf image from relaxed probe positions. LJ or Morse potential |
+| `evalDispersion_toImg` | Dispersion contribution to Δf |
+| `gradient_central_diff` | Numerical gradient via central differences |
 
-Helpers: `interpFE`, `update_FIRE`, `tipForce`, trilinear `read_imagef` sampling.
+Helpers: `interpFE` (trilinear field interpolation), `update_FIRE` (FIRE damping + line search), `tipForce` (tip-sample force model), `read_imagef` (hardware texture sampling).
 
 ---
 
 ## LCAO_grid.cl
 
-Project LCAO density and orbitals onto 3D grids (DFTB, Fireball, etc.). **Self-contained** types (`GridSpec`, `AtomData`, `TaskData`).
+Projects LCAO density matrices and molecular orbitals onto 3D grids or arbitrary point lists. Supports any LCAO basis (DFTB, Fireball, Siesta) with s, p, d orbitals. **Self-contained** types (`GridSpec`, `AtomData`, `TaskData`).
+
+**Physics:** ρ(r) = Σ_{i,j} Σ_{μ,ν} D_{μ_i,ν_j} φ_μ(r−R_i) φ_ν(r−R_j), where φ = R_l(r)·Y_l^m(r̂). Radial: cubic B-spline (tabulated) or exp(−β(r−r₀)) (vacuum/STM).
+
+**Orbital order:** Fortran [s,py,pz,px] vs OpenCL [px,py,pz,s] — swizzle `.wyzx` converts.
+
+**Parallelization:** Grid divided into 8³-voxel task blocks. 3-pass scheduling: count overlapping atoms → fill atom lists → compact non-empty blocks. 1 workgroup = 1 task block.
 
 | Kernel | Role |
 |--------|------|
-| `project_density_sparse*` | Sparse density → grid |
-| `project_orbital*` | Orbital projection (sparse/dense, grid/points) |
-| `mo_overlap_points_exp_sk*` | MO overlap at points (STM input) |
-| `count_atoms_per_block`, `fill_task_atoms`, `compact_tasks` | Task scheduling |
+| `project_density_sparse` | Sparse density → grid. 4×4 (s+p) hardcoded blocks. Linear neighbor search O(neigh_max) |
+| `project_density_sparse_tiled` | Same with __local atom/ρ caching (TILE_ATOMS=8). Uses atomic_add + `.wyzx` swizzle |
+| `project_orbital` | Single MO → grid. s+p only (float4 coeffs) |
+| `project_orbital_dense` | Dense MO → grid. Full s,p,d via `eval_angular_dense` |
+| `project_orbital_points[_exp]` | MO at arbitrary points. Spline or exponential radial |
+| `project_orbital_dense_points[_exp]` | Dense MO at points, full s/p/d. `_exp` has no cutoff (STM vacuum) |
+| `project_density_dense_points` | Dense density at points. O(N²) per point, max 9 orbitals/atom |
+| `mo_overlap_points_exp_sk[_2mol]` | MO overlap with Slater-Koster angular. 1 thread = 1 scan pixel. Quaternion tip rotation |
+| `count_atoms_per_block` | Sphere-AABB test, atomic_inc per block. 1 thread = 1 atom |
+| `fill_task_atoms` | Write atom indices into block lists. 1 thread = 1 atom |
+| `compact_tasks` | Prefix-sum compaction of non-empty blocks |
+
+Helpers: `evaluate_radial` (B-spline), `eval_angular_dense` (Y_lm l=0,1,2), `eval_atom_orbitals` (full φ at point), `sk_contract_sp` (SK s-p contraction), `quat_rotate3` (quaternion rotation).
+
+**Caveats:** Sparse variant limited to s+p (4 orbitals). Dense points limited to 9 orbitals/atom (no f). Exponential variants have no distance cutoff.
 
 ---
 
 ## LCAO_STM.cl
 
-STM tunneling via Dyson equation. Requires `LCAO_grid.cl` types.
+STM tunneling current via Dyson equation: G = (I − G₀·V_TS)⁻¹·G₀, where G₀ = diag(G_T, G_S) and V_TS is the tip-sample hopping (Slater-Koster with exponential radial decay). Requires `LCAO_grid.cl` types.
 
-| Kernel | Role |
-|--------|------|
-| `response_amplitude_exp` | STM response amplitude |
-| `solve_stm_dyson_wg` | Workgroup Dyson solve |
-| `stm_gf_dyson_2mol_mo_scan` | Two-molecule scan |
+Three approaches (increasing physical accuracy, decreasing GPU cost):
+
+| Kernel | Approach | Parallelization |
+|--------|----------|-----------------|
+| `response_amplitude_exp` | Scalar Dyson (Tersoff-Hamann s-tip): resp = \|v·a_st^H\|² / \|(E−E_tip) − a_st·G0·a_st^H\|². CPU precomputes G0, v. O(ns²) per point | 1 thread = 1 point |
+| `solve_stm_dyson_wg` | Full matrix Dyson with **active subspace trick**: extract ≤32×32 sub-blocks of G_T/G_S into __local, build W=I−G_S·V^H·G_T·V, solve by parallel Gauss-Jordan. 8 KB/matrix | 1 workgroup = 1 pixel |
+| `stm_gf_dyson_2mol_mo_scan` | Bardeen transfer Hamiltonian: amp = Σ u_T[it]·H_hop(it,is)·v_S[is]. CPU precomputes u_T=c_tip^H·G_T, v_S=G_S·c_smp. O(n_tip×n_smp) per pixel, no matrix inversion | 1 thread = 1 pixel |
+
+Helpers: `c_add`, `c_sub`, `c_mul`, `c_div` (complex float2 arithmetic, 1e-30 regularization).
+
+**Caveats:** `response_amplitude_exp` limited to 256 sample orbitals (private array). `solve_stm_dyson_wg` drops atoms beyond 8 per side (MAX_ACT_ORB=32). Gauss-Jordan has no partial pivoting (stable for N≤32). All kernels assume 4 orbitals/atom (s+p), zero-padded for H.
 
 ---
 
 ## lingebra.cl
 
-Batched symmetric eigendecomposition (parallel Jacobi). **Self-contained.**
+Batched symmetric eigendecomposition via parallel cyclic Jacobi rotations. **Self-contained.** Each workgroup solves one m×m eigenproblem; threads collaborate on off-diagonal annihilation sweeps.
 
 | Kernel | Role |
 |--------|------|
-| `local_jacobi_blocks_parallel` | (batch × m × m) → eigenvalues + eigenvectors |
+| `local_jacobi_blocks_parallel` | (batch × m × m) → eigenvalues + eigenvectors. Converges in O(log²m) sweeps for typical matrices |
 
 **Tests:** `pytest tests/test_lingebra.py`
 

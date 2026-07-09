@@ -1,35 +1,138 @@
 // spff.cl - SPFFsp3 force field: bonding interactions + MD integrator
+// ====================================================================
 //
-// Implements the SPFFsp3 force field for molecular dynamics with pi-orbital
-// degrees of freedom. Each node atom has up to 4 neighbors with bond, angle,
-// torsion, and pi-pi alignment interactions. Pi-orbitals are additional DOFs
-// that carry recoil forces gathered from back-neighbors during integration.
+// SPFFsp3 FORCE FIELD FOR GPU MOLECULAR DYNAMICS
+// ==============================================
 //
-// Execution flow (one MD step):
-//   1. getSPFFf4 — evaluate bonding forces (bonds, angles, pi-pi, H-bond)
-//   2. getNonBond_ex2 (in nonbonded.cl) — evaluate non-bonded LJ/Coulomb forces
+// Implements the SPFFsp3 (Simple Pauli Force Field for sp3 atoms) force
+// field for molecular dynamics with pi-orbital degrees of freedom.
+// Designed for covalent systems (organic molecules, sp3/sp2 hybridization)
+// where each atom has up to 4 sigma-bonded neighbors plus an optional
+// pi-orbital vector representing the p-orbital orientation.
+//
+// --- Physics Overview ---
+//
+// The SPFFsp3 force field includes the following interaction terms:
+//
+//   1. Bond stretching (harmonic):
+//      V_bond = (1/2) * k * (r - r0)^2
+//      F_bond = -k * (r - r0) * r_hat
+//
+//   2. Angle bending (cos-half formulation):
+//      V_angle = k * (1 - cos((theta - theta0)/2))
+//      This quasi-harmonic form is better than simple cos(theta) because
+//      it remains harmonic for angles > 90 degrees.
+//      Reference: see evalAngleCosHalf() comments below.
+//
+//   3. Pi-pi alignment (conjugation):
+//      V_pipi = -K * cos(angle between pi-orbitals)
+//      Favors parallel pi-orbital orientation on adjacent atoms,
+//      modeling pi-conjugation in molecules with double bonds.
+//
+//   4. Pi-sigma orthogonalization (planarity):
+//      V_pisigma = K * (cos(angle between pi-orbital and sigma-bond) - c0)^2
+//      Keeps pi-orbitals perpendicular to the sigma-bond plane,
+//      enforcing molecular planarity at sp2 centers.
+//
+//   5. Non-bonded (LJ + Coulomb, in nonbonded.cl):
+//      V_LJ = 4*eps*((sigma/r)^12 - (sigma/r)^6)
+//      V_Coul = q_i*q_j / (4*pi*eps0*r)
+//      Excluded for 1-2 and 1-3 pairs (bonded neighbors).
+//
+// --- Pi-Orbital Degrees of Freedom ---
+//
+// Each node atom has an associated pi-orbital vector (stored as an extra
+// float4 in the apos array at index iav+nAtoms). This vector:
+//   - Is normalized to unit length after each integration step
+//   - Experiences forces from pi-pi and pi-sigma interactions
+//   - In the _rot variant, is integrated as a rotational DOF (torque ->
+//     angular velocity -> rotation via Rodrigues' formula)
+//   - In the standard variant, is integrated as a linear vector with
+//     radial component projected out (tangential motion only)
+//
+// --- Recoil Force Mechanism ---
+//
+// When getSPFFf4 computes forces on a node atom, it also generates
+// "recoil" forces on its neighbors (Newton's 3rd law). These are stored
+// in the fneigh array (indexed by node * 4 + neighbor_slot). During
+// integration, updateAtomsSPFFf4 gathers these recoil forces from
+// back-neighbors (bkNeighs) and adds them to the atom's total force.
+//
+// This two-pass approach (scatter recoil -> gather recoil) avoids
+// race conditions: multiple threads writing to the same atom's force
+// would require atomic operations.
+//
+// --- Execution Flow (one MD step) ---
+//
+//   1. getSPFFf4 — evaluate bonding forces (bonds, angles, pi-pi, pi-sigma)
+//      Stores: atom forces in fapos, recoil forces in fneigh
+//   2. getNonBond_ex2 (in nonbonded.cl) — evaluate non-bonded LJ/Coulomb
+//      Adds to fapos (accumulates with bonding forces)
 //   3. cleanForceSPFFf4 — zero/clear force buffers for next step
 //   4. updateAtomsSPFFf4 — gather recoil forces, integrate positions/velocities,
 //      normalize pi-orbitals, apply constraints and bounding boxes
 //
+//   Alternative: relax_nsteps_serial — runs all steps in local memory
+//   within a single workgroup, eliminating Python dispatch overhead.
+//
+// --- Key Caveats ---
+//
+//   CAVEAT 1: The bond evaluation uses `if(iG < ing)` to avoid double-counting
+//   bonds (each bond is evaluated once, by the lower-indexed atom). This
+//   means the recoil force on the higher-indexed neighbor is stored in
+//   fneigh, not applied directly. The gather step in updateAtomsSPFFf4
+//   collects these recoil forces.
+//
+//   CAVEAT 2: Pi-orbital normalization after each step means the pi-DOF
+//   lives on a sphere (S^2), not in R^3. The standard integrator projects
+//   out the radial component of force and velocity, keeping motion tangent
+//   to the sphere. The _rot variant uses proper rotational dynamics.
+//
+//   CAVEAT 3: Force limiting (Flimit) scales down any force exceeding the
+//   threshold. This prevents numerical instabilities from close contacts
+//   but introduces energy drift (non-conservative). Use sparingly.
+//
+//   CAVEAT 4: The bSubtractVdW flag subtracts non-bonded LJ/Coulomb
+//   interactions between 1-3 pairs (atoms sharing a common neighbor).
+//   This is needed because the non-bonded kernel does not exclude 1-3
+//   pairs by default. The subtraction is done inside the angle loop.
+//
 // Kernels:
-//   - getSPFFf4: Compute bonding forces for all node atoms (bonds, angles,
-//     torsions, pi-pi alignment, H-bond correction). Stores atom forces in
-//     fapos and recoil forces on neighbors in fneigh. 1 thread = 1 node atom.
-//   - updateGroups: Compute group center-of-mass, forward direction, and up
-//     vector for rigid groups of atoms (used for constrained groups).
-//   - groupForce: Distribute external forces on groups back to individual atoms.
-//   - updateAtomsSPFFf4: MD integrator — gather recoil from fneigh/bkNeighs,
-//     apply constraints (springs, bounding boxes, inter-system bonds), update
-//     velocities and positions, normalize pi-orbital vectors. Supports thermal
-//     driving and force limiting.
-//   - cleanForceSPFFf4: Clear/zero force arrays between MD steps.
+//   - getSPFFf4: Bonding forces (bonds, angles, pi-pi, pi-sigma). 1 thread = 1 node.
+//   - getSPFFf4_rot: Same but with torque-based pi interactions for rotational dynamics.
+//   - updateGroups: Compute group CoM, forward, and up vectors for rigid groups.
+//   - groupForce: Distribute external group forces/torques back to individual atoms.
+//   - updateAtomsSPFFf4: MD integrator (leap-frog with damping) + recoil gather.
+//   - updateAtomsSPFFf4_rot: MD integrator with rotational pi-orbital dynamics.
+//   - cleanForceSPFFf4: Zero force arrays between MD steps.
+//   - relax_nsteps_serial: Single-workgroup in-local-memory relaxation loop.
 //
 // Helper functions: evalAngCos, evalAngleCosHalf (angular force/energy),
-// evalPiAling (pi-pi alignment), evalBond (harmonic bond stretching).
+// evalPiAling (pi-pi alignment), evalBond (harmonic bond stretching),
+// evalPiSigma_tq, evalPiAlign_tq (torque-based pi variants),
+// sinc_div_r2_taylor, rotate_by_omega_taylor (rotational helpers),
+// KvaziFIREdamp (FIRE damping), hash_wang/hashf_wang (RNG for thermal noise).
 // Requires: common.cl + Forces.cl to be concatenated before this file.
 
-// ---- SPFF bonding helper functions ----
+// ==================================================================
+//  SPFF Bonding Helper Functions
+// ==================================================================
+//
+//  These inline functions compute energy and force for individual
+//  interaction terms. All return energy E and write forces via pointers.
+//  The hr vectors are (direction, inverse_length) — direction is normalized,
+//  hr.w = 1/|r| is used to scale forces to physical units.
+//
+
+// Angular force using cos(theta) formulation.
+//   V = K * (cos(theta) - c0)^2
+//   F1 = -2K*(cos(theta)-c0) * (hr2 - hr1*cos(theta)) / |hr1|
+//   F2 = -2K*(cos(theta)-c0) * (hr1 - hr2*cos(theta)) / |hr2|
+//
+// CAVEAT: This formulation is NOT quasi-harmonic for angles > 90 deg.
+// The force vanishes at theta=180 deg (cos=-1) even if c0 != -1.
+// For sp3 angles near 109.5 deg this is fine, but for angles near 180 deg
+// use evalAngleCosHalf instead.
 inline float evalAngCos( const float4 hr1, const float4 hr2, float K, float c0, __private float3* f1, __private float3* f2 ){
     float  c = dot(hr1.xyz,hr2.xyz);
     float3 hf1,hf2;
@@ -45,7 +148,24 @@ inline float evalAngCos( const float4 hr1, const float4 hr2, float K, float c0, 
     return E;
 }
 
-// evaluate angular force and energy using cos(angle/2) formulation - a bit slower, but not good for angles > 90 deg
+// Angular force using cos(theta/2) formulation — quasi-harmonic.
+//
+//   V = k * (1 - cos((theta - theta0)/2))
+//
+// This is MUCH better than evalAngCos for angles > 90 deg because it
+// remains harmonic (restoring force increases monotonically) up to 180 deg.
+// The cost is 2 extra sqrt() calls.
+//
+// Math:
+//   cos(theta/2) = |hr1 + hr2| / 2   (for normalized hr1, hr2)
+//   sin(theta/2) = sqrt(1 - cos^2(theta/2))
+//   The force is derived by differentiating V w.r.t. atom positions.
+//
+// cs0 = (cos(theta0/2), sin(theta0/2)) — equilibrium half-angle
+// k = angular stiffness
+//
+// CAVEAT: The 1e-7 regularizer in s2 = 1-c2+1e-7 prevents NaN from
+// sqrt(0) when theta=0 (collapsed angle). This introduces a tiny bias.
 inline float evalAngleCosHalf( const float4 hr1, const float4 hr2, const float2 cs0, float k, __private float3* f1, __private float3* f2 ){
     // This is much better angular function than evalAngleCos() with just a little higher computational cost ( 2x sqrt )
     // the main advantage is that it is quasi-harmonic beyond angles > 90 deg
@@ -65,8 +185,13 @@ inline float evalAngleCosHalf( const float4 hr1, const float4 hr2, const float2 
     return E;
 }
 
-// evaluate angular force and energy for pi-pi alignment interaction
-inline float evalPiAling( const float3 h1, const float3 h2,  float K, __private float3* f1, __private float3* f2 ){  // interaction between two pi-bonds
+// Pi-pi alignment (conjugation) interaction.
+//   V = -K * cos(angle between pi-orbitals h1, h2)
+//   F1 = K * (h2 - h1*cos)   [perpendicular component of h2]
+//   F2 = K * (h1 - h2*cos)   [perpendicular component of h1]
+// If angle > 90 deg (cos < 0), force sign is flipped to maintain restoring force.
+// h1, h2 must be normalized.
+inline float evalPiAling( const float3 h1, const float3 h2,  float K, __private float3* f1, __private float3* f2 ){
     float  c = dot(h1,h2); // cos(a) (assumes that h1 and h2 are normalized)
     float3 hf1,hf2;        // working forces or direction vectors
     hf1 = h2 - h1*c;       // component of h2 perpendicular to h1
@@ -82,16 +207,30 @@ inline float evalPiAling( const float3 h1, const float3 h2,  float K, __private 
     return E;
 }
 
-// evaluate bond force and energy for harmonic bond stretching
+// Harmonic bond stretching.
+//   V = (1/2) * k * dl^2    where dl = (r - r0)
+//   F = -k * dl * h_hat     (force along bond direction)
+// h = normalized bond direction, dl = length deviation, k = stiffness.
 inline float evalBond( float3 h, float dl, float k, __private float3* f ){
     float fr = dl*k;   // force magnitude
     *f = h * fr;       // force on atom a
     return fr*dl*0.5;  // energy
 }
 
-// ---- Torque-based pi interaction helpers (for rotational pi dynamics) ----
+// ==================================================================
+//  Torque-Based Pi Interaction Helpers (for rotational pi dynamics)
+// ==================================================================
+//
+//  These variants return torques instead of linear forces, for use with
+//  the _rot kernels that integrate pi-orbitals as rotational DOFs.
+//  The torque is computed as tau = hpi x F_linear, which is the correct
+//  transformation from linear force on a unit vector to torque on that vector.
+//
 
-// pi-sigma orthogonalization: returns torque on pi-orbital + recoil force on neighbor bond
+// Pi-sigma orthogonalization (torque variant):
+//   V = K * (cos(angle) - c0)^2
+//   tau_pi = cross(hpi, h) * (-2K*(cos-c0))   [torque on pi-orbital]
+//   F_recoil = (hpi - h*cos) * (-2K*(cos-c0)) * h.w  [recoil on neighbor]
 inline float evalPiSigma_tq(const float3 hpi, const float4 h, const float K, const float c0, __private float3 *tqi, __private float3 *fj){
     const float c    = dot(hpi, h.xyz);
     const float c_   = c - c0;
@@ -103,21 +242,45 @@ inline float evalPiSigma_tq(const float3 hpi, const float4 h, const float K, con
     return E;
 }
 
-// pi-pi alignment: returns (torque on pi, energy) as float4
+// Pi-pi alignment (torque variant):
+//   V = -K * cos(angle)
+//   tau = cross(h1, h2) * K   [torque on pi-orbital 1]
+// Returns (tau_x, tau_y, tau_z, E) as float4.
 inline float4 evalPiAlign_tq(const float3 h1, const float3 h2, const float K){
     const float c = dot(h1,h2);
     const float E = -K * c;
     return (float4){ cross(h1, h2) * K, E };
 }
 
-// ---- Rotation helpers for pi-orbital rotational dynamics ----
+// ==================================================================
+//  Rotation Helpers for Pi-Orbital Rotational Dynamics
+// ==================================================================
+//
+//  These functions implement small-angle rotation of a unit vector p
+//  by a rotation vector w (where |w| = rotation angle, w_hat = axis).
+//  Uses Rodrigues' formula with Taylor series for sinc/sinc-half:
+//    p' = p + (w x p) * sinc(|w|) + (w x (w x p)) * (1-cos(|w|))/|w|^2
+//  where sinc(x) = sin(x)/x and (1-cos(x))/x^2 = (1-cos(x))/x^2.
+//
+//  The Taylor series avoids division by zero for small |w| and is
+//  accurate to ~1e-7 for |w| < 0.1 rad (one MD step with small dt).
+//
+//  Reference: Rodrigues' rotation formula.
+//  Also used in rigid.cl for quaternion-based rotation.
+//
 
+// Taylor series for sin(r)/r and (1-cos(r))/r^2, accurate for small r.
+//   sin(r)/r     = 1 - r^2/6 + r^4/120 - r^6/5040 + ...
+//   (1-cos(r))/r^2 = 1/2 - r^2/24 + r^4/720 - r^6/40320 + ...
 float2 sinc_div_r2_taylor(float r2){
     float s = 1.0f + r2 * ( (-1.0f/6.0f)  + r2 * ( (1.0f/120.0f) + r2 * (-1.0f/5040.0f  ) ) );
     float c = 0.5f + r2 * ( (-1.0f/24.0f) + r2 * ( (1.0f/720.0f) + r2 * (-1.0f/40320.0f ) ) );
     return (float2){s, c};
 }
 
+// Rotate unit vector p by rotation vector w using Rodrigues' formula
+// with Taylor series for sinc terms. Accurate for small |w| (< 0.1 rad).
+//   p' = p + (w x p)*sinc(|w|) + (w x (w x p))*(1-cos(|w|))/|w|^2
 float3 rotate_by_omega_taylor(float3 p, float3 w){
     float r2    = dot(w,w);
     float2 sc   = sinc_div_r2_taylor(r2);
@@ -126,13 +289,35 @@ float3 rotate_by_omega_taylor(float3 p, float3 w){
     return p + wxp*sc.x + wwxp*sc.y;
 }
 
-// ---- getSPFFf4: bonding interactions (bonds, angles, torsions, pi-pi, H-bond) ----
 // ======================================================================
 //                          getSPFFf4()
 // ======================================================================
-
-// 1.  getSPFFf4() - computes bonding interactions between atoms and nodes and its neighbors (max. 4 neighbors allowed), the resulting forces on atoms are stored "fapos" array and recoil forces on neighbors are stored in "fneigh" array
-//                   kernel run over all atoms and all systems in parallel to exploit GPU parallelism
+//
+//  Computes all bonding interactions for one node atom per thread.
+//  GPU parallelization: dim 0 = atom index, dim 1 = system index.
+//
+//  Per node atom (up to 4 neighbors), evaluates:
+//    1. Bond stretching (harmonic) — each bond once (iG < ing guard)
+//    2. Pi-pi alignment (conjugation) — only between node atoms
+//    3. Pi-sigma orthogonalization (planarity) — pi vs each sigma bond
+//    4. Angle bending (cos-half) — all unique neighbor pairs (i < j)
+//    5. Optional: subtract non-bonded VdW for 1-3 pairs (bSubtractVdW)
+//
+//  Force storage:
+//    fapos[iav]       += (F_center, E)   — force + energy on center atom
+//    fapos[iav+nAtoms] = (F_pi, 0)       — force on pi-orbital
+//    fneigh[i4+i]      = (F_recoil_i, 0) — recoil force on i-th neighbor
+//    fneigh[i4p+i]     = (F_pi_recoil_i, 0) — pi recoil on i-th neighbor's pi
+//
+//  where i4  = (iG + iS*nnode*2)*4         (sigma recoil slot)
+//        i4p = i4 + nnode*4                (pi recoil slot)
+//
+//  CAVEAT: The `if(iG < ing)` guard ensures each bond is evaluated once.
+//  The neighbor with higher index receives its force via recoil, not directly.
+//
+//  CAVEAT: PBC shifts are applied to bond vectors via neighCell indices
+//  into the pbc_shifts array. This handles bonds across cell boundaries.
+//
 //__attribute__((reqd_work_group_size(1,1,1)))
 __kernel void getSPFFf4(
     const int4 nDOFs,               // 1   (nAtoms,nnode) dimensions of the system
@@ -330,8 +515,17 @@ __kernel void getSPFFf4(
 // ======================================================================
 //                          getSPFFf4_rot()
 // ======================================================================
-// Same as getSPFFf4 but uses torque-based pi interactions for rotational dynamics.
-// Pi-orbital forces are torques (not linear forces), stored in aforce[iav+nAtoms].
+//
+//  Torque-based variant of getSPFFf4 for rotational pi-orbital dynamics.
+//  Instead of linear forces on pi-orbitals, computes torques:
+//    - Pi-pi alignment:  tau = cross(h1, h2) * K
+//    - Pi-sigma ortho:   tau = cross(hpi, h) * (-2K*(cos-c0))
+//  Torques are stored in aforce[iav+nAtoms] and integrated by
+//  updateAtomsSPFFf4_rot using Rodrigues' rotation formula.
+//
+//  The sigma (bond + angle) forces are identical to getSPFFf4.
+//  Only the pi interaction helpers differ (evalPiAlign_tq, evalPiSigma_tq).
+//
 //__attribute__((reqd_work_group_size(1,1,1)))
 __kernel void getSPFFf4_rot(
     const int4 nDOFs,               // 1   (nAtoms,nnode) dimensions of the system
@@ -452,11 +646,26 @@ __kernel void getSPFFf4_rot(
     aforce[iav ] += (float4){fa.x,fa.y,fa.z,E};
 }
 
-// ---- updateGroups ----
 // ======================================================================
 //                     updateGroups()
 // ======================================================================
-
+//
+//  Computes geometric properties of rigid atom groups for constrained dynamics.
+//  One thread per group. For each group:
+//    1. Center of geometry (CoG) = weighted average of member positions
+//    2. Forward vector (fw) = weighted principal direction (1st eigenvector)
+//    3. Up vector (up) = weighted secondary direction, orthogonalized to fw
+//
+//  The fw/up vectors define a local coordinate frame for the group, used
+//  by groupForce to decompose applied torques into Cartesian components.
+//
+//  Weights: gweights[ia] = (w_com, w_fw, w_up, 0) — separate weights for
+//  CoM, forward, and up computation. This allows e.g. using only terminal
+//  atoms for direction vectors while all atoms contribute to CoM.
+//
+//  Orthonormalization: Gram-Schmidt — fw normalized, then up projected
+//  perpendicular to fw and normalized.
+//
 //__attribute__((reqd_work_group_size(1,1,1)))
 __kernel void updateGroups(
     int               ngroup,      // 1 // number of groups (total, for all systems)
@@ -521,11 +730,28 @@ __kernel void updateGroups(
     gups[iG] = (float4){up,0.0f};
 }
 
-// ---- groupForce ----
 // ======================================================================
 //                     groupForce()
 // ======================================================================
-
+//
+//  Distributes external forces and torques applied to rigid groups back
+//  to individual member atoms. One thread per atom.
+//
+//  For each atom belonging to a group:
+//    F_atom += F_group * w_linear + cross(r_atom - r_group, tau_group) * w_linear
+//
+//  where tau_group is decomposed into the group's local frame (fw, up, lf):
+//    tau_cartesian = fw * tau.x + up * tau.y + lf * tau.z
+//  and lf = normalize(cross(fw, up)) is the left/right direction.
+//
+//  This is the rigid-body force distribution: a force on the group center
+//  translates all atoms equally, while a torque rotates the group and
+//  produces position-dependent forces on each atom.
+//
+//  CAVEAT: gfweights stores only a single weight (w.x) used for both
+//  linear and torque contributions. If different weighting is needed,
+//  the kernel must be modified.
+//
 //__attribute__((reqd_work_group_size(1,1,1)))
 __kernel void groupForce(
     const int4        n,            // 1 // (natoms,nnode) dimensions of the system
@@ -610,6 +836,40 @@ __kernel void groupForce(
 // ======================================================================
 //                     updateAtomsSPFFf4()
 // ======================================================================
+//
+//  MD integrator for SPFF with pi-orbital linear dynamics.
+//  One thread per atom (or pi-orbital), one system per dim-1.
+//
+//  Steps per atom:
+//    1. Gather recoil forces from back-neighbors (bkNeighs -> fneigh)
+//    2. Apply force limiting (Flimit) if enabled
+//    3. Apply constraints (harmonic springs to fixed positions)
+//    4. Apply bounding box (z-direction only; x,y commented out)
+//    5. Apply inter-system bonds (compression/tension between replicas)
+//    6. For pi-orbitals: project out radial component of force & velocity
+//    7. Integrate: v *= damp; v += F*dt/m; r += v*dt
+//    8. For pi-orbitals: normalize to unit length
+//
+//  Integration scheme: Damped leap-frog (semi-implicit Euler):
+//    v_new = damp * v_old + F * dt / m
+//    r_new = r_old + v_new * dt
+//  When damp=1.0, this is pure leap-frog (symplectic for conservative forces).
+//  When damp<1.0, velocity is scaled each step (non-conservative, energy dissipating).
+//
+//  Pi-orbital dynamics (standard variant):
+//    The pi-orbital is a unit vector. Forces are projected tangent to the
+//    sphere: F_tangent = F - (F.p)p, same for velocity. After integration,
+//    the vector is renormalized. This is a first-order approximation to
+//    motion on S^2. For proper rotational dynamics, use updateAtomsSPFFf4_rot.
+//
+//  CAVEAT: Bounding box is only applied in z-direction (x,y lines commented
+//  out at lines ~801-802). This is intentional for surface simulations where
+//  atoms should be free laterally but confined vertically.
+//
+//  CAVEAT: Force limiting (Flimit) is non-conservative and can cause energy
+//  drift. It should only be used during initial relaxation, not production.
+//
+
 
 /*
 float2 KvaziFIREdamp( float c, float2 damp_lims, float2 clim ){
@@ -648,7 +908,16 @@ def KvaziFIREdamp( c, clim, damps ):
 */
 
 
-// Damping function for FIRE algorithm, modified to reduction of forece and velocity arrays to make it more suitable for parallelization
+// FIRE (Fast Inertial Relaxation Engine) damping function.
+// Returns (velocity_factor, force_factor) based on the alignment c = F.v / (|F||v|):
+//   c < clim.x: F and v anti-aligned -> strong damping (damps.x), no force boost
+//   c > clim.y: F and v aligned -> weak damping (damps.y), no force boost
+//   clim.x <= c <= clim.y: intermediate -> linear interpolation + parabolic boost
+//
+// Reference: Bitzek et al., PRL 97, 170201 (2006).
+// CAVEAT: This is a modified FIRE for GPU parallelization — the force boost
+// term (cvf.y) is applied per-atom rather than globally, which differs from
+// the original algorithm. This may affect convergence behavior.
 float2 KvaziFIREdamp( float c, float2 clim, float2 damps ){
     float2 cvf;
     if      (c < clim.x ){   //-- force against veloctiy
@@ -665,6 +934,8 @@ float2 KvaziFIREdamp( float c, float2 clim, float2 damps ){
     return cvf;
 }
 
+// Wang hash: fast integer hash for thermal noise generation.
+// Reference: https://www.reishin.org/pseud-random-number-generator-wang/
 unsigned int hash_wang(unsigned int bits) {
     //unsigned int bits = __float_as_int(value);
     bits = (bits ^ 61) ^ (bits >> 16);
@@ -675,13 +946,13 @@ unsigned int hash_wang(unsigned int bits) {
     return bits;
 }
 
+// Hash a float to a uniform random float in [xmin, xmax].
+// Uses Wang hash on the bit representation of val.
 float hashf_wang( float val, float xmin, float xmax) {
     //return ( (float)(bits)*(2147483647.0f );
     return (((float)( hash_wang(  __float_as_int(val) ) )) * 4.6566129e-10 )  *(xmax-xmin)+ xmin;
 }
 
-// ---- updateAtomsSPFFf4: SPFF integrator with recoil, pi-orbital norm ----
-// Assemble recoil forces from neighbors and  update atoms positions and velocities
 //__attribute__((reqd_work_group_size(1,1,1)))
 __kernel void updateAtomsSPFFf4(
     const int4        n,            // 1 // (natoms,nnode) dimensions of the system
@@ -851,7 +1122,14 @@ __kernel void updateAtomsSPFFf4(
 // ======================================================================
 //                     cleanForceSPFFf4()
 // ======================================================================
-// Clean forces on atoms and neighbors to prepare for next forcefield evaluation
+//
+//  Zeros force arrays between MD steps. One thread per atom per system.
+//  Clears: aforce[iav] and fneigh[ian*4..ian*4+3] (4 recoil slots per node).
+//  Must be called before getSPFFf4/getNonBond_ex2 at the start of each step.
+//
+//  CAVEAT: Only clears fneigh for node atoms (iG < nnode). Pi-orbital
+//  recoil slots (i4p) are cleared in the force evaluation kernels, not here.
+//
 //__attribute__((reqd_work_group_size(1,1,1)))
 __kernel void cleanForceSPFFf4(
     const int4        n,           // 2
@@ -887,9 +1165,26 @@ __kernel void cleanForceSPFFf4(
 // ======================================================================
 //                     updateAtomsSPFFf4_rot()
 // ======================================================================
-// MD integrator with rotational pi-orbital dynamics.
-// Pi-orbitals are integrated as rotational DOFs (torque -> angular velocity -> rotation).
-// Atoms use simple leap-frog integration.
+//
+//  MD integrator for SPFF with rotational pi-orbital dynamics.
+//  Atoms use damped leap-frog (same as updateAtomsSPFFf4).
+//  Pi-orbitals use proper rotational dynamics:
+//    1. angular_velocity *= damp
+//    2. angular_velocity += torque * dt  (inv_I = 1 for unit sphere)
+//    3. pi_orbital = rotate_by_omega_taylor(pi, angular_velocity * dt)
+//    4. pi_orbital = normalize(pi_orbital)
+//
+//  The rotation uses Rodrigues' formula with Taylor series for small angles.
+//  This is more physically correct than the linear projection approach in
+//  updateAtomsSPFFf4, which only approximates motion on S^2.
+//
+//  CAVEAT: inv_I = 1.0 hardcoded for pi-orbitals. If different moments of
+//  inertia are needed for different atom types, this must be parameterized.
+//
+//  CAVEAT: Recoil forces are NOT gathered for pi-orbitals in this kernel
+//  (the `if(!bPi)` guard at line ~932 skips the gather). Pi recoil is
+//  handled differently in the _rot variant — torques are applied directly.
+//
 //__attribute__((reqd_work_group_size(1,1,1)))
 __kernel void updateAtomsSPFFf4_rot(
     const int4        nDOFs,            // 1 // (natoms,nnode) dimensions of the system
@@ -1001,18 +1296,34 @@ __kernel void updateAtomsSPFFf4_rot(
 // ======================================================================
 //                     relax_nsteps_serial()
 // ======================================================================
-// Single-workgroup relaxation kernel: runs nsteps MD steps entirely in
-// local memory. Eliminates Python dispatch overhead (3 kernel calls/step
-// -> 1 call total). No non-bonded interactions (slot reserved for future).
 //
-// Workgroup size: 128 threads (WG_SIZE). Covers molecules up to ~80 atoms
-// (nvec = natoms + nnode <= WG_SIZE=128, nnode <= MAX_NNODE=64).
+//  Fused relaxation kernel: runs nsteps MD steps entirely in local memory
+//  within a single workgroup. Eliminates Python dispatch overhead (3 kernel
+//  calls/step -> 1 call total). No non-bonded interactions (slot reserved).
 //
-// Data flow per step:
-//   1. Zero aforce + fneigh (all threads)
-//   2. Compute SPFF bonded forces (threads 0..nnode-1)
-//   3. Gather recoil + integrate (threads 0..nvec-1)
-// All data stays in __local memory between steps.
+//  GPU strategy: One workgroup per molecule. All data (positions, velocities,
+//  forces, neighbor lists, FF params) is loaded into __local memory once,
+//  then the relaxation loop runs entirely on-chip with barriers between phases.
+//
+//  Workgroup size: WG_SIZE=128 threads. Covers molecules up to ~80 atoms
+//  (nvec = natoms + nnode <= WG_SIZE=128, nnode <= MAX_NNODE=64).
+//
+//  Data flow per step:
+//    Phase 1: Zero aforce + fneigh (all threads cooperate) -> barrier
+//    Phase 2: Compute SPFF bonded forces (threads 0..nnode-1) -> barrier
+//    Phase 3: Gather recoil + integrate (threads 0..nvec-1) -> barrier
+//  All data stays in __local memory between steps — no global memory traffic.
+//
+//  CAVEAT: No non-bonded interactions. Only bonded (bond, angle, pi) forces
+//  are computed. Suitable for intramolecular relaxation where non-bonded
+//  forces are negligible or handled separately.
+//
+//  CAVEAT: PBC is NOT handled in this kernel (bonds assumed within one cell).
+//  For periodic systems, use the multi-kernel path with getSPFFf4 instead.
+//
+//  CAVEAT: The fneigh array is sized MAX_NNODE*8 = 64*8 = 512 float4s.
+//  This is the maximum for nnode=64 with 4 neighbors * 2 (sigma+pi) slots.
+//
 // ======================================================================
 #ifndef WG_SIZE
 #define WG_SIZE 128

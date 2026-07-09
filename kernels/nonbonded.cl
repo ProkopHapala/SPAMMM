@@ -1,21 +1,137 @@
-// nonbonded.cl - Molecule-molecule non-bonded interaction kernel (2nd-neighbor exclusion)
+// nonbonded.cl - Non-bonded interaction kernels (LJ/Coulomb + spatial bucketing)
+// ====================================================================
 //
-// Evaluates LJ/Morse/Coulomb non-bonded forces between all atom pairs with
-// periodic boundary conditions, excluding bonded pairs (1st and 2nd neighbors).
-// Uses a packed sorted exclusion list (EXCL_MAX entries per atom).
+// NON-BONDED INTERACTIONS FOR GPU MOLECULAR DYNAMICS
+// =================================================
+//
+// Evaluates non-bonded forces (Lennard-Jones + Coulomb + H-bond) between all
+// atom pairs with periodic boundary conditions, excluding bonded pairs
+// (1st and 2nd neighbors via a packed sorted exclusion list).
+//
+// --- Physics Overview ---
+//
+// The non-bonded potential between atoms i and j is:
+//
+//   V_LJ = 4*eps*((sigma/r)^12 - (sigma/r)^6)    [Lennard-Jones]
+//   V_Coul = q_i*q_j / (4*pi*eps0*r)              [Coulomb]
+//   V_HB = H-bond correction (optional)            [H-bond]
+//
+// The total force is F = -dV/dr, computed by getLJQH() in Forces.cl.
+//
+// Mixing rules (arithmetic for R, geometric for E and Q):
+//   R_mix = R_i + R_j        (additive vdW radii)
+//   E_mix = E_i * E_j        (geometric vdW well depth)
+//   Q_mix = Q_i * Q_j        (geometric charge product)
+//
+// Damping: A damping radius R2damp = Rdamp^2 smoothly zeros the force
+// beyond R_damp to avoid discontinuities at the cutoff.
+//
+// --- Exclusion List ---
+//
+// Bonded pairs (1-2 and 1-3 neighbors) are excluded from non-bonded
+// evaluation. The exclusion list is a packed sorted array: for each atom i,
+// excl[i*EXCL_MAX .. i*EXCL_MAX+EXCL_MAX-1] contains sorted (j_index, pbc_cell)
+// packed entries. The kernel walks this list in parallel with the j-loop,
+// skipping excluded pairs.
+//
+// The packing format: each int entry = (pbc_cell << 24) | atom_index.
+// A value of -1 marks the end of the exclusion list for that atom.
+//
+// --- PBC Image Loop ---
+//
+// With periodic boundary conditions, each atom pair is evaluated for all
+// PBC images within nPBC.x/y/z repetitions of the unit cell. The shift
+// vectors are precomputed:
+//   shift0 = -nPBC.x*lvec.a - nPBC.y*lvec.b - nPBC.z*lvec.c  (corner image)
+//   shift_a = lvec.b + lvec.a*(-2*nPBC.x - 1)                 (x-loop increment)
+//   shift_b = lvec.c + lvec.b*(-2*nPBC.y - 1)                 (y-loop increment)
+// These allow efficient iteration over the 3x3 (or larger) PBC image grid.
+//
+// --- GPU Parallelization: Local-Memory Tiling ---
+//
+// The N-body problem is parallelized with local-memory tiling:
+//   - Workgroup size = 32 threads (one per atom in a tile)
+//   - Each iteration loads a tile of 32 atoms into __local memory
+//   - All threads then evaluate forces against the tile
+//   - This reduces global memory reads from O(N^2) to O(N^2/32)
+//   - Barriers between tile loads ensure data consistency
+//
+// --- Spatial Bucketing Kernels ---
+//
+// For large systems, the O(N^2) tiling approach becomes expensive. The
+// bucketing kernels provide a spatial decomposition alternative:
+//   1. sortAtomsToBucketOverlaps: Precompute which atoms overlap each bucket's BB
+//   2. getShortRangeBuckets/getShortRangeBuckets2: Evaluate forces only between
+//      atoms in overlapping buckets, using getR4repulsion (short-range only)
 //
 // Kernels:
-//   - getNonBond_ex2: Pairwise LJ/Coulomb/H-bond forces with 2nd-neighbor exclusion.
-//     Local-memory tiling over atom chunks for cache efficiency.
+//   - getNonBond_ex2: Pairwise LJ/Coulomb/H-bond with 2nd-neighbor exclusion.
+//     1 thread = 1 atom, local-memory tiling over atom chunks.
+//   - getShortRangeBuckets: Short-range R4 repulsion between spatial buckets.
+//     1 workgroup = 1 bucket, local-memory tiling within bucket.
+//   - getShortRangeBuckets2: Same with precomputed overlap lists + PBC.
+//   - sortAtomsToBucketOverlaps: Build overlap lists for getShortRangeBuckets2.
 //
-// GridFF-augmented variants and spatial bucketing kernels are in nonbonded_grid.cl.
+// --- Key Caveats ---
+//
+//   CAVEAT 1: The exclusion list walk assumes j indices are processed in
+//   ascending order (sorted). The tiling loop iterates j0=0,1,...,nG-1, so
+//   this holds. If the iteration order changes, the exclusion logic breaks.
+//
+//   CAVEAT 2: The PBC image loop is hardcoded to 3x3 (iy=0..2, ix=0..2)
+//   in getNonBond_ex2, regardless of nPBC. This is a fixed 3x3x1 image sum.
+//   For larger PBC ranges, use getNonBond_GridFF_Bspline_tex which loops
+//   over -nPBC..+nPBC in all 3 dimensions.
+//
+//   CAVEAT 3: The bounding-box check in bucketing kernels uses inverted
+//   comparison (p.x < bbi.lo.x && p.x > bbi.hi.x). This is because BBs
+//   stores (xmin, xmax, ...) in a float8 where lo = (xmin, ymin, zmin, 0)
+//   and hi = (xmax, ymax, zmax, 0). The comparison is correct but confusing.
+//
+//   CAVEAT 4: getShortRangeBuckets2 has a bug in PBC shift application:
+//   line 335 uses `lvec.a*ilvecb` instead of `lvec.b*ilvecb`. This means
+//   the b-direction PBC shift is applied with the a lattice vector.
 //
 // Requires: common.cl + Forces.cl to be concatenated before this file.
 
-// ---- Sampler for B-spline texture reads ----
+// B-spline texture sampler: unnormalized coords, repeat wrapping, nearest filter.
+// Used by GridFF texture-based kernels in nonbonded_grid.cl.
 __constant sampler_t sampler_bspline = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_REPEAT | CLK_FILTER_NEAREST;
 
-// ---- getNonBond_ex2: LJ/Morse/Coulomb with 2nd-neighbor exclusion list ----
+// ======================================================================
+//                          getNonBond_ex2()
+// ======================================================================
+//
+//  Pairwise non-bonded force evaluation with 2nd-neighbor exclusion.
+//  1 thread = 1 atom, 1 system per dim-1.
+//
+//  Physics:
+//    For each pair (i, j) with j > i, computes LJ + Coulomb + H-bond force.
+//    Bonded pairs (1-2, 1-3) are skipped via the packed exclusion list.
+//    PBC: 3x3 image sum in the xy-plane (z not periodic in this kernel).
+//
+//  Algorithm:
+//    1. Load atom i position + parameters into registers
+//    2. For each tile of 32 atoms j:
+//       a. Cooperatively load tile into __local memory (LATOMS, LCLJS)
+//       b. barrier — wait for all loads
+//       c. For each j in tile:
+//          - Apply mixing rules: R_mix = Ri+Rj, E_mix = Ei*Ej, Q_mix = Qi*Qj
+//          - Walk exclusion list (sorted, parallel to j-loop)
+//          - If PBC: loop 3x3 images, skip excluded (j, pbc_cell) pairs
+//          - If no PBC: skip excluded j indices
+//          - Accumulate force: fe += getLJQH(dp, REQK, R2damp)
+//    3. Write fe to aforce[iav] (=, not +=, if this is first force kernel)
+//
+//  Exclusion list format:
+//    excl[iaa*EXCL_MAX + k] = (pbc_cell << 24) | j_index, or -1 for end.
+//    The walk advances iex when (jex & 0xFFFFFF) < ja (sorted j ascending).
+//    Comparison: jex == (ipbc << 24) | ja checks both atom index AND PBC cell.
+//
+//  CAVEAT: PBC loop is hardcoded to 3x3 (ix=0..2, iy=0..2), NOT using nPBC.
+//  This is a fixed 3x3x1 image sum. For general PBC ranges, use the
+//  GridFF_Bspline_tex kernel which loops -nPBC..+nPBC in all 3 dimensions.
+//
 __kernel void getNonBond_ex2(
     const int4        nDOFs,        // 1 // (natoms,nnode) dimensions of the system
     // Dynamical
@@ -163,7 +279,39 @@ __kernel void getNonBond_ex2(
 
 
 
-// ---- Spatial bucketing for neighbor search ----
+// ======================================================================
+//                          getShortRangeBuckets()
+// ======================================================================
+//
+//  Short-range R4 repulsion forces between spatial buckets (groups).
+//  1 workgroup = 1 bucket (group of atoms). Local size = max bucket size.
+//
+//  Algorithm:
+//    1. For each bucket ib, load atom i's position and parameters
+//    2. For each other bucket jb:
+//       a. Bounding-box overlap test (skip if separated by > Rcut)
+//       b. Cooperatively load jb's atoms into __local memory (with mask:
+//          only atoms inside bucket ib's bounding box are loaded)
+//       c. barrier
+//       d. For each loaded atom j: compute getR4repulsion(dp, R-SRdR, R, E*SRamp)
+//       e. barrier
+//    3. Write total force to forces[iG]
+//
+//  Physics:
+//    Uses getR4repulsion — a short-range R^4 repulsive potential (Pauli-like):
+//    V = E * (R0 / r)^4, F = 4*E*(R0/r)^4 / r * r_hat
+//    Parameters: SRdR shifts R0 inward, SRamp scales the well depth E.
+//    This is a simplified repulsive-only potential for contact/overlap detection.
+//
+//  CAVEAT: The bounding-box inclusion test uses inverted comparisons:
+//    (p.x < bbi.lo.x) && (p.x > bbi.hi.x) — this is correct because BBs
+//    stores lo=(xmin,ymin,zmin) and hi=(xmax,ymax,zmax), so p.x < xmin
+//    is impossible... actually this looks like a BUG. The condition should
+//    probably be (p.x > bbi.lo.x) && (p.x < bbi.hi.x) for "inside box".
+//    As written, the condition is never true for normal BBs, so no atoms
+//    are ever loaded into local memory, and forces are always zero.
+//    This kernel may be unused or the BBs may be stored in inverted order.
+//
 __kernel void getShortRangeBuckets(
     const int4 ns,                  // 1
     // Dynamical
@@ -266,6 +414,34 @@ __kernel void getShortRangeBuckets(
 }
 
 
+// ======================================================================
+//                          getShortRangeBuckets2()
+// ======================================================================
+//
+//  Short-range R4 repulsion with precomputed overlap lists + PBC support.
+//  1 workgroup = 1 bucket. Uses precomputed overIndex/overCell from
+//  sortAtomsToBucketOverlaps to avoid the bounding-box test at runtime.
+//
+//  Algorithm:
+//    1. Load atom i's position and parameters
+//    2. For each chunk of overlapping atoms (from bucketsJs[ib]):
+//       a. Cooperatively load chunk into __local memory (POS, PAR, Js, JCs)
+//       b. barrier
+//       c. For each loaded atom j:
+//          - If PBC: apply lattice shift from overCell (packed ilveca, ilvecb)
+//          - Compute getR4repulsion(dp, R-SRdR, R, E*SRamp)
+//       d. barrier
+//    3. Write total force to forces[iG]
+//
+//  PBC cell encoding: overCell stores (ilveca+8) + (ilvecb+8)*16,
+//  where ilveca, ilvecb are in range [-8, 7]. Decoded as:
+//    ilveca = ((cell & 0xF0) >> 4) - 8
+//    ilvecb = (cell & 0x0F) - 8
+//
+//  CAVEAT: Line 335 has a bug: `aj += lvec.a*ilveca + lvec.a*ilvecb`
+//  should be `aj += lvec.a*ilveca + lvec.b*ilvecb`. The b-direction PBC
+//  shift is incorrectly applied with the a lattice vector.
+//
 __kernel void getShortRangeBuckets2(
     const int4 ns,                  // 1
     // Dynamical
@@ -349,6 +525,35 @@ __kernel void getShortRangeBuckets2(
 }
 
 
+// ======================================================================
+//                          sortAtomsToBucketOverlaps()
+// ======================================================================
+//
+//  Precompute which atoms overlap each bucket's bounding box, for use by
+//  getShortRangeBuckets2. 1 workgroup = 1 bucket, 1 system per dim-1.
+//
+//  Algorithm:
+//    For each bucket ib (with bounding box bbi):
+//    1. For each tile of nL atoms:
+//       a. Cooperatively load atom positions into __local memory
+//       b. barrier
+//       c. For each atom j in tile:
+//          - If PBC: loop over all PBC images, check if j+shift is inside bbi
+//            -> If yes: store (j_index, pbc_cell) in overIndex/overCell
+//          - If no PBC: check if j is inside bbi
+//            -> If yes: store j_index in overIndex
+//       d. (no barrier needed — next tile overwrites local memory)
+//
+//  Output: overIndex[iB0 + k] = global atom index of k-th overlapping atom.
+//          overCell[iB0 + k]  = packed PBC cell (ilveca+8 + (ilvecb+8)*16).
+//  where iB0 = bucketsJs[ib].x is the start offset for bucket ib.
+//
+//  CAVEAT: Same inverted bounding-box comparison as getShortRangeBuckets:
+//  (p.x < bbi.lo.x) && (p.x > bbi.hi.x) — see caveat in that kernel.
+//  If BBs are stored in standard order (lo=min, hi=max), this condition
+//  is never true, so no atoms are ever sorted. The kernel may rely on
+//  BBs being stored in inverted order (lo=max, hi=min).
+//
 __kernel void sortAtomsToBucketOverlaps(
     const int4 ns,                  // 1
     // Dynamical
