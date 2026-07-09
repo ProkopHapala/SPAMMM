@@ -198,25 +198,61 @@ def fit_folded_for_molecule(mol_file, substrate_file=NACL_SUBSTRATE, z_range_rel
     }
 
 
+def save_fit(fit, fname):
+    """Save a fit result dict to a small .npz file."""
+    np.savez(fname,
+        coeffs=fit['coeffs'],
+        basis_params=fit['basis_params'],
+        atom_type_ids=fit['atom_type_ids'],
+        folded_lvec2d=fit['folded_lvec2d'],
+        unique_REQs=fit['unique_REQs'],
+        z_range=np.array(fit['z_range'], dtype=np.float32),
+        enames_str=','.join(fit['enames']),
+        reqs=fit['reqs'],
+        apos_mol=fit['apos_mol'],
+    )
+
+
+def load_fit(fname):
+    """Load a fit result dict from .npz file written by save_fit."""
+    d = np.load(fname, allow_pickle=False)
+    return {
+        'coeffs': d['coeffs'],
+        'basis_params': d['basis_params'],
+        'atom_type_ids': d['atom_type_ids'],
+        'folded_lvec2d': d['folded_lvec2d'],
+        'unique_REQs': d['unique_REQs'],
+        'z_range': tuple(d['z_range']),
+        'enames': list(str(d['enames_str'].item()).split(',')),
+        'reqs': d['reqs'],
+        'apos_mol': d['apos_mol'],
+    }
+
+
 def setup_rigid_folded(mol_file, fit_result, z_init=3.0, xy_init=(0.0, 0.0), quats=None, mass_trans=1.0, debug=False):
     """Create RigidBodyDynamics with folded basis from fit result.
 
     Args:
-        mol_file: path to molecule XYZ
+        mol_file: path to molecule XYZ, or None to use fit_result['apos_mol'] etc.
         fit_result: dict from fit_folded_for_molecule
         z_init: initial height above surface top in Angstrom
         xy_init: initial (x, y) position
         quats: (4,) initial quaternion, or None for identity
         mass_trans: translational mass parameter
     """
-    apos_mol, reqs, enames, _, _ = load_xyz_with_REQs(mol_file)
+    if mol_file is None:
+        apos_mol = fit_result['apos_mol']
+        reqs = fit_result['reqs']
+        enames = fit_result['enames']
+    else:
+        apos_mol, reqs, enames, _, _ = load_xyz_with_REQs(mol_file)
     apos_mol = np.asarray(apos_mol, dtype=np.float32)
     masses = _guess_mass(enames)
     com0 = (apos_mol * masses[:, None]).sum(axis=0) / masses.sum()
     rel = apos_mol - com0[None, :]
     mtot, I, Iinv = compute_mass_properties(rel, masses)
     I_mean = float(np.mean(np.diag(I)))
-    Iinv = Iinv * I_mean
+    Iinv = Iinv * (mtot / max(mass_trans, 1e-9)) * 0.5
 
     n_bodies = 1
     n_atoms = len(enames)

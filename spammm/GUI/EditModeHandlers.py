@@ -55,7 +55,8 @@ class EditModeHandler:
     # ── Event hooks (default: no-op) ────────────────────────────────────────
 
     def on_press(self, event, p_world, ctrl): pass
-    def on_move(self, p_world): pass
+    def on_move(self, p_world, r0=None, rd=None): pass
+    def on_release(self, event, p_world, ctrl): pass
     def on_rmb_atom(self, atom_id, ctrl): pass
     def on_link(self, from_id, to_id): pass
     def on_atom_click(self, atom_id): pass
@@ -176,7 +177,7 @@ class UnifiedMode(EditModeHandler):
         elif event.button == 3:  # Middle click
             self._toggle_h_at(p_world)
 
-    def on_move(self, p_world):
+    def on_move(self, p_world, r0=None, rd=None):
         target_type, target = self.resolve_target(p_world)
         if target_type == 'atom':
             self._hover_atom(target)
@@ -233,7 +234,7 @@ class AtomMode(EditModeHandler):
         elif event.button == 3:
             self._toggle_h_at(p_world)
 
-    def on_move(self, p_world):
+    def on_move(self, p_world, r0=None, rd=None):
         hovered_atom = self.backend.pick_atom(p_world, radius=self.pick_radius)
         if hovered_atom:
             self._hover_atom(hovered_atom)
@@ -284,7 +285,7 @@ class PiMode(EditModeHandler):
             self.backend.adjust_h()
         self.gui.refresh_view()
 
-    def on_move(self, p_world):
+    def on_move(self, p_world, r0=None, rd=None):
         hovered_atom = self.backend.pick_atom(p_world, radius=self.pick_radius)
         if hovered_atom:
             self._hover_atom(hovered_atom)
@@ -318,7 +319,7 @@ class BondMode(EditModeHandler):
                 debug_print(2, f"Deleted bond {bond._id}")
             self._refresh()
 
-    def on_move(self, p_world):
+    def on_move(self, p_world, r0=None, rd=None):
         bond = self.backend.pick_bond(p_world, radius=0.5)
         if bond:
             self._hover_bond(bond)
@@ -348,7 +349,7 @@ class RingMode(EditModeHandler):
             debug_print(2, f"Deleted bond {bond._id}")
             self._refresh()
 
-    def on_move(self, p_world):
+    def on_move(self, p_world, r0=None, rd=None):
         bond = self.backend.pick_bond(p_world, radius=0.5)
         if bond:
             self._hover_bond(bond)
@@ -379,7 +380,7 @@ class HexMode(EditModeHandler):
         elif event.button == 3:
             self._toggle_h_at(p_world)
 
-    def on_move(self, p_world):
+    def on_move(self, p_world, r0=None, rd=None):
         self.backend.detect_geometry_rings()
         hovered_ring = self.backend.pick_ring(p_world, radius=1.0)
         if hovered_ring:
@@ -423,7 +424,7 @@ class SelectMode(EditModeHandler):
     status_msg = "LMB: Select/Deselect | RMB: Delete | Scroll: Zoom"
     selection_mode = True
 
-    def on_move(self, p_world):
+    def on_move(self, p_world, r0=None, rd=None):
         hovered_atom = self.backend.pick_atom(p_world, radius=self.pick_radius)
         if hovered_atom:
             self._hover_atom(hovered_atom)

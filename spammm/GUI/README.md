@@ -24,6 +24,7 @@ PyQt5 GUI for molecular editing and AFM simulation. Main window combines VisPy 3
 ## Extensions
 
 - **KekuleExtension.py** — Kekulé π-bond-order solver panel
+- **FoldedRigidExtension.py** — Folded-basis rigid-body manipulation panel (load molecule, fit/load substrate potential, drag atoms)
 - **AsciiArtExtension.py** — ASCII art → molecule; must match `build_ascii_hbond_system` pipeline for DFTB scans
 - **ReactionCoordinateExtension.py** — H-bond RC scan: import graph, DFTB methods, slider, bond viz, ESP animation
 - **rc_esp_view.py** — Blitted ESP heatmap synced to RC slider (uses `mpl_blit.py`)
@@ -34,6 +35,7 @@ PyQt5 GUI for molecular editing and AFM simulation. Main window combines VisPy 3
 
 Run via `./run_gui.sh --script spammm/GUI/gui_scripts/NAME.py [-- extra args]`:
 
+- **folded_rigid_setup.py** — Folded-rigid molecule-on-surface manipulation: load molecule, fit/load potential, run/drag
 - **rc_scan_review.py** — 2Quinolone symmetric pm-NEB relaxed review; `--preview` loads cached npz
 - **rc_scan_offline.py** — Same DFTB path without Qt (`PYTHONPATH=. python3 …`)
 

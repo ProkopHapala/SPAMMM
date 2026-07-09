@@ -16,7 +16,7 @@ Debugging pitfalls: [doc/Takeways.md](../../doc/Takeways.md) (z alignment, F_ref
 - **Ewald2D.py** — NumPy 2D Ewald reference (plane-wave formulation, parity vs GPU)
 - **Surface_utils.py** — GridFF metadata, load precomputed grids, visualization, atom-position sampling
 - **GridFFRelaxedScan.py** — Relaxed PES scanning with full geometry relaxation at each grid point
-- **FoldedRigid.py** — Folded-basis rigid-body simulation (fit potentials, relaxation, manipulation)
+- **FoldedRigid.py** — Folded-basis rigid-body simulation (fit potentials, relaxation, manipulation, `setup_rigid_folded`)
 - **SubstrateBuilder.py** — Crystal slab generation (NaCl, CaF₂): flat slabs and step edges
 - **surface_plots.py** — Matplotlib plots for relaxation trajectories, lateral scans, manipulation
 

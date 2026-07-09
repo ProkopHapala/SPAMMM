@@ -150,7 +150,40 @@ This **is** a supplement to:
 - **Consolidation needed:** `GridFF.py` vs `GridFFRelaxedScan.py` — overlapping functionality
 - **Tests:** `tests/test_surface.py`, `tests/test_folded_relax.py`, `tests/surfaces/ocl_GridFF_new.py`
 
-### 3b. Contact Surface (quasi-2D static AFM)
+### 3b. Folded Rigid Body Manipulation (molecule-on-surface)
+
+Interactive rigid-body dynamics of a small molecule on a periodic substrate using a pre-fitted folded basis expansion (Pauli/London/Coulomb). The GUI supports loading the molecule, fitting or loading the substrate potential, continuous relaxation, and LMB dragging of individual atoms.
+
+| Location | Status | Notes |
+|----------|--------|-------|
+| `spammm/surfaces/FoldedRigid.py` | active | `setup_rigid_folded`, `relax_folded`, `fit_folded_for_molecule`, `RigidBodyDynamics` setup |
+| `spammm/GUI/FoldedRigidExtension.py` | active | Extension panel, edit modes (`fr_pin`, `fr_com`, `fr_manip`), continuous timer, drag atom picking |
+| `spammm/GUI/gui_scripts/folded_rigid_setup.py` | active | One-command setup script (`--run`, `--manip`, `--fit`, `--mol`) |
+| `spammm/forcefields/SPFF_cl.py` | active | `fit_folded_surface_basis` with `coulomb_solver='ewald2d'` |
+| `spammm/forcefields/RigidBodyDynamics.py` | active | OpenCL rigid-body state, `run_folded`, `update_anchors` |
+| `kernels/rigid.cl` | active | `rigid_body_folded_kernel` folded basis force/torque + anchor springs |
+| `spammm/GUI/SPAMMM_GUI.py` | active | Mouse dispatch (`on_mouse_press/move/release`), `refresh_view` no-bonds fix, extension integration |
+| `spammm/GUI/EditModeHandlers.py` | active | `on_move` ray-origin/direction, `on_release` hook base class |
+| `data/fits/h2o_nacl.npz` | data | Cached H2O/NaCl folded basis fit (`nu=4, nv=4`) |
+
+**Key design points:**
+- `AtomicGraph` is the SSOT for atom positions; `RigidBodyDynamics` is the SSOT for the physics state.
+- `_update_graph` rebuilds the backend graph if the atom count diverges between `backend` and `rbd`.
+- `FRManipMode` uses `AtomScene._pick_id_from_mouse` for screen-space atom picking and ray-projection for anchor targets.
+- Default dynamics: `k=2.0`, `dt=0.02`, `n_iter=250`, adaptive `Run` timer `max(20, 0.1·n_iter)` ms.
+- Inverse inertia tensor scaled by `mtot/2` to keep rotation responsive while avoiding spring-induced flipping.
+
+**GUI scripts:**
+```bash
+./run_gui.sh --script spammm/GUI/gui_scripts/folded_rigid_setup.py -- --mol data/xyz/H2O.xyz --fit data/fits/h2o_nacl.npz --run
+./run_gui.sh --script spammm/GUI/gui_scripts/folded_rigid_setup.py -- --mol data/xyz/H2O.xyz --fit data/fits/h2o_nacl.npz --manip
+```
+
+**Tests:** `tests/surfaces/test_folded_relax.py` (smoke), manual `Run`/`drag` L2 review.
+
+**Open issues:** `Run` speed is GPU-timer-limited; the `Run` timer interval is auto-scaled with `n_iter`. No L0 pytest for the GUI drag path yet.
+
+## 3c. Contact Surface (quasi-2D static AFM)
 
 Compact alternative to 3D `img_FF` for aperiodic rigid PP-AFM: **separable B-spline×poly**
 (global corrugation) and **radial PIC** (per-atom compact support).

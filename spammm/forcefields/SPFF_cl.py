@@ -1324,7 +1324,7 @@ class SPFF_cl(OpenCLBase):
         if len(z_mask) != len(uvz):
             raise ValueError(f'fit_folded_surface_basis(): fit_mask length {len(z_mask)} != nsamples {len(uvz)}')
         for it in range(ntypes):
-            md1 = MolecularDynamics(nloc=self.nloc, debug_build_options='-DDBG_UFF=0')
+            md1 = self.__class__(nloc=self.nloc, debug_build_options='-DDBG_UFF=0')
             md1.init_rigid_molecule_batch(np.zeros((1,3), dtype=np.float32), uniq_REQs[it:it+1], nSystems=min(max(len(transforms), 1), 8192))
             md1.set_surface(surf_xyz, nPBC=nPBC, pos0=(0.0,0.0,0.0), alpha_morse=alpha_morse, r_damp=r_damp, bMacro=bMacro, type_map=type_map)
             morse_comps = [ck for ck in comp_keys if ck != 'coulomb'] if (want_coulomb and coulomb_solver == 'ewald2d') else comp_keys

@@ -57,11 +57,13 @@ class UIComponents:
       panel       – QWidget shown in a CollapsibleSection
       edit_modes  – list of (label: str, callback: callable)
       view_modes  – list of (label: str, callback: callable)
+      help_text   – str or dict with per-widget documentation
     """
-    def __init__(self, panel=None, edit_modes=None, view_modes=None):
+    def __init__(self, panel=None, edit_modes=None, view_modes=None, help_text=None):
         self.panel      = panel
         self.edit_modes = edit_modes or []
         self.view_modes = view_modes or []
+        self.help_text  = help_text
 
 # ---------------------------------------------------------------------------
 # Extension registry (declarative metadata only)
@@ -152,6 +154,11 @@ EXTENSION_REGISTRY = {
         dependencies=[], req_paths=[],
         build_ui='build_ui',
     ),
+    'folded_rigid': dict(
+        module='spammm.GUI.FoldedRigidExtension', class_name=None,
+        dependencies=['pyopencl'], req_paths=[],
+        build_ui='build_ui',
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -174,6 +181,7 @@ DEFAULT_CONFIG = {
     'fragments': dict(enabled=True),
     'reaction_coord': dict(enabled=True),
     'vibrations': dict(enabled=True),
+    'folded_rigid': dict(enabled=True),
 }
 
 # ---------------------------------------------------------------------------

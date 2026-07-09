@@ -19,6 +19,7 @@ SPAMMM (Scanning Probe Accelerated Modeling of Microscopy and Manipulation) is a
 - Never apply quick-fixes that hide root causes (e.g. hard-coded outputs)
 - Never reinvent functionality already implemented. Inventory fist, check the provided examples and references, base classs etc.
 - Never copy-paste between apps — extract to shared lib and include.
+- **Ask, don't guess** — when you encounter problem which where you are not sure, ask the user instead of trying to infer it.
 
 ## Debugging & Testing
 

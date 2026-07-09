@@ -280,6 +280,13 @@ class MoleculeEditorBackend:
         self.sys.natoms  = len(atom_list)
         self.sys.bonds   = bonds if len(bonds) else None
         self.sys.ngs     = None  # invalidate neighbor cache
+        # Sync per-atom properties: charges from graph, Rs and labels from element table
+        charges = [a.charge for a in atom_list]
+        self.sys.qs = np.array(charges, dtype=np.float64)
+        if not np.any(self.sys.qs):
+            self.sys.qs = np.array([elements.ELEMENTS[z-1][9] for z in self.sys.atypes], dtype=np.float64)
+        self.sys.Rs = np.array([elements.ELEMENTS[z-1][7] for z in self.sys.atypes], dtype=np.float64)
+        self.sys.aux_labels = [str(i) for i in range(len(atom_list))]
         # 4 mapping arrays: dense index ↔ stable _id (atoms and bonds)
         self._atom_ids    = np.array([a._id for a in atom_list], dtype=np.int64)
         self._atom_idx_map = {a._id: i for i, a in enumerate(atom_list)}
@@ -1373,6 +1380,7 @@ class MoleculeEditorBackend:
                                     e, elements.ELEMENT_DICT[e][0],
                                     pin=nk, parent=None,
                                     npi=self._get_element_default_npi(e))
+            a.charge = float(qs[i])
             atoms_map[i] = a
         # Add bonds from file (only between heavy atoms that were added)
         if bonds is not None and len(bonds) > 0:
@@ -1397,9 +1405,10 @@ class MoleculeEditorBackend:
                 d = float(np.linalg.norm(p - a.pos))
                 if d < best_d: best_d = d; best_a = a
             if best_a is not None and best_d < 1.5:
-                self.graph.add_atom(np.array(p, dtype=np.float64), 'H',
+                a = self.graph.add_atom(np.array(p, dtype=np.float64), 'H',
                                     elements.ELEMENT_DICT['H'][0],
                                     pin=None, parent=best_a, npi=-1)
+                a.charge = float(qs[i])
         self.graph.sync_neighbor_lists()
         self._sync_sys()
 
@@ -1430,10 +1439,11 @@ class MoleculeEditorBackend:
             if e in ('H', 'E'): continue
             pos = apos[i]
             nk = self.grid.snap_to_node(pos[0], pos[1], tol=0.3)
-            self.graph.add_atom(np.array([pos[0], pos[1], pos[2] if len(pos) > 2 else 0.0]),
+            a = self.graph.add_atom(np.array([pos[0], pos[1], pos[2] if len(pos) > 2 else 0.0]),
                                 e, elements.ELEMENT_DICT[e][0],
                                 pin=nk, parent=None,
                                 npi=self._get_element_default_npi(e))
+            a.charge = float(qs[i])
         # Create bonds for all heavy atoms (no recalc_bonds!)
         heavy_atoms = [a for a in self.graph.atoms.values() if a.alive and a.ename not in ('H', 'E')]
         for a in heavy_atoms:
@@ -1450,9 +1460,10 @@ class MoleculeEditorBackend:
                 d = float(np.linalg.norm(p - a.pos))
                 if d < best_d: best_d = d; best_a = a
             if best_a is not None and best_d < 1.5:
-                self.graph.add_atom(np.array(p, dtype=np.float64), 'H',
+                a = self.graph.add_atom(np.array(p, dtype=np.float64), 'H',
                                     elements.ELEMENT_DICT['H'][0],
                                     pin=None, parent=best_a, npi=-1)
+                a.charge = float(qs[i])
         # Sync after loading H atoms (bonds already created above)
         self.graph.sync_neighbor_lists()
         self._sync_sys()

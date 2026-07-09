@@ -206,6 +206,7 @@ class SPAMMMWindow(BaseGUI):
         self.scene.lock_drag = False  # Default mode is Unified, allow dragging
         self.scene.canvas.events.mouse_press.connect(self.on_mouse_press)
         self.scene.canvas.events.mouse_move.connect(self.on_mouse_move)
+        self.scene.canvas.events.mouse_release.connect(self.on_mouse_release)
         self.scene.sig_selection_changed.connect(self.on_selection_changed)
         self.copied_packed = None  # PackedMolecule for internal copy/paste
         self.undo_stack = UndoStack(maxlen=100)
@@ -398,7 +399,7 @@ class SPAMMMWindow(BaseGUI):
         self._ext_view_modes = {}   # label -> callback
         self._extension_sections = {}  # extension key / panel title -> CollapsibleSection
 
-        EXTENSION_TITLES = {'ff': 'Force Field', 'afm': 'AFM', 'dftb': 'DFTB', 'firecore': 'FireCore', 'qeq': 'QEq Charges', 'kekule': 'Kekule Solver', 'ascii': 'ASCII Builder', 'fragments': 'Fragments', 'reaction_coord': 'Reaction coordinate', 'vibrations': 'Vibrations'}
+        EXTENSION_TITLES = {'ff': 'Force Field', 'afm': 'AFM', 'dftb': 'DFTB', 'firecore': 'FireCore', 'qeq': 'QEq Charges', 'kekule': 'Kekule Solver', 'ascii': 'ASCII Builder', 'fragments': 'Fragments', 'reaction_coord': 'Reaction coordinate', 'vibrations': 'Vibrations', 'folded_rigid': 'Folded Rigid'}
         for name in self.extensions.enabled_extensions():
             ui = self.extensions.build_ui(name, self)
             title = EXTENSION_TITLES.get(name, name.capitalize())
@@ -406,7 +407,23 @@ class SPAMMMWindow(BaseGUI):
             self._extension_sections[name] = sec
             self._extension_sections[title] = sec
             if ui.panel is not None:
-                sec.setContent(ui.panel)
+                if ui.help_text:
+                    wrapper = QtWidgets.QWidget()
+                    w_layout = QtWidgets.QVBoxLayout(wrapper)
+                    w_layout.setContentsMargins(0, 0, 0, 0)
+                    w_layout.setSpacing(2)
+                    help_btn = QtWidgets.QPushButton("?")
+                    help_btn.setMaximumWidth(24)
+                    help_btn.setToolTip("Show help")
+                    help_btn.clicked.connect(lambda checked=False, n=name, t=ui.help_text: self._show_extension_help(n, t))
+                    hbox = QtWidgets.QHBoxLayout()
+                    hbox.addStretch()
+                    hbox.addWidget(help_btn)
+                    w_layout.addLayout(hbox)
+                    w_layout.addWidget(ui.panel)
+                    sec.setContent(wrapper)
+                else:
+                    sec.setContent(ui.panel)
                 ok = self.extensions.is_loaded(name)
                 sec.set_status(ok, '' if ok else self.extensions.status(name).replace('error: ', '')[:30])
             else:
@@ -426,6 +443,25 @@ class SPAMMMWindow(BaseGUI):
                 self.register_mode_handler(label, EditModeHandler(self))
             for label, cb in ui.view_modes:
                 self._ext_view_modes[label] = cb
+
+    def _show_extension_help(self, name, help_text):
+        """Open a dialog with extension help text."""
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"{name} Help")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        text = QtWidgets.QTextEdit()
+        text.setReadOnly(True)
+        if isinstance(help_text, dict):
+            lines = [f"{k}: {v}" for k, v in help_text.items()]
+            text.setPlainText("\n".join(lines))
+        else:
+            text.setPlainText(str(help_text))
+        layout.addWidget(text)
+        btn = QtWidgets.QPushButton("Close")
+        btn.clicked.connect(dialog.accept)
+        layout.addWidget(btn)
+        dialog.resize(450, 350)
+        dialog.show()
 
     def set_view_mode(self, mode: str):
         """Called by extension view-mode callbacks."""
@@ -993,7 +1029,21 @@ class SPAMMMWindow(BaseGUI):
         self._clear_hover()
         h = self.mode_handlers.get(self.edit_mode)
         if h and h.on_move:
-            h.on_move(p_world)
+            h.on_move(p_world, r0, rd)
+            if getattr(h, 'capture_move', False):
+                event.handled = True
+
+    def on_mouse_release(self, event):
+        """Dispatch mouse release to mode handler."""
+        if getattr(event, 'handled', False):
+            return
+        h = self.mode_handlers.get(self.edit_mode)
+        if h is None or h.on_release is None: return
+        ctrl = 'Control' in event.modifiers if isinstance(event.modifiers, (tuple, list)) else False
+        r0, rd = self.scene._ray_from_mouse(event.pos)
+        p_world = self.scene._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0,0,1]))
+        if p_world is None: return
+        h.on_release(event, p_world, ctrl)
 
     def on_atom_remove(self, atom_id):
         """Signal callback: RMB on atom dispatched to mode handler."""
@@ -1173,76 +1223,76 @@ class SPAMMMWindow(BaseGUI):
                     colors[i] = color
         
         # Bonds
+        bonds_heavy = []
+        bonds_h = []
         if sys.bonds is not None:
             is_heavy = np.array([sys.enames[i] != 'H' for i in range(len(sys.enames))])
-            bonds_heavy = []
-            bonds_h = []
-            
             for b in sys.bonds:
                 if is_heavy[b[0]] and is_heavy[b[1]]:
                     bonds_heavy.append(b)
                 else:
                     bonds_h.append(b)
-            
-            # Bond color visualization mode
-            if self.bond_viz_mode and bonds_heavy:
-                bond_segs, bond_colors = compute_bond_colors_by_length(bonds_heavy, pos)
-                self.scene._line_set("bonds-colored", self.scene.bond_colored_lines, bond_segs, color=bond_colors, width=5.0)
-                self.scene.bond_colored_lines.visible = True
-                self.scene.bond_lines.visible = False
-                self.scene.set_data(pos, colors=colors, sizes=sizes, bonds=None)
-            elif self.bond_viz_mode:
-                # Bond viz mode but no bonds - hide both bond visuals
-                self.scene.bond_colored_lines.visible = False
-                self.scene.bond_lines.visible = False
-                self.scene.set_data(pos, colors=colors, sizes=sizes, bonds=None)
-            else:
-                # Normal bond rendering - use standard bond_lines
-                self.scene.bond_colored_lines.visible = False
-                self.scene.bond_lines.visible = True
-                self.scene.set_data(pos, colors=colors, sizes=sizes, bonds=bonds_heavy)
-            
-            if bonds_h:
-                h_segs = pos[np.array(bonds_h)].reshape(-1, 3)
-                self.scene._line_set("CH-bonds", self.scene.ch_bond_lines, h_segs, color=(0.4, 0.4, 0.4, 0.6), width=1.0)
-            else:
-                self.scene.ch_bond_lines.set_data(np.zeros((0, 3), dtype=np.float32))
 
-            hbonds = sys.find_hbonds(bPrint=False)
-            if hbonds:
-                hb_segs = []
-                for d, h, a, dist, ang in hbonds:
-                    hb_segs.append(pos[h])
-                    hb_segs.append(pos[a])
-                hb_segs = np.array(hb_segs, dtype=np.float32)
-                self.scene._line_set("H-bonds", self.scene.hbond_lines, hb_segs, color=(0.8, 0.2, 0.8, 0.5), width=1.5)
-            else:
-                self.scene.hbond_lines.set_data(np.zeros((0, 3), dtype=np.float32))
+        # Bond visuals
+        if self.bond_viz_mode and bonds_heavy:
+            bond_segs, bond_colors = compute_bond_colors_by_length(bonds_heavy, pos)
+            self.scene._line_set("bonds-colored", self.scene.bond_colored_lines, bond_segs, color=bond_colors, width=5.0)
+            self.scene.bond_colored_lines.visible = True
+            self.scene.bond_lines.visible = False
+            bonds_arg = None
+        elif self.bond_viz_mode:
+            self.scene.bond_colored_lines.visible = False
+            self.scene.bond_lines.visible = False
+            bonds_arg = None
+        else:
+            self.scene.bond_colored_lines.visible = False
+            self.scene.bond_lines.visible = bool(bonds_heavy)
+            bonds_arg = bonds_heavy if bonds_heavy else None
 
-            # Fragment extension: bond + bbox highlights via dedicated visuals
-            frag_data = getattr(self, '_frag_overlay', None)
-            if frag_data:
-                self.scene.set_frag_highlights(**frag_data)
-            else:
-                self.scene.set_frag_highlights()
+        if bonds_h:
+            h_segs = pos[np.array(bonds_h)].reshape(-1, 3)
+            self.scene._line_set("CH-bonds", self.scene.ch_bond_lines, h_segs, color=(0.4, 0.4, 0.4, 0.6), width=1.0)
+        else:
+            self.scene.ch_bond_lines.set_data(np.zeros((0, 3), dtype=np.float32))
 
-            # Bond orders (from Bond.order on AtomicGraph — authoritative store)
-            bo_bonds, bo_vals = self.backend.get_graph_bond_orders()
-            if bo_bonds is not None:
-                self.scene.set_bond_orders(bo_bonds, bo_vals, show_labels=self.show_bond_order_labels)
-            else:
-                self.scene.set_bond_orders(None, None)
+        hbonds = sys.find_hbonds(bPrint=False) if sys.bonds is not None else []
+        if hbonds:
+            hb_segs = []
+            for d, h, a, dist, ang in hbonds:
+                hb_segs.append(pos[h])
+                hb_segs.append(pos[a])
+            hb_segs = np.array(hb_segs, dtype=np.float32)
+            self.scene._line_set("H-bonds", self.scene.hbond_lines, hb_segs, color=(0.8, 0.2, 0.8, 0.5), width=1.5)
+        else:
+            self.scene.hbond_lines.set_data(np.zeros((0, 3), dtype=np.float32))
 
-            # Labels based on label_mode
-            lbl_pos, lbl_texts = generate_atom_labels(self.label_mode, pos, sys.enames, self.backend.atom_npi, self.backend, bonds_heavy)
-            if lbl_pos:
-                self.scene.text_labels.text = lbl_texts
-                self.scene.text_labels.pos = np.array(lbl_pos, dtype=np.float32)
-                self.scene.text_labels.color = np.array([(0, 0, 0, 1)] * len(lbl_texts), dtype=np.float32)
-                self.scene.text_labels.visible = True
-            else:
-                self.scene.text_labels.visible = False
-        
+        # Fragment extension: bond + bbox highlights via dedicated visuals
+        frag_data = getattr(self, '_frag_overlay', None)
+        if frag_data:
+            self.scene.set_frag_highlights(**frag_data)
+        else:
+            self.scene.set_frag_highlights()
+
+        # Bond orders (from Bond.order on AtomicGraph — authoritative store)
+        bo_bonds, bo_vals = self.backend.get_graph_bond_orders()
+        if bo_bonds is not None:
+            self.scene.set_bond_orders(bo_bonds, bo_vals, show_labels=self.show_bond_order_labels)
+        else:
+            self.scene.set_bond_orders(None, None)
+
+        # Update atom markers
+        self.scene.set_data(pos, colors=colors, sizes=sizes, bonds=bonds_arg)
+
+        # Labels based on label_mode
+        lbl_pos, lbl_texts = generate_atom_labels(self.label_mode, pos, sys.enames, self.backend.atom_npi, self.backend, bonds_heavy)
+        if lbl_pos:
+            self.scene.text_labels.text = lbl_texts
+            self.scene.text_labels.pos = np.array(lbl_pos, dtype=np.float32)
+            self.scene.text_labels.color = np.array([(0, 0, 0, 1)] * len(lbl_texts), dtype=np.float32)
+            self.scene.text_labels.visible = True
+        else:
+            self.scene.text_labels.visible = False
+
         # Force immediate canvas update to avoid async rendering lag
         self.scene.canvas.update()
         QtWidgets.QApplication.processEvents()
