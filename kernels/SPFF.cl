@@ -1305,8 +1305,12 @@ __kernel void updateAtomsSPFFf4_rot(
 //  forces, neighbor lists, FF params) is loaded into __local memory once,
 //  then the relaxation loop runs entirely on-chip with barriers between phases.
 //
-//  Workgroup size: WG_SIZE=128 threads. Covers molecules up to ~80 atoms
-//  (nvec = natoms + nnode <= WG_SIZE=128, nnode <= MAX_NNODE=64).
+//  Workgroup size: WG_SIZE=192 threads. Covers molecules up to ~96 atoms
+//  with pi nodes (nvec = natoms + nnode <= MAX_NVEC=192, nnode <= MAX_NNODE=96).
+//
+//  Local arrays are sized to MAX_NVEC / MAX_NATOM / MAX_NNODE (not all to WG_SIZE)
+//  so WG=192 fits in ~38 KB local memory (NVIDIA ~48 KB limit). Naive WG=256 with
+//  12*WG float4 arrays exceeds ~64 KB and fails to compile on many GPUs.
 //
 //  Data flow per step:
 //    Phase 1: Zero aforce + fneigh (all threads cooperate) -> barrier
@@ -1321,15 +1325,24 @@ __kernel void updateAtomsSPFFf4_rot(
 //  CAVEAT: PBC is NOT handled in this kernel (bonds assumed within one cell).
 //  For periodic systems, use the multi-kernel path with getSPFFf4 instead.
 //
-//  CAVEAT: The fneigh array is sized MAX_NNODE*8 = 64*8 = 512 float4s.
-//  This is the maximum for nnode=64 with 4 neighbors * 2 (sigma+pi) slots.
+//  CAVEAT: The fneigh array is sized MAX_NNODE*8 = 96*8 = 768 float4s.
+//  This is the maximum for nnode=96 with 4 neighbors * 2 (sigma+pi) slots.
+//
+//  CAVEAT: Phase 2/3 require WG_SIZE >= nnode and WG_SIZE >= nvec (one thread
+//  per DOF). Enforce in Python before launch.
 //
 // ======================================================================
 #ifndef WG_SIZE
-#define WG_SIZE 128
+#define WG_SIZE 192
+#endif
+#ifndef MAX_NVEC
+#define MAX_NVEC 192
+#endif
+#ifndef MAX_NATOM
+#define MAX_NATOM 128
 #endif
 #ifndef MAX_NNODE
-#define MAX_NNODE 64
+#define MAX_NNODE 96
 #endif
 
 __kernel void relax_nsteps_serial(
@@ -1357,20 +1370,20 @@ __kernel void relax_nsteps_serial(
     const int nvec   = natoms + nnode;
     const int iL     = get_local_id(0);
 
-    // ---- Local memory buffers ----
-    __local float4  s_apos   [WG_SIZE];     // positions (atoms + pi)
-    __local float4  s_avel   [WG_SIZE];     // velocities
-    __local float4  s_aforce [WG_SIZE];     // forces
+    // ---- Local memory buffers (sized by role, not all to WG_SIZE) ----
+    __local float4  s_apos   [MAX_NVEC];      // positions (atoms + pi)
+    __local float4  s_avel   [MAX_NVEC];      // velocities
+    __local float4  s_aforce [MAX_NVEC];      // forces
     __local float4  s_fneigh [MAX_NNODE*8];   // recoil forces (nnode*4*2 max)
-    __local int4    s_neighs [WG_SIZE];     // neighbor indices
-    __local int4    s_bkNeighs[WG_SIZE];    // back-neighbor indices
-    __local float4  s_apars  [WG_SIZE];     // FF params
-    __local float4  s_bLs    [WG_SIZE];     // bond lengths
-    __local float4  s_bKs    [WG_SIZE];     // bond stiffness
-    __local float4  s_Ksp    [WG_SIZE];     // sigma-pi stiffness
-    __local float4  s_Kpp    [WG_SIZE];     // pi-pi stiffness
-    __local float4  s_constr [WG_SIZE];     // constraints
-    __local float4  s_constrK[WG_SIZE];     // constraint stiffness
+    __local int4    s_neighs [MAX_NATOM];     // neighbor indices
+    __local int4    s_bkNeighs[MAX_NVEC];     // back-neighbor indices
+    __local float4  s_apars  [MAX_NNODE];     // FF params
+    __local float4  s_bLs    [MAX_NNODE];     // bond lengths
+    __local float4  s_bKs    [MAX_NNODE];     // bond stiffness
+    __local float4  s_Ksp    [MAX_NNODE];     // sigma-pi stiffness
+    __local float4  s_Kpp    [MAX_NNODE];     // pi-pi stiffness
+    __local float4  s_constr [MAX_NATOM];     // constraints
+    __local float4  s_constrK[MAX_NATOM];     // constraint stiffness
 
     // ---- Cooperative load from global to local ----
     for(int i = iL; i < nvec;    i += WG_SIZE) s_apos[i]      = g_apos[i];
@@ -1560,3 +1573,256 @@ __kernel void relax_nsteps_serial(
     for(int i = iL; i < nvec;    i += WG_SIZE) g_aforce[i] = s_aforce[i];
 }
 
+
+// ======================================================================
+//                     relax_nsteps_global()
+// ======================================================================
+//
+//  Same fused nsteps MD loop as relax_nsteps_serial, but dynamics and
+//  topology stay in GLOBAL memory. Overcomes local-memory size limits so
+//  workgroup size can be 256/512 and nvec can exceed ~192.
+//
+//  Strategy: one workgroup, strided loops over nnode/nvec (WG need not
+//  equal nvec). Uses global fneigh buffer for recoil. Barriers between
+//  phases. Optional FAF substrate (do_faf!=0) adds folded-basis forces
+//  after bonded forces (coeffs/kxyz cached in local — tiny).
+//
+// ======================================================================
+#ifndef WG_GLOBAL
+#define WG_GLOBAL 256
+#endif
+
+inline float folded_eval_basis_g(float u, float v, float z, float4 prm){
+    const float twopi = 6.283185307179586f;
+    float bx = native_cos(twopi * prm.x * u);
+    float by = native_cos(twopi * prm.y * v);
+    float bz = native_exp(-prm.z * fmax(0.0f, z - prm.w));
+    return bx * by * bz;
+}
+
+inline float3 folded_eval_grad_g(float u, float v, float z, float4 prm, float4 invL){
+    const float twopi = 6.283185307179586f;
+    float ku = prm.x, kv = prm.y, az = prm.z, z0 = prm.w;
+    float bx = native_cos(twopi * ku * u);
+    float by = native_cos(twopi * kv * v);
+    float bz = native_exp(-az * fmax(0.0f, z - z0));
+    float dbx_du = -twopi * ku * native_sin(twopi * ku * u);
+    float dby_dv = -twopi * kv * native_sin(twopi * kv * v);
+    float dbz_dz = (z >= z0) ? (-az * bz) : 0.0f;
+    float dE_du = dbx_du * by * bz;
+    float dE_dv = bx * dby_dv * bz;
+    float dE_dz = bx * by * dbz_dz;
+    float3 g;
+    g.x = dE_du * invL.x + dE_dv * invL.z;
+    g.y = dE_du * invL.y + dE_dv * invL.w;
+    g.z = dE_dz;
+    return g;
+}
+
+__kernel void relax_nsteps_global(
+    const int4  nDOFs,              // (natoms, nnode, nsteps, do_faf)
+    __global       float4*  g_apos,
+    __global       float4*  g_avel,
+    __global       float4*  g_aforce,
+    __global       float4*  g_fneigh,   // [nnode*8]
+    __global const int4*    g_neighs,
+    __global const int4*    g_bkNeighs,
+    __global const float4*  g_apars,
+    __global const float4*  g_bLs,
+    __global const float4*  g_bKs,
+    __global const float4*  g_Ksp,
+    __global const float4*  g_Kpp,
+    __global const float4*  g_constr,
+    __global const float4*  g_constrK,
+    __global const float4*  g_MDparams,
+    // --- FAF (used when do_faf!=0) ---
+    __global const float*   g_folded_coeffs,   // [ntypes*nbasis] flat
+    __global const float4*  g_folded_kxyz,     // [nbasis]
+    __global const int*     g_folded_atom_type,// [natoms]
+    const int4              folded_meta,       // (nbasis, ntypes, 0, 0)
+    const float4            folded_lvec2d      // (ax,bx,ay,by)
+){
+    const int natoms = nDOFs.x;
+    const int nnode  = nDOFs.y;
+    const int nsteps = nDOFs.z;
+    const int do_faf = nDOFs.w;
+    const int nvec   = natoms + nnode;
+    const int iL     = get_local_id(0);
+    const int nL     = get_local_size(0);
+
+    const float4 MDpars = g_MDparams[0];
+    const float dt   = MDpars.x;
+    const float damp = MDpars.y;
+    const float Flimit = MDpars.z;
+
+    // FAF local cache (small)
+    __local float4 LBASIS[64];
+    __local float  LCOEFFS[8*64];
+    float4 invLvec2d = (float4)(0,0,0,0);
+    int nbasis = 0, ntypes = 0;
+    if(do_faf){
+        nbasis = folded_meta.x;
+        ntypes = folded_meta.y;
+        if(nbasis>0 && nbasis<=64 && ntypes>0 && ntypes<=8){
+            for(int j=iL; j<nbasis; j+=nL) LBASIS[j] = g_folded_kxyz[j];
+            for(int j=iL; j<nbasis*ntypes; j+=nL) LCOEFFS[j] = g_folded_coeffs[j];
+            float ax = folded_lvec2d.x, bx = folded_lvec2d.y, ay = folded_lvec2d.z, by = folded_lvec2d.w;
+            float det = ax*by - bx*ay;
+            if(fabs(det) > 1e-12f) invLvec2d = (float4)(by/det, -bx/det, -ay/det, ax/det);
+        } else { nbasis = 0; }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    #define NNEIGH 4
+
+    for(int step = 0; step < nsteps; step++){
+        // Phase 1: zero forces
+        for(int i = iL; i < nvec;    i += nL) g_aforce[i] = float4Zero;
+        for(int i = iL; i < nnode*8; i += nL) g_fneigh[i] = float4Zero;
+        barrier(CLK_GLOBAL_MEM_FENCE);
+
+        // Phase 2: bonded SPFF (strided over nodes)
+        for(int iG = iL; iG < nnode; iG += nL){
+            float4  hs[4];
+            float3  fbs[4];
+            float3  fps[4];
+            float3  fa  = float3Zero;
+            float   E   = 0;
+            const int4  ng  = g_neighs[iG];
+            const float3 pa = g_apos[iG].xyz;
+            const float4 par = g_apars[iG];
+            const int*  ings = (int*)&ng;
+            for(int i=0; i<NNEIGH; i++){ fbs[i]=float3Zero; fps[i]=float3Zero; }
+            float3 fpi = float3Zero;
+            {
+                const float4 vbL = g_bLs[iG];
+                const float4 vbK = g_bKs[iG];
+                const float4 vKs = g_Ksp[iG];
+                const float4 vKp = g_Kpp[iG];
+                const float* bL   = (float*)&vbL;
+                const float* bK   = (float*)&vbK;
+                const float* Kspi = (float*)&vKs;
+                const float* Kppi = (float*)&vKp;
+                const float3 hpi  = g_apos[natoms + iG].xyz;
+                for(int i=0; i<NNEIGH; i++){
+                    float4 h;
+                    const int ing = ings[i];
+                    if(ing<0) break;
+                    h.xyz = g_apos[ing].xyz - pa;
+                    float l = length(h.xyz);
+                    h.w = 1.f/l;
+                    h.xyz *= h.w;
+                    hs[i] = h;
+                    if(iG < ing){
+                        float3 f1;
+                        E += evalBond(h.xyz, l-bL[i], bK[i], &f1);
+                        fbs[i] -= f1; fa += f1;
+                        float kpp = Kppi[i];
+                        if((ing < nnode) && (kpp > 1e-6f)){
+                            float3 f1p, f2p;
+                            const float3 hpi_j = g_apos[natoms + ing].xyz;
+                            E += evalPiAling(hpi, hpi_j, kpp, &f1p, &f2p);
+                            fpi += f1p; fps[i] += f2p;
+                        }
+                    }
+                    float ksp = Kspi[i];
+                    if(ksp > 1e-6f){
+                        float3 f1, f2;
+                        E += evalAngCos((float4){hpi,1.f}, h, ksp, par.w, &f1, &f2);
+                        fpi += f1; fa -= f2; fbs[i] += f2;
+                    }
+                }
+                const int i4p = iG*4 + nnode*4;
+                for(int i=0; i<NNEIGH; i++) g_fneigh[i4p+i] = (float4){fps[i], 0};
+                g_aforce[natoms + iG] = (float4){fpi, 0};
+            }
+            for(int i=0; i<NNEIGH; i++){
+                int ing = ings[i];
+                if(ing<0) break;
+                const float4 hi = hs[i];
+                for(int j=i+1; j<NNEIGH; j++){
+                    int jng = ings[j];
+                    if(jng<0) break;
+                    const float4 hj = hs[j];
+                    float3 f1, f2;
+                    E += evalAngleCosHalf(hi, hj, par.xy, par.z, &f1, &f2);
+                    fa -= f1 + f2;
+                    fbs[i] += f1;
+                    fbs[j] += f2;
+                }
+            }
+            const int i4 = iG*4;
+            for(int i=0; i<NNEIGH; i++) g_fneigh[i4+i] = (float4){fbs[i], 0};
+            g_aforce[iG] += (float4){fa, E};
+        }
+        barrier(CLK_GLOBAL_MEM_FENCE);
+
+        // Phase 2b: optional FAF substrate
+        if(do_faf && nbasis>0){
+            for(int iG = iL; iG < natoms; iG += nL){
+                float3 pos = g_apos[iG].xyz;
+                float u = invLvec2d.x*pos.x + invLvec2d.y*pos.y;
+                float v = invLvec2d.z*pos.x + invLvec2d.w*pos.y;
+                u = u - floor(u);
+                v = v - floor(v);
+                int ityp = g_folded_atom_type[iG];
+                if(ityp < 0 || ityp >= ntypes) continue;
+                float E = 0.0f;
+                float3 F = (float3)(0.0f,0.0f,0.0f);
+                int ioff = ityp*nbasis;
+                for(int ib=0; ib<nbasis; ib++){
+                    float c = LCOEFFS[ioff + ib];
+                    float4 prm = LBASIS[ib];
+                    float  b = folded_eval_basis_g(u, v, pos.z, prm);
+                    float3 g = folded_eval_grad_g(u, v, pos.z, prm, invLvec2d);
+                    E += c * b;
+                    F -= c * g;
+                }
+                g_aforce[iG] += (float4)(F.x, F.y, F.z, -E);
+            }
+            barrier(CLK_GLOBAL_MEM_FENCE);
+        }
+
+        // Phase 3: gather + integrate (strided over nvec)
+        for(int iG = iL; iG < nvec; iG += nL){
+            float4 fe = g_aforce[iG];
+            const bool bPi = (iG >= natoms);
+            const int4 ngs = g_bkNeighs[iG];
+            float4 frec = float4Zero;
+            if(ngs.x>=0) frec += g_fneigh[ngs.x];
+            if(ngs.y>=0) frec += g_fneigh[ngs.y];
+            if(ngs.z>=0) frec += g_fneigh[ngs.z];
+            if(ngs.w>=0) frec += g_fneigh[ngs.w];
+            fe += frec;
+            if(Flimit > 0){
+                float fr2 = dot(fe.xyz, fe.xyz);
+                if(fr2 > Flimit*Flimit) fe.xyz *= Flimit / sqrt(fr2);
+            }
+            g_aforce[iG] = fe;
+            if(iG < natoms){
+                float4 cons = g_constr[iG];
+                if(cons.w > 0){
+                    float4 cK = g_constrK[iG];
+                    cK = max(cK, (float4){0,0,0,0});
+                    float4 pe_c = g_apos[iG];
+                    fe.xyz += (cons.xyz - pe_c.xyz) * cK.xyz;
+                }
+            }
+            float4 ve = g_avel[iG];
+            float4 pe = g_apos[iG];
+            if(bPi){
+                fe.xyz += pe.xyz * (-dot(pe.xyz, fe.xyz));
+                ve.xyz += pe.xyz * (-dot(pe.xyz, ve.xyz));
+            }
+            float inv_mass = (pe.w > 1e-8f) ? (1.f / pe.w) : 1.f;
+            ve.xyz *= damp;
+            ve.xyz += fe.xyz * dt * inv_mass;
+            pe.xyz += ve.xyz * dt;
+            if(bPi) pe.xyz = normalize(pe.xyz);
+            ve.w = 0;
+            g_avel[iG] = ve;
+            g_apos[iG] = pe;
+        }
+        barrier(CLK_GLOBAL_MEM_FENCE);
+    }
+}

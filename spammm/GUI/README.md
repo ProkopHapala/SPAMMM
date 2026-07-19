@@ -23,6 +23,7 @@ PyQt5 GUI for molecular editing and AFM simulation. Main window combines VisPy 3
 
 ## Extensions
 
+- **AFMExtension.py** — FDBM AFM/STM panel; **K_LAT in N/m** (converted to eV/Å² internally). Prefer grid step ≤0.1 Å. See `doc/Tasks/AFMTesting.md` lessons (Jul 2026).
 - **KekuleExtension.py** — Kekulé π-bond-order solver panel
 - **FoldedRigidExtension.py** — Folded-basis rigid-body manipulation panel (load molecule, fit/load substrate potential, drag atoms)
 - **AsciiArtExtension.py** — ASCII art → molecule; must match `build_ascii_hbond_system` pipeline for DFTB scans

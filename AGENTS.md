@@ -38,6 +38,7 @@ SPAMMM (Scanning Probe Accelerated Modeling of Microscopy and Manipulation) is a
 
 * Minimize Python orchestration; push compute to OpenCL kernels. Flat arrays, cache-aware, preallocate. See skill:`python-perf`, skill:`port-to-opencl`.
 * GPU/OpenCL : memory latency, gather over scatter, local memory, minimize host-device transfers. See skill:`gpu-optimize`.
+* **OpenCL device:** always prefer **NVIDIA GPU** (`OpenCLBase.select_device(preferred_vendor='nvidia')`). Never report PoCL/CPU timings as GPU. Agents must run OpenCL Shell commands unrestricted (`all`) so the NVIDIA ICD is visible — see `doc/AGENTS/notes/opencl-nvidia-device.md` and `.cursor/rules/opencl-nvidia-gpu.mdc`.
 
 ## Documentation & Navigation
 

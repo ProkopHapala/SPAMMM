@@ -60,6 +60,23 @@ from ..utils.OpenCLBase import OpenCLBase
 
 COULOMB_CONST = 14.3996448915  # [eV*Ang/e^2]
 
+# ── Stiffness units (SSOT) ────────────────────────────────────────────────────
+# Internal PP springs use eV/Å². Literature / GUI prefer N/m.
+# 1 eV/Å² = 16.02176634 N/m  (e = 1.602176634e-19 C, Å = 1e-10 m)
+EV_A2_PER_N_M = 1.0 / 16.02176634   # N/m → eV/Å²
+N_M_PER_EV_A2 = 16.02176634         # eV/Å² → N/m
+# Classic Hapala CO tip: K_lat ≈ 0.5 N/m ≈ 0.031 eV/Å²
+K_LAT_HAPALA_N_M = 0.5
+K_LAT_HAPALA_EV_A2 = K_LAT_HAPALA_N_M * EV_A2_PER_N_M  # ≈ 0.0312
+
+def stiffness_Nm_to_eVA2(k_Nm):
+    """Convert spring constant from N/m to eV/Å²."""
+    return float(k_Nm) * EV_A2_PER_N_M
+
+def stiffness_eVA2_to_Nm(k_eVA2):
+    """Convert spring constant from eV/Å² to N/m."""
+    return float(k_eVA2) * N_M_PER_EV_A2
+
 
 def _bytes_to_gb(nbytes):
     return nbytes / (1024.0**3)
@@ -76,7 +93,7 @@ class AFMulator(OpenCLBase):
     DEFAULT_tipA       = np.array([ 1., 0., 0., 0.], dtype=np.float32)
     DEFAULT_tipB       = np.array([ 0., 1., 0., 0.], dtype=np.float32)
     DEFAULT_tipC       = np.array([ 0., 0., 1.,-0.1], dtype=np.float32)  # .w=dtip
-    DEFAULT_stiffness  = np.array([-0.03,-0.03,-0.03,-1.0], dtype=np.float32)
+    DEFAULT_stiffness  = np.array([-0.03,-0.03,-0.03,-1.0], dtype=np.float32)  # eV/Å² (~0.48 N/m lateral)
     DEFAULT_dpos0      = np.array([ 0., 0.,-4.0, 4.0], dtype=np.float32)
     DEFAULT_relax_pars = np.array([ 0.5, 0.1, 0.02, 0.5], dtype=np.float32)
     DEFAULT_surfFF     = np.array([ 0., 0., 0., 0.], dtype=np.float32)
@@ -192,7 +209,7 @@ class AFMulator(OpenCLBase):
 
     def scan_fdbm(self, scan_xs, scan_ys, probe_heights, mol_z=0.0,
                   ppm_mode=True, use_fire=True,
-                  K_LAT=0.5, K_RAD=20.0, bond_length=3.0,
+                  K_LAT=0.03, K_RAD=20.0, bond_length=3.0,
                   stiffness=None, dpos0=None, relax_pars=None):
         """
         GPU probe-particle relaxation over a 2D scan using relaxStrokes kernel.
@@ -203,9 +220,10 @@ class AFMulator(OpenCLBase):
             Probe on a radial bond of length L below tip-apex.
             dpos0 = (0, 0, -bond_length, bond_length)
             stiffness = (-K_LAT, -K_LAT, -K_LAT, -K_RAD)
-            Scan heights are tip-apex heights; probe sits ~bond_length below.
-            Stiffness units: eV/Ang^2
-            Typical: K_LAT=0.5, K_RAD=20.0, L=3 Ang.
+            Probe heights are O-apex heights above mol; tip apex = probe + L.
+            Stiffness units: eV/Å² (GUI enters N/m → stiffness_Nm_to_eVA2).
+            Typical: K_LAT≈0.03 eV/Å² (=0.5 N/m Hapala), K_RAD=20 eV/Å², L=3–4 Å.
+            WARNING: entering 0.5 as if N/m but storing eV/Å² → 8 N/m (~17× too stiff, blunt tip).
 
           ppm_mode=False (linear harmonic):
             Pure 3D harmonic spring, no radial bond (stiffness.w=0).
@@ -222,13 +240,13 @@ class AFMulator(OpenCLBase):
         Args:
             scan_xs:       (nx_s,) x scan positions [Ang, world coords]
             scan_ys:       (ny_s,) y scan positions [Ang]
-            probe_heights: (nz_s,) tip-apex heights above mol_z [Ang]
+            probe_heights: (nz_s,) probe (O) heights above mol_z [Ang]
             mol_z:         float  z of molecule top [Ang]
             ppm_mode:      bool  True=PPM radial bond, False=simple harmonic
             use_fire:      bool  True=FIRE integrator, False=damped velocity
-            K_LAT:         float  lateral stiffness [eV/Ang^2]  (ppm_mode=True)
-            K_RAD:         float  radial bond stiffness [eV/Ang^2]  (ppm_mode=True)
-            bond_length:   float  CO bond length [Ang]  (ppm_mode=True)
+            K_LAT:         float  lateral stiffness [eV/Å²]
+            K_RAD:         float  radial bond stiffness [eV/Å²]
+            bond_length:   float  CO bond length [Ang]
             stiffness:     (4,) float4 override; None -> auto from mode
             dpos0:         (4,) float4 override; None -> auto from mode
             relax_pars:    (4,) float4 (dt,damp,tmin,tmax); None -> auto from mode/use_fire
@@ -311,20 +329,20 @@ class AFMulator(OpenCLBase):
         }
         return FEs_relax, tip_disp
 
-    def scan_fdbm_2d(self, scan_xs, scan_ys, probe_heights, mol_z=0.0, K_LAT=0.5, dt=0.3, damp=0.2):
+    def scan_fdbm_2d(self, scan_xs, scan_ys, probe_heights, mol_z=0.0, K_LAT=0.03, dt=0.3, damp=0.2):
         """
         2D lateral-only relaxation using relaxStrokes2D kernel.
         Exactly matches CPU pp_relax_2d: z fixed per slice, only x,y relax with damped MD.
         Damped update: v *= (1-damp); v += F*dt; pos += v*dt
         Probe resets to anchor at start of each height slice (same as CPU).
-        Stiffness units: eV/Ang^2
+        Stiffness units: eV/Å²  (0.03 ≈ 0.5 N/m Hapala; GUI converts N/m → eV/Å²)
 
         Args:
             scan_xs:       (nx_s,) x scan positions [Ang, world coords]
             scan_ys:       (ny_s,) y scan positions [Ang]
             probe_heights: (nz_s,) probe heights above mol_z, ascending [Ang]
             mol_z:         float  z of molecule top [Ang]
-            K_LAT:         float  lateral stiffness [eV/Ang^2]
+            K_LAT:         float  lateral stiffness [eV/Å²]
             dt:            float  time step
             damp:          float  damping coefficient (v *= 1-damp)
 
@@ -1967,8 +1985,9 @@ def pp_relax_2d_cl(afmulator, F_total, origin, step,
     Backward-compat wrapper: calls AFMulator.setup_fdbm_grid + scan_fdbm.
     Prefer calling those methods directly for repeated scans (avoids re-uploading image).
 
-    ppm_mode=True:  physical PPM with radial CO bond (L=3 Ang, K_RAD=20.0 N/m : there seems to be som confusion beteen units).
+    ppm_mode=True:  physical PPM with radial CO bond (L≈3–4 Å, K_RAD stiff in eV/Å²).
     ppm_mode=False: simplified harmonic, probe pinned at scan heights.
+    K_LAT in eV/Å² (0.03 ≈ 0.5 N/m). See stiffness_Nm_to_eVA2().
     """
     afmulator.setup_fdbm_grid(F_total, origin, step)
     FEs_relax, tip_disp = afmulator.scan_fdbm(
@@ -2046,26 +2065,24 @@ def compute_pauli_field(rho_grid, rho_tip_total, step, A_pauli=1.0, beta_pauli=1
     return scale_pauli_field(overlap_raw, step, A_pauli, beta_pauli)
 
 def compute_es_conv_field(V_ES, rho_tip_delta, step, tip_rolled=False, return_grads=True):
-    """Convolve electrostatic potential with tip delta-density.
+    """Electrostatic energy from tip delta-density vs sample potential.
 
-    Args:
-        V_ES: (nx, ny, nz) electrostatic potential
-        rho_tip_delta: (nx, ny, nz) tip delta density
-        step: grid spacing
-        tip_rolled: if True, use rolled tip (default False)
-        return_grads: if True, compute and return gradients (default True for backward compat)
+    Physical cross-correlation: E(R)=∫ V(r) ρ_tip(r−R) dr.
+    Implemented as convolution with spatially reversed tip:
+      E = IFFT( FFT(V) * FFT(tip[::-1,::-1,::-1]) )
+    (equivalent to IFFT(FFT(V)*conj(FFT(tip))) up to origin convention).
 
-    Returns:
-        E_es: (nx, ny, nz) electrostatic energy field
-        grads: (nx, ny, nz, 3) electrostatic gradients (if return_grads=True)
+    tip_rolled=True: tip O already at (0,0,0); still reverse for cross-corr
+      (no-flip / conj-only looks like approaching CO from the wrong end).
+    tip_rolled=False: tip centered — reverse then roll origin to (0,0,0).
     """
     dV = step**3
     nx_t, ny_t, nz_t = rho_tip_delta.shape
-    flipped = rho_tip_delta[::-1,::-1,::-1]
+    flipped = rho_tip_delta[::-1, ::-1, ::-1]
     if tip_rolled:
         tip_kernel = flipped
     else:
-        tip_kernel = np.roll(np.roll(np.roll(flipped, -(nx_t//2), axis=0), -(ny_t//2), axis=1), -(nz_t//2), axis=2)
+        tip_kernel = np.roll(np.roll(np.roll(flipped, -(nx_t // 2), axis=0), -(ny_t // 2), axis=1), -(nz_t // 2), axis=2)
     E_es = dV * np.real(np.fft.ifftn(np.fft.fftn(V_ES) * np.fft.fftn(tip_kernel))).astype(np.float32)
     if return_grads:
         grads = np.stack([np.gradient(E_es, step, axis=i) for i in range(3)], axis=-1)
@@ -2121,15 +2138,10 @@ def read_grid_spec_from_log(log_path):
                 ngrid_str = parts[1].strip()
                 origin = np.array([float(x) for x in origin_str.strip('[]').split()])
                 ngrid = np.array([int(x) for x in ngrid_str.strip('[]').split()])
-                # step is usually after ngrid, e.g. "ngrid=[152 88 96] step=0.15"
-                step = 0.15
-                if 'step=' in line:
-                    step_parts = line.split('step=')
-                    if len(step_parts) > 1:
-                        try:
-                            step = float(step_parts[1].split()[0])
-                        except ValueError:
-                            pass
+                # step must be present in the log line (no silent default — fragile for wrong dstep)
+                if 'step=' not in line:
+                    raise ValueError(f"Grid log line missing step=: {line.strip()}")
+                step = float(line.split('step=')[1].split()[0])
                 return origin, ngrid, step
     return None, None, None
 

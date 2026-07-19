@@ -68,10 +68,10 @@ def _load_molecule(xyz_path):
     atomTypes = np.array([ELEM_Z.get(e, 6) for e in enames], dtype=np.int32)
     return atomPos, enames, atomTypes
 
-def _run_fdbm_pipeline(xyz_path, basis='mio-1-1', step=STEP, margin=MARGIN, z_extra=Z_EXTRA, work_dir=None):
+def _run_fdbm_pipeline(xyz_path, basis='mio-1-1', step=STEP, margin=MARGIN, z_extra=Z_EXTRA, work_dir=None, tip_mode='gaussian'):
     """Run the full FDBM pipeline for a molecule. Returns dict with all intermediates.
 
-    This is the workhorse function — tests call it and check invariants on the output.
+    tip_mode: 'gaussian' (fast, isotropic) or 'co' (real CO tip density, O at (0,0,0)).
     """
     from spammm.SPM import AFM as afm
     from spammm.SPM import AFM_utils as afm_utils
@@ -79,7 +79,7 @@ def _run_fdbm_pipeline(xyz_path, basis='mio-1-1', step=STEP, margin=MARGIN, z_ex
 
     atomPos, enames, atomTypes = _load_molecule(xyz_path)
     natoms = len(enames)
-    print(f"\n[FDBM] {os.path.basename(xyz_path)}: {natoms} atoms, enames={enames[:5]}...")
+    print(f"\n[FDBM] {os.path.basename(xyz_path)}: {natoms} atoms, tip_mode={tip_mode}, enames={enames[:5]}...")
 
     # Setup grid
     grid_spec, origin, ngrid = afm.setup_density_grid(atomPos, step=step, margin=margin, z_extra=z_extra)
@@ -96,7 +96,7 @@ def _run_fdbm_pipeline(xyz_path, basis='mio-1-1', step=STEP, margin=MARGIN, z_ex
         raise FileNotFoundError(f"SK dir not found: {sk_dir}")
 
     if work_dir is None:
-        work_dir = os.path.join(_debug_dir(), f'dftb_work_{os.path.basename(xyz_path).replace(".xyz","")}')
+        work_dir = os.path.join(_debug_dir(), f'dftb_work_{os.path.basename(xyz_path).replace(".xyz","")}_{tip_mode}')
     os.makedirs(work_dir, exist_ok=True)
 
     # Use get_density_from_dftb_dense — handles SCF + projection + neutral density + Poisson
@@ -111,12 +111,12 @@ def _run_fdbm_pipeline(xyz_path, basis='mio-1-1', step=STEP, margin=MARGIN, z_ex
     rho_diff = result['rho_diff']
     V_ES = result['V_ES']
 
-    # Step 2: Pauli overlap (raw, A=1, beta=1)
-    print("  Step 2: Pauli overlap...")
-    # Build Gaussian tip density for CO tip
-    sigma_tip = 0.7  # Å — Gaussian approximation for CO tip
-    rho_tip_total = afm.build_gaussian_tip((nx, ny, nz), step, sigma_tip)
-    rho_tip_delta = rho_tip_total  # For Gaussian tip, delta = total (no neutral atom subtraction)
+    # Step 2: Tip densities (switchable)
+    print(f"  Step 2: Tip densities (mode={tip_mode})...")
+    rho_tip_total, rho_tip_delta = afm_utils.get_tip_densities(
+        tip_mode=tip_mode, target_shape=(nx, ny, nz), step=step, margin=margin,
+        basis=basis, output_dir=work_dir, backend='dftb',
+    )
 
     overlap_raw = afm.compute_pauli_overlap(rho_scf, rho_tip_total, step, tip_rolled=True)
     print(f"  overlap_raw: [{overlap_raw.min():.4e}, {overlap_raw.max():.4e}]")
@@ -185,7 +185,7 @@ def _run_fdbm_pipeline(xyz_path, basis='mio-1-1', step=STEP, margin=MARGIN, z_ex
         'FEs_relax': FEs_relax, 'Fz_relax': Fz_relax, 'df': df, 'tip_disp': tip_disp,
         'scan_xs': scan_xs, 'scan_ys': scan_ys, 'heights': heights,
         'origin': origin, 'step': step, 'ngrid': ngrid,
-        'rho_tip_total': rho_tip_total,
+        'rho_tip_total': rho_tip_total, 'rho_tip_delta': rho_tip_delta, 'tip_mode': tip_mode,
     }
 
 
@@ -424,3 +424,60 @@ def test_fdbm_visual(fdbm_results):
         plt.close(fig)
 
         print(f"  Saved FDBM visualizations for {mol_file}")
+
+
+def _xy_mirror_asym(sl):
+    """Relative mirror asymmetry about the peak (not array center — for rolled tips use fftshift first)."""
+    a = np.asarray(sl, dtype=np.float64)
+    px, py = np.unravel_index(int(np.argmax(np.abs(a))), a.shape)
+    r = int(min(px, py, a.shape[0] - 1 - px, a.shape[1] - 1 - py, 20))
+    if r < 2:
+        return 1.0
+    c = a[px - r:px + r + 1, py - r:py + r + 1]
+    peak = np.max(np.abs(c)) + 1e-30
+    return float(np.max(np.abs(c - c[::-1, :])) / peak)
+
+
+@pytest.mark.gpu
+def test_co_tip_xy_symmetry_and_origin():
+    """CO tip: O-peak at (0,0,0) after roll; XY slice radially symmetric; q≈10."""
+    _check_dftb_available()
+    from spammm.SPM import AFM_utils as afm_utils
+
+    step, margin = 0.15, 4.0
+    target = (64, 64, 80)
+    work = _debug_dir('co_tip_symmetry')
+    rho_t, rho_d = afm_utils.get_tip_densities(
+        tip_mode='co', target_shape=target, step=step, margin=margin,
+        output_dir=work, backend='dftb', force_recompute=True,
+    )
+    peak = np.unravel_index(int(np.argmax(np.abs(rho_t))), rho_t.shape)
+    q = float(rho_t.sum() * step**3)
+    # Measure symmetry on fftshift'd XY through O (z=0)
+    asym = _xy_mirror_asym(np.fft.fftshift(rho_t[:, :, 0]))
+    print(f"CO tip: peak={peak} q={q:.4f} XY_mirror_asym@z0(fftshift)={asym:.3e}")
+    assert peak == (0, 0, 0), f"O peak must be at (0,0,0), got {peak}"
+    assert abs(q - 10.0) < 1.5, f"CO valence q={q:.3f} expected ~10"
+    assert asym < 0.05, f"CO tip XY asymmetry {asym:.3e} too large (expect <5%)"
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_fdbm_co_tip_vs_gaussian_h2o():
+    """H2O FDBM with tip_mode=co and gaussian both produce finite df; tips differ."""
+    _check_dftb_available()
+    xyz = os.path.join(DATA_DIR, 'xyz', 'H2O.xyz')
+    if not os.path.exists(xyz):
+        pytest.skip("H2O.xyz missing")
+    r_g = _run_fdbm_pipeline(xyz, tip_mode='gaussian', work_dir=_debug_dir('h2o_gauss'))
+    r_c = _run_fdbm_pipeline(xyz, tip_mode='co', work_dir=_debug_dir('h2o_co'))
+    assert np.all(np.isfinite(r_g['df'])) and np.all(np.isfinite(r_c['df']))
+    assert np.max(np.abs(r_g['df'])) > 1e-8
+    assert np.max(np.abs(r_c['df'])) > 1e-8
+    # Tips must differ (CO vs Gaussian)
+    corr = correlation(r_g['rho_tip_total'].ravel(), r_c['rho_tip_total'].ravel())
+    print(f"tip density correlation gaussian↔co: {corr:.4f}")
+    assert corr < 0.99, "CO and Gaussian tips should not be identical"
+    # CO tip peak at origin
+    peak = np.unravel_index(int(np.argmax(np.abs(r_c['rho_tip_total']))), r_c['rho_tip_total'].shape)
+    assert peak == (0, 0, 0), peak

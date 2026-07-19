@@ -97,7 +97,12 @@ def _update_afm_status(window, msg):
 
 
 def _get_pipeline_params(window):
-    """Snapshot current UI parameter values - used for dirty detection."""
+    """Snapshot current UI parameter values - used for dirty detection.
+
+    klat is stored in the spinbox as N/m; converted here to eV/Å² for the pipeline.
+    """
+    from spammm.SPM import AFM as afm_mod
+    klat_Nm = window.afm_klat_spin.value()
     return {
         'basis':      window.afm_basis_combo.currentText(),
         'step':       window.afm_step_spin.value(),
@@ -110,7 +115,8 @@ def _get_pipeline_params(window):
         'pauli_a':    window.afm_pauli_a_spin.value(),
         'pauli_beta': window.afm_pauli_beta_spin.value(),
         'c6':         window.afm_vdw_c6_spin.value(),
-        'klat':       window.afm_klat_spin.value(),
+        'klat_Nm':    klat_Nm,
+        'klat':       afm_mod.stiffness_Nm_to_eVA2(klat_Nm),  # eV/Å² for scan_fdbm
     }
 
 
@@ -964,11 +970,12 @@ def build_ui(window):
     window.afm_basis_combo = QtWidgets.QComboBox()
     window.afm_basis_combo.addItems(["mio-1-1", "3ob-3-1"])
     density_grid.addWidget(window.afm_basis_combo, 0, 1)
-    density_grid.addWidget(QtWidgets.QLabel("Step:"), 1, 0)
+    density_grid.addWidget(QtWidgets.QLabel("Step [Å]:"), 1, 0)
     window.afm_step_spin = QtWidgets.QDoubleSpinBox()
     window.afm_step_spin.setRange(0.05, 0.5); window.afm_step_spin.setValue(0.1); window.afm_step_spin.setSingleStep(0.05)
+    window.afm_step_spin.setToolTip("Density/FF grid spacing. Prefer ≤0.1 Å for ES near the molecule (0.15 Å undersamples ρ_diff → broken hex symmetry).")
     density_grid.addWidget(window.afm_step_spin, 1, 1)
-    density_grid.addWidget(QtWidgets.QLabel("Margin:"), 2, 0)
+    density_grid.addWidget(QtWidgets.QLabel("Margin [Å]:"), 2, 0)
     window.afm_margin_spin = QtWidgets.QDoubleSpinBox()
     window.afm_margin_spin.setRange(2.0, 10.0); window.afm_margin_spin.setValue(4.0)
     density_grid.addWidget(window.afm_margin_spin, 2, 1)
@@ -996,22 +1003,42 @@ def build_ui(window):
 
     physics_group = QtWidgets.QGroupBox("Physics")
     physics_grid = QtWidgets.QGridLayout(physics_group)
-    physics_grid.addWidget(QtWidgets.QLabel("Pauli A:"), 0, 0)
+    physics_grid.addWidget(QtWidgets.QLabel("Pauli A [eV]:"), 0, 0)
     window.afm_pauli_a_spin = QtWidgets.QDoubleSpinBox()
     window.afm_pauli_a_spin.setRange(0.1, 2000.0); window.afm_pauli_a_spin.setValue(787.22); window.afm_pauli_a_spin.setDecimals(2)
     physics_grid.addWidget(window.afm_pauli_a_spin, 0, 1)
-    physics_grid.addWidget(QtWidgets.QLabel("Beta:"), 1, 0)
+    physics_grid.addWidget(QtWidgets.QLabel("Beta [-]:"), 1, 0)
     window.afm_pauli_beta_spin = QtWidgets.QDoubleSpinBox()
     window.afm_pauli_beta_spin.setRange(0.5, 3.0); window.afm_pauli_beta_spin.setValue(1.2371); window.afm_pauli_beta_spin.setDecimals(4)
     physics_grid.addWidget(window.afm_pauli_beta_spin, 1, 1)
-    physics_grid.addWidget(QtWidgets.QLabel("C6:"), 2, 0)
+    physics_grid.addWidget(QtWidgets.QLabel("C6 [eV·Å⁶]:"), 2, 0)
     window.afm_vdw_c6_spin = QtWidgets.QDoubleSpinBox()
     window.afm_vdw_c6_spin.setRange(10.0, 100.0); window.afm_vdw_c6_spin.setValue(30.0)
     physics_grid.addWidget(window.afm_vdw_c6_spin, 2, 1)
-    physics_grid.addWidget(QtWidgets.QLabel("K_LAT:"), 3, 0)
+    physics_grid.addWidget(QtWidgets.QLabel("K_LAT [N/m]:"), 3, 0)
     window.afm_klat_spin = QtWidgets.QDoubleSpinBox()
-    window.afm_klat_spin.setRange(0.1, 2.0); window.afm_klat_spin.setValue(0.5)
+    # Literature / Hapala: ~0.5 N/m. Internally converted to eV/Å² (÷16.02).
+    # Bug (Jul 2026): spin used to be unlabeled eV/Å² defaulting to 0.5 → 8 N/m (rigid tip).
+    window.afm_klat_spin.setRange(0.05, 5.0)
+    window.afm_klat_spin.setValue(0.5)
+    window.afm_klat_spin.setDecimals(2)
+    window.afm_klat_spin.setSingleStep(0.1)
+    window.afm_klat_spin.setToolTip(
+        "Lateral PP spring in N/m (classic Hapala ≈0.5 N/m).\n"
+        "Converted to eV/Å² for GPU: k[eV/Å²] = k[N/m] / 16.02.\n"
+        "Old bug: entering 0.5 as eV/Å² ≈ 8 N/m → |dxy|≪0.1Å blunt/rigid contrast.")
     physics_grid.addWidget(window.afm_klat_spin, 3, 1)
+    window.afm_klat_eva2_label = QtWidgets.QLabel("")
+    window.afm_klat_eva2_label.setStyleSheet("color: #666; font-size: 10px;")
+    physics_grid.addWidget(window.afm_klat_eva2_label, 4, 0, 1, 2)
+
+    def _refresh_klat_unit_label():
+        from spammm.SPM import AFM as afm_mod
+        k_nm = window.afm_klat_spin.value()
+        k_ev = afm_mod.stiffness_Nm_to_eVA2(k_nm)
+        window.afm_klat_eva2_label.setText(f"  → {k_ev:.4f} eV/Å²  (internal)")
+    _refresh_klat_unit_label()
+    window.afm_klat_spin.valueChanged.connect(_refresh_klat_unit_label)
     param_layout.addWidget(physics_group)
 
     def on_basis_changed(idx):

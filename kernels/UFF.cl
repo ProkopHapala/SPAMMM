@@ -1207,3 +1207,290 @@ __kernel void updateAtomsSPFFf4(
 
 
 
+
+// ======================================================================
+//  relax_nsteps_local_UFF / relax_nsteps_global_UFF
+//  Fused nsteps MD: bonds (neighs) + Fourier angles.
+//  Parallel SPFF-style: eval -> per-angle force slots -> gather (NO atomics,
+//  NO single-thread serial angle loop).
+//  Local mem budget ~35 KB with MAX_UFF_ATOMS=128, MAX_UFF_ANGLES=256.
+// ======================================================================
+#ifndef MAX_UFF_ATOMS
+#define MAX_UFF_ATOMS 128
+#endif
+#ifndef MAX_UFF_ANGLES
+#define MAX_UFF_ANGLES 256
+#endif
+// Tile size for global-kernel angle scratch (fits in local even for large nangles)
+#ifndef MAX_UFF_ANG_TILE
+#define MAX_UFF_ANG_TILE 128
+#endif
+
+inline void uff_eval_angle_forces(
+    float3 qij, float3 qkj, float4 par1, float K,
+    __private float3* fi, __private float3* fj, __private float3* fk, __private float* Eout
+){
+    float3 h = qij + qkj;
+    float c = 0.5f * (dot(h,h) - 2.0f);
+    c = clamp(c, -1.0f, 1.0f);
+    float s = sqrt(fmax(0.0f, 1.0f - c*c) + 1e-14f);
+    float2 cs  = (float2)(c, s);
+    float2 csn = cs;
+    float Eloc = par1.x + par1.y * cs.x;
+    float fmag = par1.y;
+    csn = (float2)(csn.x*cs.x - csn.y*cs.y, csn.x*cs.y + csn.y*cs.x);
+    Eloc += par1.z * csn.x;
+    fmag += 2.0f * par1.z;
+    csn = (float2)(csn.x*cs.x - csn.y*cs.y, csn.x*cs.y + csn.y*cs.x);
+    Eloc += par1.w * csn.x;
+    fmag += 3.0f * par1.w;
+    Eloc *= K;
+    fmag *= K;
+    float3 fij = qij * fmag;
+    float3 fkj = qkj * fmag;
+    *fi =  fij;
+    *fk =  fkj;
+    *fj = -fij - fkj;
+    *Eout = Eloc;
+}
+
+// Gather angle-slot forces onto one atom (race-free; called with one thread per atom).
+inline float4 uff_gather_angle_force(
+    int ia, int ntile,
+    __local const int4*   s_angA,
+    __local const float4* s_fi,
+    __local const float4* s_fj,
+    __local const float4* s_fk
+){
+    float3 f = (float3)(0,0,0);
+    float  E = 0.f;
+    for(int t=0; t<ntile; t++){
+        const int4 a = s_angA[t];
+        if(a.x==ia){ f += s_fi[t].xyz; E += s_fi[t].w; }
+        if(a.y==ia){ f += s_fj[t].xyz; E += s_fj[t].w; }
+        if(a.z==ia){ f += s_fk[t].xyz; E += s_fk[t].w; }
+    }
+    return (float4)(f, E);
+}
+
+__kernel void relax_nsteps_local_UFF(
+    const int4 nDOFs,
+    __global       float4* g_apos,
+    __global       float4* g_avel,
+    __global       float4* g_aforce,
+    __global const int4*   g_neighs,
+    __global const int4*   g_neighBs,
+    __global const float2* g_bonParams,
+    __global const int4*   g_angAtoms,
+    __global const float4* g_angParams1,
+    __global const float*  g_angParams2_w,
+    __global const float4* g_MDparams
+){
+    const int natoms  = nDOFs.x;
+    const int nangles = nDOFs.y;
+    const int nsteps  = nDOFs.z;
+    const int nbonds  = nDOFs.w;
+    const int iL = get_local_id(0);
+    const int nL = get_local_size(0);
+    // Never return before barriers — gate work with ok flag
+    const int ok = (natoms <= MAX_UFF_ATOMS && nangles <= MAX_UFF_ANGLES && natoms > 0) ? 1 : 0;
+
+    __local float4 s_apos  [MAX_UFF_ATOMS];
+    __local float4 s_avel  [MAX_UFF_ATOMS];
+    __local float4 s_aforce[MAX_UFF_ATOMS];
+    __local int4   s_neighs[MAX_UFF_ATOMS];
+    __local int4   s_neighBs[MAX_UFF_ATOMS];
+    __local float2 s_bpar  [MAX_UFF_ATOMS*4];
+    __local int4   s_angA  [MAX_UFF_ANGLES];
+    __local float4 s_angP1 [MAX_UFF_ANGLES];
+    __local float  s_angK  [MAX_UFF_ANGLES];
+    // Per-angle force slots (gather targets) — float4 = {fx,fy,fz,E/3}
+    __local float4 s_fi[MAX_UFF_ANGLES];
+    __local float4 s_fj[MAX_UFF_ANGLES];
+    __local float4 s_fk[MAX_UFF_ANGLES];
+
+    const float4 MDpars = g_MDparams[0];
+    const float dt=MDpars.x, damp=MDpars.y, Flimit=MDpars.z;
+
+    if(ok){
+        for(int i=iL; i<natoms; i+=nL){
+            s_apos[i]=g_apos[i]; s_avel[i]=g_avel[i];
+            s_neighs[i]=g_neighs[i]; s_neighBs[i]=g_neighBs[i];
+        }
+        int nbp = nbonds; if(nbp > MAX_UFF_ATOMS*4) nbp = MAX_UFF_ATOMS*4;
+        for(int i=iL; i<nbp; i+=nL) s_bpar[i]=g_bonParams[i];
+        for(int i=iL; i<nangles; i+=nL){
+            s_angA[i]=g_angAtoms[i]; s_angP1[i]=g_angParams1[i]; s_angK[i]=g_angParams2_w[i];
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    // If !ok: still hit every barrier below; work bodies are gated by `if(ok)`.
+
+    for(int step=0; step<nsteps; step++){
+        if(ok){ for(int i=iL; i<natoms; i+=nL) s_aforce[i]=(float4)(0,0,0,0); }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // --- Bonds: parallel over atoms ---
+        if(ok){
+            for(int ia=iL; ia<natoms; ia+=nL){
+                float3 pa = s_apos[ia].xyz;
+                int4 ng = s_neighs[ia];
+                int4 nb = s_neighBs[ia];
+                float3 ftot = (float3)(0,0,0);
+                float Eb = 0;
+                for(int in=0; in<4; in++){
+                    int ing = ((int*)&ng)[in];
+                    if(ing<0) break;
+                    int ib = ((int*)&nb)[in];
+                    if(ib<0 || ib>=nbonds) continue;
+                    float2 bp = s_bpar[ib];
+                    float3 dp = s_apos[ing].xyz - pa;
+                    float l = length(dp)+1e-12f;
+                    float3 h = dp/l;
+                    float dl = l - bp.y;
+                    float K = bp.x;
+                    ftot += h * (2.0f * K * dl);
+                    Eb += 0.5f * K * dl * dl;
+                }
+                s_aforce[ia] = (float4)(ftot, Eb);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // --- Angles: PARALLEL over angles -> slots, then PARALLEL gather ---
+        if(ok){
+            for(int iang=iL; iang<nangles; iang+=nL){
+                int4 a = s_angA[iang];
+                int ia=a.x, ja=a.y, ka=a.z;
+                float3 pi=s_apos[ia].xyz, pj=s_apos[ja].xyz, pk=s_apos[ka].xyz;
+                float3 vij=pi-pj; float lij=length(vij)+1e-12f; float3 qij=vij/lij;
+                float3 vkj=pk-pj; float lkj=length(vkj)+1e-12f; float3 qkj=vkj/lkj;
+                float3 fi,fj,fk; float E;
+                uff_eval_angle_forces(qij,qkj,s_angP1[iang],s_angK[iang],&fi,&fj,&fk,&E);
+                const float e3 = E*(1.f/3.f);
+                s_fi[iang] = (float4)(fi, e3);
+                s_fj[iang] = (float4)(fj, e3);
+                s_fk[iang] = (float4)(fk, e3);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if(ok){
+            for(int ia=iL; ia<natoms; ia+=nL){
+                s_aforce[ia] += uff_gather_angle_force(ia, nangles, s_angA, s_fi, s_fj, s_fk);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // --- Integrate ---
+        if(ok){
+            for(int ia=iL; ia<natoms; ia+=nL){
+                float4 fe=s_aforce[ia];
+                if(Flimit>0){ float fr2=dot(fe.xyz,fe.xyz); if(fr2>Flimit*Flimit) fe.xyz*=Flimit/sqrt(fr2); }
+                float4 ve=s_avel[ia], pe=s_apos[ia];
+                float inv_m=(pe.w>1e-8f)?(1.f/pe.w):1.f;
+                ve.xyz*=damp; ve.xyz+=fe.xyz*dt*inv_m; pe.xyz+=ve.xyz*dt;
+                ve.w=0; s_avel[ia]=ve; s_apos[ia]=pe; s_aforce[ia]=fe;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if(ok){
+        for(int i=iL;i<natoms;i+=nL){ g_apos[i]=s_apos[i]; g_avel[i]=s_avel[i]; g_aforce[i]=s_aforce[i]; }
+    }
+}
+
+__kernel void relax_nsteps_global_UFF(
+    const int4 nDOFs,
+    __global       float4* g_apos,
+    __global       float4* g_avel,
+    __global       float4* g_aforce,
+    __global const int4*   g_neighs,
+    __global const int4*   g_neighBs,
+    __global const float2* g_bonParams,
+    __global const int4*   g_angAtoms,
+    __global const float4* g_angParams1,
+    __global const float*  g_angParams2_w,
+    __global const float4* g_MDparams
+){
+    const int natoms  = nDOFs.x;
+    const int nangles = nDOFs.y;
+    const int nsteps  = nDOFs.z;
+    const int nbonds  = nDOFs.w;
+    const int iL = get_local_id(0);
+    const int nL = get_local_size(0);
+    const float4 MDpars = g_MDparams[0];
+    const float dt=MDpars.x, damp=MDpars.y, Flimit=MDpars.z;
+
+    // Local scratch for one angle tile (gather over scatter, no atomics)
+    __local int4   s_angA[MAX_UFF_ANG_TILE];
+    __local float4 s_fi[MAX_UFF_ANG_TILE];
+    __local float4 s_fj[MAX_UFF_ANG_TILE];
+    __local float4 s_fk[MAX_UFF_ANG_TILE];
+
+    for(int step=0; step<nsteps; step++){
+        for(int i=iL; i<natoms; i+=nL) g_aforce[i]=(float4)(0,0,0,0);
+        barrier(CLK_GLOBAL_MEM_FENCE);
+
+        // Bonds: parallel over atoms
+        for(int ia=iL; ia<natoms; ia+=nL){
+            float3 pa = g_apos[ia].xyz;
+            int4 ng = g_neighs[ia];
+            int4 nb = g_neighBs[ia];
+            float3 ftot = (float3)(0,0,0);
+            float Eb = 0;
+            for(int in=0; in<4; in++){
+                int ing = ((int*)&ng)[in];
+                if(ing<0) break;
+                int ib = ((int*)&nb)[in];
+                if(ib<0 || ib>=nbonds) continue;
+                float2 bp = g_bonParams[ib];
+                float3 dp = g_apos[ing].xyz - pa;
+                float l = length(dp)+1e-12f;
+                float3 h = dp/l;
+                float dl = l - bp.y;
+                float K = bp.x;
+                ftot += h * (2.0f * K * dl);
+                Eb += 0.5f * K * dl * dl;
+            }
+            g_aforce[ia] = (float4)(ftot, Eb);
+        }
+        barrier(CLK_GLOBAL_MEM_FENCE);
+
+        // Angles: tiled parallel eval -> local slots -> parallel gather into g_aforce
+        for(int base=0; base<nangles; base+=MAX_UFF_ANG_TILE){
+            const int ntile = min(MAX_UFF_ANG_TILE, nangles - base);
+            for(int t=iL; t<ntile; t+=nL){
+                const int iang = base + t;
+                int4 a = g_angAtoms[iang];
+                s_angA[t] = a;
+                float3 pi=g_apos[a.x].xyz, pj=g_apos[a.y].xyz, pk=g_apos[a.z].xyz;
+                float3 vij=pi-pj; float lij=length(vij)+1e-12f; float3 qij=vij/lij;
+                float3 vkj=pk-pj; float lkj=length(vkj)+1e-12f; float3 qkj=vkj/lkj;
+                float3 fi,fj,fk; float E;
+                uff_eval_angle_forces(qij,qkj,g_angParams1[iang],g_angParams2_w[iang],&fi,&fj,&fk,&E);
+                const float e3 = E*(1.f/3.f);
+                s_fi[t] = (float4)(fi, e3);
+                s_fj[t] = (float4)(fj, e3);
+                s_fk[t] = (float4)(fk, e3);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+            for(int ia=iL; ia<natoms; ia+=nL){
+                g_aforce[ia] += uff_gather_angle_force(ia, ntile, s_angA, s_fi, s_fj, s_fk);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        barrier(CLK_GLOBAL_MEM_FENCE);
+
+        // Integrate
+        for(int ia=iL; ia<natoms; ia+=nL){
+            float4 fe=g_aforce[ia];
+            if(Flimit>0){ float fr2=dot(fe.xyz,fe.xyz); if(fr2>Flimit*Flimit) fe.xyz*=Flimit/sqrt(fr2); }
+            float4 ve=g_avel[ia], pe=g_apos[ia];
+            float inv_m=(pe.w>1e-8f)?(1.f/pe.w):1.f;
+            ve.xyz*=damp; ve.xyz+=fe.xyz*dt*inv_m; pe.xyz+=ve.xyz*dt;
+            ve.w=0; g_avel[ia]=ve; g_apos[ia]=pe; g_aforce[ia]=fe;
+        }
+        barrier(CLK_GLOBAL_MEM_FENCE);
+    }
+}

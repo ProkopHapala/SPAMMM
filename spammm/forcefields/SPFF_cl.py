@@ -103,6 +103,9 @@ class SPFF_cl(OpenCLBase):
             os.path.join(kernel_dir, 'surface.cl'),
             os.path.join(kernel_dir, 'nonbonded.cl'),
         ]
+        if enable_nonbond:
+            # GridFF-augmented nonbond kernels (getNonBond_GridFF_Bspline_ex2 / _tex)
+            kernel_paths.append(os.path.join(kernel_dir, 'nonbonded_grid.cl'))
         if not self.load_program_multi(kernel_paths, bPrint=False, build_options=debug_build_options):
             exit(1)
         
@@ -1721,14 +1724,27 @@ class SPFF_cl(OpenCLBase):
             prg.updateAtomsSPFFf4(queue, sz_nvec, sz_loc, *args_update)
         queue.finish()  # single sync at end
 
+    # Serial local-memory kernel caps (must match kernels/SPFF.cl defines)
+    SERIAL_WG_SIZE = 192
+    SERIAL_MAX_NVEC = 192
+    SERIAL_MAX_NATOM = 128
+    SERIAL_MAX_NNODE = 96
+
     def relax_serial(self, nsteps=100, dt=0.01, damp=0.95, Flimit=100.0):
         """Run nsteps entirely on GPU in a single kernel call using local memory.
-        Single workgroup (128 threads). No non-bonded. Only for nSystems=1 and nvec<=128."""
+        Single workgroup (SERIAL_WG_SIZE threads). No non-bonded. Only for nSystems=1
+        with nvec<=SERIAL_MAX_NVEC, nnode<=SERIAL_MAX_NNODE, natoms<=SERIAL_MAX_NATOM."""
         import pyopencl as cl
-        WG_SIZE = 128
+        WG_SIZE = self.SERIAL_WG_SIZE
         nvec = self.nvecs
+        if nvec > self.SERIAL_MAX_NVEC:
+            raise ValueError(f"relax_serial: nvec={nvec} > MAX_NVEC={self.SERIAL_MAX_NVEC}, use relax_batch instead")
+        if self.nnode > self.SERIAL_MAX_NNODE:
+            raise ValueError(f"relax_serial: nnode={self.nnode} > MAX_NNODE={self.SERIAL_MAX_NNODE}, use relax_batch instead")
+        if self.natoms > self.SERIAL_MAX_NATOM:
+            raise ValueError(f"relax_serial: natoms={self.natoms} > MAX_NATOM={self.SERIAL_MAX_NATOM}, use relax_batch instead")
         if nvec > WG_SIZE:
-            raise ValueError(f"relax_serial: nvec={nvec} > WG_SIZE={WG_SIZE}, use relax_batch instead")
+            raise ValueError(f"relax_serial: nvec={nvec} > WG_SIZE={WG_SIZE} (need one thread per DOF), use relax_batch instead")
         if self.nSystems != 1:
             raise ValueError(f"relax_serial: nSystems={self.nSystems} != 1, use relax_batch instead")
         # Set MD params
@@ -1754,6 +1770,70 @@ class SPFF_cl(OpenCLBase):
         ]
         self.prg.relax_nsteps_serial(self.queue, (WG_SIZE,), (WG_SIZE,), *args)
         self.queue.finish()
+
+    def relax_global(self, nsteps=100, dt=0.01, damp=0.95, Flimit=100.0, wg=256, do_faf=False):
+        """Fused nsteps MD in one kernel using GLOBAL memory (strided WG).
+
+        Unlike relax_serial, no local-memory atom/nvec caps — suitable for larger
+        molecules. Optional do_faf adds FoldedAtomicFunctions substrate forces.
+        """
+        import pyopencl as cl
+        from pyopencl import cltypes
+        if self.nSystems != 1:
+            raise ValueError(f"relax_global: nSystems={self.nSystems} != 1")
+        self.set_md_params(dt=dt, damp=damp, Flimit=Flimit)
+        nDOFs = cltypes.make_int4(self.natoms, self.nnode, nsteps, 1 if do_faf else 0)
+        # Dummy FAF buffers if not used
+        folded_coeffs = self.buffer_dict.get('folded_coeffs', self.buffer_dict['REQs'])
+        folded_kxyz = self.buffer_dict.get('folded_kxyz', self.buffer_dict['REQs'])
+        folded_atype = self.buffer_dict.get('folded_atom_type', self.buffer_dict['neighs'])
+        folded_meta = self.kernel_params.get('folded_meta', np.array([0, 0, 0, 0], dtype=np.int32))
+        folded_lvec = self.kernel_params.get('folded_lvec2d', np.array([1, 0, 0, 1], dtype=np.float32))
+        if do_faf and int(folded_meta[0]) <= 0:
+            raise ValueError("relax_global(do_faf=True): call upload_folded_fit() first")
+        args = [
+            nDOFs,
+            self.buffer_dict['apos'], self.buffer_dict['avel'], self.buffer_dict['aforce'],
+            self.buffer_dict['fneigh'],
+            self.buffer_dict['neighs'], self.buffer_dict['bkNeighs'],
+            self.buffer_dict['apars'], self.buffer_dict['bLs'], self.buffer_dict['bKs'],
+            self.buffer_dict['Ksp'], self.buffer_dict['Kpp'],
+            self.buffer_dict['constr'], self.buffer_dict['constrK'],
+            self.buffer_dict['MDparams'],
+            folded_coeffs, folded_kxyz, folded_atype,
+            cltypes.make_int4(int(folded_meta[0]), int(folded_meta[1]), 0, 0),
+            cltypes.make_float4(float(folded_lvec[0]), float(folded_lvec[1]), float(folded_lvec[2]), float(folded_lvec[3])),
+        ]
+        self.prg.relax_nsteps_global(self.queue, (wg,), (wg,), *args)
+        self.queue.finish()
+
+    def upload_folded_fit(self, fit):
+        """Upload FAF fit dict from fit_folded_for_molecule / load_fit onto this MD engine."""
+        import pyopencl as cl
+        coeffs = np.asarray(fit['coeffs'], dtype=np.float32)
+        kxyz = np.asarray(fit['basis_params'], dtype=np.float32)
+        atype = np.asarray(fit['atom_type_ids'], dtype=np.int32)
+        lvec2d = np.asarray(fit['folded_lvec2d'], dtype=np.float32).reshape(4)
+        ntypes, nbasis = int(coeffs.shape[0]), int(coeffs.shape[1])
+        if len(atype) != self.natoms:
+            raise ValueError(f"upload_folded_fit: atom_type_ids len {len(atype)} != natoms {self.natoms}")
+        if nbasis > FOLDED_BASIS_MAX or ntypes > FOLDED_TYPES_MAX:
+            raise ValueError(f"upload_folded_fit: ntypes={ntypes} nbasis={nbasis} exceeds caps")
+        float_size = np.float32().itemsize
+        mf = cl.mem_flags
+        self.check_buf('folded_coeffs', FOLDED_TYPES_MAX * FOLDED_BASIS_MAX * float_size, mf.READ_ONLY)
+        self.check_buf('folded_kxyz', FOLDED_BASIS_MAX * 4 * float_size, mf.READ_ONLY)
+        self.check_buf('folded_atom_type', self.natoms * np.int32().itemsize, mf.READ_ONLY)
+        coeff_pad = np.zeros((FOLDED_TYPES_MAX, FOLDED_BASIS_MAX), dtype=np.float32)
+        coeff_pad[:ntypes, :nbasis] = coeffs[:, :nbasis]
+        kxyz_pad = np.zeros((FOLDED_BASIS_MAX, 4), dtype=np.float32)
+        kxyz_pad[:nbasis, :4] = kxyz[:nbasis, :4]
+        self.toGPU('folded_coeffs', coeff_pad)
+        self.toGPU('folded_kxyz', kxyz_pad)
+        self.toGPU('folded_atom_type', atype)
+        self.kernel_params['folded_meta'] = np.array([nbasis, ntypes, 0, 0], dtype=np.int32)
+        self.kernel_params['folded_lvec2d'] = lvec2d.copy()
+        self.folded_params = {'basis_params': kxyz[:nbasis].copy(), 'coeffs': coeffs.copy()}
 
     def run_md(self, nsteps=100, dt=0.01, Flimit=1e10, use_rot=False, do_nb=False):
         """NVE molecular dynamics entirely on GPU. Returns final energy."""

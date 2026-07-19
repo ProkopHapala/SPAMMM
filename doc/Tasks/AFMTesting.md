@@ -431,3 +431,36 @@ Test `stage5_stm` and `stage6_br_stm`. See `doc/Topics/STM/`.
 | Phase 2 (FDBM) | ✅ Complete (ModularAFMPipeline + physics functions) | ❌ No tests — 4 tiers planned |
 | Parameter fitting | ✅ Methodology documented | ❌ Not started |
 | STM | ✅ stage5/stage6 implemented | ❌ Not started |
+
+---
+
+## Lessons learned (Jul 2026) — GUI FDBM / PP contrast & hex symmetry
+
+### 1. PP lateral stiffness units (blunt “rigid tip” contrast) — **fixed**
+
+**Symptom:** AFM `df` lacked sharp PP edges; tip looked rigid at all heights.
+
+**Cause:** GUI `K_LAT` was treated as eV/Å² with default `0.5`. Literature Hapala value is **0.5 N/m ≈ 0.031 eV/Å²**. Entering `0.5` in eV/Å² is **~8 N/m (~17× too stiff)** → tip `|dxy|_max ≈ 0.08 Å` (rigid). Soft K (`0.03 eV/Å²`) gives `|dxy|_max ≈ 0.85 Å` and sharp PP contrast.
+
+**Conversion (SSOT in `spammm/SPM/AFM.py`):**
+```
+1 eV/Å² = 16.02176634 N/m
+k[eV/Å²] = k[N/m] / 16.02
+```
+
+**Fix:** GUI spin is now **`K_LAT [N/m]`** (default 0.5 N/m), converted via `stiffness_Nm_to_eVA2()` before Stage 4. Pipeline prints both units. Diagnostic: `tests/SPM/testplot_pp_relax_gui.py` → `debug/afm_pp_relax_gui/`.
+
+### 2. Hexagonal / ES “anisotropy” at coarse grid — **mostly undersampling**
+
+**Symptom:** Benzene/coronene images looked diagonally skewed / low rot60 symmetry.
+
+**Causes (layered):**
+1. **Broken CO tip (fixed):** non-orthogonal DFTB DM construction → bad tip charge; cache key bumped to `v3`.
+2. **Molecule orientation / flatness:** benzene had slight out-of-plane / rotated ring — do **not** force square grids or rotate molecules for “pretty” symmetry.
+3. **Grid step:** at `dstep=0.15 Å`, `q_diff` charge neutrality fails (~−0.08 e) and near-field `V_ES` rot60≈0.90; at `0.1 Å`, `q_diff≈−0.001` and rot60≈0.99. FFT k-vectors were already correct — not a squeezed-lattice bug.
+
+**Recommendation:** prefer `dstep ≤ 0.1 Å` for FDBM ES; watch `[CHARGE CHECK] q_diff`.
+
+### 3. What to plot for PP debug
+
+Plot **`Tip |dxy| (PP)`** and `|dxy|_max` per height — not only `df`. Sharp bond contrast requires `|dxy| ≳ 0.3–0.5 Å`.

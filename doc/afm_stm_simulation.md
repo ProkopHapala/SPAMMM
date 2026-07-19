@@ -229,13 +229,25 @@ OpenCL-accelerated rigid body dynamics engine. Simulates multiple rigid bodies w
 
 ---
 
-## 5. AFMExtension (`pyBall/AFMExtension.py`)
+## 5. AFMExtension (`spammm/GUI/AFMExtension.py`)
 
 ### Purpose
 
 AFM simulation extension for `KekuleExplorerGUI`. Uses `ModularAFMPipeline` for staged, cached computation. Dirty flag system ensures only changed stages are recomputed.
 
-**File**: `pyBall/AFMExtension.py` (~1194 lines)
+**File**: `spammm/GUI/AFMExtension.py`
+
+### Units (Jul 2026)
+
+| UI control | Unit shown | Internal |
+|------------|------------|----------|
+| **K_LAT** | **N/m** (default 0.5 = Hapala) | eV/Å² via `stiffness_Nm_to_eVA2` (`÷ 16.02`) |
+| Step | Å | Å |
+| Pauli A | eV | eV |
+
+**Bug fixed:** K_LAT was unlabeled and defaulted to `0.5` interpreted as eV/Å² (= **8 N/m**, ~17× too stiff) → rigid/blunt PP contrast. See [AFMTesting.md § Lessons learned](Tasks/AFMTesting.md#lessons-learned-jul-2026--gui-fdbm--pp-contrast--hex-symmetry).
+
+**Grid step:** prefer `≤ 0.1 Å` for FDBM ES; `0.15 Å` undersamples `ρ_diff` (charge neutrality / hex symmetry).
 
 ### Dirty Flag System
 
@@ -248,7 +260,7 @@ AFM simulation extension for `KekuleExplorerGUI`. Uses `ModularAFMPipeline` for 
 | S1 | Geometry + DFTB+ SCF | Geometry change |
 | S2 | Grid projection (density) | Step/margin change |
 | S3 | Potential calculation | Pauli/vdW params change |
-| S4 | Force relaxation | Scan range/heights change |
+| S4 | Force relaxation | Scan range/heights / K_LAT change |
 | S5 | AFM image | Scan params change |
 | S6 | STM / BR-STM | MO selection change |
 
@@ -257,12 +269,10 @@ AFM simulation extension for `KekuleExplorerGUI`. Uses `ModularAFMPipeline` for 
 | Function | Purpose |
 |----------|---------|
 | `_get_afm_geometry(window)` | Convert backend geometry to AFM format |
-| `_get_pipeline_params(window)` | Snapshot current UI parameter values |
+| `_get_pipeline_params(window)` | Snapshot UI params; converts K_LAT N/m → eV/Å² |
 | `_ensure_pipeline(window)` | Create or recreate `ModularAFMPipeline` if needed |
-| `run_afm_scan(window)` | Execute full AFM scan from GUI |
-| `run_stm_scan(window)` | Execute STM scan from GUI |
-
----
+| `run_afm_full_pipeline(window)` | Execute full AFM scan from GUI |
+| `run_stm(window)` | Execute STM scan from GUI |
 
 ## 6. ModularAFMPipeline (`pyBall/OCL/ModularPipeline.py`)
 

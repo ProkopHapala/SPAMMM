@@ -38,6 +38,7 @@ class ModularAFMPipeline:
                  work_dir=None, step=0.1, margin=4.0, z_extra=6.0,
                  scan_range=3.0, scan_step=0.1, height_range=(2.8, 3.6), height_step=0.1,
                  co_tip_dir=None,
+                 tip_mode='co',  # 'co' = real CO density; 'gaussian' = isotropic Gaussian tip
                  atomPos=None, enames=None,  # Optional: inject geometry directly instead of xyz_file
                  backend='dftb', pyscf_params=None):  # Backend selection and parameters
         self.xyz_file = xyz_file
@@ -47,6 +48,7 @@ class ModularAFMPipeline:
         self.basis = basis
         self.slako_prefix = slako_prefix
         self.co_tip_dir = co_tip_dir
+        self.tip_mode = tip_mode.lower()
         self.backend = backend.lower()
         self.pyscf_params = pyscf_params or {'method': 'RHF', 'basis': 'sto-3g', 'xc': None}
         
@@ -472,40 +474,16 @@ Hamiltonian = DFTB {{
         # Step 2: Electrostatics
         V_ES = afm.fft_poisson(rho_diff, self.step)
         
-        # Load CO tip density
-        target_shape = tuple(self.ngrid)
+        # Tip densities: 'co' (real CO, O at (0,0,0)) or 'gaussian'
+        target_shape = tuple(int(x) for x in self.ngrid)
         fdata_dir = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tests', 'pyFireball', 'Fdata'))
         fdata_basis = os.path.join(fdata_dir, 'basis')
-        
-        # Check local co_tip_dir first (like full pipeline)
-        if self.co_tip_dir is not None and os.path.isdir(self.co_tip_dir):
-            print(f"  Loading precomputed CO tip from {self.co_tip_dir}...")
-            co_rho_total_raw = np.load(os.path.join(self.co_tip_dir, 'co_rho_total.npy'))
-            co_rho_delta_raw = np.load(os.path.join(self.co_tip_dir, 'co_rho_delta.npy'))
-            print(f"  Raw CO tip shape: {co_rho_total_raw.shape}")
-        else:
-            # Check global cache
-            cached = afm_utils._get_cached_co_tip(self.step, self.margin, fdata_dir, fdata_basis, backend=self.backend)
-            if cached is not None:
-                print(f"  Loading cached CO tip (step={self.step}, margin={self.margin})...")
-                co_rho_total_raw, co_rho_delta_raw = cached
-                print(f"  Raw CO tip shape: {co_rho_total_raw.shape}")
-            else:
-                # Compute on-the-fly
-                print(f"  Computing CO tip on-the-fly (step={self.step})...")
-                co_tip_work = os.path.join(self.output_dir, 'co_tip_work')
-                os.makedirs(co_tip_work, exist_ok=True)
-                co_grid_spec, co_ngrid, co_origin = afm_utils._compute_co_tip_grid(step=self.step, margin=self.margin)
-                print(f"  CO grid: ngrid={co_ngrid}, origin={co_origin}")
-                afm_utils._call_compute_co_tip_script(co_tip_work, co_grid_spec, self.step, 100, fdata_dir, fdata_basis, backend=self.backend)
-                co_rho_total_raw = np.load(os.path.join(co_tip_work, 'co_rho_total.npy'))
-                co_rho_delta_raw = np.load(os.path.join(co_tip_work, 'co_rho_delta.npy'))
-                # Save to global cache for reuse
-                afm_utils._save_cached_co_tip(co_rho_total_raw, co_rho_delta_raw, self.step, self.margin, fdata_dir, fdata_basis, backend=self.backend)
-                print(f"  CO tip saved to global cache")
-            
-        co_rho_total = afm_utils._pad_and_roll_co_tip(co_rho_total_raw, target_shape)
-        co_rho_delta = afm_utils._pad_and_roll_co_tip(co_rho_delta_raw, target_shape)
+        print(f"  Tip mode: {self.tip_mode}")
+        co_rho_total, co_rho_delta = afm_utils.get_tip_densities(
+            tip_mode=self.tip_mode, target_shape=target_shape, step=self.step, margin=self.margin,
+            output_dir=self.output_dir, co_tip_dir=self.co_tip_dir,
+            fdata_dir=fdata_dir, fdata_basis=fdata_basis, backend=self.backend,
+        )
         
         # Step 3: Pauli repulsion
         overlap_raw = afm.compute_pauli_overlap(rho_scf, co_rho_total, self.step, tip_rolled=True)
@@ -534,15 +512,22 @@ Hamiltonian = DFTB {{
         print(f"  Stage 3 complete and cached.")
         return V_ES, E_pauli_field, E_ES_field, E_vdw, F_total
 
-    def stage4_relax(self, F_total, force_recompute=False, relax_params={'K_LAT': 0.5}, ppm_mode=True):
+    def stage4_relax(self, F_total, force_recompute=False, relax_params=None, ppm_mode=True):
         """Stage 4: Probe-particle MD relaxation (yielding AFM signal and tip displacements)."""
+        if relax_params is None:
+            from spammm.SPM import AFM as afm_mod
+            relax_params = {'K_LAT': afm_mod.K_LAT_HAPALA_EV_A2}  # 0.5 N/m → eV/Å²
         if not force_recompute and os.path.exists(self.cache_stage4):
             print(f"\n[ModularPipeline] Loading Stage 4 (relaxation) from cache...")
             data = np.load(self.cache_stage4)
             tip_disp = {'dx': data['tip_disp_dx'], 'dy': data['tip_disp_dy'], 'dz': data['tip_disp_dz']}
             return data['df'], tip_disp, data['FEs_relax']
             
-        print(f"\n[ModularPipeline] Running Stage 4 (probe relaxation)...")
+        k_ev = relax_params['K_LAT']
+        from spammm.SPM import AFM as afm_mod
+        k_nm = afm_mod.stiffness_eVA2_to_Nm(k_ev)
+        print(f"\n[ModularPipeline] Running Stage 4 (probe relaxation) "
+              f"K_LAT={k_ev:.4f} eV/Å² (= {k_nm:.2f} N/m)...")
         afmulator = afm.AFMulator(use_morse=False, nloc=32)
         
         df, tip_disp = afm_utils.compose_and_relax_total(
@@ -552,7 +537,8 @@ Hamiltonian = DFTB {{
             use_gpu_relax=True, ppm_mode=ppm_mode, afmulator=afmulator
         )
         
-        # Output FEs_relax from composition
+        # Reuse tip_disp/FEs from compose — do NOT re-scan (was double work + could desync)
+        # compose_and_relax_total already ran scan_fdbm; recover FEs via a single scan matching tip_disp
         mol_z = float(self.atomPos[:,2].max())
         if ppm_mode:
             relax_pars_ppm = [0.1, 0.1, 0.03, 0.1]
@@ -565,6 +551,8 @@ Hamiltonian = DFTB {{
                 self.scan_xs, self.scan_ys, self.heights, mol_z=mol_z,
                 K_LAT=relax_params['K_LAT']
             )
+        dxy = np.hypot(tip_disp['dx'], tip_disp['dy'])
+        print(f"  Stage 4 tip |dxy|_max={float(dxy.max()):.4f}Å  (soft K→large deflection / sharp PP edges)")
             
         np.savez_compressed(self.cache_stage4, df=df, tip_disp_dx=tip_disp['dx'],
                             tip_disp_dy=tip_disp['dy'], tip_disp_dz=tip_disp['dz'], FEs_relax=FEs_relax)

@@ -285,9 +285,17 @@ The serial kernel has reserved argument slots for `g_REQs` and `g_excl` (non-bon
 - Computing pairwise non-bonded forces within the workgroup
 - This is feasible for small molecules (≤80 atoms) since all positions are already in `s_apos`
 
+**Also planned (not started):** connect fused multi-step kernels to **FAF** substrate forces and non-covalent / GridFF without falling back to per-step host launches. Tracking: `doc/Tasks/PerfBenchmark_Relaxation.md` §Future work, `doc/ToDo/ToDo.agents.md`.
+
 ### 7.5 UFF Forcefield Path
 
 `FFController.build_ff()` raises `NotImplementedError` for `ff_type='uff'`. The UFF path needs integration with the MD engine (`SPFF_cl`), which currently expects SPFF-format arrays.
+
+**Also planned (not started):** fused UFF (`relax_nsteps_local_UFF` / `_global_UFF`) currently does bonds+angles only — add **torsions/dihedrals** (and inversions) with parallel gather. See `doc/Tasks/PerfBenchmark_Relaxation.md` §Future work.
+
+### 7.5b SPFF fused π terms
+
+**Planned (not started):** audit that fused `relax_nsteps_serial` / `relax_nsteps_global` fully cover **π–π** and **π–σ** with parity vs `getSPFFf4` / `relax_batch`.
 
 ### 7.6 Multi-Molecule Batch Relaxation
 

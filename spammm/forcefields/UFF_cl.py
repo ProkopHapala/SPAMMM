@@ -295,6 +295,44 @@ class UFF_cl(OpenCLBase):
             self._run_integrator()
         return self.get_total_energy()
 
+    def relax_serial(self, nsteps=100, dt=0.01, damp=0.9, Flimit=100.0, wg=128):
+        """Fused local-memory UFF relax (bonds+angles). Parallel angles+gather. natoms<=128, nangles<=256."""
+        from pyopencl import cltypes
+        if self.natoms > 128:
+            raise ValueError(f"relax_serial: natoms={self.natoms} > 128, use relax_global")
+        if self.nangles > 256:
+            raise ValueError(f"relax_serial: nangles={self.nangles} > 256, use relax_global")
+        self.set_md_params(dt=dt, damp=damp, Flimit=Flimit)
+        cl.enqueue_fill_buffer(self.queue, self.buffer_dict["avel"], np.float32(0), 0, self.buffer_dict["avel"].size)
+        nDOFs = cltypes.make_int4(self.natoms, self.nangles, nsteps, self.nbonds)
+        args = [
+            nDOFs,
+            self.buffer_dict['apos'], self.buffer_dict['avel'], self.buffer_dict['fapos'],
+            self.buffer_dict['neighs'], self.buffer_dict['neighBs'], self.buffer_dict['bonParams'],
+            self.buffer_dict['angAtoms'], self.buffer_dict['angParams1'], self.buffer_dict['angParams2_w'],
+            self.buffer_dict['MDparams'],
+        ]
+        self.prg.relax_nsteps_local_UFF(self.queue, (wg,), (wg,), *args)
+        self.queue.finish()
+        return self.get_total_energy()
+
+    def relax_global(self, nsteps=100, dt=0.01, damp=0.9, Flimit=100.0, wg=256):
+        """Fused global-memory UFF relax (bonds+angles), strided WG — no local-size atom cap."""
+        from pyopencl import cltypes
+        self.set_md_params(dt=dt, damp=damp, Flimit=Flimit)
+        cl.enqueue_fill_buffer(self.queue, self.buffer_dict["avel"], np.float32(0), 0, self.buffer_dict["avel"].size)
+        nDOFs = cltypes.make_int4(self.natoms, self.nangles, nsteps, self.nbonds)
+        args = [
+            nDOFs,
+            self.buffer_dict['apos'], self.buffer_dict['avel'], self.buffer_dict['fapos'],
+            self.buffer_dict['neighs'], self.buffer_dict['neighBs'], self.buffer_dict['bonParams'],
+            self.buffer_dict['angAtoms'], self.buffer_dict['angParams1'], self.buffer_dict['angParams2_w'],
+            self.buffer_dict['MDparams'],
+        ]
+        self.prg.relax_nsteps_global_UFF(self.queue, (wg,), (wg,), *args)
+        self.queue.finish()
+        return self.get_total_energy()
+
     def run_md(self, nsteps=100, dt=0.01, Flimit=1e10):
         """NVE molecular dynamics entirely on GPU. Returns final energy."""
         self.set_md_params(dt=dt, damp=1.0, Flimit=Flimit)  # damp=1.0 = no damping

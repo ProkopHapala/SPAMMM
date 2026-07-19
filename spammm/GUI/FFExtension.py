@@ -163,7 +163,7 @@ def _on_serial_toggled(window, checked):
     if checked and ctrl.is_built:
         if not ctrl._can_use_serial(ctrl.enable_nonbond):
             window.relax_serial_chk.setChecked(False)
-            window.relax_status_label.setText("Status: Serial unavailable (nvec>128 or non-bonded) — using batch")
+            window.relax_status_label.setText("Status: Serial unavailable (too large or non-bonded) — using batch")
         else:
             window.relax_status_label.setText("Status: Serial kernel ON")
     elif not checked:

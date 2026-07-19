@@ -44,12 +44,15 @@ High-level status for agent-driven work. Details in linked docs — do not dupli
 - [ ] **FDBM image asymmetry** — coronene df map lacks 6-fold symmetry; suspected grid misalignment or CO tip axis/roll issue (`doc/Tasks/AFMTesting.md` §Bug)
 - [ ] **FDBM perf: < 1s end-to-end** — per-stage timing, eliminate Python overhead, fix `spammm.DFTB` import (T01, `doc/Tasks/PerfBenchmark_FDBM.md`)
 - [ ] **UFF/SPFF relax perf: instant GUI relax** — isolate GPU vs GUI overhead, use serial kernel, reduce callback frequency (T02, `doc/Tasks/PerfBenchmark_Relaxation.md`)
+- [ ] **UFF fused completeness** — add torsions/dihedrals (+ inversions) to `relax_nsteps_{local,global}_UFF` with parallel gather (not serial); parity vs multi-kernel (`doc/Tasks/PerfBenchmark_Relaxation.md` §Future work)
+- [ ] **SPFF fused π terms audit** — ensure π–π / π–σ present and parity-checked in `relax_nsteps_serial` and `relax_nsteps_global` (`doc/Tasks/PerfBenchmark_Relaxation.md` §Future work)
+- [ ] **Fused relax + FAF + non-covalent** — connect fused multi-step kernels to FAF substrate and NB/GridFF without per-step launch fallback (`doc/Tasks/PerfBenchmark_Relaxation.md` §Future work; §5 ARCH_ROADMAP)
 - [ ] Roll L1 `review.py` artifacts to more topology tests
 - [ ] Integration tests: relaxed scan H2O/benzene on NaCl (stubs removed, need real implementation)
 - [ ] **Robust pySCF backend**: integrate custom modified pySCF, density grid projection, FDBM pipeline integration (§2 ARCH_ROADMAP)
 - [ ] **GridFF consolidation**: unify tricubic B-spline (4ch) vs trilinear (12ch) via common interface + preprocessor kernel variants (§6 ARCH_ROADMAP)
 - [ ] **Mol browser plugin port**: port `MolBrowserPlugin` system from FireCore `VispyMolBrowser.py`, write SPAMMM plugins (AFM, vibration, relax) (§1 ARCH_ROADMAP)
-- [ ] **FAF substrate relaxation**: implement ForcedAtomicFunction as analytic substrate potential for on-surface molecule relaxation (§5 ARCH_ROADMAP)
+- [ ] **FAF substrate relaxation**: implement ForcedAtomicFunction as analytic substrate potential for on-surface molecule relaxation (§5 ARCH_ROADMAP) — prefer fused `relax_global(do_faf=True)` path once complete
 - [ ] **Presentation tools**: `spammm/utils/html_pres.py` — HTML slide generator for LLM agents, auto-generate from test artifacts (§3 ARCH_ROADMAP)
 - [ ] **Consolidate GUI verbosity → `spammm.globals`**: replace per-module `verbose`/`bPrint` with `globals.debug_print()` (§10 ARCH_ROADMAP)
 

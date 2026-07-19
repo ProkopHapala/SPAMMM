@@ -220,6 +220,8 @@ optimized for SPM/FDBM workflows.
 3. Compare FAF vs GridFF accuracy and performance
 4. Use FAF as default for interactive GUI relaxation (fast setup), GridFF for production (fast evaluation)
 
+**Related (fused MD kernels — planned, not started):** see `doc/Tasks/PerfBenchmark_Relaxation.md` §Future work — wire FAF + non-covalent into `relax_nsteps_global` / UFF fused paths; complete UFF torsions/dihedrals and audit SPFF π–π / π–σ in fused loops.
+
 ---
 
 ## 6. GridFF Consolidation (Tricubic B-spline vs Trilinear)

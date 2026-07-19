@@ -2,7 +2,47 @@
 
 **Goal:** GUI "Relax" button should feel instant (< 0.5s for typical molecules, < 2s for large PAHs).
 
-**Status:** Not started. This document defines the benchmarking plan and identifies suspected bottlenecks.
+**Status:** Benchmarks run (2026-07-19) on `flat_1.mol2` — **unverified** pending USER review of `debug/test_relax_flat1/` artifacts.
+
+---
+
+## Measured results — `flat_1.mol2` (96 atoms, 66 C + 30 H)
+
+Input: `/home/prokop/svec_triptacene/flat_1.mol2`  
+Harness: `tests/test_relax_flat1.py` (`pytest tests/test_relax_flat1.py --develop -s`)  
+GPU: NVIDIA RTX 3090, `PYOPENCL_CTX=0`
+
+| Case | Mode | Steps | Time | E | fmax | planarity_C | Notes |
+|------|------|-------|------|---|------|-------------|-------|
+| Vacuum UFF | multi-kernel/step | 2000 | **2.07 s** | 9.99 | 1.01 | 0.31 | mean C–C 1.41, C–H 1.08 |
+| Vacuum SPFF | `relax_batch` | 2000 | **0.80 s** | −424.21 | 2.62 | 0.36 | damp=0.9 |
+| Vacuum SPFF | `relax_serial` WG=192 | 2000 | **0.0049 s** | −424.21 | 2.62 | 0.36 | **~163× vs batch**, identical E/fmax |
+| NaCl GridFF + SPFF | batch + GridFF ex2 | 1500 | **0.93 s** | −413.71 | 2.95 | — | z_rel(min−top)=3.55 Å (stays above surface) |
+
+Artifacts (L2 review):
+
+- `debug/test_relax_flat1/uff_vacuum_{geometry.png,init_final.xyz,out}`
+- `debug/test_relax_flat1/spff_batch_vacuum_*`
+- `debug/test_relax_flat1/spff_serial_vacuum_*`
+- `debug/test_relax_flat1/spff_substrate_{geometry.png,init_final.xyz,out}`
+
+### Findings
+
+1. **Serial local-memory kernel works for flat_1** after memory-safe sizing (`WG_SIZE=192`, `MAX_NVEC=192`, `MAX_NATOM=128`, `MAX_NNODE=96` ≈ 38 KB local — fits NVIDIA 48 KB). Naive WG=256 with 12×WG float4 arrays would be ~64 KB and fail.
+2. **Parity**: serial vs batch on flat_1 give identical energy and fmax (and `tests/test_relax_serial.py` still all-pass).
+3. **GUI damp default was too low**: `DEFAULT_DAMP=0.1` left SPFF at fmax≈12 after 2000 steps; `damp=0.9` → fmax≈2.6. Default updated to **0.9**.
+4. **UFF** is usable at 96 atoms (~2 s / 2000 steps) but has no serial fused kernel.
+5. **UFF+GridFF** not wired; substrate case is SPFF+GridFF only. `nonbonded_grid.cl` now loads when `enable_nonbond=True`.
+
+### Serial limits (updated)
+
+| Cap | Value |
+|-----|-------|
+| `WG_SIZE` | 192 |
+| `MAX_NVEC` | 192 |
+| `MAX_NATOM` | 128 |
+| `MAX_NNODE` | 96 |
+| Requires | `nSystems==1`, no non-bonded / no GridFF in serial kernel |
 
 ---
 
@@ -10,110 +50,69 @@
 
 ### GUI path (`FFExtension._on_relax`)
 
-`@/home/prokop/git/SPAMMM/spammm/GUI/FFExtension.py:382`
+`spammm/GUI/FFExtension.py`
 
 1. `_ensure_built(window)` → `FFController.build_ff()` (if not built)
 2. `ctrl.relax_until_converged(max_steps, dt, damp, callback, batch_size)`
-3. Callback `_cb()` runs **every batch**:
-   - `ctrl.get_state()` — copies positions from GPU to host
-   - `_sync_positions_to_graph()` — updates AtomicGraph
-   - `window.refresh_view()` — redraws 3D scene
-   - `QtWidgets.QApplication.processEvents()` — processes Qt events
+3. Callback `_cb()` runs **every batch**: GPU→host sync, AtomicGraph update, Vispy refresh, `processEvents`
 
 ### GPU paths (`FFController.relax_n` / `relax_until_converged`)
 
-`@/home/prokop/git/SPAMMM/spammm/forcefields/FFController.py:164`
+- **`relax_serial`**: Single-kernel local-memory, WG=192. Runs N steps in one kernel call. ~160× faster than batch on flat_1. Caps above; no non-bonded.
+- **`relax_batch`**: Per-step kernel launches; sync at end (or each GUI callback).
 
-- **`relax_serial`**: Single-kernel local-memory, 128-thread workgroup. Runs N steps in one kernel call. ~150x faster than batch. **Only works when** `nSystems==1, nvecs<=128, nnode<=64, no non-bonded`.
-- **`relax_batch`**: Per-step kernel launches with `queue.finish()` only at end. Faster than per-step sync but still has kernel launch overhead per step.
+### Remaining suspected bottlenecks (GUI)
 
-### Suspected bottlenecks
+1. **GUI callback overhead** every batch (`get_state` + refresh + `processEvents`)
+2. **Serial unavailable** when non-bonded / GridFF / nvecs>192
+3. Kernel launch overhead in batch mode for large systems
 
-1. **GUI callback overhead**: `_cb()` calls `get_state()` + `_sync_positions_to_graph()` + `refresh_view()` + `processEvents()` **every batch**. If `batch_size` is small (e.g. 100 steps), this means frequent GPU→CPU transfers and Qt redraws during relaxation. This is likely the #1 bottleneck for perceived speed.
+## Optimization targets (still open)
 
-2. **Serial kernel not used**: `_can_use_serial()` requires `nvecs <= 128, nnode <= 64`. For molecules with > 64 atoms or > 128 bond vectors, falls back to `relax_batch`. Check if threshold is too conservative or if large molecules always hit batch path.
+1. Reduce GUI callback frequency (refresh every N batches or only at end)
+2. Optional WG=256 with even tighter local packing if needed for larger PAHs
+3. Serial / fused kernel + GridFF (not started)
+4. Wire UFF into `FFController` GUI combo (still `NotImplementedError`)
 
-3. **Non-bonded enabled**: If `enable_nonbond=True` (default?), serial path is disabled. Non-bonded kernel may be slow or unnecessary for planar PAHs.
+## Future work — fused kernels completeness (do not start until scheduled)
 
-4. **Kernel launch overhead in batch mode**: `relax_batch` launches 4+ kernels per step (cleanForce, evalBond, evalAngle, evalDihedral, evalInversion, assembleForces, updateAtoms). For 5000 steps = 20,000+ kernel launches. Each launch has ~10μs overhead → 0.2s just in launches.
+Status: **planned / not started**. Notes only — no implementation yet.
 
-5. **Queue synchronization**: `relax_batch` only syncs at end, but `get_state()` in callback forces implicit sync via `cl.enqueue_copy` → blocks CPU until GPU finishes.
+### UFF fused (`kernels/UFF.cl` `relax_nsteps_local_UFF` / `relax_nsteps_global_UFF`)
 
-6. **FFController.build_ff() rebuild**: If GUI doesn't cache the controller between relax calls, every click rebuilds kernels + reallocates buffers.
+- [ ] **Torsions / dihedrals** in the fused multi-step kernels (parallel eval → force slots → gather, same pattern as angles — never serial `iL==0`).
+- [ ] **Inversions** in the same fused path (parity with multi-kernel UFF).
+- [ ] Parity test vs multi-kernel UFF on flat_1 / benzene (E, fmax, geometry).
+- Today fused UFF is **bonds + Fourier angles only**; that is why energies differ from full UFF multi-kernel.
 
-## Benchmarking plan
+### SPFF fused (`kernels/SPFF.cl` `relax_nsteps_serial` / `relax_nsteps_global`)
 
-### Step 1: Isolate GPU time from GUI overhead
+- [ ] Audit / complete **π–π** (`evalPiAling`) and **π–σ** (`evalAngCos` / Ksp) coverage in both local and global fused loops; keep parity with `getSPFFf4` / `relax_batch`.
+- [ ] Document which terms are in serial vs global vs batch; add L0 parity asserts if any term is missing.
 
-```python
-# In _on_relax, time the components:
-t0 = time.time()
-result = ctrl.relax_until_converged(...)  # pure GPU
-t_gpu = time.time() - t0
+### Substrate + non-covalent (fused path)
 
-# vs with callback:
-t0 = time.time()
-result = ctrl.relax_until_converged(..., callback=_cb, batch_size=nsteps)
-t_total = time.time() - t0
+- [ ] Wire **FAF** (`getSurfFolded` / `upload_folded_fit` + `relax_global(..., do_faf=True)`) into flat_1 / GUI substrate relax — analytic substrate, not GridFF-first.
+- [ ] Wire **non-covalent** (LJ/Coulomb exclusions, and/or GridFF) into fused multi-step kernels without falling back to per-step host launches.
+- [ ] Bench FAF fused vs GridFF batch on NaCl (speed + z_rel / energy).
 
-print(f"GPU: {t_gpu:.3f}s  Total: {t_total:.3f}s  GUI overhead: {t_total-t_gpu:.3f}s")
-```
-
-### Step 2: Benchmark serial vs batch
-
-```python
-# For same molecule, same nsteps:
-ctrl.md.relax_serial(nsteps=1000)  # time this
-ctrl.md.relax_batch(nsteps=1000)   # time this
-```
-
-### Step 3: Profile kernel times
-
-Use `cl.command_queue` profiling:
-
-```python
-import pyopencl as cl
-queue = cl.CommandQueue(ctx, properties=cl.command_queue_properties.PROFILING_ENABLE)
-# ... launch kernels ...
-# Get event profiling info: event.get_profiling_info(cl.profiling_info.START)
-```
-
-### Step 4: Test with increasing molecule size
-
-| Molecule | Atoms | nvecs | nnode | Serial? | Expected |
-|----------|-------|-------|-------|---------|----------|
-| Benzene | 12 | ~18 | 12 | Yes | < 0.1s |
-| Coronene | 24 | ~42 | 24 | Yes | < 0.2s |
-| Pentacene | 36 | ~66 | 36 | Yes | < 0.3s |
-| Triacene | 60 | ~100+ | 60 | Maybe | < 1s |
-| Large PAH (100+ atoms) | 100+ | >128 | >64 | No (batch) | < 2s |
-
-### Step 5: Test molecules
-
-User specified `flat_1.mol2` and `flat_1_relaxed.mol2` — need to create or locate these. Likely a flat PAH for testing relaxation convergence. Use coronene or pentacene from `data/xyz/` as fallback.
-
-## Optimization targets
-
-1. **Reduce callback frequency**: Only refresh GUI every N batches (e.g. every 1000 steps), not every batch. Or: run relaxation fully on GPU, only sync at end.
-2. **Increase serial threshold**: If `relax_serial` kernel can handle nvecs=256, raise the limit. Check local memory size.
-3. **Disable non-bonded for planar molecules**: Non-bonded (vdW) may not be needed for in-plane relaxation of PAHs.
-4. **Cache FFController**: Don't rebuild on every relax click if molecule hasn't changed topology.
-5. **Fire-and-forget relaxation**: Run relaxation in background thread, update GUI only at end or on timer.
+See also: `doc/ToDo/ToDo.agents.md` (Soon items), `doc/ARCHITECTURE_ROADMAP.md` §5, `doc/GUI_FF_Relaxation.md` § non-bonded gaps.
 
 ## Success criteria
 
 - Benzene (12 atoms): < 0.1s to convergence (fmax < 0.05)
 - Coronene (24 atoms): < 0.3s
 - Pentacene (36 atoms): < 0.5s
-- Large PAH (100+ atoms): < 2s
-- GUI remains responsive during relaxation (no freezing)
-- Serial kernel used for molecules ≤ 64 atoms
+- Large PAH (~100 atoms): < 2s — **flat_1 serial vacuum: 0.005 s / 2000 steps (GPU only)**
+- GUI remains responsive during relaxation
+- Serial kernel used for molecules with nvecs≤192, nnode≤96
 
 ## References
 
-- `spammm/forcefields/FFController.py` — relax_n, relax_until_converged, _can_use_serial
-- `spammm/forcefields/SPFF_cl.py` — relax_serial (line 1724), relax_batch (line 1703), run_step_basic (line 1637)
+- `spammm/forcefields/FFController.py` — relax_n, `_can_use_serial`
+- `spammm/forcefields/SPFF_cl.py` — `relax_serial` / `relax_batch`, `SERIAL_*` caps
+- `kernels/SPFF.cl` — `relax_nsteps_serial`
 - `spammm/forcefields/UFF_cl.py` — UFF relax path
-- `spammm/GUI/FFExtension.py` — _on_relax (line 382), _cb callback
-- `tests/test_forcefield.py` — existing FF tests (functional, not perf)
-- `tests/test_relax_serial.py` — serial vs batch parity test
+- `spammm/GUI/FFExtension.py` — GUI wiring
+- `tests/test_relax_flat1.py` — flat_1 systematic benchmarks
+- `tests/test_relax_serial.py` — serial vs batch parity

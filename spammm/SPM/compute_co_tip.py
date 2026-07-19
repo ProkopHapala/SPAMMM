@@ -4,6 +4,9 @@ Standalone script to compute CO tip density via SCF + PyOpenCL projection.
 Supports both FireCore and DFTB backends.
 Must run in separate process because Fireball cannot reallocate for different molecules.
 
+CO geometry: O at grid geometric center, C along +z (bond ~1.14 Å).
+Caller pads+rolls so O ends at array index (0,0,0) for FFT convolution.
+
 Usage:
     python compute_co_tip.py <output_dir> <grid_spec_json> <step> <nscf> <fdata_dir> <fdata_basis> [backend]
 
@@ -29,10 +32,9 @@ if backend == 'firecore':
     except (OSError, ImportError) as e:
         raise RuntimeError(f"[ERROR] FireCore backend requested but libFireCore.so not found: {e}")
 elif backend == 'dftb':
-    from spammm.quantum.DFTB.DFTBcore import DFTBcore
-    from spammm.quantum.DFTB import Grid_dftb as dg
     from spammm.quantum import DFTB_utils as du
-    from spammm.quantum.DFTB.DFTBplusParser import parse_wfc_hsd, convert_wfc_to_species_list_ang
+    from spammm.config_utils import get_dftb_basis_path
+    from spammm.SPM.AFM_utils import get_density_from_dftb_dense
 else:
     raise ValueError(f"Unknown backend: {backend}. Use 'firecore' or 'dftb'.")
 
@@ -79,11 +81,24 @@ def main():
     
     co_xyz = os.path.join(_ROOT, 'data', 'xyz', 'CO.xyz')
     co_types, co_pos = load_xyz(co_xyz)
-    
-    grid_center = np.array(grid_spec['origin']) + 0.5 * (np.array(grid_spec['ngrid']) - 1) * step
+    # Enforce O-first, C along +z from O (ignore file atom order if swapped)
+    if int(co_types[0]) != 8:
+        # swap so O is index 0
+        co_types = co_types[::-1].copy()
+        co_pos = co_pos[::-1].copy()
+    # Reset to O at (0,0,0), C at (0,0,|bond|) along +z
+    bond = float(np.linalg.norm(co_pos[1] - co_pos[0]))
+    co_pos = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, bond]], dtype=np.float64)
+
+    # Place O exactly on a voxel center (index n//2), C along +z.
+    # Using 0.5*(n-1)*step puts O between voxels for even n → broken XY symmetry.
+    ngrid = np.asarray(grid_spec['ngrid'], dtype=np.int32)
+    origin = np.asarray(grid_spec['origin'], dtype=np.float64)
+    ijk = ngrid // 2
+    grid_center = origin + ijk.astype(np.float64) * step
     co_pos = co_pos + grid_center
-    print(f"  Grid center: {grid_center}")
-    print(f"  CO positions (centered): O={co_pos[0]}, C={co_pos[1]}")
+    print(f"  O voxel index={tuple(ijk.tolist())}  pos={grid_center}")
+    print(f"  CO positions (O on voxel, C along +z): O={co_pos[0]}, C={co_pos[1]}  bond={bond:.4f} Å")
     print(f"  Using backend: {backend}")
     
     if backend == 'firecore':
@@ -137,69 +152,36 @@ def main():
         os.chdir(orig_cwd)
     
     elif backend == 'dftb':
+        # Use DFTBcore.get_dm_dense via get_density_from_dftb_dense — NOT manual outer(evecs).
+        # Manual MO outer-product is wrong for non-orthogonal DFTB basis (asymmetric tip, q≠10).
         basis_name = 'mio-1-1'
-        sk_prefix = du.get_sk_path(basis_name)
-        basis_hsd_path = du.WFC_HSD_PATHS.get(basis_name)
+        basis_hsd_path = get_dftb_basis_path(basis_name)
         if basis_hsd_path is None:
-            raise RuntimeError(f"Basis HSD file not found for {basis_name}. Check WFC_HSD_PATHS in DFTB_utils.py")
-        
+            basis_hsd_path = du.WFC_HSD_PATHS.get(basis_name)
+        if basis_hsd_path is None or not os.path.exists(basis_hsd_path):
+            raise RuntimeError(f"Basis HSD file not found for {basis_name}")
+
         work_dir = os.path.join(out_dir, 'dftb_work')
-        enames = ['C' if z == 6 else 'O' if z == 8 else 'H' for z in co_types]
-        
-        print(f"[CO Tip Subprocess] Running DFTB SCF on CO (nscf={nscf})...")
-        geo, evecs = du.run_dftb_for_density(work_dir, enames, co_pos, sk_prefix, xyz_fname='geom.xyz')
-        
-        occupations = geo['occupations']
-        norb = geo['norb']
-        dm_dense = np.zeros((norb, norb), dtype=np.float32)
-        for k in range(len(occupations)):
-            if occupations[k] > 0:
-                dm_dense += occupations[k] * np.outer(evecs[:, k], evecs[:, k])
-        
-        basis_data = parse_wfc_hsd(basis_hsd_path)
-        basis_ang = convert_wfc_to_species_list_ang(basis_data, resolution_bohr=0.04)
-        
-        norb_per_atom = []
-        orb_offsets = [0]
-        for name in enames:
-            sp = basis_data[name]
-            norb = sum(2 * orb['AngularMomentum'] + 1 for orb in sp['orbitals'])
-            norb_per_atom.append(norb)
-            orb_offsets.append(orb_offsets[-1] + norb)
-        norb_per_atom = np.array(norb_per_atom, dtype=np.int32)
-        orb_offsets = np.array(orb_offsets, dtype=np.int32)
-        
-        coords_bohr = co_pos * 1.8897259886
-        species_per_atom = list(range(len(enames)))
-        dftb_data = {
-            'coords_bohr': coords_bohr,
-            'species_per_atom': species_per_atom,
-            'species_names': enames
-        }
-        
-        projector, atoms_dict = dg.setup_gridprojector_from_dftb(dftb_data, basis_ang, verbosity=0, max_shells=2)
-        
-        print("  Projecting CO total density (DFTB)...")
-        rho_total = projector.project_density_dense(dm_dense.astype(np.float32), norb_per_atom, orb_offsets, atoms_dict, grid_spec)
-        
-        print("  Projecting CO neutral-atom density (DFTB)...")
-        geo_dict = {
-            'natoms': len(enames),
-            'species_per_atom': species_per_atom,
-            'species_names': enames,
-            'coords_bohr': coords_bohr
-        }
-        rho_na_grid = dg.project_neutral_density(geo_dict, projector, atoms_dict, grid_spec, basis_ang)
+        print(f"[CO Tip Subprocess] DFTB dense DM projection (basis={basis_name})...")
+        result = get_density_from_dftb_dense(
+            co_pos, co_types, basis_hsd_path, work_dir,
+            grid_spec=grid_spec, step=step, margin=4.0, z_extra=0.0, verbosity=0
+        )
+        rho_total = result['rho_scf'].astype(np.float32)
+        rho_na_grid = result['rho_na'].astype(np.float32)
     
     rho_delta = (rho_total - rho_na_grid).astype(np.float32)
     
     nx, ny, nz = rho_total.shape
     dV = step**3
-    q_total = rho_total.sum() * dV
-    q_delta = rho_delta.sum() * dV
+    q_total = float(rho_total.sum() * dV)
+    q_delta = float(rho_delta.sum() * dV)
+    peak = np.unravel_index(int(np.argmax(rho_total)), rho_total.shape)
     print(f"  CO rho_total: shape={rho_total.shape} range=[{rho_total.min():.4f},{rho_total.max():.4f}] q={q_total:.3f}")
     print(f"  CO rho_delta: range=[{rho_delta.min():.4f},{rho_delta.max():.4f}] q={q_delta:.3f}")
-    print(f"  CO centered at grid center ({nx//2},{ny//2},{nz//2})")
+    print(f"  Peak index={peak}  grid_center_idx=({nx//2},{ny//2},{nz//2})")
+    if abs(q_total - 10.0) > 1.0:
+        print(f"  WARNING: CO tip electron count q={q_total:.3f} far from 10 — check DM/projection")
     
     np.save(os.path.join(out_dir, 'co_rho_total.npy'), rho_total)
     np.save(os.path.join(out_dir, 'co_rho_delta.npy'), rho_delta)

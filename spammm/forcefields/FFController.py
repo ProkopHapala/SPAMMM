@@ -28,7 +28,7 @@ MASS_MAP = {'H': 1.0, 'C': 12.0, 'N': 14.0, 'O': 16.0, 'S': 32.0, 'P': 31.0,
 
 # Default relaxation parameters
 DEFAULT_DT = 0.01
-DEFAULT_DAMP = 0.1
+DEFAULT_DAMP = 0.9   # 0.1 under-damps large PAHs (fmax plateaus ~12); 0.9 matches test_forcefield / serial parity
 DEFAULT_FLIMIT = 100.0
 DEFAULT_PIN_K = 1e6  # constraint stiffness for pinned atoms
 
@@ -159,7 +159,13 @@ class FFController:
 
     def _can_use_serial(self, do_nb):
         """Check if relax_serial is applicable (single system, small enough, no non-bonded)."""
-        return (self.md.nSystems == 1 and self.md.nvecs <= 128 and self.md.nnode <= 64 and not do_nb)
+        from .SPFF_cl import SPFF_cl
+        return (self.md.nSystems == 1
+                and self.md.nvecs <= SPFF_cl.SERIAL_MAX_NVEC
+                and self.md.nnode <= SPFF_cl.SERIAL_MAX_NNODE
+                and self.md.natoms <= SPFF_cl.SERIAL_MAX_NATOM
+                and self.md.nvecs <= SPFF_cl.SERIAL_WG_SIZE
+                and not do_nb)
 
     def relax_n(self, nsteps=100, dt=None, damp=None, Flimit=None, do_nb=None):
         """Run nsteps of relaxation on GPU. Returns final energy.

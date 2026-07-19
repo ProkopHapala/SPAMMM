@@ -4,9 +4,9 @@ GPU-accelerated force field implementations and molecular dynamics. All OpenCL m
 
 - **FFController.py** — Pure-logic orchestrator: bridges AtomicSystem → forcefield build → GPU relaxation → positions/forces download (no Qt dependency)
 - **FFEvaluator.py** — Single-point UFF/SPFF `eval_fn(pos)→(E,F)` for finite-difference Hessians (`dynamics/Vibrations.py`)
-- **UFF_cl.py** — PyOpenCL UFF runtime: bonds, angles, torsions, inversions, LJ + electrostatic non-bonded (FIRE + velocity Verlet)
+- **UFF_cl.py** — PyOpenCL UFF runtime: bonds, angles, torsions, inversions, LJ + electrostatic non-bonded (FIRE + velocity Verlet). Fused multi-step: `relax_serial` / `relax_global` (bonds+angles today; torsions/dihedrals planned — see `doc/Tasks/PerfBenchmark_Relaxation.md`).
 - **UFFbuilder.py** — Converts AtomicSystem to UFF topology arrays (atom types, bonds, angles, torsions, inversions, exclusions)
-- **SPFF_cl.py** — PyOpenCL SPFFsp3 runtime with pi-orbital DOFs (FIRE + damped velocity Verlet)
+- **SPFF_cl.py** — PyOpenCL SPFFsp3 runtime with pi-orbital DOFs (FIRE + damped velocity Verlet). Fused: `relax_serial` / `relax_global` (+ optional FAF); π–π/π–σ audit + NB/FAF wiring tracked in same task doc.
 - **SPFFbuilder.py** — Converts AtomicSystem to SPFFsp3 topology arrays (positions, neighbors, bond/angle params, pi-orbitals)
 - **RigidBodyDynamics.py** — 6-DOF rigid body GPU dynamics with quaternion integration (symplectic Euler, Taylor-series quaternion exp)
 - **RigidBodyAFM.py** — High-level AFM scanning: molecule on tip via harmonic spring interacting with substrate GridFF (future: `spammm/surfaces/ContactSurface.py` quasi-2D sample potential)

@@ -700,7 +700,7 @@ def compose_and_relax(grads_pauli, grads_es, grads_vdw, scan_xs, scan_ys, height
     return df, tip_disp
 
 
-def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, atomPos, K_LAT=0.5,  K_RAD=20.0, bond_length=4.0,  use_gpu_relax=True, ppm_mode=False, afmulator=None):
+def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, atomPos, K_LAT=None,  K_RAD=20.0, bond_length=4.0,  use_gpu_relax=True, ppm_mode=False, afmulator=None):
     """
     Compose force field from total force field and run probe particle relaxation.
 
@@ -712,22 +712,26 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
         origin:        (3,) grid origin
         step:          grid spacing
         atomPos:       (natoms, 3) atom positions (for mol_z)
-        K_LAT:         lateral stiffness [eV/Ang^2]
+        K_LAT:         lateral stiffness [eV/Å²]; default Hapala 0.5 N/m ≈ 0.031 eV/Å²
+        K_RAD:         radial stiffness [eV/Å²]
         use_gpu_relax: True (default) = GPU relaxStrokes; False = legacy CPU scipy
         ppm_mode:      False (default) = 2D lateral-only relaxation (z fixed per slice);
-                       True = spherical PPM radial bond (CO-tip, L=4 Ang, Kr=1.0)
+                       True = spherical PPM radial bond (CO-tip, L=bond_length, Kr=K_RAD)
         afmulator:     AFMulator instance; created if None
 
     Returns:
         df:       (nx_s, ny_s, nz_s) frequency shift array
         tip_disp: dict with 'dx','dy' (nx_s, ny_s, nz_s) tip displacement
     """
+    if K_LAT is None:
+        K_LAT = afm.K_LAT_HAPALA_EV_A2
     mol_z     = float(atomPos[:,2].max())
     nx, ny, nz_ff = F_total.shape[:3]
 
     if use_gpu_relax:
         if ppm_mode:
-            print("  [compose_and_relax_total] GPU relaxStrokes spherical PPM (L=4, Kr=1.0)")
+            print("  [compose_and_relax_total] GPU relaxStrokes spherical PPM "
+                  f"(L={bond_length}Å, K_LAT={K_LAT:.4f} eV/Å² = {afm.stiffness_eVA2_to_Nm(K_LAT):.2f} N/m, K_RAD={K_RAD})")
             if afmulator is None:
                 afmulator = afm.AFMulator(use_morse=False, nloc=32, use_fire=False)
             afmulator.setup_fdbm_grid(F_total, origin, step)
@@ -1938,13 +1942,16 @@ def _co_tip_cache_dir():
 
 
 def _co_tip_cache_key(step, margin, fdata_dir, fdata_basis, backend='dftb'):
-    """Compute a deterministic cache key for CO tip parameters."""
+    """Compute a deterministic cache key for CO tip parameters.
+
+    Version suffix invalidates broken caches from manual MO outer-product DM (pre-v2).
+    """
     import hashlib
     # Normalize paths for portability
     fdata_dir_abs = os.path.normpath(os.path.abspath(fdata_dir))
     fdata_basis_abs = os.path.normpath(os.path.abspath(fdata_basis))
-    # Hash includes step, margin, backend, and fdata paths (basis files rarely change)
-    key_str = f"step={step:.6f}:margin={margin:.6f}:backend={backend}:fdata={fdata_dir_abs}:basis={fdata_basis_abs}"
+    # v2→v3: O snapped to voxel n//2 (not half-voxel geometric center)
+    key_str = f"v3:step={step:.6f}:margin={margin:.6f}:backend={backend}:fdata={fdata_dir_abs}:basis={fdata_basis_abs}"
     return hashlib.sha256(key_str.encode('utf-8')).hexdigest()[:16]
 
 
@@ -1995,15 +2002,15 @@ def _call_compute_co_tip_script(out_dir, grid_spec, step, nscf, fdata_dir, fdata
 
 
 def _pad_and_roll_co_tip(co_rho, target_shape):
-    """Pad CO density with zeros to target grid and roll so O atom is at index 0.
+    """Pad CO density with zeros to target grid and roll so O peak is at (0,0,0).
 
-    CO is centered in the target grid, then rolled by n//2 so O (at center)
-    moves to index 0, matching FFT convolution convention.
+    FFT convolution convention: tip origin (O atom) must sit at array index (0,0,0).
+    Finds the actual density peak after centering (robust to odd/even ngrid), then rolls.
     """
     nx_t, ny_t, nz_t = target_shape
     nx_c, ny_c, nz_c = co_rho.shape
 
-    # Center CO in target grid
+    # Center CO block in target grid
     ox = (nx_t - nx_c) // 2
     oy = (ny_t - ny_c) // 2
     oz = (nz_t - nz_c) // 2
@@ -2011,12 +2018,75 @@ def _pad_and_roll_co_tip(co_rho, target_shape):
     padded = np.zeros(target_shape, dtype=np.float32)
     padded[ox:ox+nx_c, oy:oy+ny_c, oz:oz+nz_c] = co_rho
 
-    # Roll so O atom (at center) moves to index 0
-    padded = np.roll(padded, -(nx_t // 2), axis=0)
-    padded = np.roll(padded, -(ny_t // 2), axis=1)
-    padded = np.roll(padded, -(nz_t // 2), axis=2)
-
+    # Roll actual peak (O) to index (0,0,0) — not assumed n//2
+    peak = np.unravel_index(int(np.argmax(np.abs(padded))), padded.shape)
+    for ax, p in enumerate(peak):
+        if p != 0:
+            padded = np.roll(padded, -int(p), axis=ax)
     return padded
+
+
+def get_tip_densities(tip_mode, target_shape, step, margin=4.0, sigma=0.7,
+                      basis='mio-1-1', output_dir=None, co_tip_dir=None,
+                      fdata_dir=None, fdata_basis=None, backend='dftb',
+                      force_recompute=False):
+    """Prepare tip densities for FDBM Pauli/ES convolution.
+
+    tip_mode:
+      'gaussian' — isotropic Gaussian at (0,0,0) (fast; ES uses same as Pauli)
+      'co'       — real CO tip density (O at (0,0,0) after roll, C along +z)
+
+    Returns (rho_tip_total, rho_tip_delta) as float32, already FFT-rolled to (0,0,0).
+    """
+    tip_mode = tip_mode.lower()
+    nx, ny, nz = target_shape
+
+    if tip_mode == 'gaussian':
+        rho_total = afm.build_gaussian_tip((nx, ny, nz), step, sigma).astype(np.float32)
+        rho_delta = rho_total  # no NA subtraction for Gaussian model
+        print(f"  Tip mode=gaussian  sigma={sigma}  shape={rho_total.shape}  peak@{(0,0,0)}  q≈{rho_total.sum()*step**3:.3f}")
+        return rho_total, rho_delta
+
+    if tip_mode != 'co':
+        raise ValueError(f"Unknown tip_mode={tip_mode!r}; use 'gaussian' or 'co'")
+
+    if fdata_dir is None:
+        fdata_dir = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tests', 'pyFireball', 'Fdata'))
+    if fdata_basis is None:
+        fdata_basis = os.path.join(fdata_dir, 'basis')
+    if output_dir is None:
+        output_dir = os.path.join(os.path.expanduser('~'), '.cache', 'firecore', 'co_tip_work')
+    os.makedirs(output_dir, exist_ok=True)
+
+    co_rho_total_raw = co_rho_delta_raw = None
+    if co_tip_dir is not None and os.path.isdir(co_tip_dir) and not force_recompute:
+        print(f"  Loading precomputed CO tip from {co_tip_dir}...")
+        co_rho_total_raw = np.load(os.path.join(co_tip_dir, 'co_rho_total.npy'))
+        co_rho_delta_raw = np.load(os.path.join(co_tip_dir, 'co_rho_delta.npy'))
+    if co_rho_total_raw is None and not force_recompute:
+        cached = _get_cached_co_tip(step, margin, fdata_dir, fdata_basis, backend=backend)
+        if cached is not None:
+            print(f"  Loading cached CO tip (step={step}, margin={margin}, backend={backend})...")
+            co_rho_total_raw, co_rho_delta_raw = cached
+    if co_rho_total_raw is None:
+        print(f"  Computing CO tip on-the-fly (step={step}, backend={backend})...")
+        co_tip_work = os.path.join(output_dir, 'co_tip_work')
+        os.makedirs(co_tip_work, exist_ok=True)
+        co_grid_spec, co_ngrid, co_origin = _compute_co_tip_grid(step=step, margin=margin)
+        print(f"  CO grid: ngrid={co_ngrid}, origin={co_origin}")
+        _call_compute_co_tip_script(co_tip_work, co_grid_spec, step, 100, fdata_dir, fdata_basis, backend=backend)
+        co_rho_total_raw = np.load(os.path.join(co_tip_work, 'co_rho_total.npy'))
+        co_rho_delta_raw = np.load(os.path.join(co_tip_work, 'co_rho_delta.npy'))
+        _save_cached_co_tip(co_rho_total_raw, co_rho_delta_raw, step, margin, fdata_dir, fdata_basis, backend=backend)
+
+    rho_total = _pad_and_roll_co_tip(co_rho_total_raw, target_shape)
+    rho_delta = _pad_and_roll_co_tip(co_rho_delta_raw, target_shape)
+    peak = np.unravel_index(int(np.argmax(np.abs(rho_total))), rho_total.shape)
+    q = float(rho_total.sum() * step**3)
+    print(f"  Tip mode=co  raw={co_rho_total_raw.shape} → rolled={rho_total.shape}  peak={peak}  q={q:.3f}")
+    if peak != (0, 0, 0):
+        print(f"  WARNING: CO tip peak not at (0,0,0) after roll: {peak}")
+    return rho_total.astype(np.float32), rho_delta.astype(np.float32)
 
 
 def _plot_co_tip_diagnostics(co_rho_total, co_rho_delta, output_dir, origin, step, title_suffix=""):
