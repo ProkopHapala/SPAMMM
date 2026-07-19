@@ -23,14 +23,15 @@ PyQt5 GUI for molecular editing and AFM simulation. Main window combines VisPy 3
 
 ## Extensions
 
-- **AFMExtension.py** — FDBM AFM/STM panel; **K_LAT in N/m** (converted to eV/Å² internally). Prefer grid step ≤0.1 Å. See `doc/Tasks/AFMTesting.md` lessons (Jul 2026).
+- **AFMExtension.py** — FDBM AFM/STM panel (GUI uses ModularPipeline only). **K_LAT in N/m** → eV/Å² internally. Default plot z=3.0 Å; atom overlay checkbox replots live; atoms as `'.'` dots. Prefer grid step ≤0.1 Å. Perf via pipeline `SPAMMM_AFM_FAST_S3` — see `doc/Tasks/PerfBenchmark_FDBM.md`, `doc/Tasks/AFMTesting.md`.
 - **KekuleExtension.py** — Kekulé π-bond-order solver panel
 - **FoldedRigidExtension.py** — Folded-basis rigid-body manipulation panel (load molecule, fit/load substrate potential, drag atoms)
 - **AsciiArtExtension.py** — ASCII art → molecule; must match `build_ascii_hbond_system` pipeline for DFTB scans
 - **ReactionCoordinateExtension.py** — H-bond RC scan: import graph, DFTB methods, slider, bond viz, ESP animation
 - **rc_esp_view.py** — Blitted ESP heatmap synced to RC slider (uses `mpl_blit.py`)
 - **rc_scan_gui_script.py** — Headless setup helper for review scripts
-- **AFMExtension.py**, **FFExtension.py**, **QEqExtension.py**, **VibrationExtension.py** — simulation / FF / charge / normal-mode panels
+- **FFExtension.py**, **QEqExtension.py**, **VibrationExtension.py** — FF relax / charge / normal-mode panels
+- **FragmentExtension.py**, **DFTBExtension.py** — fragment browser / DFTB panel
 
 ## Control scripts (`gui_scripts/`)
 

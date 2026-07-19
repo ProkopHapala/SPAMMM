@@ -428,7 +428,7 @@ Test `stage5_stm` and `stage6_br_stm`. See `doc/Topics/STM/`.
 | Phase | Code Status | Test Status |
 |-------|-----------|-------------|
 | Phase 1 (Morse+Coulomb) | ✅ Complete | ✅ Tests written, ⏳ need to run |
-| Phase 2 (FDBM) | ✅ Complete (ModularAFMPipeline + physics functions) | ❌ No tests — 4 tiers planned |
+| Phase 2 (FDBM) | ✅ Complete (ModularAFMPipeline + FAST_S3 perf) | ✅ Tests exist (`test_afm_fdbm.py` + parity); GUI verified |
 | Parameter fitting | ✅ Methodology documented | ❌ Not started |
 | STM | ✅ stage5/stage6 implemented | ❌ Not started |
 
@@ -468,16 +468,27 @@ Plot **`Tip |dxy| (PP)`** and `|dxy|_max` per height — not only `df`. Sharp bo
 
 ---
 
-## Round-2 FDBM performance TODOs (notes only — after commit)
+## Round-2 FDBM performance — **achieved** (2026-07-19)
 
-Full write-up + speedup report: **`doc/Tasks/PerfBenchmark_FDBM.md`**.
+Full numbers + env switches: **`doc/Tasks/PerfBenchmark_FDBM.md`**. GUI cosmetic: default plot z=3.0 Å; atom overlay checkbox replots; atoms drawn as `'.'` dots.
 
-**Already achieved (Round 1, do not re-do):** GPU `build_tasks` + gpyFFT (device k-mul) + dense NA density + shared AFMulator + drop duplicate S4 scan + uncompressed `np.savez`. Flat_1 warm S3+S4 ~**1.4 s** (was many seconds / GUI stuck on compressed cache ~10 s + NA orbital loop ~6 s).
+### Speedup summary (RTX 3090)
 
-**Next (implement later):**
+| Case | Before | After |
+|------|--------|-------|
+| Benzene warm end-to-end (tip=co, step=0.1) | ~**1.65 s** | ~**0.18 s** (R2) / ~0.55 s (R1 GPU wiring) |
+| Benzene Stage 3 fields | ~**0.26 s** legacy | **~0.07 s** (`SPAMMM_AFM_FAST_S3=1`) |
+| Flat_1 S2 `rho_na` (96 atoms) | **5.87 s** | **0.03 s** |
+| Flat_1 S3 disk cache | ~**10 s** (`savez_compressed`) | **~0.4 s** (`savez`) |
+| Flat_1 warm S3+S4 (NO_IO) | GUI felt stuck | **~1.4 s** |
 
-1. **GPU `pauli_scale` + tip pad/roll** (and `E_total` sum) — eliminate host CPU; then keep arrays on GPU.
-2. **Fuse Poisson + ES FFTs:** \(E_\mathrm{ES}(k)\propto\rho_\mathrm{diff}(k)\,\tilde\rho_\mathrm{tip}(k)/k^2\) is correct for the ES energy field (use `rho_diff` + tip delta; match conv/corr convention). Saves one large-grid FFT round-trip. Pauli stays separate (`overlap^β`).
-3. **Stay-on-GPU** buffers S3→S4 once (1) lands.
-4. **Benchmark** skip/async stage cache write for interactive GUI.
-5. **Benchmark** coarser `step=0.15` interactive path — **not default** (benzene hex symmetry / `q_diff` — §2 above).
+### What landed
+
+**Round 1:** GPU `build_tasks` + gpyFFT (device k-mul) + dense NA DM + shared AFMulator + no duplicate S4 scan + uncompressed cache + `AFMBench`.
+
+**Round 2 (default ON):** fused Poisson+ES in k-space; GPU tip pad/roll + Pauli scale; device compose→gradient→`setup_fdbm_grid_from_img`. Legacy: `SPAMMM_AFM_FAST_S3=0`. Parity: `test_fdbm_fast_s3_parity_pauli_es`.
+
+### Still open (polish)
+
+1. Benchmark skip/async stage cache write for interactive GUI
+2. Benchmark coarser `step=0.15` interactive — **not default** (benzene hex symmetry / `q_diff` — §2 above)

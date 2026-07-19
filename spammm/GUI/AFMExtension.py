@@ -282,8 +282,7 @@ def _ensure_stages_for_component(window, component):
             dirty.clean('s4')
             window._afm_results = {'df': df, 'tip_disp': tip_disp, 'FEs_relax': FEs_relax,
                                     'heights': pipe.heights, 'scan_xs': pipe.scan_xs, 'scan_ys': pipe.scan_ys}
-            mid_z = float(pipe.heights[len(pipe.heights)//2])
-            window.afm_z_height_spin.setValue(mid_z)
+            # Keep UI z-height (default 3.0 Å); do not jump to mid-scan height
 
     if component == "AFM Image (df)":
         _need_s1_to_s4()
@@ -409,9 +408,8 @@ def run_afm_full_pipeline(window):
                 window._afm_results['br_stm_grid'] = br_stm_grid
                 dirty.clean('s6')
 
-        mid_z = float(pipe.heights[len(pipe.heights)//2])
-        window.afm_z_height_spin.setValue(mid_z)
-        plot_afm_slice(window)  # Always show plot — setValue won't emit valueChanged if unchanged
+        # Keep UI z-height (default 3.0 Å); do not jump to mid-scan height
+        plot_afm_slice(window)
 
         nz = df.shape[2]
         msg = f"Done [{dirty.status_str()}]  df=[{df.min():.2f},{df.max():.2f}]Hz  {nz} heights"
@@ -509,9 +507,8 @@ def run_afm_stage4(window):
             'df': df, 'tip_disp': tip_disp, 'FEs_relax': FEs_relax,
             'heights': pipe.heights, 'scan_xs': pipe.scan_xs, 'scan_ys': pipe.scan_ys,
         }
-        mid_z = float(pipe.heights[len(pipe.heights)//2])
-        window.afm_z_height_spin.setValue(mid_z)
-        plot_afm_slice(window)  # Always show plot — setValue won't emit valueChanged if unchanged
+        # Keep UI z-height (default 3.0 Å); do not jump to mid-scan height
+        plot_afm_slice(window)
         _update_afm_status(window, f"Stage 4 done. [{window._afm_dirty.status_str()}]")
     except Exception as e:
         _update_afm_status(window, f"FAILED: {e}")
@@ -1124,6 +1121,13 @@ def build_ui(window):
     window.afm_show_atoms.setChecked(True)
     window.afm_show_atoms.setToolTip("Show atom positions as colored dots on AFM/STM/orbital plots")
     viz_layout.addWidget(window.afm_show_atoms)
+
+    def on_show_atoms_changed(_state=None):
+        has_data = (window._afm_results is not None) or (window._afm_potentials is not None) or (window._afm_density is not None)
+        if has_data:
+            try: plot_afm_slice(window)
+            except Exception: pass
+    window.afm_show_atoms.stateChanged.connect(on_show_atoms_changed)
 
     plot_btn = QtWidgets.QPushButton("Plot Slice")
     plot_btn.clicked.connect(lambda: plot_afm_slice(window))

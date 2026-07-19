@@ -20,6 +20,8 @@ Env:
   SPAMMM_AFM_CPU_TASKS=1     CPU build_tasks (parity)
   SPAMMM_AFM_CPU_FFT=1       NumPy FFT (parity)
   SPAMMM_AFM_NA_ORBITAL_LOOP=1  legacy per-AO rho_na (slow; parity)
+  SPAMMM_AFM_FAST_S3=0       legacy Stage-3 (default=1: fused ES + GPU pad/scale)
+  SPAMMM_AFM_DIAG_DOWNLOAD=1 force V_ES host download in fast path
 """
 import os
 import sys

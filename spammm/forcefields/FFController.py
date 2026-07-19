@@ -20,6 +20,8 @@ import numpy as np
 
 from .SPFFbuilder import SPFF
 from .SPFF_cl import SPFF_cl
+from .UFF_cl import UFF_cl
+from .LFFSolver import LFFSolver
 from ..topology.FFparams import SPFFparams
 
 # Mass lookup for apos.w (kernel uses it for velocity Verlet)
@@ -101,8 +103,25 @@ class FFController:
         elif self.ff_type == 'uff':
             # TODO: UFF path needs UFF_cl kernel integration with SPFF_cl
             raise NotImplementedError("UFF relaxation path not yet integrated with MD engine")
+        elif self.ff_type == 'lff':
+            return self._build_lff(sys)
         else:
-            raise ValueError(f"Unknown ff_type={self.ff_type!r}, expected 'spff' or 'uff'")
+            raise ValueError(f"Unknown ff_type={self.ff_type!r}, expected 'spff', 'uff', or 'lff'")
+
+    def _build_lff(self, sys):
+        """Build linearized LFF springs from UFF topology (projective Jacobi)."""
+        uff = UFF_cl(bPrint=False)
+        uff_data = uff.toUFF(sys)
+        self.uff = uff
+        self.lff = LFFSolver(bPrint=False)
+        self.lff.from_uff(uff_data, mol=sys, mass=1.0)
+        self.md = self.lff  # alias for upload_folded_fit / relax API
+        self.sys = sys
+        self.natoms = self.lff.nAtomTot
+        self._pinned_mask = np.zeros(self.natoms, dtype=bool)
+        self._pinned_positions = np.zeros((self.natoms, 3), dtype=np.float32)
+        self._built = True
+        return {'ff_type': 'lff', 'natoms': self.natoms, 'nsticks': len(self.lff.sticks)}
 
     def _build_spff(self, sys):
         """Build SPFF forcefield and pack to GPU."""

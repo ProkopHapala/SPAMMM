@@ -7,7 +7,7 @@ Quantum chemistry integration: DFTB+ scans, Hessians for vibrations, electron de
 - **esp_grid.py** — Precompute Coulomb ESP stacks `[nframes, ny, nx]` from charges (KE/r, same as QEq)
 - **hbond_scan.py** — Legacy ASCII rigid proton-transfer scan (0.1 Å axis steps); kept for existing tests
 - **pySCF_utils.py** — pySCF RHF/DFT grid densities
-- **DFTB/** — ctypes wrapper, basis parser, GPU density projection, basis optimizer
+- **DFTB/** — ctypes wrapper, basis parser, GPU density projection (dense NA DM default for FDBM), basis optimizer — see `DFTB/README.md`
 
 ## Reaction-coordinate scan (graph / GUI)
 

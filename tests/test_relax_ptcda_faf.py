@@ -1,13 +1,13 @@
-"""PTCDA on NaCl via FAF substrate + fused UFF/SPFF multi-step kernels.
+"""PTCDA on NaCl via FAF substrate + fused UFF/SPFF/LFF multi-step kernels.
 
 Uses charges from data/xyz/PTCDA.xyz (4th column on O/H) so FAF Coulomb
-types distinguish anhydride O (q=-0.2) from C/H.
+types distinguish anhydride O from C/H.
 
 Artifacts: debug/test_relax_ptcda_faf/
-  - ff_topology.out / ff_topology.png — intramolecular bonds (UFF/findBonds)
-  - before/after .xyz (molecule + replicated substrate)
-  - .png with substrate + O–Na links labeled by d3D
-  - speed / O–Na / O–C Δz table .out
+  - ff_topology / lff_topology — intramolecular bonds and LFF K12/K13/K14 sticks
+  - before/after .xyz + geometry png (xy+xz)
+  - lff_outer_sweep.out — iterations vs geometry
+  - speed_summary.out
 """
 import os
 import time
@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 
 from spammm.AtomicSystem import AtomicSystem
 from spammm.forcefields.UFF_cl import UFF_cl
+from spammm.forcefields.LFFSolver import LFFSolver
 from spammm.forcefields.FFController import FFController
 from spammm.surfaces.FoldedRigid import (
     fit_folded_for_molecule, save_fit, load_fit, load_substrate, replicate_substrate,
@@ -32,6 +33,11 @@ NSTEPS = 8000
 DT = 0.01
 DAMP = 0.9
 FLIMIT = 100.0
+# LFF: large outer dt + Jacobi inners (projective); fewer outers than explicit MD
+LFF_DT = 0.04
+LFF_NINNER = 16
+LFF_NOUTER = 200
+LFF_OUTER_SWEEP = (50, 100, 200, 500, 1000)
 # Start off-registry + in-plane rotation so lateral O→Na relaxation is visible
 XY_SHIFT = (1.5, 1.0)  # Å
 ROT_Z_DEG = 18.0       # in-plane rotation about molecule COM
@@ -315,10 +321,52 @@ def _permute_fit_atypes(fit, mol):
     return fit2
 
 
+def _dump_lff_topology(outdir, mol, sticks):
+    """Plot K12/K13/K14 linearized springs for LFF."""
+    from matplotlib.lines import Line2D
+    pos = np.asarray(mol.apos, dtype=np.float64)
+    enames = list(mol.enames)
+    colors = {'bond': 'tab:red', 'angle': 'tab:green', 'dihedral': 'tab:blue'}
+    counts = {t: 0 for t in colors}
+    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
+    for i, j, l0, k, tag in sticks:
+        counts[tag] = counts.get(tag, 0) + 1
+        c = colors.get(tag, '0.5')
+        ax.plot([pos[i, 0], pos[j, 0]], [pos[i, 1], pos[j, 1]], color=c, lw=0.9 if tag == 'bond' else 0.55, alpha=0.75, zorder=1)
+    for e, c, s in (('C', 'k', 28), ('O', 'tab:red', 70), ('H', '0.7', 16)):
+        m = [i for i, ee in enumerate(enames) if ee == e]
+        if m:
+            ax.scatter(pos[m, 0], pos[m, 1], c=c, s=s, zorder=3)
+    ax.set_aspect('equal')
+    ax.set_title(f'LFF linearized springs  K12={counts.get("bond",0)} K13={counts.get("angle",0)} K14={counts.get("dihedral",0)}')
+    ax.legend(handles=[
+        Line2D([0], [0], color='tab:red', lw=2, label=f'K12 bond ({counts.get("bond",0)})'),
+        Line2D([0], [0], color='tab:green', lw=2, label=f'K13 angle ({counts.get("angle",0)})'),
+        Line2D([0], [0], color='tab:blue', lw=2, label=f'K14 dihedral ({counts.get("dihedral",0)})'),
+    ], loc='upper right', fontsize=8)
+    png = os.path.join(outdir, 'lff_topology.png')
+    fig.tight_layout()
+    fig.savefig(png, dpi=130)
+    plt.close(fig)
+    out = os.path.join(outdir, 'lff_topology.out')
+    lines = [
+        'LFF linearized topology from UFF (K12 bonds, K13 angles, K14 dihedrals)',
+        f'nsticks={len(sticks)}  K12={counts.get("bond",0)} K13={counts.get("angle",0)} K14={counts.get("dihedral",0)}',
+        'i j tag l0 k',
+    ]
+    for i, j, l0, k, tag in sticks:
+        lines.append(f'{i:3d} {j:3d} {tag:8s} {l0:8.4f} {k:10.4f}')
+    with open(out, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    print(f'REVIEW: {out}', flush=True)
+    print(f'REVIEW: {png}', flush=True)
+    return out, png
+
+
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_ptcda_faf_fused_pipelines(make_review):
-    """SPFF serial/global + UFF local/global on PTCDA+FAF NaCl; artifacts + speed table."""
+    """SPFF serial/global + UFF local/global + LFF FAF on PTCDA+NaCl; artifacts + speed table."""
     rev = make_review('ptcda_faf')
     outdir = _outdir()
     assert os.path.isfile(PTCDA), PTCDA
@@ -337,6 +385,14 @@ def test_ptcda_faf_fused_pipelines(make_review):
     rev.out(f'topology nbonds={len(bonds)} REVIEW: {topo_out} REVIEW: {topo_png}')
     _faf_force_report(outdir, fit, apos0, enames0, z_top)
 
+    # LFF spring topology (from UFF linearization)
+    uff_topo = UFF_cl(bPrint=False)
+    uff_data0 = uff_topo.toUFF(mol0)
+    lff_probe = LFFSolver(bPrint=False)
+    sticks0 = lff_probe.from_uff(uff_data0, mol=mol0, mass=1.0)
+    lff_topo_out, lff_topo_png = _dump_lff_topology(outdir, mol0, sticks0)
+    rev.out(f'LFF sticks={len(sticks0)} REVIEW: {lff_topo_out} REVIEW: {lff_topo_png}')
+
     sub_apos, sub_enames, _, sub_lvec = load_substrate(SUB)
     sub_rep, sub_rep_e = replicate_substrate(
         sub_apos, sub_enames, sub_lvec, (-12, 12), (-12, 12), z_min=float(np.min(sub_apos[:, 2])) - 1.0)
@@ -347,6 +403,7 @@ def test_ptcda_faf_fused_pipelines(make_review):
         f'PTCDA + FAF NaCl fused pipelines  z_top={z_top:.3f} XY_SHIFT={XY_SHIFT} ROT_Z={ROT_Z_DEG} Z_REL={Z_REL}',
         f'R_Na={R_NA_ION} Q_O={Q_O} Q_H={Q_H} (Morse R0(O-Na)={1.75+R_NA_ION:.2f}; substrate q=±1; COULOMB_CONST=14.40)',
         f'nsteps={NSTEPS} dt={DT} damp={DAMP}  nbasis={fit["coeffs"].shape[1]} ntypes={fit["coeffs"].shape[0]}',
+        f'LFF: nOuter={LFF_NOUTER} nInner={LFF_NINNER} dt={LFF_DT} damp={DAMP} (sweep {LFF_OUTER_SWEEP})',
         f'device=NVIDIA (select_device preferred_vendor=nvidia)',
         '',
         f'{"tag":22s} {"t_s":>8s} {"E":>10s} {"fmax":>8s} {"z_min":>7s} {"meanBL":>7s} {"dONa3":>7s} {"dOCdz":>7s}',
@@ -397,6 +454,8 @@ def test_ptcda_faf_fused_pipelines(make_review):
         assert z_min - z_top > 0.8, f'{tag} crashed into surface: z_min={z_min} z_top={z_top}'
         # intramolecular: do not collapse (UFF angle bug previously drove meanBL~1.06)
         assert mean_bl > 1.20, f'{tag} intramolecular collapse meanBL={mean_bl}'
+        spanx = float(apos_final[:, 0].max() - apos_final[:, 0].min())
+        assert spanx > 8.0, f'{tag} lateral crumple spanx={spanx:.2f}'
         return mean_d3, dOCdz, n_pref_Na
 
     def spff_serial(mol, fit0):
@@ -456,10 +515,45 @@ def test_ptcda_faf_fused_pipelines(make_review):
         apos = np.asarray(uff.get_positions(), dtype=np.float64)
         return t, E, fmax, apos
 
+    def lff_faf(mol, fit0, n_outer=LFF_NOUTER):
+        uff = UFF_cl(bPrint=False)
+        uff_data = uff.toUFF(mol)
+        lff = LFFSolver(bPrint=False)
+        lff.from_uff(uff_data, mol=mol, mass=1.0)
+        lff.upload_folded_fit(fit0)
+        t0 = time.perf_counter()
+        st = lff.relax(n_outer=n_outer, n_inner=LFF_NINNER, dt=LFF_DT, damp=DAMP, do_faf=True)
+        t = time.perf_counter() - t0
+        apos = np.asarray(st['pos'][:, :3], dtype=np.float64)
+        # LFF has no force buffer; report displacement from init as proxy
+        disp = float(np.max(np.linalg.norm(apos - np.asarray(mol.apos, dtype=np.float64), axis=1)))
+        E = 0.0  # no energy accumulator in LFF kernel yet
+        return t, E, disp, apos
+
     mean_spff, dOCdz_spff, nNa_spff = _run_case('spff_serial_faf', 'SPFF serial+FAF', spff_serial)
     _run_case('spff_global_faf', 'SPFF global+FAF', spff_global)
     _run_case('uff_local_faf', 'UFF local+FAF', uff_local)
     _run_case('uff_global_faf', 'UFF global+FAF', uff_global)
+    _run_case('lff_faf', f'LFF+FAF nOuter={LFF_NOUTER}', lambda mol, fit0: lff_faf(mol, fit0, LFF_NOUTER))
+
+    # LFF outer-step sweep (iteration count vs geometry)
+    sweep_lines = ['LFF outer sweep (nInner=%d dt=%.3f)' % (LFF_NINNER, LFF_DT),
+                   f'{"nOuter":>8s} {"t_s":>8s} {"meanBL":>8s} {"dOCdz":>8s} {"dONa3":>8s}']
+    for nout in LFF_OUTER_SWEEP:
+        mol_s, _, _ = _load_ptcda_placed()
+        t, E, fmax, apos_s = lff_faf(mol_s, fit, n_outer=nout)
+        mb = _mean_bond_len(apos_s, bonds)
+        dz = _oc_delta_z(apos_s, list(mol_s.enames))
+        ona_s = _o_na_stats(apos_s, list(mol_s.enames), sub_rep, sub_rep_e)
+        md3 = float(np.mean([dNa for _, dNa, _, _, _ in ona_s]))
+        sweep_lines.append(f'{nout:8d} {t:8.4f} {mb:8.4f} {dz:8.4f} {md3:8.4f}')
+        print(f'[LFF sweep] nOuter={nout} t={t:.4f}s meanBL={mb:.4f} dOCdz={dz:.4f} dONa3={md3:.4f}', flush=True)
+    sweep_path = os.path.join(outdir, 'lff_outer_sweep.out')
+    with open(sweep_path, 'w') as f:
+        f.write('\n'.join(sweep_lines) + '\n')
+    print(f'REVIEW: {sweep_path}', flush=True)
+    for L in sweep_lines:
+        rev.out(L)
 
     ona0 = _o_na_stats(apos0, enames0, sub_rep, sub_rep_e)
     mean0_d3 = float(np.mean([dNa for _, dNa, _, _, _ in ona0]))

@@ -34,6 +34,8 @@
 //   - evalMorseC_QZs_toImg: Evaluate Morse + Coulomb at Z-slices to image.
 //   - evalDispersion_toImg: Evaluate London dispersion at Z-slices to image.
 //   - gradient_central_diff: Numerical gradient via central differences on grid.
+//   - fdbm_pad_roll_f32 / fdbm_flip3_f32 / fdbm_*_fft_* / fdbm_scale_pauli_pow_f32 /
+//     fdbm_compose_E_to_img / fdbm_mul_poisson_tip_c64 — Round-2 fast S3 (switchable)
 //
 // Helper functions: tipForce (spring force), read_imagef_trilin/trilin_
 // (manual trilinear interpolation), interpFE/interpFE_prec (field sampling),
@@ -1188,4 +1190,114 @@ __kernel void gradient_central_diff(
 
     // Output: (Fx, Fy, Fz, E)
     write_imagef(imgOut, coord, (float4)(grad_x, grad_y, grad_z, f_center.x));
+}
+
+
+// ==========================
+//   FDBM fast-S3 helpers (Round 2) — NEW kernels; do not replace legacy paths
+//   Host layout for float buffers: (nx,ny,nz) C-order, idx = ix*(ny*nz)+iy*nz+iz
+//   FFT complex layout: (nz,ny,nx), idx = iz*(ny*nx)+iy*nx+ix
+// ==========================
+
+__kernel void fdbm_pad_roll_f32(
+    __global const float* src, const int sx, const int sy, const int sz,
+    __global float* dst, const int nx, const int ny, const int nz,
+    const int ox, const int oy, const int oz,
+    const int rx, const int ry, const int rz
+) {
+    // dst[i] = padded[(i+r)%n] with padded = zeros except block at (ox,oy,oz)
+    const int ix = get_global_id(0);
+    const int iy = get_global_id(1);
+    const int iz = get_global_id(2);
+    if (ix >= nx || iy >= ny || iz >= nz) return;
+    int jx = ix + rx; if (jx >= nx) jx -= nx; if (jx < 0) jx += nx;
+    int jy = iy + ry; if (jy >= ny) jy -= ny; if (jy < 0) jy += ny;
+    int jz = iz + rz; if (jz >= nz) jz -= nz; if (jz < 0) jz += nz;
+    float v = 0.0f;
+    const int lx = jx - ox, ly = jy - oy, lz = jz - oz;
+    if (lx >= 0 && lx < sx && ly >= 0 && ly < sy && lz >= 0 && lz < sz)
+        v = src[lx * (sy * sz) + ly * sz + lz];
+    dst[ix * (ny * nz) + iy * nz + iz] = v;
+}
+
+__kernel void fdbm_flip3_f32(
+    __global const float* src, __global float* dst,
+    const int nx, const int ny, const int nz
+) {
+    const int ix = get_global_id(0);
+    const int iy = get_global_id(1);
+    const int iz = get_global_id(2);
+    if (ix >= nx || iy >= ny || iz >= nz) return;
+    const int jx = nx - 1 - ix, jy = ny - 1 - iy, jz = nz - 1 - iz;
+    dst[ix * (ny * nz) + iy * nz + iz] = src[jx * (ny * nz) + jy * nz + jz];
+}
+
+__kernel void fdbm_xyz_to_fft_c64(
+    __global const float* src, __global float2* dst,
+    const int nx, const int ny, const int nz
+) {
+    const int ix = get_global_id(0);
+    const int iy = get_global_id(1);
+    const int iz = get_global_id(2);
+    if (ix >= nx || iy >= ny || iz >= nz) return;
+    const float v = src[ix * (ny * nz) + iy * nz + iz];
+    dst[iz * (ny * nx) + iy * nx + ix] = (float2)(v, 0.0f);
+}
+
+__kernel void fdbm_fft_real_to_xyz_f32(
+    __global const float2* src, __global float* dst,
+    const int nx, const int ny, const int nz
+) {
+    const int ix = get_global_id(0);
+    const int iy = get_global_id(1);
+    const int iz = get_global_id(2);
+    if (ix >= nx || iy >= ny || iz >= nz) return;
+    dst[ix * (ny * nz) + iy * nz + iz] = src[iz * (ny * nx) + iy * nx + ix].x;
+}
+
+__kernel void fdbm_scale_pauli_pow_f32(
+    __global float* field, const int n,
+    const float A, const float beta, const float clip_min
+) {
+    const int i = get_global_id(0);
+    if (i >= n) return;
+    float o = field[i];
+    if (o < clip_min) o = clip_min;
+    field[i] = A * native_powr(o, beta);
+}
+
+__kernel void fdbm_compose_E_to_img(
+    __global const float* E_pauli,
+    __global const float* E_es,
+    __read_only image3d_t img_vdw,
+    __write_only image3d_t img_E,
+    const int nx, const int ny, const int nz
+) {
+    const sampler_t smp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;
+    const int ix = get_global_id(0);
+    const int iy = get_global_id(1);
+    const int iz = get_global_id(2);
+    if (ix >= nx || iy >= ny || iz >= nz) return;
+    const float Ep = E_pauli[ix * (ny * nz) + iy * nz + iz];
+    const float Ee = E_es[ix * (ny * nz) + iy * nz + iz];
+    const float Ev = read_imagef(img_vdw, smp, (int4)(ix, iy, iz, 0)).w;
+    write_imagef(img_E, (int4)(ix, iy, iz, 0), (float4)(Ep + Ee + Ev, 0.0f, 0.0f, 0.0f));
+}
+
+__kernel void fdbm_mul_poisson_tip_c64(
+    __global float2* rho_k,
+    __global const float2* tip_k,
+    __global const float* k2_inv,
+    const float scale,
+    const int n
+) {
+    // rho_k *= tip_k * (scale * k2_inv); DC → 0
+    const int i = get_global_id(0);
+    if (i >= n) return;
+    if (i == 0) { rho_k[0] = (float2)(0.0f, 0.0f); return; }
+    const float2 a = rho_k[i];
+    const float2 b = tip_k[i];
+    const float s = scale * k2_inv[i];
+    // complex multiply a*b then *s
+    rho_k[i] = (float2)((a.x * b.x - a.y * b.y) * s, (a.x * b.y + a.y * b.x) * s);
 }

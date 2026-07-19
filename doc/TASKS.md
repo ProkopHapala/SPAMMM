@@ -10,13 +10,44 @@ who implement, test, and report back.
 
 | ID | Task | Priority | Status | Spec |
 |----|------|----------|--------|------|
-| T01 | AFM FDBM pipeline < 1s end-to-end | High | Not started | [`doc/Tasks/PerfBenchmark_FDBM.md`](Tasks/PerfBenchmark_FDBM.md) |
-| T02 | UFF/SPFF relaxation speedup (GUI) | High | Not started | [`doc/Tasks/PerfBenchmark_Relaxation.md`](Tasks/PerfBenchmark_Relaxation.md) |
+| T01 | AFM FDBM pipeline < 1s end-to-end | High | **Implementation done** (R1+R2; benzene warm ~0.2 s; flat_1 S3+S4 ~1.4 s) | [`doc/Tasks/PerfBenchmark_FDBM.md`](Tasks/PerfBenchmark_FDBM.md) |
+| T02 | UFF/SPFF/LFF relaxation speedup (GUI) | High | **In progress** — fused UFF+FAF + LFF bring-up; GUI callback / combo open | [`doc/Tasks/PerfBenchmark_Relaxation.md`](Tasks/PerfBenchmark_Relaxation.md) |
 | T03 | Fragment/Group library + substitution | Medium | Design done | [`doc/ARCHITECTURE_ROADMAP.md`](ARCHITECTURE_ROADMAP.md) §11 |
 | T04 | Molecular browser plugin port | Medium | Design done | [`doc/ARCHITECTURE_ROADMAP.md`](ARCHITECTURE_ROADMAP.md) §1 |
 | T05 | GridFF consolidation (B-spline vs trilinear) | Medium | Design done | [`doc/ARCHITECTURE_ROADMAP.md`](ARCHITECTURE_ROADMAP.md) §6 |
 | T06 | GUI verbosity consolidation | Low | Design done | [`doc/ARCHITECTURE_ROADMAP.md`](ARCHITECTURE_ROADMAP.md) §10 |
 | T07 | SMILES builder | Low | Not started | [`doc/ARCHITECTURE_ROADMAP.md`](ARCHITECTURE_ROADMAP.md) §9 |
+
+---
+
+## T01 note — FDBM perf (2026-07-19)
+
+**Spec:** `doc/Tasks/PerfBenchmark_FDBM.md`. Switch: `SPAMMM_AFM_FAST_S3=1` (default) / `=0` legacy.
+
+| Milestone | Before → After | Mechanism |
+|-----------|----------------|-----------|
+| Benzene warm GUI-like | ~1.65 s → ~**0.18–0.55 s** | GPU tasks + gpyFFT + fused S3 |
+| Flat_1 S2 `rho_na` | 5.87 s → **0.03 s** | dense NA DM |
+| Flat_1 S3 cache write | ~10 s → **~0.4 s** | uncompressed `np.savez` |
+| Benzene S3 fields | 0.26 s legacy → **0.07 s** fast | fused ES + GPU pad/scale |
+| Flat_1 warm S3+S4 (NO_IO) | “stuck” / many s → **~1.4 s** | R1+R2 |
+
+**Remaining (not blocking):** async cache skip for interactive GUI; optional `step=0.15` interactive (not quality default). Full write-up in PerfBenchmark_FDBM.md.
+
+---
+
+## T02 note — Relax perf / LFF (2026-07-19)
+
+**Spec:** `doc/Tasks/PerfBenchmark_Relaxation.md`. Topic: `doc/Topics/ForceFields/LFF_ProjectiveRelax.md`.
+
+| Milestone | Status | Notes |
+|-----------|--------|-------|
+| SPFF fused serial (flat_1) | Measured | ~0.005 s / 2000 steps vacuum |
+| UFF fused + dih/inv + FAF | Implemented | PTCDA force parity vs multi-kernel; physics vs SPFF **unverified** |
+| LFF projective + FAF | Implemented | PTCDA: 50×16 ≈ 0.004 s, dOCdz≈SPFF; **unverified** pending USER review |
+| GUI callback / UFF+LFF combo | Open | Main remaining T02 path to “instant Relax” button |
+
+Do **not** mark T02 Complete without USER confirmation of plots under `debug/test_relax_ptcda_faf/`.
 
 ---
 

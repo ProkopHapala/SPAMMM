@@ -168,6 +168,7 @@ Review paths:
 - **`relax_serial` (SPFF):** Single-kernel local-memory, WG=192. Runs N steps in one kernel call. ~160× faster than batch on flat_1. Caps above; no molecule–molecule non-bonded; **FAF optional** when fit uploaded.
 - **`relax_batch`:** Per-step kernel launches; sync at end (or each GUI callback).
 - **UFF fused:** `UFF_cl.relax_serial` / `relax_global` — bonds+angles+dihedrals+inversions (+ optional FAF). Not yet the default GUI path (`FFController` UFF combo still incomplete).
+- **LFF:** `LFFSolver.relax` — projective Jacobi on UFF-derived springs + optional FAF outer. `ff_type='lff'` builds; GUI combo not wired. See [`LFF_ProjectiveRelax.md`](../Topics/ForceFields/LFF_ProjectiveRelax.md).
 
 ### Remaining suspected bottlenecks (GUI)
 
@@ -180,7 +181,8 @@ Review paths:
 1. Reduce GUI callback frequency (refresh every N batches or only at end)
 2. Optional WG=256 with even tighter local packing if needed for larger PAHs
 3. Serial / fused kernel + GridFF (not started); bench FAF fused vs GridFF batch
-4. Wire UFF into `FFController` GUI combo (still `NotImplementedError`)
+4. Wire UFF / LFF into `FFController` GUI combo (still incomplete for non-SPFF)
+5. Prefer LFF for interactive adsorbate morphing once GUI wired (nOuter≈50)
 
 ## Fused kernels completeness — checklist
 
@@ -192,7 +194,8 @@ Status: **FAF + UFF torsions implemented**; geometry/charge dial-back and SPFF �
 - [x] Harness `tests/test_relax_ptcda_faf.py` + artifacts under `debug/test_relax_ptcda_faf/`
 - [x] UFF fused **Fourier angle force** fixed (parity vs multi-kernel)
 - [x] UFF fused **dihedrals (torsions)** + **inversions** (tiled gather; force parity on buckled PTCDA)
-- [ ] USER sign-off: SPFF/UFF FAF geometries and charge strength OK (or dial back)
+- [x] LFF bring-up (kernel + host + PTCDA topology/sweep) — see § LFF below
+- [ ] USER sign-off: SPFF/UFF/LFF FAF geometries and charge strength OK (or dial back)
 
 ### Still open
 
@@ -216,6 +219,36 @@ Status: **FAF + UFF torsions implemented**; geometry/charge dial-back and SPFF �
 
 See also: `doc/ToDo/ToDo.agents.md` (Soon items), `doc/ARCHITECTURE_ROADMAP.md` §5, `doc/GUI_FF_Relaxation.md` § non-bonded gaps.
 
+## LFF — linearized projective Jacobi (3rd relax path, 2026-07-19)
+
+**SSOT topic:** [`doc/Topics/ForceFields/LFF_ProjectiveRelax.md`](../Topics/ForceFields/LFF_ProjectiveRelax.md)
+
+**Goal:** fewer outer steps than explicit UFF/SPFF MD by solving hard geometry as distance springs (K₁₂/K₁₃/K₁₄) with \(M/dt^2\) Jacobi; soft FAF in the outer predictor. Mass scaling does **not** help (same atoms feel hard + soft); prefer **mass=1** and project hard terms.
+
+| Piece | Location |
+|-------|----------|
+| Kernel | `kernels/LFF.cl` — `lff_jacobi` (+ optional FAF) |
+| Host | `spammm/forcefields/LFFSolver.py` — `build_linearized_from_uff`, `relax()`, `upload_folded_fit()` |
+| FFController | `ff_type='lff'` |
+| Test | `tests/test_relax_ptcda_faf.py` — `lff_topology.png`, `lff_outer_sweep.out`, `lff_faf_*` |
+
+**Topology (PTCDA):** K₁₂=44, K₁₃=74, K₁₄=99 (from UFF). K₁₄ rest lengths from **current geometry**; \(K=\mathrm{clip}(40V,5,80)\) — never raw \(V/(dl/d\phi)^2\) (crumples XY).
+
+**Measured (RTX 3090, FAF NaCl):**
+
+| Method | steps | t_s | meanBL | dOCdz | notes |
+|--------|-------|-----|--------|-------|-------|
+| SPFF serial | 8000 | 0.07 | 1.34 | −0.63 | reference |
+| UFF fused | 8000 | 0.15 | 1.36 | −1.09 | |
+| **LFF** | **50** outer ×16 Jacobi | **0.004** | 1.34 | **−0.62** | closest to SPFF bend |
+| LFF | 200 ×16 | 0.014 | 1.34 | −1.29 | stronger O bend |
+
+Review: `debug/test_relax_ptcda_faf/lff_topology.png`, `lff_outer_sweep.out`, `lff_faf_geometry.png`.
+
+**Fit knobs:** `dt≈0.04`, `n_inner=16`, `damp=0.9`, `n_outer≈50` for SPFF-like bend (200 overshoots).
+
+**Open (unverified / polish):** energy accumulator; GUI combo for `lff`; default nOuter; mols>64 atoms; K₁₄ vs FAF tuning; no molecule–molecule NB in LFF yet. **Not** marked fixed pending USER confirmation.
+
 ## Success criteria
 
 - Benzene (12 atoms): < 0.1s to convergence (fmax < 0.05)
@@ -237,4 +270,5 @@ See also: `doc/ToDo/ToDo.agents.md` (Soon items), `doc/ARCHITECTURE_ROADMAP.md` 
 - `spammm/GUI/FFExtension.py` — GUI wiring
 - `tests/test_relax_flat1.py` — flat_1 systematic benchmarks
 - `tests/test_relax_serial.py` — serial vs batch parity
-- `tests/test_relax_ptcda_faf.py` — PTCDA + FAF fused pipelines
+- `tests/test_relax_ptcda_faf.py` — PTCDA + FAF fused pipelines + LFF
+- `doc/Topics/ForceFields/LFF_ProjectiveRelax.md` — LFF physics / API / pitfalls

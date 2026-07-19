@@ -702,7 +702,7 @@ def compose_and_relax(grads_pauli, grads_es, grads_vdw, scan_xs, scan_ys, height
     return df, tip_disp
 
 
-def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, atomPos, K_LAT=None,  K_RAD=20.0, bond_length=4.0,  use_gpu_relax=True, ppm_mode=False, afmulator=None):
+def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, atomPos, K_LAT=None,  K_RAD=20.0, bond_length=4.0,  use_gpu_relax=True, ppm_mode=False, afmulator=None, reuse_fdbm_grid=False):
     """
     Compose force field from total force field and run probe particle relaxation.
 
@@ -720,6 +720,7 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
         ppm_mode:      False (default) = 2D lateral-only relaxation (z fixed per slice);
                        True = spherical PPM radial bond (CO-tip, L=bond_length, Kr=K_RAD)
         afmulator:     AFMulator instance; created if None
+        reuse_fdbm_grid: if True, skip setup_fdbm_grid (fast-S3 already uploaded img_FF_fdbm)
 
     Returns:
         df:        (nx_s, ny_s, nz_s) frequency shift array
@@ -738,7 +739,8 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
                   f"(L={bond_length}Å, K_LAT={K_LAT:.4f} eV/Å² = {afm.stiffness_eVA2_to_Nm(K_LAT):.2f} N/m, K_RAD={K_RAD})")
             if afmulator is None:
                 afmulator = afm.AFMulator(use_morse=False, nloc=32, use_fire=False)
-            afmulator.setup_fdbm_grid(F_total, origin, step)
+            if not reuse_fdbm_grid:
+                afmulator.setup_fdbm_grid(F_total, origin, step)
             # Smaller dt=0.1, damp=0.3 for stability with weak forces (probe far from surface)
             relax_pars_ppm = [0.1, 0.1, 0.03, 0.1]  # dt, damp, alpha, dt_fire
             FEs_relax, tip_disp = afmulator.scan_fdbm( scan_xs, scan_ys, heights, mol_z=mol_z,  K_LAT=K_LAT, K_RAD=K_RAD, bond_length=bond_length,  relax_pars=relax_pars_ppm )
@@ -754,7 +756,8 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
             print("  [compose_and_relax_total] GPU relaxStrokes2D 2D lateral-only")
             if afmulator is None:
                 afmulator = afm.AFMulator(use_morse=False, nloc=32, use_fire=False)
-            afmulator.setup_fdbm_grid(F_total, origin, step)
+            if not reuse_fdbm_grid:
+                afmulator.setup_fdbm_grid(F_total, origin, step)
             FEs_relax, tip_disp = afmulator.scan_fdbm_2d(scan_xs, scan_ys, heights, mol_z=mol_z, K_LAT=K_LAT)
             # Diagnostic: report maximum displacement for each z-height
             from spammm.globals import DEBUG_PRINT_LEVEL
@@ -2037,14 +2040,18 @@ def _pad_and_roll_co_tip(co_rho, target_shape):
 def get_tip_densities(tip_mode, target_shape, step, margin=4.0, sigma=0.7,
                       basis='mio-1-1', output_dir=None, co_tip_dir=None,
                       fdata_dir=None, fdata_basis=None, backend='dftb',
-                      force_recompute=False):
+                      force_recompute=False, pad_mode='cpu'):
     """Prepare tip densities for FDBM Pauli/ES convolution.
 
     tip_mode:
       'gaussian' — isotropic Gaussian at (0,0,0) (fast; ES uses same as Pauli)
       'co'       — real CO tip density (O at (0,0,0) after roll, C along +z)
 
-    Returns (rho_tip_total, rho_tip_delta) as float32, already FFT-rolled to (0,0,0).
+    pad_mode:
+      'cpu'  — pad+roll on host to target_shape (legacy)
+      'none' — return raw CO arrays (possibly smaller); caller pads on GPU (fast S3)
+
+    Returns (rho_tip_total, rho_tip_delta) as float32.
     """
     tip_mode = tip_mode.lower()
     nx, ny, nz = target_shape
@@ -2087,6 +2094,11 @@ def get_tip_densities(tip_mode, target_shape, step, margin=4.0, sigma=0.7,
         co_rho_total_raw = np.load(os.path.join(co_tip_work, 'co_rho_total.npy'))
         co_rho_delta_raw = np.load(os.path.join(co_tip_work, 'co_rho_delta.npy'))
         _save_cached_co_tip(co_rho_total_raw, co_rho_delta_raw, step, margin, fdata_dir, fdata_basis, backend=backend)
+
+    if pad_mode == 'none':
+        from spammm.globals import debug_print
+        debug_print(1, f"  Tip mode=co  raw={co_rho_total_raw.shape} (GPU pad/roll deferred)")
+        return co_rho_total_raw.astype(np.float32), co_rho_delta_raw.astype(np.float32)
 
     rho_total = _pad_and_roll_co_tip(co_rho_total_raw, target_shape)
     rho_delta = _pad_and_roll_co_tip(co_rho_delta_raw, target_shape)

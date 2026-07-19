@@ -113,12 +113,13 @@ This **is** a supplement to:
 ## 2. Force Fields
 
 ### 2a. Intramolecular Force Fields
-- UFF (universal), SPFF (sp3 with pi-orbital nodes), rigid body dynamics
-- **Key files:** `spammm/forcefields/UFF_cl.py`, `spammm/forcefields/SPFF_cl.py`, `spammm/forcefields/UFFbuilder.py`, `spammm/forcefields/SPFFbuilder.py`, `spammm/forcefields/RigidBodyDynamics.py`
-- **Kernels:** `kernels/UFF.cl`, `kernels/SPFF.cl`, `kernels/rigid.cl`
-- **Controller:** `spammm/forcefields/FFController.py`
-- **Audit Documents:** [forcefields_overview.md](forcefields_overview.md), [intramolecular_forcefields.md](intramolecular_forcefields.md)
-- **Tests:** `tests/test_forcefield.py`
+- UFF (universal), SPFF (sp3 with pi-orbital nodes), **LFF** (projective Jacobi springs), rigid body dynamics
+- **Key files:** `spammm/forcefields/UFF_cl.py`, `spammm/forcefields/SPFF_cl.py`, `spammm/forcefields/LFFSolver.py`, `spammm/forcefields/UFFbuilder.py`, `spammm/forcefields/SPFFbuilder.py`, `spammm/forcefields/RigidBodyDynamics.py`
+- **Kernels:** `kernels/UFF.cl`, `kernels/SPFF.cl`, `kernels/LFF.cl`, `kernels/rigid.cl`
+- **Controller:** `spammm/forcefields/FFController.py` (`ff_type` in `{spff,uff,lff}`)
+- **Audit Documents:** [forcefields_overview.md](forcefields_overview.md), [intramolecular_forcefields.md](intramolecular_forcefields.md), [Topics/ForceFields/LFF_ProjectiveRelax.md](Topics/ForceFields/LFF_ProjectiveRelax.md)
+- **Tests:** `tests/test_forcefield.py`, `tests/test_relax_serial.py`, `tests/test_relax_ptcda_faf.py`
+- **Caveats (LFF):** surrogate springs (not energy-parity with UFF/SPFF); K₁₄ caps mandatory; uniform mass=1; WG≤64 atoms
 
 ### 2b. Non-Bonding Force Fields
 - LJ/Morse/Coulomb, exclusion schemes
@@ -214,14 +215,18 @@ no GUI integration yet.
 
 ## 4. AFM/STM Simulation
 
-### 4a. AFM Simulation
-- Morse/LJ force field, Full Density-Based Model (FDBM), modular pipeline (S1-S6 stages)
-- **Key files:** `spammm/SPM/AFM.py`, `spammm/SPM/AFM_util.py`, `spammm/SPM/ModularPipeline.py`, `spammm/SPM/ScanUtils.py`, `spammm/SPM/ManipulationPathOpt.py`
+### 4a. AFM Simulation (FDBM = GUI engine)
+- Morse/LJ (tests/scripts) vs **FDBM** ModularPipeline S1–S6 (GUI). Round-1+2 perf: GPU tasks/FFT, dense NA, uncompressed cache, fused ES + GPU pad/scale (`SPAMMM_AFM_FAST_S3=1` default).
+- **Key files:** `spammm/SPM/AFM.py`, `spammm/SPM/AFM_utils.py`, `spammm/SPM/ModularPipeline.py`, `spammm/SPM/ScanUtils.py`, `spammm/SPM/ManipulationPathOpt.py`
+- **Folder README:** `spammm/SPM/README.md`
+- **Kernel:** `kernels/AFM.cl` (incl. `fdbm_*` Stage-3 helpers)
+- **GUI:** `spammm/GUI/AFMExtension.py`
+- **Density:** `spammm/quantum/DFTB/Grid_dftb.py`
+- **Perf / tests:** `doc/Tasks/PerfBenchmark_FDBM.md`, `tests/SPM/bench_fdbm.py`, `tests/SPM/test_afm_morse.py`, `tests/SPM/test_afm_fdbm.py`
+- **Topical audit:** [TopicalAudit/AFM_FDBM.md](TopicalAudit/AFM_FDBM.md)
+- **Overview doc:** [afm_stm_simulation.md](afm_stm_simulation.md)
 - **Rigid body AFM:** `spammm/forcefields/RigidBodyAFM.py`
-- **Kernel:** `kernels/AFM.cl`
-- **GUI extension:** `spammm/GUI/AFMExtension.py`
-- **Audit Document:** [afm_stm_simulation.md](afm_stm_simulation.md)
-- **Tests:** `tests/SPM/test_afm_morse.py`, `tests/SPM/test_afm_fdbm.py`
+- **Caveats:** K_LAT N/m vs eV/Å²; prefer `step ≤ 0.1 Å` (`doc/Tasks/AFMTesting.md`)
 
 ### 4b. STM Simulation
 - LCAO orbital projection, spectral function, DOS/STM current

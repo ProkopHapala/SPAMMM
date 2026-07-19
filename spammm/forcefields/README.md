@@ -1,18 +1,29 @@
 # forcefields/
 
-GPU-accelerated force field implementations and molecular dynamics. All OpenCL modules inherit from `utils/OpenCLBase.py`.
+GPU-accelerated intramolecular FFs and MD. All OpenCL modules inherit from `utils/OpenCLBase.py`. Three relax paths: **SPFF** (π-orbitals), **UFF** (classic), **LFF** (projective Jacobi springs) — see `doc/Topics/ForceFields/LFF_ProjectiveRelax.md`.
 
-- **FFController.py** — Pure-logic orchestrator: bridges AtomicSystem → forcefield build → GPU relaxation → positions/forces download (no Qt dependency)
-- **FFEvaluator.py** — Single-point UFF/SPFF `eval_fn(pos)→(E,F)` for finite-difference Hessians (`dynamics/Vibrations.py`)
-- **UFF_cl.py** — PyOpenCL UFF runtime: bonds, angles, torsions, inversions, LJ + electrostatic non-bonded (FIRE + velocity Verlet). Fused multi-step: `relax_serial` / `relax_global` (bonds+angles today; torsions/dihedrals planned — see `doc/Tasks/PerfBenchmark_Relaxation.md`).
-- **UFFbuilder.py** — Converts AtomicSystem to UFF topology arrays (atom types, bonds, angles, torsions, inversions, exclusions)
-- **SPFF_cl.py** — PyOpenCL SPFFsp3 runtime with pi-orbital DOFs (FIRE + damped velocity Verlet). Fused: `relax_serial` / `relax_global` (+ optional FAF); π–π/π–σ audit + NB/FAF wiring tracked in same task doc.
-- **SPFFbuilder.py** — Converts AtomicSystem to SPFFsp3 topology arrays (positions, neighbors, bond/angle params, pi-orbitals)
-- **RigidBodyDynamics.py** — 6-DOF rigid body GPU dynamics with quaternion integration (symplectic Euler, Taylor-series quaternion exp)
-- **RigidBodyAFM.py** — High-level AFM scanning: molecule on tip via harmonic spring interacting with substrate GridFF (future: `spammm/surfaces/ContactSurface.py` quasi-2D sample potential)
-- **QEq.py** — Charge Equilibration via direct matrix solve (Rappe & Goddard, Cholesky+Schur default, LU backup)
-- **Assembly.py** — Hexagonal SAM rigid-body packing: GPU clash scoring + Python orchestration (`run_assembly_search`, `generate_assembly_transforms`, `AssemblyOCL`). Kernel: `kernels/assembly.cl`
-- **AssemblyPlot.py** — Top-view figures (height shading, clash/strain/clearance maps, XYZ export). Used by `tests/testplot_assembly.py`
+- **FFController.py** — Pure-logic orchestrator: AtomicSystem → FF build → GPU relax → download (no Qt). `ff_type` in `{spff, uff, lff}`
+- **FFEvaluator.py** — Single-point UFF/SPFF `eval_fn(pos)→(E,F)` for FD Hessians (`dynamics/Vibrations.py`)
+- **UFF_cl.py** — UFF runtime + fused multi-step `relax_serial` / `relax_global` (bonds+angles+dihedrals+inversions, optional FAF)
+- **UFFbuilder.py** — AtomicSystem → UFF topology arrays (types, bonds, angles, torsions, inversions, exclusions)
+- **SPFF_cl.py** — SPFFsp3 + π-DOFs; fused `relax_serial` / `relax_global` (+ optional FAF); π–π/π–σ audit still open
+- **SPFFbuilder.py** — AtomicSystem → SPFF topology (neighbors, params, π-orbitals)
+- **LFFSolver.py** — Linearized projective Jacobi: UFF→K₁₂/K₁₃/K₁₄ springs, soft FAF outer, ~50 outer steps vs thousands of MD; kernel `kernels/LFF.cl`
+- **RigidBodyDynamics.py** — 6-DOF rigid body GPU dynamics (quaternion exp map)
+- **RigidBodyAFM.py** — Molecule-on-tip AFM vs substrate GridFF (future: ContactSurface)
+- **QEq.py** — Charge equilibration (Rappé–Goddard; Cholesky+Schur / LU)
+- **Assembly.py** — Hexagonal SAM packing: GPU clash + orchestration; kernel `kernels/assembly.cl`
+- **AssemblyPlot.py** — Top views, clash/strain maps, XYZ export (`tests/testplot_assembly.py`)
+
+## Relax path cheat-sheet
+
+| Path | Hard terms | Soft / substrate | Typical use |
+|------|------------|------------------|-------------|
+| SPFF fused | bonds, angles, π, … | FAF in fused loop | Accurate adsorbate MD |
+| UFF fused | bonds, angles, dih, inv | FAF in fused loop | Universal typing, no π |
+| LFF | distance springs from UFF | FAF outer predictor | Fast GUI / morphing |
+
+Perf & PTCDA+FAF numbers: `doc/Tasks/PerfBenchmark_Relaxation.md`.
 
 ## Assembly (on-surface SAM)
 

@@ -96,6 +96,10 @@ AFM_BENCH_NO_IO: int = _afm_int_env("SPAMMM_AFM_BENCH_NO_IO", 0)
 AFM_CPU_TASKS: int = _afm_int_env("SPAMMM_AFM_CPU_TASKS", 0)
 AFM_CPU_FFT: int = _afm_int_env("SPAMMM_AFM_CPU_FFT", 0)
 AFM_NA_ORBITAL_LOOP: int = _afm_int_env("SPAMMM_AFM_NA_ORBITAL_LOOP", 0)
+# Round-2 fast Stage-3 path (fused ES + GPU pad/scale; default ON). Set =0 for legacy S3.
+AFM_FAST_S3: int = _afm_int_env("SPAMMM_AFM_FAST_S3", 1)
+# Download E/V fields to host (plots/cache). Default off when FAST_S3; force with =1.
+AFM_DIAG_DOWNLOAD: int = _afm_int_env("SPAMMM_AFM_DIAG_DOWNLOAD", 0)
 
 
 def afm_bench_enabled() -> bool:
@@ -120,6 +124,16 @@ def afm_use_cpu_tasks() -> bool:
 def afm_use_cpu_fft() -> bool:
     """True → NumPy FFT (SPAMMM_AFM_CPU_FFT=1). Default False = gpyFFT."""
     return AFM_CPU_FFT > 0
+
+
+def afm_use_fast_s3() -> bool:
+    """True → Round-2 fused/GPU Stage-3 (SPAMMM_AFM_FAST_S3=1, default). Requires GPU FFT."""
+    return AFM_FAST_S3 > 0 and not afm_use_cpu_fft()
+
+
+def afm_diag_download() -> bool:
+    """Download E/V grids to host for plots/cache (SPAMMM_AFM_DIAG_DOWNLOAD=1)."""
+    return AFM_DIAG_DOWNLOAD > 0
 
 
 class AFMBench:
@@ -328,9 +342,90 @@ class AFMulator(OpenCLBase):
         self.fdbm_dinvB  = np.array([0.,    1./Ly, 0.,    -origin[1]/Ly], dtype=np.float32)
         self.fdbm_dinvC  = np.array([0.,    0.,    1./Lz, -origin[2]/Lz], dtype=np.float32)
         self.fdbm_origin = np.asarray(origin, dtype=np.float32)
-        self.fdbm_step   = float(step)
-        self.fdbm_shape  = (nx, ny, nz)
+        self.fdbm_step = float(step)
+        self.fdbm_shape = (nx, ny, nz)
         debug_print(1, f"AFMulator.setup_fdbm_grid: grid={nx}x{ny}x{nz}  step={step:.3f}  L=({Lx:.1f},{Ly:.1f},{Lz:.1f}) Ang")
+
+    def setup_fdbm_grid_from_img(self, img_F, shape, origin, step):
+        """Device-side FDBM grid setup (no host F_total upload). New path; does not replace setup_fdbm_grid."""
+        nx, ny, nz = [int(x) for x in shape[:3]]
+        Lx, Ly, Lz = nx * step, ny * step, nz * step
+        mf = cl.mem_flags
+        fmt = cl.ImageFormat(cl.channel_order.RGBA, cl.channel_type.FLOAT)
+        # Persistent image for scan; READ_WRITE so we can device-copy from gradient output
+        if getattr(self, 'img_FF_fdbm', None) is None or self.fdbm_shape != (nx, ny, nz):
+            self.img_FF_fdbm = cl.Image(self.ctx, mf.READ_WRITE, fmt, shape=(nx, ny, nz))
+        cl.enqueue_copy(self.queue, self.img_FF_fdbm, img_F,
+                        src_origin=(0, 0, 0), dest_origin=(0, 0, 0), region=(nx, ny, nz))
+        self.queue.finish()
+        self.fdbm_dinvA = np.array([1. / Lx, 0., 0., -origin[0] / Lx], dtype=np.float32)
+        self.fdbm_dinvB = np.array([0., 1. / Ly, 0., -origin[1] / Ly], dtype=np.float32)
+        self.fdbm_dinvC = np.array([0., 0., 1. / Lz, -origin[2] / Lz], dtype=np.float32)
+        self.fdbm_origin = np.asarray(origin, dtype=np.float32)
+        self.fdbm_step = float(step)
+        self.fdbm_shape = (nx, ny, nz)
+
+    def compute_dispersion_to_img_cl(self, atomPos, atomTypes, origin, step, ngrid, C6_atom_dict=None, C6_CO=30.0, RA=1.5):
+        """Dispersion → image3d on GPU (no host download). New helper for fast S3."""
+        if C6_atom_dict is None:
+            C6_atom_dict = {1: 6.5, 6: 24.0, 7: 20.0, 8: 15.0}
+        nx, ny, nz = [int(i) for i in ngrid[:3]]
+        natoms = len(atomPos)
+        atoms_arr = np.zeros((natoms, 4), dtype=np.float32)
+        atoms_arr[:, :3] = np.asarray(atomPos, dtype=np.float32)
+        C6_atom = np.array([C6_atom_dict.get(z, 1.0) for z in atomTypes], dtype=np.float32)
+        C6_params = np.zeros((natoms, 2), dtype=np.float32)
+        C6_params[:, 0] = np.sqrt(C6_atom * C6_CO)
+        self.realloc_dispersion_buffers(natoms)
+        self.toGPU_(self.disp_atoms_cl, atoms_arr)
+        self.toGPU_(self.disp_C6_cl, C6_params)
+        origin = np.asarray(origin, dtype=np.float32)
+        step_f = float(step)
+        grid_p0 = np.array([origin[0], origin[1], origin[2], 0.0], dtype=np.float32)
+        grid_dA = np.array([step_f, 0.0, 0.0, 0.0], dtype=np.float32)
+        grid_dB = np.array([0.0, step_f, 0.0, 0.0], dtype=np.float32)
+        grid_dC = np.array([0.0, 0.0, step_f, 0.0], dtype=np.float32)
+        nGrid = np.array([nx, ny, nz, nx * ny * nz], dtype=np.int32)
+        mf = cl.mem_flags
+        fmt = cl.ImageFormat(cl.channel_order.RGBA, cl.channel_type.FLOAT)
+        if getattr(self, 'img_disp_fast', None) is None or getattr(self, '_disp_fast_shape', None) != (nx, ny, nz):
+            self.img_disp_fast = cl.Image(self.ctx, mf.READ_WRITE, fmt, shape=(nx, ny, nz))
+            self._disp_fast_shape = (nx, ny, nz)
+        self.prg.evalDispersion_toImg(
+            self.queue, (nx * ny * nz,), (32,),
+            np.int32(natoms), self.disp_atoms_cl, self.disp_C6_cl, self.img_disp_fast,
+            nGrid, grid_p0, grid_dA, grid_dB, grid_dC, np.float32(RA * RA),
+        )
+        return self.img_disp_fast
+
+    def compose_E_and_gradient_fast_cl(self, E_pauli_cl, E_es_cl, img_vdw, step, shape):
+        """Compose E_total on GPU from Pauli+ES buffers + vdW image, then central-diff gradient. No host E transfer."""
+        nx, ny, nz = [int(x) for x in shape[:3]]
+        mf = cl.mem_flags
+        fmt = cl.ImageFormat(cl.channel_order.RGBA, cl.channel_type.FLOAT)
+        # READ_WRITE so compose can write then gradient can read (no host / no image copy)
+        if getattr(self, 'img_E_compose', None) is None or getattr(self, '_grad_shape', None) != (nx, ny, nz):
+            self.img_E_compose = cl.Image(self.ctx, mf.READ_WRITE, fmt, shape=(nx, ny, nz))
+            self.img_F_out = cl.Image(self.ctx, mf.WRITE_ONLY, fmt, shape=(nx, ny, nz))
+            self._grad_shape = (nx, ny, nz)
+        gs = (self._roundup(nx, 8), self._roundup(ny, 8), self._roundup(nz, 4))
+        ls = (8, 8, 4)
+        self.prg.fdbm_compose_E_to_img(
+            self.queue, gs, ls,
+            E_pauli_cl.data, E_es_cl.data, img_vdw, self.img_E_compose,
+            np.int32(nx), np.int32(ny), np.int32(nz),
+        )
+        self.prg.gradient_central_diff(self.queue, gs, ls, self.img_E_compose, self.img_F_out, np.float32(step))
+        self.queue.finish()
+        return self.img_F_out
+
+    def download_image_rgba_xyz(self, img, shape):
+        """Download RGBA image3d → (nx,ny,nz,4) host. Diagnostics / cache only."""
+        nx, ny, nz = [int(x) for x in shape[:3]]
+        host = np.empty((nz, ny, nx, 4), dtype=np.float32)
+        cl.enqueue_copy(self.queue, host, img, origin=(0, 0, 0), region=(nx, ny, nz))
+        self.queue.finish()
+        return np.ascontiguousarray(host.transpose(2, 1, 0, 3))
 
     def scan_fdbm(self, scan_xs, scan_ys, probe_heights, mol_z=0.0,
                   ppm_mode=True, use_fire=True,
@@ -1731,8 +1826,11 @@ def fft_poisson_cpu(rho, step):
 _fdbm_fft_ctx = None
 
 class _FDBMGpyFFT:
-    """Reusable gpyFFT context for FDBM Poisson / convolution. Layout: host (nx,ny,nz), GPU (nz,ny,nx)."""
-    def __init__(self):
+    """Reusable gpyFFT context for FDBM Poisson / convolution. Layout: host (nx,ny,nz), GPU (nz,ny,nx).
+
+    Prefer constructing with AFMulator.ctx/queue so fast-S3 kernels share one device context.
+    """
+    def __init__(self, ctx=None, queue=None):
         import pyopencl.array as cl_array
         from spammm.utils import clUtils as clu
         clu.try_load_clFFT()
@@ -1743,12 +1841,15 @@ class _FDBMGpyFFT:
             )
         self.FFT = clu.FFT
         self.cl_array = cl_array
-        self.ctx, self.queue = clu.get_nvidia_device("nvidia")
-        if self.ctx is None:
-            raise RuntimeError(
-                "No NVIDIA OpenCL device for GPU FDBM FFT. "
-                "Set SPAMMM_AFM_CPU_FFT=1 for explicit NumPy path."
-            )
+        if ctx is not None and queue is not None:
+            self.ctx, self.queue = ctx, queue
+        else:
+            self.ctx, self.queue = clu.get_nvidia_device("nvidia")
+            if self.ctx is None:
+                raise RuntimeError(
+                    "No NVIDIA OpenCL device for GPU FDBM FFT. "
+                    "Set SPAMMM_AFM_CPU_FFT=1 for explicit NumPy path."
+                )
         self._shape = None
         self._buf_a = None
         self._buf_b = None
@@ -1760,6 +1861,16 @@ class _FDBMGpyFFT:
         self._step = None
         self._plan_a = None  # cached gpyFFT plans (recreate only when shape changes)
         self._plan_b = None
+        # Fast-S3 scratch (xyz float32)
+        self._xyz_a = self._xyz_b = self._xyz_c = None
+        self._xyz_tip_tot = self._xyz_tip_del = self._xyz_flip = None
+        self._xyz_rho_scf = self._xyz_rho_diff = None
+        self._xyz_E_pauli = self._xyz_E_es = None
+        self._afm_prg = None  # AFMulator.prg for Round-2 kernels
+
+    def bind_afm_program(self, prg):
+        """Attach AFMulator OpenCL program (fdbm_* kernels)."""
+        self._afm_prg = prg
 
     @staticmethod
     def is_fft_friendly(n):
@@ -1794,6 +1905,16 @@ class _FDBMGpyFFT:
             self._buf_b = self.cl_array.Array(self.queue, shape_fft, dtype=np.complex64)
             self._plan_a = self.FFT(self.ctx, self.queue, self._buf_a, axes=(0, 1, 2))
             self._plan_b = self.FFT(self.ctx, self.queue, self._buf_b, axes=(0, 1, 2))
+            self._xyz_a = self.cl_array.Array(self.queue, shape, dtype=np.float32)
+            self._xyz_b = self.cl_array.Array(self.queue, shape, dtype=np.float32)
+            self._xyz_c = self.cl_array.Array(self.queue, shape, dtype=np.float32)
+            self._xyz_tip_tot = self.cl_array.Array(self.queue, shape, dtype=np.float32)
+            self._xyz_tip_del = self.cl_array.Array(self.queue, shape, dtype=np.float32)
+            self._xyz_flip = self.cl_array.Array(self.queue, shape, dtype=np.float32)
+            self._xyz_rho_scf = self.cl_array.Array(self.queue, shape, dtype=np.float32)
+            self._xyz_rho_diff = self.cl_array.Array(self.queue, shape, dtype=np.float32)
+            self._xyz_E_pauli = self.cl_array.Array(self.queue, shape, dtype=np.float32)
+            self._xyz_E_es = self.cl_array.Array(self.queue, shape, dtype=np.float32)
             self._shape = shape
             self._nxyz = float(nx * ny * nz)
             self._step = None  # force k-grid rebuild
@@ -1812,6 +1933,10 @@ class _FDBMGpyFFT:
             self._k2_inv[0, 0, 0] = 0.0
             self._k2_inv_cl = self.cl_array.to_device(self.queue, self._k2_inv)
 
+    def _gs3(self, shape=None):
+        nx, ny, nz = self._shape if shape is None else shape
+        return (nx, ny, nz), (8, 8, 4)
+
     def _to_gpu_complex(self, buf, arr_xyz):
         t = np.ascontiguousarray(np.asarray(arr_xyz, dtype=np.float32).transpose(2, 1, 0))
         buf.set(t.astype(np.complex64))
@@ -1821,6 +1946,25 @@ class _FDBMGpyFFT:
         c = buf.get()
         out = c.real.astype(np.float32)
         return np.ascontiguousarray(out.transpose(2, 1, 0))
+
+    def _xyz_host_to_cl(self, dest_cl, arr_xyz):
+        dest_cl.set(np.ascontiguousarray(arr_xyz, dtype=np.float32))
+
+    def _xyz_cl_to_fft(self, xyz_cl, fft_buf):
+        prg = self._afm_prg
+        if prg is None:
+            raise RuntimeError("_FDBMGpyFFT: bind_afm_program() required for device xyz→FFT path")
+        gs, ls = self._gs3()
+        nx, ny, nz = self._shape
+        prg.fdbm_xyz_to_fft_c64(self.queue, gs, ls, xyz_cl.data, fft_buf.data,
+                                np.int32(nx), np.int32(ny), np.int32(nz))
+
+    def _fft_real_to_xyz_cl(self, fft_buf, xyz_cl):
+        prg = self._afm_prg
+        gs, ls = self._gs3()
+        nx, ny, nz = self._shape
+        prg.fdbm_fft_real_to_xyz_f32(self.queue, gs, ls, fft_buf.data, xyz_cl.data,
+                                     np.int32(nx), np.int32(ny), np.int32(nz))
 
     def fft_forward(self, buf):
         plan = self._plan_a if buf is self._buf_a else self._plan_b
@@ -1833,6 +1977,7 @@ class _FDBMGpyFFT:
         event.wait()
 
     def poisson(self, rho, step):
+        """Legacy API: Poisson on GPU, download V to host."""
         self.ensure(rho.shape, step=step)
         self._to_gpu_complex(self._buf_a, rho)
         self.fft_forward(self._buf_a)
@@ -1843,7 +1988,7 @@ class _FDBMGpyFFT:
         return self._from_gpu_real(self._buf_a)
 
     def corr_conj(self, a, b):
-        """real(ifft(fft(a) * conj(fft(b)))) matching NumPy."""
+        """real(ifft(fft(a) * conj(fft(b)))) matching NumPy. Downloads to host."""
         self.ensure(a.shape)
         self._to_gpu_complex(self._buf_a, a)
         self._to_gpu_complex(self._buf_b, b)
@@ -1854,7 +1999,7 @@ class _FDBMGpyFFT:
         return self._from_gpu_real(self._buf_a)
 
     def conv(self, a, b):
-        """real(ifft(fft(a) * fft(b))) matching NumPy."""
+        """real(ifft(fft(a) * fft(b))) matching NumPy. Downloads to host."""
         self.ensure(a.shape)
         self._to_gpu_complex(self._buf_a, a)
         self._to_gpu_complex(self._buf_b, b)
@@ -1864,9 +2009,90 @@ class _FDBMGpyFFT:
         self.fft_inverse(self._buf_a)
         return self._from_gpu_real(self._buf_a)
 
+    def pad_roll_to_cl(self, src_xyz, target_shape, ox, oy, oz, rx, ry, rz, dest_cl=None):
+        """Pad+roll tip into target grid on GPU. Returns xyz float cl_array."""
+        self.ensure(target_shape)
+        prg = self._afm_prg
+        if prg is None:
+            raise RuntimeError("pad_roll_to_cl needs bind_afm_program()")
+        nx, ny, nz = [int(x) for x in target_shape]
+        sx, sy, sz = [int(x) for x in src_xyz.shape]
+        src_cl = self.cl_array.to_device(self.queue, np.ascontiguousarray(src_xyz, dtype=np.float32))
+        if dest_cl is None:
+            dest_cl = self._xyz_a
+        gs, ls = self._gs3(target_shape)
+        prg.fdbm_pad_roll_f32(
+            self.queue, gs, ls,
+            src_cl.data, np.int32(sx), np.int32(sy), np.int32(sz),
+            dest_cl.data, np.int32(nx), np.int32(ny), np.int32(nz),
+            np.int32(ox), np.int32(oy), np.int32(oz),
+            np.int32(rx), np.int32(ry), np.int32(rz),
+        )
+        return dest_cl
 
-def _get_fdbm_fft():
+    def flip3_cl(self, src_cl, dest_cl):
+        prg = self._afm_prg
+        gs, ls = self._gs3()
+        nx, ny, nz = self._shape
+        prg.fdbm_flip3_f32(self.queue, gs, ls, src_cl.data, dest_cl.data,
+                           np.int32(nx), np.int32(ny), np.int32(nz))
+        return dest_cl
+
+    def pauli_overlap_scaled_cl(self, rho_xyz_cl, tip_xyz_cl, step, A_pauli, beta_pauli, out_cl=None):
+        """Pauli on device: overlap = dV*IFFT(FFT(ρ)·conj(FFT(tip))); then A·overlap^β. No 1/k²."""
+        self.ensure(self._shape, step=step)
+        prg = self._afm_prg
+        if out_cl is None:
+            out_cl = self._xyz_E_pauli
+        dV = np.float32(float(step) ** 3)
+        self._xyz_cl_to_fft(rho_xyz_cl, self._buf_a)
+        self._xyz_cl_to_fft(tip_xyz_cl, self._buf_b)
+        self.fft_forward(self._buf_a)
+        self.fft_forward(self._buf_b)
+        self._buf_a *= self._buf_b.conj()
+        self.fft_inverse(self._buf_a)
+        self._fft_real_to_xyz_cl(self._buf_a, out_cl)
+        out_cl *= dV
+        n = int(self._nxyz)
+        prg.fdbm_scale_pauli_pow_f32(
+            self.queue, (n,), (256,),
+            out_cl.data, np.int32(n),
+            np.float32(A_pauli), np.float32(beta_pauli), np.float32(1e-30),
+        )
+        return out_cl
+
+    def es_fused_from_rho_cl(self, rho_diff_xyz_cl, tip_delta_xyz_cl, step, out_cl=None):
+        """Fused ES: E = dV · IFFT( FFT(ρ_diff) · FFT(tip[::-1]) · 4πC/k² ). Stays on GPU."""
+        self.ensure(self._shape, step=step)
+        prg = self._afm_prg
+        if out_cl is None:
+            out_cl = self._xyz_E_es
+        # tip_kernel = tip[::-1] (tip already rolled to (0,0,0)); Pauli tip untouched
+        self.flip3_cl(tip_delta_xyz_cl, self._xyz_flip)
+        self._xyz_cl_to_fft(rho_diff_xyz_cl, self._buf_a)
+        self._xyz_cl_to_fft(self._xyz_flip, self._buf_b)
+        self.fft_forward(self._buf_a)
+        self.fft_forward(self._buf_b)
+        dV = float(step) ** 3
+        scale = np.float32(self._poisson_scale * dV)
+        n = int(self._nxyz)
+        prg.fdbm_mul_poisson_tip_c64(
+            self.queue, (n,), (256,),
+            self._buf_a.data, self._buf_b.data, self._k2_inv_cl.data,
+            scale, np.int32(n),
+        )
+        self.fft_inverse(self._buf_a)
+        self._fft_real_to_xyz_cl(self._buf_a, out_cl)
+        return out_cl
+
+
+def _get_fdbm_fft(ctx=None, queue=None):
+    """Return shared gpyFFT helper. Pass AFMulator ctx/queue for fast-S3 (same device)."""
     global _fdbm_fft_ctx
+    if ctx is not None and queue is not None:
+        if _fdbm_fft_ctx is None or getattr(_fdbm_fft_ctx, 'ctx', None) is not ctx:
+            _fdbm_fft_ctx = _FDBMGpyFFT(ctx=ctx, queue=queue)
+        return _fdbm_fft_ctx
     if _fdbm_fft_ctx is None:
         _fdbm_fft_ctx = _FDBMGpyFFT()
     return _fdbm_fft_ctx
@@ -2393,6 +2619,85 @@ def compute_es_conv_field(V_ES, rho_tip_delta, step, tip_rolled=False, return_gr
         grads = np.stack([np.gradient(E_es, step, axis=i) for i in range(3)], axis=-1)
         return E_es, grads
     return E_es
+
+
+def pad_roll_shifts(co_rho, target_shape):
+    """Compute pad origin + roll shifts for tip peak → (0,0,0). Tiny host work on raw tip only."""
+    nx_t, ny_t, nz_t = [int(x) for x in target_shape]
+    nx_c, ny_c, nz_c = co_rho.shape
+    ox = (nx_t - nx_c) // 2
+    oy = (ny_t - ny_c) // 2
+    oz = (nz_t - nz_c) // 2
+    px, py, pz = np.unravel_index(int(np.argmax(np.abs(co_rho))), co_rho.shape)
+    # peak in padded coords → roll by -peak so peak lands at (0,0,0)
+    rx, ry, rz = ox + int(px), oy + int(py), oz + int(pz)
+    return ox, oy, oz, rx, ry, rz
+
+
+def compute_es_fused_field(rho_diff, rho_tip_delta, step, tip_rolled=True, return_grads=False):
+    """Host-facing fused Poisson+ES (parity / diagnostics). New API; legacy is fft_poisson+compute_es_conv_field.
+
+    E_ES(k) ∝ ρ_diff(k) · tip_flip(k) / k²   (no separate V materialization).
+    """
+    if afm_use_cpu_fft():
+        V_ES = fft_poisson_cpu(rho_diff, step)
+        return compute_es_conv_field_cpu(V_ES, rho_tip_delta, step, tip_rolled=tip_rolled, return_grads=return_grads)
+    # GPU fused via temporary AFMulator program binding not required if we use host transpose path:
+    # For parity tests without AFMulator, fall back to two-step GPU (still correct).
+    V_ES = fft_poisson(rho_diff, step)
+    return compute_es_conv_field(V_ES, rho_tip_delta, step, tip_rolled=tip_rolled, return_grads=return_grads)
+
+
+def stage3_fdbm_fields_fast(afmulator, rho_scf, rho_diff, tip_total_raw, tip_delta_raw,
+                            origin, step, ngrid, atomPos, atomTypes,
+                            A_pauli, beta_pauli, C6_CO=30.0,
+                            tip_already_rolled=False, download_fields=True):
+    """Round-2 Stage-3 on GPU: pad/roll tip, Pauli+scale, fused ES, vdW, compose+grad — minimal host transfers.
+
+    Returns (V_ES, E_pauli, E_ES, E_vdw, F_total).
+    V_ES is None (fused path); E_* downloaded only if download_fields.
+    F_total always downloaded once (S4 / API need it) — no mid-pipeline transfers.
+    """
+    target_shape = tuple(int(x) for x in ngrid[:3])
+    fft = _get_fdbm_fft(ctx=afmulator.ctx, queue=afmulator.queue)
+    fft.bind_afm_program(afmulator.prg)
+    fft.ensure(target_shape, step=step)
+
+    # Tip pad/roll on GPU (or upload if already rolled / full-grid gaussian)
+    if tip_already_rolled:
+        fft._xyz_host_to_cl(fft._xyz_tip_tot, tip_total_raw)
+        fft._xyz_host_to_cl(fft._xyz_tip_del, tip_delta_raw)
+    else:
+        for raw, dest in ((tip_total_raw, fft._xyz_tip_tot), (tip_delta_raw, fft._xyz_tip_del)):
+            if tuple(raw.shape) == target_shape:
+                fft._xyz_host_to_cl(dest, raw)
+            else:
+                ox, oy, oz, rx, ry, rz = pad_roll_shifts(raw, target_shape)
+                fft.pad_roll_to_cl(raw, target_shape, ox, oy, oz, rx, ry, rz, dest_cl=dest)
+
+    fft._xyz_host_to_cl(fft._xyz_rho_scf, rho_scf)
+    fft._xyz_host_to_cl(fft._xyz_rho_diff, rho_diff)
+
+    E_pauli_cl = fft.pauli_overlap_scaled_cl(
+        fft._xyz_rho_scf, fft._xyz_tip_tot, step, A_pauli, beta_pauli, out_cl=fft._xyz_E_pauli)
+    E_es_cl = fft.es_fused_from_rho_cl(
+        fft._xyz_rho_diff, fft._xyz_tip_del, step, out_cl=fft._xyz_E_es)
+
+    img_vdw = afmulator.compute_dispersion_to_img_cl(
+        atomPos, atomTypes, origin, step, ngrid, C6_CO=C6_CO)
+    img_F = afmulator.compose_E_and_gradient_fast_cl(E_pauli_cl, E_es_cl, img_vdw, step, target_shape)
+    afmulator.setup_fdbm_grid_from_img(img_F, target_shape, origin, step)
+
+    F_total = afmulator.download_image_rgba_xyz(afmulator.img_FF_fdbm, target_shape)
+    V_ES = E_pauli = E_ES = E_vdw = None
+    if download_fields:
+        E_pauli = np.ascontiguousarray(E_pauli_cl.get())
+        E_ES = np.ascontiguousarray(E_es_cl.get())
+        E_vdw = afmulator.download_image_rgba_xyz(img_vdw, target_shape)[..., 3]
+        if afm_diag_download():
+            V_ES = fft_poisson(rho_diff, step)
+    return V_ES, E_pauli, E_ES, E_vdw, F_total
+
 
 def compute_vdw_field(atomPos, atomTypes, origin, step, ngrid, C6_table=None, C6_CO=30.0, RA=1.5):
     """Compute vdW dispersion field C6/r^6 on grid.

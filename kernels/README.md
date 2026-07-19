@@ -9,7 +9,8 @@ OpenCL source for SPAMMM GPU compute. Python harnesses concatenate `.cl` snippet
 | `common.cl` | Shared types, constants, math helpers | (always first) |
 | `Forces.cl` | Inline pairwise potentials (LJ, Morse, Coulomb) | all force modules |
 | `SPFF.cl` | SPFFsp3 bonding + MD integrator (π-orbitals) | `forcefields/SPFF_cl.py` |
-| `UFF.cl` | UFF bonding + simplified integrator | `forcefields/UFF_cl.py` |
+| `UFF.cl` | UFF bonding + fused multi-step (+ optional FAF) | `forcefields/UFF_cl.py` |
+| `LFF.cl` | Projective Jacobi on K₁₂/K₁₃/K₁₄ springs + FAF outer | `forcefields/LFFSolver.py` |
 | `nonbonded.cl` | `getNonBond_ex2` — LJ/Coulomb with 2nd-neighbor exclusion | SPFF, UFF |
 | `nonbonded_grid.cl` | GridFF-augmented nonbonded + spatial bucketing | SPFF (on demand) |
 | `gridFF.cl` | 3D B-spline grid build, Poisson, sampling | SPFF, GridFF, rigid |
@@ -30,6 +31,7 @@ Concatenation order matters. Typical stacks:
 |----------|------------------|
 | SPFF MD | `common` + `Forces` + `SPFF` + `gridFF` + `surface` + `nonbonded` |
 | UFF MD | `common` + `Forces` + `UFF` + `nonbonded` |
+| LFF projective | `LFF.cl` alone (`LFFSolver`; FAF helpers inlined) |
 | SPFF + GridFF NB | add `nonbonded_grid.cl` (separate program) |
 | Rigid body + GridFF | `common` + `Forces` + `gridFF` + `rigid` |
 | Rigid body + folded | `common` + `Forces` + `surface` + `rigid` |
@@ -104,6 +106,25 @@ Universal Force Field (Rappé et al.): harmonic bonds, cosine angle bending, tor
 | `updateAtomsSPFFf4` | Simplified velocity-Verlet integrator (no π-recoil) |
 
 **Caveat:** Force scattering uses atomic_add — race-free but non-deterministic accumulation order.
+
+Fused multi-step (`relax_nsteps_{local,global}_UFF`): bonds+angles+dihedrals+inversions with tiled gather (no atomics); optional FAF each step. Angle force must match multi-kernel Fourier formula (historical shrink bug). Topic: `doc/Tasks/PerfBenchmark_Relaxation.md`.
+
+---
+
+## LFF.cl
+
+**Linearized Force Field** — third relax path. Hard intramolecular geometry → distance springs; soft substrate (FAF) / E-field in a large outer predictor; inner diagonal projective Jacobi with \(M/dt^2\).
+
+| Kernel | Role |
+|--------|------|
+| `lff_jacobi` | Outer soft force + predict; inner Jacobi on packed `neighs`/`KLs` springs; optional FAF |
+| `lff_nb_jacobi` | Legacy NB variant (FireCore parity; adsorbates prefer FAF) |
+
+**Caps:** `LFF_WG_SIZE=64` (one molecule ≤ 64 atoms / WG), `MAX_NEIGHBORS=24` (PAH K₁₂+K₁₃+K₁₄ packing).
+
+**Caveats:** Not energy-parity with UFF/SPFF (surrogate for speed). K₁₄ must use capped \(K\) + geometry-based \(l_0\) — raw \(V/(dl/d\phi)^2\) blows up. Uniform `mass=1` for relax. Topic: `doc/Topics/ForceFields/LFF_ProjectiveRelax.md`.
+
+**Driver:** `pytest tests/test_relax_ptcda_faf.py --develop -s` → `debug/test_relax_ptcda_faf/lff_*`
 
 ---
 
@@ -265,8 +286,16 @@ AFM probe-particle relaxation and image generation. Simulates the oscillating AF
 | `evalLJC_QZs_toImg`, `evalMorseC_QZs_toImg` | Compute Δf image from relaxed probe positions. LJ or Morse potential |
 | `evalDispersion_toImg` | Dispersion contribution to Δf |
 | `gradient_central_diff` | Numerical gradient via central differences |
+| `fdbm_pad_roll_f32` | Pad+roll tip density onto target grid (Round-2 FAST_S3) |
+| `fdbm_flip3_f32` | Spatial reverse for ES convolution convention |
+| `fdbm_xyz_to_fft_c64` / `fdbm_fft_real_to_xyz_f32` | Host-layout ↔ gpyFFT buffer transpose on device |
+| `fdbm_scale_pauli_pow_f32` | `E = A·overlap^β` on GPU (no download) |
+| `fdbm_compose_E_to_img` | Pauli + ES + vdW → energy image for gradient |
+| `fdbm_mul_poisson_tip_c64` | Fused ES: `ρ_diff(k)·tip(k)/k²` in Fourier space |
 
 Helpers: `interpFE` (trilinear field interpolation), `update_FIRE` (FIRE damping + line search), `tipForce` (tip-sample force model), `read_imagef` (hardware texture sampling).
+
+**FDBM Stage-3 perf:** default path uses `fdbm_*` + gpyFFT (Python: `spammm/SPM/AFM.py`, switch `SPAMMM_AFM_FAST_S3`). Pauli overlap stays a separate FFT (no `1/k²`). See `doc/Tasks/PerfBenchmark_FDBM.md`.
 
 ---
 

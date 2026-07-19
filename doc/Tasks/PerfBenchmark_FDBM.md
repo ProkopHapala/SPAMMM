@@ -2,7 +2,7 @@
 
 **Goal:** End-to-end FDBM AFM image generation interactive (~0.1 s).
 
-**Status (2026-07-19):** Round-1 speedups **implemented and measured**. Next ideas **documented only** (below) — implement after commit.  
+**Status (2026-07-19):** Round-1 + Round-2 **shipped and measured**. Benzene warm ~**0.18 s**; large-mol (flat_1) warm S3+S4 ~**1.4 s**. Fast S3 default (`SPAMMM_AFM_FAST_S3=1`); legacy via `=0`.  
 `AFMBench` SSOT: `spammm/SPM/AFM.py` (not `globals.py`).
 
 **How to re-run:**
@@ -10,11 +10,28 @@
 # Quiet summary tables (default SPAMMM_AFM_BENCH=1); live >>/<< with =2
 SPAMMM_AFM_BENCH=1 SPAMMM_AFM_BENCH_NO_IO=1 SPAMMM_VERBOSITY=0 AFM_DEBUG_PLOT_LEVEL=0 \
   python tests/SPM/bench_fdbm.py --mol data/xyz/benzene.xyz --tip co --step 0.1 --scan-step 0.1 --repeats 2
+# Legacy S3 for comparison:
+#   SPAMMM_AFM_FAST_S3=0 ...
 ```
 
 ---
 
-## Speedup report — what we achieved (2026-07-19)
+## Executive summary — speedups (2026-07-19)
+
+| Case | Before | After | Approx. factor |
+|------|--------|-------|----------------|
+| Benzene warm E2E (GUI-like, tip=co) | ~1.65 s | ~**0.18 s** (R2) | **~9×** |
+| Benzene S3 field build | ~0.26 s | ~**0.07 s** | **~4×** |
+| Flat_1 S2 NA density | 5.87 s | **0.03 s** | **~200×** |
+| Flat_1 S3 cache I/O | ~10 s compressed | ~**0.4 s** uncompressed | **~25×** |
+| Flat_1 warm S3+S4 (NO_IO) | many s / GUI stuck | **~1.4 s** | order-of-magnitude |
+
+**Round 1:** GPU density tasks + gpyFFT + dense NA + shared AFMulator + drop duplicate scan + `np.savez`.  
+**Round 2:** fused ES (`(ρ_diff·ρ_tip)/k²`) + GPU pad/roll + GPU Pauli scale + stay-on-GPU compose/grad (`fdbm_*` kernels). Pauli remains a separate overlap FFT (no `1/k²`).
+
+---
+
+## Speedup report — detail
 
 ### Baseline (before Round 1) → After
 
@@ -34,19 +51,21 @@ SPAMMM_AFM_BENCH=1 SPAMMM_AFM_BENCH_NO_IO=1 SPAMMM_VERBOSITY=0 AFM_DEBUG_PLOT_LE
 | WARM S3+S4 | **1.41 s** |
 | WARM S3 + uncompressed cache | **1.57 s** (cache write **0.41 s**) |
 
-**Warm S3 remaining (NO_IO) — ranked:**
+**Warm S3 remaining after Round 1 (NO_IO, pre–Round 2) — for history:**
 
 | Segment | sec | Note |
 |---------|-----|------|
-| Pauli FFT | 0.22 | still host↔GPU field copies |
+| Pauli FFT | 0.22 | host↔GPU field copies |
 | ES FFT | 0.22 | same |
 | `compute_gradient_cl` | 0.20 | RGBA pack + upload/download |
 | Poisson FFT | 0.14 | same |
-| `pauli_scale` | 0.11 | **CPU** `A * overlap**beta` |
-| Tip pad/roll | 0.10 | **CPU** |
+| `pauli_scale` | 0.11 | **CPU** — eliminated in R2 |
+| Tip pad/roll | 0.10 | **CPU** — eliminated in R2 |
 | Dispersion | 0.09 | GPU |
-| `E_total` sum | 0.06 | **CPU** |
+| `E_total` sum | 0.06 | **CPU** — eliminated in R2 |
 | S4 compose/relax | 0.24 | GPU |
+
+After Round 2, benzene S3 collapses to a single `S3.fast_fields_gpu` ~**0.07 s** (see table above).
 
 ### Round-1 changes (already in tree — commit candidates)
 
@@ -59,59 +78,53 @@ SPAMMM_AFM_BENCH=1 SPAMMM_AFM_BENCH_NO_IO=1 SPAMMM_VERBOSITY=0 AFM_DEBUG_PLOT_LE
 
 ---
 
-## TODO next (notes only — implement after commit)
+## TODO next (partially done Round 2 — 2026-07-19)
 
-### T-next-1 — Kill remaining CPU ops (pauli_scale, tip pad/roll, E_total)
+### T-next-1 — Kill remaining CPU ops — **DONE (switchable)**
 
-- [ ] **`pauli_scale` on GPU:** fold `E = A * overlap^beta` into a small OpenCL kernel (or Elementwise) immediately after Pauli IFFT, before download. Prefer fuse into same pass that produces overlap if possible.
-- [ ] **Tip pad/roll on GPU:** replace host `_pad_and_roll_co_tip` by writing tip into target grid with **periodic index shift** (or embed shift in the convolution kernel’s k-phase / index map). Peak-at-(0,0,0) is just an indexing convention.
-- [ ] **`E_total = E_pauli + E_ES + E_vdw` on GPU** — trivial; enables keeping fields device-side into gradient.
-- [ ] Once those are gone → **keep ρ / E / F buffers on GPU** end-to-end (T-next-3).
+- [x] GPU `pauli_scale` (`fdbm_scale_pauli_pow_f32`) fused after Pauli IFFT
+- [x] GPU tip pad/roll (`fdbm_pad_roll_f32`); raw tip via `get_tip_densities(..., pad_mode='none')`
+- [x] `E_total` compose on GPU (`fdbm_compose_E_to_img`)
+- Legacy path kept: `SPAMMM_AFM_FAST_S3=0`
 
-### T-next-2 — Fuse Poisson + ES into one Fourier path?
+### T-next-2 — Fuse Poisson + ES — **DONE (switchable)**
 
-**Physics check (user proposal):**  
-Wanted: \(E_\mathrm{ES}(R)=\int V(r)\,\rho_\mathrm{tip}(r-R)\,dr\) with \(V\) from Poisson on sample charge.
+- [x] `es_fused_from_rho_cl`: \(E_\mathrm{ES}\propto\mathrm{IFFT}(\rho_\mathrm{diff}(k)\,\tilde\rho_\mathrm{tip}(k)/k^2)\)
+- [x] Pauli remains separate (overlap, **no** \(1/k^2\))
+- Parity: `tests/SPM/test_afm_fdbm.py::test_fdbm_fast_s3_parity_pauli_es`
 
-In Fourier space (up to real-space convention / conjugation for correlation vs convolution):
+### T-next-3 — Stay on GPU — **mostly done**
 
-\[
-V(k) \propto \frac{\rho_\mathrm{diff}(k)}{k^2},\qquad
-E_\mathrm{ES}(k) \propto V(k)\,\tilde\rho_\mathrm{tip}(k)
-\propto \frac{\rho_\mathrm{diff}(k)\,\tilde\rho_\mathrm{tip}(k)}{k^2}.
-\]
+- [x] Shared AFMulator ctx with gpyFFT; device compose→gradient→`setup_fdbm_grid_from_img`
+- [x] S4 `reuse_fdbm_grid` skips F re-upload
+- [ ] Optional: skip F host download entirely when NO_IO (S4-only device)
 
-**Yes — that is correct** for the electrostatic tip–sample energy field used today (cross-correlation / convolution with tip **delta**-density). Current code does Poisson then a second FFT of \(V\); fused path is:
+### T-next-4 — Benchmarks (still open)
 
-1. `FFT(rho_diff)`, `FFT(tip_delta)` (tip can be **cached in k-space**)
-2. one multiply: `ρ_diff(k) * tip(k) * (4π C / k²)` (DC = 0)
-3. one `IFFT` → `E_ES`
+- [ ] Skip/async stage cache write for interactive GUI
+- [ ] Coarser `step=0.15` interactive (not default)
 
-**Caveats / corrections vs the informal formula:**
+### Round-2 measured (benzene, tip=co, 144×128×144, NO_IO)
 
-| Item | Detail |
-|------|--------|
-| Charge | Use **`rho_diff = rho_scf − rho_na`**, not full `rho_scf` |
-| Tip | ES uses **`rho_tip_delta`** (charged tip), not `rho_tip_total` (Pauli) |
-| Conv vs corr | Match existing `tip[::-1]` / conj convention so fused ≡ current `compute_es_conv_field` |
-| Constants | Keep `COULOMB_CONST` / `4π` same as `fft_poisson` |
-| `V_ES` diagnostic | Interactive path can skip materializing `V_ES`; still need it if GUI/plots/cache expect it |
-| Pauli | **Separate** — `IFFT(FFT(ρ_scf)·conj(FFT(ρ_tip_total)))` then **`A·overlap^β`**. β≠1 → cannot absorb scale into the same `/k²` multiply |
+| Path | S3 wall (incl. AFMulator ctor ~40 ms) | Field compute |
+|------|----------------------------------------|---------------|
+| Legacy `FAST_S3=0` | **0.256 s** | ~0.22 s (3 FFTs + CPU scale/pad + grad) |
+| Fast `FAST_S3=1` | **0.109 s** | **0.068 s** (`S3.fast_fields_gpu`) |
+| S4 after fast (reuse grid) | **0.002 s** | vs legacy S4 **0.047 s** |
 
-**Expected win:** drop one full 3D FFT round-trip of the large grid (~Poisson IFFT + ES FFT of V).
+Switch: `SPAMMM_AFM_FAST_S3=1` (default) / `=0` legacy. Diag downloads: `SPAMMM_AFM_DIAG_DOWNLOAD=1`.
 
-- [ ] Implement fused `es_from_rho_diff_k` + parity vs `fft_poisson`+`compute_es_conv_field`
-- [ ] Optional: cache `FFT(tip_delta)` / `FFT(tip_total)` across S3
+---
 
-### T-next-3 — Stay on GPU (consequence of T-next-1/2)
+## Historical notes (pre–Round 2 TODOs kept for context)
 
-- [ ] Persistent cl_array / Image buffers for `rho_*`, `E_*`, `F_total` across S3→S4
-- [ ] Gradient kernel reading device E; `setup_fdbm_grid` without host RGBA round-trip
+### T-next-1 (original) — Kill remaining CPU ops (pauli_scale, tip pad/roll, E_total)
 
-### T-next-4 — Benchmarks (do, don’t change defaults yet)
+See Round 2 section above — implemented behind `SPAMMM_AFM_FAST_S3`.
 
-- [ ] **Skip / async stage cache write** for interactive GUI (`SPAMMM_AFM_BENCH_NO_IO`-like flag or “interactive mode”). Measure: flat_1 S3 with vs without `np.savez` (already ~0.41 s uncompressed).
-- [ ] **Coarser grid `step=0.15`** interactive path — measure flat_1 + benzene. **Do not make default:** known benzene / hex-symmetry issues at coarse ES grids (`AFMTesting.md` lessons). Keep `step=0.1` as quality default.
+### T-next-2 (original) — Fuse Poisson + ES
+
+See Round 2 — physics confirmed; fused kernel in use when FAST_S3=1.
 
 ---
 
@@ -139,11 +152,11 @@ Wall **1.65 s** warm GUI-like. Grid `136×128×144`. Dominant: Python `build_tas
 | S2 `build_tasks` / AABB | OpenCL `build_tasks_gpu` (default); CPU via `SPAMMM_AFM_CPU_TASKS=1` | GPU |
 | S3 Poisson `fft_poisson` | gpyFFT; k-space multiply **on device** (default); NumPy via `SPAMMM_AFM_CPU_FFT=1` | GPU |
 | S3 Pauli overlap | gpyFFT corr on device (default) | GPU |
-| S3 Pauli scale `overlap**beta` | numpy | **CPU** |
-| S3 ES convolution | gpyFFT conv on device (default) | GPU |
-| S3 tip gaussian/CO pad | numpy | **CPU** |
-| S3 dispersion | `compute_dispersion_grid_cl` (shared AFMulator) | GPU |
-| S3 `E_total` sum | numpy | **CPU** |
+| S3 Pauli scale `overlap**beta` | OpenCL `fdbm_scale_pauli_pow` (FAST_S3); numpy if `FAST_S3=0` | GPU / CPU |
+| S3 ES | fused `ρ_diff·tip/k²` (FAST_S3); else Poisson+conv | GPU |
+| S3 tip gaussian/CO pad | OpenCL `fdbm_pad_roll` (FAST_S3); numpy if `FAST_S3=0` | GPU / CPU |
+| S3 `E_total` sum | OpenCL `fdbm_compose_E_to_img` (FAST_S3); numpy if legacy | GPU / CPU |
+| S3 dispersion | `compute_dispersion_grid_cl` / `compute_dispersion_to_img_cl` | GPU |
 | S3 `compute_gradient_cl` | OpenCL (shared AFMulator) | GPU |
 | S4 `setup_fdbm_grid` + `scan_fdbm` | OpenCL (same AFMulator; no duplicate scan) | GPU |
 | S4 `compute_df` | numpy | CPU (tiny) |

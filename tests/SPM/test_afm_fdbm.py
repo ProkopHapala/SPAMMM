@@ -462,6 +462,47 @@ def test_co_tip_xy_symmetry_and_origin():
 
 
 @pytest.mark.gpu
+def test_fdbm_fast_s3_parity_pauli_es():
+    """Round-2 GPU Pauli+scale and fused ES match legacy host/GPU path (synthetic grid)."""
+    from spammm.SPM import AFM as afm
+    nx = ny = nz = 32
+    step = 0.2
+    rng = np.random.default_rng(1)
+    rho_scf = np.abs(rng.standard_normal((nx, ny, nz))).astype(np.float32) * 0.01
+    rho_diff = rng.standard_normal((nx, ny, nz)).astype(np.float32) * 0.001
+    rho_diff -= rho_diff.mean()
+    tip = np.zeros((nx, ny, nz), np.float32)
+    tip[0, 0, 0] = 1.0
+    tip[0, 0, 1] = 0.3
+    tip_d = tip.copy()
+    tip_d[0, 0, 0] = 0.5
+    A, beta = 10.0, 1.4
+
+    afmulator = afm.AFMulator(use_morse=False, nloc=32)
+    fft = afm._get_fdbm_fft(ctx=afmulator.ctx, queue=afmulator.queue)
+    fft.bind_afm_program(afmulator.prg)
+
+    V = afm.fft_poisson(rho_diff, step)
+    Ep_leg = afm.scale_pauli_field(
+        afm.compute_pauli_overlap(rho_scf, tip, step, tip_rolled=True),
+        step, A, beta, return_grads=False)
+    Ee_leg = afm.compute_es_conv_field(V, tip_d, step, tip_rolled=True, return_grads=False)
+
+    fft.ensure((nx, ny, nz), step=step)
+    fft._xyz_host_to_cl(fft._xyz_tip_tot, tip)
+    fft._xyz_host_to_cl(fft._xyz_tip_del, tip_d)
+    fft._xyz_host_to_cl(fft._xyz_rho_scf, rho_scf)
+    fft._xyz_host_to_cl(fft._xyz_rho_diff, rho_diff)
+    Ep_fast = fft.pauli_overlap_scaled_cl(fft._xyz_rho_scf, fft._xyz_tip_tot, step, A, beta).get()
+    Ee_fast = fft.es_fused_from_rho_cl(fft._xyz_rho_diff, fft._xyz_tip_del, step).get()
+
+    assert correlation(Ep_leg.ravel(), Ep_fast.ravel()) > 0.999
+    assert correlation(Ee_leg.ravel(), Ee_fast.ravel()) > 0.999
+    assert rmse(Ep_leg, Ep_fast) < 1e-5
+    assert rmse(Ee_leg, Ee_fast) < 1e-5
+
+
+@pytest.mark.gpu
 @pytest.mark.slow
 def test_fdbm_co_tip_vs_gaussian_h2o():
     """H2O FDBM with tip_mode=co and gaussian both produce finite df; tips differ."""

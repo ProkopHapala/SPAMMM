@@ -1387,7 +1387,7 @@ def make_2d_grid(grid_origin, size_xy, center_z, z_height, n=200):
     extent = [xs[0], xs[-1], ys[0], ys[-1]]
     return points, extent, nx, ny
 
-def overlay_atoms(ax, apos, enames, xs=None, ys=None, label_heavy=True):
+def overlay_atoms(ax, apos, enames, xs=None, ys=None, label_heavy=True, marker='.', markersize=2):
     """Overlay atom positions on a matplotlib axes.
 
     Args:
@@ -1396,6 +1396,8 @@ def overlay_atoms(ax, apos, enames, xs=None, ys=None, label_heavy=True):
         enames: list of element name strings
         xs, ys: optional grid axes for bounds checking
         label_heavy: if True, annotate non-H atoms with element+index
+        marker: matplotlib marker (default '.' = small dots)
+        markersize: marker size in points
     """
     for i, (p, e) in enumerate(zip(apos, enames)):
         x, y = p[0], p[1]
@@ -1403,7 +1405,7 @@ def overlay_atoms(ax, apos, enames, xs=None, ys=None, label_heavy=True):
             if not (xs[0] <= x <= xs[-1] and ys[0] <= y <= ys[-1]):
                 continue
         c = ELEM_COLOR_2D.get(e, 'magenta')
-        ax.plot(x, y, 'o', color=c, markersize=5, markeredgecolor='k', markeredgewidth=0.5, zorder=5)
+        ax.plot(x, y, marker, color=c, markersize=markersize, zorder=5)
         if label_heavy and e != 'H':
             ax.annotate(f"{e}{i}", (x, y), fontsize=7, ha='left', va='bottom', color='black')
 

@@ -30,10 +30,11 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `heterocycle_generator.py` — heterocycle structure generation
 
 ### spammm/forcefields/ — Interatomic Force Fields
-- `FFController.py` — forcefield controller/orchestrator
+- `FFController.py` — forcefield controller/orchestrator (`spff` / `uff` / `lff`)
 - `FFEvaluator.py` — single-point UFF/SPFF E,F evaluator for FD Hessians
 - `SPFF_cl.py` — SPFF forcefield (PyOpenCL)
-- `UFF_cl.py` — UFF forcefield (PyOpenCL)
+- `UFF_cl.py` — UFF forcefield (PyOpenCL); fused multi-step + optional FAF
+- `LFFSolver.py` — linearized projective Jacobi (K₁₂/K₁₃/K₁₄ from UFF; soft FAF)
 - `SPFFbuilder.py` — SPFF topology/buffer builder
 - `UFFbuilder.py` — UFF topology/buffer builder
 - `RigidBodyDynamics.py` — rigid body dynamics integrator
@@ -41,6 +42,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `Assembly.py` — hexagonal SAM rigid-body packing search (orchestration + `AssemblyOCL`)
 - `AssemblyPlot.py` — assembly top views, clash/strain diagnostics, XYZ export
 - `QEq.py` — charge equilibration
+- `README.md` — module index; three relax paths + Assembly
 
 ### spammm/dynamics/ — Vibrational Analysis
 - `Vibrations.py` — Hessian assembly (DFTB / UFF / SPFF), rigid-mode projection, mode analysis, unit conversion
@@ -60,9 +62,10 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `README.md` — module index; contact-surface API summary + fit knobs
 
 ### spammm/SPM/ — Scanning Probe Microscopy (AFM/STM)
-- `AFM.py` — AFM simulation (Morse/LJ + FDBM); **contact surface:** `fit_contact_surface`, `run_scan_contact`, `fit_pic_contact_surface`, `run_scan_pic`
-- `AFM_util.py` — AFM utilities, density-based model helpers
-- `ModularPipeline.py` — modular AFM pipeline (S1-S6 stages)
+- `AFM.py` — AFMulator (Morse/LJ + FDBM); contact surface helpers; **FAST_S3** fused ES + GPU pad/scale (`SPAMMM_AFM_FAST_S3`); `AFMBench`
+- `AFM_utils.py` — tip densities, FDBM orchestration, `compose_and_relax_total`
+- `ModularPipeline.py` — modular AFM/STM pipeline (S1–S6) with dual Stage-3 (fast/legacy)
+- Perf report: `doc/Tasks/PerfBenchmark_FDBM.md`; bench: `tests/SPM/bench_fdbm.py`
 - `ManipulationPathOpt.py` — manipulation path optimization
 - `ScanUtils.py` — scan grid utilities
 
@@ -90,7 +93,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `ExtensionManager.py` — plugin/extension manager
 - `KekuleExtension.py` — Kekule solver GUI extension
 - `AsciiArtExtension.py` — ASCII art → molecule + Kekule + H-bond resolution GUI
-- `AFMExtension.py` — AFM simulation GUI extension
+- `AFMExtension.py` — FDBM AFM/STM GUI (ModularPipeline); plot z=3.0 Å default; atom overlay
 - `FFExtension.py` — forcefield GUI extension
 - `VibrationExtension.py` — normal-mode analysis GUI (DFTB / UFF / SPFF, clickable mode table)
 - `QEqExtension.py` — QEq GUI extension
@@ -119,10 +122,11 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `globals.py` — global constants
 
 ## kernels/ — OpenCL Kernel Sources
-- `UFF.cl` — UFF forcefield kernels
-- `SPFF.cl` — SPFF forcefield kernels
+- `UFF.cl` — UFF forcefield kernels (incl. fused multi-step + FAF)
+- `SPFF.cl` — SPFF forcefield kernels (incl. fused multi-step + FAF)
+- `LFF.cl` — projective Jacobi on linearized springs (K₁₂/K₁₃/K₁₄ + FAF outer)
 - `Forces.cl` — general force computation
-- `AFM.cl` — AFM simulation kernels
+- `AFM.cl` — AFM PP relax + FDBM Stage-3 `fdbm_*` helpers (FAST_S3)
 - `gridFF.cl` — grid force field kernels
 - `surface.cl` — surface interaction kernels
 - `contact_surface.cl` — quasi-2D contact field: brute reference, separable Av/Atv/eval, PIC fit/eval, `relaxStrokesTiltedContact` / `relaxStrokesTiltedPIC`
@@ -140,6 +144,9 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `conftest.py` — pytest fixtures (data paths, molecule loader, `--update-refs`)
 - `test_topology.py` — bond/angle/hybridization/type assignment
 - `test_forcefield.py` — UFF/SPFF optimization, NVE conservation, energy–force correspondence
+- `test_relax_serial.py` — SPFF serial vs batch parity
+- `test_relax_flat1.py` — flat_1 PAH vacuum/substrate timing
+- `test_relax_ptcda_faf.py` — PTCDA+FAF: SPFF/UFF fused + LFF topology/sweep
 - `test_vibrations.py` — normal modes (H2O fast; benzene/PTCDA slow); `debug/test_vibrations/`
 - `test_surface.py` — Ewald vs brute, GridFF, folded function
 - `test_folded_relax.py` — rigid body relaxation + manipulation
@@ -182,7 +189,9 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `Tasks/` — task design documents (e.g. `ReactionCoordinateExtension_Design.md`)
 - `Topics/AFM/ContactSurface_Static.md` — **quasi-2D AFM field** (separable + PIC): API, tutorial, parity
 - `Topics/AFM/ContactSurface_Elastic.md` — elastic extension (future)
+- `Topics/ForceFields/LFF_ProjectiveRelax.md` — LFF projective Jacobi (springs + FAF outer); 3rd relax path
 - `Topics/Vibrations.md` — normal-mode analysis (Hessian, GUI, units, tests)
 - `Topics/ReactionCoordinateScan.md` — H-bond RC scan, pm-NEB, ScanDataset, ESP animation
+- `Tasks/PerfBenchmark_Relaxation.md` — UFF/SPFF/LFF relax perf + PTCDA+FAF session log
 - `Ideas/` — research ideas
 - Various topic-specific `.md` files (forcefields, topology, surfaces, AFM, GUI)

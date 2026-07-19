@@ -23,7 +23,7 @@ import time
 import numpy as np
 import spammm.atomicUtils as au
 from spammm.globals import debug_print
-from spammm.SPM.AFM import AFMBench, afm_bench_enabled, afm_bench_no_io, afm_use_cpu_fft
+from spammm.SPM.AFM import AFMBench, afm_bench_enabled, afm_bench_no_io, afm_use_cpu_fft, afm_use_fast_s3, afm_diag_download
 from spammm.SPM import AFM as afm
 from spammm.SPM import AFM_utils as afm_utils
 from spammm.config_utils import get_config, get_path, get_dftb_basis_path
@@ -114,6 +114,7 @@ class ModularAFMPipeline:
         self.norb_per_atom = None
         self.orb_offsets = None
         self._afmulator = None  # reused across S3 dispersion/gradient + S4 relax
+        self._fdbm_grid_ready = False  # True after fast-S3 device setup_fdbm_grid_from_img
 
         # pySCF structures (only used for backend='pyscf')
         self._pyscf_data = None  # Cache for mol, mf, dm from pySCF
@@ -538,62 +539,101 @@ Hamiltonian = DFTB {{
                 else:
                     print(f"  WARNING: No fitted Pauli params found for {self.basis}, using default")
                     pauli_params = {'A': 155.33, 'beta': 1.5507}  # mio-1-1 default
-        
-        # Step 2: Electrostatics — currently NumPy FFT on CPU
-        from spammm.SPM.AFM import afm_use_cpu_fft
+
+        A_pauli = pauli_params.get('A', 787.22)
+        beta_pauli = pauli_params.get('beta', 1.2371)
+        target_shape = tuple(int(x) for x in self.ngrid)
+        fdata_dir = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tests', 'pyFireball', 'Fdata'))
+        fdata_basis = os.path.join(fdata_dir, 'basis')
+        afmulator = self._get_afmulator()
+
+        # ── Round-2 fast S3 (default): fused ES + GPU pad/scale; legacy via SPAMMM_AFM_FAST_S3=0 ──
+        if afm_use_fast_s3():
+            debug_print(1, f"  Tip mode: {self.tip_mode}  [FAST_S3]")
+            _bench().begin('S3.tip_densities', 'IO')
+            tip_tot, tip_del = afm_utils.get_tip_densities(
+                tip_mode=self.tip_mode, target_shape=target_shape, step=self.step, margin=self.margin,
+                output_dir=self.output_dir, co_tip_dir=self.co_tip_dir,
+                fdata_dir=fdata_dir, fdata_basis=fdata_basis, backend=self.backend,
+                pad_mode='none' if self.tip_mode == 'co' else 'cpu',
+            )
+            _bench().end('S3.tip_densities')
+            # Host E/V for GUI plots + cache; skip only under SPAMMM_AFM_BENCH_NO_IO
+            need_E = (not afm_bench_no_io()) or afm_diag_download() or _cache_write_ok()
+            _bench().begin('S3.fast_fields_gpu', 'GPU')
+            V_ES, E_pauli_field, E_ES_field, E_vdw, F_total = afm.stage3_fdbm_fields_fast(
+                afmulator, rho_scf, rho_diff, tip_tot, tip_del,
+                self.origin, self.step, self.ngrid, self.atomPos, self.atomTypes,
+                A_pauli, beta_pauli, C6_CO=vdw_params['C6_CO'],
+                tip_already_rolled=False, download_fields=need_E,
+            )
+            afmulator.queue.finish()
+            _bench().end('S3.fast_fields_gpu')
+            self._fdbm_grid_ready = True
+            if _cache_write_ok():
+                _bench().begin('S3.cache_write', 'IO')
+                if V_ES is None:
+                    V_ES = afm.fft_poisson(rho_diff, self.step)
+                if E_pauli_field is None:
+                    fft = afm._get_fdbm_fft(afmulator.ctx, afmulator.queue)
+                    E_pauli_field = np.ascontiguousarray(fft._xyz_E_pauli.get())
+                    E_ES_field = np.ascontiguousarray(fft._xyz_E_es.get())
+                    E_vdw = afmulator.download_image_rgba_xyz(afmulator.img_disp_fast, target_shape)[..., 3]
+                np.savez(self.cache_stage3, V_ES=V_ES, E_pauli_field=E_pauli_field,
+                         E_ES_field=E_ES_field, E_vdw=E_vdw, F_total=F_total)
+                _bench().end('S3.cache_write')
+                debug_print(1, f"  Stage 3 complete and cached [FAST_S3].")
+            else:
+                debug_print(1, f"  Stage 3 complete [FAST_S3] (cache write skipped).")
+            _bench_stage_end('Stage 3 FDBM potentials')
+            return V_ES, E_pauli_field, E_ES_field, E_vdw, F_total
+
+        # ── Legacy Stage-3 path (SPAMMM_AFM_FAST_S3=0 or CPU FFT) ──
         _fft_where = 'CPU' if afm_use_cpu_fft() else 'GPU'
         _bench().begin('S3.fft_poisson', _fft_where)
         V_ES = afm.fft_poisson(rho_diff, self.step)
         _bench().end('S3.fft_poisson')
-        
-        # Tip densities: 'co' (real CO, O at (0,0,0)) or 'gaussian'
-        target_shape = tuple(int(x) for x in self.ngrid)
-        fdata_dir = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tests', 'pyFireball', 'Fdata'))
-        fdata_basis = os.path.join(fdata_dir, 'basis')
-        debug_print(1, f"  Tip mode: {self.tip_mode}")
-        _bench().begin('S3.tip_densities', 'CPU')  # gaussian=CPU; co=IO/CPU (or slow DFTB)
+
+        debug_print(1, f"  Tip mode: {self.tip_mode}  [LEGACY_S3]")
+        _bench().begin('S3.tip_densities', 'CPU')
         co_rho_total, co_rho_delta = afm_utils.get_tip_densities(
             tip_mode=self.tip_mode, target_shape=target_shape, step=self.step, margin=self.margin,
             output_dir=self.output_dir, co_tip_dir=self.co_tip_dir,
             fdata_dir=fdata_dir, fdata_basis=fdata_basis, backend=self.backend,
+            pad_mode='cpu',
         )
         _bench().end('S3.tip_densities')
-        
+
         _bench().begin('S3.pauli_overlap_fft', _fft_where)
         overlap_raw = afm.compute_pauli_overlap(rho_scf, co_rho_total, self.step, tip_rolled=True)
         _bench().end('S3.pauli_overlap_fft')
-        A_pauli = pauli_params.get('A', 787.22)
-        beta_pauli = pauli_params.get('beta', 1.2371)
         _bench().begin('S3.pauli_scale', 'CPU')
         E_pauli_field = afm.scale_pauli_field(overlap_raw, self.step, A_pauli, beta_pauli, return_grads=False)
         _bench().end('S3.pauli_scale')
-        
+
         _bench().begin('S3.es_conv_fft', _fft_where)
         E_ES_field = afm.compute_es_conv_field(V_ES, co_rho_delta, self.step, tip_rolled=True, return_grads=False)
         _bench().end('S3.es_conv_fft')
-        
-        # Step 5: Dispersion — OpenCL by default (reuse AFMulator)
-        afmulator = self._get_afmulator()
+
         _bench().begin('S3.dispersion', 'GPU')
         E_vdw = afm.compute_dispersion_grid(
             self.atomPos, self.atomTypes, self.origin, self.step, self.ngrid,
             C6_CO=vdw_params['C6_CO'], return_grads=False, afmulator=afmulator
         )
         _bench().end('S3.dispersion')
-        
-        # Total force field
+
         _bench().begin('S3.E_total_sum', 'CPU')
         E_total = E_pauli_field + E_ES_field + E_vdw
         _bench().end('S3.E_total_sum')
-        
+
         _bench().begin('S3.compute_gradient_cl', 'GPU')
         F_total = afmulator.compute_gradient_cl(E_total, self.step, bAlloc=True)
         afmulator.queue.finish()
         _bench().end('S3.compute_gradient_cl')
-        
+        self._fdbm_grid_ready = False
+
         if _cache_write_ok():
             _bench().begin('S3.cache_write', 'IO')
-            # Uncompressed: savez_compressed was ~10s / 90% of Stage 3 on large FDBM grids
             np.savez(self.cache_stage3, V_ES=V_ES, E_pauli_field=E_pauli_field,
                                 E_ES_field=E_ES_field, E_vdw=E_vdw, F_total=F_total)
             _bench().end('S3.cache_write')
@@ -630,10 +670,12 @@ Hamiltonian = DFTB {{
             F_total,
             self.scan_xs, self.scan_ys, self.heights,
             self.origin, self.step, self.atomPos, K_LAT=relax_params['K_LAT'],
-            use_gpu_relax=True, ppm_mode=ppm_mode, afmulator=afmulator
+            use_gpu_relax=True, ppm_mode=ppm_mode, afmulator=afmulator,
+            reuse_fdbm_grid=bool(getattr(self, '_fdbm_grid_ready', False)),
         )
         afmulator.queue.finish()
         _bench().end('S4.compose_and_relax_total')
+        self._fdbm_grid_ready = False
         
         dxy = np.hypot(tip_disp['dx'], tip_disp['dy'])
         debug_print(1, f"  Stage 4 tip |dxy|_max={float(dxy.max()):.4f}Å  (soft K→large deflection / sharp PP edges)")

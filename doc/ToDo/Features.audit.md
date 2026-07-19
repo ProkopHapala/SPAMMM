@@ -72,16 +72,18 @@ Topology (AtomicGraph SSOT) → Type Assignment → Force Fields → Surface Int
 | [SubstrateBuilder.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/surfaces/SubstrateBuilder.py:0:0-0:0) | ⚠️ Minimal | No test | NaCl/CaF2 only, no CIF parsing |
 | [Surface_utils.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/surfaces/Surface_utils.py:0:0-0:0) | ✅ Active | Implicit | Surface utilities |
 
-### 2.4 SPM / AFM / STM (⚠️ Mixed)
+### 2.4 SPM / AFM / STM (✅ FDBM interactive; Morse solid)
 
 | Module | Status | Tests | Notes |
 |--------|--------|-------|-------|
-| `AFM.py` (AFMulator) | ✅ Morse works | [test_afm_morse.py](cci:7://file:///home/prokop/git/SPAMMM/tests/SPM/test_afm_morse.py:0:0-0:0) (9 tests) | Morse/LJ + Coulomb: fully working, FDBM: partially |
-| `AFM_util.py` | ⚠️ Partially | [test_afm_fdbm.py](cci:7://file:///home/prokop/git/SPAMMM/tests/SPM/test_afm_fdbm.py:0:0-0:0) (11 tests) | FDBM pipeline runs but df degenerate (relaxStrokes bug) |
-| `ModularPipeline.py` | ⚠️ Imports fixed | No test | 6-stage pipeline (S1-S6), not tested end-to-end |
+| `AFM.py` (AFMulator) | ✅ Morse + FDBM FAST_S3 | [test_afm_morse.py](cci:7://file:///home/prokop/git/SPAMMM/tests/SPM/test_afm_morse.py:0:0-0:0), [test_afm_fdbm.py](cci:7://file:///home/prokop/git/SPAMMM/tests/SPM/test_afm_fdbm.py:0:0-0:0) | Morse/LJ + Coulomb OK; FDBM R1+R2 perf (`SPAMMM_AFM_FAST_S3`); fused ES + GPU pad/scale |
+| `AFM_utils.py` | ✅ Active | FDBM + tip helpers | Tip `pad_mode='none'` for GPU roll; `compose_and_relax_total(reuse_fdbm_grid=…)` |
+| `ModularPipeline.py` | ✅ Active | `tests/SPM/bench_fdbm.py` | S1–S6 + `AFMBench`; dual S3 path (fast/legacy) |
 | `ScanUtils.py` | ✅ Active | Implicit | Scan utilities |
 | `ManipulationPathOpt.py` | ⚠️ Imports fixed | No test | Autonomous manipulation |
-| STM ([LCAO_STM.cl](cci:7://file:///home/prokop/git/SPAMMM/kernels/LCAO_STM.cl:0:0-0:0), [LCAO_grid.cl](cci:7://file:///home/prokop/git/SPAMMM/kernels/LCAO_grid.cl:0:0-0:0)) | ⚠️ Kernels exist | No test | Orbital projection, DOS/STM current — untested |
+| STM ([LCAO_STM.cl](cci:7://file:///home/prokop/git/SPAMMM/kernels/LCAO_STM.cl:0:0-0:0), [LCAO_grid.cl](cci:7://file:///home/prokop/git/SPAMMM/kernels/LCAO_grid.cl:0:0-0:0)) | ⚠️ Kernels exist | No dedicated STM L0 | Orbital projection — untested at L0 |
+
+**FDBM perf (T01, 2026-07-19) — measured on RTX 3090:** benzene warm ~**0.18 s** (was ~1.65 s); flat_1 S2 NA **5.87→0.03 s**; S3 cache **~10→0.4 s**; flat_1 warm S3+S4 ~**1.4 s**. Spec: `doc/Tasks/PerfBenchmark_FDBM.md`.
 
 ### 2.5 Quantum Backends (⚠️ Partially Working)
 
@@ -103,7 +105,7 @@ Topology (AtomicGraph SSOT) → Type Assignment → Force Fields → Surface Int
 |--------|--------|-------|-------|
 | [SPAMMM_GUI.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/GUI/SPAMMM_GUI.py:0:0-0:0) | ✅ Active | No test | Main window, mouse dispatch, grid transforms (transpose/flip) |
 | [EditModeHandlers.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/GUI/EditModeHandlers.py:0:0-0:0) | ✅ Active | No test | Unified/Atom/Bond/Ring/Hex modes; Ring mode combines edge+corner+hex ring placement |
-| [AFMExtension.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/GUI/AFMExtension.py:0:0-0:0) | ⚠️ Imports fixed | No test | Dirty flag system (S1-S6), UI panel |
+| [AFMExtension.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/GUI/AFMExtension.py:0:0-0:0) | ✅ Active | No pytest (manual GUI) | Dirty flags S1–S6; FDBM FAST_S3; plot z default 3.0 Å; atom overlay toggle + `'.'` dots |
 | [KekuleExtension.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/GUI/KekuleExtension.py:0:0-0:0) | ✅ Active | No test | Bond order visualization |
 | [FoldedRigidExtension.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/GUI/FoldedRigidExtension.py:0:0-0:0) | ✅ Active | No test (manual L2) | Interactive manipulation |
 | [FFExtension.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/GUI/FFExtension.py:0:0-0:0) | ✅ Active | No test | FF relaxation panel |
@@ -151,10 +153,10 @@ Plus: 42 topology editing tests, 5 folded rigid tests, 2 contact surface tests, 
 
 | Area | Gap | Priority |
 |------|-----|----------|
-| FDBM pipeline | `relaxStrokes` kernel bug → degenerate df | **High** |
-| ModularPipeline S1-S6 | No end-to-end test | **High** |
-| STM simulation | No tests at all | **High** |
-| DFTB+ density projection | Only implicit via FDBM test | Medium |
+| FDBM hex/rot60 image QA | Coarse `step=0.15` symmetry; see AFMTesting lessons | Medium |
+| ModularPipeline S1-S6 | Bench exists (`bench_fdbm.py`); more L0 E2E asserts welcome | Medium |
+| STM simulation | No dedicated L0 tests | **High** |
+| DFTB+ density projection | Covered via FDBM tests; dedicated unit tests thin | Medium |
 | pySCF backend | No test | Medium |
 | GridFF construction/interpolation | No test | Medium |
 | SPFF relaxation | Stubs only | Medium |
@@ -169,8 +171,7 @@ Plus: 42 topology editing tests, 5 folded rigid tests, 2 contact surface tests, 
 
 ### Critical (pipeline-breaking):
 
-1. **FDBM `relaxStrokes` kernel** ([AFM.cl](cci:7://file:///home/prokop/git/SPAMMM/kernels/AFM.cl:0:0-0:0)): FIRE integrator commented out (`#if OPT_FIRE` lines 375-379), damped velocity diverges with dt=0.5/K_RAD=20 → NaN → constant force output. Also `tipForce` divides by `r=0` when probe=tip. Fix identified but not applied.
-2. **FDBM df is blank**: Consequence of #1 — `Fz_relax` is constant, `df` is exactly zero.
+1. ~~**FDBM df blank / relaxStrokes**~~ — **stale as of 2026-07:** GUI FDBM + PP relax produces finite non-zero `df` (benzene `|df|max`~0.2 Hz in `bench_fdbm`). Re-verify old FIRE/`tipForce` notes in `AFM.cl` only if blank images reappear.
 
 ### Algorithmic:
 
@@ -288,14 +289,15 @@ The repo has a well-organized documentation hierarchy:
 - DFTB+ SCF + GPU density projection
 - FDBM Pauli parameter fitting (global log-log, 3 basis sets)
 - FDBM Fz/df imaging via `plot_fdbm_relax.py` (PTCDA, pentacene)
+- **FDBM ModularPipeline perf (T01 R1+R2):** benzene warm ~0.18 s; flat_1 S3+S4 ~1.4 s; fused ES + GPU pad/scale (`SPAMMM_AFM_FAST_S3`); see `doc/Tasks/PerfBenchmark_FDBM.md`
 - Z-scan reference curves (60 curves, 4 QM methods)
 - Jacobi eigendecomposition GPU kernel (6 tests)
 - Reaction-coordinate scan + GUI
 - Test infrastructure (L0/L1/L2, conftest, helpers, ref_data)
 
 ### ⚠️ Partially Working / Needs Fixing:
-- **FDBM pipeline end-to-end**: `relaxStrokes` kernel bug → degenerate df (fix identified)
-- **ModularPipeline S1-S6**: No end-to-end test, imports fixed
+- **FDBM image hex symmetry** at coarse grids (`step=0.15`) — prefer ≤0.1 Å (`doc/Tasks/AFMTesting.md`)
+- **FDBM perf polish:** async cache skip; optional interactive coarse grid (`PerfBenchmark_FDBM.md` T-next-4)
 - **UFF CH4 relaxation**: Bond assertion failure
 - **UFF NVE conservation**: Array shape mismatch
 - **Folded poly basis**: Power sequence wrong
