@@ -1345,8 +1345,36 @@ __kernel void updateAtomsSPFFf4_rot(
 #define MAX_NNODE 96
 #endif
 
+#ifndef FAF_BASIS_MAX
+#define FAF_BASIS_MAX 128
+#endif
+#ifndef FAF_TYPES_MAX
+#define FAF_TYPES_MAX 8
+#endif
+
+inline float folded_eval_basis_s(float u, float v, float z, float4 prm){
+    const float twopi = 6.283185307179586f;
+    float bx = native_cos(twopi * prm.x * u);
+    float by = native_cos(twopi * prm.y * v);
+    float bz = native_exp(-prm.z * fmax(0.0f, z - prm.w));
+    return bx * by * bz;
+}
+
+// Correct chain rule (dudx,dudy,dvdx,dvdy) packed in invL — matches rigid.cl, not buggy surface.cl
+inline float3 folded_eval_grad_s(float u, float v, float z, float4 prm, float4 invL){
+    const float twopi = 6.283185307179586f;
+    float ku = prm.x, kv = prm.y, az = prm.z, z0 = prm.w;
+    float bx = native_cos(twopi * ku * u);
+    float by = native_cos(twopi * kv * v);
+    float bz = native_exp(-az * fmax(0.0f, z - z0));
+    float dE_du = (-twopi * ku * native_sin(twopi * ku * u)) * by * bz;
+    float dE_dv = bx * (-twopi * kv * native_sin(twopi * kv * v)) * bz;
+    float dE_dz = (z >= z0) ? (bx * by * (-az * bz)) : 0.0f;
+    return (float3)(dE_du*invL.x + dE_dv*invL.z, dE_du*invL.y + dE_dv*invL.w, dE_dz);
+}
+
 __kernel void relax_nsteps_serial(
-    const int4  nDOFs,              // (natoms, nnode, nsteps, 0)
+    const int4  nDOFs,              // (natoms, nnode, nsteps, do_faf)
     __global       float4*  g_apos,     // [nvec] positions (atoms + pi)
     __global       float4*  g_avel,     // [nvec] velocities
     __global       float4*  g_aforce,   // [nvec] forces (output)
@@ -1360,13 +1388,17 @@ __kernel void relax_nsteps_serial(
     __global const float4*  g_constr,   // [natoms] constraints (xyz, K_flag)
     __global const float4*  g_constrK,  // [natoms] constraint stiffness
     __global const float4*  g_MDparams, // (dt, damp, Flimit, 0)
-    // --- reserved slots for future non-bonded (not used now) ---
-    __global const float4*  g_REQs,     // [natoms] non-bonded params (unused)
-    __global const int4*    g_excl      // [natoms*EXCL_MAX] exclusions (unused)
+    // --- FAF substrate (used when do_faf!=0); same contract as getSurfFolded ---
+    __global const float*   g_folded_coeffs,   // [ntypes*nbasis]
+    __global const float4*  g_folded_kxyz,     // [nbasis]
+    __global const int*     g_folded_atom_type,// [natoms]
+    const int4              folded_meta,       // (nbasis, ntypes, 0, 0)
+    const float4            folded_lvec2d      // (ax,bx,ay,by)
 ){
     const int natoms = nDOFs.x;
     const int nnode  = nDOFs.y;
     const int nsteps = nDOFs.z;
+    const int do_faf = nDOFs.w;
     const int nvec   = natoms + nnode;
     const int iL     = get_local_id(0);
 
@@ -1384,6 +1416,9 @@ __kernel void relax_nsteps_serial(
     __local float4  s_Kpp    [MAX_NNODE];     // pi-pi stiffness
     __local float4  s_constr [MAX_NATOM];     // constraints
     __local float4  s_constrK[MAX_NATOM];     // constraint stiffness
+    __local int     s_atype  [MAX_NATOM];     // FAF atom type
+    __local float4  LBASIS   [FAF_BASIS_MAX];
+    __local float   LCOEFFS  [FAF_TYPES_MAX * FAF_BASIS_MAX];
 
     // ---- Cooperative load from global to local ----
     for(int i = iL; i < nvec;    i += WG_SIZE) s_apos[i]      = g_apos[i];
@@ -1404,6 +1439,23 @@ __kernel void relax_nsteps_serial(
     const float dt   = MDpars.x;
     const float damp = MDpars.y;
     const float Flimit = MDpars.z;
+
+    // FAF cache (once)
+    float4 invLvec2d = (float4)(0,0,0,0);
+    int nbasis = 0, ntypes = 0;
+    if(do_faf){
+        nbasis = folded_meta.x;
+        ntypes = folded_meta.y;
+        if(nbasis>0 && nbasis<=FAF_BASIS_MAX && ntypes>0 && ntypes<=FAF_TYPES_MAX){
+            for(int j=iL; j<nbasis; j+=WG_SIZE) LBASIS[j] = g_folded_kxyz[j];
+            for(int j=iL; j<nbasis*ntypes; j+=WG_SIZE) LCOEFFS[j] = g_folded_coeffs[j];
+            for(int j=iL; j<natoms; j+=WG_SIZE) s_atype[j] = g_folded_atom_type[j];
+            float ax = folded_lvec2d.x, bx = folded_lvec2d.y, ay = folded_lvec2d.z, by = folded_lvec2d.w;
+            float det = ax*by - bx*ay;
+            if(fabs(det) > 1e-12f) invLvec2d = (float4)(by/det, -bx/det, -ay/det, ax/det);
+            else nbasis = 0;
+        } else { nbasis = 0; }
+    }
 
     barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -1509,6 +1561,32 @@ __kernel void relax_nsteps_serial(
             s_aforce[iG] += (float4){fa, E};
         }
         barrier(CLK_LOCAL_MEM_FENCE);
+
+        // === Phase 2b: FAF substrate (atoms only; parallel over atoms) ===
+        if(do_faf && nbasis>0){
+            for(int ia = iL; ia < natoms; ia += WG_SIZE){
+                float3 pos = s_apos[ia].xyz;
+                float u = invLvec2d.x*pos.x + invLvec2d.y*pos.y;
+                float v = invLvec2d.z*pos.x + invLvec2d.w*pos.y;
+                u = u - floor(u);
+                v = v - floor(v);
+                int ityp = s_atype[ia];
+                if(ityp < 0 || ityp >= ntypes) continue;
+                float E = 0.0f;
+                float3 F = (float3)(0.0f,0.0f,0.0f);
+                int ioff = ityp*nbasis;
+                for(int ib=0; ib<nbasis; ib++){
+                    float c = LCOEFFS[ioff + ib];
+                    float4 prm = LBASIS[ib];
+                    float  b = folded_eval_basis_s(u, v, pos.z, prm);
+                    float3 g = folded_eval_grad_s(u, v, pos.z, prm, invLvec2d);
+                    E += c * b;
+                    F -= c * g;
+                }
+                s_aforce[ia] += (float4)(F.x, F.y, F.z, -E);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
 
         // === Phase 3: Gather recoil + integrate (threads 0..nvec-1) ===
         if(iL < nvec){
@@ -1655,20 +1733,21 @@ __kernel void relax_nsteps_global(
     const float damp = MDpars.y;
     const float Flimit = MDpars.z;
 
-    // FAF local cache (small)
-    __local float4 LBASIS[64];
-    __local float  LCOEFFS[8*64];
+    // FAF local cache
+    __local float4 LBASIS[FAF_BASIS_MAX];
+    __local float  LCOEFFS[FAF_TYPES_MAX * FAF_BASIS_MAX];
     float4 invLvec2d = (float4)(0,0,0,0);
     int nbasis = 0, ntypes = 0;
     if(do_faf){
         nbasis = folded_meta.x;
         ntypes = folded_meta.y;
-        if(nbasis>0 && nbasis<=64 && ntypes>0 && ntypes<=8){
+        if(nbasis>0 && nbasis<=FAF_BASIS_MAX && ntypes>0 && ntypes<=FAF_TYPES_MAX){
             for(int j=iL; j<nbasis; j+=nL) LBASIS[j] = g_folded_kxyz[j];
             for(int j=iL; j<nbasis*ntypes; j+=nL) LCOEFFS[j] = g_folded_coeffs[j];
             float ax = folded_lvec2d.x, bx = folded_lvec2d.y, ay = folded_lvec2d.z, by = folded_lvec2d.w;
             float det = ax*by - bx*ay;
             if(fabs(det) > 1e-12f) invLvec2d = (float4)(by/det, -bx/det, -ay/det, ax/det);
+            else nbasis = 0;
         } else { nbasis = 0; }
     }
     barrier(CLK_LOCAL_MEM_FENCE);

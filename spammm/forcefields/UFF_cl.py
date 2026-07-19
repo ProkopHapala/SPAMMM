@@ -295,8 +295,8 @@ class UFF_cl(OpenCLBase):
             self._run_integrator()
         return self.get_total_energy()
 
-    def relax_serial(self, nsteps=100, dt=0.01, damp=0.9, Flimit=100.0, wg=128):
-        """Fused local-memory UFF relax (bonds+angles). Parallel angles+gather. natoms<=128, nangles<=256."""
+    def relax_serial(self, nsteps=100, dt=0.01, damp=0.9, Flimit=100.0, wg=128, do_faf=False):
+        """Fused local-memory UFF relax (bonds+angles+dihedrals+inversions + optional FAF). natoms<=128, nangles<=256."""
         from pyopencl import cltypes
         if self.natoms > 128:
             raise ValueError(f"relax_serial: natoms={self.natoms} > 128, use relax_global")
@@ -305,33 +305,86 @@ class UFF_cl(OpenCLBase):
         self.set_md_params(dt=dt, damp=damp, Flimit=Flimit)
         cl.enqueue_fill_buffer(self.queue, self.buffer_dict["avel"], np.float32(0), 0, self.buffer_dict["avel"].size)
         nDOFs = cltypes.make_int4(self.natoms, self.nangles, nsteps, self.nbonds)
+        nDOFs2 = cltypes.make_int4(self.ndihedrals, self.ninversions, 0, 0)
+        faf_args = self._faf_kernel_args(do_faf)
         args = [
-            nDOFs,
+            nDOFs, nDOFs2,
             self.buffer_dict['apos'], self.buffer_dict['avel'], self.buffer_dict['fapos'],
             self.buffer_dict['neighs'], self.buffer_dict['neighBs'], self.buffer_dict['bonParams'],
             self.buffer_dict['angAtoms'], self.buffer_dict['angParams1'], self.buffer_dict['angParams2_w'],
+            self.buffer_dict['dihAtoms'], self.buffer_dict['dihParams'],
+            self.buffer_dict['invAtoms'], self.buffer_dict['invParams'],
             self.buffer_dict['MDparams'],
+            np.int32(1 if do_faf else 0),
+            *faf_args,
         ]
         self.prg.relax_nsteps_local_UFF(self.queue, (wg,), (wg,), *args)
         self.queue.finish()
         return self.get_total_energy()
 
-    def relax_global(self, nsteps=100, dt=0.01, damp=0.9, Flimit=100.0, wg=256):
-        """Fused global-memory UFF relax (bonds+angles), strided WG — no local-size atom cap."""
+    def relax_global(self, nsteps=100, dt=0.01, damp=0.9, Flimit=100.0, wg=256, do_faf=False):
+        """Fused global-memory UFF relax (bonds+angles+dihedrals+inversions + optional FAF)."""
         from pyopencl import cltypes
         self.set_md_params(dt=dt, damp=damp, Flimit=Flimit)
         cl.enqueue_fill_buffer(self.queue, self.buffer_dict["avel"], np.float32(0), 0, self.buffer_dict["avel"].size)
         nDOFs = cltypes.make_int4(self.natoms, self.nangles, nsteps, self.nbonds)
+        nDOFs2 = cltypes.make_int4(self.ndihedrals, self.ninversions, 0, 0)
+        faf_args = self._faf_kernel_args(do_faf)
         args = [
-            nDOFs,
+            nDOFs, nDOFs2,
             self.buffer_dict['apos'], self.buffer_dict['avel'], self.buffer_dict['fapos'],
             self.buffer_dict['neighs'], self.buffer_dict['neighBs'], self.buffer_dict['bonParams'],
             self.buffer_dict['angAtoms'], self.buffer_dict['angParams1'], self.buffer_dict['angParams2_w'],
+            self.buffer_dict['dihAtoms'], self.buffer_dict['dihParams'],
+            self.buffer_dict['invAtoms'], self.buffer_dict['invParams'],
             self.buffer_dict['MDparams'],
+            np.int32(1 if do_faf else 0),
+            *faf_args,
         ]
         self.prg.relax_nsteps_global_UFF(self.queue, (wg,), (wg,), *args)
         self.queue.finish()
         return self.get_total_energy()
+
+    def _faf_kernel_args(self, do_faf):
+        from pyopencl import cltypes
+        meta = getattr(self, 'folded_meta', np.array([0, 0, 0, 0], dtype=np.int32))
+        lvec = getattr(self, 'folded_lvec2d', np.array([1, 0, 0, 1], dtype=np.float32))
+        if do_faf and int(meta[0]) <= 0:
+            raise ValueError("UFF FAF: call upload_folded_fit() first")
+        coeffs = self.buffer_dict.get('folded_coeffs', self.buffer_dict['apos'])
+        kxyz = self.buffer_dict.get('folded_kxyz', self.buffer_dict['apos'])
+        atype = self.buffer_dict.get('folded_atom_type', self.buffer_dict['neighs'])
+        return [
+            coeffs, kxyz, atype,
+            cltypes.make_int4(int(meta[0]), int(meta[1]), 0, 0),
+            cltypes.make_float4(float(lvec[0]), float(lvec[1]), float(lvec[2]), float(lvec[3])),
+        ]
+
+    def upload_folded_fit(self, fit):
+        """Upload FAF fit dict (same layout as SPFF_cl.upload_folded_fit)."""
+        coeffs = np.asarray(fit['coeffs'], dtype=np.float32)
+        kxyz = np.asarray(fit['basis_params'], dtype=np.float32)
+        atype = np.asarray(fit['atom_type_ids'], dtype=np.int32)
+        lvec2d = np.asarray(fit['folded_lvec2d'], dtype=np.float32).reshape(4)
+        ntypes, nbasis = int(coeffs.shape[0]), int(coeffs.shape[1])
+        if len(atype) != self.natoms:
+            raise ValueError(f"upload_folded_fit: atom_type_ids len {len(atype)} != natoms {self.natoms}")
+        if nbasis > 128 or ntypes > 8:
+            raise ValueError(f"upload_folded_fit: ntypes={ntypes} nbasis={nbasis} exceeds caps")
+        mf = cl.mem_flags
+        self.check_buf('folded_coeffs', 8 * 128 * f32sz, mf.READ_ONLY)
+        self.check_buf('folded_kxyz', 128 * 4 * f32sz, mf.READ_ONLY)
+        self.check_buf('folded_atom_type', self.natoms * i32sz, mf.READ_ONLY)
+        coeff_pad = np.zeros((8, 128), dtype=np.float32)
+        coeff_pad[:ntypes, :nbasis] = coeffs[:, :nbasis]
+        kxyz_pad = np.zeros((128, 4), dtype=np.float32)
+        kxyz_pad[:nbasis, :4] = kxyz[:nbasis, :4]
+        cl.enqueue_copy(self.queue, self.buffer_dict['folded_coeffs'], coeff_pad.ravel())
+        cl.enqueue_copy(self.queue, self.buffer_dict['folded_kxyz'], kxyz_pad.ravel())
+        cl.enqueue_copy(self.queue, self.buffer_dict['folded_atom_type'], atype)
+        self.folded_meta = np.array([nbasis, ntypes, 0, 0], dtype=np.int32)
+        self.folded_lvec2d = lvec2d.copy()
+        self.queue.finish()
 
     def run_md(self, nsteps=100, dt=0.01, Flimit=1e10):
         """NVE molecular dynamics entirely on GPU. Returns final energy."""

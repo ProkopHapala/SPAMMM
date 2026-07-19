@@ -341,7 +341,8 @@ class GridProjector(OpenCLBase):
         )
         self.queue.finish()
         T1 = time.perf_counter_ns()
-        print(f"[TIME] count_atoms_per_block {(T1-T0)*1e-6:.3f} [ms]")
+        if self.verbosity > 0:
+            print(f"[TIME] count_atoms_per_block {(T1-T0)*1e-6:.3f} [ms]")
 
         T0 = time.perf_counter_ns()
         # 3. Kernel 2: Fill task_atoms
@@ -359,7 +360,8 @@ class GridProjector(OpenCLBase):
         cl.enqueue_copy(self.queue, h_block_counts, self.gtask_block_counts_buff)
         self.queue.finish()
         T1 = time.perf_counter_ns()
-        print(f"[TIME] count_atoms_per_block.compact_tasks {(T1-T0)*1e-6:.3f} [ms]")
+        if self.verbosity > 0:
+            print(f"[TIME] count_atoms_per_block.compact_tasks {(T1-T0)*1e-6:.3f} [ms]")
 
         mask = h_block_counts > 0
         n_tasks = np.sum(mask)
@@ -369,7 +371,8 @@ class GridProjector(OpenCLBase):
         empty_blocks = np.sum(h_block_counts == 0)
         one_blocks   = np.sum(h_block_counts == 1)
         multi_blocks = n_blocks_total - empty_blocks - one_blocks
-        print(f"[DEBUG GPU] block atom stats: na_max={max_count}, nbloks: empty={empty_blocks}, one={one_blocks}, multi={multi_blocks}")
+        if self.verbosity > 0:
+            print(f"[DEBUG GPU] block atom stats: na_max={max_count}, nbloks: empty={empty_blocks}, one={one_blocks}, multi={multi_blocks}")
         self.last_block_atom_counts = h_block_counts
 
         if max_count > nMaxAtom:
@@ -401,7 +404,8 @@ class GridProjector(OpenCLBase):
         cl.enqueue_copy(self.queue, task_atoms_np, self.gtask_task_atoms_out_buff)
         self.queue.finish()
         T1 = time.perf_counter_ns()
-        print(f"[TIME] compact_tasks + readback {(T1-T0)*1e-6:.3f} [ms]")
+        if self.verbosity > 0:
+            print(f"[TIME] compact_tasks + readback {(T1-T0)*1e-6:.3f} [ms]")
 
         # Optional: sorting by na (descending) on host
         idx = np.argsort(tasks_np['na'])[::-1]
@@ -410,9 +414,23 @@ class GridProjector(OpenCLBase):
         
         return tasks_np, task_atoms_np
 
+    def build_tasks_selected(self, atoms, grid_spec, block_res=8, nMaxAtom=64):
+        """Dispatch to GPU or CPU task builder. Controlled by SPAMMM_AFM_CPU_TASKS (default GPU).
+
+        No silent fallback: GPU path raises if kernels/buffers fail.
+        """
+        from spammm.SPM.AFM import afm_use_cpu_tasks
+        if afm_use_cpu_tasks():
+            if self.verbosity > 0:
+                print("[GridProjector] build_tasks: CPU (SPAMMM_AFM_CPU_TASKS=1)")
+            return self.build_tasks(atoms, grid_spec, block_res=block_res, nMaxAtom=nMaxAtom)
+        if self.verbosity > 0:
+            print("[GridProjector] build_tasks: GPU (build_tasks_gpu)")
+        return self.build_tasks_gpu(atoms, grid_spec, block_res=block_res, nMaxAtom=nMaxAtom, bAlloc=True)
+
     def build_tasks(self, atoms, grid_spec, block_res=8, nMaxAtom=64):
         """
-        Partition the grid into tasks (active blocks).
+        Partition the grid into tasks (active blocks). CPU reference / parity path.
         """
         nx, ny, nz = grid_spec['ngrid'][:3]
         n_blocks = (
@@ -507,13 +525,16 @@ class GridProjector(OpenCLBase):
         
         return grid_spec_np
 
-    def project_density(self, rho, neighs, atoms, grid_spec, tasks=None, nMaxAtom=64, use_gpu_tasks=False, use_tiled=True, bAlloc=True):
+    def project_density(self, rho, neighs, atoms, grid_spec, tasks=None, nMaxAtom=64, use_gpu_tasks=None, use_tiled=True, bAlloc=True):
         """
         Main entry point for density projection using the tiled kernel.
+        use_gpu_tasks: None → follow SPAMMM_AFM_CPU_TASKS (default GPU); True/False override.
         """
         if tasks is None:
             T0 = time.perf_counter_ns()
-            if use_gpu_tasks:
+            if use_gpu_tasks is None:
+                tasks_np, task_atoms_np = self.build_tasks_selected(atoms, grid_spec, nMaxAtom=nMaxAtom)
+            elif use_gpu_tasks:
                 tasks_np, task_atoms_np = self.build_tasks_gpu(atoms, grid_spec, nMaxAtom=nMaxAtom)
             else:
                 tasks_np, task_atoms_np = self.build_tasks(atoms, grid_spec, nMaxAtom=nMaxAtom)
@@ -1133,7 +1154,7 @@ class GridProjector(OpenCLBase):
         """
         import time
         
-        tasks_np, task_atoms_np = self.build_tasks(atoms_dict, grid_spec, nMaxAtom=nMaxAtom, block_res=8)
+        tasks_np, task_atoms_np = self.build_tasks_selected(atoms_dict, grid_spec, nMaxAtom=nMaxAtom, block_res=8)
         if self.verbosity > 0: print(f"[DEBUG] project_orbital_dense: n_tasks={len(tasks_np)}")
         
         natoms = len(atoms_dict['pos'])
@@ -1196,7 +1217,7 @@ class GridProjector(OpenCLBase):
         """
         import time
         
-        tasks_np, task_atoms_np = self.build_tasks(atoms_dict, grid_spec, nMaxAtom=nMaxAtom, block_res=8)
+        tasks_np, task_atoms_np = self.build_tasks_selected(atoms_dict, grid_spec, nMaxAtom=nMaxAtom, block_res=8)
         if self.verbosity > 0: print(f"[DEBUG] project_density_dense: n_tasks={len(tasks_np)}")
         
         natoms = len(atoms_dict['pos'])
@@ -1809,7 +1830,7 @@ class GridProjector(OpenCLBase):
         import time
 
         # Build tasks
-        tasks_np, task_atoms_np = self.build_tasks(atoms_dict, grid_spec, nMaxAtom=64, block_res=8)
+        tasks_np, task_atoms_np = self.build_tasks_selected(atoms_dict, grid_spec, nMaxAtom=64, block_res=8)
         if self.verbosity > 0: print(f"[DEBUG] project_orbital: n_tasks={len(tasks_np)}")
 
         # Coefficient packing (vectorized)
@@ -1885,7 +1906,7 @@ class GridProjector(OpenCLBase):
         mf = cl.mem_flags
         t0 = time.perf_counter_ns()
 
-        tasks_np, task_atoms_np = self.build_tasks(atoms_dict, grid_spec, nMaxAtom=nMaxAtom)
+        tasks_np, task_atoms_np = self.build_tasks_selected(atoms_dict, grid_spec, nMaxAtom=nMaxAtom)
         n_tasks = len(tasks_np)
         natoms   = len(atoms_dict['pos'])
         numorb_max = 4
@@ -2063,50 +2084,94 @@ def project_dftb_density(geo, evecs, projector, atoms_dict, grid_spec, basis, B3
     return (rho_grid * B3_FACTOR).astype(np.float32)
 
 
-def project_neutral_density(geo, projector, atoms_dict, grid_spec, basis, B3_FACTOR=B3_FACTOR):
-    """
-    Project superposition of neutral atom densities onto a real-space grid.
-    Uses reference valence occupations per (l, Z).
+# Valence occupations per element (Z) and angular momentum (l)
+# DFTB valence electron counts (frozen core). Shared by dense + orbital-loop paths.
+OCC_NA = {
+    1:  {0: 1.0},           # H: 1s1
+    6:  {0: 2.0, 1: 2/3},   # C: 2s2 2p2 -> p: 2/3 per orbital
+    7:  {0: 2.0, 1: 1.0},   # N: 2s2 2p3 -> p: 3/3 = 1 per orbital
+    8:  {0: 2.0, 1: 4/3},   # O: 2s2 2p4 -> p: 4/3 per orbital
+    9:  {0: 2.0, 1: 5/3},   # F: 2s2 2p5 -> p: 5/3 per orbital
+    15: {0: 2.0, 1: 3/3},   # P: 3s2 3p3 -> p: 3/3 = 1 per orbital
+    16: {0: 2.0, 1: 4/3},   # S: 3s2 3p4 -> p: 4/3 per orbital
+    17: {0: 2.0, 1: 5/3},   # Cl: 3s2 3p5 -> p: 5/3 per orbital
+    35: {0: 2.0, 1: 5/3},   # Br: 4s2 4p5 -> p: 5/3 per orbital (3d frozen)
+    53: {0: 2.0, 1: 5/3},   # I: 5s2 5p5 -> p: 5/3 per orbital (4d frozen)
+}
 
-    Returns rho_na_grid (nx,ny,nz) float32 in e/Å³.
-    """
+
+def _na_orbital_layout(geo, basis):
+    """norb_per_atom / orb_offsets from geo + angular basis (same order as dense projection)."""
+    natoms = geo['natoms']
+    species_per_atom = geo['species_per_atom']
+    species_names = geo['species_names']
+    sp_by_name = {sp['name']: sp for sp in basis}
+    norb_per_atom = []
+    orb_offsets = [0]
+    for ia in range(natoms):
+        sp = sp_by_name[species_names[species_per_atom[ia]]]
+        norb = sum(2 * orb['l'] + 1 for orb in sp['orbitals'])
+        norb_per_atom.append(norb)
+        orb_offsets.append(orb_offsets[-1] + norb)
+    return (np.asarray(norb_per_atom, dtype=np.int32),
+            np.asarray(orb_offsets, dtype=np.int32),
+            sp_by_name)
+
+
+def build_na_dm_diagonal(geo, basis, atoms_dict, norb_per_atom=None, orb_offsets=None):
+    """Diagonal AO density matrix with neutral-atom valence occupations (same physics as AO loop)."""
+    if norb_per_atom is None or orb_offsets is None:
+        norb_per_atom, orb_offsets, sp_by_name = _na_orbital_layout(geo, basis)
+    else:
+        sp_by_name = {sp['name']: sp for sp in basis}
+        norb_per_atom = np.asarray(norb_per_atom, dtype=np.int32)
+        orb_offsets = np.asarray(orb_offsets, dtype=np.int32)
+    natoms = geo['natoms']
+    species_per_atom = geo['species_per_atom']
+    species_names = geo['species_names']
+    norb_total = int(orb_offsets[-1])
+    dm = np.zeros((norb_total, norb_total), dtype=np.float32)
+    for ia in range(natoms):
+        Z = int(atoms_dict['type'][ia])
+        occ_by_l = OCC_NA.get(Z, {0: 2.0, 1: 2/3})
+        sp = sp_by_name[species_names[species_per_atom[ia]]]
+        i0 = int(orb_offsets[ia])
+        off = 0
+        for orb in sp['orbitals']:
+            l = orb['l']
+            nm = 2 * l + 1
+            f_na = float(occ_by_l.get(l, 0.0))
+            if f_na > 0.0:
+                for m in range(nm):
+                    j = i0 + off + m
+                    dm[j, j] = f_na
+            off += nm
+        if off != int(norb_per_atom[ia]):
+            raise ValueError(f"NA layout mismatch atom {ia}: shells={off} norb={norb_per_atom[ia]}")
+    return dm, norb_per_atom, orb_offsets
+
+
+def _project_neutral_density_orbital_loop(geo, projector, atoms_dict, grid_spec, basis, B3_FACTOR=B3_FACTOR):
+    """Legacy: one project_orbital_prepped + host download per AO (slow on large grids)."""
     from .DFTBplusParser import precompute_coeff_gather
     import time
-    # Valence occupations per element (Z) and angular momentum (l)
-    # These are DFTB valence electron counts (frozen core approximation)
-    OCC_NA = {
-        1:  {0: 1.0},           # H: 1s1
-        6:  {0: 2.0, 1: 2/3},   # C: 2s2 2p2 -> p: 2/3 per orbital
-        7:  {0: 2.0, 1: 1.0},   # N: 2s2 2p3 -> p: 3/3 = 1 per orbital
-        8:  {0: 2.0, 1: 4/3},   # O: 2s2 2p4 -> p: 4/3 per orbital
-        9:  {0: 2.0, 1: 5/3},   # F: 2s2 2p5 -> p: 5/3 per orbital
-        15: {0: 2.0, 1: 3/3},   # P: 3s2 3p3 -> p: 3/3 = 1 per orbital
-        16: {0: 2.0, 1: 4/3},   # S: 3s2 3p4 -> p: 4/3 per orbital
-        17: {0: 2.0, 1: 5/3},   # Cl: 3s2 3p5 -> p: 5/3 per orbital
-        35: {0: 2.0, 1: 5/3},   # Br: 4s2 4p5 -> p: 5/3 per orbital (3d frozen)
-        53: {0: 2.0, 1: 5/3},   # I: 5s2 5p5 -> p: 5/3 per orbital (4d frozen)
-    }
-
-    natoms          = geo['natoms']
+    natoms = geo['natoms']
     species_per_atom = geo['species_per_atom']
-    species_names   = geo['species_names']
-    sp_by_name      = {sp['name']: sp for sp in basis}
-
+    species_names = geo['species_names']
+    sp_by_name = {sp['name']: sp for sp in basis}
     src_idx, dst_idx = precompute_coeff_gather(natoms, species_per_atom, species_names, basis)
     proj_ctx = projector.prepare_orbital_projection(atoms_dict, grid_spec)
-
-    nx, ny, nz  = proj_ctx['nx'], proj_ctx['ny'], proj_ctx['nz']
-    rho_na      = np.zeros((nx, ny, nz), dtype=np.float32)
+    nx, ny, nz = proj_ctx['nx'], proj_ctx['ny'], proj_ctx['nz']
+    rho_na = np.zeros((nx, ny, nz), dtype=np.float32)
     coeffs_flat = np.zeros(natoms * 4, dtype=np.float32)
-
     t0 = time.time()
     orb_offset = 0
     for ia in range(natoms):
-        Z  = int(atoms_dict['type'][ia])
+        Z = int(atoms_dict['type'][ia])
         sp = sp_by_name[species_names[species_per_atom[ia]]]
         occ_by_l = OCC_NA.get(Z, {0: 2.0, 1: 2/3})
         for orb in sp['orbitals']:
-            l  = orb['l']
+            l = orb['l']
             nm = 2 * l + 1
             f_na = occ_by_l.get(l, 0.0)
             if f_na > 0:
@@ -2116,5 +2181,30 @@ def project_neutral_density(geo, projector, atoms_dict, grid_spec, basis, B3_FAC
                     psi = projector.project_orbital_prepped(coeffs_flat, proj_ctx)
                     rho_na += f_na * (psi ** 2)
             orb_offset += nm
-    print(f"[project_neutral_density] {time.time()-t0:.2f}s")
+    print(f"[project_neutral_density] orbital_loop {time.time()-t0:.2f}s")
     return (rho_na * B3_FACTOR).astype(np.float32)
+
+
+def project_neutral_density(geo, projector, atoms_dict, grid_spec, basis, B3_FACTOR=B3_FACTOR,
+                            norb_per_atom=None, orb_offsets=None):
+    """
+    Project superposition of neutral atom densities onto a real-space grid.
+    Uses reference valence occupations per (l, Z).
+
+    Default: one project_density_dense with diagonal NA DM (same physics as AO loop).
+    SPAMMM_AFM_NA_ORBITAL_LOOP=1 → legacy per-AO loop (parity / backup).
+
+    Returns rho_na_grid (nx,ny,nz) float32 in e/Å³.
+    """
+    import time
+    from spammm.SPM.AFM import AFM_NA_ORBITAL_LOOP
+    if AFM_NA_ORBITAL_LOOP:
+        return _project_neutral_density_orbital_loop(geo, projector, atoms_dict, grid_spec, basis, B3_FACTOR=B3_FACTOR)
+
+    t0 = time.time()
+    dm, norb_per_atom, orb_offsets = build_na_dm_diagonal(
+        geo, basis, atoms_dict, norb_per_atom=norb_per_atom, orb_offsets=orb_offsets)
+    # project_density_dense already applies B3_FACTOR
+    rho_na = projector.project_density_dense(dm, norb_per_atom, orb_offsets, atoms_dict, grid_spec)
+    print(f"[project_neutral_density] dense_dm {time.time()-t0:.2f}s  norb={int(orb_offsets[-1])}")
+    return rho_na.astype(np.float32)

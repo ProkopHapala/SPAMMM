@@ -328,8 +328,10 @@ Hamiltonian = DFTB {{
         'species_names': enames,
         'coords_bohr': coords_bohr
     }
-    # Use sparse project_neutral_density for rho_na (same as in sparse method)
-    rho_na = dg.project_neutral_density(geo, projector, atoms_dict, grid_spec, proj_basis)
+    # Neutral-atom density: diagonal NA DM → one project_density_dense (same physics as AO loop)
+    rho_na = dg.project_neutral_density(
+        geo, projector, atoms_dict, grid_spec, proj_basis,
+        norb_per_atom=norb_per_atom, orb_offsets=orb_offsets)
 
     rho_diff = (rho_scf - rho_na).astype(np.float32)
 
@@ -720,8 +722,9 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
         afmulator:     AFMulator instance; created if None
 
     Returns:
-        df:       (nx_s, ny_s, nz_s) frequency shift array
-        tip_disp: dict with 'dx','dy' (nx_s, ny_s, nz_s) tip displacement
+        df:        (nx_s, ny_s, nz_s) frequency shift array
+        tip_disp:  dict with 'dx','dy' (nx_s, ny_s, nz_s) tip displacement
+        FEs_relax: (nx_s, ny_s, nz_s, 4) forces at relaxed positions
     """
     if K_LAT is None:
         K_LAT = afm.K_LAT_HAPALA_EV_A2
@@ -730,7 +733,8 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
 
     if use_gpu_relax:
         if ppm_mode:
-            print("  [compose_and_relax_total] GPU relaxStrokes spherical PPM "
+            from spammm.globals import debug_print
+            debug_print(1, "  [compose_and_relax_total] GPU relaxStrokes spherical PPM "
                   f"(L={bond_length}Å, K_LAT={K_LAT:.4f} eV/Å² = {afm.stiffness_eVA2_to_Nm(K_LAT):.2f} N/m, K_RAD={K_RAD})")
             if afmulator is None:
                 afmulator = afm.AFMulator(use_morse=False, nloc=32, use_fire=False)
@@ -739,11 +743,13 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
             relax_pars_ppm = [0.1, 0.1, 0.03, 0.1]  # dt, damp, alpha, dt_fire
             FEs_relax, tip_disp = afmulator.scan_fdbm( scan_xs, scan_ys, heights, mol_z=mol_z,  K_LAT=K_LAT, K_RAD=K_RAD, bond_length=bond_length,  relax_pars=relax_pars_ppm )
             # Diagnostic: report maximum displacement for each z-height
-            print("  [compose_and_relax_total] Tip displacement diagnostics:")
-            for iz, h in enumerate(heights):
-                dx_max = np.abs(tip_disp['dx'][:,:,iz]).max()
-                dy_max = np.abs(tip_disp['dy'][:,:,iz]).max()
-                print(f"    z={h:.2f}A: max|dx|={dx_max:.4f}A, max|dy|={dy_max:.4f}A")
+            from spammm.globals import DEBUG_PRINT_LEVEL
+            if DEBUG_PRINT_LEVEL >= 2:
+                print("  [compose_and_relax_total] Tip displacement diagnostics:")
+                for iz, h in enumerate(heights):
+                    dx_max = np.abs(tip_disp['dx'][:,:,iz]).max()
+                    dy_max = np.abs(tip_disp['dy'][:,:,iz]).max()
+                    print(f"    z={h:.2f}A: max|dx|={dx_max:.4f}A, max|dy|={dy_max:.4f}A")
         else:
             print("  [compose_and_relax_total] GPU relaxStrokes2D 2D lateral-only")
             if afmulator is None:
@@ -751,11 +757,13 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
             afmulator.setup_fdbm_grid(F_total, origin, step)
             FEs_relax, tip_disp = afmulator.scan_fdbm_2d(scan_xs, scan_ys, heights, mol_z=mol_z, K_LAT=K_LAT)
             # Diagnostic: report maximum displacement for each z-height
-            print("  [compose_and_relax_total] Tip displacement diagnostics:")
-            for iz, h in enumerate(heights):
-                dx_max = np.abs(tip_disp['dx'][:,:,iz]).max()
-                dy_max = np.abs(tip_disp['dy'][:,:,iz]).max()
-                print(f"    z={h:.2f}A: max|dx|={dx_max:.4f}A, max|dy|={dy_max:.4f}A")
+            from spammm.globals import DEBUG_PRINT_LEVEL
+            if DEBUG_PRINT_LEVEL >= 2:
+                print("  [compose_and_relax_total] Tip displacement diagnostics:")
+                for iz, h in enumerate(heights):
+                    dx_max = np.abs(tip_disp['dx'][:,:,iz]).max()
+                    dy_max = np.abs(tip_disp['dy'][:,:,iz]).max()
+                    print(f"    z={h:.2f}A: max|dx|={dx_max:.4f}A, max|dy|={dy_max:.4f}A")
     else:
         print("  [compose_and_relax_total] CPU scipy relaxation (legacy)")
         from scipy.ndimage import map_coordinates
@@ -773,7 +781,7 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
         FEs_relax, tip_disp = afm.pp_relax_2d(force_func, scan_xs, scan_ys, heights, mol_z=mol_z, K_LAT=K_LAT, N_RELAX=50, step=step)
 
     df = afm.compute_df(FEs_relax[:,:,:,2], heights[1]-heights[0])
-    return df, tip_disp
+    return df, tip_disp, FEs_relax
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1806,7 +1814,7 @@ def run_afm_pipeline(
 
     # Step 6: Compose and relax using total force field
     print("\nStep 6: Composing force fields and running probe relaxation...")
-    df, tip_disp = compose_and_relax_total(
+    df, tip_disp, FEs_relax = compose_and_relax_total(
         F_total,
         scan_xs, scan_ys, heights,
         origin, step, atomPos, K_LAT=relax_params['K_LAT'],
@@ -2066,7 +2074,8 @@ def get_tip_densities(tip_mode, target_shape, step, margin=4.0, sigma=0.7,
     if co_rho_total_raw is None and not force_recompute:
         cached = _get_cached_co_tip(step, margin, fdata_dir, fdata_basis, backend=backend)
         if cached is not None:
-            print(f"  Loading cached CO tip (step={step}, margin={margin}, backend={backend})...")
+            from spammm.globals import debug_print
+            debug_print(1, f"  Loading cached CO tip (step={step}, margin={margin}, backend={backend})...")
             co_rho_total_raw, co_rho_delta_raw = cached
     if co_rho_total_raw is None:
         print(f"  Computing CO tip on-the-fly (step={step}, backend={backend})...")
@@ -2083,7 +2092,8 @@ def get_tip_densities(tip_mode, target_shape, step, margin=4.0, sigma=0.7,
     rho_delta = _pad_and_roll_co_tip(co_rho_delta_raw, target_shape)
     peak = np.unravel_index(int(np.argmax(np.abs(rho_total))), rho_total.shape)
     q = float(rho_total.sum() * step**3)
-    print(f"  Tip mode=co  raw={co_rho_total_raw.shape} → rolled={rho_total.shape}  peak={peak}  q={q:.3f}")
+    from spammm.globals import debug_print
+    debug_print(1, f"  Tip mode=co  raw={co_rho_total_raw.shape} → rolled={rho_total.shape}  peak={peak}  q={q:.3f}")
     if peak != (0, 0, 0):
         print(f"  WARNING: CO tip peak not at (0,0,0) after roll: {peak}")
     return rho_total.astype(np.float32), rho_delta.astype(np.float32)

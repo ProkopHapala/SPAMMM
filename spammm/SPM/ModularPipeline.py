@@ -19,11 +19,38 @@ projection) and pySCF (CPU evaluation).
 """
 
 import os
+import time
 import numpy as np
 import spammm.atomicUtils as au
+from spammm.globals import debug_print
+from spammm.SPM.AFM import AFMBench, afm_bench_enabled, afm_bench_no_io, afm_use_cpu_fft
 from spammm.SPM import AFM as afm
 from spammm.SPM import AFM_utils as afm_utils
 from spammm.config_utils import get_config, get_path, get_dftb_basis_path
+
+
+def _bench():
+    return AFMBench.get()
+
+
+def _cache_write_ok():
+    """Stage cache writes: off when SPAMMM_AFM_BENCH_NO_IO=1."""
+    return not afm_bench_no_io()
+
+
+def _bench_stage_start(title: str):
+    """Start a fresh per-stage timing table (GUI default)."""
+    if not afm_bench_enabled():
+        return
+    b = AFMBench.reset()
+    b.start_run()
+    print(f"\n[BENCH] ===== {title} =====", flush=True)
+
+
+def _bench_stage_end(title: str):
+    if afm_bench_enabled():
+        _bench().report(title=title)
+
 
 class ModularAFMPipeline:
     """
@@ -86,12 +113,21 @@ class ModularAFMPipeline:
         self.atoms_dict = None
         self.norb_per_atom = None
         self.orb_offsets = None
+        self._afmulator = None  # reused across S3 dispersion/gradient + S4 relax
 
         # pySCF structures (only used for backend='pyscf')
         self._pyscf_data = None  # Cache for mol, mf, dm from pySCF
         
         # Load molecule and scan grid parameters
         self._init_geometry_and_grids()
+
+    def _get_afmulator(self):
+        """Single AFMulator for S3–S4 (avoid 3× OpenCL compile / device init)."""
+        if self._afmulator is None:
+            _bench().begin('AFMulator_ctor', 'INIT')
+            self._afmulator = afm.AFMulator(use_morse=False, nloc=32)
+            _bench().end('AFMulator_ctor')
+        return self._afmulator
 
     def _init_geometry_and_grids(self):
         """Load molecular structure and define grid parameters."""
@@ -136,6 +172,7 @@ class ModularAFMPipeline:
         from spammm.quantum.DFTB.DFTBplusParser import parse_wfc_hsd, convert_wfc_to_species_list_ang
         from spammm.quantum.DFTB import Grid_dftb as dg
 
+        _bench().begin('init.dftb_projector_setup', 'INIT')
         basis_name = self.basis
         if basis_name == 'mio-1-1':
             self.slako_prefix = _SK_PATHS.get('mio-1-1', self.slako_prefix)
@@ -167,9 +204,10 @@ class ModularAFMPipeline:
                 'species_names': self.enames
             }
             self.projector, self.atoms_dict = dg.setup_gridprojector_from_dftb(dftb_data, basis_ang, verbosity=0, max_shells=max_shells)
-            print(f"[ModularPipeline] DFTB backend initialized with {len(self.enames)} atoms")
+            debug_print(1, f"[ModularPipeline] DFTB backend initialized with {len(self.enames)} atoms")
         else:
             print(f"[ModularPipeline] WARNING: Basis file not found: {basis_hsd_path}")
+        _bench().end('init.dftb_projector_setup')
 
     def _init_pyscf_backend(self):
         """Initialize pySCF backend: no projector setup (CPU-based evaluation)."""
@@ -183,15 +221,18 @@ class ModularAFMPipeline:
     def stage1_scf(self, force_recompute=False):
         """Stage 1: SCF computation (DFTB or pySCF depending on backend)."""
         if not force_recompute and os.path.exists(self.cache_stage1):
-            print(f"\n[ModularPipeline] Loading Stage 1 (SCF) from cache...")
+            debug_print(1, f"\n[ModularPipeline] Loading Stage 1 (SCF) from cache...")
+            _bench().begin('S1.cache_load', 'IO')
             data = np.load(self.cache_stage1, allow_pickle=True)
             if self.backend == 'dftb':
-                return data['dm_dense'], data['eigvecs'], data['eigvals']
+                out = data['dm_dense'], data['eigvecs'], data['eigvals']
             else:  # pySCF
                 self._pyscf_data = {k: data[k] for k in data.keys() if k.startswith('mol_') or k in ['dm', 'eigvecs', 'eigvals']}
-                return data.get('dm'), data['eigvecs'], data['eigvals']
+                out = data.get('dm'), data['eigvecs'], data['eigvals']
+            _bench().end('S1.cache_load')
+            return out
 
-        print(f"\n[ModularPipeline] Running Stage 1 (SCF) with backend='{self.backend}'...")
+        debug_print(1, f"\n[ModularPipeline] Running Stage 1 (SCF) with backend='{self.backend}'...")
 
         if self.backend == 'dftb':
             return self._stage1_scf_dftb()
@@ -205,6 +246,7 @@ class ModularAFMPipeline:
         from spammm.quantum.DFTB_utils import SK_PATHS as _SK_PATHS
         import shutil
 
+        _bench().begin('S1.setup_inputs', 'CPU')
         basis_name = self.slako_prefix.rstrip('/').split('/')[-1] if '/' in self.slako_prefix else self.slako_prefix
         if not basis_name:
             basis_name = '3ob-3-1'
@@ -258,10 +300,12 @@ Hamiltonian = DFTB {{
                     src = os.path.join(sk_dir, sk_file)
                     if os.path.exists(src):
                         shutil.copy(src, self.work_dir)
+        _bench().end('S1.setup_inputs')
 
         old_cwd = os.getcwd()
         try:
             os.chdir(self.work_dir)
+            _bench().begin('S1.DFTBcore_SCF', 'CPU')  # native lib, host-side
             dftb = DFTBcore()
             dftb.init('dftb_in.hsd')
             dftb.enable_matrix_collection(dm=True, h=False, s=False)
@@ -269,11 +313,17 @@ Hamiltonian = DFTB {{
             dm_dense = dftb.get_dm_dense()
             eigvecs, eigvals = dftb.get_eigvecs_dense()
             dftb.finalize()
+            _bench().end('S1.DFTBcore_SCF')
         finally:
             os.chdir(old_cwd)
 
-        np.savez_compressed(self.cache_stage1, dm_dense=dm_dense, eigvecs=eigvecs, eigvals=eigvals)
-        print(f"  Stage 1 (DFTB) complete and cached.")
+        if _cache_write_ok():
+            _bench().begin('S1.cache_write', 'IO')
+            np.savez_compressed(self.cache_stage1, dm_dense=dm_dense, eigvecs=eigvecs, eigvals=eigvals)
+            _bench().end('S1.cache_write')
+            debug_print(1, f"  Stage 1 (DFTB) complete and cached.")
+        else:
+            debug_print(1, f"  Stage 1 (DFTB) complete (cache write skipped).")
         return dm_dense, eigvecs, eigvals
 
     def _stage1_scf_pyscf(self):
@@ -359,7 +409,8 @@ Hamiltonian = DFTB {{
 
         # DFTB backend: standard GPU projection
         if not force_recompute and os.path.exists(self.cache_stage2):
-            print(f"\n[ModularPipeline] Loading Stage 2 (density grids) from cache...")
+            debug_print(1, f"\n[ModularPipeline] Loading Stage 2 (density grids) from cache...")
+            _bench().begin('S2.cache_load', 'IO')
             data = np.load(self.cache_stage2)
             self.origin = data['origin']
             self.ngrid = data['ngrid']
@@ -372,16 +423,15 @@ Hamiltonian = DFTB {{
                 'dC': np.array([0.0, 0.0, self.step], dtype=np.float32),
                 'ngrid': self.ngrid,
             }
-            z_profile = rho_scf.sum(axis=(0, 1))
-            iz_max = int(np.argmax(z_profile))
-            print(f"  [Stage2 cache] rho_scf: shape={rho_scf.shape} range=[{rho_scf.min():.4e},{rho_scf.max():.4e}] sum={rho_scf.sum():.4e}")
-            print(f"  [Stage2 cache] density z-peak at iz={iz_max}, z={float(self.origin[2]) + iz_max*self.step:.3f} A")
+            _bench().end('S2.cache_load')
             return rho_scf, rho_na, rho_diff
 
-        print(f"\n[ModularPipeline] Projecting Stage 2 (density grids)...")
+        debug_print(1, f"\n[ModularPipeline] Projecting Stage 2 (density grids)...")
+        _bench_stage_start('Stage 2 density grids')
         from spammm.quantum.DFTB.DFTBplusParser import parse_wfc_hsd, convert_wfc_to_species_list_ang
         from spammm.quantum.DFTB import Grid_dftb as dg
 
+        _bench().begin('S2.grid_setup', 'CPU')
         # Grid parameters setup
         padding = self.margin + self.z_extra
         x_min, x_max = self.atomPos[:,0].min() - self.margin, self.atomPos[:,0].max() + self.margin
@@ -390,8 +440,8 @@ Hamiltonian = DFTB {{
 
         origin = np.array([x_min, y_min, z_min], dtype=np.float32)
         ngrid = np.ceil(np.array([x_max - x_min, y_max - y_min, z_max - z_min]) / self.step).astype(np.int32)
-        # Round to nearest multiple of 8
-        ngrid = ((ngrid + 7) // 8) * 8
+        # Round up to clFFT-friendly size (factors 2,3,5,7) and multiple of 8 (GPU block_res)
+        ngrid = np.array([afm._FDBMGpyFFT.round_fft_friendly(int(n)) for n in ngrid], dtype=np.int32)
 
         self.origin = origin
         self.ngrid = ngrid
@@ -416,9 +466,14 @@ Hamiltonian = DFTB {{
 
         basis_data = parse_wfc_hsd(basis_hsd_path)
         basis_ang = convert_wfc_to_species_list_ang(basis_data, resolution_bohr=0.04)
+        _bench().end('S2.grid_setup')
 
+        _bench().begin('S2.project_rho_scf', 'GPU')
         rho_scf = self.projector.project_density_dense(dm_dense.astype(np.float32), self.norb_per_atom, self.orb_offsets, self.atoms_dict, self.grid_spec)
-        print(f"  [Stage2] rho_scf: shape={rho_scf.shape} range=[{rho_scf.min():.4e},{rho_scf.max():.4e}] sum={rho_scf.sum():.4e}")
+        if hasattr(self.projector, 'queue'):
+            self.projector.queue.finish()
+        _bench().end('S2.project_rho_scf')
+        debug_print(1, f"  [Stage2] rho_scf: shape={rho_scf.shape} range=[{rho_scf.min():.4e},{rho_scf.max():.4e}] sum={rho_scf.sum():.4e}")
 
         coords_bohr = self.atomPos * 1.8897259886
         species_per_atom = list(range(len(self.enames)))
@@ -428,28 +483,41 @@ Hamiltonian = DFTB {{
             'species_names': self.enames,
             'coords_bohr': coords_bohr
         }
-        rho_na = dg.project_neutral_density(geo, self.projector, self.atoms_dict, self.grid_spec, basis_ang)
-        print(f"  [Stage2] rho_na:  shape={rho_na.shape} range=[{rho_na.min():.4e},{rho_na.max():.4e}] sum={rho_na.sum():.4e}")
+        _bench().begin('S2.project_rho_na', 'GPU')
+        rho_na = dg.project_neutral_density(
+            geo, self.projector, self.atoms_dict, self.grid_spec, basis_ang,
+            norb_per_atom=self.norb_per_atom, orb_offsets=self.orb_offsets)
+        if hasattr(self.projector, 'queue'):
+            self.projector.queue.finish()
+        _bench().end('S2.project_rho_na')
+        debug_print(1, f"  [Stage2] rho_na:  shape={rho_na.shape} range=[{rho_na.min():.4e},{rho_na.max():.4e}] sum={rho_na.sum():.4e}")
+        _bench().begin('S2.rho_diff', 'CPU')
         rho_diff = (rho_scf - rho_na).astype(np.float32)
-        print(f"  [Stage2] rho_diff:range=[{rho_diff.min():.4e},{rho_diff.max():.4e}] sum={rho_diff.sum():.4e}")
-        # z-profile to show where density lives
-        z_profile = rho_scf.sum(axis=(0,1))
-        iz_max = int(np.argmax(z_profile))
-        print(f"  [Stage2] density z-peak at iz={iz_max}, z={float(self.origin[2]) + iz_max*self.step:.3f} A (mol z range [{self.atomPos[:,2].min():.2f},{self.atomPos[:,2].max():.2f}])")
+        _bench().end('S2.rho_diff')
 
-        np.savez_compressed(self.cache_stage2, rho_scf=rho_scf, rho_na=rho_na, rho_diff=rho_diff, origin=self.origin, ngrid=self.ngrid)
-        print(f"  Stage 2 complete and cached.")
+        if _cache_write_ok():
+            _bench().begin('S2.cache_write', 'IO')
+            np.savez(self.cache_stage2, rho_scf=rho_scf, rho_na=rho_na, rho_diff=rho_diff, origin=self.origin, ngrid=self.ngrid)
+            _bench().end('S2.cache_write')
+            debug_print(1, f"  Stage 2 complete and cached.")
+        else:
+            debug_print(1, f"  Stage 2 complete (cache write skipped).")
+        _bench_stage_end('Stage 2 density grids')
         return rho_scf, rho_na, rho_diff
 
     def stage3_potentials(self, rho_scf, rho_na, rho_diff, force_recompute=False,
                           pauli_params=None, vdw_params={'C6_CO': 30.0}):
         """Stage 3: Poisson Electrostatic, Pauli Repulsion, Dispersion, and Total Field (F_total) computation."""
         if not force_recompute and os.path.exists(self.cache_stage3):
-            print(f"\n[ModularPipeline] Loading Stage 3 (potentials) from cache...")
+            debug_print(1, f"\n[ModularPipeline] Loading Stage 3 (potentials) from cache...")
+            _bench().begin('S3.cache_load', 'IO')
             data = np.load(self.cache_stage3)
-            return data['V_ES'], data['E_pauli_field'], data['E_ES_field'], data['E_vdw'], data['F_total']
+            out = data['V_ES'], data['E_pauli_field'], data['E_ES_field'], data['E_vdw'], data['F_total']
+            _bench().end('S3.cache_load')
+            return out
             
-        print(f"\n[ModularPipeline] Computing Stage 3 (FDBM potentials)...")
+        debug_print(1, f"\n[ModularPipeline] Computing Stage 3 (FDBM potentials)...")
+        _bench_stage_start('Stage 3 FDBM potentials')
         
         # Set default Pauli params based on backend
         if pauli_params is None:
@@ -458,7 +526,7 @@ Hamiltonian = DFTB {{
                 pyscf_basis_key = f"pyscf_{self.pyscf_params.get('basis', 'sto-3g')}"
                 if pyscf_basis_key in afm_mod.PAULI_FITTED_DEFAULTS:
                     pauli_params = afm_mod.PAULI_FITTED_DEFAULTS[pyscf_basis_key]
-                    print(f"  Using pySCF Pauli defaults for {pyscf_basis_key}: A={pauli_params['A']:.2f}, beta={pauli_params['beta']:.2f}")
+                    debug_print(1, f"  Using pySCF Pauli defaults for {pyscf_basis_key}: A={pauli_params['A']:.2f}, beta={pauli_params['beta']:.2f}")
                 else:
                     print(f"  WARNING: No fitted Pauli params found for {pyscf_basis_key}, using default")
                     pauli_params = {'A': 39.53, 'beta': 1.1544}  # Fitted for 6-31g*
@@ -466,50 +534,73 @@ Hamiltonian = DFTB {{
                 from spammm.SPM import AFM as afm_mod
                 if self.basis in afm_mod.PAULI_FITTED_DEFAULTS:
                     pauli_params = afm_mod.PAULI_FITTED_DEFAULTS[self.basis]
-                    print(f"  Using DFTB Pauli defaults for {self.basis}: A={pauli_params['A']:.2f}, beta={pauli_params['beta']:.2f}")
+                    debug_print(1, f"  Using DFTB Pauli defaults for {self.basis}: A={pauli_params['A']:.2f}, beta={pauli_params['beta']:.2f}")
                 else:
                     print(f"  WARNING: No fitted Pauli params found for {self.basis}, using default")
                     pauli_params = {'A': 155.33, 'beta': 1.5507}  # mio-1-1 default
         
-        # Step 2: Electrostatics
+        # Step 2: Electrostatics — currently NumPy FFT on CPU
+        from spammm.SPM.AFM import afm_use_cpu_fft
+        _fft_where = 'CPU' if afm_use_cpu_fft() else 'GPU'
+        _bench().begin('S3.fft_poisson', _fft_where)
         V_ES = afm.fft_poisson(rho_diff, self.step)
+        _bench().end('S3.fft_poisson')
         
         # Tip densities: 'co' (real CO, O at (0,0,0)) or 'gaussian'
         target_shape = tuple(int(x) for x in self.ngrid)
         fdata_dir = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tests', 'pyFireball', 'Fdata'))
         fdata_basis = os.path.join(fdata_dir, 'basis')
-        print(f"  Tip mode: {self.tip_mode}")
+        debug_print(1, f"  Tip mode: {self.tip_mode}")
+        _bench().begin('S3.tip_densities', 'CPU')  # gaussian=CPU; co=IO/CPU (or slow DFTB)
         co_rho_total, co_rho_delta = afm_utils.get_tip_densities(
             tip_mode=self.tip_mode, target_shape=target_shape, step=self.step, margin=self.margin,
             output_dir=self.output_dir, co_tip_dir=self.co_tip_dir,
             fdata_dir=fdata_dir, fdata_basis=fdata_basis, backend=self.backend,
         )
+        _bench().end('S3.tip_densities')
         
-        # Step 3: Pauli repulsion
+        _bench().begin('S3.pauli_overlap_fft', _fft_where)
         overlap_raw = afm.compute_pauli_overlap(rho_scf, co_rho_total, self.step, tip_rolled=True)
+        _bench().end('S3.pauli_overlap_fft')
         A_pauli = pauli_params.get('A', 787.22)
         beta_pauli = pauli_params.get('beta', 1.2371)
+        _bench().begin('S3.pauli_scale', 'CPU')
         E_pauli_field = afm.scale_pauli_field(overlap_raw, self.step, A_pauli, beta_pauli, return_grads=False)
+        _bench().end('S3.pauli_scale')
         
-        # Step 4: Electrostatic convolution
+        _bench().begin('S3.es_conv_fft', _fft_where)
         E_ES_field = afm.compute_es_conv_field(V_ES, co_rho_delta, self.step, tip_rolled=True, return_grads=False)
+        _bench().end('S3.es_conv_fft')
         
-        # Step 5: Dispersion
+        # Step 5: Dispersion — OpenCL by default (reuse AFMulator)
+        afmulator = self._get_afmulator()
+        _bench().begin('S3.dispersion', 'GPU')
         E_vdw = afm.compute_dispersion_grid(
             self.atomPos, self.atomTypes, self.origin, self.step, self.ngrid,
-            C6_CO=vdw_params['C6_CO'], return_grads=False
+            C6_CO=vdw_params['C6_CO'], return_grads=False, afmulator=afmulator
         )
+        _bench().end('S3.dispersion')
         
         # Total force field
+        _bench().begin('S3.E_total_sum', 'CPU')
         E_total = E_pauli_field + E_ES_field + E_vdw
+        _bench().end('S3.E_total_sum')
         
-        # Use GPU for gradient computation
-        afmulator = afm.AFMulator(use_morse=False, nloc=32)
+        _bench().begin('S3.compute_gradient_cl', 'GPU')
         F_total = afmulator.compute_gradient_cl(E_total, self.step, bAlloc=True)
+        afmulator.queue.finish()
+        _bench().end('S3.compute_gradient_cl')
         
-        np.savez_compressed(self.cache_stage3, V_ES=V_ES, E_pauli_field=E_pauli_field,
-                            E_ES_field=E_ES_field, E_vdw=E_vdw, F_total=F_total)
-        print(f"  Stage 3 complete and cached.")
+        if _cache_write_ok():
+            _bench().begin('S3.cache_write', 'IO')
+            # Uncompressed: savez_compressed was ~10s / 90% of Stage 3 on large FDBM grids
+            np.savez(self.cache_stage3, V_ES=V_ES, E_pauli_field=E_pauli_field,
+                                E_ES_field=E_ES_field, E_vdw=E_vdw, F_total=F_total)
+            _bench().end('S3.cache_write')
+            debug_print(1, f"  Stage 3 complete and cached.")
+        else:
+            debug_print(1, f"  Stage 3 complete (cache write skipped).")
+        _bench_stage_end('Stage 3 FDBM potentials')
         return V_ES, E_pauli_field, E_ES_field, E_vdw, F_total
 
     def stage4_relax(self, F_total, force_recompute=False, relax_params=None, ppm_mode=True):
@@ -518,45 +609,44 @@ Hamiltonian = DFTB {{
             from spammm.SPM import AFM as afm_mod
             relax_params = {'K_LAT': afm_mod.K_LAT_HAPALA_EV_A2}  # 0.5 N/m → eV/Å²
         if not force_recompute and os.path.exists(self.cache_stage4):
-            print(f"\n[ModularPipeline] Loading Stage 4 (relaxation) from cache...")
+            debug_print(1, f"\n[ModularPipeline] Loading Stage 4 (relaxation) from cache...")
+            _bench().begin('S4.cache_load', 'IO')
             data = np.load(self.cache_stage4)
             tip_disp = {'dx': data['tip_disp_dx'], 'dy': data['tip_disp_dy'], 'dz': data['tip_disp_dz']}
-            return data['df'], tip_disp, data['FEs_relax']
+            out = data['df'], tip_disp, data['FEs_relax']
+            _bench().end('S4.cache_load')
+            return out
             
         k_ev = relax_params['K_LAT']
         from spammm.SPM import AFM as afm_mod
         k_nm = afm_mod.stiffness_eVA2_to_Nm(k_ev)
-        print(f"\n[ModularPipeline] Running Stage 4 (probe relaxation) "
+        debug_print(1, f"\n[ModularPipeline] Running Stage 4 (probe relaxation) "
               f"K_LAT={k_ev:.4f} eV/Å² (= {k_nm:.2f} N/m)...")
-        afmulator = afm.AFMulator(use_morse=False, nloc=32)
+        _bench_stage_start('Stage 4 probe relaxation')
+        afmulator = self._get_afmulator()
         
-        df, tip_disp = afm_utils.compose_and_relax_total(
+        _bench().begin('S4.compose_and_relax_total', 'GPU')
+        df, tip_disp, FEs_relax = afm_utils.compose_and_relax_total(
             F_total,
             self.scan_xs, self.scan_ys, self.heights,
             self.origin, self.step, self.atomPos, K_LAT=relax_params['K_LAT'],
             use_gpu_relax=True, ppm_mode=ppm_mode, afmulator=afmulator
         )
+        afmulator.queue.finish()
+        _bench().end('S4.compose_and_relax_total')
         
-        # Reuse tip_disp/FEs from compose — do NOT re-scan (was double work + could desync)
-        # compose_and_relax_total already ran scan_fdbm; recover FEs via a single scan matching tip_disp
-        mol_z = float(self.atomPos[:,2].max())
-        if ppm_mode:
-            relax_pars_ppm = [0.1, 0.1, 0.03, 0.1]
-            FEs_relax, _ = afmulator.scan_fdbm(
-                self.scan_xs, self.scan_ys, self.heights, mol_z=mol_z,
-                K_LAT=relax_params['K_LAT'], relax_pars=relax_pars_ppm
-            )
-        else:
-            FEs_relax, _ = afmulator.scan_fdbm_2d(
-                self.scan_xs, self.scan_ys, self.heights, mol_z=mol_z,
-                K_LAT=relax_params['K_LAT']
-            )
         dxy = np.hypot(tip_disp['dx'], tip_disp['dy'])
-        print(f"  Stage 4 tip |dxy|_max={float(dxy.max()):.4f}Å  (soft K→large deflection / sharp PP edges)")
+        debug_print(1, f"  Stage 4 tip |dxy|_max={float(dxy.max()):.4f}Å  (soft K→large deflection / sharp PP edges)")
             
-        np.savez_compressed(self.cache_stage4, df=df, tip_disp_dx=tip_disp['dx'],
-                            tip_disp_dy=tip_disp['dy'], tip_disp_dz=tip_disp['dz'], FEs_relax=FEs_relax)
-        print(f"  Stage 4 complete and cached.")
+        if _cache_write_ok():
+            _bench().begin('S4.cache_write', 'IO')
+            np.savez(self.cache_stage4, df=df, tip_disp_dx=tip_disp['dx'],
+                                tip_disp_dy=tip_disp['dy'], tip_disp_dz=tip_disp['dz'], FEs_relax=FEs_relax)
+            _bench().end('S4.cache_write')
+            debug_print(1, f"  Stage 4 complete and cached.")
+        else:
+            debug_print(1, f"  Stage 4 complete (cache write skipped).")
+        _bench_stage_end('Stage 4 probe relaxation')
         return df, tip_disp, FEs_relax
 
     def stage5_stm(self, eigvecs, eigvals, lumo_offsets=[1, 2, 3], mo_indices=None,

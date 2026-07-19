@@ -1,8 +1,154 @@
 # Performance Benchmark: AFM FDBM Pipeline
 
-**Goal:** End-to-end FDBM AFM image generation < 1 second for small molecules (benzene, H2O, coronene).
+**Goal:** End-to-end FDBM AFM image generation interactive (~0.1 s).
 
-**Status:** Investigation done (2026-07-19). Instrumentation and `bench_fdbm.py` **not implemented yet**. Plan below remains the implementation target.
+**Status (2026-07-19):** Round-1 speedups **implemented and measured**. Next ideas **documented only** (below) — implement after commit.  
+`AFMBench` SSOT: `spammm/SPM/AFM.py` (not `globals.py`).
+
+**How to re-run:**
+```bash
+# Quiet summary tables (default SPAMMM_AFM_BENCH=1); live >>/<< with =2
+SPAMMM_AFM_BENCH=1 SPAMMM_AFM_BENCH_NO_IO=1 SPAMMM_VERBOSITY=0 AFM_DEBUG_PLOT_LEVEL=0 \
+  python tests/SPM/bench_fdbm.py --mol data/xyz/benzene.xyz --tip co --step 0.1 --scan-step 0.1 --repeats 2
+```
+
+---
+
+## Speedup report — what we achieved (2026-07-19)
+
+### Baseline (before Round 1) → After
+
+| Case | Before | After | How |
+|------|--------|-------|-----|
+| Benzene GUI-like warm (step=0.1 tip=co) | ~**1.65 s** | ~**0.55 s** (earlier GPU wiring) | GPU `build_tasks` + gpyFFT |
+| Flat_1 (96 atoms) S2 `rho_na` | **5.87 s** | **0.03 s** | Diagonal NA DM → one `project_density_dense` (was per-AO loop) |
+| Flat_1 Stage 3 wall (GUI, with cache) | ~**11–12 s** felt | ~**1.6–1.8 s** | Kill `savez_compressed` (was **~10 s** alone) + GPU k-mul + one AFMulator |
+| Flat_1 warm S3+S4 NO_IO | (not measured cleanly) | **~1.4 s** | Same + no duplicate S4 scan |
+
+**Flat_1 headless (RTX 3090, 336×256×144, tip=co, `SPAMMM_AFM_BENCH_NO_IO=1`):**
+
+| Mode | Wall |
+|------|------|
+| COLD S1–S4 | **1.86 s** |
+| WARM S2 | **0.08 s** |
+| WARM S3+S4 | **1.41 s** |
+| WARM S3 + uncompressed cache | **1.57 s** (cache write **0.41 s**) |
+
+**Warm S3 remaining (NO_IO) — ranked:**
+
+| Segment | sec | Note |
+|---------|-----|------|
+| Pauli FFT | 0.22 | still host↔GPU field copies |
+| ES FFT | 0.22 | same |
+| `compute_gradient_cl` | 0.20 | RGBA pack + upload/download |
+| Poisson FFT | 0.14 | same |
+| `pauli_scale` | 0.11 | **CPU** `A * overlap**beta` |
+| Tip pad/roll | 0.10 | **CPU** |
+| Dispersion | 0.09 | GPU |
+| `E_total` sum | 0.06 | **CPU** |
+| S4 compose/relax | 0.24 | GPU |
+
+### Round-1 changes (already in tree — commit candidates)
+
+1. GPU `build_tasks` default (`SPAMMM_AFM_CPU_TASKS=1` backup)
+2. gpyFFT Poisson/Pauli/ES default; **k-space multiply on device** (no `.get()/.set()` mid-FFT)
+3. `project_neutral_density` → dense diagonal NA DM (`SPAMMM_AFM_NA_ORBITAL_LOOP=1` backup)
+4. One shared `AFMulator` S3–S4; drop duplicate `scan_fdbm`
+5. Stage cache: `np.savez` not `savez_compressed` (huge GUI win)
+6. `AFMBench` in `AFM.py`; summary-only default (`=2` for live lines)
+
+---
+
+## TODO next (notes only — implement after commit)
+
+### T-next-1 — Kill remaining CPU ops (pauli_scale, tip pad/roll, E_total)
+
+- [ ] **`pauli_scale` on GPU:** fold `E = A * overlap^beta` into a small OpenCL kernel (or Elementwise) immediately after Pauli IFFT, before download. Prefer fuse into same pass that produces overlap if possible.
+- [ ] **Tip pad/roll on GPU:** replace host `_pad_and_roll_co_tip` by writing tip into target grid with **periodic index shift** (or embed shift in the convolution kernel’s k-phase / index map). Peak-at-(0,0,0) is just an indexing convention.
+- [ ] **`E_total = E_pauli + E_ES + E_vdw` on GPU** — trivial; enables keeping fields device-side into gradient.
+- [ ] Once those are gone → **keep ρ / E / F buffers on GPU** end-to-end (T-next-3).
+
+### T-next-2 — Fuse Poisson + ES into one Fourier path?
+
+**Physics check (user proposal):**  
+Wanted: \(E_\mathrm{ES}(R)=\int V(r)\,\rho_\mathrm{tip}(r-R)\,dr\) with \(V\) from Poisson on sample charge.
+
+In Fourier space (up to real-space convention / conjugation for correlation vs convolution):
+
+\[
+V(k) \propto \frac{\rho_\mathrm{diff}(k)}{k^2},\qquad
+E_\mathrm{ES}(k) \propto V(k)\,\tilde\rho_\mathrm{tip}(k)
+\propto \frac{\rho_\mathrm{diff}(k)\,\tilde\rho_\mathrm{tip}(k)}{k^2}.
+\]
+
+**Yes — that is correct** for the electrostatic tip–sample energy field used today (cross-correlation / convolution with tip **delta**-density). Current code does Poisson then a second FFT of \(V\); fused path is:
+
+1. `FFT(rho_diff)`, `FFT(tip_delta)` (tip can be **cached in k-space**)
+2. one multiply: `ρ_diff(k) * tip(k) * (4π C / k²)` (DC = 0)
+3. one `IFFT` → `E_ES`
+
+**Caveats / corrections vs the informal formula:**
+
+| Item | Detail |
+|------|--------|
+| Charge | Use **`rho_diff = rho_scf − rho_na`**, not full `rho_scf` |
+| Tip | ES uses **`rho_tip_delta`** (charged tip), not `rho_tip_total` (Pauli) |
+| Conv vs corr | Match existing `tip[::-1]` / conj convention so fused ≡ current `compute_es_conv_field` |
+| Constants | Keep `COULOMB_CONST` / `4π` same as `fft_poisson` |
+| `V_ES` diagnostic | Interactive path can skip materializing `V_ES`; still need it if GUI/plots/cache expect it |
+| Pauli | **Separate** — `IFFT(FFT(ρ_scf)·conj(FFT(ρ_tip_total)))` then **`A·overlap^β`**. β≠1 → cannot absorb scale into the same `/k²` multiply |
+
+**Expected win:** drop one full 3D FFT round-trip of the large grid (~Poisson IFFT + ES FFT of V).
+
+- [ ] Implement fused `es_from_rho_diff_k` + parity vs `fft_poisson`+`compute_es_conv_field`
+- [ ] Optional: cache `FFT(tip_delta)` / `FFT(tip_total)` across S3
+
+### T-next-3 — Stay on GPU (consequence of T-next-1/2)
+
+- [ ] Persistent cl_array / Image buffers for `rho_*`, `E_*`, `F_total` across S3→S4
+- [ ] Gradient kernel reading device E; `setup_fdbm_grid` without host RGBA round-trip
+
+### T-next-4 — Benchmarks (do, don’t change defaults yet)
+
+- [ ] **Skip / async stage cache write** for interactive GUI (`SPAMMM_AFM_BENCH_NO_IO`-like flag or “interactive mode”). Measure: flat_1 S3 with vs without `np.savez` (already ~0.41 s uncompressed).
+- [ ] **Coarser grid `step=0.15`** interactive path — measure flat_1 + benzene. **Do not make default:** known benzene / hex-symmetry issues at coarse ES grids (`AFMTesting.md` lessons). Keep `step=0.1` as quality default.
+
+---
+
+## Historical baseline (pre–Round 1) — benzene 2026-07-19
+
+Wall **1.65 s** warm GUI-like. Grid `136×128×144`. Dominant: Python `build_tasks`/AABB + NumPy FFT + slow NA orbital loop on larger mols.
+
+### cProfile smoking guns (then)
+
+| Hotspot | Note |
+|---------|------|
+| `build_tasks` / `check_overlap_sphere_aabb` | Pure Python — **fixed** → GPU default |
+| `numpy.fft` | Poisson+Pauli+ES — **fixed** → gpyFFT |
+| `project_neutral_density` AO loop | **fixed** → dense NA DM |
+
+---
+
+## CPU vs GPU inventory (current code, post Round 1)
+
+| Operation | Implementation | Device |
+|-----------|----------------|--------|
+| S1 DFTB+ SCF | `DFTBcore` native lib | CPU |
+| S2 `project_density_dense` | OpenCL kernels | GPU (+ heavy Python prep) |
+| S2 `project_neutral_density` | OpenCL `project_density_dense` (diagonal NA DM); legacy AO loop via `SPAMMM_AFM_NA_ORBITAL_LOOP=1` | GPU (default) |
+| S2 `build_tasks` / AABB | OpenCL `build_tasks_gpu` (default); CPU via `SPAMMM_AFM_CPU_TASKS=1` | GPU |
+| S3 Poisson `fft_poisson` | gpyFFT; k-space multiply **on device** (default); NumPy via `SPAMMM_AFM_CPU_FFT=1` | GPU |
+| S3 Pauli overlap | gpyFFT corr on device (default) | GPU |
+| S3 Pauli scale `overlap**beta` | numpy | **CPU** |
+| S3 ES convolution | gpyFFT conv on device (default) | GPU |
+| S3 tip gaussian/CO pad | numpy | **CPU** |
+| S3 dispersion | `compute_dispersion_grid_cl` (shared AFMulator) | GPU |
+| S3 `E_total` sum | numpy | **CPU** |
+| S3 `compute_gradient_cl` | OpenCL (shared AFMulator) | GPU |
+| S4 `setup_fdbm_grid` + `scan_fdbm` | OpenCL (same AFMulator; no duplicate scan) | GPU |
+| S4 `compute_df` | numpy | CPU (tiny) |
+| Stage cache `np.savez` | disk | IO (gated by `SPAMMM_AFM_BENCH_NO_IO`) |
+| Matplotlib plots | — | gated by `AFM_DEBUG_PLOT_LEVEL` |
 
 ---
 
@@ -20,6 +166,7 @@ Evidence:
 - Stage buttons / tooltips say “FDBM potentials”; no Morse/LJ toggle in the AFM panel.
 - Inside the pipeline, `AFMulator(use_morse=False)` is only used as a **GPU helper** for `compute_gradient_cl` and FDBM scan/relax — not for building Morse/LJ forcefields.
 - ExtensionManager: `'afm'` → `spammm.GUI.AFMExtension`, enabled by default.
+- GUI defaults: `step=0.1`, `scan_step=0.1` (hardcoded), `tip_mode` pipeline default **`co`**.
 
 `AFM.py` supports both engines; GUI wires only the FDBM modular path.
 
@@ -49,54 +196,21 @@ Every wall-clock second from “Run AFM” / CLI entry to `df` ready must sit in
 1. Pipeline `__init__` / geometry+grid setup / DFTB projector init  
 2. Cache load vs recompute branches  
 3. CO tip load / pad / on-the-fly compute (often hidden inside S3)  
-4. Host↔device copies and `np.savez_compressed` I/O  
+4. Host↔device copies and `np.savez` I/O (uncompressed; still measurable on large grids)  
 5. AFMulator construction + OpenCL compile (can dominate cold runs)  
 6. S5/S6 if measuring “full GUI Run”, else exclude explicitly from FDBM bench
 
 ---
 
-## How speed benchmarking works **today** (investigation)
-
-### Verdict
+## How speed benchmarking works **today**
 
 | Layer | Status |
 |-------|--------|
-| End-to-end FDBM stage timing | **None** — `ModularPipeline.py` has **zero** `time` / `perf_counter` / `[BENCH]` |
-| Dedicated bench script | **Missing** — `tests/SPM/bench_fdbm.py` planned in this doc, does not exist |
-| Python profiler (`cProfile` / line_profiler) on AFM path | **Not used** |
-| OpenCL event profiling (`PROFILING_ENABLE`) on AFM | **Not used** |
-| Ad-hoc stopwatches elsewhere | **Yes**, sparse — see below |
-| Formal protocol | Documented in `doc/AGENTS/protocols/general/performance_optimization.md` (warmup, median, `queue.finish()`, event profiling) — **not applied to FDBM yet** |
-
-**Gating today:** nothing gates FDBM perf. No CI timing assert, no bench harness. Perf work is “Not started” in `doc/TASKS.md` T01. Functional tests (`tests/SPM/test_afm_fdbm.py`) check correctness, not speed.
-
-### What exists (manual stopwatches, not a unified system)
-
-1. **`Grid_dftb.py`** — fine-grained GPU wall-clock around kernels:
-   - `time.perf_counter_ns()` + `queue.finish()` then print `[TIME] … [ms]`
-   - Also coarser `time.time()` around orbital loops in `project_dftb_density` / `project_neutral_density`
-   - Useful for S2 GPU internals; not rolled up to ModularPipeline stages
-
-2. **`AFM_utils.get_density_from_pyscf`** — coarse `time.time()` prints for SCF / density eval / total (pySCF backend only; GUI default is DFTB)
-
-3. **`AFM_utils` fitting/compare helpers** — wall-clock around whole FDBM-generate + fit jobs (minutes-scale scripts), not per-stage S1–S4
-
-4. **`FFExtension.py` (GUI FF relax, not AFM)** — `time.time()` around build/step/relax — pattern to copy, different subsystem
-
-5. **Protocol doc** recommends:
-   - Wall-clock with warmup + median/min/max  
-   - Separate GPU kernel time via OpenCL events (not only wall-clock)  
-   - `queue.finish()` before stopping the timer for GPU work  
-
-So today = **scattered manual stopwatches inside lower-level kernels**, plus a **written plan** for stage wrappers. No profiler-driven AFM benchmark, no single table covering S1–S4.
-
-### Recommended dual approach (to implement)
-
-| Tool | Role |
-|------|------|
-| **Manual segmented stopwatch** (`time.perf_counter` + `queue.finish()`) | Primary SSOT for stage/sub-op table; always on in `bench_fdbm.py` and optional `SPAMMM_AFM_BENCH=1` in ModularPipeline |
-| **`cProfile` / `pyinstrument` (optional flag)** | Find unexpected Python hotspots *outside* named segments; one cold + one warm run |
-| **OpenCL event profiling** (optional, deeper) | Split GPU kernel vs host for S2/S3/S4 once wall-clock shows which stage dominates |
+| End-to-end FDBM stage timing | **`AFMBench`** in `spammm/SPM/AFM.py`; wired in `ModularPipeline` |
+| Dedicated bench script | **`tests/SPM/bench_fdbm.py`** |
+| Env gates | `SPAMMM_AFM_BENCH=0/1/2`, `SPAMMM_AFM_BENCH_NO_IO=1`, `SPAMMM_AFM_CPU_FFT`, `SPAMMM_AFM_CPU_TASKS`, `SPAMMM_AFM_NA_ORBITAL_LOOP` |
+| OpenCL event profiling | Still optional / not default |
+| Protocol | `doc/AGENTS/protocols/general/performance_optimization.md` |
 
 ---
 
@@ -108,7 +222,7 @@ So today = **scattered manual stopwatches inside lower-level kernels**, plus a *
 | S2: Density projection | GPU density grid projection | `stage2_project()` → `Grid_dftb` | GPU kernel itself may be fine; Python orchestration / projector setup / host copies suspected. Partial `[TIME]` prints already in Grid_dftb |
 | S3a: Potentials | Pauli (FFT), Poisson (FFT), vdW | `stage3_potentials()` energy part | FFT convolution; CO tip I/O; Python-side array copies; `np.savez` |
 | S3b: Gradients | `E_total → F_total` | `compute_gradient_cl()` | Must be timed separately; required for S4 |
-| S4: PP relaxation | Probe-particle MD on GPU | `stage4_relax()` | GPU kernel should be fast. Per-step `queue.finish()`? Double work: `compose_and_relax_total` then another `scan_fdbm` |
+| S4: PP relaxation | Probe-particle MD on GPU | `stage4_relax()` | GPU; duplicate `scan_fdbm` removed (returns `FEs_relax` from compose) |
 | S5: df / STM | Frequency shift / LDOS | `stage5_*` | Negligible for FDBM AFM target; exclude from <1s criterion unless measuring full GUI |
 | S6: BR-STM / viz | Bond-resolved STM / plots | `stage6_*` | Visual only |
 
@@ -119,64 +233,16 @@ So today = **scattered manual stopwatches inside lower-level kernels**, plus a *
 3. **Redundant recomputation**: `force_recompute` flags may trigger unnecessary re-runs. Dirty flag system (S1–S6) may not track dependencies correctly.
 4. **Grid setup per call**: projector / AFMulator may rebuild (compile kernels, allocate buffers) every call instead of caching across stages.
 5. **OpenCL kernel compilation**: Kernels may recompile per session instead of being cached via `pyopencl.cache_dir`.
-6. **S4 double scan**: `compose_and_relax_total` then a second `scan_fdbm` for `FEs_relax` — likely duplicate GPU work; confirm and time both.
+6. ~~**S4 double scan**~~ — removed (Round 1).
 
 ---
 
-## Benchmarking plan
+## Benchmarking plan (done for Round 1; keep for Round 2)
 
-### Step 1: Per-stage timing instrumentation
-
-Add timing wrappers to each `stageN_*()` method in `ModularPipeline.py`, and **sub-timers** so nothing is outside a bucket:
-
-```python
-import time
-t0 = time.perf_counter()
-# ... stage / sub-op ...
-# if GPU: queue.finish()
-t1 = time.perf_counter()
-print(f"[BENCH] Stage {N}/{label}: {t1-t0:.4f}s")
-```
-
-Required segments (cold and warm / cache-hit runs):
-
-| Segment | Sub-ops to time |
-|---------|-----------------|
-| init | geometry, grids, DFTB projector / basis load |
-| S1 | SCF only; separately cache write |
-| S2 | projector setup, `project_density_dense`, `project_neutral_density`, rho_diff, cache write |
-| S3a | Poisson, CO tip get, Pauli, ES conv, vdW, E_total sum |
-| S3b | AFMulator ctor (if cold), `compute_gradient_cl`, cache write |
-| S4 | upload/setup FDBM grid, `compose_and_relax_total`, second `scan_fdbm` if kept, cache write |
-| I/O | each `np.load` / `np.savez_compressed` |
-
-Gate prints with env `SPAMMM_AFM_BENCH=1` so GUI stays quiet by default.
-
-### Step 2: End-to-end benchmark script
-
-`tests/SPM/bench_fdbm.py` — CLI script, not pytest:
-
-```bash
-python tests/SPM/bench_fdbm.py --mol data/xyz/benzene.xyz --repeats 5
-python tests/SPM/bench_fdbm.py --mol ... --profile   # optional cProfile dump
-```
-
-Output: per-stage timing table + total. Run with and without cache. Report median/min/max (see performance protocol).
-
-### Step 3: Identify bottlenecks
-
-For each stage, separate:
-- **GPU kernel time**: `queue.finish()` + wall-clock around kernel calls; later OpenCL events
-- **Python overhead**: total stage time − GPU kernel time
-- **I/O time**: cache save/load time
-
-### Step 4: Optimization targets
-
-- Move host-device transfers out of hot loops
-- Pre-allocate and reuse GPU buffers across stages
-- Cache OpenCL kernel compilations / reuse one AFMulator across S3–S4
-- Skip cache I/O when running end-to-end (in-memory pipeline)
-- Eliminate duplicate S4 scan if confirmed redundant
+- [x] Per-stage `AFMBench` + `tests/SPM/bench_fdbm.py`
+- [x] GPU FFT / tasks / NA dense / shared AFMulator / uncompressed cache
+- [ ] Round-2 TODOs above (T-next-1 … T-next-4) — **after commit**
+- [ ] Optional OpenCL event profiling once host CPU ops are gone
 
 ## Test molecules
 
@@ -198,11 +264,10 @@ For each stage, separate:
 ## References
 
 - `spammm/GUI/AFMExtension.py` — GUI wiring (FDBM ModularPipeline only)
-- `spammm/SPM/ModularPipeline.py` — staged pipeline (no stage timers yet)
-- `spammm/SPM/AFM.py` — AFMulator core (FDBM + Morse/LJ engines)
-- `spammm/SPM/AFM_utils.py` — high-level orchestration; sparse pySCF timings
-- `spammm/quantum/DFTB/Grid_dftb.py` — existing `[TIME]` kernel stopwatches (S2)
-- `tests/SPM/test_afm_fdbm.py` — existing FDBM tests (functional, not perf)
-- `tests/SPM/test_afm_morse.py` — Morse+point-charge path (not GUI)
-- `doc/AGENTS/protocols/general/performance_optimization.md` — warmup/median/event profiling
-- `doc/ARCHITECTURE_ROADMAP.md` §2 (pySCF backend)
+- `spammm/SPM/ModularPipeline.py` — staged pipeline + `AFMBench` hooks
+- `spammm/SPM/AFM.py` — AFMulator + `AFMBench` + FFT GPU path
+- `spammm/quantum/DFTB/Grid_dftb.py` — density projection / GPU tasks
+- `tests/SPM/bench_fdbm.py` — headless FDBM perf harness
+- `tests/SPM/test_afm_fdbm.py` — functional FDBM tests
+- `doc/Tasks/AFMTesting.md` — functional tests + Round-2 perf TODO pointer
+- `doc/AGENTS/protocols/general/performance_optimization.md`

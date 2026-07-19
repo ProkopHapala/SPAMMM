@@ -1210,9 +1210,8 @@ __kernel void updateAtomsSPFFf4(
 
 // ======================================================================
 //  relax_nsteps_local_UFF / relax_nsteps_global_UFF
-//  Fused nsteps MD: bonds (neighs) + Fourier angles.
-//  Parallel SPFF-style: eval -> per-angle force slots -> gather (NO atomics,
-//  NO single-thread serial angle loop).
+//  Fused nsteps MD: bonds + Fourier angles + dihedrals + inversions.
+//  Parallel SPFF-style: eval -> per-interaction force slots -> gather (NO atomics).
 //  Local mem budget ~35 KB with MAX_UFF_ATOMS=128, MAX_UFF_ANGLES=256.
 // ======================================================================
 #ifndef MAX_UFF_ATOMS
@@ -1226,31 +1225,37 @@ __kernel void updateAtomsSPFFf4(
 #define MAX_UFF_ANG_TILE 128
 #endif
 
+// Match evalAngles_UFF / UFF.h::evalAngle_Prokop (qij,qkj unit; lij,lkj lengths).
 inline void uff_eval_angle_forces(
-    float3 qij, float3 qkj, float4 par1, float K,
+    float3 qij, float3 qkj, float lij, float lkj, float4 par1, float K,
     __private float3* fi, __private float3* fj, __private float3* fk, __private float* Eout
 ){
     float3 h = qij + qkj;
     float c = 0.5f * (dot(h,h) - 2.0f);
     c = clamp(c, -1.0f, 1.0f);
     float s = sqrt(fmax(0.0f, 1.0f - c*c) + 1e-14f);
+    float inv_s = (s > 1e-12f) ? (1.0f / s) : 0.0f;
     float2 cs  = (float2)(c, s);
     float2 csn = cs;
     float Eloc = par1.x + par1.y * cs.x;
     float fmag = par1.y;
     csn = (float2)(csn.x*cs.x - csn.y*cs.y, csn.x*cs.y + csn.y*cs.x);
     Eloc += par1.z * csn.x;
-    fmag += 2.0f * par1.z;
+    fmag += par1.z * csn.y * inv_s * 2.0f;
     csn = (float2)(csn.x*cs.x - csn.y*cs.y, csn.x*cs.y + csn.y*cs.x);
     Eloc += par1.w * csn.x;
-    fmag += 3.0f * par1.w;
+    fmag += par1.w * csn.y * inv_s * 3.0f;
     Eloc *= K;
     fmag *= K;
-    float3 fij = qij * fmag;
-    float3 fkj = qkj * fmag;
-    *fi =  fij;
-    *fk =  fkj;
-    *fj = -fij - fkj;
+    float inv_lij = 1.0f / (lij + 1e-12f);
+    float inv_lkj = 1.0f / (lkj + 1e-12f);
+    float fi_s = fmag * inv_lij;
+    float fk_s = fmag * inv_lkj;
+    float fic = fi_s * c;
+    float fkc = fk_s * c;
+    *fi = fic * qij - fi_s * qkj;
+    *fk = -fk_s * qij + fkc * qkj;
+    *fj = (fk_s - fic) * qij + (fi_s - fkc) * qkj;
     *Eout = Eloc;
 }
 
@@ -1273,8 +1278,114 @@ inline float4 uff_gather_angle_force(
     return (float4)(f, E);
 }
 
+// Match evalDihedrals_UFF / UFF.h::evalDihedral_Prokop (no 1-4 NB subtract in fused path).
+// h12=unit(i-j), h32=unit(k-j), h43=unit(l-k); invL = 1/bond lengths.
+inline void uff_eval_dihedral_forces(
+    float3 h12, float3 h32, float3 h43, float inv_l12, float inv_l32, float inv_l43,
+    float3 par, // {V, d=cos(n*phi0), n}
+    __private float3* fi, __private float3* fj, __private float3* fk, __private float3* fl, __private float* Eout
+){
+    float3 n123 = cross(h12, h32);
+    float3 n234 = cross(h43, h32);
+    float n123_2 = dot(n123,n123);
+    float n234_2 = dot(n234,n234);
+    if(n123_2 < 1e-30f || n234_2 < 1e-30f){
+        *fi=*fj=*fk=*fl=(float3)(0); *Eout=0; return;
+    }
+    float il2_123 = 1.0f / n123_2;
+    float il2_234 = 1.0f / n234_2;
+    float inv_n12 = sqrt(il2_123 * il2_234);
+    float2 cs = (float2)( dot(n123,n234)*inv_n12,  -dot(n123,h43)*inv_n12 );
+    float2 csn = cs;
+    int nint = (int)(par.z);
+    for(int i=1;i<nint;i++){ csn = (float2)( csn.x*cs.x - csn.y*cs.y,  csn.x*cs.y + csn.y*cs.x ); }
+    *Eout = par.x * ( 1.0f + par.y * csn.x );
+    float f = -par.x * par.y * par.z * csn.y;
+    float3 fp1 = n123 * (-f * il2_123 * inv_l12);
+    float3 fp4 = n234 * ( f * il2_234 * inv_l43);
+    float c123 = dot(h32,h12) * (inv_l32 / inv_l12);
+    float c432 = dot(h32,h43) * (inv_l32 / inv_l43);
+    *fi = fp1;
+    *fl = fp4;
+    *fk = fp1 * (-c123) + fp4 * (-c432 - 1.0f);
+    *fj = fp1 * ( c123 - 1.0f) + fp4 * ( c432      );
+}
+
+// Match evalInversions_UFF (central atom i). h21=unit(j-i), h31=unit(k-i), h41=unit(l-i).
+inline void uff_eval_inversion_forces(
+    float3 h21, float3 h31, float3 h41, float inv_l21, float inv_l31, float inv_l41,
+    float4 par, // {K, c0, c1, c2}
+    __private float3* fi, __private float3* fj, __private float3* fk, __private float3* fl, __private float* Eout
+){
+    float3 n123 = cross(-h21, -h31); // cross(ij, ik)
+    float n123_mag2 = dot(n123, n123);
+    float il123 = 0.0f;
+    if(n123_mag2 > 1e-16f){ il123 = rsqrt(n123_mag2); n123 *= il123; }
+    else n123 = (float3)(0);
+    float s_w = -dot(n123, h41);
+    s_w = clamp(s_w, -1.0f, 1.0f);
+    float c_w = sqrt(1.0f - s_w*s_w);
+    float K=par.x, c0=par.y, c1=par.z, c2=par.w;
+    float c_2w = 2.0f*c_w*c_w - 1.0f;
+    *Eout = K * ( c0 + c1*c_w + c2*c_2w );
+    float s_2w = 2.0f*s_w*c_w;
+    float dEdw = -K * ( c1*s_w + 2.0f*c2*s_2w );
+    float f_term = (c_w > 1e-7f) ? dEdw / c_w : 0.0f;
+    float fq41 = f_term * inv_l41;
+    float fi123 = f_term * il123;
+    float3 tq = s_w*fi123*n123 + fi123*h41;
+    *fl = fq41*n123 + s_w*fq41*h41;
+    *fj = cross( h31, tq) * inv_l21;
+    *fk = cross( tq, h21) * inv_l31;
+    *fi = -(*fj + *fk + *fl);
+}
+
+// Gather 4-atom interaction (dihedral/inversion) onto one atom.
+inline float4 uff_gather_4_force(
+    int ia, int ntile,
+    __local const int4*   s_atoms,
+    __local const float4* s_fi,
+    __local const float4* s_fj,
+    __local const float4* s_fk,
+    __local const float4* s_fl
+){
+    float3 f = (float3)(0,0,0);
+    float  E = 0.f;
+    for(int t=0; t<ntile; t++){
+        const int4 a = s_atoms[t];
+        if(a.x==ia){ f += s_fi[t].xyz; E += s_fi[t].w; }
+        if(a.y==ia){ f += s_fj[t].xyz; E += s_fj[t].w; }
+        if(a.z==ia){ f += s_fk[t].xyz; E += s_fk[t].w; }
+        if(a.w==ia){ f += s_fl[t].xyz; E += s_fl[t].w; }
+    }
+    return (float4)(f, E);
+}
+
+#ifndef FAF_BASIS_MAX
+#define FAF_BASIS_MAX 128
+#endif
+#ifndef FAF_TYPES_MAX
+#define FAF_TYPES_MAX 8
+#endif
+
+inline float folded_eval_basis_uff(float u, float v, float z, float4 prm){
+    const float twopi = 6.283185307179586f;
+    return native_cos(twopi*prm.x*u) * native_cos(twopi*prm.y*v) * native_exp(-prm.z * fmax(0.0f, z - prm.w));
+}
+inline float3 folded_eval_grad_uff(float u, float v, float z, float4 prm, float4 invL){
+    const float twopi = 6.283185307179586f;
+    float ku=prm.x, kv=prm.y, az=prm.z, z0=prm.w;
+    float bx=native_cos(twopi*ku*u), by=native_cos(twopi*kv*v);
+    float bz=native_exp(-az*fmax(0.0f,z-z0));
+    float dEdu=(-twopi*ku*native_sin(twopi*ku*u))*by*bz;
+    float dEdv=bx*(-twopi*kv*native_sin(twopi*kv*v))*bz;
+    float dEdz=(z>=z0)?(bx*by*(-az*bz)):0.0f;
+    return (float3)(dEdu*invL.x+dEdv*invL.z, dEdu*invL.y+dEdv*invL.w, dEdz);
+}
+
 __kernel void relax_nsteps_local_UFF(
-    const int4 nDOFs,
+    const int4 nDOFs,                  // (natoms, nangles, nsteps, nbonds)
+    const int4 nDOFs2,                 // (ndihedrals, ninversions, 0, 0)
     __global       float4* g_apos,
     __global       float4* g_avel,
     __global       float4* g_aforce,
@@ -1284,12 +1395,24 @@ __kernel void relax_nsteps_local_UFF(
     __global const int4*   g_angAtoms,
     __global const float4* g_angParams1,
     __global const float*  g_angParams2_w,
-    __global const float4* g_MDparams
+    __global const int4*   g_dihAtoms,
+    __global const float4* g_dihParams,
+    __global const int4*   g_invAtoms,
+    __global const float4* g_invParams,
+    __global const float4* g_MDparams,
+    const int              do_faf,
+    __global const float*  g_folded_coeffs,
+    __global const float4* g_folded_kxyz,
+    __global const int*    g_folded_atom_type,
+    const int4             folded_meta,
+    const float4           folded_lvec2d
 ){
     const int natoms  = nDOFs.x;
     const int nangles = nDOFs.y;
     const int nsteps  = nDOFs.z;
     const int nbonds  = nDOFs.w;
+    const int ndihedrals  = nDOFs2.x;
+    const int ninversions = nDOFs2.y;
     const int iL = get_local_id(0);
     const int nL = get_local_size(0);
     // Never return before barriers — gate work with ok flag
@@ -1308,9 +1431,18 @@ __kernel void relax_nsteps_local_UFF(
     __local float4 s_fi[MAX_UFF_ANGLES];
     __local float4 s_fj[MAX_UFF_ANGLES];
     __local float4 s_fk[MAX_UFF_ANGLES];
+    // Tiled 4-atom slots (dihedral/inversion); do NOT overwrite s_angA (cached for all steps)
+    __local int4   s_tileA[MAX_UFF_ANG_TILE];
+    __local float4 s_fl[MAX_UFF_ANG_TILE];
+    __local int    s_atype[MAX_UFF_ATOMS];
+    __local float4 LBASIS[FAF_BASIS_MAX];
+    __local float  LCOEFFS[FAF_TYPES_MAX * FAF_BASIS_MAX];
 
     const float4 MDpars = g_MDparams[0];
     const float dt=MDpars.x, damp=MDpars.y, Flimit=MDpars.z;
+
+    float4 invLvec2d = (float4)(0,0,0,0);
+    int nbasis = 0, ntypes = 0;
 
     if(ok){
         for(int i=iL; i<natoms; i+=nL){
@@ -1321,6 +1453,18 @@ __kernel void relax_nsteps_local_UFF(
         for(int i=iL; i<nbp; i+=nL) s_bpar[i]=g_bonParams[i];
         for(int i=iL; i<nangles; i+=nL){
             s_angA[i]=g_angAtoms[i]; s_angP1[i]=g_angParams1[i]; s_angK[i]=g_angParams2_w[i];
+        }
+        if(do_faf){
+            nbasis = folded_meta.x; ntypes = folded_meta.y;
+            if(nbasis>0 && nbasis<=FAF_BASIS_MAX && ntypes>0 && ntypes<=FAF_TYPES_MAX){
+                for(int j=iL; j<nbasis; j+=nL) LBASIS[j]=g_folded_kxyz[j];
+                for(int j=iL; j<nbasis*ntypes; j+=nL) LCOEFFS[j]=g_folded_coeffs[j];
+                for(int j=iL; j<natoms; j+=nL) s_atype[j]=g_folded_atom_type[j];
+                float ax=folded_lvec2d.x, bx=folded_lvec2d.y, ay=folded_lvec2d.z, by=folded_lvec2d.w;
+                float det=ax*by-bx*ay;
+                if(fabs(det)>1e-12f) invLvec2d=(float4)(by/det,-bx/det,-ay/det,ax/det);
+                else nbasis=0;
+            } else nbasis=0;
         }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -1366,7 +1510,7 @@ __kernel void relax_nsteps_local_UFF(
                 float3 vij=pi-pj; float lij=length(vij)+1e-12f; float3 qij=vij/lij;
                 float3 vkj=pk-pj; float lkj=length(vkj)+1e-12f; float3 qkj=vkj/lkj;
                 float3 fi,fj,fk; float E;
-                uff_eval_angle_forces(qij,qkj,s_angP1[iang],s_angK[iang],&fi,&fj,&fk,&E);
+                uff_eval_angle_forces(qij,qkj,lij,lkj,s_angP1[iang],s_angK[iang],&fi,&fj,&fk,&E);
                 const float e3 = E*(1.f/3.f);
                 s_fi[iang] = (float4)(fi, e3);
                 s_fj[iang] = (float4)(fj, e3);
@@ -1378,6 +1522,81 @@ __kernel void relax_nsteps_local_UFF(
         if(ok){
             for(int ia=iL; ia<natoms; ia+=nL){
                 s_aforce[ia] += uff_gather_angle_force(ia, nangles, s_angA, s_fi, s_fj, s_fk);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // --- Dihedrals: tiled (global params; local positions). Uses s_fi/s_fj/s_fk[0..TILE) + s_fl ---
+        for(int base=0; base<ndihedrals; base+=MAX_UFF_ANG_TILE){
+            const int ntile = min(MAX_UFF_ANG_TILE, ndihedrals - base);
+            if(ok){
+                for(int t=iL; t<ntile; t+=nL){
+                    const int idih = base + t;
+                    int4 a = g_dihAtoms[idih];
+                    s_tileA[t] = a;
+                    float3 pi=s_apos[a.x].xyz, pj=s_apos[a.y].xyz, pk=s_apos[a.z].xyz, pl=s_apos[a.w].xyz;
+                    float3 rji=pi-pj; float lji=length(rji)+1e-12f; float3 h12=rji/lji; float inv_l12=1.f/lji;
+                    float3 rkj=pk-pj; float lkj=length(rkj)+1e-12f; float3 h32=rkj/lkj; float inv_l32=1.f/lkj;
+                    float3 rlk=pl-pk; float llk=length(rlk)+1e-12f; float3 h43=rlk/llk; float inv_l43=1.f/llk;
+                    float3 fi,fj,fk,fl; float E;
+                    uff_eval_dihedral_forces(h12,h32,h43,inv_l12,inv_l32,inv_l43,g_dihParams[idih].xyz,&fi,&fj,&fk,&fl,&E);
+                    const float e4 = E*(1.f/4.f);
+                    s_fi[t]=(float4)(fi,e4); s_fj[t]=(float4)(fj,e4); s_fk[t]=(float4)(fk,e4); s_fl[t]=(float4)(fl,e4);
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+            if(ok){
+                for(int ia=iL; ia<natoms; ia+=nL){
+                    s_aforce[ia] += uff_gather_4_force(ia, ntile, s_tileA, s_fi, s_fj, s_fk, s_fl);
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+
+        // --- Inversions: tiled ---
+        for(int base=0; base<ninversions; base+=MAX_UFF_ANG_TILE){
+            const int ntile = min(MAX_UFF_ANG_TILE, ninversions - base);
+            if(ok){
+                for(int t=iL; t<ntile; t+=nL){
+                    const int iinv = base + t;
+                    int4 a = g_invAtoms[iinv];
+                    s_tileA[t] = a;
+                    float3 pi=s_apos[a.x].xyz, pj=s_apos[a.y].xyz, pk=s_apos[a.z].xyz, pl=s_apos[a.w].xyz;
+                    float3 rij=pj-pi; float lij=length(rij)+1e-12f; float3 h21=rij/lij; float inv_l21=1.f/lij;
+                    float3 rik=pk-pi; float lik=length(rik)+1e-12f; float3 h31=rik/lik; float inv_l31=1.f/lik;
+                    float3 ril=pl-pi; float lil=length(ril)+1e-12f; float3 h41=ril/lil; float inv_l41=1.f/lil;
+                    float3 fi,fj,fk,fl; float E;
+                    uff_eval_inversion_forces(h21,h31,h41,inv_l21,inv_l31,inv_l41,g_invParams[iinv],&fi,&fj,&fk,&fl,&E);
+                    const float e4 = E*(1.f/4.f);
+                    s_fi[t]=(float4)(fi,e4); s_fj[t]=(float4)(fj,e4); s_fk[t]=(float4)(fk,e4); s_fl[t]=(float4)(fl,e4);
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+            if(ok){
+                for(int ia=iL; ia<natoms; ia+=nL){
+                    s_aforce[ia] += uff_gather_4_force(ia, ntile, s_tileA, s_fi, s_fj, s_fk, s_fl);
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+
+        // --- FAF substrate ---
+        if(ok && do_faf && nbasis>0){
+            for(int ia=iL; ia<natoms; ia+=nL){
+                float3 pos = s_apos[ia].xyz;
+                float u = invLvec2d.x*pos.x + invLvec2d.y*pos.y;
+                float v = invLvec2d.z*pos.x + invLvec2d.w*pos.y;
+                u -= floor(u); v -= floor(v);
+                int ityp = s_atype[ia];
+                if(ityp<0 || ityp>=ntypes) continue;
+                float E=0; float3 F=(float3)(0,0,0);
+                int ioff=ityp*nbasis;
+                for(int ib=0; ib<nbasis; ib++){
+                    float c=LCOEFFS[ioff+ib]; float4 prm=LBASIS[ib];
+                    E += c*folded_eval_basis_uff(u,v,pos.z,prm);
+                    F -= c*folded_eval_grad_uff(u,v,pos.z,prm,invLvec2d);
+                }
+                s_aforce[ia] += (float4)(F, -E);
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -1402,6 +1621,7 @@ __kernel void relax_nsteps_local_UFF(
 
 __kernel void relax_nsteps_global_UFF(
     const int4 nDOFs,
+    const int4 nDOFs2,                 // (ndihedrals, ninversions, 0, 0)
     __global       float4* g_apos,
     __global       float4* g_avel,
     __global       float4* g_aforce,
@@ -1411,22 +1631,52 @@ __kernel void relax_nsteps_global_UFF(
     __global const int4*   g_angAtoms,
     __global const float4* g_angParams1,
     __global const float*  g_angParams2_w,
-    __global const float4* g_MDparams
+    __global const int4*   g_dihAtoms,
+    __global const float4* g_dihParams,
+    __global const int4*   g_invAtoms,
+    __global const float4* g_invParams,
+    __global const float4* g_MDparams,
+    const int              do_faf,
+    __global const float*  g_folded_coeffs,
+    __global const float4* g_folded_kxyz,
+    __global const int*    g_folded_atom_type,
+    const int4             folded_meta,
+    const float4           folded_lvec2d
 ){
     const int natoms  = nDOFs.x;
     const int nangles = nDOFs.y;
     const int nsteps  = nDOFs.z;
     const int nbonds  = nDOFs.w;
+    const int ndihedrals  = nDOFs2.x;
+    const int ninversions = nDOFs2.y;
     const int iL = get_local_id(0);
     const int nL = get_local_size(0);
     const float4 MDpars = g_MDparams[0];
     const float dt=MDpars.x, damp=MDpars.y, Flimit=MDpars.z;
 
-    // Local scratch for one angle tile (gather over scatter, no atomics)
+    // Local scratch for one interaction tile (gather over scatter, no atomics)
     __local int4   s_angA[MAX_UFF_ANG_TILE];
     __local float4 s_fi[MAX_UFF_ANG_TILE];
     __local float4 s_fj[MAX_UFF_ANG_TILE];
     __local float4 s_fk[MAX_UFF_ANG_TILE];
+    __local float4 s_fl[MAX_UFF_ANG_TILE];
+    __local float4 LBASIS[FAF_BASIS_MAX];
+    __local float  LCOEFFS[FAF_TYPES_MAX * FAF_BASIS_MAX];
+
+    float4 invLvec2d = (float4)(0,0,0,0);
+    int nbasis=0, ntypes=0;
+    if(do_faf){
+        nbasis=folded_meta.x; ntypes=folded_meta.y;
+        if(nbasis>0 && nbasis<=FAF_BASIS_MAX && ntypes>0 && ntypes<=FAF_TYPES_MAX){
+            for(int j=iL; j<nbasis; j+=nL) LBASIS[j]=g_folded_kxyz[j];
+            for(int j=iL; j<nbasis*ntypes; j+=nL) LCOEFFS[j]=g_folded_coeffs[j];
+            float ax=folded_lvec2d.x, bx=folded_lvec2d.y, ay=folded_lvec2d.z, by=folded_lvec2d.w;
+            float det=ax*by-bx*ay;
+            if(fabs(det)>1e-12f) invLvec2d=(float4)(by/det,-bx/det,-ay/det,ax/det);
+            else nbasis=0;
+        } else nbasis=0;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
 
     for(int step=0; step<nsteps; step++){
         for(int i=iL; i<natoms; i+=nL) g_aforce[i]=(float4)(0,0,0,0);
@@ -1468,7 +1718,7 @@ __kernel void relax_nsteps_global_UFF(
                 float3 vij=pi-pj; float lij=length(vij)+1e-12f; float3 qij=vij/lij;
                 float3 vkj=pk-pj; float lkj=length(vkj)+1e-12f; float3 qkj=vkj/lkj;
                 float3 fi,fj,fk; float E;
-                uff_eval_angle_forces(qij,qkj,g_angParams1[iang],g_angParams2_w[iang],&fi,&fj,&fk,&E);
+                uff_eval_angle_forces(qij,qkj,lij,lkj,g_angParams1[iang],g_angParams2_w[iang],&fi,&fj,&fk,&E);
                 const float e3 = E*(1.f/3.f);
                 s_fi[t] = (float4)(fi, e3);
                 s_fj[t] = (float4)(fj, e3);
@@ -1481,6 +1731,75 @@ __kernel void relax_nsteps_global_UFF(
             barrier(CLK_LOCAL_MEM_FENCE);
         }
         barrier(CLK_GLOBAL_MEM_FENCE);
+
+        // Dihedrals: tiled
+        for(int base=0; base<ndihedrals; base+=MAX_UFF_ANG_TILE){
+            const int ntile = min(MAX_UFF_ANG_TILE, ndihedrals - base);
+            for(int t=iL; t<ntile; t+=nL){
+                const int idih = base + t;
+                int4 a = g_dihAtoms[idih];
+                s_angA[t] = a;
+                float3 pi=g_apos[a.x].xyz, pj=g_apos[a.y].xyz, pk=g_apos[a.z].xyz, pl=g_apos[a.w].xyz;
+                float3 rji=pi-pj; float lji=length(rji)+1e-12f; float3 h12=rji/lji; float inv_l12=1.f/lji;
+                float3 rkj=pk-pj; float lkj=length(rkj)+1e-12f; float3 h32=rkj/lkj; float inv_l32=1.f/lkj;
+                float3 rlk=pl-pk; float llk=length(rlk)+1e-12f; float3 h43=rlk/llk; float inv_l43=1.f/llk;
+                float3 fi,fj,fk,fl; float E;
+                uff_eval_dihedral_forces(h12,h32,h43,inv_l12,inv_l32,inv_l43,g_dihParams[idih].xyz,&fi,&fj,&fk,&fl,&E);
+                const float e4 = E*(1.f/4.f);
+                s_fi[t]=(float4)(fi,e4); s_fj[t]=(float4)(fj,e4); s_fk[t]=(float4)(fk,e4); s_fl[t]=(float4)(fl,e4);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+            for(int ia=iL; ia<natoms; ia+=nL){
+                g_aforce[ia] += uff_gather_4_force(ia, ntile, s_angA, s_fi, s_fj, s_fk, s_fl);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        barrier(CLK_GLOBAL_MEM_FENCE);
+
+        // Inversions: tiled
+        for(int base=0; base<ninversions; base+=MAX_UFF_ANG_TILE){
+            const int ntile = min(MAX_UFF_ANG_TILE, ninversions - base);
+            for(int t=iL; t<ntile; t+=nL){
+                const int iinv = base + t;
+                int4 a = g_invAtoms[iinv];
+                s_angA[t] = a;
+                float3 pi=g_apos[a.x].xyz, pj=g_apos[a.y].xyz, pk=g_apos[a.z].xyz, pl=g_apos[a.w].xyz;
+                float3 rij=pj-pi; float lij=length(rij)+1e-12f; float3 h21=rij/lij; float inv_l21=1.f/lij;
+                float3 rik=pk-pi; float lik=length(rik)+1e-12f; float3 h31=rik/lik; float inv_l31=1.f/lik;
+                float3 ril=pl-pi; float lil=length(ril)+1e-12f; float3 h41=ril/lil; float inv_l41=1.f/lil;
+                float3 fi,fj,fk,fl; float E;
+                uff_eval_inversion_forces(h21,h31,h41,inv_l21,inv_l31,inv_l41,g_invParams[iinv],&fi,&fj,&fk,&fl,&E);
+                const float e4 = E*(1.f/4.f);
+                s_fi[t]=(float4)(fi,e4); s_fj[t]=(float4)(fj,e4); s_fk[t]=(float4)(fk,e4); s_fl[t]=(float4)(fl,e4);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+            for(int ia=iL; ia<natoms; ia+=nL){
+                g_aforce[ia] += uff_gather_4_force(ia, ntile, s_angA, s_fi, s_fj, s_fk, s_fl);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        barrier(CLK_GLOBAL_MEM_FENCE);
+
+        // FAF substrate
+        if(do_faf && nbasis>0){
+            for(int ia=iL; ia<natoms; ia+=nL){
+                float3 pos = g_apos[ia].xyz;
+                float u = invLvec2d.x*pos.x + invLvec2d.y*pos.y;
+                float v = invLvec2d.z*pos.x + invLvec2d.w*pos.y;
+                u -= floor(u); v -= floor(v);
+                int ityp = g_folded_atom_type[ia];
+                if(ityp<0 || ityp>=ntypes) continue;
+                float E=0; float3 F=(float3)(0,0,0);
+                int ioff=ityp*nbasis;
+                for(int ib=0; ib<nbasis; ib++){
+                    float c=LCOEFFS[ioff+ib]; float4 prm=LBASIS[ib];
+                    E += c*folded_eval_basis_uff(u,v,pos.z,prm);
+                    F -= c*folded_eval_grad_uff(u,v,pos.z,prm,invLvec2d);
+                }
+                g_aforce[ia] += (float4)(F, -E);
+            }
+            barrier(CLK_GLOBAL_MEM_FENCE);
+        }
 
         // Integrate
         for(int ia=iL; ia<natoms; ia+=nL){

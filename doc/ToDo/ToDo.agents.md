@@ -53,6 +53,7 @@ High-level status for agent-driven work. Details in linked docs — do not dupli
 - [ ] **GridFF consolidation**: unify tricubic B-spline (4ch) vs trilinear (12ch) via common interface + preprocessor kernel variants (§6 ARCH_ROADMAP)
 - [ ] **Mol browser plugin port**: port `MolBrowserPlugin` system from FireCore `VispyMolBrowser.py`, write SPAMMM plugins (AFM, vibration, relax) (§1 ARCH_ROADMAP)
 - [ ] **FAF substrate relaxation**: implement ForcedAtomicFunction as analytic substrate potential for on-surface molecule relaxation (§5 ARCH_ROADMAP) — prefer fused `relax_global(do_faf=True)` path once complete
+- [ ] **Fused FAF (PTCDA)** — wired in SPFF/UFF fused kernels + `tests/test_relax_ptcda_faf.py`; **unverified** pending USER review of `debug/test_relax_ptcda_faf/` (`doc/Tasks/PerfBenchmark_Relaxation.md`)
 - [ ] **Presentation tools**: `spammm/utils/html_pres.py` — HTML slide generator for LLM agents, auto-generate from test artifacts (§3 ARCH_ROADMAP)
 - [ ] **Consolidate GUI verbosity → `spammm.globals`**: replace per-module `verbose`/`bPrint` with `globals.debug_print()` (§10 ARCH_ROADMAP)
 

@@ -1255,7 +1255,7 @@ class SPFF_cl(OpenCLBase):
         out[2, :3] = np.array(self.surface_lvec[2, :3], dtype=np.float32)
         return out
 
-    def fit_folded_surface_basis(self, surf_xyz=None, type_map=None, nPBC=(4,4,0), z_range=(0.5, 8.0), nu=4, nv=4, nz=4, nxy=32, nz_samp=40, r_damp=0.0, alpha_morse=1.8, bMacro=True, components=('total',), fit_mask=None, weight_power=0.0, coulomb_solver='morse', ewald_n_harm=6, z_scale=None, custom_alphas=None):
+    def fit_folded_surface_basis(self, surf_xyz=None, type_map=None, nPBC=(4,4,0), z_range=(0.5, 8.0), nu=4, nv=4, nz=4, nxy=32, nz_samp=40, r_damp=0.0, alpha_morse=1.8, bMacro=True, components=('total',), fit_mask=None, weight_power=0.0, coulomb_solver='morse', ewald_n_harm=6, z_scale=None, custom_alphas=None, substrate_R_override=None):
         if self.rigid_REQs0 is None:
             raise ValueError('fit_folded_surface_basis(): call init_rigid_molecule_batch() first')
         if surf_xyz is None:
@@ -1330,6 +1330,11 @@ class SPFF_cl(OpenCLBase):
             md1 = self.__class__(nloc=self.nloc, debug_build_options='-DDBG_UFF=0')
             md1.init_rigid_molecule_batch(np.zeros((1,3), dtype=np.float32), uniq_REQs[it:it+1], nSystems=min(max(len(transforms), 1), 8192))
             md1.set_surface(surf_xyz, nPBC=nPBC, pos0=(0.0,0.0,0.0), alpha_morse=alpha_morse, r_damp=r_damp, bMacro=bMacro, type_map=type_map)
+            if substrate_R_override:
+                for ia, e in enumerate(md1.surface_enames):
+                    if e in substrate_R_override:
+                        md1.surface_REQs[ia, 0] = float(substrate_R_override[e])
+                md1.toGPU('REQ_s', md1.surface_REQs)
             morse_comps = [ck for ck in comp_keys if ck != 'coulomb'] if (want_coulomb and coulomb_solver == 'ewald2d') else comp_keys
             out = md1.eval_rigid_getSurfMorse_components(transforms.reshape(-1,12), chunk_size=md1.nSystems, components=morse_comps)
             for ck in comp_keys:
@@ -1730,43 +1735,44 @@ class SPFF_cl(OpenCLBase):
     SERIAL_MAX_NATOM = 128
     SERIAL_MAX_NNODE = 96
 
-    def relax_serial(self, nsteps=100, dt=0.01, damp=0.95, Flimit=100.0):
+    def relax_serial(self, nsteps=100, dt=0.01, damp=0.95, Flimit=100.0, do_faf=False):
         """Run nsteps entirely on GPU in a single kernel call using local memory.
-        Single workgroup (SERIAL_WG_SIZE threads). No non-bonded. Only for nSystems=1
-        with nvec<=SERIAL_MAX_NVEC, nnode<=SERIAL_MAX_NNODE, natoms<=SERIAL_MAX_NATOM."""
+        Single workgroup (SERIAL_WG_SIZE threads). Optional FAF substrate (do_faf).
+        Only for nSystems=1 with nvec/nnode/natoms within SERIAL_* caps."""
         import pyopencl as cl
+        from pyopencl import cltypes
         WG_SIZE = self.SERIAL_WG_SIZE
         nvec = self.nvecs
         if nvec > self.SERIAL_MAX_NVEC:
-            raise ValueError(f"relax_serial: nvec={nvec} > MAX_NVEC={self.SERIAL_MAX_NVEC}, use relax_batch instead")
+            raise ValueError(f"relax_serial: nvec={nvec} > MAX_NVEC={self.SERIAL_MAX_NVEC}, use relax_batch/global")
         if self.nnode > self.SERIAL_MAX_NNODE:
-            raise ValueError(f"relax_serial: nnode={self.nnode} > MAX_NNODE={self.SERIAL_MAX_NNODE}, use relax_batch instead")
+            raise ValueError(f"relax_serial: nnode={self.nnode} > MAX_NNODE={self.SERIAL_MAX_NNODE}, use relax_batch/global")
         if self.natoms > self.SERIAL_MAX_NATOM:
-            raise ValueError(f"relax_serial: natoms={self.natoms} > MAX_NATOM={self.SERIAL_MAX_NATOM}, use relax_batch instead")
+            raise ValueError(f"relax_serial: natoms={self.natoms} > MAX_NATOM={self.SERIAL_MAX_NATOM}, use relax_batch/global")
         if nvec > WG_SIZE:
-            raise ValueError(f"relax_serial: nvec={nvec} > WG_SIZE={WG_SIZE} (need one thread per DOF), use relax_batch instead")
+            raise ValueError(f"relax_serial: nvec={nvec} > WG_SIZE={WG_SIZE}, use relax_batch/global")
         if self.nSystems != 1:
-            raise ValueError(f"relax_serial: nSystems={self.nSystems} != 1, use relax_batch instead")
-        # Set MD params
+            raise ValueError(f"relax_serial: nSystems={self.nSystems} != 1, use relax_batch")
         self.set_md_params(dt=dt, damp=damp, Flimit=Flimit)
-        nDOFs = cltypes.make_int4(self.natoms, self.nnode, nsteps, 0)
+        folded_meta = self.kernel_params.get('folded_meta', np.array([0, 0, 0, 0], dtype=np.int32))
+        folded_lvec = self.kernel_params.get('folded_lvec2d', np.array([1, 0, 0, 1], dtype=np.float32))
+        if do_faf and int(folded_meta[0]) <= 0:
+            raise ValueError("relax_serial(do_faf=True): call upload_folded_fit() first")
+        folded_coeffs = self.buffer_dict.get('folded_coeffs', self.buffer_dict['REQs'])
+        folded_kxyz = self.buffer_dict.get('folded_kxyz', self.buffer_dict['REQs'])
+        folded_atype = self.buffer_dict.get('folded_atom_type', self.buffer_dict['neighs'])
+        nDOFs = cltypes.make_int4(self.natoms, self.nnode, nsteps, 1 if do_faf else 0)
         args = [
             nDOFs,
-            self.buffer_dict['apos'],
-            self.buffer_dict['avel'],
-            self.buffer_dict['aforce'],
-            self.buffer_dict['neighs'],
-            self.buffer_dict['bkNeighs'],
-            self.buffer_dict['apars'],
-            self.buffer_dict['bLs'],
-            self.buffer_dict['bKs'],
-            self.buffer_dict['Ksp'],
-            self.buffer_dict['Kpp'],
-            self.buffer_dict['constr'],
-            self.buffer_dict['constrK'],
+            self.buffer_dict['apos'], self.buffer_dict['avel'], self.buffer_dict['aforce'],
+            self.buffer_dict['neighs'], self.buffer_dict['bkNeighs'],
+            self.buffer_dict['apars'], self.buffer_dict['bLs'], self.buffer_dict['bKs'],
+            self.buffer_dict['Ksp'], self.buffer_dict['Kpp'],
+            self.buffer_dict['constr'], self.buffer_dict['constrK'],
             self.buffer_dict['MDparams'],
-            self.buffer_dict['REQs'],
-            self.buffer_dict.get('excl', self.buffer_dict['REQs']),  # dummy if no excl
+            folded_coeffs, folded_kxyz, folded_atype,
+            cltypes.make_int4(int(folded_meta[0]), int(folded_meta[1]), 0, 0),
+            cltypes.make_float4(float(folded_lvec[0]), float(folded_lvec[1]), float(folded_lvec[2]), float(folded_lvec[3])),
         ]
         self.prg.relax_nsteps_serial(self.queue, (WG_SIZE,), (WG_SIZE,), *args)
         self.queue.finish()

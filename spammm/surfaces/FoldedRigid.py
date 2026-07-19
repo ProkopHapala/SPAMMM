@@ -153,14 +153,22 @@ def load_substrate(substrate_file=NACL_SUBSTRATE):
 # Folded basis workflow
 # =============================================================================
 
-def fit_folded_for_molecule(mol_file, substrate_file=NACL_SUBSTRATE, z_range_rel=(1.5, 8.0), nu=4, nv=4, nPBC=(4, 4, 0), alpha_morse=1.8, custom_alphas=None):
+def fit_folded_for_molecule(mol_file, substrate_file=NACL_SUBSTRATE, z_range_rel=(1.5, 8.0), nu=4, nv=4, nPBC=(4, 4, 0), alpha_morse=1.8, custom_alphas=None, substrate_R_override=None, q_override=None):
     """Fit folded basis coefficients for a molecule on a substrate.
 
     Morse (pauli+london) and Coulomb are fitted independently via
     fit_folded_surface_basis with coulomb_solver='ewald2d'.
     Returns dict with total_coeffs, basis_params, atom_type_ids, basis_lvec2d.
+
+    substrate_R_override: optional dict element->RvdW (Å), e.g. {'Na': 1.45}
+    q_override: optional dict element->charge, e.g. {'O': -0.4} (overrides xyz/REQ Q)
     """
     apos_mol, reqs, enames, _, _ = load_xyz_with_REQs(mol_file)
+    reqs = np.asarray(reqs, dtype=np.float32).copy()
+    if q_override:
+        for i, e in enumerate(enames):
+            if e in q_override:
+                reqs[i, 2] = float(q_override[e])
     z_range_abs = (Z_SURF_TOP + z_range_rel[0], Z_SURF_TOP + z_range_rel[1])
     if custom_alphas is None:
         custom_alphas = COMBINED_ALPHAS
@@ -169,12 +177,18 @@ def fit_folded_for_molecule(mol_file, substrate_file=NACL_SUBSTRATE, z_range_rel
     md = MolecularDynamics(nloc=32, debug_build_options='-DDBG_UFF=0')
     md.init_rigid_molecule_batch(np.zeros((len(enames), 3), dtype=np.float32), reqs, nSystems=8192)
     md.set_surface(substrate_file, nPBC=nPBC, alpha_morse=alpha_morse, bMacro=True)
+    if substrate_R_override:
+        for ia, e in enumerate(md.surface_enames):
+            if e in substrate_R_override:
+                md.surface_REQs[ia, 0] = float(substrate_R_override[e])
+        md.toGPU('REQ_s', md.surface_REQs)
 
     params = md.fit_folded_surface_basis(
         surf_xyz=substrate_file, components=('pauli', 'london', 'coulomb'),
         coulomb_solver='ewald2d', z_range=z_range_abs,
         nu=nu, nv=nv, nz=nz, custom_alphas=custom_alphas,
         nPBC=nPBC, alpha_morse=alpha_morse, nxy=32, nz_samp=60, ewald_n_harm=6,
+        substrate_R_override=substrate_R_override,
     )
 
     coeff_sets = params['coeff_sets']
@@ -195,6 +209,7 @@ def fit_folded_for_molecule(mol_file, substrate_file=NACL_SUBSTRATE, z_range_rel
         'enames': enames,
         'reqs': reqs,
         'apos_mol': apos_mol,
+        'substrate_R_override': dict(substrate_R_override) if substrate_R_override else {},
     }
 
 

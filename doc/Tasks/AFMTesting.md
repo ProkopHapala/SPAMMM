@@ -459,8 +459,25 @@ k[eV/Å²] = k[N/m] / 16.02
 2. **Molecule orientation / flatness:** benzene had slight out-of-plane / rotated ring — do **not** force square grids or rotate molecules for “pretty” symmetry.
 3. **Grid step:** at `dstep=0.15 Å`, `q_diff` charge neutrality fails (~−0.08 e) and near-field `V_ES` rot60≈0.90; at `0.1 Å`, `q_diff≈−0.001` and rot60≈0.99. FFT k-vectors were already correct — not a squeezed-lattice bug.
 
-**Recommendation:** prefer `dstep ≤ 0.1 Å` for FDBM ES; watch `[CHARGE CHECK] q_diff`.
+**Recommendation:** prefer `dstep ≤ 0.1 Å` for FDBM ES; watch `[CHARGE CHECK] q_diff`.  
+**Perf note:** `step=0.15` is a useful **interactive** speed experiment (see Round-2 TODOs) but must **not** become the quality default until charge/symmetry issues are understood/fixed.
 
 ### 3. What to plot for PP debug
 
 Plot **`Tip |dxy| (PP)`** and `|dxy|_max` per height — not only `df`. Sharp bond contrast requires `|dxy| ≳ 0.3–0.5 Å`.
+
+---
+
+## Round-2 FDBM performance TODOs (notes only — after commit)
+
+Full write-up + speedup report: **`doc/Tasks/PerfBenchmark_FDBM.md`**.
+
+**Already achieved (Round 1, do not re-do):** GPU `build_tasks` + gpyFFT (device k-mul) + dense NA density + shared AFMulator + drop duplicate S4 scan + uncompressed `np.savez`. Flat_1 warm S3+S4 ~**1.4 s** (was many seconds / GUI stuck on compressed cache ~10 s + NA orbital loop ~6 s).
+
+**Next (implement later):**
+
+1. **GPU `pauli_scale` + tip pad/roll** (and `E_total` sum) — eliminate host CPU; then keep arrays on GPU.
+2. **Fuse Poisson + ES FFTs:** \(E_\mathrm{ES}(k)\propto\rho_\mathrm{diff}(k)\,\tilde\rho_\mathrm{tip}(k)/k^2\) is correct for the ES energy field (use `rho_diff` + tip delta; match conv/corr convention). Saves one large-grid FFT round-trip. Pauli stays separate (`overlap^β`).
+3. **Stay-on-GPU** buffers S3→S4 once (1) lands.
+4. **Benchmark** skip/async stage cache write for interactive GUI.
+5. **Benchmark** coarser `step=0.15` interactive path — **not default** (benzene hex symmetry / `q_diff` — §2 above).

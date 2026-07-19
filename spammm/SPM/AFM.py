@@ -81,6 +81,131 @@ def stiffness_eVA2_to_Nm(k_eVA2):
 def _bytes_to_gb(nbytes):
     return nbytes / (1024.0**3)
 
+
+# ── AFM runtime config / bench (SSOT here — NOT spammm.globals) ───────────────
+def _afm_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except Exception:
+        return default
+
+# SPAMMM_AFM_BENCH=0 off | =1 summary table per stage | =2 live >>/<< + table
+AFM_BENCH: int = _afm_int_env("SPAMMM_AFM_BENCH", 1)
+AFM_BENCH_NO_IO: int = _afm_int_env("SPAMMM_AFM_BENCH_NO_IO", 0)
+# Explicit CPU backups (default = GPU; no silent fallback)
+AFM_CPU_TASKS: int = _afm_int_env("SPAMMM_AFM_CPU_TASKS", 0)
+AFM_CPU_FFT: int = _afm_int_env("SPAMMM_AFM_CPU_FFT", 0)
+AFM_NA_ORBITAL_LOOP: int = _afm_int_env("SPAMMM_AFM_NA_ORBITAL_LOOP", 0)
+
+
+def afm_bench_enabled() -> bool:
+    return AFM_BENCH > 0
+
+
+def afm_bench_verbose() -> bool:
+    """Live [BENCH] >>/<< lines (SPAMMM_AFM_BENCH>=2)."""
+    return AFM_BENCH >= 2
+
+
+def afm_bench_no_io() -> bool:
+    """Skip stage cache writes during bench (SPAMMM_AFM_BENCH_NO_IO=1)."""
+    return AFM_BENCH > 0 and AFM_BENCH_NO_IO > 0
+
+
+def afm_use_cpu_tasks() -> bool:
+    """True → CPU build_tasks (SPAMMM_AFM_CPU_TASKS=1). Default False = GPU."""
+    return AFM_CPU_TASKS > 0
+
+
+def afm_use_cpu_fft() -> bool:
+    """True → NumPy FFT (SPAMMM_AFM_CPU_FFT=1). Default False = gpyFFT."""
+    return AFM_CPU_FFT > 0
+
+
+class AFMBench:
+    """Segmented wall-clock timer for ModularAFMPipeline.
+
+    SPAMMM_AFM_BENCH=0 → off
+    SPAMMM_AFM_BENCH=1 → summary table at stage end (default, quiet)
+    SPAMMM_AFM_BENCH=2 → live >>/<< per segment + table
+    """
+    _inst = None
+
+    def __init__(self):
+        self.records = []
+        self._stack = []
+        self.t_run0 = None
+
+    @classmethod
+    def get(cls):
+        if cls._inst is None:
+            cls._inst = cls()
+        return cls._inst
+
+    @classmethod
+    def reset(cls):
+        cls._inst = cls()
+        return cls._inst
+
+    def start_run(self):
+        import time
+        self.t_run0 = time.perf_counter()
+        self.records.clear()
+        self._stack.clear()
+
+    def begin(self, name: str, where: str = 'CPU'):
+        if not afm_bench_enabled():
+            return
+        import time
+        if afm_bench_verbose():
+            print(f"[BENCH] >> {name}  ({where})", flush=True)
+        self._stack.append((name, where, time.perf_counter()))
+
+    def end(self, name: str = None):
+        if not afm_bench_enabled() or not self._stack:
+            return
+        import time
+        n, where, t0 = self._stack.pop()
+        if name is not None and name != n:
+            n = name
+        dt = time.perf_counter() - t0
+        self.records.append((n, where, dt))
+        if afm_bench_verbose():
+            print(f"[BENCH] << {n}  {where}  {dt:.3f}s", flush=True)
+
+    def add(self, name: str, where: str, seconds: float):
+        if afm_bench_enabled():
+            self.records.append((name, where, float(seconds)))
+            if afm_bench_verbose():
+                print(f"[BENCH] << {name}  {where}  {float(seconds):.3f}s", flush=True)
+
+    def report(self, title: str = 'AFM BENCH'):
+        if not afm_bench_enabled():
+            return
+        import time
+        total_wall = (time.perf_counter() - self.t_run0) if self.t_run0 is not None else sum(r[2] for r in self.records)
+        seg = sum(r[2] for r in self.records)
+        by_where = {}
+        for n, w, s in self.records:
+            by_where[w] = by_where.get(w, 0.0) + s
+        print(f"\n========== [{title}] ==========", flush=True)
+        print(f"{'segment':<42} {'where':<6} {'sec':>10} {'%wall':>7}", flush=True)
+        print('-' * 70, flush=True)
+        for n, w, s in self.records:
+            pct = 100.0 * s / total_wall if total_wall > 0 else 0.0
+            print(f"{n:<42} {w:<6} {s:10.4f} {pct:6.1f}%", flush=True)
+        print('-' * 70, flush=True)
+        print(f"{'SUM segments':<42} {'':6} {seg:10.4f} {100.0*seg/total_wall if total_wall else 0:6.1f}%", flush=True)
+        print(f"{'WALL total':<42} {'':6} {total_wall:10.4f} {100.0:6.1f}%", flush=True)
+        uncovered = total_wall - seg
+        print(f"{'UNCOVERED (outside timers)':<42} {'':6} {uncovered:10.4f} {100.0*uncovered/total_wall if total_wall else 0:6.1f}%", flush=True)
+        print("--- by where ---", flush=True)
+        for w, s in sorted(by_where.items(), key=lambda x: -x[1]):
+            print(f"  {w:<10} {s:10.4f}s  ({100.0*s/total_wall if total_wall else 0:5.1f}%)", flush=True)
+        print("================================\n", flush=True)
+        return {'wall': total_wall, 'segments': list(self.records), 'by_where': by_where, 'uncovered': uncovered}
+
+
 class AFMulator(OpenCLBase):
     """
     PyOpenCL AFM simulator (Phase 1: LJ/Morse + point charges).
@@ -109,11 +234,11 @@ class AFMulator(OpenCLBase):
             d = os.path.dirname(os.path.abspath(__file__))
             cl_src_dir = os.path.realpath(os.path.join(d,'..','..','kernels'))
         self.cl_src_dir = cl_src_dir
-        print(f"AFMulator: cl_src_dir={cl_src_dir}")
+        debug_print(2, f"AFMulator: cl_src_dir={cl_src_dir}")
         dev = self.ctx.devices[0]
         self._max_alloc = dev.get_info(cl.device_info.MAX_MEM_ALLOC_SIZE)
         self._global_mem = dev.get_info(cl.device_info.GLOBAL_MEM_SIZE)
-        print(f"AFMulator: device max_alloc={_bytes_to_gb(self._max_alloc):.3f} GB global_mem={_bytes_to_gb(self._global_mem):.3f} GB")
+        debug_print(2, f"AFMulator: device max_alloc={_bytes_to_gb(self._max_alloc):.3f} GB global_mem={_bytes_to_gb(self._global_mem):.3f} GB")
         # Build options: -DOPT_FIRE=0 for damped velocity (matches CPU), -DOPT_FIRE=1 for FIRE
         build_options = ['-D', f'OPT_FIRE={1 if use_fire else 0}']
         kernel_paths = [
@@ -122,9 +247,9 @@ class AFMulator(OpenCLBase):
             os.path.join(cl_src_dir, 'AFM.cl'),
             os.path.join(cl_src_dir, 'contact_surface.cl'),
         ]
-        print(f"AFMulator: compiling {kernel_paths}")
+        debug_print(2, f"AFMulator: compiling {kernel_paths}")
         self.load_program_multi(kernel_paths, build_options=build_options)
-        print(f"AFMulator: AFM.cl + contact_surface.cl compiled OK (use_fire={use_fire})")
+        debug_print(1, f"AFMulator: AFM.cl + contact_surface.cl compiled OK (use_fire={use_fire})")
         # State
         self.mol = self.elem_types = None
         self.atoms_arr = self.cLJs_arr = None
@@ -205,7 +330,7 @@ class AFMulator(OpenCLBase):
         self.fdbm_origin = np.asarray(origin, dtype=np.float32)
         self.fdbm_step   = float(step)
         self.fdbm_shape  = (nx, ny, nz)
-        print(f"AFMulator.setup_fdbm_grid: grid={nx}x{ny}x{nz}  step={step:.3f}  L=({Lx:.1f},{Ly:.1f},{Lz:.1f}) Ang")
+        debug_print(1, f"AFMulator.setup_fdbm_grid: grid={nx}x{ny}x{nz}  step={step:.3f}  L=({Lx:.1f},{Ly:.1f},{Lz:.1f}) Ang")
 
     def scan_fdbm(self, scan_xs, scan_ys, probe_heights, mol_z=0.0,
                   ppm_mode=True, use_fire=True,
@@ -320,7 +445,7 @@ class AFMulator(OpenCLBase):
         FEs_relax = FEs_h.reshape(nx_s, ny_s, nz_s, 4)[:, :, ::-1, :]
         disps_relax = disps_h.reshape(nx_s, ny_s, nz_s, 4)[:, :, ::-1, :]
         Fz = FEs_relax[:,:,:,2]
-        print(f"  AFMulator.scan_fdbm: Fz min={Fz.min():.4f}  max={Fz.max():.4f}  mean={Fz.mean():.4f} eV/Ang  ppm_mode={ppm_mode}")
+        debug_print(1, f"  AFMulator.scan_fdbm: Fz min={Fz.min():.4f}  max={Fz.max():.4f}  mean={Fz.mean():.4f} eV/Ang  ppm_mode={ppm_mode}")
         
         tip_disp = {
             'dx': disps_relax[..., 0],
@@ -1259,15 +1384,21 @@ class AFMulator(OpenCLBase):
         """
         import numpy as np
         import pyopencl as cl
+        from spammm.globals import debug_print
 
         nx, ny, nz = E_field.shape
-        print(f"AFMulator.compute_gradient_cl: grid={nx}x{ny}x{nz}, step={step}")
-        print(f"  Input E_field range: [{E_field.min():.6f}, {E_field.max():.6f}]")
+        debug_print(1, f"AFMulator.compute_gradient_cl: grid={nx}x{ny}x{nz}, step={step}")
+        # Avoid full-grid min/max scans on large FDBM grids (each pass ~10–20 ms)
 
-        # Create input image (copy E_field to GPU)
-        # Note: OpenCL images have z varying fastest, so we need shape (nz, ny, nx, 4)
-        E_cl = np.zeros((nz, ny, nx, 4), dtype=np.float32)
-        E_cl[:, :, :, 0] = E_field.transpose(2, 1, 0)  # (nx,ny,nz) -> (nz,ny,nx)
+        # Pack E into RGBA image host buffer (OpenCL image layout: shape (nz,ny,nx,4))
+        # Reuse staging arrays when grid size unchanged
+        need = (nz, ny, nx, 4)
+        if getattr(self, '_grad_E_host', None) is None or self._grad_E_host.shape != need:
+            self._grad_E_host = np.empty(need, dtype=np.float32)
+            self._grad_F_host = np.empty(need, dtype=np.float32)
+        E_cl = self._grad_E_host
+        E_cl[..., 0] = np.ascontiguousarray(E_field.transpose(2, 1, 0))
+        # kernel only reads .x — skip clearing unused channels (saves ~50 MB write)
         
         mf = cl.mem_flags
         fmt = cl.ImageFormat(cl.channel_order.RGBA, cl.channel_type.FLOAT)
@@ -1287,18 +1418,15 @@ class AFMulator(OpenCLBase):
         ls = (8, 8, 4)
         self.prg.gradient_central_diff(self.queue, gs, ls, self.img_E_in, self.img_F_out, np.float32(step))
 
-        # Read back results
-        # Output is (Fx, Fy, Fz, E) in .xyzw
-        F_cl = np.zeros((nz, ny, nx, 4), dtype=np.float32)
+        # Read back results — (Fx, Fy, Fz, E) in .xyzw
+        F_cl = self._grad_F_host
         cl.enqueue_copy(self.queue, F_cl, self.img_F_out, origin=origin, region=region)
+        self.queue.finish()
         
         # Transpose back to (nx, ny, nz, 4)
-        grads = F_cl.transpose(2, 1, 0, 3)
+        grads = np.ascontiguousarray(F_cl.transpose(2, 1, 0, 3))
         
-        print(f"AFMulator.compute_gradient_cl: done. grads shape={grads.shape}, range=[{grads.min():.4f},{grads.max():.4f}]")
-        print(f"  Output Fx range: [{grads[...,0].min():.6f}, {grads[...,0].max():.6f}]")
-        print(f"  Output Fy range: [{grads[...,1].min():.6f}, {grads[...,1].max():.6f}]")
-        print(f"  Output Fz range: [{grads[...,2].min():.6f}, {grads[...,2].max():.6f}]")
+        debug_print(2, f"AFMulator.compute_gradient_cl: done. grads shape={grads.shape}")
         return grads
 
     def compute_gradient_fft_cl(self, E_field, step, bAlloc=True, bDebug=True, debug_dir='./fft_debug'):
@@ -1321,7 +1449,7 @@ class AFMulator(OpenCLBase):
         import numpy as np
         import pyopencl as cl
         import pyopencl.array as cl_array
-        from . import clUtils as clu
+        from spammm.utils import clUtils as clu
         import matplotlib.pyplot as plt
         import os
         
@@ -1354,6 +1482,8 @@ class AFMulator(OpenCLBase):
         # Load gpyFFT
         clu.try_load_clFFT()
         FFT = clu.FFT
+        if FFT is None:
+            raise RuntimeError("gpyFFT required for compute_gradient_fft_cl but failed to load")
         
         # FFT requires complex buffers with reversed shape (nz, ny, nx)
         shape_fft = (nz, ny, nx)
@@ -1584,8 +1714,8 @@ def compute_df_amp(Fz, dz, amp=1.0):
         df -= wk * df_z
     return df.astype(np.float32)
 
-def fft_poisson(rho, step):
-    """FFT Poisson solver: V(r) from charge density rho(r) on uniform grid with spacing `step`."""
+def fft_poisson_cpu(rho, step):
+    """CPU NumPy FFT Poisson (parity / backup). V(r) from charge density rho(r)."""
     nx, ny, nz = rho.shape
     rho_k = np.fft.fftn(rho)
     kx = 2*np.pi * np.fft.fftfreq(nx, d=step)
@@ -1595,6 +1725,161 @@ def fft_poisson(rho, step):
     k2 = KX**2 + KY**2 + KZ**2;  k2[0,0,0] = 1.0
     V_k = 4.0*np.pi*COULOMB_CONST*rho_k / k2;  V_k[0,0,0] = 0.0
     return np.real(np.fft.ifftn(V_k)).astype(np.float32)
+
+
+# ── gpyFFT (clFFT) helpers for FDBM — same stack as GridFF ────────────────────
+_fdbm_fft_ctx = None
+
+class _FDBMGpyFFT:
+    """Reusable gpyFFT context for FDBM Poisson / convolution. Layout: host (nx,ny,nz), GPU (nz,ny,nx)."""
+    def __init__(self):
+        import pyopencl.array as cl_array
+        from spammm.utils import clUtils as clu
+        clu.try_load_clFFT()
+        if clu.FFT is None:
+            raise RuntimeError(
+                "gpyFFT/clFFT required for GPU FDBM FFT but failed to load. "
+                "Install gpyfft, or set SPAMMM_AFM_CPU_FFT=1 for explicit NumPy path."
+            )
+        self.FFT = clu.FFT
+        self.cl_array = cl_array
+        self.ctx, self.queue = clu.get_nvidia_device("nvidia")
+        if self.ctx is None:
+            raise RuntimeError(
+                "No NVIDIA OpenCL device for GPU FDBM FFT. "
+                "Set SPAMMM_AFM_CPU_FFT=1 for explicit NumPy path."
+            )
+        self._shape = None
+        self._buf_a = None
+        self._buf_b = None
+        self._nxyz = 1.0
+        self._KX = self._KY = self._KZ = None
+        self._k2_inv = None
+        self._k2_inv_cl = None  # GPU copy — avoid host get/set on every Poisson
+        self._poisson_scale = np.float32(4.0 * np.pi * COULOMB_CONST)
+        self._step = None
+        self._plan_a = None  # cached gpyFFT plans (recreate only when shape changes)
+        self._plan_b = None
+
+    @staticmethod
+    def is_fft_friendly(n):
+        n = int(n)
+        if n <= 0:
+            return False
+        for p in (2, 3, 5, 7):
+            while n % p == 0:
+                n //= p
+        return n == 1
+
+    @staticmethod
+    def round_fft_friendly(n, multiple=8):
+        """Round up to multiple of `multiple` with only prime factors 2,3,5,7 (clFFT)."""
+        n = int(((int(n) + multiple - 1) // multiple) * multiple)
+        while not _FDBMGpyFFT.is_fft_friendly(n):
+            n += multiple
+        return n
+
+    def ensure(self, shape, step=None):
+        nx, ny, nz = [int(x) for x in shape]
+        shape = (nx, ny, nz)
+        for dim, name in zip(shape, ('nx', 'ny', 'nz')):
+            if not self.is_fft_friendly(dim):
+                raise RuntimeError(
+                    f"GPU FDBM FFT: {name}={dim} not clFFT-friendly (prime factors must be 2,3,5,7 only). "
+                    f"Use ModularPipeline grid rounding, or set SPAMMM_AFM_CPU_FFT=1 for explicit NumPy."
+                )
+        shape_fft = (nz, ny, nx)
+        if self._shape != shape:
+            self._buf_a = self.cl_array.Array(self.queue, shape_fft, dtype=np.complex64)
+            self._buf_b = self.cl_array.Array(self.queue, shape_fft, dtype=np.complex64)
+            self._plan_a = self.FFT(self.ctx, self.queue, self._buf_a, axes=(0, 1, 2))
+            self._plan_b = self.FFT(self.ctx, self.queue, self._buf_b, axes=(0, 1, 2))
+            self._shape = shape
+            self._nxyz = float(nx * ny * nz)
+            self._step = None  # force k-grid rebuild
+        if step is not None and self._step != float(step):
+            self._step = float(step)
+            kx = 2.0 * np.pi * np.fft.fftfreq(nx, d=self._step)
+            ky = 2.0 * np.pi * np.fft.fftfreq(ny, d=self._step)
+            kz = 2.0 * np.pi * np.fft.fftfreq(nz, d=self._step)
+            KZ, KY, KX = np.meshgrid(kz, ky, kx, indexing='ij')
+            self._KX = KX.astype(np.float32)
+            self._KY = KY.astype(np.float32)
+            self._KZ = KZ.astype(np.float32)
+            k2 = self._KX**2 + self._KY**2 + self._KZ**2
+            k2[0, 0, 0] = 1.0
+            self._k2_inv = (1.0 / k2).astype(np.float32)
+            self._k2_inv[0, 0, 0] = 0.0
+            self._k2_inv_cl = self.cl_array.to_device(self.queue, self._k2_inv)
+
+    def _to_gpu_complex(self, buf, arr_xyz):
+        t = np.ascontiguousarray(np.asarray(arr_xyz, dtype=np.float32).transpose(2, 1, 0))
+        buf.set(t.astype(np.complex64))
+
+    def _from_gpu_real(self, buf):
+        # This gpyFFT build: ifft(fft(x)) ≈ x (no extra nxyz factor; do NOT divide).
+        c = buf.get()
+        out = c.real.astype(np.float32)
+        return np.ascontiguousarray(out.transpose(2, 1, 0))
+
+    def fft_forward(self, buf):
+        plan = self._plan_a if buf is self._buf_a else self._plan_b
+        event, = plan.enqueue(forward=True)
+        event.wait()
+
+    def fft_inverse(self, buf):
+        plan = self._plan_a if buf is self._buf_a else self._plan_b
+        event, = plan.enqueue(forward=False)
+        event.wait()
+
+    def poisson(self, rho, step):
+        self.ensure(rho.shape, step=step)
+        self._to_gpu_complex(self._buf_a, rho)
+        self.fft_forward(self._buf_a)
+        # k-space multiply on GPU (was: get → NumPy → set — ~100ms+ on large grids)
+        self._buf_a *= self._poisson_scale * self._k2_inv_cl
+        self._buf_a[0, 0, 0] = np.complex64(0)
+        self.fft_inverse(self._buf_a)
+        return self._from_gpu_real(self._buf_a)
+
+    def corr_conj(self, a, b):
+        """real(ifft(fft(a) * conj(fft(b)))) matching NumPy."""
+        self.ensure(a.shape)
+        self._to_gpu_complex(self._buf_a, a)
+        self._to_gpu_complex(self._buf_b, b)
+        self.fft_forward(self._buf_a)
+        self.fft_forward(self._buf_b)
+        self._buf_a *= self._buf_b.conj()
+        self.fft_inverse(self._buf_a)
+        return self._from_gpu_real(self._buf_a)
+
+    def conv(self, a, b):
+        """real(ifft(fft(a) * fft(b))) matching NumPy."""
+        self.ensure(a.shape)
+        self._to_gpu_complex(self._buf_a, a)
+        self._to_gpu_complex(self._buf_b, b)
+        self.fft_forward(self._buf_a)
+        self.fft_forward(self._buf_b)
+        self._buf_a *= self._buf_b
+        self.fft_inverse(self._buf_a)
+        return self._from_gpu_real(self._buf_a)
+
+
+def _get_fdbm_fft():
+    global _fdbm_fft_ctx
+    if _fdbm_fft_ctx is None:
+        _fdbm_fft_ctx = _FDBMGpyFFT()
+    return _fdbm_fft_ctx
+
+
+def fft_poisson(rho, step):
+    """FFT Poisson solver: V(r) from charge density rho(r).
+
+    Default: gpyFFT (GPU). Set SPAMMM_AFM_CPU_FFT=1 for NumPy (explicit; no silent fallback).
+    """
+    if afm_use_cpu_fft():
+        return fft_poisson_cpu(rho, step)
+    return _get_fdbm_fft().poisson(rho, step)
 
 def build_gaussian_tip(grid_shape, step, sigma):
     """Build normalized Gaussian tip density kernel with FFT wrap-around. Returns (nx,ny,nz) float64."""
@@ -2018,18 +2303,24 @@ PAULI_FITTED_DEFAULTS = {
     'pyscf_sto-3g': {'A': 1.15, 'beta': 0.36},  # fitted for pentacene atom 0, pySCF sto-3g, fit range 3.0-6.0 Å
 }
 
+def compute_pauli_overlap_cpu(rho_grid, rho_tip_total, step, tip_rolled=False):
+    """CPU NumPy Pauli overlap (parity / backup)."""
+    dV = step**3
+    overlap_raw = dV * np.real(np.fft.ifftn(np.fft.fftn(rho_grid) * np.conj(np.fft.fftn(rho_tip_total)))).astype(np.float32)
+    return np.clip(overlap_raw, 1e-30, None)
+
+
 def compute_pauli_overlap(rho_grid, rho_tip_total, step, tip_rolled=False):
     """Compute raw Pauli overlap via FFT cross-correlation (A=1, beta=1).
 
     overlap(R) = dV * IFFT(FFT(rho_grid) * conj(FFT(rho_tip)))
-    This is the pure density-density overlap integral at each tip position R.
-    Clipped to [1e-30, inf] to allow safe power-law scaling.
-
-    If tip_rolled=True the tip already has O at index (0,0,0).
-    Returns overlap_raw (nx,ny,nz) float32.
+    Default: gpyFFT. SPAMMM_AFM_CPU_FFT=1 → NumPy (explicit).
+    tip_rolled=True: tip already has O at index (0,0,0).
     """
     dV = step**3
-    overlap_raw = dV * np.real(np.fft.ifftn(np.fft.fftn(rho_grid) * np.conj(np.fft.fftn(rho_tip_total)))).astype(np.float32)
+    if afm_use_cpu_fft():
+        return compute_pauli_overlap_cpu(rho_grid, rho_tip_total, step, tip_rolled=tip_rolled)
+    overlap_raw = (dV * _get_fdbm_fft().corr_conj(rho_grid, rho_tip_total)).astype(np.float32)
     return np.clip(overlap_raw, 1e-30, None)
 
 
@@ -2064,18 +2355,8 @@ def compute_pauli_field(rho_grid, rho_tip_total, step, A_pauli=1.0, beta_pauli=1
     overlap_raw = compute_pauli_overlap(rho_grid, rho_tip_total, step, tip_rolled=tip_rolled)
     return scale_pauli_field(overlap_raw, step, A_pauli, beta_pauli)
 
-def compute_es_conv_field(V_ES, rho_tip_delta, step, tip_rolled=False, return_grads=True):
-    """Electrostatic energy from tip delta-density vs sample potential.
-
-    Physical cross-correlation: E(R)=∫ V(r) ρ_tip(r−R) dr.
-    Implemented as convolution with spatially reversed tip:
-      E = IFFT( FFT(V) * FFT(tip[::-1,::-1,::-1]) )
-    (equivalent to IFFT(FFT(V)*conj(FFT(tip))) up to origin convention).
-
-    tip_rolled=True: tip O already at (0,0,0); still reverse for cross-corr
-      (no-flip / conj-only looks like approaching CO from the wrong end).
-    tip_rolled=False: tip centered — reverse then roll origin to (0,0,0).
-    """
+def compute_es_conv_field_cpu(V_ES, rho_tip_delta, step, tip_rolled=False, return_grads=True):
+    """CPU NumPy ES convolution (parity / backup)."""
     dV = step**3
     nx_t, ny_t, nz_t = rho_tip_delta.shape
     flipped = rho_tip_delta[::-1, ::-1, ::-1]
@@ -2084,6 +2365,30 @@ def compute_es_conv_field(V_ES, rho_tip_delta, step, tip_rolled=False, return_gr
     else:
         tip_kernel = np.roll(np.roll(np.roll(flipped, -(nx_t // 2), axis=0), -(ny_t // 2), axis=1), -(nz_t // 2), axis=2)
     E_es = dV * np.real(np.fft.ifftn(np.fft.fftn(V_ES) * np.fft.fftn(tip_kernel))).astype(np.float32)
+    if return_grads:
+        grads = np.stack([np.gradient(E_es, step, axis=i) for i in range(3)], axis=-1)
+        return E_es, grads
+    return E_es
+
+
+def compute_es_conv_field(V_ES, rho_tip_delta, step, tip_rolled=False, return_grads=True):
+    """Electrostatic energy from tip delta-density vs sample potential.
+
+    Physical cross-correlation: E(R)=∫ V(r) ρ_tip(r−R) dr.
+    Implemented as convolution with spatially reversed tip:
+      E = IFFT( FFT(V) * FFT(tip[::-1,::-1,::-1]) )
+    Default: gpyFFT. SPAMMM_AFM_CPU_FFT=1 → NumPy (explicit).
+    """
+    if afm_use_cpu_fft():
+        return compute_es_conv_field_cpu(V_ES, rho_tip_delta, step, tip_rolled=tip_rolled, return_grads=return_grads)
+    dV = step**3
+    nx_t, ny_t, nz_t = rho_tip_delta.shape
+    flipped = rho_tip_delta[::-1, ::-1, ::-1]
+    if tip_rolled:
+        tip_kernel = flipped
+    else:
+        tip_kernel = np.roll(np.roll(np.roll(flipped, -(nx_t // 2), axis=0), -(ny_t // 2), axis=1), -(nz_t // 2), axis=2)
+    E_es = (dV * _get_fdbm_fft().conv(V_ES, tip_kernel)).astype(np.float32)
     if return_grads:
         grads = np.stack([np.gradient(E_es, step, axis=i) for i in range(3)], axis=-1)
         return E_es, grads
@@ -2196,7 +2501,7 @@ def project_single_atom(Z, rho_4x4, step, margin, fdata_basis_dir, use_tiled=Tru
 # Singleton AFMulator instance for dispersion computation
 _dispersion_afmulator = None
 
-def compute_dispersion_grid(atomPos, atomTypes, origin, step, ngrid, C6_atom_dict=None, C6_CO=30.0, RA=1.5, use_opencl=True, return_grads=True):
+def compute_dispersion_grid(atomPos, atomTypes, origin, step, ngrid, C6_atom_dict=None, C6_CO=30.0, RA=1.5, use_opencl=True, return_grads=True, afmulator=None):
     """
     Compute C6/r^6 dispersion energy grid for CO tip.
 
@@ -2211,6 +2516,7 @@ def compute_dispersion_grid(atomPos, atomTypes, origin, step, ngrid, C6_atom_dic
         RA: damping radius in Angstrom
         use_opencl: if True, use OpenCL GPU acceleration (default True)
         return_grads: if True, compute and return gradients (default True for backward compat)
+        afmulator: optional shared AFMulator (avoids re-compile in ModularPipeline)
 
     Returns:
         E_vdw: (nx, ny, nz) dispersion energy field
@@ -2222,26 +2528,29 @@ def compute_dispersion_grid(atomPos, atomTypes, origin, step, ngrid, C6_atom_dic
     # Use OpenCL version if requested
     if use_opencl:
         global _dispersion_afmulator
-        
-        # Check if we need to recreate (first run or molecule/grid changed)
-        need_recreate = _dispersion_afmulator is None
-        if not need_recreate and hasattr(_dispersion_afmulator, '_disp_n_atoms'):
-            # Recreate if atom count changed - avoid buffer size mismatches
-            need_recreate = _dispersion_afmulator._disp_n_atoms != len(atomPos)
-        
-        if need_recreate:
-            _dispersion_afmulator = AFMulator(use_morse=False, nloc=32)
-            _dispersion_afmulator.realloc_dispersion_buffers(len(atomPos))
-            _dispersion_afmulator._disp_n_atoms = len(atomPos)
+
+        if afmulator is not None:
+            if not hasattr(afmulator, '_disp_n_atoms') or afmulator._disp_n_atoms != len(atomPos):
+                afmulator.realloc_dispersion_buffers(len(atomPos))
+                afmulator._disp_n_atoms = len(atomPos)
+            disp_afm = afmulator
+        else:
+            need_recreate = _dispersion_afmulator is None
+            if not need_recreate and hasattr(_dispersion_afmulator, '_disp_n_atoms'):
+                need_recreate = _dispersion_afmulator._disp_n_atoms != len(atomPos)
+            if need_recreate:
+                _dispersion_afmulator = AFMulator(use_morse=False, nloc=32)
+                _dispersion_afmulator.realloc_dispersion_buffers(len(atomPos))
+                _dispersion_afmulator._disp_n_atoms = len(atomPos)
+            disp_afm = _dispersion_afmulator
 
         if return_grads:
-            return _dispersion_afmulator.compute_dispersion_grid_cl(
+            return disp_afm.compute_dispersion_grid_cl(
                 atomPos, atomTypes, origin, step, ngrid,
                 C6_atom_dict=C6_atom_dict, C6_CO=C6_CO, RA=RA, bAlloc=False, return_grads=True
             )
         else:
-            # Compute energy only (no gradient)
-            return _dispersion_afmulator.compute_dispersion_grid_cl(
+            return disp_afm.compute_dispersion_grid_cl(
                 atomPos, atomTypes, origin, step, ngrid,
                 C6_atom_dict=C6_atom_dict, C6_CO=C6_CO, RA=RA, bAlloc=False, return_grads=False
             )
