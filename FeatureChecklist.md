@@ -19,17 +19,20 @@
 - **Hybridization inference** — sp/sp2/sp3 from atom types, pi-orbital tracking
 - **PBC support** — `pbc_x`, `pbc_y` flags for periodic structures in editor
 
-### ⚠️ In Progress
-- **MOL2 loading** — data files exist in `data/mol/`, no test coverage
-- **AtomicGraph editing** — add/remove atom/bond/ring implemented, untested
-- **Ring detection** — `detect_rings()` implemented, untested
-- **Bond order / hybridization assignment** — no test, manual assignment only
+### ✅ Working (updated)
+- **AtomicGraph editing** — add/remove atom/bond/ring, 42 tests in `test_editing_ops.py`
+- **Ring detection** — `detect_rings()` implemented + tested
+- **KekuleSolver** — `KekulePure.py` multi-seed bond order solver, tested
+- **Electron pair placement** — `make_epair_geom` for sp/sp2/sp3, 9 molecules tested
+- **Fragment/bridge detection** — `test_fragmentation.py` passing
+- **PackedMolecule** — undo stack + clipboard, tested
+
+### ✅ Working (updated)
+- **PAH/zigzag ribbon builder** — zigzag graphene ribbon (3×3) with H passivation via `adjust_h()`, tested in `test_editing_ops.py`
 
 ### 🔲 Planned
-- **KekuleSolver** — automatic bond order assignment by minimization of bond-order constraint violation (perfect matching Kekulé structure). Currently no solver exists; bond orders are set manually via editor.
-- **PAH builder** — build polyaromatic hydrocarbon structures from hex tile composition (hex grid exists in `KekuleBackend`, but no high-level PAH/ribbon builder API)
-- **Graphene edge builder** — generate graphene nanoribbons with specific edge types (armchair, zigzag) and passivation patterns
-- **Graphene ribbon builder** — periodic ribbons with width/length control, edge passivation encoding (`PASSIVATION_ENCODING` exists but no ribbon generator)
+- **Pentagon/heptagon drawing** — extend hex grid to N-gon rings (5,7 membered). See `doc/ARCHITECTURE_ROADMAP.md` §9
+- **SMILES builder** — parse SMILES → AtomicGraph. See `doc/ARCHITECTURE_ROADMAP.md` §9
 
 ### 🔲 Planned — Port from FireCore (`web/molgui_webgpu/`, `web/common_js/`)
 - **Selection query system** — compile/select by element + neighbor-count constraints. Query syntax: `"C n{C}={2,3}"` selects carbons with 2 or 3 carbon neighbors; `"* deg={1}"` selects any atom with degree 1. Supports element wildcards (`*`), atom-type matching (`C_sp2`), set operations (replace/add/subtract). Source: `MoleculeSelection.js` (`compileSelectQuerySpec`, `applySelectQuery`).
@@ -61,16 +64,16 @@
 - **UFF NVE conservation** — shape mismatch `(5,3)` vs `(1,5,3)` — array broadcasting bug in MD code
 - **UFF non-bonded (LJ + Coulomb)** — implemented in `UFF.cl` + `nonbonded.cl`, not tested with `bDoNonBonded=True`
 - **SPFF relaxation** — test stub only, not implemented
-- **SPFF energy/forces standalone** — no test (works through `MolecularDynamics.py`)
 - **SPFF pi-pi interactions** — no dedicated test
 - **SPFF H-bond corrections** — no test
 - **MolecularDynamics FIRE** — implemented in `MolecularDynamics.py`, no test
 - **MolecularDynamics velocity Verlet** — implemented, no test
 - **MolecularDynamics multi-system** — buffer management exists, no test
-- **SPFF with pi-orbital rotation** — `getSPFFf4_rot` / `updateAtomsSPFFf4_rot` exist, untested; `updateAtomsSPFFf4` from UFF.cl shadows SPFF.cl version (fragile)
+- **SPFF with pi-orbital rotation** — `getSPFFf4_rot` / `updateAtomsSPFFf4_rot` exist, untested
+- **FAF substrate relaxation** — use ForcedAtomicFunction instead of GridFF for on-surface relaxation. See `doc/ARCHITECTURE_ROADMAP.md` §5
 
-### 🔲 Planned
-- **Charge Equilibration (QEq)** — CPU numpy implementation exists in `AFMulator.solve_QEq()` (`AFM.py:714`), using `Eaff`, `Ehard`, `Ra` from `ElementTypes.dat`. Needs: standalone module, GPU kernel, integration with force fields (UFF/SPFF charge assignment), test coverage.
+### ✅ Working (updated)
+- **QEq module** — `spammm/forcefields/QEq.py` + GUI extension (`QEqExtension.py`)
 - **RigidAtom forcefield (RRsp3)** — cluster-sorted rigid body dynamics with ARAP-style "ports" and PBD/Jacobi collisions with recoils. **Reference implementation in FireCore** (`pyBall/RigidAtomFF/RRsp3/`):
   - `RRsp3.cl` (1748 lines) — OpenCL kernels: `update_bboxes_rigid`, `build_local_topology_rigid`, `compute_collision_cluster_rigid`, `compute_ports_cluster_rigid`, `apply_corrections_rigid_ports`
   - `RRsp3.py` (42KB) — Python harness: buffer management, state upload/download, topology upload, solver execution
@@ -81,8 +84,9 @@
   - Also: `XPDB_new/` (experimental force+position based), `XPDB_legacy/` (deprecated simple PBD), `XPBD_2D/` (2D specialization)
   - Test scripts: convergence, momentum conservation, smoke, debug, Vispy GUI
   - **SPAMMM port status:** not started. Would extend `RigidBodyDynamics.py` with per-atom orientation parameters and cluster-sorted layout.
-- **Reactive forcefield** — bond-breaking/forming force field (e.g., ReaxFF-style or simplified reactive potential). No implementation. Would require dynamic topology updates in GPU kernels and bond order / dissociation energy terms.
+- **Reactive forcefield** — port from `NumericalMathPlayground/topics/ReactiveFF/`. Angular-dependent pair potential with per-atom quaternion orientation. See `doc/ARCHITECTURE_ROADMAP.md` §8
 - **SPFFL / LMMF** — linearized SPFF for fast assembly/placement without full relaxation. Exists in FireCore, not yet ported to SPAMMM.
+- **AABB collision relaxation** — projective/position-based with bounding boxes for multi-molecule clusters. See `doc/ARCHITECTURE_ROADMAP.md` §7
 
 ---
 
@@ -106,6 +110,7 @@
 - **GridFFRelaxedScan** — imports fixed, untested (relaxed PES scan: GridFF + SPFF + MD)
 - **SubstrateBuilder** — NaCl, CaF2 slab generation, no test
 - **Folded atomic functions** — `Surface_utils.py`, no test
+- **GridFF consolidation** — unify tricubic B-spline (4ch) vs trilinear (12ch). See `doc/ARCHITECTURE_ROADMAP.md` §6
 
 ### 🔲 Planned
 - **GridFF extensions** — precomputed grids, multi-species grids, additional GridFF utilities
@@ -130,6 +135,7 @@
 - **STM orbital projection** — `LCAO_STM.cl` kernel exists, no test
 - **STM DOS/LDOS** — no test
 - **Bond-resolved STM** — sampling STM at relaxed PP positions, no test
+- **Contact surface AFM** — `ContactSurface.py` with separable + PIC, 2 tests passing. Needs wiring into `AFMulator`
 
 ### 🔲 Planned
 - **Lateral force microscopy with dissipation** — LFM mode measuring lateral forces and energy dissipation during tip oscillation. No implementation. Would require: lateral force channel in scan, dissipation integration over oscillation cycle.
@@ -141,26 +147,30 @@
 
 ## 5. Rigid Body Dynamics
 
-### ⚠️ In Progress
-- **RigidBodyDynamics 6-DOF** — quaternion-based dynamics, `rigid.cl` kernel, implemented but untested
-- **Quaternion→matrix conversion** — `_quat_to_matrix_np` exists, untested
-- **RigidBodyAFM scanning** — `RigidBodyAFM.py`, scan_line/scan_grid/relax_to_constraint implemented, untested
-- **RigidBodyAFM anchor springs** — harmonic constraint on specific atoms, implemented, untested
-- **RigidBody folded basis** — `init_folded()` / `run_folded()` for folded atomic function surface interaction, implemented, untested
+### ✅ Working (updated)
+- **RigidBodyDynamics 6-DOF** — quaternion-based dynamics, `rigid.cl` kernel, 5 tests in `test_folded_relax.py`
+- **RigidBodyAFM anchor springs** — harmonic constraint on specific atoms, tested (manipulation H2O + PTCDA)
+- **RigidBody folded basis** — `init_folded()` / `run_folded()` for folded atomic function surface interaction, tested
+- **Folded basis relaxation + manipulation** — 5 tests, reference data system, trail plots
 
 ### 🔲 Planned
 - **Assembly collision** — `testplot_assembly.py` visual demo + XYZ/diag artifacts (`Assembly.py`, `AssemblyPlot.py`, `assembly.cl`); pytest L0 pending
+- **AABB collision relaxation** — projective/position-based with bounding boxes for multi-molecule clusters. See `doc/ARCHITECTURE_ROADMAP.md` §7
 
 ---
 
 ## 6. Quantum Backends
 
+### ✅ Working (updated)
+- **DFTB+ SCF** — `DFTBcore.py` ctypes wrapper, runs correctly (H2O E=-342 eV, benzene E=-1033 eV)
+- **DFTB+ density grid projection** — `Grid_dftb.py` + `LCAO_grid.cl`, electron count correct, density visualization works via `plot_density_projection.py`
+- **DFTB+ wfc parsing** — `DFTBplusParser.py`, active
+- **DFTB_utils subprocess runner** — `DFTB_utils.py`, imports fixed, tested via `test_hbond_scan.py`
+- **Z-scan reference curves** — 60 curves, 4 QM methods (dftb_mio, dftb_3ob, pyscf_pbe, pyscf_b3lyp)
+- **FDBM Pauli parameter fitting** — global log-log fit, A/β for mio-1-1, 3ob-3-1, pySCF
+
 ### ⚠️ In Progress
-- **DFTB+ SCF** — `DFTBcore.py` ctypes wrapper, runs (H2O E=-342 eV, benzene E=-1033 eV), but density projection produces empty slices
-- **DFTB+ density grid projection** — `Grid_dftb.py` + `LCAO_grid.cl`, electron count correct but visualization empty (grid layout issue)
-- **DFTB+ wfc parsing** — `DFTBplusParser.py`, no test
-- **pySCF density** — `pySCF_utils.py`, no test
-- **DFTB_utils subprocess runner** — `DFTB_utils.py`, imports fixed, no test
+- **pySCF backend** — `pySCF_utils.py` minimal, needs robust integration with custom modified pySCF. See `doc/ARCHITECTURE_ROADMAP.md` §2
 
 ### 🔲 Planned
 - **Fireball / OCL Hamiltonian** — OpenCL Hamiltonian assembly, CheFSI, OMM. May re-add if DFTB+ insufficient for STM accuracy.
@@ -173,9 +183,11 @@
 - **KekuleExplorerGUI** — VisPy + PyQt5 molecular editor, imports fixed, launch untested
 - **AFMExtension** — AFM panel with S1-S6 pipeline UI, imports fixed, untested
 - **VispyUtils AtomScene** — reusable 3D widget, implemented, untested
+- **MolecularBrowserVispy** — VisPy Phase 1 (thumbnail grid + 3D view), no plugin system yet
 
 ### 🔲 Planned
-- **MolecularBrowser VisPy port** — currently uses deprecated PyOpenGL, needs port to VisPy `AtomScene`
+- **Molecular browser plugin system** — port from FireCore `VispyMolBrowser.py` plugin architecture. See `doc/ARCHITECTURE_ROADMAP.md` §1
+- **3D viewer** — topology independent of hex grid
 
 ---
 
@@ -191,9 +203,17 @@
 - **No `pyproject.toml` / `setup.py`** — package not formally installable via pip
 - **Legacy `ocl_GridFF_new.py`** — partial import fixes, still has hardcoded `PYOPENCL_CTX` override
 
+### ✅ Working (updated)
+- **`spammm/globals.py`** — centralized verbosity: `DEBUG_PRINT_LEVEL`, `DEBUG_SAVE_LEVEL`, `DEBUG_PLOT_LEVEL`, `set_develop_mode()`
+- **Jacobi eigendecomposition** — `Lingebra_ocl.py` + `lingebra.cl`, 6 tests passing
+
+### ⚠️ In Progress
+- **GUI verbosity consolidation** — `globals.py` exists but 284 matches for `verbose`/`verbosity` across 44 files still use per-module state. See `doc/ARCHITECTURE_ROADMAP.md` §10
+
 ### 🔲 Planned
 - **Codon compilation** — compile core geometry/topology/assembly modules with Codon for performance (after core functionality stable)
 - **ManipulationTrajectory** — full manipulation trajectory recording and replay
+- **Presentation tools** — `html_pres.py` for LLM-generated HTML slides. See `doc/ARCHITECTURE_ROADMAP.md` §3
 
 ---
 
@@ -216,17 +236,17 @@
 
 | Category | ✅ Working | ⚠️ In Progress | 🔲 Planned | Total |
 |----------|-----------|----------------|------------|-------|
-| Topology & Editing | 8 | 4 | 12 | 24 |
-| Force Fields | 8 | 11 | 4 | 23 |
-| Surface Interactions | 8 | 8 | 2 | 18 |
-| SPM / AFM / STM | 6 | 6 | 4 | 16 |
-| Rigid Body Dynamics | 0 | 5 | 1 | 6 |
-| Quantum Backends | 0 | 5 | 1 | 6 |
-| GUI | 0 | 3 | 1 | 4 |
-| Infrastructure | 4 | 2 | 2 | 8 |
+| Topology & Editing | 14 | 2 | 8 | 24 |
+| Force Fields | 9 | 10 | 6 | 25 |
+| Surface Interactions | 8 | 9 | 2 | 19 |
+| SPM / AFM / STM | 7 | 6 | 4 | 17 |
+| Rigid Body Dynamics | 4 | 1 | 2 | 7 |
+| Quantum Backends | 7 | 1 | 1 | 9 |
+| GUI | 0 | 4 | 2 | 6 |
+| Infrastructure | 6 | 1 | 3 | 10 |
 | Integration | 0 | 3 | 3 | 6 |
 | Testing Strategy | 0 | 0 | 1 | 1 |
-| **Total** | **34** | **47** | **31** | **112** |
+| **Total** | **55** | **37** | **32** | **124** |
 
 ---
 

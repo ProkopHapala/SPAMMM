@@ -14,6 +14,9 @@ See `doc/TEST_DESIGN.md` for L0/L1/L2 review levels.
 | `testplot_fdbm_potentials.py` | visual | FDBM potential plots (Pauli, ES, dispersion) |
 | `testplot_fdbm_relax.py` | visual | FDBM + PP relaxation: Fz, df, tip displacement |
 | `testplot_afm_morse.py` | visual | Morse AFM energy/Fz/df maps |
+| `test_afm_contact_surface.py` | pytest | Contact-surface AFM: separable + PIC parity |
+| `testplot_afm_contact_surface.py` | visual | Contact-surface fit + PP relaxed scan |
+| `testplot_folded_rigid_diag.py` | visual | Folded basis rigid body relaxation diagnostics |
 | `testplot_zscan_reference.py` | visual | Z-scan reference curves |
 | `testplot_3ob_basis_tails.py` | visual | 3ob basis tail diagnostics |
 | `testplot_dftb_vs_pyscf_basis.py` | visual | DFTB vs PySCF basis comparison |

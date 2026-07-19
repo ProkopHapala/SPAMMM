@@ -155,7 +155,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `test_directory_navigator.py` — directory navigator tests
 - `test_thumbnail_cache.py` — thumbnail cache tests
 - `test_relax_serial.py` — serial relaxation
-- `test_integration.py` — integration test stubs
+- `test_integration.py` — (removed, stubs were never implemented)
 - `run_manipulation.py` — CLI relaxed scan, export .xyz movie (Class 2)
 - `ref_data/` — git-tracked reference files (`.ref.json`, `.ref.xyz`)
 - `helpers/` — test utility modules (`parity.py`, `geometry.py`, `scan.py`, `folded_rigid.py`, `topology_test.py`)

@@ -69,7 +69,7 @@ SPAMMM/
 │   ├── test_surface.py         # Ewald vs brute-force, GPU parity, visual scans
 │   ├── test_forcefield.py      # UFF/SPFF relaxation, energy conservation
 │   ├── test_afm.py             # AFM relaxation convergence, visual images
-│   ├── test_integration.py     # Relaxed scans (molecule on substrate)
+│   ├── (test_integration.py removed — stubs never implemented)
 │   ├── helpers/                # Shared test utilities
 │   │   ├── parity.py           # rmse, correlation, overlay_plot, assert_parity
 │   │   ├── geometry.py         # bond_lengths, bond_angle, planarity, distort

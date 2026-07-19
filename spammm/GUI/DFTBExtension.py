@@ -43,7 +43,7 @@ def _on_relax(window):
     QtWidgets.QApplication.processEvents()
 
     try:
-        E, forces, lvs = window.backend.run_relaxation(workdir='gui_relax')
+        E, forces, lvs = window.backend.run_relaxation(workdir='debug/gui_relax')
         msg = f"Relaxation done. E = {E:.4f} eV"
         window.statusBar().showMessage(msg)
         window.dftb_status_label.setText(f"Status: Done\nE = {E:.4f} eV")

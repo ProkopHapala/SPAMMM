@@ -1,12 +1,10 @@
-"""Diagnostic test: run long relaxation of H2O on NaCl and plot trajectory statistics.
+"""Diagnostic visual demo: run long relaxation of H2O on NaCl and plot trajectory statistics.
 
-Run: pytest tests/SPM/test_folded_rigid_diag.py -s --develop
-Or:  python tests/SPM/test_folded_rigid_diag.py
+Run: python tests/SPM/testplot_folded_rigid_diag.py
 """
 import os
 import sys
 import numpy as np
-import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO_ROOT)
@@ -19,8 +17,7 @@ MOL_PATH = os.path.join(REPO_ROOT, 'data', 'xyz', 'H2O.xyz')
 DEBUG_DIR = os.path.join(REPO_ROOT, 'debug', 'folded_rigid_diag')
 
 
-@pytest.mark.slow
-def test_relax_diag():
+def main():
     """Run 5000-step relaxation and save diagnostic plots."""
     os.makedirs(DEBUG_DIR, exist_ok=True)
     fit = load_fit(FIT_PATH)
@@ -48,10 +45,12 @@ def test_relax_diag():
     np.savez(npz_path, **recs)
     print(f"Data saved to {npz_path}")
 
-    # Assertions: energy should decrease, |F| should decrease
-    assert recs['E'][-1] < recs['E'][0], "Energy should decrease"
-    assert recs['Fmag'][-1] < recs['Fmag'][0] * 2, "Force should not grow"
+    # Sanity checks (not pytest assertions — this is a visual demo)
+    if recs['E'][-1] >= recs['E'][0]:
+        print(f"WARNING: Energy did not decrease ({recs['E'][0]:.6f} → {recs['E'][-1]:.6f})")
+    if recs['Fmag'][-1] >= recs['Fmag'][0] * 2:
+        print(f"WARNING: Force grew ({recs['Fmag'][0]:.6f} → {recs['Fmag'][-1]:.6f})")
 
 
 if __name__ == '__main__':
-    test_relax_diag()
+    main()

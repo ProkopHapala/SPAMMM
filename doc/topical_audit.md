@@ -93,8 +93,14 @@ This **is** a supplement to:
 
 ### 1f. Molecular Editor (GUI backend)
 - Hex-grid editing, passivation, ring ops — **not** the Kekule bond-order solver
-- **Key files:** `spammm/topology/MoleculeEditorBackend.py`, `spammm/GUI/SPAMMM_GUI.py` (`SPAMMMWindow`)
+- **Key files:** `spammm/topology/MoleculeEditorBackend.py`, `spammm/GUI/SPAMMM_GUI.py` (`SPAMMMWindow`), `spammm/GUI/EditModeHandlers.py`
 - **Legacy alias:** `KekuleExplorerWindow` → `SPAMMMWindow`
+- **Ring placement (3 modes, unified in `RingMode`):**
+  - **Edge ring** (`add_adjacent_ring`): n-gon sharing 1 existing bond as edge; side determined by mouse position
+  - **Corner ring** (`add_corner_ring`): n-gon sharing 2 existing bonds at an inner corner atom (angle < 180°); uses circumcircle through B-A-C, vector-math only (dot/cross products, no atan2); outer corners (>180°) fall through to edge/hex method; mouse direction selects which neighbor pair
+  - **Hex-grid ring** (`add_ring`): snap to hex grid center, creates hexagonal ring on grid
+  - Priority in RingMode: bond → corner atom → hex center
+- **Grid transforms:** transpose, flip X, flip Y — apply to both grid and atom geometry (`transform_atoms`)
 - **Tests:** `tests/topology/test_editing_ops.py`, `tests/test_export_import.py`
 
 ### 1g. Editors & GUI
@@ -233,7 +239,8 @@ no GUI integration yet.
 ## 6. GUI & Visualization
 
 - Main GUI: VisPy-based molecular editor with extension plugins
-- **Key files:** `spammm/GUI/SPAMMM_GUI.py`, `spammm/GUI/BaseGUI.py`, `spammm/GUI/GLGUI.py`, `spammm/GUI/VispyUtils.py`, `spammm/GUI/MoleculeViewer.py`, `spammm/GUI/MolecularBrowser.py`, `spammm/GUI/ExtensionManager.py`
+- **Key files:** `spammm/GUI/SPAMMM_GUI.py`, `spammm/GUI/BaseGUI.py`, `spammm/GUI/GLGUI.py`, `spammm/GUI/VispyUtils.py`, `spammm/GUI/MoleculeViewer.py`, `spammm/GUI/MolecularBrowser.py`, `spammm/GUI/ExtensionManager.py`, `spammm/GUI/EditModeHandlers.py`
+- **Edit modes:** Unified (atom/bond/hex/empty), Atom, Bond, Ring (edge+corner+hex), Hex (paint/toggle), pi, Select
 - **Extensions:** `KekuleExtension.py`, `AFMExtension.py`, `FFExtension.py`, `QEqExtension.py`, `VibrationExtension.py`
 - **Design docs:** [GUI.desing.md](GUI.desing.md), [GUI_FF_Relaxation.md](GUI_FF_Relaxation.md), [GUI_topology_edit.desing.md](GUI_topology_edit.desing.md)
 - **Audit Document:** [molecular_topology_editors.md](molecular_topology_editors.md), [gui_audit.md](gui_audit.md)

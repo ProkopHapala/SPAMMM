@@ -20,6 +20,7 @@ SPAMMM (Scanning Probe Accelerated Modeling of Microscopy and Manipulation) is a
 - Never reinvent functionality already implemented. Inventory fist, check the provided examples and references, base classs etc.
 - Never copy-paste between apps — extract to shared lib and include.
 - **Ask, don't guess** — when you encounter problem which where you are not sure, ask the user instead of trying to infer it.
+- **NEVER mark an issue as "fixed", "resolved", or "done" without explicit USER confirmation.** This applies to bug reports, task documents, ToDo items, and any status tracking. A code change is NOT proof of a fix. You must: (1) run a test or verification that demonstrates the fix, (2) show the result to the USER, (3) wait for USER confirmation before updating any status field. Violating this rule is considered a critical error. When in doubt, leave the status as "investigating" or "unverified".
 
 ## Debugging & Testing
 

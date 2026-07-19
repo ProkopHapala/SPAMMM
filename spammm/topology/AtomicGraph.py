@@ -87,7 +87,7 @@ class Bond:
 # ─── Ring ───────────────────────────────────────────────────────────────────
 
 class Ring:
-    __slots__ = ('atoms', 'bonds', 'cog', '_id', 'alive')
+    __slots__ = ('atoms', 'bonds', 'cog', 'radius', 'bbox_min', 'bbox_max', '_id', 'alive')
     _counter = 0
 
     def __init__(self, atoms, bonds):
@@ -102,6 +102,8 @@ class Ring:
         self.atoms = list(atoms)    # [Atom, ...] — ordered cyclically
         self.bonds = list(bonds)    # [Bond, ...] — ordered cyclically
         self.cog   = self._compute_cog()
+        self.radius = self._compute_radius()
+        self.bbox_min, self.bbox_max = self._compute_bbox()
 
     def _compute_cog(self):
         """Compute center of geometry as average of atom positions."""
@@ -111,6 +113,21 @@ class Ring:
             return np.zeros(3)
         positions = np.array([a.pos for a in alive_atoms])
         return np.mean(positions, axis=0)
+
+    def _compute_radius(self):
+        """Circumradius: max distance from cog to any alive atom."""
+        alive_atoms = [a for a in self.atoms if a.alive]
+        if not alive_atoms:
+            return 0.0
+        return max(np.linalg.norm(a.pos - self.cog) for a in alive_atoms)
+
+    def _compute_bbox(self):
+        """Axis-aligned bounding box (min, max) of alive atom positions."""
+        alive_atoms = [a for a in self.atoms if a.alive]
+        if not alive_atoms:
+            return np.zeros(3), np.zeros(3)
+        positions = np.array([a.pos for a in alive_atoms])
+        return positions.min(axis=0), positions.max(axis=0)
 
     def __repr__(self):
         status = "" if self.alive else "[DEAD]"
@@ -732,11 +749,22 @@ class AtomicGraph:
         return None
 
     def pick_ring(self, pos, radius=1.0):
-        """Find ring whose COG is within radius of position. Returns Ring or None."""
+        """Find ring whose COG is within radius of position. Returns Ring or None.
+        Uses ring's own circumradius as primary test, falls back to fixed radius for small rings."""
+        pos = np.asarray(pos)
+        best_ring = None
+        best_dist = float('inf')
         for ring in self.rings.values():
-            if ring.alive and np.linalg.norm(ring.cog - pos) < radius:
-                return ring
-        return None
+            if not ring.alive:
+                continue
+            d = np.linalg.norm(ring.cog - pos)
+            # Point is inside ring if within circumradius; also accept if within fixed radius of cog
+            if d < ring.radius or d < radius:
+                # Prefer the closest ring (smallest cog distance)
+                if d < best_dist:
+                    best_dist = d
+                    best_ring = ring
+        return best_ring
 
     def format_table(self, pos=False, neighbors=True, bond_orders=False, charge=False, hyb=True, alive_only=True):
         """Compact one-line-per-atom table for L1 agent review. uid elem [hyb npi] [neighs] [x y z]."""

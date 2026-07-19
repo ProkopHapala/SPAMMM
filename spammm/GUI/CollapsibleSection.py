@@ -1,25 +1,23 @@
 """
-CollapsibleSection.py — Animated foldable panel widget for PyQt5.
+CollapsibleSection.py — Foldable panel widget for PyQt5.
 
-Purpose: Provide a collapsible section widget with a header button that expands/
-contracts the content area with a smooth height animation. Used for organizing
-complex control panels into tidy sections.
+Purpose: Provide a collapsible section widget with a header button that
+instantly shows/hides the content area. Used for organizing complex
+control panels into tidy hierarchical sections.
 
 Key functionality:
   - Toggle button with arrow indicator (►/▼)
-  - Smooth height animation on expand/collapse
+  - Instant show/hide via setVisible — no animation, no delay
   - Content widget container (any QWidget can be added)
 
 Role in SPAMMM: UI component for AFMExtension and other panels that need
 many grouped controls (simulation params, rendering options, etc.).
+See doc/GUI.desing.md §Visual Design Principles.
 
 Usage:
     sec = CollapsibleSection("Fireball", parent=self)
     sec.setContent(some_widget)
     layout.addWidget(sec)
-
-The header is a toggle button (▶ / ▼) that shows/hides the content area
-with a short CSS-free height animation.
 """
 
 from PyQt5 import QtWidgets, QtCore, QtGui
@@ -30,7 +28,6 @@ class CollapsibleSection(QtWidgets.QWidget):
 
     def __init__(self, title: str, collapsed: bool = False, parent=None):
         super().__init__(parent)
-        self._anim_duration = 150   # ms
 
         # --- header button ---
         self._toggle = QtWidgets.QToolButton()
@@ -60,11 +57,6 @@ class CollapsibleSection(QtWidgets.QWidget):
         self._content_layout.setContentsMargins(4, 0, 0, 4)
         self._content_layout.setSpacing(2)
 
-        # --- animation ---
-        self._anim = QtCore.QPropertyAnimation(self._content, b"maximumHeight")
-        self._anim.setDuration(self._anim_duration)
-        self._anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad)
-
         # --- separator line ---
         line = QtWidgets.QFrame()
         line.setFrameShape(QtWidgets.QFrame.HLine)
@@ -79,7 +71,7 @@ class CollapsibleSection(QtWidgets.QWidget):
         outer.addWidget(line)
 
         if collapsed:
-            self._content.setMaximumHeight(0)
+            self._content.setVisible(False)
 
     def setContent(self, widget: QtWidgets.QWidget):
         """Set (or replace) the widget shown inside this section."""
@@ -94,18 +86,7 @@ class CollapsibleSection(QtWidgets.QWidget):
         self._toggle.setArrowType(
             QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow
         )
-        if checked:
-            # expanding: measure natural height first
-            self._content.setMaximumHeight(16777215)
-            target = self._content.sizeHint().height()
-            self._content.setMaximumHeight(0)
-            self._anim.setStartValue(0)
-            self._anim.setEndValue(target)
-        else:
-            current = self._content.height()
-            self._anim.setStartValue(current)
-            self._anim.setEndValue(0)
-        self._anim.start()
+        self._content.setVisible(checked)
 
     def is_open(self) -> bool:
         return self._toggle.isChecked()

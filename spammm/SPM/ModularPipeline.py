@@ -377,8 +377,8 @@ Hamiltonian = DFTB {{
             return rho_scf, rho_na, rho_diff
 
         print(f"\n[ModularPipeline] Projecting Stage 2 (density grids)...")
-        from spammm.DFTB.DFTBplusParser import parse_wfc_hsd, convert_wfc_to_species_list_ang
-        from spammm.DFTB import Grid_dftb as dg
+        from spammm.quantum.DFTB.DFTBplusParser import parse_wfc_hsd, convert_wfc_to_species_list_ang
+        from spammm.quantum.DFTB import Grid_dftb as dg
 
         # Grid parameters setup
         padding = self.margin + self.z_extra

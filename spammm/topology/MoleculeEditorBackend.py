@@ -832,6 +832,94 @@ class MoleculeEditorBackend:
             self.adjust_h()
         return new_atoms
 
+    @staticmethod
+    def compute_corner_ring_positions(atom, n_members=5, mouse_pos=None):
+        """Compute positions for n-gon ring sharing two bonds at a corner atom.
+
+        Ring path: B→A→C→new₁→...→newₙ₋₃→B where A is the corner atom,
+        B,C are heavy neighbors forming an inner corner (angle < 180°).
+        Uses circumcircle through B,A,C. Vector math only (dot/cross products),
+        no atan2 — same results as original angle-based method.
+
+        Returns (n,3) array [B,A,C,new₁,...,newₙ₋₃] or None if not applicable
+        (outer angle, <2 heavy neighbors, or collinear).
+        """
+        heavy = [n for n in atom.neighbors if n.alive and n.npi != -1]
+        if len(heavy) < 2: return None
+        pos_a = atom.pos[:2]
+        # --- Detection: pick neighbor pair whose inner bisector faces mouse ---
+        mouse_dir = None
+        if mouse_pos is not None:
+            md = np.array(mouse_pos[:2]) - pos_a
+            md_n = np.linalg.norm(md)
+            mouse_dir = md / md_n if md_n > 1e-6 else None
+        best_score, best_pair = -2.0, None
+        for i in range(len(heavy)):
+            for j in range(i + 1, len(heavy)):
+                vb = heavy[i].pos[:2] - pos_a; vc = heavy[j].pos[:2] - pos_a
+                vb_n = vb / (np.linalg.norm(vb) + 1e-10); vc_n = vc / (np.linalg.norm(vc) + 1e-10)
+                bisect = vb_n + vc_n; bn = np.linalg.norm(bisect)
+                if bn < 1e-6: continue  # ~180°, skip
+                bisect = bisect / bn
+                score = np.dot(bisect, mouse_dir) if mouse_dir is not None else bn
+                if score > best_score: best_score, best_pair = score, (heavy[i], heavy[j])
+        if best_pair is None or best_score < 0: return None  # outer angle or no valid pair
+        B, C = best_pair
+        pos_b, pos_c = B.pos[:2], C.pos[:2]
+        # --- Geometry: circumcircle through B, A, C ---
+        ax, ay = pos_a; bx, by = pos_b; cx, cy = pos_c
+        D = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+        if abs(D) < 1e-10: return None  # collinear
+        ux = ((ax**2+ay**2)*(by-cy) + (bx**2+by**2)*(cy-ay) + (cx**2+cy**2)*(ay-by)) / D
+        uy = ((ax**2+ay**2)*(cx-bx) + (bx**2+by**2)*(ax-cx) + (cx**2+cy**2)*(bx-ax)) / D
+        center = np.array([ux, uy]); R = np.linalg.norm(pos_a - center)
+        # Unit vectors from center to each point
+        vB = (pos_b - center) / R; vA = (pos_a - center) / R; vC = (pos_c - center) / R
+        # Arc B→A→C (through A): angles via dot product, direction via cross product
+        cos_ba = np.clip(np.dot(vB, vA), -1, 1)
+        cos_ac = np.clip(np.dot(vA, vC), -1, 1)
+        theta_through_a = np.arccos(cos_ba) + np.arccos(cos_ac)
+        # Direction of B→A arc: cross product z-component (CCW=+1, CW=-1)
+        direction = 1.0 if (vB[0]*vA[1] - vB[1]*vA[0]) >= 0 else -1.0
+        # Remaining arc C→B (not through A): continue in SAME direction from C
+        remaining = 2*np.pi - theta_through_a
+        if remaining < 1e-6: return None
+        n_new = n_members - 3
+        step = direction * remaining / (n_new + 1)
+        # Place new atoms by rotation from C (same direction as B→A→C arc)
+        cos_s, sin_s = np.cos(step), np.sin(step)
+        v = vC.copy()
+        verts = [np.array([pos_b[0], pos_b[1], 0.0]), np.array([pos_a[0], pos_a[1], 0.0]), np.array([pos_c[0], pos_c[1], 0.0])]
+        for _ in range(n_new):
+            v = np.array([cos_s*v[0] - sin_s*v[1], sin_s*v[0] + cos_s*v[1]])
+            verts.append(np.array([center[0] + R*v[0], center[1] + R*v[1], 0.0]))
+        return np.array(verts)
+
+    def add_corner_ring(self, atom, n_members=5, ename='C', mouse_pos=None):
+        """Create n-membered ring at a corner atom, sharing two existing bonds B-A and A-C.
+        New bonds: C→new₁→...→newₙ₋₃→B. Returns list of new Atom objects."""
+        verts = self.compute_corner_ring_positions(atom, n_members, mouse_pos)
+        if verts is None: return []
+        # Find B and C by position matching
+        heavy = [n for n in atom.neighbors if n.alive and n.npi != -1]
+        B = C = None
+        for n in heavy:
+            if np.linalg.norm(n.pos[:2] - verts[0][:2]) < 0.01: B = n
+            if np.linalg.norm(n.pos[:2] - verts[2][:2]) < 0.01: C = n
+        if B is None or C is None: return []
+        new_atoms = []
+        prev = C
+        for i in range(3, n_members):
+            a = self.graph.add_atom(verts[i], ename, elements.ELEMENT_DICT[ename][0], pin=None, parent=None, npi=1)
+            new_atoms.append(a)
+            self.graph.add_bond(prev, a)
+            prev = a
+        self.graph.add_bond(prev, B)  # close ring
+        self._rings_dirty = True
+        self._sync_sys()
+        if self.auto_h_cap: self.adjust_h()
+        return new_atoms
+
     def collapse_bond(self, bond, mouse_pos):
         """Collapse a bond by removing one atom and transferring its bonds to the other.
         
@@ -1228,6 +1316,20 @@ class MoleculeEditorBackend:
             if a.pin is not None:
                 a.pos[0] = a.pin[0]; a.pos[1] = a.pin[1]; a.pos[2] = 0.0
 
+    def transform_atoms(self, mode):
+        """Apply geometry transform to all atom positions in-place.
+        mode: 'transpose' (swap x,y), 'flip_x' (negate x), 'flip_y' (negate y).
+        Also transforms H atoms attached to heavy atoms."""
+        for a in self.graph.atoms.values():
+            if not a.alive: continue
+            if mode == 'transpose':
+                a.pos[0], a.pos[1] = a.pos[1], a.pos[0]
+            elif mode == 'flip_x':
+                a.pos[0] = -a.pos[0]
+            elif mode == 'flip_y':
+                a.pos[1] = -a.pos[1]
+        self._sync_sys()
+
     def reassign_pins(self):
         """Rebuild pin cache by snapping all alive heavy atoms to current grid.
         Call after grid transform changes. Atoms not near any grid node get pin=None."""
@@ -1269,7 +1371,7 @@ class MoleculeEditorBackend:
     
     def run_relaxation(self, workdir='kekule_relax', **kwargs):
         """Run DFTB+ geometry optimization on self.sys."""
-        from . import dftb_utils
+        from spammm.quantum import DFTB_utils as dftb_utils
         lvs = self.build_lattice_vectors()
         if len(self.sys.apos) == 0:
             raise ValueError("Cannot relax an empty system.")
@@ -1410,6 +1512,8 @@ class MoleculeEditorBackend:
                                     pin=None, parent=best_a, npi=-1)
                 a.charge = float(qs[i])
         self.graph.sync_neighbor_lists()
+        self._rings_dirty = True
+        self.detect_geometry_rings()  # detect rings immediately after load
         self._sync_sys()
 
     def get_xyz_string(self):

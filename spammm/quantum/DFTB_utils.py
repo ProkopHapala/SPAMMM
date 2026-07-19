@@ -620,7 +620,7 @@ def run_dftb_for_density(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz'
     """
     from multiprocessing import Process, Queue
     from spammm import atomicUtils as au
-    from spammm.DFTB.DFTBplusParser import parse_detailed_xml_custom, parse_eigenvec_bin_custom
+    from spammm.quantum.DFTB.DFTBplusParser import parse_detailed_xml_custom, parse_eigenvec_bin_custom
 
     os.makedirs(work_dir, exist_ok=True)
     xyz_path = os.path.join(work_dir, xyz_fname)
@@ -645,7 +645,7 @@ def run_dftb_for_density(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz'
             ret = os.system(f'{DFTB_EXE} > OUT 2> ERR')
             if ret != 0:
                 raise RuntimeError(f"DFTB+ failed in {work_dir}, see ERR file")
-            from spammm.DFTB.DFTBplusParser import parse_detailed_xml_custom, parse_eigenvec_bin_custom
+            from spammm.quantum.DFTB.DFTBplusParser import parse_detailed_xml_custom, parse_eigenvec_bin_custom
             geo   = parse_detailed_xml_custom('detailed.xml')
             evecs = parse_eigenvec_bin_custom('eigenvec.bin', geo['nstates'], geo['norb'])
             queue.put((geo, evecs))

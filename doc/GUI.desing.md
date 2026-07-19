@@ -1,5 +1,21 @@
 # SPAMMM GUI — Kekule Structure Explorer
 
+## Visual Design Principles
+
+This is **serious scientific software**, not a marketing webpage. The GUI must give the user great power to control everything, fitting hierarchical levels of deeper and deeper control into a limited-size window in an ergonomic way.
+
+**Screen space, user attention, and user time are limited resources. We must use them efficiently and not waste them on bullshit.**
+
+1. **Fast and snappy** — UI must respond instantly. No animations, no transitions, no multi-frame effects. Show/hide is `setVisible(True/False)`, period. If something can be done in 0 ms, do it in 0 ms.
+2. **Minimalist** — No decoration, no margins, no padding, no rounded corners, no gradients, no shadows. Every pixel must earn its place by carrying information or enabling control. Qt default styles are already too bloated — strip them where possible.
+3. **Highly informative** — The user must see all relevant state at a glance: cache status, dirty flags, numerical ranges, error messages. Status labels and diagnostic output are first-class citizens, not afterthoughts.
+4. **Hierarchical control** — Collapsible sections give access to deeper levels of control without cluttering the default view. Common operations are visible; advanced parameters are one click away. The hierarchy is: main buttons → parameters → visualization → advanced/diagnostics.
+5. **No wasted space** — Side panel is fixed-width, wrapped in a `QScrollArea`. Expanding sections scrolls, never resizes the window. Compact spacing, no empty gaps, no unnecessary group box borders.
+6. **No bullshit** — No tooltips that state the obvious. No confirmation dialogs for reversible actions. No progress bars for sub-second operations. No "welcome" screens. The user is a scientist who knows what they want.
+8. **Keyboard-first** — Mouse is for the 3D viewport. Side panel controls should be reachable via keyboard (Tab navigation, Enter to apply). Shortcuts for frequent operations.
+
+---
+
 ## Overview
 
 Interactive molecular editor for designing carbon-based nanostructures (graphene, nanoribbons, functionalized edges, 2D heterostructures). Built on PyQt5 + Vispy, with a hexagonal grid for graphene-like scaffolding and a real-time 3D viewport.

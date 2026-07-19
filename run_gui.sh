@@ -3,6 +3,8 @@
 #
 # Usage:
 #   ./run_gui.sh                    # Launch with defaults (output → <repo>/output)
+#   ./run_gui.sh -m data/xyz/benzene.xyz  # Launch with molecule loaded
+#   ./run_gui.sh -d /path/to/mols   # Set working dir for save/load dialogs
 #   ./run_gui.sh -o /tmp/myimgs     # Custom output directory
 #   ./run_gui.sh -v 3               # Max verbosity
 #   ./run_gui.sh -f /path/to/Fdata  # Custom Fdata path

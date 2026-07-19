@@ -329,37 +329,150 @@ class BondMode(EditModeHandler):
 # ── Ring mode ───────────────────────────────────────────────────────────────
 
 class RingMode(EditModeHandler):
-    status_msg = "LMB: Add n-gon ring on bond | RMB: Delete bond | Numpad +/-: Ring size | Scroll: Zoom"
+    status_msg = "LMB: Add ring on bond/corner/hex | RMB: Delete bond/atom/ring | Numpad +/-: Ring size"
     lock_drag = True
     ring_size_visible = True
 
+    def _pick_hex(self, p_world):
+        """Return (q,r) if near a hex center, else None."""
+        if not hasattr(self.backend, 'snap_to_ring'): return None
+        q, r = self.backend.snap_to_ring(p_world[0], p_world[1])
+        ring_nodes = self.backend.grid.ring_nodes(q, r)
+        from spammm.topology.HexGrid import snap_to_grid
+        center = np.mean([snap_to_grid(n)[:2] for n in ring_nodes], axis=0)
+        if np.linalg.norm(center - p_world[:2]) < self.backend.a_CC * 0.5:
+            return (q, r)
+        return None
+
     def on_press(self, event, p_world, ctrl):
+        # 0. Existing ring → RMB delete whole ring (highest priority for RMB)
+        if event.button == 2:
+            self.backend.detect_geometry_rings()
+            hovered_ring = self.backend.pick_ring(p_world, radius=self.pick_radius)
+            if hovered_ring is not None:
+                atom_ids = [a._id for a in hovered_ring.atoms if a.alive]
+                self._push_undo()
+                self.backend.remove_atoms_by_id(atom_ids)
+                debug_print(2, f"Deleted ring {hovered_ring._id} ({len(atom_ids)} atoms)")
+                self._refresh()
+                return
+        # 1. Bond → edge ring (LMB) or delete bond (RMB)
         bond = self.backend.pick_bond(p_world, radius=self.pick_radius)
-        if bond is None: return
-        if event.button == 1:
+        if bond is not None:
+            if event.button == 1:
+                self._push_undo()
+                n = int(self.gui.ring_size_spinbox.value())
+                side = self.backend.compute_ring_side(bond, p_world)
+                new_atoms = self.backend.add_adjacent_ring(bond, n_members=n, ename=self.cur_atom_type, side=side)
+                debug_print(2, f"Added {n}-ring on bond {bond._id} side={side}, {len(new_atoms)} new atoms")
+                self._refresh()
+            elif event.button == 2:
+                self._push_undo()
+                self.backend.delete_bond(bond)
+                debug_print(2, f"Deleted bond {bond._id}")
+                self._refresh()
+            return
+        # 2. Atom → corner ring (LMB inner angle) or delete atom (RMB)
+        atom = self.backend.pick_atom(p_world, radius=self.pick_radius)
+        if atom is not None:
+            if event.button == 1:
+                n = int(self.gui.ring_size_spinbox.value())
+                verts = self.backend.compute_corner_ring_positions(atom, n, p_world)
+                if verts is not None:
+                    self._push_undo()
+                    new_atoms = self.backend.add_corner_ring(atom, n_members=n, ename=self.cur_atom_type, mouse_pos=p_world)
+                    debug_print(2, f"Added {n}-ring at corner atom {atom._id}, {len(new_atoms)} new atoms")
+                    self._refresh()
+                    return
+            elif event.button == 2:
+                self._push_undo()
+                if ctrl:
+                    self.backend.remove_atom_with_bridge(atom._id)
+                    debug_print(2, f"Bridged atom {atom._id}")
+                else:
+                    self.backend.remove_atom_by_id(atom._id)
+                    debug_print(2, f"Deleted atom {atom._id}")
+                self._refresh()
+                return
+        # 3. Hex grid center → hex ring (LMB only)
+        hex_pos = self._pick_hex(p_world)
+        if hex_pos is not None and event.button == 1:
+            q, r = hex_pos
             self._push_undo()
-            n = int(self.gui.ring_size_spinbox.value())
-            side = self.backend.compute_ring_side(bond, p_world)
-            new_atoms = self.backend.add_adjacent_ring(bond, n_members=n, ename=self.cur_atom_type, side=side)
-            debug_print(2, f"Added {n}-ring on bond {bond._id} side={side}, {len(new_atoms)} new atoms")
-            self._refresh()
-        elif event.button == 2:
-            self._push_undo()
-            self.backend.delete_bond(bond)
-            debug_print(2, f"Deleted bond {bond._id}")
+            self.backend.add_ring(q, r)
+            debug_print(2, f"Added hex ring at ({q},{r})")
             self._refresh()
 
     def on_move(self, p_world, r0=None, rd=None):
+        n = int(self.gui.ring_size_spinbox.value())
+        # 0. Existing ring hover (yellow highlight) — check before bond/atom
+        self.backend.detect_geometry_rings()
+        hovered_ring = self.backend.pick_ring(p_world, radius=self.pick_radius)
+        if hovered_ring is not None:
+            alive_atoms = [a for a in hovered_ring.atoms if a.alive]
+            if not alive_atoms:
+                return
+            ring_pos = np.array([a.pos for a in alive_atoms] + [alive_atoms[0].pos], dtype=np.float32)
+            self.scene.hover_ring_lines.set_data(pos=ring_pos, color=(1.0, 0.9, 0.0, 0.4))
+            self.scene.hover_ring_lines.visible = True
+            cog_lines = []
+            for atom in hovered_ring.atoms:
+                if atom.alive:
+                    cog_lines.append(hovered_ring.cog)
+                    cog_lines.append(atom.pos)
+            cog_arr = np.array(cog_lines, dtype=np.float32) if cog_lines else np.zeros((0, 3), dtype=np.float32)
+            self.scene.hover_ring_markers.set_data(pos=cog_arr)
+            self.scene.hover_ring_markers.visible = True
+            self.scene.hover_ring_text.pos = hovered_ring.cog
+            self.scene.hover_ring_text.text = f"R{len(hovered_ring.atoms)}"
+            self.gui.statusBar().showMessage(f"Ring {hovered_ring._id} ({len(hovered_ring.atoms)} atoms) — RMB: Delete whole ring")
+            debug_print(3, f"Hovered ring: {hovered_ring} (n={len(hovered_ring.atoms)})")
+            # Hide ring preview (we're over an existing ring, not drawing)
+            self.scene.ring_preview_line.visible = False
+            self.gui.hover_markers.visible = False
+            return
+        # Hide ring hover visuals when not over a ring
+        self.scene.hover_ring_lines.visible = False
+        self.scene.hover_ring_markers.visible = False
+        self.scene.hover_ring_text.text = ''
+        # 1. Bond preview
         bond = self.backend.pick_bond(p_world, radius=0.5)
         if bond:
             self._hover_bond(bond)
             debug_print(3, f"Hovered bond: {bond}")
-            n = int(self.gui.ring_size_spinbox.value())
             side = self.backend.compute_ring_side(bond, p_world)
             verts = self.backend.compute_adjacent_ring_positions(bond, n, side)
             closed = np.vstack([verts, verts[:1]]).astype(np.float32)
             self.scene.ring_preview_line.set_data(pos=closed, color=(0.2, 0.8, 0.8, 0.6))
             self.scene.ring_preview_line.visible = True
+            return
+        # 2. Corner atom preview
+        atom = self.backend.pick_atom(p_world, radius=self.pick_radius)
+        if atom is not None:
+            verts = self.backend.compute_corner_ring_positions(atom, n, p_world)
+            if verts is not None:
+                self._hover_atom(atom)
+                closed = np.vstack([verts, verts[:1]]).astype(np.float32)
+                self.scene.ring_preview_line.set_data(pos=closed, color=(0.2, 0.8, 0.8, 0.6))
+                self.scene.ring_preview_line.visible = True
+                debug_print(3, f"Hovered corner atom: {atom._id} for {n}-ring")
+                return
+        # 3. Hex grid preview
+        hex_pos = self._pick_hex(p_world)
+        if hex_pos is not None:
+            q, r = hex_pos
+            from spammm.topology.HexGrid import snap_to_grid
+            ring_nodes = self.backend.grid.ring_nodes(q, r)
+            hover_pos = np.array([[snap_to_grid(nd)[0], snap_to_grid(nd)[1], -0.08] for nd in ring_nodes], dtype=np.float32)
+            closed = np.vstack([hover_pos, hover_pos[:1]]).astype(np.float32)
+            self.scene.ring_preview_line.set_data(pos=closed, color=(0.2, 0.8, 0.8, 0.6))
+            self.scene.ring_preview_line.visible = True
+            self.gui.hover_markers.set_data(pos=hover_pos, symbol='disc', edge_width=2, edge_color='orange', face_color='transparent', size=12)
+            self.gui.hover_markers.visible = True
+            debug_print(3, f"Hovered hex ({q},{r})")
+            return
+        self.scene.ring_preview_line.visible = False
+        self.gui.hover_markers.visible = False
 
 
 # ── Hex modes ───────────────────────────────────────────────────────────────

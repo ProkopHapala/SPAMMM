@@ -135,9 +135,11 @@ def _ensure_pipeline(window):
         reinit_keys = {'basis', 'step', 'margin', 'z_extra', 'scan_range', 'hmin', 'hmax', 'hstep'}
         needs_reinit = any(params[k] != prev.get(k) for k in reinit_keys)
         if not needs_reinit:
-            # Check geometry (by atom count + centroid hash)
+            # Check geometry — strong hash of all positions + element types
+            import hashlib
             prev_geom = window._afm_pipeline_geom_hash
-            cur_hash = (len(atomPos), round(float(atomPos[:,0].mean()), 4), round(float(atomPos[:,1].mean()), 4))
+            geom_bytes = atomPos.astype(np.float64).tobytes() + b''.join(e.encode() for e in enames)
+            cur_hash = hashlib.md5(geom_bytes).hexdigest()[:16]
             needs_reinit = (prev_geom != cur_hash)
 
     if needs_reinit:
@@ -159,7 +161,9 @@ def _ensure_pipeline(window):
             atomPos=atomPos, enames=enames,
         )
         window._afm_pipeline_params = params.copy()
-        window._afm_pipeline_geom_hash = (len(atomPos), round(float(atomPos[:,0].mean()), 4), round(float(atomPos[:,1].mean()), 4))
+        import hashlib
+        geom_bytes = atomPos.astype(np.float64).tobytes() + b''.join(e.encode() for e in enames)
+        window._afm_pipeline_geom_hash = hashlib.md5(geom_bytes).hexdigest()[:16]
         window._afm_dirty.mark_geometry_changed()  # Full cascade
 
     return window._afm_pipeline
@@ -401,6 +405,7 @@ def run_afm_full_pipeline(window):
 
         mid_z = float(pipe.heights[len(pipe.heights)//2])
         window.afm_z_height_spin.setValue(mid_z)
+        plot_afm_slice(window)  # Always show plot — setValue won't emit valueChanged if unchanged
 
         nz = df.shape[2]
         msg = f"Done [{dirty.status_str()}]  df=[{df.min():.2f},{df.max():.2f}]Hz  {nz} heights"
@@ -500,6 +505,7 @@ def run_afm_stage4(window):
         }
         mid_z = float(pipe.heights[len(pipe.heights)//2])
         window.afm_z_height_spin.setValue(mid_z)
+        plot_afm_slice(window)  # Always show plot — setValue won't emit valueChanged if unchanged
         _update_afm_status(window, f"Stage 4 done. [{window._afm_dirty.status_str()}]")
     except Exception as e:
         _update_afm_status(window, f"FAILED: {e}")

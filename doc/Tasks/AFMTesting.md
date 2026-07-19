@@ -231,6 +231,54 @@ These exercise the complete `ModularAFMPipeline` end-to-end.
 4. **Charge conservation** — ∫Δρ dV ≈ 0. Test: verify `project_density_grids` output integrates to ~0 (tolerance < 0.5 e).
 5. **Grid alignment for convolution** — Tip O-atom must be at grid origin for correct convolution shift. Test: verify Pauli overlap peaks at correct position.
 
+### Bug: FDBM Image Asymmetry (Observed in GUI)
+
+**Status:** Observed, not yet diagnosed. Coronene (D6h symmetry) produces asymmetric AFM df image.
+
+**Symptoms:** The df map for coronene should have 6-fold rotational symmetry, but the output image appears asymmetric. The molecule geometry itself is symmetric (confirmed by DFTB SCF converging with zero dipole).
+
+**Suspected causes (to test systematically):**
+
+1. **Grid misalignment between molecule density grid and CO tip grid:**
+   - Molecule grid (S2): `origin = [x_min, y_min, z_min]`, `ngrid` rounded to multiple of 8
+   - CO tip grid (S3): `origin = [-margin, -margin, -margin]`, separate `ngrid`
+   - If the two grids have different origins, step sizes, or ngrid, the FFT convolution may shift the tip relative to the sample incorrectly
+   - **Test:** Print both grid specs (origin, ngrid, step) and verify they are compatible for convolution. Check `_pad_and_roll_co_tip` alignment logic
+
+2. **CO tip axis misalignment (x/y vs z):**
+   - CO is linear: O at origin, C at z=1.13Å. The tip density should be symmetric in x-y plane
+   - If the CO.xyz file has atoms in wrong order or the grid centering shifts O off-center in x/y, the convolution kernel will be asymmetric
+   - **Test:** Verify `co_rho_total` is radially symmetric in x-y slices. Plot central x-y slice of CO tip density and check for asymmetry
+
+3. **`_pad_and_roll_co_tip` roll offset:**
+   - After padding, the O atom should be at index (0,0,0) for FFT convolution convention
+   - If the roll amount is wrong (off-by-one, or wrong axis), the tip will be shifted in the final image
+   - **Test:** Verify rolled CO tip has peak at (0,0,0). Compare with FireCore reference
+
+4. **Scan grid vs density grid origin mismatch:**
+   - Scan grid (`scan_xs`, `scan_ys`) is centered on molecule, but density grid origin is at corner
+   - If the interpolation from density grid to scan grid doesn't account for the origin offset, the image will be shifted
+   - **Test:** Verify scan grid coordinates map to correct density grid indices
+
+5. **FFT convolution circular wrap-around:**
+   - If density grid is not large enough, the FFT convolution wraps around and creates artifacts on one side
+   - **Test:** Check that density grid has sufficient padding (margin) around molecule. Compare with larger margin
+
+**Diagnostic tests to write:**
+
+| Test | What | How |
+|------|------|-----|
+| `test_co_tip_xy_symmetry` | CO tip density radially symmetric in x-y | Load cached `co_rho_total.npy`, compute radial profile, check deviation < 1% |
+| `test_fdbm_df_symmetry_coronene` | df map for coronene has 6-fold symmetry | Run pipeline on coronene, check `df[iz]` has 6-fold rotational symmetry (correlation with rotated copy > 0.99) |
+| `test_grid_alignment` | Molecule grid and CO tip grid compatible | Print both specs, verify step sizes match, origins compatible for convolution |
+| `test_pad_roll_correct` | After pad+roll, CO peak at (0,0,0) | Call `_pad_and_roll_co_tip`, check max at index 0 |
+
+**Files involved:**
+- `spammm/SPM/AFM_utils.py` — `_pad_and_roll_co_tip`, `_compute_co_tip_grid`, `_call_compute_co_tip_script`
+- `spammm/SPM/AFM.py` — `get_pauli_convolution`, `compute_es_conv_field`, `compute_fdbm_forcefield`
+- `spammm/SPM/ModularPipeline.py` — `stage3_potentials` (grid setup, CO tip loading)
+- `spammm/SPM/compute_co_tip.py` — CO tip density computation (grid centering)
+
 ### Debug Output Directory
 
 ```

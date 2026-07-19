@@ -1978,9 +1978,8 @@ def _call_compute_co_tip_script(out_dir, grid_spec, step, nscf, fdata_dir, fdata
     """
     import json, subprocess, sys
     _THIS_FILE = os.path.abspath(__file__)
-    # __file__ is spammm/OCL/AFM_utils.py; repo root is 2 levels up
-    repo_root = os.path.normpath(os.path.join(os.path.dirname(_THIS_FILE), '..', '..'))
-    script = os.path.join(repo_root, 'tests', 'tAFM', 'pyocl_fdbm', 'compute_co_tip.py')
+    # compute_co_tip.py is in the same directory as AFM_utils.py (spammm/SPM/)
+    script = os.path.join(os.path.dirname(_THIS_FILE), 'compute_co_tip.py')
 
     # Convert numpy arrays to lists for JSON serialization
     grid_spec_json = {k: (v.tolist() if hasattr(v, 'tolist') else v) for k, v in grid_spec.items()}

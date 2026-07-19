@@ -72,12 +72,13 @@ from spammm.GUI.CollapsibleSection import CollapsibleSection
 class SPAMMMWindow(BaseGUI):
     sig_geometry_changed = QtCore.pyqtSignal()  # Emitted whenever atom geometry changes
 
-    def __init__(self, output_dir=None, fdata_path=None, verbosity=None):
+    def __init__(self, output_dir=None, fdata_path=None, verbosity=None, work_dir=None):
         super().__init__("SPAMMM")
         self.resize(1024, 768)
 
         self.extensions = ExtensionManager()
         self.backend = MoleculeEditorBackend()
+        self.work_dir = work_dir or os.path.expanduser("~")
         self.cur_atom_type = 'C'
         self.edit_mode = 'Unified'  # 'Unified', 'Hex1' (paint), 'Hex2' (toggle), 'Atom', 'Bond', 'Ring', 'pi', 'Select'
         self.label_mode = 'Element+Index'
@@ -148,12 +149,11 @@ class SPAMMMWindow(BaseGUI):
         main_widget = QtWidgets.QWidget()
         main_layout = QtWidgets.QHBoxLayout(main_widget)
         
-        # Create side panel
-        side_panel = QtWidgets.QFrame()
-        side_panel.setFrameStyle(QtWidgets.QFrame.StyledPanel)
-        side_panel.setFixedWidth(280)
-        side_layout = QtWidgets.QVBoxLayout(side_panel)
+        # Create side panel content (inside a scroll area)
+        side_content = QtWidgets.QWidget()
+        side_layout = QtWidgets.QVBoxLayout(side_content)
         side_layout.setSpacing(1)
+        side_layout.setContentsMargins(0, 0, 0, 0)
         
         # Add sections
         side_layout.addWidget(self.create_editors_section())
@@ -162,8 +162,16 @@ class SPAMMMWindow(BaseGUI):
         self._build_extension_panels(side_layout)
         side_layout.addStretch()
         
+        # Wrap in scroll area so expanding sections doesn't resize the window
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(side_content)
+        scroll.setWidgetResizable(True)
+        scroll.setFixedWidth(300)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll.setFrameStyle(QtWidgets.QFrame.NoFrame)
+        
         # Add to main layout
-        main_layout.addWidget(side_panel)
+        main_layout.addWidget(scroll)
         main_layout.addWidget(self.scene.canvas.native)
         
         self.setCentralWidget(main_widget)
@@ -356,9 +364,12 @@ class SPAMMMWindow(BaseGUI):
         self.a_CC_spin = self.spinBox(1.42, 0.01, max_width=55, vmin=0.5, vmax=5.0, decimals=3)
         self.a_CC_spin.valueChanged.connect(self.set_a_CC)
         row1.addWidget(self.a_CC_spin)
-        self.grid_transpose_btn = self.button("Transpose", self.transpose_grid, layout=row1)
+        self.grid_transpose_btn = self.button("T-Grid", self.transpose_grid_only, layout=row1)
         self.grid_transpose_btn.setCheckable(True)
         self.grid_transpose_btn.setChecked(self.backend.grid.transpose)
+        self.button("T-All", self.transpose_grid, layout=row1)
+        self.button("Flip X", self.flip_x_geometry, layout=row1)
+        self.button("Flip Y", self.flip_y_geometry, layout=row1)
         layout.addLayout(row1)
 
         # Row 2: Rotate° | Offset unit checkbox
@@ -741,12 +752,41 @@ class SPAMMMWindow(BaseGUI):
         self.refresh_view()
         debug_print(2, f"a_CC = {value}")
 
-    def transpose_grid(self):
+    def transpose_grid_only(self):
+        """Transpose grid axes only (swap X/Y), without moving atoms."""
+        self._push_undo()
         self.backend.grid.toggle_transpose()
         self.grid_transpose_btn.setChecked(self.backend.grid.transpose)
         self.backend.reassign_pins()
         self.refresh_view()
-        debug_print(2, f"Grid transpose: {self.backend.grid.transpose}")
+        debug_print(2, f"Grid transpose (grid only): {self.backend.grid.transpose}")
+
+    def transpose_grid(self):
+        """Transpose grid axes AND transform atom geometry (swap X/Y for both)."""
+        self._push_undo()
+        self.backend.grid.toggle_transpose()
+        self.grid_transpose_btn.setChecked(self.backend.grid.transpose)
+        self.backend.transform_atoms('transpose')
+        self.backend.reassign_pins()
+        self.refresh_view()
+        self.sig_geometry_changed.emit()
+        debug_print(2, f"Grid transpose (grid+atoms): {self.backend.grid.transpose}")
+
+    def flip_x_geometry(self):
+        self._push_undo()
+        self.backend.transform_atoms('flip_x')
+        self.backend.reassign_pins()
+        self.refresh_view()
+        self.sig_geometry_changed.emit()
+        debug_print(2, "Flip X geometry")
+
+    def flip_y_geometry(self):
+        self._push_undo()
+        self.backend.transform_atoms('flip_y')
+        self.backend.reassign_pins()
+        self.refresh_view()
+        self.sig_geometry_changed.emit()
+        debug_print(2, "Flip Y geometry")
 
     def set_grid_rotation(self, degrees):
         self.backend.grid.set_rotation(np.radians(degrees))
@@ -1115,7 +1155,8 @@ class SPAMMMWindow(BaseGUI):
     def export_structure(self):
         """Export current structure to .xyz, .mol, or .mol2 file."""
         fname = self.fileDialog(mode="save", title="Export Structure",
-                                filter_str="Molecular Files (*.xyz *.mol *.mol2);;XYZ (*.xyz);;MOL (*.mol);;MOL2 (*.mol2)")
+                                filter_str="Molecular Files (*.xyz *.mol *.mol2);;XYZ (*.xyz);;MOL (*.mol);;MOL2 (*.mol2)",
+                                start_dir=self.work_dir)
         if fname:
             self.backend.save_structure(fname)
             self.statusBar().showMessage(f"Exported to {fname}")
@@ -1124,7 +1165,8 @@ class SPAMMMWindow(BaseGUI):
     def import_structure(self):
         """Import structure from .xyz, .mol, or .mol2 file."""
         fname = self.fileDialog(mode="open", title="Import Structure",
-                                filter_str="Molecular Files (*.xyz *.mol *.mol2);;XYZ (*.xyz);;MOL (*.mol);;MOL2 (*.mol2)")
+                                filter_str="Molecular Files (*.xyz *.mol *.mol2);;XYZ (*.xyz);;MOL (*.mol);;MOL2 (*.mol2)",
+                                start_dir=self.work_dir)
         if fname:
             self.backend.load_structure(fname)
             self.refresh_view()
@@ -1190,6 +1232,38 @@ class SPAMMMWindow(BaseGUI):
         else:
             self.debug_markers.visible = False
             self.debug_lines.visible = False
+
+        # 0.6. Debug view: ring COG + bounding circles for all detected rings
+        if self.debug_view_mode:
+            self.backend.detect_geometry_rings()
+            rings = self.backend.geometry_rings
+            if rings:
+                cog_pos = []
+                circle_segs = []
+                n_seg = 32
+                for ring in rings:
+                    if not ring.alive: continue
+                    cog_pos.append(ring.cog)
+                    # Draw bounding circle as line segments in xy plane
+                    z = 0.02
+                    for k in range(n_seg):
+                        a0 = 2 * np.pi * k / n_seg
+                        a1 = 2 * np.pi * (k + 1) / n_seg
+                        circle_segs.append([ring.cog[0] + ring.radius * np.cos(a0), ring.cog[1] + ring.radius * np.sin(a0), z])
+                        circle_segs.append([ring.cog[0] + ring.radius * np.cos(a1), ring.cog[1] + ring.radius * np.sin(a1), z])
+                if cog_pos:
+                    self.scene.hover_ring_markers.set_data(pos=np.array(cog_pos, dtype=np.float32), symbol='cross', edge_width=2, edge_color='yellow', face_color='yellow', size=10)
+                    self.scene.hover_ring_markers.visible = True
+                    if circle_segs:
+                        segs = np.array(circle_segs, dtype=np.float32)
+                        conn = np.zeros(len(segs), dtype=bool); conn[0::2] = True
+                        self.scene.hover_ring_lines.set_data(pos=segs, connect=conn, color=(1.0, 0.9, 0.0, 0.3), width=1.0)
+                        self.scene.hover_ring_lines.visible = True
+                    self.scene.hover_ring_text.text = ''
+                else:
+                    self.scene.hover_ring_markers.visible = False
+                    self.scene.hover_ring_lines.visible = False
+        # When debug_view_mode is off, ring visuals are managed by mode handlers (on_move)
 
         # 1. Use persistent sys directly
         sys = self.backend.sys
@@ -1306,13 +1380,20 @@ if __name__ == "__main__":
     parser.add_argument('--output-dir', '-o', type=str, default=None, help='Directory for saved images (default: <repo>/output)')
     parser.add_argument('--fdata-path', '-f', type=str, default=None, help='Path to Fdata directory')
     parser.add_argument('--verbosity', '-v', type=int, default=None, choices=[0, 1, 2, 3], help='Verbosity level 0-3 (default: 2)')
+    parser.add_argument('--mol', '-m', type=str, default=None, metavar='PATH', help='Molecule file to load on startup (.xyz/.mol/.mol2)')
+    parser.add_argument('--dir', '-d', type=str, default=None, metavar='PATH', help='Working directory for save/load dialogs')
     parser.add_argument('--script', '-s', type=str, default=None, metavar='PATH', help='GUI control script (must define run(window, argv)); args after -- go to script')
     args, script_argv = parser.parse_known_args()
 
     app = QtWidgets.QApplication(sys.argv)
-    window = SPAMMMWindow(output_dir=args.output_dir, fdata_path=args.fdata_path, verbosity=args.verbosity)
+    window = SPAMMMWindow(output_dir=args.output_dir, fdata_path=args.fdata_path, verbosity=args.verbosity, work_dir=args.dir)
     window.show()
     QtWidgets.QApplication.processEvents()
+    if args.mol:
+        window.backend.load_structure(args.mol)
+        window.refresh_view()
+        debug_print(2, f"Loaded molecule from CLI: {args.mol}")
+        QtWidgets.QApplication.processEvents()
     if args.script:
         from spammm.GUI.gui_script_runner import run_gui_script
         script_argv = list(script_argv)

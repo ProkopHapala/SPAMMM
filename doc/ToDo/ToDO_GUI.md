@@ -5,14 +5,18 @@
    - arbitrary shift?
    - Hex grid should be just guideline for drawing, tolology should not rely on it, atoms should be possible to place outside the grid
 
-- Export molecule with tpopology e.g. to .mol / mol2, later .pdb (we perhaps do not have implemented that yet)
-- Allow undo (Ctrl+Z) and redo (Ctrl+Y). How? 
+- [x] Export molecule with topology e.g. to .mol / mol2, later .pdb (implemented: .xyz, .mol, .mol2)
+- [x] Allow undo (Ctrl+Z) and redo (Ctrl+Y). How? 
    - Simplets is just keep in memroy few last topologies/geometries of the molecule
+   - Implemented: UndoStack with PackedMolecule snapshots, Ctrl+Z. Redo not yet.
 
-- We have bond-insert but we do not have creating bond between existing atoms?
-- Removing atoms still does not work reliably
+- [x] We have bond-insert but we do not have creating bond between existing atoms?
+   - Implemented: Ctrl+LMB drag in Atom mode creates bond between two atoms
+- [x] Removing atoms still does not work reliably
+   - Fixed: ID-based pipeline (Atom._id), soft-delete, no index shifting
 
-- Ctrl+C/Ctrl+Z direcly as .xyz or .mol
+- [x] Ctrl+C/Ctrl+Z direcly as .xyz or .mol
+   - Implemented: Ctrl+C copies PackedMolecule + puts .mol/.xyz text on Qt clipboard
 
 - Drawing pentagon, hepagon etc ?
 
@@ -42,7 +46,11 @@
 
 - Function to attach selected chemical group anywhere 
 
-- Define fragments, store it into fragment library, figgre out format for subrituting attachmetnd from the fragment library 
-  - easy when it is bonded by just one bond
-  - there can be also gridging groups and vicinal groups - like attaching ataracene to whatever
+- Define fragments, store into fragment library — see ARCHITECTURE_ROADMAP §11 for full design
+  - **1-terminal groups** (–OH, –NH₂, –CH₃, ...): hover over atom → preview → click to attach
+  - **2-terminal vicinal groups** (–CH=CH–, –N=N–, fused rings, ...):
+    - Edge attachment: hover over bond A–B → group bridges across (like edge ring)
+    - Corner attachment: hover over inner corner atom B (angle < 180°) → group spans A–C (like corner ring)
+  - Group library: JSON-based, extensible, with terminal atoms + bond mode (substitute/add)
+  - Interaction reuses Ring mode hover priority: bond → corner → atom
 

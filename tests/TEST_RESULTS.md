@@ -212,9 +212,9 @@ All `spammm.OCL.*` and `spammm.FireballOCL.*` imports corrected:
 
 ### Integration
 
-- [ ] **Relaxed scan H2O/NaCl** — [test_relaxed_scan_water_nacl](cci:1://file:///home/prokop/git/SPAMMM/tests/test_integration.py:10:0-16:8) ⚠️ stub
-- [ ] **Relaxed scan benzene/NaCl** — [test_relaxed_scan_benzene_nacl](cci:1://file:///home/prokop/git/SPAMMM/tests/test_integration.py:18:0-22:8) ⚠️ stub
-- [ ] **Visual relaxed scan** — [test_visual_relaxed_scan](cci:1://file:///home/prokop/git/SPAMMM/tests/test_integration.py:24:0-31:8) ⚠️ stub
+- [ ] **Relaxed scan H2O/NaCl** — no test (stub removed, TODO: implement)
+- [ ] **Relaxed scan benzene/NaCl** — no test (stub removed, TODO: implement)
+- [ ] **Visual relaxed scan** — no test (stub removed, TODO: implement)
 - [ ] **Full pipeline: molecule → relax → dock → AFM** — no test
 
 ### GUI
@@ -238,7 +238,7 @@ All `spammm.OCL.*` and `spammm.FireballOCL.*` imports corrected:
 3. **`test_nve_conservation`** — Shape mismatch `(5,3)` vs `(1,5,3)` — array broadcasting bug in MD code
 4. **Implement SPFF test stubs** in [test_forcefield.py](cci:7://file:///home/prokop/git/SPAMMM/tests/test_forcefield.py:0:0-0:0)
 5. **Implement AFM test stubs** in [test_afm.py](cci:7://file:///home/prokop/git/SPAMMM/tests/test_afm.py:0:0-0:0)
-6. **Implement integration test stubs** in [test_integration.py](cci:7://file:///home/prokop/git/SPAMMM/tests/test_integration.py:0:0-0:0)
+6. **Implement integration tests** — relaxed scan H2O/benzene on NaCl (stubs removed, need real implementation)
 
 ---
 
