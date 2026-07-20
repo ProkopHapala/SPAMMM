@@ -7,7 +7,8 @@ Generates:
   3. Log-scale plot for repulsive region
 
 Usage:
-  python tests/SPM/plot_zscan_reference.py [--outdir debug/zscan_plots]
+  python tests/SPM/testplot_zscan_reference.py [--outdir debug/zscan_plots]
+  python tests/SPM/testplot_zscan_reference.py --review-external
 """
 import os, sys, glob, json, re
 import numpy as np
@@ -29,6 +30,7 @@ METHOD_STYLES = {
     'dftb_3ob':    {'color': 'tab:orange','ls': '-',  'label': 'DFTB 3ob-3-1'},
     'pyscf_pbe':   {'color': 'tab:blue',  'ls': '--', 'label': 'pySCF PBE/6-31G*'},
     'pyscf_b3lyp': {'color': 'tab:green', 'ls': '--', 'label': 'pySCF B3LYP/6-31G*'},
+    'pyscf_gpu_pbe': {'color': 'tab:purple', 'ls': '-.', 'label': 'pySCF GPU PBE/def2-SVP'},
 }
 
 ATOM_COLORS = {'C': 'gray', 'O': 'red', 'H': 'white', 'N': 'blue'}
@@ -124,7 +126,7 @@ def plot_per_molecule(curves, outdir):
         plot_molecule_skeleton(mol, atom_names, atom_pos, all_target_indices, axes[0, 0])
         for col, site in enumerate(sites):
             ax = axes[0, col + 1]
-            for method_name in ['dftb_mio', 'dftb_3ob', 'pyscf_pbe', 'pyscf_b3lyp']:
+            for method_name in ['dftb_mio', 'dftb_3ob', 'pyscf_pbe', 'pyscf_b3lyp', 'pyscf_gpu_pbe']:
                 key = f'{mol}/{method_name}/{site}'
                 if key not in mol_curves:
                     continue
@@ -153,7 +155,7 @@ def plot_per_molecule(curves, outdir):
         plot_molecule_skeleton(mol, atom_names, atom_pos, all_target_indices, axes[0, 0])
         for col, site in enumerate(sites):
             ax = axes[0, col + 1]
-            for method_name in ['dftb_mio', 'dftb_3ob', 'pyscf_pbe', 'pyscf_b3lyp']:
+            for method_name in ['dftb_mio', 'dftb_3ob', 'pyscf_pbe', 'pyscf_b3lyp', 'pyscf_gpu_pbe']:
                 key = f'{mol}/{method_name}/{site}'
                 if key not in mol_curves:
                     continue
@@ -246,7 +248,7 @@ def plot_per_element_overlay(curves, outdir):
     """For each element (C, O, H, N): subplots per method, each showing all molecules.
     Line style per method, color per molecule."""
     elements = ['C', 'O', 'H', 'N']
-    method_order = ['dftb_mio', 'dftb_3ob', 'pyscf_pbe', 'pyscf_b3lyp']
+    method_order = ['dftb_mio', 'dftb_3ob', 'pyscf_pbe', 'pyscf_b3lyp', 'pyscf_gpu_pbe']
     mol_list = sorted(set(c['mol'] for c in curves.values()))
     mol_colors = {m: plt.cm.tab10(i / max(1, len(mol_list))) for i, m in enumerate(mol_list)}
     for elem in elements:
@@ -333,7 +335,7 @@ def plot_log_linear(curves, outdir):
     Generates per-method figures: each curve as log(E) vs z with linear fit in tail region.
     Also generates a per-element figure with subplots per method.
     """
-    method_order = ['dftb_mio', 'dftb_3ob', 'pyscf_pbe', 'pyscf_b3lyp']
+    method_order = ['dftb_mio', 'dftb_3ob', 'pyscf_pbe', 'pyscf_b3lyp', 'pyscf_gpu_pbe']
     mol_list = sorted(set(c['mol'] for c in curves.values()))
     mol_colors = {m: plt.cm.tab10(i / max(1, len(mol_list))) for i, m in enumerate(mol_list)}
 
@@ -441,11 +443,184 @@ def print_summary(curves):
     print(f"{'='*80}")
 
 
+# External Fukui CO-scan jobs (GPAW / pySCF short) — review for large-molecule refs
+PYSCF_CO_DIR = '/home/prokop/SIMULATIONS/Fukui_AFM/jobs_CO_scan_pyscf_short'
+GPAW_CO_DIR  = '/home/prokop/SIMULATIONS/Fukui_AFM/jobs_CO_scan_gpaw'
+
+
+def _parse_run_script_geometry(py_path):
+    """Parse tip/target geometry from a generated run_*.py job script."""
+    with open(py_path) as f:
+        txt = f.read()
+    m_idx = re.search(r'ATOM_IDX\s*=\s*(\d+)', txt)
+    m_str = re.search(r'MOL_ATOM_STR\s*=\s*"([^"]+)"', txt)
+    if not (m_idx and m_str):
+        return None
+    atoms = []
+    for part in m_str.group(1).split(';'):
+        p = part.strip().split()
+        if len(p) >= 4:
+            atoms.append((p[0], float(p[1]), float(p[2]), float(p[3])))
+    idx = int(m_idx.group(1))
+    ax, ay, az = atoms[idx][1], atoms[idx][2], atoms[idx][3]
+    # Tip C is always at (0,0,r) in these jobs (C-down); lateral offset to labeled atom
+    d_lat = float(np.hypot(ax, ay))
+    return {'atom_idx': idx, 'atom_xyz': (ax, ay, az), 'd_lat': d_lat, 'n_atoms': len(atoms)}
+
+
+def load_unique_pyscf_short_scans(root=PYSCF_CO_DIR):
+    """Load unique pySCF short CO-scan curves (dedupe identical E(z) within a molecule).
+
+    Returns list of dicts: mol, path, z, E_eV, Fz_eV_A, n_copies, d_lat_mean, tip_ok.
+    """
+    curves = []
+    res = os.path.join(root, 'results')
+    for mol_dir in sorted(glob.glob(os.path.join(res, 'CO_scan_*'))):
+        mol_tag = os.path.basename(mol_dir)  # e.g. CO_scan_PTCDA_PBE_def2-SVP
+        # molecule name between CO_scan_ and _PBE_
+        m = re.match(r'CO_scan_(.+)_PBE_', mol_tag)
+        mol = m.group(1) if m else mol_tag
+        by_hash = {}
+        for dat in sorted(glob.glob(os.path.join(mol_dir, '*_scan.dat'))):
+            data_lines = [l for l in open(dat) if l.strip() and not l.startswith('#')]
+            key = ''.join(data_lines)
+            by_hash.setdefault(key, []).append(dat)
+        # geometry from matching run scripts
+        d_lats = []
+        for py in glob.glob(os.path.join(root, f'run_{mol}_*.py')):
+            geo = _parse_run_script_geometry(py)
+            if geo:
+                d_lats.append(geo['d_lat'])
+        for copies in by_hash.values():
+            data = np.loadtxt(copies[0], comments='#')
+            if data.ndim == 1:
+                data = data.reshape(1, -1)
+            z = data[:, 0]
+            e_ev = data[:, 2] if data.shape[1] >= 3 else data[:, 1] * 27.2114
+            fz = -np.gradient(e_ev, z)
+            d_lat_mean = float(np.mean(d_lats)) if d_lats else float('nan')
+            tip_ok = bool(d_lats) and max(d_lats) < 0.05
+            curves.append({
+                'mol': mol, 'path': copies[0], 'n_copies': len(copies),
+                'z': z, 'E_eV': e_ev, 'Fz': fz,
+                'd_lat_mean': d_lat_mean, 'tip_ok': tip_ok,
+                'copy_names': [os.path.basename(p) for p in copies],
+            })
+    return curves
+
+
+def inventory_gpaw_co_scans(root=GPAW_CO_DIR):
+    """Return list of (mol, site, n_r_ok, co_bytes, status) for GPAW CO-scan results."""
+    rows = []
+    res = os.path.join(root, 'results')
+    for mol_dir in sorted(glob.glob(os.path.join(res, 'CO_scan_*'))):
+        mol = os.path.basename(mol_dir)
+        # group by site prefix before _mol/_CO/_r
+        sites = {}
+        for f in os.listdir(mol_dir):
+            m = re.match(r'(.+?)_(mol|CO|r[\d.]+)\.txt$', f)
+            if not m:
+                continue
+            sites.setdefault(m.group(1), []).append(f)
+        for site, files in sorted(sites.items()):
+            co_b = next((os.path.getsize(os.path.join(mol_dir, f)) for f in files if f.endswith('_CO.txt')), 0)
+            r_ok = sum(1 for f in files if '_r' in f and os.path.getsize(os.path.join(mol_dir, f)) > 0)
+            status = 'OK' if (r_ok >= 5 and co_b > 0) else ('PARTIAL' if r_ok else 'FAIL')
+            rows.append({'mol': mol, 'site': site, 'n_r_ok': r_ok, 'co_bytes': co_b, 'status': status})
+    return rows
+
+
+def review_external_co_scans(outdir):
+    """L1/L2 review of Fukui GPAW + pySCF short CO-scan jobs → debug plots + .out."""
+    os.makedirs(outdir, exist_ok=True)
+    out_path = os.path.join(outdir, 'review.out')
+    lines = []
+    def log(s=''):
+        print(s); lines.append(s)
+
+    log('REVIEW: external CO-scan references (GPAW + pySCF short)')
+    log(f'GPAW dir:  {GPAW_CO_DIR}')
+    log(f'pySCF dir: {PYSCF_CO_DIR}')
+    log('')
+
+    # --- GPAW ---
+    gpaw_rows = inventory_gpaw_co_scans()
+    n_ok = sum(1 for r in gpaw_rows if r['status'] == 'OK')
+    log(f'GPAW sites: {len(gpaw_rows)}  OK={n_ok}  FAIL={len(gpaw_rows)-n_ok}')
+    for r in gpaw_rows:
+        log(f"  {r['status']:7} {r['mol']}/{r['site']}: r_ok={r['n_r_ok']} CO_bytes={r['co_bytes']}")
+    log('')
+    log('VERDICT GPAW: unusable — jobs OOM-killed; no complete E(z) scan files.')
+    log('')
+
+    # --- pySCF ---
+    curves = load_unique_pyscf_short_scans()
+    log(f'pySCF unique curves (after dedupe): {len(curves)}')
+    for c in curves:
+        mono = bool(np.all(np.diff(c['E_eV']) < 0))
+        log(f"  {c['mol']:12} n_copies={c['n_copies']:2d} tip_ok={c['tip_ok']} "
+            f"d_lat_mean={c['d_lat_mean']:.3f} Å  "
+            f"E[{c['E_eV'][0]:.3f}..{c['E_eV'][-1]:.3f}] eV  mono_dec={mono}  "
+            f"file={os.path.basename(c['path'])}")
+    log('')
+    n_tip_ok = sum(1 for c in curves if c['tip_ok'])
+    log(f'VERDICT pySCF: {len(curves)} molecules have scan.dat; only {n_tip_ok} have tip above labeled atom.')
+    log('  Tip geometry: C-down at xy=(0,0); molecule not recentered → site labels are duplicates.')
+    log('  Range: z=1.5–1.9 Å only (Pauli wall). Useful as one curve per molecule, NOT site-resolved.')
+    log('')
+
+    # --- Plots: unique E + Fz ---
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    for c in curves:
+        axes[0].plot(c['z'], c['E_eV'], 'o-', lw=1, ms=4, label=f"{c['mol']} (×{c['n_copies']})")
+        axes[1].plot(c['z'], c['Fz'], 'o-', lw=1, ms=4, label=c['mol'])
+    axes[0].set_xlabel('z (Å)'); axes[0].set_ylabel('E_int (eV)')
+    axes[0].set_title('pySCF PBE/def2-SVP CO short — E_int (unique)')
+    axes[0].legend(fontsize=7); axes[0].grid(True, alpha=0.3)
+    axes[1].set_xlabel('z (Å)'); axes[1].set_ylabel('Fz ≈ −dE/dz (eV/Å)')
+    axes[1].set_title('Numerical Fz (unique curves)')
+    axes[1].legend(fontsize=7); axes[1].grid(True, alpha=0.3)
+    fig.tight_layout()
+    p_all = os.path.join(outdir, 'pyscf_short_E_Fz_all.png')
+    fig.savefig(p_all, dpi=150); plt.close(fig)
+    log(f'REVIEW: {p_all}')
+
+    # Per-molecule panel (large ones emphasized)
+    large = [c for c in curves if c['mol'] in ('PTCDA', 'pentacene', 'pyridine', 'pyrrol')]
+    if large:
+        fig, axes = plt.subplots(len(large), 2, figsize=(10, 3.2 * len(large)), squeeze=False)
+        for i, c in enumerate(large):
+            axes[i, 0].plot(c['z'], c['E_eV'], 'bo-', lw=1.5)
+            axes[i, 0].set_ylabel('E_int (eV)'); axes[i, 0].set_title(f"{c['mol']} E  tip_ok={c['tip_ok']} d_lat={c['d_lat_mean']:.2f}")
+            axes[i, 0].grid(True, alpha=0.3)
+            axes[i, 1].plot(c['z'], c['Fz'], 'rs-', lw=1.5)
+            axes[i, 1].set_ylabel('Fz (eV/Å)'); axes[i, 1].set_title(f"{c['mol']} Fz  copies={c['n_copies']}")
+            axes[i, 1].grid(True, alpha=0.3)
+        axes[-1, 0].set_xlabel('z (Å)'); axes[-1, 1].set_xlabel('z (Å)')
+        fig.tight_layout()
+        p_large = os.path.join(outdir, 'pyscf_short_E_Fz_large.png')
+        fig.savefig(p_large, dpi=150); plt.close(fig)
+        log(f'REVIEW: {p_large}')
+
+    with open(out_path, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    log(f'REVIEW: {out_path}')
+    return curves
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='Plot E(z) reference curves')
     parser.add_argument('--outdir', default='debug/zscan_plots', help='Output directory')
+    parser.add_argument('--review-external', action='store_true',
+                        help='Review Fukui GPAW/pySCF CO-scan jobs → debug/co_scan_ref_review/')
     args = parser.parse_args()
+
+    if args.review_external:
+        outdir = os.path.join(_ROOT, 'debug', 'co_scan_ref_review')
+        review_external_co_scans(outdir)
+        return
+
     outdir = os.path.join(_ROOT, args.outdir)
     os.makedirs(outdir, exist_ok=True)
 

@@ -2513,12 +2513,16 @@ def pp_relax_2d_cl(afmulator, F_total, origin, step,
 # FDBM AFM field computation helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Pauli parameters fitted against Ez reference z-scans with Gaussian tip overlap (sigma=0.7 Å)
+# Pauli parameters fitted against Ez reference z-scans with **Gaussian tip** overlap (sigma=0.7 Å)
 # E_pauli = A_pauli * overlap_raw^beta_pauli
 # Fit method: global log-log linear regression over all curves pooled per method
 # Fit range: z = 1.7–2.3 Å above target atoms
 # Molecules: C2H4, CH2O, H2O, NH3, CH2NH, benzene, pyridine, pyrrole, PTCDA
 # See: tests/ref_data/Ez_FDBM/pauli_fit_results.json
+#
+# WARNING: these defaults are NOT for real tip densities (CO_O, H2O_O, …).
+# For cube/CO tips re-fit with AFM_utils._fit_pauli_powerlaw vs Kriging/DFT
+# (e.g. tests/SPM/testplot_kriging_vs_fdbm_cube.py --fit_pauli, z∈[1.5,2.0]).
 PAULI_FITTED_DEFAULTS = {
     'mio-1-1':    {'A': 155.33, 'beta': 1.5507},   # global log-log fit, R²=0.963, 120 points
     '3ob-3-1':    {'A': 124.84, 'beta': 1.4330},   # global log-log fit, R²=0.961, 120 points

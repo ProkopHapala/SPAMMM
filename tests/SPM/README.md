@@ -12,13 +12,17 @@ See `doc/TEST_DESIGN.md` for L0/L1/L2 review levels.
 | `test_afm_fdbm.py` | pytest | FDBM pipeline: DFTB SCF, density projection, relaxed scan |
 | `testplot_density_projection.py` | visual | DFTB+ density projection, 2D slices + `.cub` |
 | `testplot_fdbm_potentials.py` | visual | FDBM potential plots (Pauli, ES, dispersion) |
-| `testplot_fdbm_relax.py` | visual | FDBM + PP relaxation: Fz, df, tip displacement |
+| `testplot_fdbm_relax.py` | visual | FDBM + PP relaxation: Fz, df; **`--ptcda-stock-vs-sa`** → 8-height stock 3ob vs SA-prolonged |
 | `testplot_afm_morse.py` | visual | Morse AFM energy/Fz/df maps |
 | `test_afm_contact_surface.py` | pytest | Contact-surface AFM: separable + PIC parity |
 | `testplot_afm_contact_surface.py` | visual | Contact-surface fit + PP relaxed scan |
 | `testplot_folded_rigid_diag.py` | visual | Folded basis rigid body relaxation diagnostics |
 | `testplot_zscan_reference.py` | visual | Z-scan reference curves |
+| `extract_pauli_zscan.py` | visual | FDBM Pauli vs Ez (log); CO or Gaussian tip |
+| `compute_densities.py` | CLI | Cache ρ for z-scan / Pauli / SA fit |
 | `testplot_3ob_basis_tails.py` | visual | 3ob basis tail diagnostics |
 | `testplot_dftb_vs_pyscf_basis.py` | visual | DFTB vs PySCF basis comparison |
 
-Run visual demos: `python tests/SPM/testplot_fdbm_relax.py`
+Run visual demos: `python tests/SPM/testplot_fdbm_relax.py`  
+PTCDA stock vs SA: `SPAMMM_AFM_CPU_FFT=1 python tests/SPM/testplot_fdbm_relax.py --ptcda-stock-vs-sa`  
+Presentation artifacts: `FOR_PRESENTATION.md`, `debug/presentation.html`

@@ -222,3 +222,27 @@ centroid with a common half-width (shrunk to fit all grids).
 - Explore per-shell (s, p, d) independent ζ values instead of single ζ per element
 - Fit against 2D density maps, not just 1D z-profiles
 - Investigate analytical gradient-based optimization as alternative to SA
+
+## PTCDA campaign (2026-07-20)
+
+End-to-end on **PTCDA** using local pySCF GPU density (not Fukui GPAW paths):
+
+```bash
+python examples/density_comparison/optimize_basis.py \
+  --ref-rho debug/densities/rho_PTCDA_pyscf_gpu_pbe.npy \
+  --ref-meta debug/densities/rho_PTCDA_pyscf_gpu_pbe.meta.npz \
+  --xyz data/xyz/PTCDA.xyz --molecule PTCDA --n-iter 2000 \
+  --fit-lo 1.0 --fit-hi 2.5 --outdir debug/dftb_basis_sa_ptcda \
+  --project-density --compare-pauli --tip-mode co
+```
+
+| Result | Value / path |
+|--------|----------------|
+| SA obj | 18.1 → 0.79 (H,C,O) |
+| Params | `debug/dftb_basis_sa_ptcda/PTCDA_sa_params.json` |
+| Pauli CO-tip vs Ez | stock A=12.82 β=0.651; SA A=11.76 β=0.852 |
+| AFM images | `testplot_fdbm_relax.py --ptcda-stock-vs-sa` → `debug/fdbm_ptcda_stock_vs_sa/` |
+
+**stock** = multi-ζ **3ob-3-1**. **SA-prolonged** = Simulated Annealing Slater tails for projection only.
+
+Full report: `doc/Reports/PTCDA_FDBM_prolonged_basis.md`. Presentation: `FOR_PRESENTATION.md`.

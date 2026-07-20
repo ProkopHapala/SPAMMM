@@ -8,7 +8,7 @@ orchestration on top of AFM.py's pure physics.
 
 Key functionality:
   - Plotting: AFM frequency shift maps, tip trajectories, orbital densities
-  - Density providers: get_density_from_dftb(), get_density_from_pyscf()
+  - Density providers: get_density_from_dftb(), get_density_from_pyscf(), get_density_from_cube()
   - CO tip: _co_tip_cache_dir(), _compute_co_tip_subprocess()
   - FDBM helpers: fft_poisson(), compute_pauli_field(), compute_es_conv_field()
   - STM: compute_stm(), compute_bond_resolved_stm()
@@ -361,7 +361,8 @@ Hamiltonian = DFTB {{
 _ATOMIC_DM_CACHE = {}
 
 def get_density_from_pyscf(atomPos, atomTypes, grid_spec=None, step=0.1, margin=4.0, z_extra=6.0,
-                            basis='sto-3g', method='RHF', xc=None, verbosity=0):
+                            basis='sto-3g', method='RHF', xc=None, verbosity=0,
+                            skip_na=False, use_df=True, mf=None, dm=None):
     """Get density grids using pySCF for SCF and direct grid evaluation (CPU-based).
 
     This is the Phase 1 pySCF backend: uses pySCF's eval_ao/eval_rho on CPU.
@@ -376,6 +377,9 @@ def get_density_from_pyscf(atomPos, atomTypes, grid_spec=None, step=0.1, margin=
         method: 'RHF' or 'RKS' (DFT)
         xc: XC functional for DFT (e.g., 'lda,vwn', 'pbe')
         verbosity: pySCF verbosity level (0=silent)
+        skip_na: if True, skip ρ_NA / Δρ / V_ES (Pauli-only FDBM needs ρ_scf only)
+        use_df: density-fit SCF (much faster for PTCDA-scale)
+        mf, dm: optional precomputed mean-field + DM (skip SCF; use mf.mol for AO eval)
 
     Returns:
         dict with 'rho_scf', 'rho_na', 'rho_diff', 'V_ES', 'origin', 'ngrid', 'grid_spec',
@@ -399,113 +403,134 @@ def get_density_from_pyscf(atomPos, atomTypes, grid_spec=None, step=0.1, margin=
 
     t0 = time.time()
 
-    # Build pySCF molecule from atomPos (Angstrom) and enames
-    atom_list = [[enames[i], atomPos[i]] for i in range(len(enames))]
-    mol = gto.Mole()
-    mol.atom = atom_list
-    mol.basis = basis
-    mol.verbose = verbosity
-    mol.spin = 0
-    mol.charge = 0
-    mol.build()
-
-    # Run SCF
-    if method.upper() == 'RHF':
-        mf = scf.RHF(mol)
-    elif method.upper() == 'RKS':
-        mf = dft.RKS(mol)
-        if xc is not None:
-            mf.xc = xc
+    if mf is not None and dm is not None:
+        mol = mf.mol
+        eigvecs = getattr(mf, 'mo_coeff', None)
+        eigvals = getattr(mf, 'mo_energy', None)
+        t1 = time.time()
+        print(f"  [pySCF] Using precomputed SCF ({t1-t0:.3f}s), energy={float(mf.e_tot):.6f} Hartree")
     else:
-        raise ValueError(f"Unknown method: {method}. Use 'RHF' or 'RKS'.")
+        # Build pySCF molecule from atomPos (Angstrom) and enames
+        atom_list = [[enames[i], atomPos[i]] for i in range(len(enames))]
+        mol = gto.Mole()
+        mol.atom = atom_list
+        mol.basis = basis
+        mol.verbose = verbosity
+        mol.spin = 0
+        mol.charge = 0
+        mol.build()
 
-    mf.kernel()
-    dm = mf.make_rdm1()
-    eigvecs = mf.mo_coeff
-    eigvals = mf.mo_energy
+        # Run SCF
+        if method.upper() == 'RHF':
+            mf = scf.RHF(mol)
+        elif method.upper() == 'RKS':
+            mf = dft.RKS(mol)
+            if xc is not None:
+                mf.xc = xc
+        else:
+            raise ValueError(f"Unknown method: {method}. Use 'RHF' or 'RKS'.")
+        if use_df:
+            mf = mf.density_fit()
+        mf.kernel()
+        dm = mf.make_rdm1()
+        eigvecs = mf.mo_coeff
+        eigvals = mf.mo_energy
 
-    t1 = time.time()
-    print(f"  [pySCF] SCF converged in {t1-t0:.3f}s, energy={mf.e_tot:.6f} Hartree")
+        t1 = time.time()
+        print(f"  [pySCF] SCF converged in {t1-t0:.3f}s, energy={mf.e_tot:.6f} Hartree")
 
-    # Generate grid points from grid_spec
+    # Chunked density eval — full AO(npts×nao) for PTCDA/def2-SVP is ~20+ GB
     nx, ny, nz = ngrid
     origin_bohr = origin * BOHR_PER_ANGSTROM
     dA_bohr = np.array(grid_spec['dA']) * BOHR_PER_ANGSTROM
     dB_bohr = np.array(grid_spec['dB']) * BOHR_PER_ANGSTROM
     dC_bohr = np.array(grid_spec['dC']) * BOHR_PER_ANGSTROM
-
-    # Build flattened (N, 3) array of grid points in Bohr
-    ix = np.arange(nx)
-    iy = np.arange(ny)
-    iz = np.arange(nz)
-    mesh_ix, mesh_iy, mesh_iz = np.meshgrid(ix, iy, iz, indexing='ij')
-
-    # Vectorized grid point computation: r = origin + ix*dA + iy*dB + iz*dC
-    grid_points_bohr = (
-        origin_bohr +
-        mesh_ix[..., None] * dA_bohr +
-        mesh_iy[..., None] * dB_bohr +
-        mesh_iz[..., None] * dC_bohr
-    ).reshape(-1, 3)
-
-    # Evaluate SCF density on grid
-    ao = numint.eval_ao(mol, grid_points_bohr, deriv=0)
-    rho_flat = numint.eval_rho(mol, ao, dm, xctype='LDA')
-    rho_scf = rho_flat.reshape(nx, ny, nz).astype(np.float32)
-
+    npts = int(nx) * int(ny) * int(nz)
+    chunk = max(8192, min(65536, npts))  # ~0.2 GB AO at nao~460
+    rho_scf = np.empty(npts, dtype=np.float32)
+    print(f"  [pySCF] Density eval chunked: npts={npts} nao={mol.nao_nr()} chunk={chunk}")
+    for i0 in range(0, npts, chunk):
+        i1 = min(i0 + chunk, npts)
+        idx = np.arange(i0, i1)
+        ix = idx // (ny * nz)
+        rem = idx % (ny * nz)
+        iy = rem // nz
+        iz = rem % nz
+        pts = (origin_bohr + ix[:, None] * dA_bohr + iy[:, None] * dB_bohr + iz[:, None] * dC_bohr)
+        ao = numint.eval_ao(mol, pts, deriv=0)
+        rho_scf[i0:i1] = numint.eval_rho(mol, ao, dm, xctype='LDA').astype(np.float32)
+        if (i0 // chunk) % 20 == 0:
+            print(f"    … {i1}/{npts} ({100.0*i1/npts:.0f}%)")
+    rho_scf = rho_scf.reshape(nx, ny, nz)
     t2 = time.time()
-    print(f"  [pySCF] Density evaluation: {t2-t1:.3f}s for {len(grid_points_bohr)} points")
+    print(f"  [pySCF] Density evaluation: {t2-t1:.3f}s for {npts} points")
 
-    # Compute neutral atom density (rho_NA) by summing isolated atoms
-    rho_na = np.zeros_like(rho_scf)
+    if skip_na:
+        rho_na = np.zeros_like(rho_scf)
+        rho_diff = rho_scf.copy()
+        V_ES = None
+        cell_volume = step**3
+        print(f"  [pySCF] skip_na=True — ρ_NA / V_ES not computed (Pauli-only)")
+        print(f"  [pySCF CHARGE CHECK] q_scf={rho_scf.sum()*cell_volume:.3f}")
+    else:
+        # Compute neutral atom density (rho_NA) by summing isolated atoms
+        rho_na = np.zeros_like(rho_scf)
 
-    # Atomic numbers for determining spin
-    ATOMIC_NUMBERS = {'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'Ne': 10}
+        # Atomic numbers for determining spin
+        ATOMIC_NUMBERS = {'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'Ne': 10}
 
-    # Cache atomic density matrices per element to avoid re-running SCF
-    unique_elements = list(set(enames))
-    for elem in unique_elements:
-        if elem not in _ATOMIC_DM_CACHE:
-            # Determine spin for atom (odd electron count = doublet)
-            nelec = ATOMIC_NUMBERS.get(elem, 6)
-            spin = 1 if nelec % 2 == 1 else 0
-            # Run single-atom SCF and cache the density matrix
-            atm = gto.M(atom=f'{elem} 0 0 0', basis=basis, verbose=0, spin=spin)
-            atm.build()
-            mf_atm = scf.RHF(atm)
-            mf_atm.kernel()
-            dm_atm = mf_atm.make_rdm1()
-            _ATOMIC_DM_CACHE[elem] = (atm, dm_atm, spin)
+        # Cache atomic density matrices per element to avoid re-running SCF
+        unique_elements = list(set(enames))
+        for elem in unique_elements:
+            if elem not in _ATOMIC_DM_CACHE:
+                # Determine spin for atom (odd electron count = doublet)
+                nelec = ATOMIC_NUMBERS.get(elem, 6)
+                spin = 1 if nelec % 2 == 1 else 0
+                # Run single-atom SCF and cache the density matrix
+                atm = gto.M(atom=f'{elem} 0 0 0', basis=basis, verbose=0, spin=spin)
+                atm.build()
+                mf_atm = scf.RHF(atm)
+                mf_atm.kernel()
+                dm_atm = mf_atm.make_rdm1()
+                _ATOMIC_DM_CACHE[elem] = (atm, dm_atm, spin)
 
-    # Evaluate each atom's density at molecular positions
-    for i, (elem, pos) in enumerate(zip(enames, atomPos)):
-        atm_cache, dm_cache, spin = _ATOMIC_DM_CACHE[elem]
-        # Rebuild atom at molecular position with correct spin
-        atm_i = gto.M(atom=[[elem, pos]], basis=basis, verbose=0, spin=spin)
-        atm_i.build()
-        mf_i = scf.RHF(atm_i)
-        mf_i.kernel()
-        dm_i = mf_i.make_rdm1()
-        ao_i = numint.eval_ao(atm_i, grid_points_bohr, deriv=0)
-        rho_i = numint.eval_rho(atm_i, ao_i, dm_i, xctype='LDA')
-        rho_na += rho_i.reshape(nx, ny, nz)
+        # Chunked NA density (same grid walk)
+        for i, (elem, pos) in enumerate(zip(enames, atomPos)):
+            atm_cache, dm_cache, spin = _ATOMIC_DM_CACHE[elem]
+            atm_i = gto.M(atom=[[elem, pos]], basis=basis, verbose=0, spin=spin)
+            atm_i.build()
+            mf_i = scf.RHF(atm_i)
+            mf_i.kernel()
+            dm_i = mf_i.make_rdm1()
+            rho_i = np.empty(npts, dtype=np.float32)
+            for i0 in range(0, npts, chunk):
+                i1 = min(i0 + chunk, npts)
+                idx = np.arange(i0, i1)
+                ix = idx // (ny * nz)
+                rem = idx % (ny * nz)
+                iy = rem // nz
+                iz = rem % nz
+                pts = (origin_bohr + ix[:, None] * dA_bohr + iy[:, None] * dB_bohr + iz[:, None] * dC_bohr)
+                ao_i = numint.eval_ao(atm_i, pts, deriv=0)
+                rho_i[i0:i1] = numint.eval_rho(atm_i, ao_i, dm_i, xctype='LDA').astype(np.float32)
+            rho_na += rho_i.reshape(nx, ny, nz)
 
-    rho_na = rho_na.astype(np.float32)
+        rho_na = rho_na.astype(np.float32)
 
-    t3 = time.time()
-    print(f"  [pySCF] Neutral atom density: {t3-t2:.3f}s")
+        t3 = time.time()
+        print(f"  [pySCF] Neutral atom density: {t3-t2:.3f}s")
 
-    rho_diff = (rho_scf - rho_na).astype(np.float32)
+        rho_diff = (rho_scf - rho_na).astype(np.float32)
 
-    # Charge check (same as DFTB path)
-    cell_volume = step**3
-    q_scf = rho_scf.sum() * cell_volume
-    q_na = rho_na.sum() * cell_volume
-    q_diff_val = rho_diff.sum() * cell_volume
-    print(f"  [pySCF CHARGE CHECK] q_scf={q_scf:.3f}, q_na={q_na:.3f}, q_diff={q_diff_val:.6f}")
+        # Charge check (same as DFTB path)
+        cell_volume = step**3
+        q_scf = rho_scf.sum() * cell_volume
+        q_na = rho_na.sum() * cell_volume
+        q_diff_val = rho_diff.sum() * cell_volume
+        print(f"  [pySCF CHARGE CHECK] q_scf={q_scf:.3f}, q_na={q_na:.3f}, q_diff={q_diff_val:.6f}")
 
-    # Electrostatic potential from rho_diff
-    V_ES = afm.fft_poisson(rho_diff, step)
+        # Electrostatic potential from rho_diff
+        V_ES = afm.fft_poisson(rho_diff, step)
 
     print(f"  [pySCF] Total time: {time.time()-t0:.3f}s")
 
@@ -530,6 +555,614 @@ def get_density_from_pyscf(atomPos, atomTypes, grid_spec=None, step=0.1, margin=
         'orb_offsets': None,
         'atoms_dict': None,
         'projector': None
+    }
+
+
+# ── Cube density provider (Psi4 / Gaussian Dt) + Gaussian ρ_NA ────────────────
+BOHR_TO_ANG = 0.529177249
+ANG_TO_BOHR = 1.0 / BOHR_TO_ANG
+
+
+def soft_clamp_density(rho, rho_max):
+    """Smooth clamp: ρ_c = ρ_max * tanh(ρ/ρ_max). C¹, no hard cutoff (avoids FFT ringing).
+
+    Asymptotically ρ_c → ρ_max; for ρ ≪ ρ_max, ρ_c ≈ ρ.
+    """
+    rho = np.asarray(rho, dtype=np.float64)
+    rho_max = float(rho_max)
+    if rho_max <= 0:
+        raise ValueError(f'soft_clamp_density: rho_max must be > 0, got {rho_max}')
+    return (rho_max * np.tanh(rho / rho_max)).astype(np.float32)
+
+
+def prepare_delta_rho_clamped(rho_scf, rho_na, origin, step, atomPos, atomZ,
+                              rho_max=None, percentile=99.5, dV=None):
+    """Build ES-safe Δρ by soft-clamping nuclear spikes in ρ_scf — without double-counting.
+
+    Physics / algebra
+    -----------------
+    Raw Δρ = ρ_scf − ρ_NA has huge positive cores because Gaussian ρ_NA is much
+    smoother than the nuclear cusp. Those spikes are *core mismatch*, not valence
+    rearrangement relevant to AFM.
+
+    Naive "clamp SCF and add the removed charge to NA" **double-counts**:
+        ρ_c = clamp(ρ_scf),  Q_ex = ∫(ρ_scf−ρ_c)
+        Δρ ≟ ρ_c − (ρ_NA + Q_ex·g)  ⇒  ∫Δρ = ∫(ρ_scf−ρ_NA) − 2 Q_ex   ← wrong
+
+    Correct charge-conserving recipe used here:
+        1. ρ_c = soft_clamp(ρ_scf; ρ_max)          # smooth, C¹
+        2. Q_ex = ∫(ρ_scf − ρ_c) dV ≥ 0           # spike charge removed from grid
+        3. ρ_NA' = ρ_NA * (∫ρ_c / ∫ρ_NA)          # match NA to *clamped* total
+        4. Δρ = ρ_c − ρ_NA'                       # ⇒ ∫Δρ = 0 by construction
+
+    Interpretation: spike charge Q_ex is absorbed into unresolved nuclear/core
+    (not represented on the Δρ grid). Valence multipoles in Δρ are unchanged at
+    leading order; only the pathological nuclear cusps are removed.
+
+    Alternative (not implemented here): soft mask cores
+        Δρ = (ρ_scf−ρ_NA)·(1−m(r)) then monopole-strip — also valid.
+
+    Args:
+        rho_scf, rho_na: (nx,ny,nz) densities [e/Å³]
+        origin, step: grid
+        atomPos, atomZ: unused now (kept for Voronoi/per-atom extension)
+        rho_max: clamp scale [e/Å³]; default = percentile of ρ_scf
+        percentile: used if rho_max is None (default 99.5 → keeps valence, clips cores)
+        dV: voxel volume; default step³
+
+    Returns:
+        dict with rho_scf_clamped, rho_na_matched, rho_diff, rho_max, Q_excess, …
+    """
+    rho_scf = np.asarray(rho_scf, dtype=np.float64)
+    rho_na = np.asarray(rho_na, dtype=np.float64)
+    if np.ndim(step) == 0:
+        dV = float(step) ** 3 if dV is None else float(dV)
+    else:
+        dV = float(np.prod(step[:3])) if dV is None else float(dV)
+
+    if rho_max is None:
+        # percentile of positive density — cores sit in the extreme tail
+        pos = rho_scf[rho_scf > 0]
+        rho_max = float(np.percentile(pos, percentile)) if pos.size else 1.0
+
+    rho_c = soft_clamp_density(rho_scf, rho_max).astype(np.float64)
+    Q_scf = float(rho_scf.sum() * dV)
+    Q_c = float(rho_c.sum() * dV)
+    Q_ex = Q_scf - Q_c
+    Q_na = float(rho_na.sum() * dV)
+    if abs(Q_na) < 1e-30:
+        raise ValueError('prepare_delta_rho_clamped: ∫ρ_NA ≈ 0')
+    rho_na_m = rho_na * (Q_c / Q_na)
+    rho_diff = (rho_c - rho_na_m).astype(np.float32)
+    Q_diff = float(rho_diff.sum() * dV)
+
+    return {
+        'rho_scf_clamped': rho_c.astype(np.float32),
+        'rho_na_matched': rho_na_m.astype(np.float32),
+        'rho_diff': rho_diff,
+        'rho_max': float(rho_max),
+        'Q_scf': Q_scf,
+        'Q_clamped': Q_c,
+        'Q_excess': Q_ex,
+        'Q_na_matched': float(rho_na_m.sum() * dV),
+        'Q_diff': Q_diff,
+        'percentile': float(percentile),
+    }
+
+
+def make_gaussian_rho_na(atomPos, atomZ, origin, step, ngrid, sigma=0.5, rescale_to_q=None):
+    """Neutral-atom density as sum of spherical Gaussians centered on atoms.
+
+    Each atom Z contributes ∫ρ = Z (before optional rescale). Used for Δρ = ρ_scf − ρ_NA
+    so that ∫Δρ ≈ 0 (charge neutrality for FFT Poisson). Shape is not physical DFT NA —
+    only needs to cancel total charge and sit exactly on nuclear positions (ppafm-like
+    Rcore ≈ 0.5–0.7 Å).
+
+    Args:
+        atomPos: (natoms, 3) Angstrom — must match density grid frame
+        atomZ: (natoms,) nuclear charges (electrons per Gaussian)
+        origin: (3,) grid origin Angstrom
+        step: float isotropic spacing Angstrom (or (3,) — uses step[0] if array)
+        ngrid: (nx, ny, nz)
+        sigma: Gaussian width [Å] (default 0.5)
+        rescale_to_q: if set, scale ρ_NA so ∫ρ_NA = rescale_to_q (exact neutrality)
+
+    Returns:
+        rho_na: (nx, ny, nz) float32  e/Å³
+    """
+    atomPos = np.asarray(atomPos, dtype=np.float64)
+    atomZ = np.asarray(atomZ, dtype=np.float64).reshape(-1)
+    nx, ny, nz = [int(x) for x in ngrid]
+    if np.ndim(step) == 0:
+        dx = dy = dz = float(step)
+    else:
+        dx, dy, dz = float(step[0]), float(step[1]), float(step[2])
+    origin = np.asarray(origin, dtype=np.float64).ravel()[:3]
+    sigma = float(sigma)
+    if sigma <= 0:
+        raise ValueError(f"make_gaussian_rho_na: sigma must be > 0, got {sigma}")
+
+    xs = origin[0] + dx * np.arange(nx, dtype=np.float64)
+    ys = origin[1] + dy * np.arange(ny, dtype=np.float64)
+    zs = origin[2] + dz * np.arange(nz, dtype=np.float64)
+    # Broadcast: evaluate each atom with separable 1D Gaussians (exact for isotropic σ)
+    norm = 1.0 / ((2.0 * np.pi * sigma ** 2) ** 1.5)
+    inv2s2 = 1.0 / (2.0 * sigma ** 2)
+    rho_na = np.zeros((nx, ny, nz), dtype=np.float64)
+    for i in range(len(atomZ)):
+        Zi = float(atomZ[i])
+        if Zi == 0.0:
+            continue
+        px, py, pz = atomPos[i]
+        gx = np.exp(-(xs - px) ** 2 * inv2s2)
+        gy = np.exp(-(ys - py) ** 2 * inv2s2)
+        gz = np.exp(-(zs - pz) ** 2 * inv2s2)
+        # outer: gx[:,None,None] * gy[None,:,None] * gz[None,None,:]
+        rho_na += Zi * norm * gx[:, None, None] * gy[None, :, None] * gz[None, None, :]
+
+    dV = dx * dy * dz
+    q_na = float(rho_na.sum() * dV)
+    if rescale_to_q is not None and q_na != 0.0:
+        rho_na *= float(rescale_to_q) / q_na
+        q_na = float(rho_na.sum() * dV)
+    return rho_na.astype(np.float32)
+
+
+def get_density_from_cube(cube_path_or_dir, *, esp_path=None, sigma_na=0.5,
+                          rescale_na=True, use_esp_cube=False, verbosity=0):
+    """Load Dt.cube (+ optional ESP) → same dict as get_density_from_dftb_dense.
+
+    ρ_scf from Dt (e/a0³ → e/Å³). ρ_NA = sum of Gaussians on cube-header atoms
+    (σ=`sigma_na` Å, charge Z_i). ρ_diff = ρ_scf − ρ_NA with ∫ρ_diff forced ≈ 0
+    via rescale of ρ_NA to match ∫ρ_scf when `rescale_na=True`.
+
+    Atom positions come from the **cube header** (not geom.xyz) so Gaussians sit
+    on the density frame. Does not modify DFTB/pySCF providers.
+
+    Args:
+        cube_path_or_dir: path to Dt.cube or directory containing Dt.cube
+        esp_path: optional ESP.cube (default: sibling ESP.cube)
+        sigma_na: Gaussian NA width [Å] (default 0.5, ppafm-like)
+        rescale_na: scale ρ_NA so ∫ρ_NA = ∫ρ_scf (charge neutrality)
+        use_esp_cube: if True and ESP found, use it as V_ES; else fft_poisson(ρ_diff)
+        verbosity: print charge checks
+
+    Returns:
+        dict with rho_scf, rho_na, rho_diff, V_ES, origin, ngrid, grid_spec, atomPos, atomZ, …
+    """
+    from spammm.quantum.DFTB.DFTBplusParser import read_cube
+
+    path = cube_path_or_dir
+    if os.path.isdir(path):
+        dt_path = os.path.join(path, 'Dt.cube')
+        if esp_path is None:
+            cand = os.path.join(path, 'ESP.cube')
+            if os.path.isfile(cand):
+                esp_path = cand
+    else:
+        dt_path = path
+        if esp_path is None:
+            cand = os.path.join(os.path.dirname(path), 'ESP.cube')
+            if os.path.isfile(cand):
+                esp_path = cand
+    if not os.path.isfile(dt_path):
+        raise FileNotFoundError(f"get_density_from_cube: missing Dt cube: {dt_path}")
+
+    rho_b, origin_b, step_b, nPoints, atoms_b = read_cube(dt_path)
+    nx, ny, nz = nPoints
+    # Density e/a0³ → e/Å³: ρ_A = ρ_B * (a0/Å)³ = ρ_B / BOHR_TO_ANG³? 
+    # ∫ ρ_B dV_B = N_e with dV_B in a0³. Same N_e = ∫ ρ_A dV_A with dV_A in Å³
+    # ⇒ ρ_A = ρ_B * (dV_B/dV_A) = ρ_B / BOHR_TO_ANG³
+    b3 = BOHR_TO_ANG ** 3
+    rho_scf = (rho_b / b3).astype(np.float32)
+    origin = np.asarray(origin_b, dtype=np.float64) * BOHR_TO_ANG
+    step_vec = np.asarray(step_b, dtype=np.float64) * BOHR_TO_ANG
+    if abs(step_vec[0] - step_vec[1]) > 1e-6 or abs(step_vec[0] - step_vec[2]) > 1e-6:
+        raise ValueError(f"get_density_from_cube: non-isotropic cube step {step_vec}")
+    step = float(step_vec[0])
+    atomZ = np.array([a[0] for a in atoms_b], dtype=np.float64)
+    atomPos = np.array([[a[1], a[2], a[3]] for a in atoms_b], dtype=np.float64) * BOHR_TO_ANG
+
+    dV = step ** 3
+    q_scf = float(rho_scf.sum() * dV)
+    rho_na = make_gaussian_rho_na(
+        atomPos, atomZ, origin, step, (nx, ny, nz),
+        sigma=sigma_na, rescale_to_q=(q_scf if rescale_na else None),
+    )
+    rho_diff = (rho_scf - rho_na).astype(np.float32)
+    q_na = float(rho_na.sum() * dV)
+    q_diff = float(rho_diff.sum() * dV)
+
+    if verbosity >= 0:
+        print(f"  [cube] {dt_path}")
+        print(f"  [cube] grid={nx}x{ny}x{nz} step={step:.5f}Å origin={origin}")
+        print(f"  [cube] natoms={len(atomZ)} Zsum={atomZ.sum():.1f} sigma_na={sigma_na}")
+        print(f"  [CHARGE CHECK] q_scf={q_scf:.6f} q_na={q_na:.6f} q_diff={q_diff:.6e}")
+        if abs(q_diff) > 0.05:
+            print(f"  WARNING: |q_diff|={abs(q_diff):.4f} > 0.05 e — ES may be unreliable")
+
+    V_ES = None
+    if use_esp_cube and esp_path and os.path.isfile(esp_path):
+        V_b, o2, s2, n2, _ = read_cube(esp_path)
+        if n2 != nPoints:
+            raise ValueError(f"ESP cube shape {n2} != Dt {nPoints}")
+        # Psi4 ESP typically Hartree/e; convert later if needed — store raw for now as float32
+        V_ES = V_b.astype(np.float32)
+        if verbosity >= 0:
+            print(f"  [cube] V_ES from {esp_path} (file units)")
+    else:
+        # Cube ngrid often has prime factors clFFT rejects; CPU Poisson is explicit here.
+        # After resample onto FDBM-friendly grids, callers can re-Poisson on GPU.
+        V_ES = afm.fft_poisson_cpu(rho_diff, step)
+        if verbosity >= 0:
+            print(f"  [cube] V_ES from fft_poisson_cpu (native cube grid)")
+
+    grid_spec = {
+        'origin': origin.copy(),
+        'dA': np.array([step, 0.0, 0.0]),
+        'dB': np.array([0.0, step, 0.0]),
+        'dC': np.array([0.0, 0.0, step]),
+        'ngrid': np.array([nx, ny, nz], dtype=int),
+    }
+    return {
+        'rho_scf': rho_scf,
+        'rho_na': rho_na,
+        'rho_diff': rho_diff,
+        'V_ES': V_ES,
+        'origin': origin,
+        'ngrid': np.array([nx, ny, nz], dtype=int),
+        'grid_spec': grid_spec,
+        'step': step,
+        'atomPos': atomPos,
+        'atomZ': atomZ,
+        'q_scf': q_scf,
+        'q_na': q_na,
+        'q_diff': q_diff,
+        'sigma_na': float(sigma_na),
+        'cube_path': dt_path,
+        'esp_path': esp_path,
+    }
+
+
+def plot_cube_density_diagnostics(d, save_dir, tag='cube', z_above=0.0):
+    """XY slices of ρ_scf, ρ_NA, ρ_diff with atom markers; write CHARGE snippet.
+
+    Atoms must sit on ρ_NA peaks. ∫ρ_diff must be ~0 (printed on figure).
+    """
+    import matplotlib.pyplot as plt
+    os.makedirs(save_dir, exist_ok=True)
+    rho_scf, rho_na, rho_diff = d['rho_scf'], d['rho_na'], d['rho_diff']
+    origin, step = d['origin'], float(d.get('step', d['grid_spec']['dA'][0]))
+    atomPos, atomZ = d['atomPos'], d['atomZ']
+    nx, ny, nz = rho_scf.shape
+    z_mol = float(atomPos[:, 2].mean())
+    z_target = z_mol + float(z_above)
+    zs = origin[2] + step * np.arange(nz)
+    iz = int(np.clip(np.argmin(np.abs(zs - z_target)), 0, nz - 1))
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.2))
+    extent = [origin[0], origin[0] + (nx - 1) * step, origin[1], origin[1] + (ny - 1) * step]
+    panels = [
+        (rho_scf[:, :, iz], 'ρ_scf', 'magma', False),
+        (rho_na[:, :, iz], 'ρ_NA (Gaussians)', 'magma', False),
+        (rho_diff[:, :, iz], 'ρ_diff = scf−NA', 'bwr', True),
+    ]
+    for ax, (sl, title, cmap, sym) in zip(axes, panels):
+        arr = sl.T
+        if sym:
+            v = max(float(np.percentile(np.abs(arr), 99)), 1e-12)
+            im = ax.imshow(arr, origin='lower', extent=extent, cmap=cmap, vmin=-v, vmax=v, aspect='equal')
+        else:
+            im = ax.imshow(arr, origin='lower', extent=extent, cmap=cmap, aspect='equal')
+        ax.scatter(atomPos[:, 0], atomPos[:, 1], c='cyan', s=40, marker='x', linewidths=1.5, label='atoms')
+        for j, Z in enumerate(atomZ):
+            ax.annotate(str(int(Z)), (atomPos[j, 0], atomPos[j, 1]), color='w', fontsize=7,
+                        xytext=(3, 3), textcoords='offset points')
+        ax.set_title(f'{title}\nz={zs[iz]:.2f}Å', fontsize=9)
+        ax.set_xlabel('x [Å]'); ax.set_ylabel('y [Å]')
+        plt.colorbar(im, ax=ax, fraction=0.046)
+    fig.suptitle(
+        f'{tag}  q_scf={d["q_scf"]:.4f}  q_na={d["q_na"]:.4f}  q_diff={d["q_diff"]:.3e}  σ_NA={d["sigma_na"]}Å',
+        fontsize=10,
+    )
+    fig.tight_layout()
+    out = os.path.join(save_dir, f'{tag}_rho_scf_na_diff.png')
+    fig.savefig(out, dpi=140)
+    plt.close(fig)
+    print(f'Saved {out}')
+
+    # Peak of ρ_NA vs atom XY distance (must be small)
+    peak = np.unravel_index(int(np.argmax(rho_na)), rho_na.shape)
+    peak_xy = np.array([origin[0] + peak[0] * step, origin[1] + peak[1] * step])
+    dmin = float(np.min(np.linalg.norm(atomPos[:, :2] - peak_xy[None, :], axis=1)))
+    # Per-atom: nearest voxel should be a local max of ρ_NA (Gaussian sits on nucleus).
+    # Allow ~1 voxel; H near O may shift slightly in the *combined* field.
+    atom_dists = []
+    for j in range(len(atomZ)):
+        ix = int(np.clip(round((atomPos[j, 0] - origin[0]) / step), 0, nx - 1))
+        iy = int(np.clip(round((atomPos[j, 1] - origin[1]) / step), 0, ny - 1))
+        iz_a = int(np.clip(round((atomPos[j, 2] - origin[2]) / step), 0, nz - 1))
+        grid_xyz = origin + step * np.array([ix, iy, iz_a], dtype=float)
+        atom_dists.append(float(np.linalg.norm(atomPos[j] - grid_xyz)))
+        x0, x1 = max(0, ix - 2), min(nx, ix + 3)
+        y0, y1 = max(0, iy - 2), min(ny, iy + 3)
+        z0, z1 = max(0, iz_a - 2), min(nz, iz_a + 3)
+        local = rho_na[x0:x1, y0:y1, z0:z1]
+        # value at atom voxel vs local max
+        v_atom = float(rho_na[ix, iy, iz_a])
+        v_max = float(local.max())
+        if v_atom < 0.5 * v_max:
+            atom_dists[-1] = 1e9  # fail marker
+    max_atom_grid_dist = max(atom_dists) if atom_dists else float('nan')
+    lines = [
+        f'tag={tag}',
+        f'cube={d.get("cube_path")}',
+        f'q_scf={d["q_scf"]:.8f} q_na={d["q_na"]:.8f} q_diff={d["q_diff"]:.8e}',
+        f'sigma_na={d["sigma_na"]} step={step}',
+        f'rho_na global peak index={peak} peak_xy={peak_xy} min_dist_to_atom_xy={dmin:.4f} Å',
+        f'max_atom_to_nearest_voxel={max_atom_grid_dist:.4f} Å (inf => NA not peaked at atom)',
+        f'PASS_charge={abs(d["q_diff"]) < 0.05}',
+        f'PASS_atoms_on_NA={max_atom_grid_dist < 0.75 * step * np.sqrt(3)}',
+    ]
+    out_txt = os.path.join(save_dir, f'{tag}_CHARGE.out')
+    with open(out_txt, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    print(f'REVIEW: {out_txt}')
+    return out, out_txt
+
+
+def resample_field_to_grid(field, origin_src, step_src, origin_dst, step_dst, ngrid_dst, order=1):
+    """Trilinear resample 3D field from src grid onto dst grid (Å)."""
+    from scipy.ndimage import map_coordinates
+    field = np.asarray(field, dtype=np.float64)
+    origin_src = np.asarray(origin_src, dtype=np.float64).ravel()[:3]
+    origin_dst = np.asarray(origin_dst, dtype=np.float64).ravel()[:3]
+    step_src = float(step_src) if np.ndim(step_src) == 0 else float(step_src[0])
+    step_dst = float(step_dst) if np.ndim(step_dst) == 0 else float(step_dst[0])
+    nx, ny, nz = [int(x) for x in ngrid_dst]
+    ix = np.arange(nx, dtype=np.float64)
+    iy = np.arange(ny, dtype=np.float64)
+    iz = np.arange(nz, dtype=np.float64)
+    X, Y, Z = np.meshgrid(ix, iy, iz, indexing='ij')
+    wx = origin_dst[0] + X * step_dst
+    wy = origin_dst[1] + Y * step_dst
+    wz = origin_dst[2] + Z * step_dst
+    coords = np.stack([
+        (wx - origin_src[0]) / step_src,
+        (wy - origin_src[1]) / step_src,
+        (wz - origin_src[2]) / step_src,
+    ], axis=0)
+    out = map_coordinates(field, coords, order=order, mode='constant', cval=0.0)
+    return out.astype(np.float32)
+
+
+def tip_density_apex_down(rho, atomPos, atomZ, apex_Z, origin, step, z_tol=0.15):
+    """Ensure tip apex atom has the lowest z (AFM approach along +z from above).
+
+    Mithun cubes: CO_O/HF_*/NH3_H already apex-down along z — leave unchanged.
+    Planar tips (H2O_O/H2O_H, all z≈0): permute (x,y,z)→(x,z,−y) then flip if needed.
+
+    Returns (rho_out, atomPos_out, origin_out, reoriented:bool).
+    """
+    atomPos = np.asarray(atomPos, dtype=np.float64)
+    atomZ = np.asarray(atomZ, dtype=np.float64)
+    origin = np.asarray(origin, dtype=np.float64).ravel()[:3]
+    step = float(step)
+    apex_mask = np.isclose(atomZ, float(apex_Z))
+    if not np.any(apex_mask):
+        raise ValueError(f"tip_density_apex_down: no atom with Z={apex_Z}")
+    z_apex = float(atomPos[apex_mask, 2].mean())
+    z_min = float(atomPos[:, 2].min())
+    z_span = float(atomPos[:, 2].max() - atomPos[:, 2].min())
+    # Already apex-down (apex near global min z, molecule has z extent)
+    if z_span > z_tol and z_apex <= z_min + z_tol:
+        return rho.astype(np.float32), atomPos.copy(), origin.copy(), False
+
+    # Planar / wrong-axis: (x,y,z) → (x,z,−y)
+    nx, ny, nz = rho.shape
+    rho2 = np.transpose(rho, (0, 2, 1))[:, :, ::-1].copy()
+    apos2 = atomPos.copy()
+    apos2[:, 0] = atomPos[:, 0]
+    apos2[:, 1] = atomPos[:, 2]
+    apos2[:, 2] = -atomPos[:, 1]
+    # out2[i,j,k] = in[i, ny-1-k, j] → origin_y'=oz, origin_z'=-(oy+(ny-1)*s)
+    origin2 = np.array([origin[0], origin[2], -(origin[1] + (ny - 1) * step)], dtype=np.float64)
+    if float(apos2[apex_mask, 2].mean()) > float(apos2[:, 2].mean()):
+        rho2 = rho2[:, :, ::-1].copy()
+        apos2[:, 2] = -apos2[:, 2]
+        nzz = rho2.shape[2]
+        origin2[2] = -origin2[2] - (nzz - 1) * step
+    return rho2.astype(np.float32), apos2, origin2, True
+
+
+def build_fdbm_grid_from_cubes(sample_cube_dir, tip_cube_dir, *, step=0.1, margin_xy=4.0,
+                               z_min=-15.0, z_max=15.0, sigma_na=0.5, apex_Z=None,
+                               A_pauli=None, beta_pauli=None, tip_name=None,
+                               use_esp_cube=False, verbosity=0,
+                               clamp_cores=True, clamp_percentile=99.0, clamp_rho_max=None,
+                               use_gpu_project=True, z_symmetric=True):
+    """Build FDBM F_total on a tall AFM grid from sample+tip Dt cubes.
+
+    Pipeline (dipole-safe):
+      1. Soft-clamp nuclear cusps in ρ_scf; match ρ_NA to ∫ρ_c → Δρ with ∫≈0, no core spikes
+      2. GPU *project* (trilinear scatter) onto dest grid — preserves charge + dipole
+         (not scipy sample, which breaks ∫Δρ)
+      3. z-box **symmetric** about the molecular plane by default (avoids fake pz from
+         uniform monopole strip on an asymmetric cell)
+      4. Poisson(Δρ); tip Δρ rolled to apex; no monopole strip unless |q| is large
+
+    Tip: apex-down only if cube is planar; then roll density peak to (0,0,0).
+    """
+    from . import AFM as afm_mod
+    from spammm.utils.GridsOCL import grid_moments_centers
+
+    d_s = get_density_from_cube(
+        sample_cube_dir, sigma_na=sigma_na, rescale_na=True,
+        use_esp_cube=use_esp_cube, verbosity=verbosity)
+    d_t = get_density_from_cube(tip_cube_dir, sigma_na=sigma_na, rescale_na=True, verbosity=verbosity)
+
+    if apex_Z is None and tip_name:
+        suf = tip_name.split('_')[-1]
+        apex_Z = {'H': 1, 'C': 6, 'N': 7, 'O': 8, 'F': 9}.get(suf, int(d_t['atomZ'][np.argmax(d_t['atomZ'])]))
+    if apex_Z is None:
+        apex_Z = int(d_t['atomZ'][np.argmax(d_t['atomZ'])])
+
+    # ── Sample Δρ: clamp cores on native cube (Pauli still uses full ρ_scf) ────
+    if clamp_cores:
+        clamp_s = prepare_delta_rho_clamped(
+            d_s['rho_scf'], d_s['rho_na'], d_s['origin'], d_s['step'],
+            d_s['atomPos'], d_s['atomZ'], rho_max=clamp_rho_max, percentile=clamp_percentile)
+        rho_diff_src = clamp_s['rho_diff']
+        if verbosity >= 0:
+            print(f"  [fdbm-cube] sample core-clamp ρ_max={clamp_s['rho_max']:.3f} "
+                  f"Q_ex={clamp_s['Q_excess']:.3f}e  ∫Δρ={clamp_s['Q_diff']:.3e}")
+    else:
+        rho_diff_src = d_s['rho_diff']
+        clamp_s = None
+
+    # ── Tip: apex-down geometry, then clamp Δρ in that frame ───────────────────
+    tip_rho, tip_apos, tip_origin, tip_reoriented = tip_density_apex_down(
+        d_t['rho_scf'], d_t['atomPos'], d_t['atomZ'], apex_Z, d_t['origin'], d_t['step'])
+    tip_na_a, _, _, _ = tip_density_apex_down(
+        d_t['rho_na'], d_t['atomPos'], d_t['atomZ'], apex_Z, d_t['origin'], d_t['step'])
+    if clamp_cores:
+        clamp_t = prepare_delta_rho_clamped(
+            tip_rho, tip_na_a, tip_origin, d_t['step'], tip_apos, d_t['atomZ'],
+            rho_max=clamp_rho_max, percentile=clamp_percentile)
+        tip_diff = clamp_t['rho_diff']
+        if verbosity >= 0:
+            print(f"  [fdbm-cube] tip core-clamp Q_ex={clamp_t['Q_excess']:.3f}e  ∫Δρ={clamp_t['Q_diff']:.3e}")
+    else:
+        tip_diff, _, _, _ = tip_density_apex_down(
+            d_t['rho_diff'], d_t['atomPos'], d_t['atomZ'], apex_Z, d_t['origin'], d_t['step'])
+        clamp_t = None
+
+    # ── Destination grid: cover sample cube AABB + margin; z symmetric ────────
+    spos = d_s['atomPos']
+    z_mol = float(spos[:, 2].mean())
+    # XY: union of atom bbox and density cube footprint
+    so, ss, sn = d_s['origin'], float(d_s['step']), d_s['rho_scf'].shape
+    x0 = min(float(spos[:, 0].min()) - margin_xy, so[0] - 0.5)
+    x1 = max(float(spos[:, 0].max()) + margin_xy, so[0] + (sn[0] - 1) * ss + 0.5)
+    y0 = min(float(spos[:, 1].min()) - margin_xy, so[1] - 0.5)
+    y1 = max(float(spos[:, 1].max()) + margin_xy, so[1] + (sn[1] - 1) * ss + 0.5)
+    Lz = float(z_max - z_min)
+    if Lz < 12.0:
+        raise ValueError(
+            f"build_fdbm_grid_from_cubes: z span {Lz:.1f} Å too small for periodic FFT "
+            f"(need ≳12 Å). Got z_min={z_min}, z_max={z_max}."
+        )
+    if z_symmetric:
+        z_half = 0.5 * Lz
+        z0, z1 = z_mol - z_half, z_mol + z_half
+    else:
+        z0, z1 = float(z_min), float(z_max)
+    nx = afm_mod._FDBMGpyFFT.round_fft_friendly(int(np.ceil((x1 - x0) / step)) + 1)
+    ny = afm_mod._FDBMGpyFFT.round_fft_friendly(int(np.ceil((y1 - y0) / step)) + 1)
+    nz = afm_mod._FDBMGpyFFT.round_fft_friendly(int(np.ceil((z1 - z0) / step)) + 1)
+    origin = np.array([x0, y0, z0], dtype=np.float64)
+    ngrid = np.array([nx, ny, nz], dtype=int)
+    dV = step ** 3
+    vol = float(nx * ny * nz) * dV
+
+    def _to_dest(field, origin_src, step_src, grids=None):
+        if use_gpu_project:
+            if grids is None:
+                from spammm.utils.GridsOCL import GridsOCL
+                grids = GridsOCL()
+            return grids.project_density(field, origin_src, step_src, origin, step, ngrid), grids
+        return resample_field_to_grid(field, origin_src, step_src, origin, step, ngrid), None
+
+    grids = None
+    rho_scf, grids = _to_dest(d_s['rho_scf'], d_s['origin'], d_s['step'], grids)
+    rho_diff, grids = _to_dest(rho_diff_src, d_s['origin'], d_s['step'], grids)
+    tip_tot, grids = _to_dest(tip_rho, tip_origin, d_t['step'], grids)
+    tip_del, grids = _to_dest(tip_diff, tip_origin, d_t['step'], grids)
+
+    tip_tot = _pad_and_roll_co_tip(tip_tot, (nx, ny, nz))
+    tip_del = _pad_and_roll_co_tip(tip_del, (nx, ny, nz))
+
+    q_scf = float(rho_scf.sum() * dV)
+    q_diff = float(rho_diff.sum() * dV)
+    q_tip_del = float(tip_del.sum() * dV)
+    _, p_diff = grid_moments_centers(rho_diff, origin, step)
+    # Only strip monopole if large; on a z-symmetric box this does not inject fake pz
+    if abs(q_diff) > 1e-4:
+        if verbosity >= 0:
+            print(f"  [fdbm-cube] WARNING stripping sample monopole q_diff={q_diff:.3e} (z_symmetric={z_symmetric})")
+        rho_diff = (rho_diff - q_diff / vol).astype(np.float32)
+        q_diff = float(rho_diff.sum() * dV)
+    if abs(q_tip_del) > 1e-4:
+        if verbosity >= 0:
+            print(f"  [fdbm-cube] WARNING stripping tip monopole q_tip_del={q_tip_del:.3e}")
+        tip_del = (tip_del - q_tip_del / vol).astype(np.float32)
+        q_tip_del = float(tip_del.sum() * dV)
+    _, p_diff = grid_moments_centers(rho_diff, origin, step)
+
+    if A_pauli is None or beta_pauli is None:
+        pa = afm_mod.PAULI_FITTED_DEFAULTS.get('pyscf_6-31g*', {'A': 40.0, 'beta': 1.15})
+        A_pauli = float(pa['A'] if A_pauli is None else A_pauli)
+        beta_pauli = float(pa['beta'] if beta_pauli is None else beta_pauli)
+
+    if verbosity >= 0:
+        print(f"  [fdbm-cube] grid={nx}x{ny}x{nz} step={step} origin={origin} Lz={nz*step:.1f}Å "
+              f"z_sym={z_symmetric} gpu_project={use_gpu_project}")
+        print(f"  [fdbm-cube] q_scf={q_scf:.4f} q_diff={q_diff:.3e} q_tip_del={q_tip_del:.3e} "
+              f"p_diff={p_diff} A={A_pauli} beta={beta_pauli} apex_Z={apex_Z} reoriented={tip_reoriented}")
+        print(f"  [fdbm-cube] tip peak after roll={np.unravel_index(int(np.argmax(np.abs(tip_tot))), tip_tot.shape)}")
+
+    os.environ.setdefault('SPAMMM_AFM_CPU_FFT', '1')
+    overlap = afm_mod.compute_pauli_overlap(rho_scf, tip_tot, step, tip_rolled=True)
+    E_pauli = afm_mod.scale_pauli_field(overlap, step, A_pauli, beta_pauli, return_grads=False)
+    if use_esp_cube and d_s.get('V_ES') is not None and d_s.get('esp_path'):
+        HARTREE_TO_EV = 27.211386
+        V_ES, _ = _to_dest(np.asarray(d_s['V_ES'], dtype=np.float32) * np.float32(HARTREE_TO_EV),
+                           d_s['origin'], d_s['step'], grids)
+        tip_del_es = (-tip_del).astype(np.float32)
+        if verbosity >= 0:
+            print(f"  [fdbm-cube] V_ES from ESP.cube (Ha→eV), tip_del → −Δρ for charge convention")
+    else:
+        V_ES = afm_mod.fft_poisson_cpu(rho_diff, step)
+        tip_del_es = tip_del
+    E_es = afm_mod.compute_es_conv_field(V_ES, tip_del_es, step, tip_rolled=True, return_grads=False)
+    atomTypes = d_s['atomZ'].astype(np.int32)
+    E_vdw = afm_mod.compute_dispersion_grid(
+        spos, atomTypes, origin, step, ngrid, C6_CO=30.0, return_grads=False, use_opencl=False)
+    E_total = (E_pauli + E_es + E_vdw).astype(np.float32)
+
+    afmulator = afm_mod.AFMulator(use_morse=False, nloc=32)
+    F_total = afmulator.compute_gradient_cl(E_total, step, bAlloc=True)
+
+    return {
+        'F_total': F_total,
+        'E_total': E_total,
+        'E_pauli': E_pauli,
+        'E_es': E_es,
+        'E_vdw': E_vdw,
+        'V_ES': V_ES,
+        'overlap_raw': overlap,
+        'rho_scf': rho_scf,
+        'rho_diff': rho_diff,
+        'tip_tot': tip_tot,
+        'tip_del': tip_del,
+        'origin': origin,
+        'step': step,
+        'ngrid': ngrid,
+        'atomPos': spos,
+        'atomZ': atomTypes,
+        'A_pauli': A_pauli,
+        'beta_pauli': beta_pauli,
+        'q_scf': q_scf,
+        'q_diff': q_diff,
+        'q_tip_del': q_tip_del,
+        'p_diff': p_diff,
+        'tip_reoriented': tip_reoriented,
+        'use_esp_cube': bool(use_esp_cube),
+        'clamp_cores': bool(clamp_cores),
+        'use_gpu_project': bool(use_gpu_project),
+        'z_symmetric': bool(z_symmetric),
+        'clamp_s': clamp_s,
+        'afmulator': afmulator,
     }
 
 
@@ -2496,37 +3129,42 @@ def plot_diagnostic_slices(E_pauli, E_es, E_vdw, origin, step, heights, output_d
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _fit_pauli_powerlaw(z, overlap_raw, e_ref, z_min=2.0, z_max=3.5):
-    """Fit Pauli power-law model: E_DFTB(z) = A * overlap(z)^beta."""
+    """Fit Pauli power-law model: E_ref(z) = A * overlap(z)^beta."""
     from scipy.optimize import curve_fit
-    
-    mask = (z >= z_min) & (z <= z_max)
+
+    z = np.asarray(z, dtype=np.float64)
+    overlap_raw = np.asarray(overlap_raw, dtype=np.float64)
+    e_ref = np.asarray(e_ref, dtype=np.float64)
+    mask = (z >= z_min) & (z <= z_max) & np.isfinite(overlap_raw) & np.isfinite(e_ref)
     if mask.sum() < 3:
         raise ValueError(f"Need >=3 points in fit range [{z_min},{z_max}]")
-    z_fit = z[mask]
     o_fit = overlap_raw[mask]
     e_fit = e_ref[mask]
     pos_mask = (o_fit > 1e-15) & (e_fit > 1e-15)
     if pos_mask.sum() < 3:
         raise ValueError("Not enough positive points")
-    log_o = np.log(o_fit[pos_mask])
-    log_e = np.log(e_fit[pos_mask])
+    o_pos, e_pos = o_fit[pos_mask], e_fit[pos_mask]
+    log_o = np.log(o_pos)
+    log_e = np.log(e_pos)
     beta_ll, lnA_ll = np.polyfit(log_o, log_e, 1)
     A_ll = np.exp(lnA_ll)
     def model(overlap, A, beta):
         return A * overlap**beta
     try:
-        popt, _ = curve_fit(model, o_fit, e_fit, p0=[A_ll, beta_ll],
+        popt, _ = curve_fit(model, o_pos, e_pos, p0=[A_ll, beta_ll],
                             bounds=([0.0, 0.0], [1e6, 5.0]))
         A_nls, beta_nls = popt
-        e_pred = model(o_fit, A_nls, beta_nls)
-        ss_res = np.sum((e_fit - e_pred)**2)
-        ss_tot = np.sum((e_fit - np.mean(e_fit))**2)
+        e_pred = model(o_pos, A_nls, beta_nls)
+        ss_res = np.sum((e_pos - e_pred)**2)
+        ss_tot = np.sum((e_pos - np.mean(e_pos))**2)
         r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
     except Exception as e:
         print(f"  WARNING: Nonlinear fit failed ({e}), using log-linear")
         A_nls, beta_nls = A_ll, beta_ll
-        e_pred = model(o_fit, A_nls, beta_nls)
-        r2 = 0.0
+        e_pred = model(o_pos, A_nls, beta_nls)
+        ss_res = np.sum((e_pos - e_pred)**2)
+        ss_tot = np.sum((e_pos - np.mean(e_pos))**2)
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
     return A_nls, beta_nls, r2, e_pred
 
 

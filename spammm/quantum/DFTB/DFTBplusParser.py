@@ -1048,56 +1048,49 @@ def parse_eigenvec_bin_custom(bin_path, nstates, norb, nkpoints=1, nspin=1):
 
 def read_cube(path):
     """
-    Read Gaussian cube file.
-    
-    Returns: (grid_data, origin, step, nPoints)
-        grid_data: (nx, ny, nz) array
-        origin: (3,) array in Bohr
-        step: (3,) array in Bohr
-        nPoints: (3,) tuple
+    Read Gaussian / Psi4 cube file.
+
+    Atom lines are standard: ``Z  charge  x  y  z`` (Bohr).
+
+    Returns
+    -------
+    grid_data : (nx, ny, nz)  density (file units, typically e/a0^3)
+    origin : (3,) Bohr
+    step : (3,) Bohr — diagonal voxel sizes
+    nPoints : (nx, ny, nz)
+    atoms : list of (Z, x, y, z) in Bohr (charge column discarded)
     """
     import numpy as np
     with open(path, 'r') as f:
         lines = f.readlines()
-    
-    # Line 1: comment
-    # Line 2: comment
-    # Line 3: natoms origin_x origin_y origin_z
+
     natoms = int(lines[2].split()[0])
     origin = np.array([float(x) for x in lines[2].split()[1:4]])
-    
-    # Lines 4-6: nPoints and step vectors
+
     nPoints = []
     step = np.zeros(3)
     for i in range(3):
-        parts = lines[3+i].split()
+        parts = lines[3 + i].split()
         nPoints.append(int(parts[0]))
-        step[i] = float(parts[1+i])  # diagonal element only
-    
+        step[i] = float(parts[1 + i])  # orthogonal diagonal
+
     nPoints = tuple(nPoints)
-    
-    # Lines 7-7+natoms: atomic numbers and coordinates
-    # Skip for now
-    
-    # Remaining lines: grid data (starts after atom section)
-    # Atom section is lines 7-9 (0-indexed: 6-8), so data starts from index 6+natoms
-    data_lines = lines[6+natoms:]
-    data = []
-    for line in data_lines:
-        data.extend([float(x) for x in line.split()])
-    
-    grid_data = np.array(data).reshape(nPoints)
-    
-    # Parse atom section
+
     atoms = []
     for i in range(natoms):
-        line = lines[6+i].split()
-        z = int(line[0])
-        x = float(line[1])
-        y = float(line[2])
-        z_coord = float(line[3])
-        atoms.append((z, x, y, z_coord))
-    
+        parts = lines[6 + i].split()
+        Z = int(float(parts[0]))
+        # parts[1] = charge; parts[2:5] = x,y,z (Bohr)
+        if len(parts) < 5:
+            raise ValueError(f"read_cube({path}): atom line {i} expected 'Z charge x y z', got {parts}")
+        x, y, z_coord = float(parts[2]), float(parts[3]), float(parts[4])
+        atoms.append((Z, x, y, z_coord))
+
+    data = []
+    for line in lines[6 + natoms:]:
+        data.extend([float(x) for x in line.split()])
+    grid_data = np.array(data, dtype=float).reshape(nPoints)
+
     return grid_data, origin, step, nPoints, atoms
 
 

@@ -28,4 +28,8 @@ debug/<script_stem>/          # matches pytest module name without .py
 | Routine | `pytest -m "not slow"` | L0 asserts only |
 | Develop | `pytest path --develop -s` | L0 + `.out`/`.log` + PNG |
 
+## Presentation gallery
+
+Open **`debug/presentation.html`** in a browser (from this folder) for clickable PTCDA FDBM / SA-prolonged figures. Index: repo-root `FOR_PRESENTATION.md`.
+
 See `doc/TEST_DESIGN.md`.

@@ -35,8 +35,24 @@ High-level status for agent-driven work. Details in linked docs — do not dupli
 
 ## Soon
 
-- [ ] Wire contact surface into `AFMulator` / `RigidBodyAFM`
-- [ ] Contact-surface L0 pytest parity (brute vs separable/PIC)
+### Repo consolidation / nc-AFM week (priority order)
+
+SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoConsolidation.md`.
+
+**P0 — conference critical**
+- [ ] **Prolonged DFTB radial basis (STM+AFM)** — analyze + wire existing fit (`basis_optimizer`, `testplot_3ob_basis_tails`); selectable WFC in projection (`doc/Tasks/ProlongedRadialBasis_DFTB.md`; `doc/DFTB_basis_fit.md`)
+- [ ] **Molecule-on-surface relax polish** — PTCDA+FAF USER review / charge dial-back; LFF GUI combo; FoldedRigid stability; instant GUI relax T02 (`doc/Tasks/PerfBenchmark_Relaxation.md`, `doc/Topics/ForceFields/LFF_ProjectiveRelax.md`)
+
+**P1 — packaging + AFM/STM demos**
+- [ ] **pip install / packaging** — `pyproject.toml`, kernels+data findable (`doc/Tasks/PipInstall_Packaging.md`)
+- [ ] **Kriging / RBF z-scan → GridFF** — port + FDBM-cube compare; **grid z/XY alignment is CRITICAL** (`doc/Tasks/Import_KrigingGridFF.md`; topic `doc/Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md`)
+- [ ] **Charge rings PME + Hubbard/MQCA** — OpenCL into SPAMMM (`doc/Tasks/Import_ChargeRings_PME.md`)
+
+**P2 — secondary if time**
+- [ ] **Frenkel Hamiltonian / TEPL** — design only today (`doc/Ideas/FrenkelRigidFF.chat.md`); no module yet
+
+### Existing Soon
+
 - [ ] Fix H not connected after molecule load
 - [ ] Decouple `ascii_art_heterocycle.py` from `KekulePure.py`
 - [ ] Molecule fragments/groups + automatic bridge search
@@ -62,6 +78,19 @@ High-level status for agent-driven work. Details in linked docs — do not dupli
 ---
 
 ## Later
+
+### Repo consolidation (P3 / post-conference)
+
+- [ ] **Contact-surface (2.5D) AFM** — wire into AFMulator; L0 parity; elastic Phase 2 (`doc/Topics/AFM/ContactSurface_Static.md`, `ContactSurface_Elastic.md`, `kernels/contact_surface.cl`) (**P3**)
+- [ ] Wire contact surface into `AFMulator` / `RigidBodyAFM`
+- [ ] Contact-surface L0 pytest parity (brute vs separable/PIC)
+- [ ] **Dyson Level-1/2/3** — `doc/Tasks/DysonOrbitals_DFTB_STM.md` (**P3**)
+- [ ] **OpenCL/JIT FF fit driver** — `doc/Tasks/FF_Optimizer_OpenCL_Driver.md` (**P3**)
+- [ ] **Stable Cosserat / cassette rods** — `doc/Tasks/Import_CosseratRods_PTCDA.md` (**P3**)
+- [ ] Charge-rings MC fit vs full experimental NPZ / QmeQ
+- [ ] Frenkel implementation (if not started under Soon P2)
+
+### Existing Later
 
 - [ ] Contact-surface elastic AFM (Winkler h, K_z, indentation solve)
 - [ ] FireCore port: RigidAtom XPBD / RRsp3
@@ -179,9 +208,27 @@ High-level status for agent-driven work. Details in linked docs — do not dupli
 | FireCore mol browser plugins | `/home/prokop/git/FireCore/pyBall/GUI/mol_browser_plugins/` |
 | Reactive FF | `/home/prokop/git/NumericalMathPlayground/topics/ReactiveFF/` |
 | FireCore RRsp3 | `/home/prokop/git/FireCore/pyBall/RigidAtomFF/RRsp3/` |
+| ppafm Kriging export | `/home/prokop/git/ppafm/docs/export/interpolation.export.md` |
+| ppafm charge rings export | `/home/prokop/git/ppafm/docs/export/charge_rings.export.md` |
+| FireCore MQCA/Hubbard export | `/home/prokop/git/FireCore/doc/Topics/ManyBody/MQCA_Hubbard_Ising.export.md` |
+| Utah Cosserat rods | https://graphics.cs.utah.edu/research/projects/stable-cosserat-rods/ |
+
+### Repo consolidation tasks
+| Item | Files |
+|------|-------|
+| Strategy + pri map | `doc/Tasks/RepoConsolidation.md`, `doc/ARCHITECTURE_ROADMAP.md` §TOC |
+| pip install (P1) | `doc/Tasks/PipInstall_Packaging.md` |
+| Prolonged DFTB basis (P0) | `doc/Tasks/ProlongedRadialBasis_DFTB.md`, `doc/DFTB_basis_fit.md` |
+| Kriging → GridFF (P1) | `doc/Tasks/Import_KrigingGridFF.md` |
+| Charge rings / PME / MQCA (P1) | `doc/Tasks/Import_ChargeRings_PME.md` |
+| Frenkel / TEPL (P2) | `doc/Ideas/FrenkelRigidFF.chat.md` |
+| Contact surface (P3) | `doc/Topics/AFM/ContactSurface_Static.md`, `kernels/contact_surface.cl` |
+| Dyson STM (P3) | `doc/Tasks/DysonOrbitals_DFTB_STM.md`, `doc/Dyson_orbitals_STM.chat.md` |
+| FF OpenCL fit driver (P3) | `doc/Tasks/FF_Optimizer_OpenCL_Driver.md` |
+| Cosserat / cassette PTCDA (P3) | `doc/Tasks/Import_CosseratRods_PTCDA.md` |
 
 ### Human ToDo (non-agent)
 | Item | Files |
 |------|-------|
-| Quick items | `doc/ToDo/ToDo.md` |
+| Quick items + consolidation backlog | `doc/ToDo/ToDo.human.md` |
 | GUI wishes | `doc/Tasks/ToDO_GUI.md` |

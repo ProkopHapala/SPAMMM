@@ -1,7 +1,7 @@
 ---
 type: Strategy
 title: SPAMMM Architecture Roadmap — High-Level Decisions & Plans
-tags: [architecture, roadmap, gui, gridff, pyscf, presentation, reactive-ff, mol-browser]
+tags: [architecture, roadmap, nc-AFM, afm, gui, gridff, pyscf, presentation, reactive-ff, mol-browser]
 ---
 
 # SPAMMM Architecture Roadmap
@@ -9,7 +9,61 @@ tags: [architecture, roadmap, gui, gridff, pyscf, presentation, reactive-ff, mol
 High-level architectural decisions, plans, and notes that must not be forgotten.
 This document captures strategic direction — for implementation status see
 `FeatureChecklist.md`, for agent task tracking see `doc/ToDo/ToDo.agents.md`,
-for comprehensive audit see `doc/ToDo/Features.audit.md`.
+for comprehensive audit see `doc/ToDo/Features.audit.md`, for import tasks see
+`doc/Tasks/RepoConsolidation.md`.
+
+---
+
+## TOC — nc-AFM conference priorities (next ~week)
+
+**Deadline context:** nc-AFM conference within about one week. Focus = **AFM demos & analysis**, not optics / Cosserat / Dyson research.
+
+Executive summary from recent git (high level): FDBM PP-AFM sped up (fused Poisson, GPU pad/scale); LFF projective relax added; FAF substrate wired into fused UFF/SPFF; FoldedRigid GUI for interactive adsorbate motion; contact-surface quasi-2D AFM prototype; prolonged DFTB projection basis fitted vs pySCF/GPAW (`c4b092d`).
+
+| Pri | Topic | Status (now) | Conference ask | Key modules / docs |
+|-----|--------|--------------|----------------|--------------------|
+| **P0** | Prolonged DFTB radial basis (AFM + STM tails) | **In repo** — SA/Slater-tail + **PTCDA AFM strip vs stock 3ob** (2026-07-20); L0 + GUI WFC switch still open | Quantify tails; wire prolonged WFC in FDBM/STM | `basis_optimizer.py`; `optimize_basis.py --ref-rho`; `testplot_fdbm_relax.py --ptcda-stock-vs-sa`; `doc/DFTB_basis_fit.md`; `doc/Reports/PTCDA_FDBM_prolonged_basis.md`; `FOR_PRESENTATION.md` |
+| **P0** | Molecule-on-surface relaxation (FAF / LFF / UFF+SPFF) | **Major recent progress** — fused FAF in UFF/SPFF; LFF bring-up; PTCDA@NaCl harness; GUI FoldedRigid (still “fishy”) | Stable, showable PTCDA (or flat PAH) adsorbate relax + instant GUI feel | `kernels/UFF.cl`, `SPFF.cl`, `LFF.cl`, `surface.cl`; `spammm/forcefields/LFFSolver.py`, `MolecularDynamics.py`; `spammm/surfaces/FoldedRigid.py`; GUI `FoldedRigidExtension.py`, `FFExtension`; harness `tests/test_relax_ptcda_faf.py`, `test_relax_flat1.py`; docs `doc/Tasks/PerfBenchmark_Relaxation.md`, `doc/Topics/ForceFields/LFF_ProjectiveRelax.md`; open: charge dial-back, LFF polish, GUI combo |
+| **P1** | `pip install` / packaging | **Missing** — no `pyproject.toml` / `setup.py` yet (`FeatureChecklist.md`) | `pip install -e .` works; kernels + data findable; short README install | Task `doc/Tasks/PipInstall_Packaging.md`; package `spammm/`; kernels `kernels/`; data under package or package-data |
+| **P1** | Kriging / RBF z-scan → GridFF | **Not in SPAMMM yet** — full stack in ppafm | Port enough to demo DFT-sample → regular GridFF → PP image | Task `doc/Tasks/Import_KrigingGridFF.md`; export `/home/prokop/git/ppafm/docs/export/interpolation.export.md`; SPAMMM GridFF consumers `spammm/surfaces/GridFF.py`, `spammm/SPM/AFM.py` |
+| **P1** | PME / charge rings / Hubbard–MQCA | Export docs + FireCore/ppafm OpenCL; **not consolidated in SPAMMM** | Bring OpenCL solvers into SPAMMM for a showable xy/xV slice | Task `doc/Tasks/Import_ChargeRings_PME.md`; `/home/prokop/git/ppafm/docs/export/charge_rings.export.md`; `/home/prokop/git/FireCore/doc/Topics/ManyBody/MQCA_Hubbard_Ising.export.md` |
+| **P2** | Frenkel Hamiltonian (TEPL / tip molecule + surface aggregate) | **Ideas only** — no `spammm/` module yet | Post-conference unless surplus time | Design chat `doc/Ideas/FrenkelRigidFF.chat.md`; would sit on rigid/FoldedRigid geometry + GPU dense eigen (~(N+1)m) |
+| **P3** | Quasi-2D / 2.5D contact-surface AFM (+ later flexible) | **Prototype in repo** — separable + PIC GPU; PP scan path; elastic Phase 2 designed not finished | Nice-to-have speed story; flexible = later | `kernels/contact_surface.cl`; `spammm/surfaces/ContactSurface.py`; `spammm/SPM/AFM.py` (`fit_contact_surface`, `run_scan_contact`); tests `tests/SPM/test_afm_contact_surface.py`, `tests/testplot_contact_surface.py`; design `doc/Topics/AFM/ContactSurface_Static.md`, `ContactSurface_Elastic.md`; pitfalls `doc/Takeways.md` |
+| **P3** | Dyson orbitals (DFTB+) | Design chat only; Level-1 optional later | Skip for conference | `doc/Tasks/DysonOrbitals_DFTB_STM.md`, `doc/Dyson_orbitals_STM.chat.md` |
+| **P3** | OpenCL/JIT FF fit driver | Not started | Skip | `doc/Tasks/FF_Optimizer_OpenCL_Driver.md` |
+| **P3** | Stable Cosserat / cassette rods | Not started | Skip | `doc/Tasks/Import_CosseratRods_PTCDA.md` |
+
+### P0 detail — prolonged basis: do we already have it?
+
+**Yes.** Commit `c4b092d` (“improved basis for electron density projection from DFTB+ fitted on pySCF and GPAW”) plus:
+
+- Optimizer: `spammm/quantum/DFTB/basis_optimizer.py`
+- Design: `doc/DFTB_basis_fit.md`
+- Visuals: `tests/SPM/testplot_3ob_basis_tails.py` → `debug/plot_3ob_basis_tails/`
+- **2026-07-20 PTCDA campaign (USER review):** SA fit vs local pySCF ρ + FDBM CO-tip AFM strip stock **3ob** vs **SA-prolonged** — report `doc/Reports/PTCDA_FDBM_prolonged_basis.md`, slides `FOR_PRESENTATION.md`, gallery `debug/presentation.html`. Still open: L0 asserts + GUI/pipeline WFC switch (see task doc).
+
+### P0 detail — molecule on surface: current status
+
+Recent stack (git): `9d131d1` FAF in fast UFF/SPFF local kernels; `56caa68` LFF + more FDBM speed; `27db479`/`a56e3a0` FoldedRigid interactive GUI (usable but stability concerns).
+
+| Path | Ready? | Notes |
+|------|--------|-------|
+| SPFF/UFF + FAF fused multi-step | mostly | PTCDA harness; USER still reviewing charges / geometry (`debug/test_relax_ptcda_faf/`) |
+| LFF projective | bring-up done | Faster morphing candidate; GUI combo + polish open |
+| FoldedRigid GUI | demo-able | “Fishy” / slightly unstable — triage if used on stage |
+| Instant GUI relax (T02) | open | `PerfBenchmark_Relaxation.md` |
+
+### P1 detail — pip install
+
+Today the repo is typically run via `PYTHONPATH` / cwd. Goal: `pip install -e .` from a clean venv installs `spammm`, resolves deps (numpy, pyopencl, …), and locates `kernels/*.cl` + element/basis data without hardcoded absolute paths. See `doc/Tasks/PipInstall_Packaging.md`.
+
+### How agents should use this TOC
+
+1. Do **P0** before new feature imports.
+2. **P1** in parallel where possible: packaging + Kriging + PME (packaging unblocks demos for others).
+3. **P2** (Frenkel) only with explicit USER go-ahead during the conference week.
+4. **P3** (contact-surface, Dyson, Cosserat, FF-fit driver) — defer unless surplus time.
+5. Status tracking remains in `doc/ToDo/ToDo.agents.md`; do **not** mark Done without USER confirmation.
 
 ---
 
@@ -119,17 +173,20 @@ batch AFM on selected molecules, save from editor → browser refreshes.
 **Goal:** Make pySCF a first-class quantum backend, using our own modified pySCF
 optimized for SPM/FDBM workflows.
 
-**Current state:**
-- `spammm/quantum/pySCF_utils.py` — minimal (91 lines): basic SCF, geometry opt, density on grid
-- No test coverage
-- No integration with FDBM pipeline
+**Current state (2026-07-20):**
+- `spammm/quantum/pySCF_utils.py` — legacy minimal API (kept for parity; do not overwrite)
+- `spammm/quantum/pySCF_utils-new.py` — SSOT: `run_co_zscan` (DM warm-start), `make_z_grid`, `resolve_backend(auto→gpu|cpu)`
+- **One CLI:** `tests/SPM/run_zscan_reference.py` — method `pyscf_gpu_pbe` (GPU preferred, stock CPU fallback); legacy `pyscf_pbe`/`b3lyp` kept for Ez_FDBM parity
+- **Proven:** PTCDA CO rigid z-scans on RTX 3090; refs in `tests/ref_data/CO_scan_pyscf_gpu/`
+- **Report:** `doc/Reports/PySCF_GPU_CO_zscan_PTCDA.md`
+- Still open: density-grid FDBM backend, ModularPipeline hook, L0 pytest on refs
 
 **Plan:**
-1. Locate and integrate our modified pySCF (user has custom version optimized for this purpose)
+1. ~~Locate and integrate modified pySCF~~ — local fork + `pySCF_utils-new`
 2. Add density grid projection (analogous to `Grid_dftb.py` for DFTB+)
 3. Add pySCF as FDBM backend in `ModularPipeline.py` (alternative to DFTB+)
-4. Test: electron count, density comparison vs DFTB, z-scan reference curves
-5. The z-scan reference system already supports pySCF (`pyscf_pbe`, `pyscf_b3lyp`) — extend to full pipeline
+4. ~~Wire z-scan CLI~~ — `run_zscan_reference.py` + `pyscf_gpu_pbe`
+5. Small-mol stock pySCF (`pyscf_pbe`, `pyscf_b3lyp`) remains for Ez_FDBM; large mols use `pyscf_gpu_pbe`
 
 ---
 
@@ -490,8 +547,17 @@ Library stored as JSON or Python dict, loadable at runtime. Initial groups:
 
 ## Cross-References
 
-| Topic | This doc section | FeatureChecklist | ToDo.agents | Other docs |
-|-------|-----------------|-------------------|-------------|------------|
+| Topic | This doc | FeatureChecklist | ToDo.agents | Other docs / modules |
+|-------|----------|------------------|-------------|------------|
+| **nc-AFM priorities TOC** | §TOC (top) | — | Soon/Later | `doc/Tasks/RepoConsolidation.md` |
+| Prolonged DFTB basis (P0) | §TOC | §6 Quantum | Soon | `doc/DFTB_basis_fit.md`, `doc/Tasks/ProlongedRadialBasis_DFTB.md`, `spammm/quantum/DFTB/` |
+| Molecule@surface relax (P0) | §TOC, §5 | §2–3 FF/Surface | Soon | `doc/Tasks/PerfBenchmark_Relaxation.md`, `LFF_ProjectiveRelax.md`, `FoldedRigid*` |
+| **pip install (P1)** | §TOC | §8 Infra | Soon | `doc/Tasks/PipInstall_Packaging.md` |
+| Kriging → GridFF (P1) | §TOC | — | Soon | `doc/Tasks/Import_KrigingGridFF.md`, ppafm `interpolation.export.md` |
+| PME / charge rings (P1) | §TOC | — | Soon | `doc/Tasks/Import_ChargeRings_PME.md` |
+| Frenkel / TEPL (P2) | §TOC | — | Later | `doc/Ideas/FrenkelRigidFF.chat.md` only |
+| Contact surface 2.5D (P3) | §TOC | — | Later | `ContactSurface_*.md`, `kernels/contact_surface.cl`, `ContactSurface.py` |
+| Dyson / Cosserat / FF-fit (P3) | §TOC | — | Later | respective `doc/Tasks/*.md` |
 | Mol Browser | §1 | §7 GUI | Soon | `doc/Tasks/ToDO_GUI.md` |
 | pySCF | §2 | §6 Quantum | — | `spammm/quantum/pySCF_utils.py` |
 | Presentations | §3, §4 | — | — | — |

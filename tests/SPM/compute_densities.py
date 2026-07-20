@@ -59,16 +59,39 @@ def compute_density_dftb(atom_pos, atom_names, basis_name, step, margin, z_extra
     return result
 
 
-def compute_density_pyscf(atom_pos, atom_names, basis, xc, step, margin, z_extra):
-    """Compute rho_scf using pySCF via AFM_utils.get_density_from_pyscf.
-    Converts density from e/Bohr³ (pySCF internal) to e/Å³ for grid consistency."""
+def compute_density_pyscf(atom_pos, atom_names, basis, xc, step, margin, z_extra,
+                          prefer_backend='cpu', profile=None, skip_na=False, max_memory_mb=20000):
+    """Compute rho_scf using pySCF. GPU SCF when prefer_backend auto/gpu and available.
+
+    Density is returned in e/Å³. skip_na=True skips ρ_NA (enough for Pauli FDBM).
+    """
+    import importlib.util
     from spammm.SPM import AFM_utils as afm_utils
     BOHR_PER_ANG = 1.8897259886
     atom_types = np.array([ELEM_Z.get(n, 6) for n in atom_names], dtype=np.int32)
     method = 'RKS' if xc else 'RHF'
+
+    mf = dm = None
+    # Fast SCF via pySCF_utils-new when GPU (or DF CPU) wanted
+    if prefer_backend in ('auto', 'gpu', 'smalldft') or basis.upper().startswith('DEF2'):
+        spec = importlib.util.spec_from_file_location(
+            'pu', os.path.join(_ROOT, 'spammm', 'quantum', 'pySCF_utils-new.py'))
+        pu = importlib.util.module_from_spec(spec); spec.loader.exec_module(pu)
+        backend = pu.resolve_backend(prefer_backend if prefer_backend != 'cpu' else 'auto')
+        if prefer_backend == 'cpu':
+            backend = 'cpu'
+        atom_str = '\n'.join(f'{e} {p[0]:.10f} {p[1]:.10f} {p[2]:.10f}' for e, p in zip(atom_names, atom_pos))
+        print(f"  [SCF] backend={backend} basis={basis} xc={xc}")
+        mf = pu.make_rks(atom_str, basis=basis, xc=xc or 'PBE', backend=backend,
+                         profile=profile or pu.DEFAULT_GPU_PROFILE, max_memory_mb=max_memory_mb,
+                         df_storage='incore')
+        _, dm, cycles, wall = pu.run_scf(mf)
+        print(f"  [SCF] done cycles={cycles} wall={wall:.1f}s E={mf.e_tot:.6f} Ha")
+
     result = afm_utils.get_density_from_pyscf(
         atom_pos, atom_types, step=step, margin=margin, z_extra=z_extra,
-        basis=basis, method=method, xc=xc, verbosity=0)
+        basis=basis, method=method, xc=xc, verbosity=0,
+        skip_na=skip_na, use_df=True, mf=mf, dm=dm)
     # pySCF eval_rho returns density in e/Bohr³, convert to e/Å³
     result['rho_scf'] = result['rho_scf'] * (BOHR_PER_ANG ** 3)
     result['rho_na'] = result['rho_na'] * (BOHR_PER_ANG ** 3)
@@ -104,9 +127,11 @@ def main():
         print(f"Molecule: {mol_name} ({len(atom_names)} atoms)")
         print(f"{'='*60}")
 
-        # Use per-molecule method list
-        mol_methods = mol_info.get('methods', list(METHODS.keys()))
-        mol_methods = [m for m in mol_methods if m in method_names]
+        # Explicit --methods wins; otherwise use molecule default list
+        if args.methods == 'all':
+            mol_methods = [m for m in mol_info.get('methods', list(METHODS.keys())) if m in method_names]
+        else:
+            mol_methods = [m for m in method_names if m in METHODS]
 
         for method_name in mol_methods:
             if method_name not in METHODS:
@@ -132,14 +157,21 @@ def main():
                         atom_pos, atom_names, method['basis'],
                         step, margin, z_extra, work_dir)
                 elif method['type'] == 'pyscf':
+                    # Pauli FDBM needs ρ_scf only; skip expensive ρ_NA for large mols / GPU path
+                    skip_na = method_name.startswith('pyscf_gpu') or mol_name in ('PTCDA', 'pentacene', 'benzene')
                     result = compute_density_pyscf(
                         atom_pos, atom_names, method['basis'], method.get('xc'),
-                        step, margin, z_extra)
+                        step, margin, z_extra,
+                        prefer_backend=method.get('prefer_backend', 'cpu'),
+                        profile=method.get('profile'),
+                        skip_na=skip_na,
+                        max_memory_mb=method.get('max_memory_mb', 16000))
                 else:
                     print(f"  ERROR: Unknown method type {method['type']}")
                     continue
             except Exception as exc:
                 print(f"  ERROR: {exc}")
+                import traceback; traceback.print_exc()
                 continue
 
             rho_scf = result['rho_scf']

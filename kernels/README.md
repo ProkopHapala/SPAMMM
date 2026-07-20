@@ -19,6 +19,7 @@ OpenCL source for SPAMMM GPU compute. Python harnesses concatenate `.cl` snippet
 | `rigid.cl` | 6-DOF rigid body (GridFF + folded) | `forcefields/RigidBodyDynamics.py` |
 | `assembly.cl` | Multi-molecule rigid transforms + clash | `forcefields/Assembly.py` |
 | `AFM.cl` | Probe relaxation + AFM image generation | `SPM/AFM.py` |
+| `grids.cl` | Density project/downsample (dipole-preserving), Gaussian NA, axpy | `utils/GridsOCL.py` |
 | `LCAO_grid.cl` | LCAO density/orbital grid projection | `quantum/DFTB/Grid_dftb.py` |
 | `LCAO_STM.cl` | STM / Dyson equation | `quantum/DFTB/Grid_dftb.py` |
 | `lingebra.cl` | Batched small-matrix Jacobi eigh | `utils/Lingebra_ocl.py` |
@@ -39,6 +40,7 @@ Concatenation order matters. Typical stacks:
 | Surface Ewald | `common` + `Forces` + `surface` |
 | GridFF only | `common` + `Forces` + `gridFF` |
 | Contact surface | `common` + `Forces` + `contact_surface` |
+| Grids (density project) | `grids.cl` (standalone) |
 | LCAO / STM | `LCAO_grid` + `LCAO_STM` |
 | Assembly | `assembly` (standalone) |
 | Lingebra | `lingebra` (standalone) |
