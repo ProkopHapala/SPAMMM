@@ -1,4 +1,11 @@
 
+1) stable cassette rots for coarse grid ptcda (https://graphics.cs.utah.edu/research/projects/stable-cosserat-rods/)
+2) implement PPAFM kiring interactions 
+3) Monte Carlo layer Pauli master equations and charge rings 
+4) prolonged radial basis with DFTB+ (both STM and AFM)
+5) Dyson orbital with DFTB+?
+6) make a little pyOpenCl weave or jit or codon driver for forcefield optimization?
+
 
 # GUI
 
