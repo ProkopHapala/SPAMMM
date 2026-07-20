@@ -1,3 +1,5 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ProkopHapala/SPAMMM)
+
 # SPAMMM — FireCore
 
 **Scanning Probe Accelerated Modeling of Microscopy and Manipulation**
