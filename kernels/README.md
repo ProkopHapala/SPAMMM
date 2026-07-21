@@ -247,17 +247,32 @@ AFMulator adds `AFM.cl` for full scan stack.
 
 ## rigid.cl
 
-6-DOF rigid-body MD: 3 translational + 3 rotational (quaternion) DOFs per body. Substrate forces from GridFF (B-spline) or folded analytic basis. Quaternion integration uses exact exponential map with Taylor-series `sinc`/`cosc` for small-angle stability.
+6-DOF rigid-body dynamics / relaxation: 3 translational + 3 rotational (quaternion) DOFs per body. Substrate forces from GridFF (B-spline) or folded analytic basis. Quaternion integration uses exact exponential map with Taylor-series `sinc`/`cos` for small-angle stability.
 
-| Kernel | Role |
+### Folded-substrate kernels (compare these four)
+
+| Kernel | Optimizer | Parallelism | Hessian / solve |
+|--------|-----------|-------------|-----------------|
+| `rigid_body_folded_kernel` | MD / FIRE (velocities) | 1 WG / body, WG=32, atoms across threads | — |
+| `rigid_body_folded_replicas_kernel` | MD / FIRE | 1 thread / replica, WG=128 | — |
+| `rigid_body_folded_newton_kernel` | Pure Newton + LM trust | 1 WG / body, WG=32; H in `__local` | lid 0: GE 6×6 |
+| `rigid_body_folded_newton_replicas_kernel` | Pure Newton + LM trust | 1 thread / replica, WG=128; H private | per-thread GE 6×6 |
+
+**Newton does not diagonalize H** (no Jacobi). Algorithm: forward FD Hessian on `u=(Δx,Δθ_body)`, symmetrize, solve `(H+λI)Δ=G` with dense 6×6 Gaussian elimination + partial pivoting (`rigid_solve6_lm`), and trust-cap `‖Δ‖`. Accepted boundary steps grow trust and lower `λ`; rejection returns to at least `λ₀`. Replica float32 energy ties are accepted only when the force/torque residual decreases. Parallelism is spent on atoms/replicas — the 6×6 solve is serial (~216 flops).
+
+### Other kernels + helpers
+
+| Symbol | Role |
 |--------|------|
-| `rigid_body_dynamics_kernel` | Pairwise inter-body forces (LJ/Coulomb) + quaternion integration step. 1 thread = 1 body |
-| `rigid_body_gridff_kernel` | Substrate forces via GridFF B-spline sampling + quaternion step |
-| `rigid_body_folded_kernel` | Substrate forces via folded analytic basis (Fourier) + quaternion step |
+| `rigid_body_dynamics_kernel` | Generic E-field + anchor springs (no substrate potential) |
+| `rigid_body_gridff_kernel` | GridFF B-spline substrate + MD/FIRE |
+| `folded_eval_basis_rigid` / `folded_eval_grad_rigid` | One basis value / world ∇B |
+| `folded_FT_replica` | Full F, τ_body, E at one pose (replicas path) |
+| `folded_FT_perturb` | Same after ±eps along one of 6 DOFs (FD Hessian column) |
+| `rigid_solve6_lm` | `(A+λI)x=b` — GE + partial pivoting; return 0 if singular |
+| `rigid_update_FIRE` | Bitzek-style velocity zeroing + dt/damp adapt |
 
-Helpers: `quat_mult` (Hamilton product), `sinc_div_r2_taylor` (sin(x)/x² Taylor expansion for small x), `quat_factors_taylor` (quaternion-to-rotation Taylor factors).
-
-**Caveat:** Gyroscopic term ω×(I·ω) must use body-frame inertia tensor. WORKGROUP_SIZE assumption in atom loops can cause issues if local size ≠ expected.
+**Caveat:** Gyroscopic term ω×(I·ω) must use body-frame inertia. Folded setup scales both `I` and `I⁻¹` with the requested effective mass; changing translation alone is inconsistent. FIRE when `md_params.w < 0`. Python: `run_folded(..., fire=True)`, `run_folded_newton` / `run_folded_newton_replicas`; host FD Newton is `relax_newton_host` (debug only).
 
 ---
 

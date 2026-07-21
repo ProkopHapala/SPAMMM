@@ -13,6 +13,11 @@ Key functionality:
   - Stage 5: STM projection → LDOS maps at constant height
   - Stage 6: Bond-resolved STM → STM at AFM-relaxed tip positions
 
+  Dual basis (DFTB): prolonged/Slater-tail ρ is for Pauli ONLY; ES keeps stock
+  Δρ→V_ES. Never charge-normalize prolonged ρ (∫ρ ≉ N_e by design). See
+  make_slater_tail_species_list / doc/DFTB_basis_fit.md /
+  doc/Tasks/Import_KrigingGridFF.md.
+
 Role in SPAMMM: The AFM pipeline controller. Used by AFMExtension.py as the
 backend for all AFM/STM simulations. Backend-agnostic: supports DFTB (GPU
 projection) and pySCF (CPU evaluation).

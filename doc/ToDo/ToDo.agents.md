@@ -41,11 +41,14 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
 
 **P0 — conference critical**
 - [ ] **Prolonged DFTB radial basis (STM+AFM)** — analyze + wire existing fit (`basis_optimizer`, `testplot_3ob_basis_tails`); selectable WFC in projection (`doc/Tasks/ProlongedRadialBasis_DFTB.md`; `doc/DFTB_basis_fit.md`)
+  - **Tip-first SA (2026-07-21):** prolonged Slater is **even more important for the tip** than sample; fit systematically on CO guinea-pig; try SA for tip / sample / both — tip-only may suffice (precomputed, simpler). Dual basis: stock ES + prolonged Pauli; never charge-normalize prolonged ρ.
+- [ ] **All-electron Δρ (clamp → compact NA)** — CO tip guinea-pig first (`delta_rho_clamp_compact_na`); then sample. Distinguish all-e (Psi4/pySCF ∑Z) vs DFTB valence. See `Import_KrigingGridFF.md` §CO guinea-pig.
 - [ ] **Molecule-on-surface relax polish** — PTCDA+FAF USER review / charge dial-back; LFF GUI combo; FoldedRigid stability; instant GUI relax T02 (`doc/Tasks/PerfBenchmark_Relaxation.md`, `doc/Topics/ForceFields/LFF_ProjectiveRelax.md`)
 
 **P1 — packaging + AFM/STM demos**
 - [ ] **pip install / packaging** — `pyproject.toml`, kernels+data findable (`doc/Tasks/PipInstall_Packaging.md`)
 - [ ] **Kriging / RBF z-scan → GridFF** — port + FDBM-cube compare; **grid z/XY alignment is CRITICAL** (`doc/Tasks/Import_KrigingGridFF.md`; topic `doc/Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md`)
+  - CO guinea-pig for ES Δρ + tip prolonged Pauli (notes in task file)
 - [ ] **Charge rings PME + Hubbard/MQCA** — OpenCL into SPAMMM (`doc/Tasks/Import_ChargeRings_PME.md`)
 
 **P2 — secondary if time**

@@ -6,7 +6,9 @@
 **Human ToDo:** item 2  
 **Parent:** `doc/Tasks/RepoConsolidation.md`  
 **Export SSOT:** `/home/prokop/git/ppafm/docs/export/interpolation.export.md`  
-**Science / data map:** `doc/Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md`
+**Science / data map:** `doc/Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md`  
+**Campaign report (2026-07-20…21):** `doc/Reports/Kriging_DFT_vs_DFTB_FDBM_pyridine.md` — physics findings, tip×sample matrix, dual-basis rules, next experiments.  
+**Plot SSOT:** skill:`afm-plotting` (`spammm/SPM/AFM_utils.py` — arbitrary probe sites, tip/probe heights, FDBM z-layout, 3-row AFM).
 
 ## Objective
 
@@ -79,7 +81,7 @@ Even after far-field \(p_z\) fix and tip-clamp diagnosis, **cube-FDBM** still do
 | Pipeline | Density | NA | \(E_\mathrm{ES}@+3\) Å (COM) |
 |----------|---------|-----|------------------------------|
 | Kriging DFT z-scan | — | — | attractive halo (reference) |
-| FDBM **Psi4 cubes** + Gaussian NA (± clamp) | all-electron cusps | spherical Gaussians σ≈0.5 | **large / wrong morphology** |
+| FDBM **Psi4 cubes** + Gaussian NA (± clamp) | all-electron cusps | spherical Gaussians σ=0.3 (default; σ≳0.6 worsens V_ES) | **large / wrong morphology** |
 | FDBM **DFTB+** `get_density_from_dftb_dense` | valence AO projection | **DFTB ρ_NA** (orbital) | **~meV** (benzene & flat pyridine) |
 
 **Conclusion:** problem is **not** “pyridine physics” and **not** the PP relax path. It is **cube Δρ construction** (all-electron SCF − crude Gaussian NA on a ~0.1 a₀ / AFM grid), i.e. **core / cusp treatment**. DFTB never sees all-electron cores → ES stays small and sane.
@@ -129,24 +131,200 @@ Today: `testplot_fdbm_relax` CLI now takes **N/m** like the GUI. With 0.5 N/m 
 5. **K_LAT:** API internal = eV/Å²; human/GUI/test CLI = N/m. Print both.
 6. **Geometry:** verify molecule is flat in XY before AFM diagnostics.
 7. **Never mark Done** without USER confirmation + shown verification.
+8. **Prolonged Slater = Pauli only.** Never normalize prolonged ρ; never use it for ES. Dual basis is intentional.
+9. **Tip project margin:** crop CO tip with margin≲1 Å → fake \(q_{\Delta\rho}\sim-0.7\). Use ≥3–4 Å (or full AFM cell).
+10. **\(V_\mathrm{ES}\) ≠ \(E_\mathrm{es}\):** \(E_\mathrm{es}=\mathrm{tip}_{\Delta\rho}\otimes V\); similar \(V(z)\) can still give different \(E_\mathrm{es}\).
+11. **Probe sites:** “opposite C” = farthest **carbon** from N, never farthest of all atoms (that is para-H). Always print `xy=` on plot titles.
+12. **CRITICAL — `aspect='equal'`** on every spatial density/potential `imshow` (1 Å x = 1 Å y/z). Never `aspect='auto'`. Tip maps: molecular frame before pad+roll; mark 1D cut on 2D. See `NOTE_plot_axis_equal.out`.
 
 ---
 
+### 2026-07-21 morning — GUI vs agent DFTB images (resolved mismatch)
+
+USER: GUI pyridine AFM looks reasonable; agent strips looked wrong / too soft.
+
+**Cause (not density, not K_LAT):** agent scripts used `PAULI_FITTED_DEFAULTS['mio-1-1']` = **A=155.33, β=1.5507**, while GUI spinboxes still ship **old** pentacene defaults **A=787.22, β=1.2371** (`AFMExtension.py`). Same ModularPipeline + flat pyridine:
+
+| Setting | df range @ GUI heights 2.8–3.6 |
+|---------|--------------------------------|
+| GUI A=787 | `[−0.10, +1.02]` — atomic PP contrast |
+| Fitted A=155 | `[−0.22, ~0]` — mostly attractive blob |
+
+Also: GUI heights **2.8–3.6** (not 2.0–5.5); `compose_and_relax_total` **L=4.0 Å**; GUI `compute_df` (not `compute_df_amp`). With GUI match: `|dr|_max`≈0.5–0.9 Å at 0.5 N/m — bending present, not “too soft”.
+
+Artifacts: `debug/afm_fdbm_diag_pyridine_gui_match/`  
+**Action:** sync GUI spinbox ↔ `PAULI_FITTED_DEFAULTS` (USER pick which is SSOT); diagnostics must call **ModularPipeline with GUI params** when comparing to GUI.
+
+### 2026-07-21 — Consistent same-tip compare + prolonged dual basis + CO tip / ES bend
+
+USER liked `zprofiles_CONSISTENT_DFTB_pySCF_Kriging.png` (same Mithun `CO_O` tip; Pauli \(A,\beta\) fit to Kriging). Status stays **investigating**.
+
+#### Dual basis / prolonged Slater (USER correction — SSOT)
+
+**Wrong agent assumption (do not repeat):** rejecting prolonged ρ because \(q\approx322\neq N_e\), or trying to charge-normalize it, or using prolonged ρ for ES.
+
+**Correct design (practical DFTB AFM trick):**
+
+| Channel | Density | Rule |
+|---------|---------|------|
+| **ES** | stock short-basis Δρ → \(V_\mathrm{ES}\) | multipoles / neutrality must stay physical |
+| **Pauli only** | prolonged / SA Slater projection of **same** SCF DM | long vacuum tails; **never** rescale ∫ρ |
+
+- Prolonged ∫ρ is **not** meant to equal \(N_e\). Pauli \(A(\int\rho_s\rho_t)^\beta\) cares about **local** overlap; \(A,\beta\) absorb scale.
+- Dual basis looks inconsistent but is intentional: improve short-basis DFTB AFM tails **without** re-SCF and **without** corrupting ES.
+- Code comments: `make_slater_tail_species_list`, `get_density_from_dftb_dense(... projection_basis_ang=...)`, `testplot_fdbm_relax --ptcda-stock-vs-sa`, `doc/DFTB_basis_fit.md`, `doc/Tasks/ProlongedRadialBasis_DFTB.md`.
+
+#### CO tip: DFTB pipeline vs Mithun `CO_O` (deep compare)
+
+Artifacts: `debug/afm_fdbm_diag_pyridine_gui_match/COtip_DFTB_vs_Mithun_{XY_cuts,zprofiles,XZ}.png`, `SUMMARY_COtip_compare.out`.
+
+| Quantity | DFTB pipeline tip | Mithun `CO_O` (compact NA, margin≥3 Å project) |
+|----------|-------------------|--------------------------------------------------|
+| \(q_\mathrm{tot}\) | ≈ **10** (valence; expected) | ≈ **14** (all-electron) |
+| \(q_{\Delta\rho}\) | ≈ −0.015 | ≈ 0 (native cube) |
+| \(p_z\) (rolled) | ≈ +0.15 | ≈ +0.022 |
+| \(\|\Delta\rho\|\) peak | mild (~1) | huge nuclear cusps (~10²–10³ on native; ~15 on 0.1 Å grid) |
+| \(\rho_\mathrm{tot}\) support | soft valence on ~8 Å tip box | compact cube ~4.2×4.2×5.4 Å — **OK**, density ≠ box edge |
+
+**CORRECTION (USER right):** Mithun CO cubes are **not** “cut mid-tail”. Agent plotted a window past the cube (`z_O+4` > cube top ≈ `z_O+3.3`) and called exterior zeros “truncation” — that was **agent display fault**, not Mithun. Native check: density does not touch any face; ~1 Å vacuum margin. See `COtip_Mithun_NATIVE_cubes_CO_O_CO_C.png`, `NOTE_Mithun_cube_NOT_truncated.out`.
+
+**Cropping trap (separate, real):** projecting tip onto a **tight** bbox (`margin=1` Å) dropped \(q_{\Delta\rho}\) to **≈ −0.71** (fake monopole). **`margin≥3` Å** or full AFM cell restores neutrality. pad+roll itself does not cut charge if dest ≥ tip support.
+
+Always plot tip diagnostics in **native / molecular frame** with cube boundary drawn; never claim truncation without checking density-vs-edge.
+
+#### Remaining ES problem (same tip, still serious)
+
+With **same** Mithun `CO_O` tip, Pauli can look similar after \(A,\beta\) fit, but **\(E_\mathrm{es}\)** still differs: pySCF bends attractive much sooner than DFTB while **\(V_\mathrm{ES}(z)\)** along the axis looks only moderately different (both repulsive over N).
+
+Tip↔sample swap on one cell (`Ees_tip_sample_swap.png`, tip project margin=4, \(q_{\Delta\rho}\approx0\)):
+
+| \(E_\mathrm{es}\) @ N, \(z=2\) Å | Mithun tip Δρ | DFTB tip Δρ |
+|----------------------------------|---------------|-------------|
+| **pySCF** sample \(V\) | **≈ −0.48 eV** (bend) | ≈ −0.06 eV |
+| **DFTB** sample \(V\) | ≈ +0.01 eV | ≈ −0.06 eV |
+
+**Verdict:** the early attractive bend is **not** explained by tip monopole alone (that was the margin=1 artifact). It is the **coupling** of cuspy all-electron tip Δρ with pySCF/cube sample \(V\) near field. Soft DFTB tip × either \(V\), or Mithun tip × DFTB \(V\), stay mild. So fixing ES requires tip and/or sample Δρ/NA treatment on the cube path (core clamp / better NA / ESP.cube), not only “use same tip”.
+
+#### Probe-site bug (V_ES “sign flip” over C — 2026-07-21)
+
+USER correctly flagged: `Ees_tip_sample_swap.png` bottom-right \(V\) over “opposite C” was **negative**, while `samecell_V_ES_zprofiles_rc_compact_sweep.png` over opposite C was **positive** (DFTB). **This was NOT a Poisson sign change.**
+
+| Plot | Site actually sampled | \(V_\mathrm{DFTB}@1.7\) (zero@8 Å) |
+|------|----------------------|-------------------------------------|
+| samecell | para-**C** `xy≈(0.00, 1.09)` atom i=3 | **+0.10** |
+| Ees_swap (buggy) | para-**H** `xy≈(0.00, 0.00)` atom i=8 | **−0.15** |
+
+Cause: `argmax` distance from N among **all** atoms picks the para-H, not the ring carbon. SSOT: farthest **carbon** (`Z==6`) from N — same as `_probe_sites` in `testplot_kriging_vs_fdbm_cube.py`.
+
+Fixed `Ees_tip_sample_swap.png` now labels XY and includes a diagnosis panel (para-C vs para-H). Tip density maps: `COtip_DFTB_vs_Mithun_rho_drho.png` (ρ + Δρ z-profiles and XZ for both tips).
+
+#### Same-cell / NA notes (earlier same day, still valid)
+
+- Far-field \(V_\mathrm{ES}\) zero at \(z\sim8\) Å; Gaussian \(\sigma_\mathrm{NA}\gtrsim0.6\) puts NA into tip region; default \(\sigma=0.3\); compact core \(r_c\le1\) flat for tip \(z\ge2\).
+- Do not confuse \(V_\mathrm{ES}\) plots with FDBM \(E_\mathrm{es}=\mathrm{tip}_{\Delta\rho}\otimes V\).
+
+### CO guinea-pig (2026-07-21) — Δρ recipe + tip Slater
+
+**Why CO:** smallest tip with real multipoles; native cubes OK (`CO_O`/`CO_C`); DFTB CO valence tip in cache. Debug algorithms here **before** pyridine/sample.
+
+**Distinguish densities:**
+
+| Kind | Source | ∫ρ |
+|------|--------|-----|
+| **All-electron** | Psi4/pySCF Mithun cubes | ≈ ∑Z (CO: 14) |
+| **DFTB valence** | `get_tip_densities` / Grid_dftb | ≈ ∑Z_val (CO: 10) |
+
+#### (1) All-electron Δρ — soft-clamp then compact NA (in progress)
+
+Code: `AFM_utils.soft_clamp_rational`, `delta_rho_clamp_compact_na`, compact profile `f=(1-(r/r_c)^2)^2` (`profile='r2'`).
+
+1. Soft-clamp nuclear spikes: USER rational clamp (`y1`, `y2`) — same math as `test_utils.soft_clamp`.
+2. Per nucleus, \(Q_{\mathrm{rem},i}=\int(\rho-\rho_c)\,dV\) inside sphere \(R\sim0.5\)–\(0.7\) Å.
+3. Build ρ_NA with \(f=(1-(r/r_c)^2)^2\), charges so ∫ρ_NA = ∫ρ_c (“NA charge − clamped charge”); Δρ = ρ_c − ρ_NA.
+4. **Neutrality:** |∫Δρ| must be ~0 (CO tip first run: \(|Q_{\mathrm{diff}}|\sim2\times10^{-7}\)).
+5. Plot vs DFTB valence Δρ on a **common valence axis** (ignore core spikes in the view).
+
+Artifact: `debug/afm_fdbm_diag_pyridine_gui_match/COtip_delta_rho_clamp_compact_vs_DFTB.png`.  
+
+#### Sample pyridine / N-h — same recipe → V_ES, E_ES (2026-07-21)
+
+Applied `delta_rho_clamp_compact_na` to Mithun `N-h` (∑Z=42 → Q_clamped≈30.6, |∫Δρ|≈1×10⁻⁷). Then Poisson → V_ES; E_es = tip_Δρ ⊗ V.
+
+Artifacts: `sample_clamp_NA_Ves_Ees.png`, `sample_delta_rho_clamp_vs_DFTB.png`, `SUMMARY_sample_clamp_Ves_Ees.out`.
+
+| Combo @ N, z=2 Å | E_es |
+|------------------|------|
+| DFTB_V ⊗ DFTB_tip | ≈ +0.02 eV |
+| **clamp_V ⊗ DFTB_tip** | ≈ −0.03 eV (mild — close to DFTB) |
+| clamp_V ⊗ clamp_tip | ≈ −0.47 eV (still bends) |
+| raw_V ⊗ raw_tip | ≈ −0.48 eV (old bend) |
+
+**Reading:** sample clamp makes V usable with a soft (DFTB) tip. The remaining E_es bend is still dominated by **cuspy all-e tip Δρ**, not sample V alone. Tip clamp params need more work (or use DFTB/prolonged tip for ES).
+
+#### FDBM recompute from cubes (Pauli=full ρ, ES=Δρ) — 2026-07-21
+
+Pipeline on `N-h` + `CO_O`:
+- **Pauli:** full `ρ_scf` sample ⊗ tip (no NA subtraction)
+- **ES:** `delta_rho_clamp_compact_na` on **both** sample and tip → \(V=\mathrm{Poisson}(\Delta\rho_s)\), \(E_\mathrm{es}=\Delta\rho_t\otimes V\)
+- Pauli \(A=11.05\), \(\beta=0.85\) (prior contact fit; not re-tuned here)
+
+Artifacts: `FDBM_cube_clamp_VES_maps_zprofiles.png`, `FDBM_cube_clamp_VES_and_channels.png`, `FDBM_cube_clamp_fields.npz`.
+
+@ z=2 Å over N: \(V\approx+0.56\), \(E_\mathrm{Pauli}\approx+1.56\), \(E_\mathrm{es}\approx-0.47\) (tip clamp still drives ES bend), \(E_\mathrm{tot}\approx+0.83\).
+
+#### Tip apex charge / V sign (USER 2026-07-21) — investigating
+
+**Poisson convention:** `fft_poisson` does \(V_k=+4\pi C\,\rho_e/k^2\) — treats **electron** Δρ as if it were **positive charge**. So:
+- \(V_\mathrm{code}>0\) over electronegative sites (N: electron excess) 
+- True electric potential \(\phi\) (where **+ attracts e−**) is \(\phi\approx -V_\mathrm{code}\)
+
+Site ordering @ z=2 (code): \(V_N=+0.56 > V_C=+0.15 > 0 > V_H=-0.11\) — electronegativity N>C, H δ+ is correct in this convention.
+
+**CO tip problem:** vacuum side of O (toward sample) has \(\langle\Delta\rho_e\rangle<0\) for both raw and clamp tip → electron **depletion** → apex acts as **δ+**, not δ−. Hence \(E_\mathrm{es}<0\) (attractive) over N — opposite of expected δ− tip repulsion from electronegative N. Classic PP CO tip uses tipQs apex ≈ −0.1.
+
+Artifacts: `FDBM_vs_Kriging_tip_charge_diagnosis.png`, `FDBM_vs_Kriging_tip_sign_flip.png` (E_es with \(-\Delta\rho_\mathrm{tip}\)), includes **para-H** probe.
+
+#### Tip × sample matrix + canonical z-layout (2026-07-21)
+
+**Always label tip and sample separately.** Previous “DFT” / “DFTB” figures were **matched** pairs:
+
+| Label | Sample | Tip |
+|-------|--------|-----|
+| DFT×DFT | Mithun `N-h` cube (clamp Δρ → \(V_\mathrm{ES}\); full ρ Pauli) | Mithun `CO_O` cube (clamp Δρ ES; full ρ Pauli) |
+| DFTB×DFTB | DFTB pyridine stock Δρ | DFTB CO (`get_tip_densities(..., backend='dftb')`) |
+
+**Cross** (same Pauli split; A,β still sample-matched — may need re-fit after tip swap):
+
+| Cross | Layout artifact |
+|-------|-----------------|
+| DFT-sample × DFTB-tip | `FDBM_sampDFT_tipDFTB_vs_Kriging_layout.png` |
+| DFTB-sample × DFT-tip | `FDBM_sampDFTB_tipDFT_vs_Kriging_layout.png` |
+
+Tip-swap overlays (fixed sample): `FDBM_cross_DFTsample_tipswap_4panel.png`, `FDBM_cross_DFTBsample_tipswap_4panel.png`. Note: `NOTE_tip_sample_combos.out`.
+
+**Plot SSOT (do not reinvent):** `spammm.SPM.AFM_utils.plot_fdbm_vs_kriging_zlayout` / `plot_fdbm_methods_zcompare_4panel` / `fdbm_probe_sites_nch`. Skill:`afm-plotting`. Normalization E−E(6), V−V(8); top=sites overlapped, bottom=per-site channels ±0.1 eV.
+
+#### (2) Prolonged Slater for Pauli — tip first
+
+Prolonged STOs today mostly on **sample**. USER: tip is **more** important for Pauli overlap. Systematic SA on CO tip (tip / sample / both); tip-only precomputed may be enough. Dual basis unchanged — see `ProlongedRadialBasis_DFTB.md`, `DFTB_basis_fit.md`.
+
 ### Open issues (priority)
 
-1. **P0 — Cube / pySCF(all-electron) Δρ for ES**  
-   Replace or fix NA: better NA (basis-projected), ESP.cube path, Voronoi/core mask, or don’t use Gaussian NA on cuspy grids. Prove ES matches DFTB order of magnitude on same geometry (flat pyridine) before trusting Kriging compare.
+1. **P0 — All-electron Δρ clamp→compact NA (CO tip)**  
+   Tune clamp/NA params until Δρ matches DFTB valence morphology on common axis; then port to sample. Wire into `build_fdbm_grid_from_cubes`.
 
-2. **P0 — Tip ES recipe**  
-   Raw tip Δρ + shared roll; confirm CO monopole~0, small dipole preserved through project.
+2. **P0 — Tip prolonged Slater SA**  
+   Fit prolonged tip ρ for Pauli; compare tip-only vs tip+sample vs sample-only.
 
-3. **P1 — Retune PP \(K_\mathrm{lat}\)** after N/m fix (USER: too soft at 0.5 N/m in latest images).
+3. **P0 — Cube / pySCF \(E_\mathrm{es}\) bend** (same tip)  
+   Revisit after (1); was cuspy tip Δρ ⊗ pySCF \(V\).
 
-4. **P1 — Pauli \(A,\beta\) for CO_O** vs Kriging contact; store separately from Gaussian-tip defaults.
+4. **P1 — Prolonged Pauli properly** (sample path)  
+   Stock \(V_\mathrm{ES}\) + prolonged ρ; fit \(A,\beta\); **no** ∫ρ rescale.
 
-5. **P2 — L0 gradient parity** for Kriging GridFF; Fukui 4th channel deferred.
+5. **P1 — Sync Pauli defaults** GUI vs `PAULI_FITTED_DEFAULTS`.
 
-6. **P2 — Attractive halo** at \(z\gtrsim3\): once ES sane, revisit vdW / BSSE vs DFT.
+6. **P2 — L0 gradient parity** / Fukui 4th channel / attractive halo.
 
 ---
 

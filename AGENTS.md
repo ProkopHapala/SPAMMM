@@ -49,3 +49,4 @@ SPAMMM (Scanning Probe Accelerated Modeling of Microscopy and Manipulation) is a
 - `doc/AGENTS/skills/` — all skills; `doc/AGENTS/protocols/` — domain protocols
 - `README.md` per folder — local index; `CODEMAP.md` — repo structure
 - Visualization: separate compute from plotting; `plt.show()` only in CLI/main
+- **AFM E/Fz/df plots (SSOT):** never ad-hoc `imshow`/`plot` for energy, force, or df maps/z-profiles — use `spammm.SPM.AFM_utils` (`imshow_afm`, `plot_afm_height_panel`, `plot_afm_z_profiles`, `save_afm_images`, `plot_grid_Fz`). **FDBM vs Kriging / tip×sample z-diagnostics:** `plot_fdbm_vs_kriging_zlayout`, `plot_fdbm_methods_zcompare_4panel`, `fdbm_probe_sites_nch` (E−E(6), V−V(8); top=sites overlapped, bottom=per-site channels). See skill:`afm-plotting`. Generic 2D scalars → skill:`centralized-plotting` (`plotUtils.plot_2d_scalar`).

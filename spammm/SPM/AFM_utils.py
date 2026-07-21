@@ -8,6 +8,7 @@ orchestration on top of AFM.py's pure physics.
 
 Key functionality:
   - Plotting: AFM frequency shift maps, tip trajectories, orbital densities
+  - FDBM vs Kriging z-layout SSOT: plot_fdbm_vs_kriging_zlayout(), plot_fdbm_methods_zcompare_4panel()
   - Density providers: get_density_from_dftb(), get_density_from_pyscf(), get_density_from_cube()
   - CO tip: _co_tip_cache_dir(), _compute_co_tip_subprocess()
   - FDBM helpers: fft_poisson(), compute_pauli_field(), compute_es_conv_field()
@@ -41,49 +42,449 @@ def safe_norm(data_2d, pct=99):
     return TwoSlopeNorm(vmin=-vabs, vcenter=0, vmax=vabs)
 
 
+def scan_extent(scan_xs, scan_ys):
+    """[xmin,xmax,ymin,ymax] for imshow from 1D scan axes."""
+    return [float(scan_xs[0]), float(scan_xs[-1]), float(scan_ys[0]), float(scan_ys[-1])]
+
+
+def imshow_afm(ax, arr_nxny, extent=None, cmap='bwr', symmetric=True, pct=99, title='', colorbar=True, transpose=True):
+    """SSOT: one AFM XY map. `arr_nxny` is (nx,ny) scan layout; transposed for imshow by default.
+
+    Returns the AxesImage. Prefer this over raw `ax.imshow(...)` for E/Fz/df maps.
+    """
+    data = np.asarray(arr_nxny).T if transpose else np.asarray(arr_nxny)
+    kw = dict(origin='lower', cmap=cmap, aspect='equal')
+    if extent is not None: kw['extent'] = extent
+    if symmetric:
+        kw['norm'] = safe_norm(data, pct=pct)
+    im = ax.imshow(data, **kw)
+    if title: ax.set_title(title)
+    if colorbar: plt.colorbar(im, ax=ax, shrink=0.7, fraction=0.04, pad=0.02)
+    return im
+
+
+def plot_afm_height_panel(data, heights, iz=None, extent=None, label='Fz', cmap='bwr', fname=None, save_dir='.', figsize_col=2.8, dpi=150, ylabel=None, transpose=True):
+    """SSOT: row of XY maps at selected heights. `data` is (nx,ny,nz).
+
+    Args:
+        data: (nx, ny, nz) E/Fz/df volume
+        heights: (nz,) probe heights [Å]
+        iz: list of z-indices (default: evenly spaced up to 6)
+        extent: [xmin,xmax,ymin,ymax] or None
+        label / ylabel: figure / left-axis label
+        fname: if set, save under save_dir and close
+    Returns:
+        fig, axes
+    """
+    nz = data.shape[2]
+    if iz is None:
+        n = min(6, nz)
+        iz = list(np.linspace(0, nz - 1, n, dtype=int))
+    else:
+        iz = [i for i in iz if 0 <= i < nz]
+    fig, axes = plt.subplots(1, len(iz), figsize=(figsize_col * len(iz), figsize_col), squeeze=False)
+    axes = axes[0]
+    for ax, i in zip(axes, iz):
+        h = float(heights[i]) if heights is not None else float(i)
+        imshow_afm(ax, data[:, :, i], extent=extent, cmap=cmap, title=f'h={h:.1f}Å', transpose=transpose)
+        ax.tick_params(labelsize=5)
+    if ylabel or label:
+        axes[0].set_ylabel(ylabel or label, fontsize=8)
+    fig.suptitle(label, fontsize=11)
+    fig.tight_layout()
+    if fname is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, fname)
+        fig.savefig(path, dpi=dpi, bbox_inches='tight'); plt.close(fig)
+        print(f"  Saved {path}")
+    return fig, axes
+
+
+def plot_afm_df_Fz_tworow(
+    df_relax, Fz_unrelax, heights_tip, heights_probe, extent=None, *,
+    title=None, bond_length=None, cmap_df='gray', cmap_Fz='seismic',
+    figsize_col=2.0, dpi=140, fname=None, save_dir='.', apos=None, Fz_relax=None,
+):
+    """Backward-compat wrapper → `plot_afm_Fz_df_threerow` (omit Fz_relax for 2-row)."""
+    return plot_afm_Fz_df_threerow(
+        Fz_unrelax, Fz_relax, df_relax, heights_tip, heights_probe, extent=extent,
+        title=title, bond_length=bond_length, cmap_df=cmap_df, cmap_Fz=cmap_Fz,
+        figsize_col=figsize_col, dpi=dpi, fname=fname, save_dir=save_dir, apos=apos,
+    )
+
+
+def plot_afm_Fz_df_threerow(
+    Fz_unrelax, Fz_relax, df_relax, heights_tip, heights_probe, extent=None, *,
+    title=None, bond_length=None, amp=None, cmap_df='gray', cmap_Fz='seismic',
+    figsize_col=1.85, dpi=140, fname=None, save_dir='.', apos=None,
+):
+    """SSOT: up to 3×nz panel — Fz_unrelax / Fz_relax / df at probe plane.
+
+    Tip / lever: column i has tip-apex `heights_tip[i]`, probe `heights_probe[i]` (= tip − L).
+    All maps at the **probe** plane. Pass `Fz_relax=None` to skip the middle row (2-row mode).
+
+    Row order (top→bottom): Fz unrelax (GridFF) · Fz relax (PP OutFz) · df (amp-averaged).
+    """
+    nz = int(Fz_unrelax.shape[2])
+    assert len(heights_tip) == nz and len(heights_probe) == nz
+    rows = [('Fz unrelax', Fz_unrelax, cmap_Fz)]
+    if Fz_relax is not None:
+        assert Fz_relax.shape[2] == nz
+        rows.append(('Fz relax', Fz_relax, cmap_Fz))
+    if df_relax is not None:
+        assert df_relax.shape[2] == nz
+        rows.append(('df relax', df_relax, cmap_df))
+    nrows = len(rows)
+    fig, axes = plt.subplots(nrows, nz, figsize=(figsize_col * nz, 2.15 * nrows), squeeze=False)
+    Lnote = f'  L={float(bond_length):.2f}Å' if bond_length is not None else ''
+    Anote = f'  amp={float(amp):.2f}Å' if amp is not None else ''
+    if title is None:
+        title = f'Fz unrelax / Fz relax / df{Lnote}{Anote}'
+    fig.suptitle(title, fontsize=9)
+    for i in range(nz):
+        ht, hp = float(heights_tip[i]), float(heights_probe[i])
+        for row, (ylab, arr, cmap) in enumerate(rows):
+            ax = axes[row, i]
+            imshow_afm(ax, arr[:, :, i], extent=extent, cmap=cmap, colorbar=(i == nz - 1),
+                       title=(f'tip={ht:.1f}  probe={hp:.1f}' if row == 0 else ''),
+                       transpose=True)
+            if apos is not None:
+                ax.plot(apos[:, 0], apos[:, 1], 'c.', ms=1.2, alpha=0.55)
+            ax.set_xticks([]); ax.set_yticks([])
+            if i == 0:
+                ax.set_ylabel(ylab, fontsize=8)
+    fig.tight_layout()
+    if fname is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, fname)
+        fig.savefig(path, dpi=dpi, bbox_inches='tight'); plt.close(fig)
+        print(f"  Saved {path}")
+    return fig, axes
+
+
+def plot_afm_z_profiles(z, profiles, xlabel='z [Å]', ylabel='value', title=None, fname=None, save_dir='.', ax=None, dpi=150):
+    """SSOT: 1D E(z) / Fz(z) / df(z) curves.
+
+    Args:
+        z: (nz,) heights
+        profiles: dict name->1d array, or list of (y, label, plot_kwargs)
+        fname: if set, save under save_dir and close
+    Returns:
+        fig, ax
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+    else:
+        fig = ax.figure
+    if isinstance(profiles, dict):
+        items = [(y, name, {}) for name, y in profiles.items()]
+    else:
+        items = []
+        for p in profiles:
+            if len(p) == 2: items.append((p[0], p[1], {}))
+            else: items.append((p[0], p[1], p[2]))
+    for y, lab, kw in items:
+        ax.plot(z, y, label=lab, **kw)
+    ax.axhline(0, color='k', lw=0.5)
+    ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+    if title: ax.set_title(title)
+    ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
+    fig.tight_layout()
+    if fname is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, fname)
+        fig.savefig(path, dpi=dpi, bbox_inches='tight'); plt.close(fig)
+        print(f"  Saved {path}")
+    return fig, ax
+
+
+# ── Canonical FDBM vs reference z-layout (arbitrary probe sites) ───────────────
+# SSOT for diagnostic E(z)/V(z) panels (Import_KrigingGridFF / DFT↔DFTB).
+# Normalization: E − E(z=6 Å), V − V(z=8 Å). Yellow band marks z ≥ z_well.
+#
+# Tip / probe (PP lever): tip_z = probe_z + bond_length. AFM GridFF / FDBM volumes
+# are sampled at the **probe** (O apex) plane. df uses oscillation amp (peak) so
+# closest approach ≈ probe_z − amp — see skill:afm-plotting.
+
+_DEFAULT_SITE_COLORS = ('tab:blue', 'tab:green', 'tab:purple', 'tab:orange', 'tab:red', 'tab:brown', 'tab:pink', 'tab:cyan')
+
+
+def normalize_probe_sites(sites):
+    """Accept list of (name, xy[, color]) or dicts {name, xy, color?} → list of (name, xy[2], color)."""
+    out = []
+    for i, s in enumerate(sites):
+        if isinstance(s, dict):
+            name = s['name']
+            xy = np.asarray(s['xy'], float).ravel()[:2]
+            c = s.get('color', _DEFAULT_SITE_COLORS[i % len(_DEFAULT_SITE_COLORS)])
+        else:
+            name = s[0]
+            xy = np.asarray(s[1], float).ravel()[:2]
+            c = s[2] if len(s) > 2 else _DEFAULT_SITE_COLORS[i % len(_DEFAULT_SITE_COLORS)]
+        out.append((str(name), xy.copy(), c))
+    if not out:
+        raise ValueError('normalize_probe_sites: empty sites')
+    return out
+
+
+def fdbm_probe_sites_from_indices(apos, indices, names=None, colors=None):
+    """Build probe site list from atom indices (any molecule / any count).
+
+    Args:
+        apos: (natoms, 3)
+        indices: sequence of atom indices
+        names: optional labels (default atom{i})
+        colors: optional colors (cycles tab: palette)
+    """
+    apos = np.asarray(apos, float)
+    indices = [int(i) for i in indices]
+    if names is None:
+        names = [f'atom{i}' for i in indices]
+    if colors is None:
+        colors = [_DEFAULT_SITE_COLORS[k % len(_DEFAULT_SITE_COLORS)] for k in range(len(indices))]
+    if not (len(names) == len(indices) == len(colors)):
+        raise ValueError('fdbm_probe_sites_from_indices: names/indices/colors length mismatch')
+    return [(names[k], apos[indices[k], :2].copy(), colors[k]) for k in range(len(indices))]
+
+
+def fdbm_probe_sites_nch(apos, Zs, colors=None):
+    """Pyridine helper: N, farthest C from N (para-C), farthest H from N (para-H).
+
+    Opposite-C is carbon (Z==6), never H. For general molecules use
+    `fdbm_probe_sites_from_indices` or pass any list to `normalize_probe_sites`.
+    """
+    apos = np.asarray(apos, float)
+    Zs = np.asarray(Zs)
+    if colors is None:
+        colors = {'N': 'tab:blue', 'para-C': 'tab:green', 'para-H': 'tab:purple'}
+    iN = int(np.where(np.isclose(Zs, 7))[0][0])
+    iCs = np.where(np.isclose(Zs, 6))[0]
+    iHs = np.where(np.isclose(Zs, 1))[0]
+    iC = int(iCs[np.argmax(np.sum((apos[iCs, :2] - apos[iN, :2]) ** 2, axis=1))])
+    iH = int(iHs[np.argmax(np.sum((apos[iHs, :2] - apos[iN, :2]) ** 2, axis=1))])
+    return [
+        ('N', apos[iN, :2].copy(), colors['N']),
+        ('para-C', apos[iC, :2].copy(), colors['para-C']),
+        ('para-H', apos[iH, :2].copy(), colors['para-H']),
+    ]
+
+
+def afm_tip_probe_heights(tip_min, tip_max, tip_step, bond_length):
+    """Tip-apex ladder and matching probe heights (probe = tip − L).
+
+    Returns (heights_tip, heights_probe) float arrays.
+    """
+    tip = np.arange(float(tip_min), float(tip_max) + 0.5 * float(tip_step), float(tip_step))
+    L = float(bond_length)
+    return tip, tip - L
+
+
+def sample_field_z_profile(F, origin, step, xy, zs, zref=None):
+    """Nearest-grid sample of 3D field along z at fixed XY; optional subtract F(zref)."""
+    F = np.asarray(F)
+    o = np.asarray(origin, float).ravel()[:3]
+    s = float(np.asarray(step).reshape(-1)[0])
+    nx, ny, nz = F.shape
+    zs = np.asarray(zs, float)
+    out = np.empty(len(zs), float)
+    for i, z in enumerate(zs):
+        ijk = np.round([(xy[0] - o[0]) / s, (xy[1] - o[1]) / s, (z - o[2]) / s]).astype(int)
+        ijk = np.clip(ijk, [0, 0, 0], [nx - 1, ny - 1, nz - 1])
+        out[i] = float(F[tuple(ijk)])
+    if zref is not None:
+        out = out - out[np.argmin(np.abs(zs - float(zref)))]
+    return out
+
+
+def _shade_zwell(ax, ylim, z0=2.5, z1=None):
+    if z1 is None:
+        z1 = ax.get_xlim()[1]
+    ax.fill_betweenx([-ylim, ylim], z0, z1, color='yellow', alpha=0.08)
+
+
+def plot_fdbm_vs_kriging_zlayout(
+    sites, origin, step, V_ES, E_pauli, E_es, E_vdw, E_tot, *,
+    kriging_E=None, sites_krig=None, A_pauli=None, beta_pauli=None,
+    title=None, title_extra='', zs=None, zs_v=None, z_well=2.5,
+    ylim_V=0.2, ylim_Ees=0.05, ylim_PauliTot=0.1, ylim_site=0.1,
+    zref_E=6.0, zref_V=8.0, figsize=None, fname=None, save_dir='.', dpi=140,
+):
+    """Canonical FDBM vs Kriging z-profile layout for **any number of probe sites**.
+
+    Top row (3 panels, sites as colored lines):
+      V_ES (±ylim_V) · E_es (±ylim_Ees) · E_Pauli(dashed)+E_tot(solid) (±ylim_PauliTot, lw=0.5)
+    Bottom row (**one panel per site**): Kriging, E_tot, E_Pauli, E_es, E_vdW (±ylim_site)
+
+    Energies zeroed at zref_E; V at zref_V. Yellow band = z ≥ z_well.
+
+    Args:
+        sites: any length — list of (name, xy[, color]) or dicts; see `normalize_probe_sites`
+        kriging_E: callable (xy, zs)->1d already zeroed at zref_E, or None
+        sites_krig: optional Kriging XY sites (same order/length as sites)
+    """
+    sites = normalize_probe_sites(sites)
+    n_sites = len(sites)
+    o = np.asarray(origin, float)
+    s = float(np.asarray(step).reshape(-1)[0])
+    if zs is None:
+        zs = np.arange(1.6, 6.01, 0.1)
+    if zs_v is None:
+        zs_v = np.arange(1.5, 8.01, 0.1)
+    if sites_krig is None:
+        sites_krig = sites
+    else:
+        sites_krig = normalize_probe_sites(sites_krig)
+        if len(sites_krig) != n_sites:
+            raise ValueError(f'sites_krig length {len(sites_krig)} != sites {n_sites}')
+
+    ncols = max(3, n_sites)
+    if figsize is None:
+        figsize = (max(11.0, 3.2 * ncols), 7.5)
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(2, ncols, height_ratios=[1.0, 1.05], hspace=0.32, wspace=0.28)
+    ab = ''
+    if A_pauli is not None and beta_pauli is not None:
+        ab = f'  A={float(A_pauli):.2f} β={float(beta_pauli):.3f}'
+    if title is None:
+        title = (
+            f'FDBM vs Kriging  |  E−E({zref_E:g}), V−V({zref_V:g})  |  n_sites={n_sites}\n'
+            f'Top: V_ES ±{ylim_V} · E_es ±{ylim_Ees} · E_Pauli(dashed)+E_tot(solid) ±{ylim_PauliTot}  |  '
+            f'Bottom: per-site ±{ylim_site}{ab}  {title_extra}'
+        )
+    fig.suptitle(title, fontsize=9)
+
+    # Top: 3 component panels (left-aligned if ncols > 3)
+    ax = fig.add_subplot(gs[0, 0])
+    for name, xy, c in sites:
+        ax.plot(zs_v, sample_field_z_profile(V_ES, o, s, xy, zs_v, zref_V), color=c, lw=1.5, label=name)
+    ax.axhline(0, color='k', lw=0.5); ax.axvline(z_well, color='gray', ls=':', lw=1)
+    ax.set_xlim(float(zs_v[0]), float(zs_v[-1])); ax.set_ylim(-ylim_V, ylim_V)
+    ax.set_title('V_ES (sites overlapped)'); ax.set_xlabel('z [Å]'); ax.set_ylabel(f'V−V({zref_V:g}) [eV]')
+    ax.legend(fontsize=7); ax.grid(True, alpha=0.3); _shade_zwell(ax, ylim_V, z_well, float(zs_v[-1]))
+
+    ax = fig.add_subplot(gs[0, 1])
+    for name, xy, c in sites:
+        ax.plot(zs, sample_field_z_profile(E_es, o, s, xy, zs, zref_E), color=c, lw=1.5, label=name)
+    ax.axhline(0, color='k', lw=0.5); ax.axvline(z_well, color='gray', ls=':', lw=1)
+    ax.set_xlim(float(zs[0]), float(zs[-1])); ax.set_ylim(-ylim_Ees, ylim_Ees)
+    ax.set_title('E_es (sites overlapped)'); ax.set_xlabel('z [Å]'); ax.set_ylabel(f'E_es−E({zref_E:g}) [eV]')
+    ax.legend(fontsize=7); ax.grid(True, alpha=0.3); _shade_zwell(ax, ylim_Ees, z_well)
+
+    ax = fig.add_subplot(gs[0, 2])
+    for name, xy, c in sites:
+        ax.plot(zs, sample_field_z_profile(E_tot, o, s, xy, zs, zref_E), color=c, lw=0.5, ls='-', label=f'{name} E_tot')
+        ax.plot(zs, sample_field_z_profile(E_pauli, o, s, xy, zs, zref_E), color=c, lw=0.5, ls='--', label=f'{name} E_Pauli')
+    ax.axhline(0, color='k', lw=0.5); ax.axvline(z_well, color='gray', ls=':', lw=1)
+    ax.set_xlim(float(zs[0]), float(zs[-1])); ax.set_ylim(-ylim_PauliTot, ylim_PauliTot)
+    ax.set_title('E_Pauli (dashed) + E_tot (solid)'); ax.set_xlabel('z [Å]'); ax.set_ylabel(f'E−E({zref_E:g}) [eV]')
+    ax.legend(fontsize=6, ncol=2); ax.grid(True, alpha=0.3); _shade_zwell(ax, ylim_PauliTot, z_well)
+
+    # Bottom: one panel per site
+    for i, ((name, xy, c), (_, xyk, _)) in enumerate(zip(sites, sites_krig)):
+        ax = fig.add_subplot(gs[1, i])
+        ax.axhline(0, color='k', lw=0.5); ax.axvline(z_well, color='gray', ls=':', lw=1)
+        if kriging_E is not None:
+            ax.plot(zs, kriging_E(xyk, zs), 'k-', lw=2.2, label='Kriging')
+        ax.plot(zs, sample_field_z_profile(E_tot, o, s, xy, zs, zref_E), color='k', lw=1.6, ls='--', label='E_tot')
+        ax.plot(zs, sample_field_z_profile(E_pauli, o, s, xy, zs, zref_E), color='tab:blue', lw=1.5, label='E_Pauli')
+        ax.plot(zs, sample_field_z_profile(E_es, o, s, xy, zs, zref_E), color='tab:red', lw=1.5, label='E_es')
+        ax.plot(zs, sample_field_z_profile(E_vdw, o, s, xy, zs, zref_E), color='tab:green', lw=1.5, label='E_vdW')
+        ax.set_xlim(float(zs[0]), float(zs[-1])); ax.set_ylim(-ylim_site, ylim_site)
+        ax.set_title(name); ax.set_xlabel('z [Å]'); ax.set_ylabel(f'E−E({zref_E:g}) [eV]')
+        ax.legend(fontsize=6); ax.grid(True, alpha=0.3); _shade_zwell(ax, ylim_site, z_well)
+
+    if fname is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, fname)
+        fig.savefig(path, dpi=dpi, bbox_inches='tight'); plt.close(fig)
+        print(f"  Saved {path}")
+    return fig, None
+
+
+def plot_fdbm_methods_zcompare_4panel(
+    methods, sites_per_method, *, keys=('V_ES', 'E_es', 'E_pauli', 'E_tot'),
+    styles=None, zs=None, zs_v=None, z_well=2.5,
+    ylims=None, zref_E=6.0, zref_V=8.0, title=None, figsize=(11, 8),
+    fname=None, save_dir='.', dpi=140,
+):
+    """4-panel overlay of FDBM methods (e.g. DFT-cube solid vs DFTB dashed).
+
+    methods: list of dicts with keys V_ES, E_es, E_pauli, E_tot, origin, step, label
+    sites_per_method: list of site lists parallel to methods (any site count; same chemical order)
+    styles: list of linestyle for each method (default ['-', '--', ...])
+    """
+    n_m = len(methods)
+    if styles is None:
+        styles = ['-', '--', ':', '-.'][:n_m]
+    if zs is None:
+        zs = np.arange(1.6, 6.01, 0.1)
+    if zs_v is None:
+        zs_v = np.arange(1.5, 8.01, 0.1)
+    if ylims is None:
+        ylims = {'V_ES': 0.2, 'E_es': 0.05, 'E_pauli': 0.1, 'E_tot': 0.1}
+    sites_per_method = [normalize_probe_sites(s) for s in sites_per_method]
+
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    if title is None:
+        labs = ' / '.join(m.get('label', f'm{i}') for i, m in enumerate(methods))
+        title = f'FDBM method compare ({labs})  |  site color · line style = method\nE−E({zref_E:g}), V−V({zref_V:g})'
+    fig.suptitle(title, fontsize=10)
+    ax_list = [axes[0, 0], axes[0, 1], axes[1, 0], axes[1, 1]]
+    ylab = {
+        'V_ES': f'V−V({zref_V:g}) [eV]', 'E_es': f'E_es−E({zref_E:g}) [eV]',
+        'E_pauli': f'E_Pauli−E({zref_E:g}) [eV]', 'E_tot': f'E_tot−E({zref_E:g}) [eV]',
+    }
+    for ax, key in zip(ax_list, keys):
+        zax = zs_v if key == 'V_ES' else zs
+        zref = zref_V if key == 'V_ES' else zref_E
+        ylim = float(ylims.get(key, 0.1))
+        for m, sites, ls in zip(methods, sites_per_method, styles):
+            lab = m.get('label', '')
+            for name, xy, c in sites:
+                y = sample_field_z_profile(m[key], m['origin'], m['step'], xy, zax, zref)
+                ax.plot(zax, y, color=c, lw=1.4, ls=ls, label=f'{name} {lab}'.strip())
+        ax.axhline(0, color='k', lw=0.5); ax.axvline(z_well, color='gray', ls=':', lw=1)
+        ax.set_xlim(float(zax[0]), float(zax[-1])); ax.set_ylim(-ylim, ylim)
+        ax.set_title(key); ax.set_xlabel('z [Å]'); ax.set_ylabel(ylab.get(key, 'E [eV]'))
+        ax.legend(fontsize=6, ncol=2); ax.grid(True, alpha=0.3); _shade_zwell(ax, ylim, z_well, float(zax[-1]))
+    fig.tight_layout()
+    if fname is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, fname)
+        fig.savefig(path, dpi=dpi, bbox_inches='tight'); plt.close(fig)
+        print(f"  Saved {path}")
+    return fig, axes
+
+
 def plot_xy_slice(data, origin, step, iz, title, fname, save_dir, sym=False, cmap='magma'):
-    """Plot xy slice at given z-index."""
-    import matplotlib.pyplot as plt
-    slice_data = data[:, :, iz].T
+    """Plot xy slice at given z-index. Prefer `imshow_afm` / `plot_afm_height_panel` for new code."""
     nx, ny = data.shape[0], data.shape[1]
-    x_min = origin[0]
-    x_max = origin[0] + nx * step
-    y_min = origin[1]
-    y_max = origin[1] + ny * step
-    
+    extent = [origin[0], origin[0] + nx * step, origin[1], origin[1] + ny * step]
     fig, ax = plt.subplots(figsize=(6, 5))
-    norm = None
-    if sym:
-        vmax = np.max(np.abs(slice_data))
-        norm = plt.Normalize(-vmax, vmax)
-    
-    im = ax.imshow(slice_data, origin='lower', extent=[x_min, x_max, y_min, y_max], cmap=cmap, norm=norm, aspect='equal')
-    ax.set_title(title)
-    ax.set_xlabel('x [A]')
-    ax.set_ylabel('y [A]')
-    plt.colorbar(im, ax=ax)
+    imshow_afm(ax, data[:, :, iz], extent=extent, cmap=cmap, symmetric=sym, title=title)
+    ax.set_xlabel('x [A]'); ax.set_ylabel('y [A]')
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, fname), dpi=120, bbox_inches='tight')
     plt.close()
     print(f"  Saved {fname}")
 
 
-def save_afm_images(df, scan_xs, scan_ys, heights, out_dir, prefix='df'):
-    """Save AFM frequency-shift images at all heights.
+def save_afm_images(df, scan_xs, scan_ys, heights, out_dir, prefix='df', cmap='afmhot'):
+    """Save AFM frequency-shift (or Fz/E) images at all heights. SSOT for full-height PNG dumps.
 
     Args:
-        df: (nx, ny, nz) frequency-shift array
+        df: (nx, ny, nz) array
         scan_xs, scan_ys: 1D scan coordinate arrays
         heights: 1D probe height array
         out_dir: directory for PNG output
         prefix: filename prefix (e.g. 'df' -> df_h3.0.png)
     """
+    ext = scan_extent(scan_xs, scan_ys)
+    os.makedirs(out_dir, exist_ok=True)
     for i in range(len(heights)):
         h = heights[i]
-        fig, ax = plt.subplots(figsize=(5,4))
-        im = ax.imshow(df[:,:,i].T, origin='lower', extent=[scan_xs[0], scan_xs[-1], scan_ys[0], scan_ys[-1]], cmap='afmhot')
-        ax.set_title(f"{prefix} at h={h:.1f} A")
-        plt.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+        fig, ax = plt.subplots(figsize=(5, 4))
+        imshow_afm(ax, df[:, :, i], extent=ext, cmap=cmap, symmetric=(cmap in ('bwr', 'seismic', 'RdBu_r')), title=f"{prefix} at h={h:.1f} A")
         plt.subplots_adjust(left=0.05, right=0.95, bottom=0.05, top=0.9)
         fname = os.path.join(out_dir, f"{prefix}_h{h:.1f}.png")
         plt.savefig(fname, dpi=150, bbox_inches='tight')
@@ -113,7 +514,7 @@ def plot_slices(data, title, fname, sym=False, cmap='magma', save_dir='.'):
 
 
 def plot_grid_Fz(Fz, heights, label, fname, x_ext=None, y_ext=None, ncols=7, save_dir='.', cmap='seismic'):
-    """Plot grid of 2D Fz images at all heights with per-slice colorbars."""
+    """SSOT: full grid of 2D Fz/df/E images at all heights with per-slice colorbars."""
     nz_p = len(heights)
     nrows = int(np.ceil(nz_p / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(4*ncols, 4*nrows), squeeze=False,
@@ -121,16 +522,12 @@ def plot_grid_Fz(Fz, heights, label, fname, x_ext=None, y_ext=None, ncols=7, sav
     axes = np.array(axes).reshape(nrows, ncols)
     fig.suptitle(f"{label} (eV/Å) [per-slice]", fontsize=10)
     ext = [x_ext[0], x_ext[1], y_ext[0], y_ext[1]] if x_ext is not None and y_ext is not None else None
-    kw = dict(origin='lower', cmap=cmap, aspect='equal')
-    if ext: kw['extent'] = ext
     for k in range(nz_p):
         r, c = divmod(k, ncols); ax = axes[r, c]
         vabs = max(float(np.percentile(np.abs(Fz[:,:,k]), 99)), 1e-6)
-        norm = safe_norm(Fz[:,:,k])
-        im = ax.imshow(Fz[:,:,k].T, norm=norm, **kw)
-        ax.set_title(f"h={heights[k]:.1f}Å ±{vabs:.2g}", fontsize=7); ax.tick_params(labelsize=5)
-        cb = plt.colorbar(im, ax=ax, shrink=0.6, pad=0.02, fraction=0.04)
-        cb.ax.tick_params(labelsize=5)
+        imshow_afm(ax, Fz[:,:,k], extent=ext, cmap=cmap, title=f"h={heights[k]:.1f}Å ±{vabs:.2g}")
+        ax.tick_params(labelsize=5)
+        ax.title.set_fontsize(7)
     for k in range(nz_p, nrows*ncols):
         r, c = divmod(k, ncols); axes[r, c].set_visible(False)
     plt.savefig(os.path.join(save_dir, fname), dpi=150, bbox_inches='tight'); plt.close()
@@ -201,9 +598,16 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
         step/margin/z_extra: grid parameters (used if grid_spec is None)
         verbosity: logging level
         max_shells: int (2=sp, 3=spd); auto-detected from basis if None
-        projection_basis_ang: optional species_list to override basis used for projection
-            (SCF still uses original basis; only projection uses override). Enables
-            Slater-tail correction hack.
+        projection_basis_ang: optional species_list to override basis used for **Pauli**
+            projection only (SCF still uses stock mio/3ob). Typical: result of
+            `make_slater_tail_species_list` / SA-prolonged STOs.
+
+            DUAL BASIS (mandatory — do not "fix"):
+              - Prolonged ρ is for Pauli overlap only. Never charge-normalize it;
+                ∫ρ ≉ N_e by design; A,β absorb overall scale.
+              - Electrostatics MUST use stock Δρ → V_ES (call this function twice
+                or keep stock ρ_diff / V_ES from a separate stock projection).
+              - See `make_slater_tail_species_list` docstring and `doc/DFTB_basis_fit.md`.
 
     Returns:
         dict with 'rho_scf', 'rho_na', 'rho_diff', 'V_ES', 'origin', 'ngrid', 'grid_spec'
@@ -575,6 +979,124 @@ def soft_clamp_density(rho, rho_max):
     return (rho_max * np.tanh(rho / rho_max)).astype(np.float32)
 
 
+def soft_clamp_rational(y, y1, y2, dy=None):
+    """Rational soft clamp (USER SSOT): above y1, approach y2 via 1/(1+z).
+
+    For y > y1:  y' = y1 + (y2-y1)·(1 − 1/(1+z)),  z=(y−y1)/(y2−y1)
+    dy' = dy / (1+z)²  (chain rule) if dy given.
+
+    Same formula as `spammm.utils.test_utils.soft_clamp` — non-mutating copy here.
+    Use for all-electron nuclear cusps before compact NA subtraction (CO guinea-pig).
+    """
+    y = np.asarray(y, dtype=np.float64)
+    y1, y2 = float(y1), float(y2)
+    if not (y2 > y1):
+        raise ValueError(f'soft_clamp_rational: need y2 > y1, got y1={y1}, y2={y2}')
+    y_new = y.copy()
+    dy_new = None if dy is None else np.asarray(dy, dtype=np.float64).copy()
+    mask = y_new > y1
+    if not np.any(mask):
+        return (y_new.astype(np.float32), dy_new)
+    y12 = y2 - y1
+    z = (y_new[mask] - y1) / y12
+    y_new[mask] = y1 + y12 * (1.0 - 1.0 / (1.0 + z))
+    if dy_new is not None:
+        dy_new[mask] *= 1.0 / (1.0 + z) ** 2
+    return y_new.astype(np.float32), dy_new
+
+
+def delta_rho_clamp_compact_na(rho_scf, origin, step, atomPos, atomZ, *,
+                               y1=None, y2=None, R_sphere=0.6, rc_na=0.6,
+                               profile='r2', valence_Z=None):
+    """All-electron Δρ recipe (CO guinea-pig SSOT): soft-clamp cores → compact NA.
+
+    Distinguishes **all-electron** (Psi4/pySCF cubes, ∫ρ≈∑Z) from **DFTB valence**
+    (∫ρ≈∑Z_val) — this path is for all-electron; DFTB already has orbital ρ_NA.
+
+    Steps:
+      1. ρ_c = soft_clamp_rational(ρ_scf; y1,y2) — kill nuclear spikes
+      2. Per nucleus, Q_rem_i = ∫(ρ_scf−ρ_c) inside sphere R_sphere (charge removed)
+      3. ρ_NA from compact f(r)=(1-(r/rc)^2)^2 (profile='r2') with per-atom charge
+         q_i = Z_i − Q_rem_i  ("NA charge − clamped charge")
+      4. Δρ = ρ_c − ρ_NA; require |∫Δρ| small (neutrality check)
+
+    Plot valence region on a common axis with DFTB Δρ; ignore core spikes visually.
+
+    Returns dict: rho_clamped, rho_na, rho_diff, Q_*, y1,y2, per-atom Q_rem, …
+    """
+    rho_scf = np.asarray(rho_scf, dtype=np.float64)
+    atomPos = np.asarray(atomPos, dtype=np.float64)
+    atomZ = np.asarray(atomZ, dtype=np.float64).reshape(-1)
+    origin = np.asarray(origin, dtype=np.float64).ravel()[:3]
+    if np.ndim(step) == 0:
+        dx = dy = dz = float(step)
+    else:
+        dx, dy, dz = float(step[0]), float(step[1]), float(step[2])
+    dV = dx * dy * dz
+    nx, ny, nz = rho_scf.shape
+    R_sphere = float(R_sphere); rc_na = float(rc_na)
+
+    # Default clamp: y1 ~ high valence (percentile away from nuclei), y2 = 2 y1
+    if y1 is None or y2 is None:
+        xs = origin[0] + dx * np.arange(nx)
+        ys = origin[1] + dy * np.arange(ny)
+        zs = origin[2] + dz * np.arange(nz)
+        X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
+        near = np.zeros(rho_scf.shape, dtype=bool)
+        for p in atomPos:
+            near |= ((X - p[0]) ** 2 + (Y - p[1]) ** 2 + (Z - p[2]) ** 2) < (0.35 ** 2)
+        far = rho_scf[~near & (rho_scf > 0)]
+        y1_auto = float(np.percentile(far, 99.0)) if far.size else 5.0
+        y1 = float(y1_auto if y1 is None else y1)
+        y2 = float(2.0 * y1 if y2 is None else y2)
+
+    rho_c, _ = soft_clamp_rational(rho_scf, y1, y2)
+    rho_c64 = np.asarray(rho_c, dtype=np.float64)
+    removed = rho_scf - rho_c64  # ≥0 where clamped
+
+    xs = origin[0] + dx * np.arange(nx)
+    ys = origin[1] + dy * np.arange(ny)
+    zs = origin[2] + dz * np.arange(nz)
+    X, Y, Zg = np.meshgrid(xs, ys, zs, indexing='ij')
+
+    Q_rem = np.zeros(len(atomZ), dtype=np.float64)
+    for i, (p, Zi) in enumerate(zip(atomPos, atomZ)):
+        m = ((X - p[0]) ** 2 + (Y - p[1]) ** 2 + (Zg - p[2]) ** 2) <= (R_sphere ** 2)
+        Q_rem[i] = float(removed[m].sum() * dV)
+
+    Q_scf = float(rho_scf.sum() * dV)
+    Q_c = float(rho_c64.sum() * dV)
+    Q_rem_tot = float(Q_rem.sum())
+    # Prefer sphere accounting; fall back to global excess if spheres miss
+    Q_ex_global = Q_scf - Q_c
+    Z_use = atomZ if valence_Z is None else np.asarray(valence_Z, dtype=np.float64).reshape(-1)
+    q_na = np.maximum(Z_use - Q_rem, 0.0)
+    # If sphere Q_rem under-counts vs global excess, scale q_na to match Q_c
+    # Target: ∫ρ_NA = Q_c  ⇒  ∫Δρ = 0
+    q_na_sum = float(q_na.sum())
+    if q_na_sum > 1e-12:
+        q_na = q_na * (Q_c / q_na_sum)
+
+    rho_na = make_compact_rho_na(
+        atomPos, q_na, origin, (dx, dy, dz) if (dx != dy or dy != dz) else dx,
+        (nx, ny, nz), rc=rc_na, rescale_to_q=Q_c, profile=profile)
+    rho_diff = (rho_c64 - np.asarray(rho_na, dtype=np.float64)).astype(np.float32)
+    Q_diff = float(rho_diff.sum() * dV)
+
+    return {
+        'rho_scf_clamped': rho_c64.astype(np.float32),
+        'rho_na': np.asarray(rho_na, dtype=np.float32),
+        'rho_diff': rho_diff,
+        'y1': float(y1), 'y2': float(y2),
+        'R_sphere': R_sphere, 'rc_na': rc_na, 'profile': profile,
+        'Q_scf': Q_scf, 'Q_clamped': Q_c, 'Q_ex_global': float(Q_ex_global),
+        'Q_rem_spheres': Q_rem, 'Q_rem_tot': Q_rem_tot,
+        'q_na_per_atom': q_na, 'Q_na': float(np.asarray(rho_na).sum() * dV),
+        'Q_diff': Q_diff,
+        'atomPos': atomPos, 'atomZ': atomZ,
+    }
+
+
 def prepare_delta_rho_clamped(rho_scf, rho_na, origin, step, atomPos, atomZ,
                               rho_max=None, percentile=99.5, dV=None):
     """Build ES-safe Δρ by soft-clamping nuclear spikes in ρ_scf — without double-counting.
@@ -650,13 +1172,13 @@ def prepare_delta_rho_clamped(rho_scf, rho_na, origin, step, atomPos, atomZ,
     }
 
 
-def make_gaussian_rho_na(atomPos, atomZ, origin, step, ngrid, sigma=0.5, rescale_to_q=None):
+def make_gaussian_rho_na(atomPos, atomZ, origin, step, ngrid, sigma=0.3, rescale_to_q=None):
     """Neutral-atom density as sum of spherical Gaussians centered on atoms.
 
     Each atom Z contributes ∫ρ = Z (before optional rescale). Used for Δρ = ρ_scf − ρ_NA
     so that ∫Δρ ≈ 0 (charge neutrality for FFT Poisson). Shape is not physical DFT NA —
-    only needs to cancel total charge and sit exactly on nuclear positions (ppafm-like
-    Rcore ≈ 0.5–0.7 Å).
+    only needs to cancel total charge and sit exactly on nuclear positions.
+    Default σ=0.3 Å (pyridine same-cell V_ES: σ≲0.5 saturates AFM-height V; wider NA worsens repulsion).
 
     Args:
         atomPos: (natoms, 3) Angstrom — must match density grid frame
@@ -664,7 +1186,7 @@ def make_gaussian_rho_na(atomPos, atomZ, origin, step, ngrid, sigma=0.5, rescale
         origin: (3,) grid origin Angstrom
         step: float isotropic spacing Angstrom (or (3,) — uses step[0] if array)
         ngrid: (nx, ny, nz)
-        sigma: Gaussian width [Å] (default 0.5)
+        sigma: Gaussian width [Å] (default 0.3)
         rescale_to_q: if set, scale ρ_NA so ∫ρ_NA = rescale_to_q (exact neutrality)
 
     Returns:
@@ -708,21 +1230,119 @@ def make_gaussian_rho_na(atomPos, atomZ, origin, step, ngrid, sigma=0.5, rescale
     return rho_na.astype(np.float32)
 
 
-def get_density_from_cube(cube_path_or_dir, *, esp_path=None, sigma_na=0.5,
-                          rescale_na=True, use_esp_cube=False, verbosity=0):
+def compact_core_profile(r, rc, power=4):
+    """Finite-support core shape f=(1-(r/rc)^p)^2 for r<rc, else 0.
+
+    power=4: older default (same-cell V_ES sweeps).
+    power=2: USER SSOT for all-electron NA after soft-clamp (smoother) — CO guinea-pig.
+    """
+    r = np.asarray(r, dtype=np.float64)
+    rc = float(rc)
+    p = int(power)
+    if rc <= 0:
+        raise ValueError(f"compact_core_profile: rc must be > 0, got {rc}")
+    if p not in (2, 4):
+        raise ValueError(f"compact_core_profile: power must be 2 or 4, got {p}")
+    u = (r / rc) ** p
+    f = np.where(r < rc, (1.0 - u) ** 2, 0.0)
+    return f
+
+
+def _compact_core_integral_unit(rc, power=4):
+    """∫ f(r) 4π r² dr for unit amplitude, f=(1-(r/rc)^p)^2 on [0,rc]."""
+    rc = float(rc)
+    if power == 4:
+        # ∫_0^rc (1-(r/rc)^4)^2 4π r² dr = 128 π rc³ / 231
+        return 128.0 * np.pi * rc ** 3 / 231.0
+    if power == 2:
+        # ∫_0^rc (1-(r/rc)^2)^2 4π r² dr = 32 π rc³ / 105
+        return 32.0 * np.pi * rc ** 3 / 105.0
+    raise ValueError(f'_compact_core_integral_unit: power={power}')
+
+
+def make_compact_rho_na(atomPos, atomZ, origin, step, ngrid, rc=0.5, rescale_to_q=None,
+                        profile='r4'):
+    """Neutral-atom density as sum of compact cores on atoms.
+
+    profile:
+      'r4' / power 4 — f=(1-(r/rc)^4)^2  (legacy)
+      'r2' / power 2 — f=(1-(r/rc)^2)^2  (USER SSOT after soft-clamp)
+
+    Support strictly r < rc. Amplitude so ∫ρ = Z (or atom charge) before optional rescale.
+
+    Args:
+        atomPos, atomZ, origin, step, ngrid: same as make_gaussian_rho_na
+        rc: cutoff / core radius [Å]
+        rescale_to_q: if set, scale so ∫ρ_NA = rescale_to_q
+        profile: 'r2' or 'r4'
+
+    Returns:
+        rho_na: (nx, ny, nz) float32  e/Å³
+    """
+    atomPos = np.asarray(atomPos, dtype=np.float64)
+    atomZ = np.asarray(atomZ, dtype=np.float64).reshape(-1)
+    nx, ny, nz = [int(x) for x in ngrid]
+    if np.ndim(step) == 0:
+        dx = dy = dz = float(step)
+    else:
+        dx, dy, dz = float(step[0]), float(step[1]), float(step[2])
+    origin = np.asarray(origin, dtype=np.float64).ravel()[:3]
+    rc = float(rc)
+    if rc <= 0:
+        raise ValueError(f"make_compact_rho_na: rc must be > 0, got {rc}")
+    prof = str(profile).lower()
+    power = 2 if prof in ('r2', '2', 'quad') else 4
+    I1 = _compact_core_integral_unit(rc, power=power)
+
+    xs = origin[0] + dx * np.arange(nx, dtype=np.float64)
+    ys = origin[1] + dy * np.arange(ny, dtype=np.float64)
+    zs = origin[2] + dz * np.arange(nz, dtype=np.float64)
+    # local stamp
+    n_pad = int(np.ceil(rc / min(dx, dy, dz))) + 2
+    rho_na = np.zeros((nx, ny, nz), dtype=np.float64)
+    for pos, Zi in zip(atomPos, atomZ):
+        Zi = float(Zi)
+        if abs(Zi) < 1e-30:
+            continue
+        A = Zi / I1
+        ix = int(round((pos[0] - origin[0]) / dx))
+        iy = int(round((pos[1] - origin[1]) / dy))
+        iz = int(round((pos[2] - origin[2]) / dz))
+        i0, i1 = max(0, ix - n_pad), min(nx, ix + n_pad + 1)
+        j0, j1 = max(0, iy - n_pad), min(ny, iy + n_pad + 1)
+        k0, k1 = max(0, iz - n_pad), min(nz, iz + n_pad + 1)
+        xx = xs[i0:i1][:, None, None]
+        yy = ys[j0:j1][None, :, None]
+        zz = zs[k0:k1][None, None, :]
+        r = np.sqrt((xx - pos[0]) ** 2 + (yy - pos[1]) ** 2 + (zz - pos[2]) ** 2)
+        rho_na[i0:i1, j0:j1, k0:k1] += A * compact_core_profile(r, rc, power=power)
+
+    if rescale_to_q is not None:
+        q = float(rho_na.sum() * dx * dy * dz)
+        if abs(q) > 1e-30:
+            rho_na *= float(rescale_to_q) / q
+    return rho_na.astype(np.float32)
+
+
+def get_density_from_cube(cube_path_or_dir, *, esp_path=None, sigma_na=0.3,
+                          rescale_na=True, use_esp_cube=False, verbosity=0,
+                          na_kind='gaussian', rc_na=0.5):
     """Load Dt.cube (+ optional ESP) → same dict as get_density_from_dftb_dense.
 
-    ρ_scf from Dt (e/a0³ → e/Å³). ρ_NA = sum of Gaussians on cube-header atoms
-    (σ=`sigma_na` Å, charge Z_i). ρ_diff = ρ_scf − ρ_NA with ∫ρ_diff forced ≈ 0
-    via rescale of ρ_NA to match ∫ρ_scf when `rescale_na=True`.
+    ρ_scf from Dt (e/a0³ → e/Å³). ρ_NA from `na_kind`:
+      - 'gaussian': Σ Z_i Gaussians, width `sigma_na`
+      - 'compact': Σ Z_i (1-(r/rc_na)^4)^2 for r<rc_na (finite support)
+    ρ_diff = ρ_scf − ρ_NA with ∫ρ_diff forced ≈ 0 via rescale when `rescale_na=True`.
 
-    Atom positions come from the **cube header** (not geom.xyz) so Gaussians sit
+    Atom positions come from the **cube header** (not geom.xyz) so NA sits
     on the density frame. Does not modify DFTB/pySCF providers.
 
     Args:
         cube_path_or_dir: path to Dt.cube or directory containing Dt.cube
         esp_path: optional ESP.cube (default: sibling ESP.cube)
-        sigma_na: Gaussian NA width [Å] (default 0.5, ppafm-like)
+        sigma_na: Gaussian NA width [Å] (default 0.3; used if na_kind='gaussian')
+        rc_na: compact core radius [Å] (default 0.5; used if na_kind='compact')
+        na_kind: 'gaussian' | 'compact'
         rescale_na: scale ρ_NA so ∫ρ_NA = ∫ρ_scf (charge neutrality)
         use_esp_cube: if True and ESP found, use it as V_ES; else fft_poisson(ρ_diff)
         verbosity: print charge checks
@@ -765,10 +1385,21 @@ def get_density_from_cube(cube_path_or_dir, *, esp_path=None, sigma_na=0.5,
 
     dV = step ** 3
     q_scf = float(rho_scf.sum() * dV)
-    rho_na = make_gaussian_rho_na(
-        atomPos, atomZ, origin, step, (nx, ny, nz),
-        sigma=sigma_na, rescale_to_q=(q_scf if rescale_na else None),
-    )
+    na_kind = str(na_kind).lower().strip()
+    if na_kind == 'gaussian':
+        rho_na = make_gaussian_rho_na(
+            atomPos, atomZ, origin, step, (nx, ny, nz),
+            sigma=sigma_na, rescale_to_q=(q_scf if rescale_na else None),
+        )
+        na_tag = f'sigma_na={sigma_na}'
+    elif na_kind == 'compact':
+        rho_na = make_compact_rho_na(
+            atomPos, atomZ, origin, step, (nx, ny, nz),
+            rc=rc_na, rescale_to_q=(q_scf if rescale_na else None),
+        )
+        na_tag = f'rc_na={rc_na}'
+    else:
+        raise ValueError(f"get_density_from_cube: na_kind must be 'gaussian' or 'compact', got {na_kind!r}")
     rho_diff = (rho_scf - rho_na).astype(np.float32)
     q_na = float(rho_na.sum() * dV)
     q_diff = float(rho_diff.sum() * dV)
@@ -776,7 +1407,7 @@ def get_density_from_cube(cube_path_or_dir, *, esp_path=None, sigma_na=0.5,
     if verbosity >= 0:
         print(f"  [cube] {dt_path}")
         print(f"  [cube] grid={nx}x{ny}x{nz} step={step:.5f}Å origin={origin}")
-        print(f"  [cube] natoms={len(atomZ)} Zsum={atomZ.sum():.1f} sigma_na={sigma_na}")
+        print(f"  [cube] natoms={len(atomZ)} Zsum={atomZ.sum():.1f} na_kind={na_kind} {na_tag}")
         print(f"  [CHARGE CHECK] q_scf={q_scf:.6f} q_na={q_na:.6f} q_diff={q_diff:.6e}")
         if abs(q_diff) > 0.05:
             print(f"  WARNING: |q_diff|={abs(q_diff):.4f} > 0.05 e — ES may be unreliable")
@@ -819,6 +1450,8 @@ def get_density_from_cube(cube_path_or_dir, *, esp_path=None, sigma_na=0.5,
         'q_na': q_na,
         'q_diff': q_diff,
         'sigma_na': float(sigma_na),
+        'rc_na': float(rc_na),
+        'na_kind': na_kind,
         'cube_path': dt_path,
         'esp_path': esp_path,
     }
@@ -976,11 +1609,12 @@ def tip_density_apex_down(rho, atomPos, atomZ, apex_Z, origin, step, z_tol=0.15)
 
 
 def build_fdbm_grid_from_cubes(sample_cube_dir, tip_cube_dir, *, step=0.1, margin_xy=4.0,
-                               z_min=-15.0, z_max=15.0, sigma_na=0.5, apex_Z=None,
+                               z_min=-15.0, z_max=15.0, sigma_na=0.3, apex_Z=None,
                                A_pauli=None, beta_pauli=None, tip_name=None,
                                use_esp_cube=False, verbosity=0,
                                clamp_cores=True, clamp_percentile=99.0, clamp_rho_max=None,
-                               use_gpu_project=True, z_symmetric=True):
+                               use_gpu_project=True, z_symmetric=True,
+                               na_kind='gaussian', rc_na=0.5):
     """Build FDBM F_total on a tall AFM grid from sample+tip Dt cubes.
 
     Pipeline (dipole-safe):
@@ -992,14 +1626,24 @@ def build_fdbm_grid_from_cubes(sample_cube_dir, tip_cube_dir, *, step=0.1, margi
       4. Poisson(Δρ); tip Δρ rolled to apex; no monopole strip unless |q| is large
 
     Tip: apex-down only if cube is planar; then roll density peak to (0,0,0).
+    na_kind/rc_na/sigma_na: forwarded to get_density_from_cube for sample+tip NA.
+
+    Caveat (CO tip vs DFTB, 2026-07-21): all-electron cube tip Δρ has huge nuclear-cusp
+    residuals vs compact/Gaussian NA even when ∫Δρ≈0; DFTB tip is valence-only (CO q≈10
+    not 14) with mild Δρ. Project tip onto the **full AFM cell** (do not crop tip with a
+    tight bbox — margin≲1 Å on CO fabricated q_del≈−0.7 and wrecked E_es). E_es bend of
+    cube path is tip_Δρ ⊗ V_sample; see `doc/Tasks/Import_KrigingGridFF.md` session notes.
     """
     from . import AFM as afm_mod
     from spammm.utils.GridsOCL import grid_moments_centers
 
     d_s = get_density_from_cube(
         sample_cube_dir, sigma_na=sigma_na, rescale_na=True,
-        use_esp_cube=use_esp_cube, verbosity=verbosity)
-    d_t = get_density_from_cube(tip_cube_dir, sigma_na=sigma_na, rescale_na=True, verbosity=verbosity)
+        use_esp_cube=use_esp_cube, verbosity=verbosity,
+        na_kind=na_kind, rc_na=rc_na)
+    d_t = get_density_from_cube(
+        tip_cube_dir, sigma_na=sigma_na, rescale_na=True, verbosity=verbosity,
+        na_kind=na_kind, rc_na=rc_na)
 
     if apex_Z is None and tip_name:
         suf = tip_name.split('_')[-1]
@@ -2762,10 +3406,11 @@ def _plot_co_tip_diagnostics(co_rho_total, co_rho_delta, output_dir, origin, ste
             sl = data[:, :, idx].T
             exts = [origin[0], origin[0] + data.shape[0]*step, origin[1], origin[1] + data.shape[1]*step]
             xl, yl = 'x [A]', 'y [A]'
-        im = ax.imshow(sl, origin='lower', extent=exts, cmap='magma')
+        im = ax.imshow(sl, origin='lower', extent=exts, cmap='magma', aspect='equal')
         ax.set_title(title)
         ax.set_xlabel(xl)
         ax.set_ylabel(yl)
+        # NOTE: always aspect='equal' for spatial maps (1 Å x = 1 Å y/z). Never aspect='auto'.
         plt.colorbar(im, ax=ax, fraction=0.03)
 
     nx, ny, nz = co_rho_total.shape

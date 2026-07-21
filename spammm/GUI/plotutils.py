@@ -10,7 +10,7 @@ future extension that needs 2D scalar field visualization in the GUI.
 """
 
 from spammm.plotUtils import (
-    compute_grid_extent, make_2d_grid, overlay_atoms, plot_2d_scalar,
+    compute_grid_extent, make_2d_grid, overlay_atoms, plot_2d_scalar, imshow_array,
 )
 
 from PyQt5 import QtWidgets

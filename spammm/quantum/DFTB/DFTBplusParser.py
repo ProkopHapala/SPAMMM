@@ -668,12 +668,22 @@ SLATER_TAIL_ZETA = {  # 1/Å — calibrated by interpolation to get density slop
 }
 
 def make_slater_tail_species_list(species_list_ang, zeta_override=None, cutoff_extend=6.0):
-    """Create modified species_list with single-exponential STOs matching DFT decay.
+    """Create modified species_list with single-exponential STOs for **Pauli tails only**.
 
-    Replaces multi-zeta basis with single-exponential per shell (l),
-    using fitted decay constants from GPAW/PySCF density profiles.
-    The DM coefficients from original DFTB SCF are projected with these
-    modified radial functions — an approximation, but captures correct tail decay.
+    CRITICAL DESIGN (do not "fix" by charge-normalizing):
+      - Prolonged / Slater-tail projection is a **practical correction** for AFM Pauli:
+        stock DFTB STOs (mio/3ob) decay too fast in vacuum; AFM needs density 1–4 Å out.
+      - SCF DM is still from the **short** basis. Only the **projection** radial functions change.
+      - ∫ρ from prolonged STOs is **NOT** physically normalized and **must not** be rescaled
+        to match N_electrons. Pauli = A·(∫ ρ_sample ρ_tip)^β cares about **local** overlap
+        in the tip region, not total charge.
+      - Use prolonged ρ **only for Pauli overlap**. Electrostatics must keep **stock**
+        Δρ = ρ_scf − ρ_NA (and V_ES = Poisson(Δρ)) so multipoles / neutrality stay valid.
+      - Dual basis (stock ES + prolonged Pauli) looks inconsistent but is intentional:
+        better AFM accuracy without re-SCF / without compromising ES.
+
+    See: `doc/DFTB_basis_fit.md`, `doc/Tasks/ProlongedRadialBasis_DFTB.md`,
+    PTCDA: stock V_ES + SA-prolonged Pauli (`testplot_fdbm_relax.py --ptcda-stock-vs-sa`).
 
     Args:
         species_list_ang: original species_list from convert_wfc_to_species_list_ang()
@@ -681,7 +691,7 @@ def make_slater_tail_species_list(species_list_ang, zeta_override=None, cutoff_e
         cutoff_extend: extended cutoff in Angstrom (default 6.0)
 
     Returns:
-        new species_list with single-exponential STOs
+        new species_list with single-exponential STOs (for Pauli projection only)
     """
     zeta_map = zeta_override or SLATER_TAIL_ZETA
     from math import factorial, sqrt

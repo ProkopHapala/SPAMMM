@@ -46,3 +46,4 @@ Before writing ANY new function, search the codebase for existing implementation
 - About to copy-paste code → STOP, refactor into a shared function
 - About to create a new file (module, script, helper) → STOP, ask: "Can this go in an existing module?" If yes, use the existing module. If no, ask the user for permission.
 - About to create multiple scripts for related functionality → STOP, consider a single unified CLI with subcommands instead
+- About to `imshow` / plot **AFM E, Fz, or df** (2D map or z-curve) → STOP → skill:`afm-plotting` / `AFM_utils`

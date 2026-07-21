@@ -1451,3 +1451,38 @@ def plot_2d_scalar(data_2d, extent, title, z_label='', cmap='seismic', symmetric
     fig.tight_layout()
     return fig
 
+
+def imshow_array(data_2d, title='', cmap='viridis', symmetric=None, colorbar=True, origin='lower'):
+    """Generic 2D array imshow (index axes, no physical extent). Returns Figure.
+
+    If symmetric is None, auto-enable when finite data straddles zero.
+    """
+    from matplotlib.figure import Figure
+    data = np.asarray(data_2d)
+    finite = np.isfinite(data)
+    if not np.any(finite):
+        vmin, vmax = 0.0, 1.0
+    else:
+        vmin = float(np.nanmin(data))
+        vmax = float(np.nanmax(data))
+        if vmax - vmin < 1e-30:
+            vmax = vmin + 1.0
+    if symmetric is None:
+        symmetric = bool(np.any(finite) and vmin < 0 and vmax > 0)
+    if symmetric:
+        v = max(abs(vmin), abs(vmax))
+        if v < 1e-30: v = 1.0
+        vmin, vmax = -v, v
+        if cmap == 'viridis':
+            cmap = 'seismic'
+    fig = Figure(figsize=(7, 6), dpi=100)
+    ax = fig.add_subplot(111)
+    im = ax.imshow(data, origin=origin, cmap=cmap, vmin=vmin, vmax=vmax, aspect='equal')
+    ax.set_title(title)
+    ax.set_xlabel('j')
+    ax.set_ylabel('i')
+    if colorbar:
+        fig.colorbar(im, ax=ax)
+    fig.tight_layout()
+    return fig
+

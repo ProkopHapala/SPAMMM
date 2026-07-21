@@ -122,8 +122,8 @@ def main():
                    help='fit Pauli to Kriging−ES−vdW (lets Pauli cancel bad ES — usually wrong)')
     p.add_argument('--fit_zmin', type=float, default=1.5)
     p.add_argument('--fit_zmax', type=float, default=2.0)
-    p.add_argument('--sigma_na', type=float, default=0.5,
-                   help='Gaussian ρ_NA width [Å] for Δρ=ρ_scf−ρ_NA (default 0.5)')
+    p.add_argument('--sigma_na', type=float, default=0.3,
+                   help='Gaussian ρ_NA width [Å] for Δρ=ρ_scf−ρ_NA (default 0.3)')
     p.add_argument('--nxy', type=int, default=120)
     p.add_argument('--outdir', default=None)
     args = p.parse_args()
@@ -142,7 +142,7 @@ def main():
     from spammm.SPM import AFM as afm_mod
 
     tag = f'{args.endgroup}-{args.tip}'
-    if abs(float(args.sigma_na) - 0.5) > 1e-9:
+    if abs(float(args.sigma_na) - 0.3) > 1e-9:
         tag = f'{tag}_sigNA{args.sigma_na:g}'
     Lz_req = float(args.z_max) - float(args.z_min)
     if abs(Lz_req - 30.0) > 0.5:  # default −5…25 → Lz=30

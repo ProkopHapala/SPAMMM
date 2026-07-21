@@ -11,6 +11,8 @@ trigger:
 
 Before writing ANY matplotlib/VisPy plotting code, check `spammm/plotUtils.py` and `spammm/GUI/plotutils.py` for existing functions. This is a blocking step — do not skip it. See also `code-reuse` skill.
 
+**AFM E / Fz / df maps and z-profiles** are NOT covered here — use skill:`afm-plotting` and `spammm.SPM.AFM_utils` (`imshow_afm`, `plot_afm_height_panel`, `plot_afm_z_profiles`, `plot_fdbm_vs_kriging_zlayout`, …). Do not reinvent those with raw `imshow`/`plot`.
+
 ## Shared Functions (SSOT)
 
 ### Pure matplotlib — `spammm/plotUtils.py`

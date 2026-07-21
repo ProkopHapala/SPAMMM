@@ -168,6 +168,8 @@ Interactive rigid-body dynamics of a small molecule on a periodic substrate usin
 | `spammm/GUI/gui_scripts/folded_rigid_setup.py` | active | One-command setup script (`--run`, `--manip`, `--fit`, `--mol`) |
 | `spammm/forcefields/SPFF_cl.py` | active | `fit_folded_surface_basis` with `coulomb_solver='ewald2d'` |
 | `spammm/forcefields/RigidBodyDynamics.py` | active | OpenCL rigid-body state, `run_folded`, `update_anchors` |
+| `tests/testplot_ptcda_nacl_replicas.py` | experimental | 256×256 pinned-PTCDA imaging; staged damped Newton, FIRE comparison, constraint-reaction maps |
+| `doc/Reports/PTCDA_NaCl_Rigid_Newton_FIRE_Relaxation.md` | active | Solver rationale, continuity evidence, performance tradeoffs, reproduction, and caveats |
 | `kernels/rigid.cl` | active | `rigid_body_folded_kernel` folded basis force/torque + anchor springs |
 | `spammm/GUI/SPAMMM_GUI.py` | active | Mouse dispatch (`on_mouse_press/move/release`), `refresh_view` no-bonds fix, extension integration |
 | `spammm/GUI/EditModeHandlers.py` | active | `on_move` ray-origin/direction, `on_release` hook base class |
@@ -178,7 +180,9 @@ Interactive rigid-body dynamics of a small molecule on a periodic substrate usin
 - `_update_graph` rebuilds the backend graph if the atom count diverges between `backend` and `rbd`.
 - `FRManipMode` uses `AtomScene._pick_id_from_mouse` for screen-space atom picking and ray-projection for anchor targets.
 - Default dynamics: `k=2.0`, `dt=0.02`, `n_iter=250`, adaptive `Run` timer `max(20, 0.1·n_iter)` ms.
-- Inverse inertia tensor scaled by `mtot/2` to keep rotation responsive while avoiding spring-induced flipping.
+- Folded setup scales `I` and `I⁻¹` consistently with the requested effective mass (`I∝m_eff`, `I⁻¹∝1/m_eff`); PTCDA imaging uses `m_eff=4` for FIRE preconditioning.
+- Stable float32 imaging Newton uses centered `eps=0.1`, trust `0.1`, and a staged LM floor (`1.0` for basin following, then `0.01` for finishing); persistent state across launches is mandatory.
+- Plot the spring reaction `F_constraint=+k(r_pin-r_anchor)` as the tip observable; total force is a convergence residual and approaches zero.
 
 **GUI scripts:**
 ```bash
@@ -188,7 +192,7 @@ Interactive rigid-body dynamics of a small molecule on a periodic substrate usin
 
 **Tests:** `tests/surfaces/test_folded_relax.py` (smoke), manual `Run`/`drag` L2 review.
 
-**Open issues:** `Run` speed is GPU-timer-limited; the `Run` timer interval is auto-scaled with `n_iter`. No L0 pytest for the GUI drag path yet.
+**Open issues:** `Run` speed is GPU-timer-limited; the `Run` timer interval is auto-scaled with `n_iter`. No L0 pytest for the GUI drag path yet. Newton translation/rotation coordinates are not nondimensionalized; the replica kernel uses centered Hessian differences while the single-body workgroup kernel still uses forward differences.
 
 ## 3c. Contact Surface (quasi-2D static AFM)
 

@@ -19,6 +19,7 @@ from tests.helpers.folded_rigid import (
     save_reference, compare_to_reference,
     NACL_SUBSTRATE, Z_SURF_TOP, LATTICE_A,
 )
+from spammm.surfaces.FoldedRigid import setup_rigid_folded_replicas
 
 DATA_XYZ = os.path.join(_proj_root, 'data', 'xyz')
 DEBUG_DIR = os.path.join(_proj_root, 'debug', 'test_folded_relax')
@@ -166,6 +167,57 @@ def test_relax_ptcda_nacl(xyz, substrate, update_refs):
         for m in msgs:
             print(f'[PTCDA-REF] {m}')
         assert passed, f'Reference comparison failed for ptcda_nacl'
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_ptcda_pinned_newton_single_replica(xyz, substrate):
+    """Continuous in-kernel Newton must converge without per-step trust resets."""
+    fit = fit_folded_for_molecule(xyz('PTCDA.xyz'), substrate_file=substrate('NaCl_1x1_L3.xyz'), z_range_rel=(1.2, 8.0))
+    xy = np.array([6.44], dtype=np.float32)
+    rbd = setup_rigid_folded_replicas(
+        fit, xy, np.array([4.47], dtype=np.float32), z_init=6.0, mass_trans=4.0,
+        pin_atom_idx=24, z_pin=Z_SURF_TOP + 6.0, k_spring=10.0,
+    )
+    out = rbd.run_folded_newton_replicas(niter=80, f_tol=1e-4, t_tol=1e-4, trust0=0.5)
+    F = float(np.linalg.norm(out['body_force'][0, :3]))
+    T = float(np.linalg.norm(out['body_torque'][0, :3]))
+    E = float(out['body_force'][0, 3])
+    print(f'[PTCDA-Newton-1px] E={E:.8f} |F|={F:.3e} |τ|={T:.3e} iters={out["body_torque"][0,3]:.0f}')
+    assert np.isfinite(out['pos']).all()
+    assert np.isfinite(out['quats']).all()
+    assert np.isfinite(E)
+    assert F < 1e-4
+    assert T < 1e-4
+
+    rbd_step = setup_rigid_folded_replicas(
+        fit, xy, np.array([4.47], dtype=np.float32), z_init=6.0, mass_trans=4.0,
+        pin_atom_idx=24, z_pin=Z_SURF_TOP + 6.0, k_spring=10.0,
+    )
+    for _ in range(80):
+        out_step = rbd_step.run_folded_newton_replicas(niter=1, f_tol=1e-4, t_tol=1e-4, trust0=0.5)
+        if np.linalg.norm(out_step['body_force'][0, :3]) < 1e-4 and np.linalg.norm(out_step['body_torque'][0, :3]) < 1e-4:
+            break
+    np.testing.assert_allclose(out_step['pos'], out['pos'], atol=2e-6, rtol=0.0)
+    np.testing.assert_allclose(out_step['quats'], out['quats'], atol=2e-6, rtol=0.0)
+    np.testing.assert_allclose(rbd_step.download_selected(['newton_state'])['newton_state'], rbd.download_selected(['newton_state'])['newton_state'], atol=2e-6, rtol=0.0)
+
+    rbd_fire_bulk = setup_rigid_folded_replicas(
+        fit, xy, np.array([4.47], dtype=np.float32), z_init=6.0, mass_trans=4.0,
+        pin_atom_idx=24, z_pin=Z_SURF_TOP + 6.0, k_spring=10.0,
+    )
+    rbd_fire_step = setup_rigid_folded_replicas(
+        fit, xy, np.array([4.47], dtype=np.float32), z_init=6.0, mass_trans=4.0,
+        pin_atom_idx=24, z_pin=Z_SURF_TOP + 6.0, k_spring=10.0,
+    )
+    rbd_fire_bulk.run_folded_replicas(100, 0.02, lin_damp=0.1, ang_damp=0.1, fire=True)
+    for _ in range(100):
+        rbd_fire_step.run_folded_replicas(1, 0.02, lin_damp=0.1, ang_damp=0.1, fire=True)
+    fire_bulk = rbd_fire_bulk.download_outputs()
+    fire_step = rbd_fire_step.download_outputs()
+    np.testing.assert_allclose(fire_step['pos'], fire_bulk['pos'], atol=2e-6, rtol=0.0)
+    np.testing.assert_allclose(fire_step['quats'], fire_bulk['quats'], atol=2e-6, rtol=0.0)
+    np.testing.assert_allclose(rbd_fire_step.download_selected(['fire_state'])['fire_state'], rbd_fire_bulk.download_selected(['fire_state'])['fire_state'], atol=2e-6, rtol=0.0)
 
 
 @pytest.mark.gpu

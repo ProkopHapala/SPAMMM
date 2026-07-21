@@ -54,6 +54,12 @@ trigger:
 
 8. **Foreground execution.** Never hide output (`| tail`, `| head`, `&`). Full stdout visible.
 
+9. **CRITICAL — equal axes for spatial maps:** any `imshow` of XY/XZ/YZ density or potential
+   **MUST** use `aspect='equal'` so **1 Å along x = 1 Å along y/z**. Never `aspect='auto'`.
+
+10. **AFM / FDBM z-diagnostics:** use skill:`afm-plotting` — especially
+    `plot_fdbm_vs_kriging_zlayout` / `plot_fdbm_methods_zcompare_4panel` (never paste a new 2×3 layout).
+
 ---
 
 ## Topology editing pattern

@@ -1,6 +1,8 @@
 
 # Inventory of Existing Components
 
+> **2026-07-21 imaging report:** [Report_PTCDA_NaCl_FAF_RigidImaging.md](Report_PTCDA_NaCl_FAF_RigidImaging.md) — PTCDA@NaCl 256×256 Newton vs FIRE (pinned O), convergence & trajectories.
+
 ## 1. Rigid Body Dynamics ([RigidBodyDynamics.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/RigidBodyDynamics.py:0:0-0:0) + [rigid.cl](cci:7://file:///home/prokop/git/SPAMMM/kernels/rigid.cl:0:0-0:0))
 
 **What exists:** A fully functional 6-DOF rigid body engine on GPU.

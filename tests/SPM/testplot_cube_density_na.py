@@ -3,7 +3,7 @@
 
 Usage:
   python tests/SPM/testplot_cube_density_na.py
-  python tests/SPM/testplot_cube_density_na.py --mol H2O_O --sigma 0.5
+  python tests/SPM/testplot_cube_density_na.py --mol H2O_O --sigma 0.3
 """
 from __future__ import annotations
 import argparse, os
@@ -13,7 +13,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--mol', nargs='+', default=['H2O_O', 'HHO-h-p_1'],
                    help='neutral/<mol> under data/mithun_afm_tip_fukui')
-    p.add_argument('--sigma', type=float, default=0.5)
+    p.add_argument('--sigma', type=float, default=0.3)
     p.add_argument('--outdir', default=None)
     args = p.parse_args()
 

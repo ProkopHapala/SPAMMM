@@ -15,6 +15,26 @@ Standard 3ob/mio STOs are confined (hard cutoff ~6 Bohr). AFM/STM probe density/
 
 Design write-up already exists: `doc/DFTB_basis_fit.md`.
 
+### Dual basis (agents: do not “normalize” prolonged ρ)
+
+USER clarification (2026-07-21) — agents kept getting this wrong:
+
+- **ES:** always stock short-basis Δρ → Poisson (neutrality / multipoles).
+- **Pauli only:** prolonged / SA Slater projection of the **same** SCF DM — vacuum tails.
+- Prolonged ∫ρ is **not** supposed to equal \(N_e\); **never** charge-normalize it. Pauli is sensitive to **local** density in the tip region, not total charge; \(A,\beta\) absorb scale.
+- Dual basis may look inconsistent; it is an intentional practical correction so short-basis DFTB+ AFM improves **without** re-SCF and without compromising ES.
+- Code SSOT: `make_slater_tail_species_list` in `DFTBplusParser.py`; also `get_density_from_dftb_dense(..., projection_basis_ang=...)`, `ModularPipeline` header, `doc/DFTB_basis_fit.md`, session notes in `doc/Tasks/Import_KrigingGridFF.md`.
+
+### Tip-first prolonged Slater (USER 2026-07-21)
+
+We currently fit / apply prolonged Slater mainly for the **sample**. For AFM Pauli it is **even more important for the tip** (overlap is tip×sample in the vacuum region).
+
+**Guinea-pig:** Mithun `CO_O` / DFTB CO tip — small, well-characterized.
+
+**Plan:** systematic SA fit of prolonged STOs for tip (and optionally sample / both). End goal may be **tip-only** prolonged ρ (precomputed once) — simpler and cheaper. Still dual basis: stock Δρ→V_ES; prolonged ρ→Pauli only; never charge-normalize.
+
+See also: all-electron Δρ clamp recipe on the same CO tip (`Import_KrigingGridFF.md` §CO guinea-pig).
+
 ## Where the tests / tools already are
 
 | Artifact | Path | Role |

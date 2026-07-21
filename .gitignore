@@ -219,7 +219,7 @@ __marimo__/
 
 # Debug output (generated test plots, .xyz cluster files)
 debug/**
-!debug/README.md
+#!debug/README.md
 
 # GUI output (screenshots, saved plots)
 output/

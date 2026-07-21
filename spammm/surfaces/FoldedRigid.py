@@ -27,7 +27,7 @@ import os
 import numpy as np
 
 from spammm.forcefields.SPFF_cl import SPFF_cl as MolecularDynamics
-from spammm.forcefields.RigidBodyDynamics import RigidBodyDynamics, _guess_mass, compute_mass_properties
+from spammm.forcefields.RigidBodyDynamics import RigidBodyDynamics, _guess_mass, _quat_to_matrix_np, compute_mass_properties
 from spammm.topology.FFparams import load_xyz_with_REQs
 from spammm.AtomicSystem import AtomicSystem
 
@@ -253,7 +253,8 @@ def setup_rigid_folded(mol_file, fit_result, z_init=3.0, xy_init=(0.0, 0.0), qua
         z_init: initial height above surface top in Angstrom
         xy_init: initial (x, y) position
         quats: (4,) initial quaternion, or None for identity
-        mass_trans: translational mass parameter
+        mass_trans: effective translational/rotational mass. Inertia is scaled
+            by mass_trans / physical total mass, preserving its shape.
     """
     if mol_file is None:
         apos_mol = fit_result['apos_mol']
@@ -266,8 +267,11 @@ def setup_rigid_folded(mol_file, fit_result, z_init=3.0, xy_init=(0.0, 0.0), qua
     com0 = (apos_mol * masses[:, None]).sum(axis=0) / masses.sum()
     rel = apos_mol - com0[None, :]
     mtot, I, Iinv = compute_mass_properties(rel, masses)
-    I_mean = float(np.mean(np.diag(I)))
-    mass_trans = mtot
+    mass_trans = float(mass_trans)
+    if mass_trans <= 0.0:
+        raise ValueError(f'mass_trans must be > 0, got {mass_trans}')
+    I_relax = I * (mass_trans / mtot)
+    Iinv_relax = Iinv * (mtot / mass_trans)
 
     n_bodies = 1
     n_atoms = len(enames)
@@ -293,9 +297,9 @@ def setup_rigid_folded(mol_file, fit_result, z_init=3.0, xy_init=(0.0, 0.0), qua
     rbd.upload_state(
         pos4, quat4, zero4, zero4,
         mass_trans, 1.0 / mass_trans,
-        np.repeat(Iinv[None, :, :], n_bodies, axis=0),
+        np.repeat(Iinv_relax[None, :, :], n_bodies, axis=0),
         atom_body,
-        inertia=np.repeat(I[None, :, :], n_bodies, axis=0),
+        inertia=np.repeat(I_relax[None, :, :], n_bodies, axis=0),
     )
 
     coeffs = fit_result['coeffs']
@@ -308,10 +312,117 @@ def setup_rigid_folded(mol_file, fit_result, z_init=3.0, xy_init=(0.0, 0.0), qua
     return rbd
 
 
-def relax_folded(rbd, n_steps=2000, dt=0.01, lin_damp=0.95, ang_damp=0.90, record_interval=100):
+def setup_rigid_folded_replicas(fit_result, xs, ys, z_init=3.0, quats=None, mass_trans=None,
+                                pin_atom_idx=None, z_pin=None, k_spring=10.0, debug=False):
+    """Create RigidBodyDynamics replicas grid for imaging on folded FAF substrate.
+
+    One replica per (x,y) pixel; identity (flat) quaternion by default.
+    xs, ys are 1D scan axes (Å, PBC).
+
+    If pin_atom_idx is set (AFM-like tip constraint):
+      - Scan (x,y) is the *pin target* (tip) position, not free COM.
+      - Anchor spring holds that atom at (x, y, z_pin) with stiffness k_spring.
+      - Molecule COM is initialized so the pin atom starts exactly on the tip
+        (flat orientation). z_pin defaults to Z_SURF_TOP + z_init.
+    Else:
+      - Free molecule with COM on the scan grid at height Z_SURF_TOP + z_init.
+    """
+    apos_mol = np.asarray(fit_result['apos_mol'], dtype=np.float32)
+    reqs = fit_result['reqs']
+    enames = fit_result['enames']
+    masses = np.ones(len(enames), dtype=np.float32)
+    com0 = (apos_mol * masses[:, None]).sum(axis=0) / masses.sum()
+    rel = apos_mol - com0[None, :]
+    mtot, I, Iinv = compute_mass_properties(rel, masses)
+    if mass_trans is None:
+        mass_trans = float(mtot)
+    mass_trans = float(mass_trans)
+    if mass_trans <= 0.0:
+        raise ValueError(f'mass_trans must be > 0, got {mass_trans}')
+    I_relax = I * (mass_trans / mtot)
+    Iinv_relax = Iinv * (mtot / mass_trans)
+
+    xs = np.asarray(xs, dtype=np.float32)
+    ys = np.asarray(ys, dtype=np.float32)
+    nx, ny = len(xs), len(ys)
+    n_rep = nx * ny
+    na = len(enames)
+    XX, YY = np.meshgrid(xs, ys, indexing='xy')  # (ny, nx)
+    sx = XX.ravel()
+    sy = YY.ravel()
+
+    quat4 = np.zeros((n_rep, 4), dtype=np.float32)
+    if quats is None:
+        quat4[:, 3] = 1.0
+    else:
+        q = np.asarray(quats, dtype=np.float32).reshape(-1)
+        q = q / max(np.linalg.norm(q), 1e-30)
+        quat4[:] = q
+
+    pos4 = np.zeros((n_rep, 4), dtype=np.float32)
+    anchors = None
+    if pin_atom_idx is not None:
+        ia = int(pin_atom_idx)
+        if ia < 0 or ia >= na:
+            raise ValueError(f'pin_atom_idx={ia} out of range [0,{na})')
+        r_pin = rel[ia]
+        r_pin_world = _quat_to_matrix_np(quat4[0]) @ r_pin
+        z_tip = float(Z_SURF_TOP + z_init if z_pin is None else z_pin)
+        pos4[:, 0] = sx - r_pin_world[0]
+        pos4[:, 1] = sy - r_pin_world[1]
+        pos4[:, 2] = z_tip - r_pin_world[2]
+        pos4[:, 3] = mass_trans
+        anchors = np.zeros((n_rep, na, 4), dtype=np.float32)
+        anchors[:, :, 3] = -1.0
+        anchors[:, ia, 0] = sx
+        anchors[:, ia, 1] = sy
+        anchors[:, ia, 2] = z_tip
+        anchors[:, ia, 3] = float(k_spring)
+    else:
+        pos4[:, 0] = sx
+        pos4[:, 1] = sy
+        pos4[:, 2] = Z_SURF_TOP + float(z_init)
+        pos4[:, 3] = mass_trans
+
+    zero4 = np.zeros((n_rep, 4), dtype=np.float32)
+    rbd = RigidBodyDynamics(debug=debug)
+    rbd.realloc_replicas(n_replicas=n_rep, num_atoms=na)
+    rbd.enames = list(enames)
+    rbd.atom_REQ = reqs.copy()
+    rbd.atom_masses = masses.copy()
+    rbd.mass_physical = float(mtot)
+    rbd.mass_trans = mass_trans
+    rbd.mass_rot = mass_trans
+    rbd.upload_replicas_state(
+        pos4, quat4, zero4, zero4, mass_trans, Iinv_relax, rel.astype(np.float32),
+        anchors=anchors, inertia=I_relax,
+    )
+    coeffs = fit_result['coeffs']
+    kxyz = fit_result['basis_params']
+    atype = fit_result['atom_type_ids']
+    lvec2d = fit_result['folded_lvec2d']
+    ntypes, nbasis = coeffs.shape
+    folded_meta = np.array([nbasis, ntypes, na, n_rep], dtype=np.int32)
+    rbd.init_replicas(n_rep, coeffs, kxyz, atype, lvec2d, folded_meta=folded_meta)
+    rbd._scan_nx = nx
+    rbd._scan_ny = ny
+    rbd._scan_xs = xs
+    rbd._scan_ys = ys
+    rbd._pin_atom_idx = pin_atom_idx
+    rbd._z_pin = None if pin_atom_idx is None else float(Z_SURF_TOP + z_init if z_pin is None else z_pin)
+    rbd._k_spring = float(k_spring) if pin_atom_idx is not None else 0.0
+    return rbd
+
+
+def relax_folded(rbd, n_steps=500, dt=0.05, lin_damp=0.1, ang_damp=0.1, record_interval=25,
+                 fire=True, f_tol=1e-4, t_tol=1e-4):
     """Run relaxation, recording trajectory.
 
-    Returns dict with 'energies', 'forces', 'torques', 'positions', 'quaternions', 'atom_positions' lists.
+    Default: FIRE quench (zero v when v·F<0 / ω when ω·τ<0). Early-exits when
+    |F|<f_tol and |τ|<t_tol. Set fire=False for plain damped MD.
+
+    Returns dict with 'energies', 'forces', 'torques', 'positions', 'quaternions',
+    'atom_positions', and 'steps' (actual steps taken).
     """
     energies = []
     forces = []
@@ -319,22 +430,34 @@ def relax_folded(rbd, n_steps=2000, dt=0.01, lin_damp=0.95, ang_damp=0.90, recor
     positions = []
     quaternions = []
     atom_positions_list = []
+    steps_done = 0
+    interval = max(1, int(record_interval))
 
-    n_record = max(1, n_steps // record_interval) if record_interval > 0 else 0
-    for i in range(0, n_steps, record_interval):
-        steps = min(record_interval, n_steps - i)
-        rbd.run_folded(steps, dt, lin_damp=lin_damp, ang_damp=ang_damp)
+    while steps_done < n_steps:
+        n = min(interval, n_steps - steps_done)
+        rbd.run_folded(n, dt, lin_damp=lin_damp, ang_damp=ang_damp, fire=fire)
+        steps_done += n
         out = rbd.download_outputs()
-        atom_pos = out['atom_positions'][0]  # (natoms, 4)
+        atom_pos = out['atom_positions'][0]
         E = float(atom_pos[:, 3].sum())
         f = out['body_force'][0]
         tq = out['body_torque'][0]
+        Fmag = float(np.linalg.norm(f[:3]))
+        Tmag = float(np.linalg.norm(tq[:3]))
         energies.append(E)
-        forces.append(float(np.linalg.norm(f[:3])))
-        torques.append(float(np.linalg.norm(tq[:3])))
+        forces.append(Fmag)
+        torques.append(Tmag)
         positions.append(out['pos'][0].copy())
         quaternions.append(out['quats'][0].copy())
         atom_positions_list.append(atom_pos[:, :3].copy())
+        if Fmag < f_tol and Tmag < t_tol:
+            # Confirm with force recompute at final pose (last body_force is pre-drift)
+            F2, Tw2, _, _, _ = rbd.eval_force_torque('folded')
+            Fmag = float(np.linalg.norm(F2)); Tmag = float(np.linalg.norm(Tw2))
+            forces[-1] = Fmag; torques[-1] = Tmag
+            if Fmag < f_tol and Tmag < t_tol:
+                break
+            # Not actually converged — continue (velocities were cleared by eval; OK near min)
 
     return {
         'energies': np.array(energies),
@@ -343,7 +466,13 @@ def relax_folded(rbd, n_steps=2000, dt=0.01, lin_damp=0.95, ang_damp=0.90, recor
         'positions': np.array(positions),
         'quaternions': np.array(quaternions),
         'atom_positions': atom_positions_list,
+        'steps': steps_done,
     }
+
+
+def relax_folded_newton(rbd, max_iter=20, trust0=0.5, f_tol=1e-5, t_tol=1e-5, record=False):
+    """Pure GPU Newton (one kernel launch). Prefer this over host FD."""
+    return rbd.run_folded_newton(niter=max_iter, trust0=trust0, f_tol=f_tol, t_tol=t_tol)
 
 
 def relax_folded_diag(rbd, n_steps=5000, dt=0.02, lin_damp=0.95, ang_damp=0.90, record_interval=10):

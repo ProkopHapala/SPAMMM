@@ -52,7 +52,7 @@ flowchart LR
 
 **Preferred Pauli-fit pair:** `N-h` (pyridine) + `CO_O` — see task §Preferred pair. Probes: **N** and **para-C**.
 
-**2026-07-20 session (investigating):** detailed report in `doc/Tasks/Import_KrigingGridFF.md` §Session report. Headline: cube/Psi4 FDBM shows **large ES repulsion** absent in Kriging *and* in DFTB FDBM → blame **all-electron core − Gaussian NA** on coarse grids (not pyridine physics). Tip clamp inflated CO dipole ~25×. Far-field fake \(p_z\) fixed (GPU project + z-symmetric box). Flat `pyridine.xyz` + DFTB control OK. PP `K_LAT`: CLI now N/m; 0.5 N/m may feel too soft — retune open.
+**2026-07-20…21 campaign (investigating):** durable write-up `doc/Reports/Kriging_DFT_vs_DFTB_FDBM_pyridine.md`; live log `doc/Tasks/Import_KrigingGridFF.md`. Headline: cube FDBM ES morphology still fails vs Kriging while DFTB FDBM is sane — two distinctions (Δρ/NA recipe vs basis tails). Dual basis: prolonged Slater = Pauli only, never normalize. Tip×sample matrix + clamp→compact NA in progress. Plot SSOT: skill:`afm-plotting`.
 
 **FDBM physics (current 3 channels used for comparison):**
 - **Pauli** — always repulsive: \(E_\mathrm{Pauli}(R) = A[\rho_\mathrm{samp}(r)\,\rho_\mathrm{tip}(r+R)]^\beta\)
@@ -64,8 +64,10 @@ Fitting target (next after port): optimize \(A_\mathrm{Pauli}\) and \(\beta\) so
 **Caveat:** `PAULI_FITTED_DEFAULTS['pyscf_6-31g*']` (A≈39.5, β≈1.15) was fitted with a **Gaussian tip** (σ=0.7 Å), not cube CO/H₂O tips — re-fit per tip with `AFM_utils._fit_pauli_powerlaw` (see `Import_KrigingGridFF.md` §Preferred pair).
 
 **Density sources for FDBM (both, in parallel):**
-1. High-quality DFT cubes / grids from **pySCF or GPAW** (Psi4 B3LYP cubes already on disk — see below)
-2. **Prolonged DFTB+** via `Grid_dftb` (separate P0 task)
+1. High-quality DFT cubes / grids from **pySCF or GPAW** (Psi4 B3LYP cubes already on disk — see below) — **all-electron**; need clamp→compact NA for Δρ (`delta_rho_clamp_compact_na`, CO guinea-pig)
+2. **Prolonged DFTB+** via `Grid_dftb` — **valence**; prolonged Slater especially for **tip** Pauli (`ProlongedRadialBasis_DFTB.md`)
+
+**CO guinea-pig (2026-07-21):** debug (1) all-e Δρ and (2) tip Slater on `CO_O` before pyridine — `doc/Tasks/Import_KrigingGridFF.md` §CO guinea-pig.
 
 ---
 
@@ -237,6 +239,10 @@ Also fixed `DFTBplusParser.read_cube` atom lines (`Z charge x y z`).
 - Comparing AFM heights before confirming z-label identity → meaningless residuals  
 
 **Status after alignment pass:** geometric frames look consistent within ~0.5 Å at COM (walls in same region). Remaining mismatch at AFM z is **physics** (FDBM ES/Gaussian NA stays repulsive; Kriging has attractive well) — not a multi-Å grid mislabel. USER review of `debug/testplot_kriging_vs_fdbm_cube/z_profiles_*.png` required before treating compare as valid.
+
+### Tip × sample matrix (label both)
+
+Matched DFT×DFT / DFTB×DFTB vs **cross** DFT-sample⊗DFTB-tip and DFTB-sample⊗DFT-tip — see `Import_KrigingGridFF.md` §Tip × sample. Plot SSOT: `plot_fdbm_vs_kriging_zlayout` (skill:`afm-plotting`).
 
 ### Side-by-side comparison harness
 

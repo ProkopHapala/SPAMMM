@@ -175,7 +175,7 @@ class GridsOCL(OpenCLBase):
         self.fromGPU_(self.dst_g, dst.ravel())
         return dst
 
-    def splat_gaussians(self, grid, origin, step, atomPos, atomZ, sigma=0.5, sign=1.0,
+    def splat_gaussians(self, grid, origin, step, atomPos, atomZ, sigma=0.3, sign=1.0,
                         nsig=5.0, bTryAllocate=True):
         """Add (sign=+1) or subtract (sign=-1) Σ Z_i N(r−R_i;σ) onto ``grid`` in-place (GPU)."""
         grid = np.asarray(grid, dtype=np.float32)

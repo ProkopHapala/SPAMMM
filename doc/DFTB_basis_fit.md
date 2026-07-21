@@ -36,7 +36,7 @@ log(rho) vs z above plane
 
 ## Solution: Single-Exponent Slater-Tail Correction
 
-### Key Idea
+### Key Idea (SSOT — read before “fixing” normalization)
 
 Replace the multi-zeta contracted radial functions with **single-exponential
 Slater-type orbitals** (STOs) of the form:
@@ -49,6 +49,24 @@ where `N` is an amplitude prefactor and `ζ` is the decay constant (in 1/Å).
 The DM coefficients from the original DFTB SCF are **reused as-is** — only the
 radial basis used for projection changes. This is an approximation, but it
 captures the correct tail decay which is what matters for AFM.
+
+**Dual-basis rule (mandatory):**
+
+| Channel | Density / potential | Basis |
+|---------|---------------------|-------|
+| **Electrostatics** | stock Δρ → \(V_\mathrm{ES}\) | short (mio/3ob) — charge-neutral, multipoles OK |
+| **Pauli only** | prolonged / SA Slater ρ | long tails — **do not** rescale ∫ρ to \(N_e\) |
+
+Pauli \(E = A\,(\int\rho_s\rho_t)^\beta\) is sensitive to **local** density in the tip region,
+not to global charge. Prolonged ρ is therefore **not** required to integrate to the
+electron count; agents must **never** “fix” a large ∫ρ by normalizing it away.
+Using the short basis for Pauli underestimates vacuum tails; using prolonged ρ for ES
+would corrupt multipoles. The dual split is an intentional practical trick to improve
+DFTB+ AFM accuracy without re-SCF cost.
+
+**Tip-first (2026-07-21):** prolonged Slater is **at least as important for the tip** as for
+the sample (Pauli = tip×sample overlap in vacuum). Use CO as guinea-pig; SA for tip /
+sample / both; tip-only precomputed may be enough. See `doc/Tasks/ProlongedRadialBasis_DFTB.md`.
 
 ### Two Approaches
 

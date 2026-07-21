@@ -319,6 +319,8 @@ def run_ptcda_stock_vs_sa(args):
 
     variants = {}
     # Stock: full density + V_ES. SA: Pauli from SA ρ, ES from stock (ρ_NA imbalance otherwise).
+    # DUAL BASIS (SSOT): prolonged/SA ρ is for Pauli ONLY — do NOT charge-normalize it;
+    # ES always uses stock Δρ. See make_slater_tail_species_list / doc/DFTB_basis_fit.md.
     work_stock = os.path.join(args.outdir, 'dftb_work_stock')
     print("\nDensity stock (ρ + V_ES)...")
     res_stock = afm_utils.get_density_from_dftb_dense(
@@ -347,6 +349,7 @@ def run_ptcda_stock_vs_sa(args):
     lines.append('NOTE: both use stock V_ES; SA-prolonged changes Pauli ρ + A,β only')
     lines.append('SA = Simulated Annealing fit of single-exponent Slater tails (N,ζ) vs pySCF ρ')
     lines.append('stock = multi-zeta 3ob-3-1 projection (NOT mio)')
+    lines.append('DUAL BASIS: prolonged ρ is NOT charge-normalized; never use it for ES')
 
     # One figure: columns = heights, rows = df/Fz × stock 3ob / SA-prolonged
     heights = variants['stock']['heights']

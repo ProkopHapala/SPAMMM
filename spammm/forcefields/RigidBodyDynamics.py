@@ -9,7 +9,9 @@ Key functionality:
   - Quaternion-to-rotation-matrix conversion
   - Per-atom local-frame position buffers rotated by quaternion
   - GridFF sampling at rigid body position/orientation
-  - FIRE relaxation for rigid body (position + quaternion)
+  - FIRE relaxation for rigid body (position + quaternion): zero v when v·F<0
+    (and ω when ω·τ<0), plus AFM-style velocity mixing / dt adaptation
+  - Trust-region Newton on the 6×6 rigid Hessian (3 translation + 3 rotation)
   - Anchor springs: harmonic constraints on specific atoms
 
 Role in SPAMMM: Rigid body engine for AFM manipulation. Used by RigidBodyAFM.py
@@ -286,6 +288,7 @@ void rigid_body_folded_kernel(
     __global       float4*   qrots,
     __global       float4*   vposs,
     __global       float4*   vrots,
+    __global       float4*   fire_state,
     __global const cl_Mat3*  I_body_inv,
     __global const cl_Mat3*  I_body,
     __global const float4*   apos_body,
@@ -309,6 +312,7 @@ void rigid_body_folded_replicas_kernel(
     __global       float4*   qrots,
     __global       float4*   vposs,
     __global       float4*   vrots,
+    __global       float4*   fire_state,
     __global const cl_Mat3*  I_body_inv,
     __global const cl_Mat3*  I_body,
     __global const float4*   apos_body,
@@ -325,6 +329,55 @@ void rigid_body_folded_replicas_kernel(
     const float              dt,
     const float4             md_params,
     const int                niter
+)""",
+            "rigid_body_folded_newton_kernel": """__kernel
+void rigid_body_folded_newton_kernel(
+    __global const int*      mols,
+    __global       float4*   poss,
+    __global       float4*   qrots,
+    __global       float4*   vposs,
+    __global       float4*   vrots,
+    __global       float4*   newton_state,
+    __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
+    __global const float4*   apos_body,
+    __global       float4*   apos_world,
+    __global       float4*   atom_force,
+    __global       float4*   body_force,
+    __global       float4*   body_torque,
+    __global const float4*   anchors,
+    __global const float*    folded_coeffs,
+    __global const float4*   folded_kxyz,
+    __global const int*      folded_atom_type,
+    const int4               folded_meta,
+    const float4             folded_lvec2d,
+    const float4             newton_params,
+    const float              f2tol,
+    const int                niter
+)""",
+            "rigid_body_folded_newton_replicas_kernel": """__kernel
+void rigid_body_folded_newton_replicas_kernel(
+    __global       float4*   poss,
+    __global       float4*   qrots,
+    __global       float4*   vposs,
+    __global       float4*   vrots,
+    __global       float4*   newton_state,
+    __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
+    __global const float4*   apos_body,
+    __global       float4*   apos_world,
+    __global       float4*   atom_force,
+    __global       float4*   body_force,
+    __global       float4*   body_torque,
+    __global const float4*   anchors,
+    __global const float*    folded_coeffs,
+    __global const float4*   folded_kxyz,
+    __global const int*      folded_atom_type,
+    const int4               folded_meta,
+    const float4             folded_lvec2d,
+    const float4             newton_params,
+    const float              f2tol,
+    const int                niter
 )"""
         }
 
@@ -333,7 +386,11 @@ void rigid_body_folded_replicas_kernel(
         self.gridff_args = None
         self.folded_args = None
         self.replicas_args = None
+        self.newton_args = None
+        self.newton_replicas_args = None
         self.krnl_folded_replicas = None
+        self.krnl_newton = None
+        self.krnl_newton_replicas = None
         self.grid_shape = None
         self.grid_data = None
         self.grid_p0 = None
@@ -372,6 +429,8 @@ void rigid_body_folded_replicas_kernel(
         self.create_buffer('qrots',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('vposs',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('vrots',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('fire_state', self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('newton_state', self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('I_body_inv', self.n_bodies * mat3_size,      mf.READ_ONLY)
         self.create_buffer('I_body',     self.n_bodies * mat3_size,      mf.READ_ONLY)
         self.create_buffer('anchors', self.total_atoms * 4 * float_size, mf.READ_ONLY)
@@ -473,6 +532,7 @@ void rigid_body_folded_replicas_kernel(
         self.toGPU('atom_force',   np.zeros((n_rep * na, 4), dtype=np.float32))
         self.toGPU('body_force',   np.zeros((n_rep, 4), dtype=np.float32))
         self.toGPU('body_torque',  np.zeros((n_rep, 4), dtype=np.float32))
+        self.reset_optimizer_state(finish=False)
         self.queue.finish()
 
     def upload_state(self, pos, quats, lin_mom, ang_mom, mass, inv_mass, inertia_inv, atom_pos_body, anchors=None, atom_PLQ=None, inertia=None):
@@ -555,7 +615,16 @@ void rigid_body_folded_replicas_kernel(
         self.toGPU('atom_force', np.zeros_like(world_atoms_flat))
         self.toGPU('body_force', np.zeros((self.n_bodies, 4), dtype=np.float32))
         self.toGPU('body_torque', np.zeros((self.n_bodies, 4), dtype=np.float32))
+        self.reset_optimizer_state(finish=False)
         self.queue.finish()
+
+    def reset_optimizer_state(self, finish=True):
+        """Reset persistent FIRE and Newton adaptation after changing the physical problem."""
+        z = np.zeros((self.n_bodies, 4), dtype=np.float32)
+        self.toGPU('fire_state', z)
+        self.toGPU('newton_state', z)
+        if finish:
+            self.queue.finish()
 
     def upload_anchors(self):
         self.toGPU('anchors', self.anchors)
@@ -582,13 +651,14 @@ void rigid_body_folded_replicas_kernel(
         self.gridff_args = self.generate_kernel_args("rigid_body_gridff_kernel")
         self.krnl_gridff = cl.Kernel(self.prg, "rigid_body_gridff_kernel")
 
-    def run(self, num_steps, dt, efield=None, lin_damp=0.92, ang_damp=0.88):
+    def run(self, num_steps, dt, efield=None, lin_damp=0.92, ang_damp=0.88, fire=False):
         if self.kernel_args is None:
             raise RuntimeError("Kernel arguments not initialized; call realloc() first")
 
         self.kernel_params['niter'] = np.int32(num_steps)
         self.kernel_params['dt'] = np.float32(dt)
-        self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, 1.0], dtype=np.float32)
+        # md_params.w < 0 enables FIRE (v·F / ω·τ quench) in rigid.cl
+        self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, -1.0 if fire else 1.0], dtype=np.float32)
         if efield is not None:
             self.kernel_params['Efield'] = _pack_float3(efield)
         self.kernel_args = self.generate_kernel_args("rigid_body_dynamics_kernel")
@@ -599,16 +669,50 @@ void rigid_body_folded_replicas_kernel(
         self.prg.rigid_body_dynamics_kernel(self.queue, global_size, local_size, *self.kernel_args)
         self.queue.finish()
 
-    def run_gridff(self, num_steps, dt, lin_damp=0.92, ang_damp=0.88, force_scale=1.0, torque_scale=1.0):
+    def run_gridff(self, num_steps, dt, lin_damp=0.92, ang_damp=0.88, force_scale=1.0, torque_scale=1.0, fire=False):
         if self.gridff_args is None:
             raise RuntimeError("GridFF kernel arguments not initialized; call init_gridff(...) first")
         self.kernel_params['dt'] = np.float32(dt)
         self.kernel_params['niter'] = np.int32(num_steps)
-        self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, force_scale, torque_scale], dtype=np.float32)
+        if fire:
+            self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, -1.0], dtype=np.float32)
+        else:
+            self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, force_scale, torque_scale], dtype=np.float32)
         self.gridff_args = self.generate_kernel_args("rigid_body_gridff_kernel")
         global_size = (self.roundUpGlobalSize(self.n_bodies * self.nloc),)
         local_size = (self.nloc,)
         self.krnl_gridff(self.queue, global_size, local_size, *self.gridff_args)
+        self.queue.finish()
+
+    def run_folded(self, num_steps, dt, lin_damp=0.92, ang_damp=0.88, force_scale=1.0, torque_scale=1.0, fire=False):
+        if self.folded_args is None:
+            raise RuntimeError("Folded kernel arguments not initialized; call init_folded(...) first")
+        self.kernel_params['dt'] = np.float32(dt)
+        self.kernel_params['niter'] = np.int32(num_steps)
+        if fire:
+            self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, -1.0], dtype=np.float32)
+        else:
+            self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, force_scale, torque_scale], dtype=np.float32)
+        self.folded_args = self.generate_kernel_args("rigid_body_folded_kernel")
+        global_size = (self.roundUpGlobalSize(self.n_bodies * self.nloc),)
+        local_size = (self.nloc,)
+        self.krnl_folded(self.queue, global_size, local_size, *self.folded_args)
+        self.queue.finish()
+
+    def run_folded_replicas(self, num_steps, dt, lin_damp=0.92, ang_damp=0.88, force_scale=1.0, torque_scale=1.0, fire=False):
+        if self.replicas_args is None:
+            raise RuntimeError("Replicas kernel not initialized; call init_replicas(...) first")
+        self.kernel_params['dt'] = np.float32(dt)
+        self.kernel_params['niter'] = np.int32(num_steps)
+        if fire:
+            self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, -1.0], dtype=np.float32)
+        else:
+            self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, force_scale, torque_scale], dtype=np.float32)
+        self.replicas_args = self.generate_kernel_args("rigid_body_folded_replicas_kernel")
+        REPLICAS_WG = 128
+        global_size = (int(np.ceil(self.n_replicas / REPLICAS_WG) * REPLICAS_WG),)
+        local_size = (REPLICAS_WG,)
+        self.krnl_folded_replicas(self.queue, global_size, local_size, *self.replicas_args)
         self.queue.finish()
 
     def init_folded(self, folded_coeffs, folded_kxyz, folded_atom_type, folded_lvec2d, folded_meta=None):
@@ -659,18 +763,55 @@ void rigid_body_folded_replicas_kernel(
         self.folded_atom_type_ids = atype.copy()
         self.folded_args = self.generate_kernel_args("rigid_body_folded_kernel")
         self.krnl_folded = cl.Kernel(self.prg, "rigid_body_folded_kernel")
+        self.kernel_params.setdefault('newton_params', np.array([0.1, 0.1, 0.5, 1e-2], dtype=np.float32))
+        self.kernel_params.setdefault('f2tol', np.float32(1e-10))
+        self.newton_args = self.generate_kernel_args("rigid_body_folded_newton_kernel")
+        self.krnl_newton = cl.Kernel(self.prg, "rigid_body_folded_newton_kernel")
 
-    def run_folded(self, num_steps, dt, lin_damp=0.92, ang_damp=0.88, force_scale=1.0, torque_scale=1.0):
-        if self.folded_args is None:
-            raise RuntimeError("Folded kernel arguments not initialized; call init_folded(...) first")
-        self.kernel_params['dt'] = np.float32(dt)
-        self.kernel_params['niter'] = np.int32(num_steps)
-        self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, force_scale, torque_scale], dtype=np.float32)
-        self.folded_args = self.generate_kernel_args("rigid_body_folded_kernel")
+    def run_folded_newton(self, niter=80, eps_t=0.1, eps_r=0.1, trust0=0.5, lambda0=1e-2, f_tol=1e-5, t_tol=1e-5):
+        """Pure GPU trust-region Newton (one kernel launch, no host FD).
+
+        All Hessian FD + 6×6 LM solve + trust steps run inside
+        ``rigid_body_folded_newton_kernel``. Hessian lives in __local.
+        ``lambda0`` is both the initial LM damping and its lower bound.
+        """
+        if self.newton_args is None:
+            raise RuntimeError("Newton kernel not initialized; call init_folded(...) first")
+        f2tol = float(min(f_tol * f_tol, t_tol * t_tol))
+        self.kernel_params['newton_params'] = np.array([eps_t, eps_r, trust0, lambda0], dtype=np.float32)
+        self.kernel_params['f2tol'] = np.float32(f2tol)
+        self.kernel_params['niter'] = np.int32(niter)
+        self.newton_args = self.generate_kernel_args("rigid_body_folded_newton_kernel")
         global_size = (self.roundUpGlobalSize(self.n_bodies * self.nloc),)
         local_size = (self.nloc,)
-        self.krnl_folded(self.queue, global_size, local_size, *self.folded_args)
+        self.krnl_newton(self.queue, global_size, local_size, *self.newton_args)
         self.queue.finish()
+        out = self.download_outputs()
+        F = out['body_force'][0, :3]
+        T = out['body_torque'][0, :3]
+        E = float(out['atom_positions'][0][:, 3].sum())
+        return {
+            'iters': int(niter),
+            'converged': float(np.linalg.norm(F)) < f_tol and float(np.linalg.norm(T)) < t_tol,
+            'F': float(np.linalg.norm(F)), 'T': float(np.linalg.norm(T)), 'E': E,
+            'out': out,
+        }
+
+    def run_folded_newton_replicas(self, niter=80, eps_t=0.1, eps_r=0.1, trust0=0.5, lambda0=1e-2, f_tol=1e-5, t_tol=1e-5):
+        """Centered-FD GPU Newton for many replicas; lambda0 is the persistent LM floor."""
+        if self.newton_replicas_args is None:
+            raise RuntimeError("Newton replicas kernel not initialized; call init_replicas(...) first")
+        f2tol = float(min(f_tol * f_tol, t_tol * t_tol))
+        self.kernel_params['newton_params'] = np.array([eps_t, eps_r, trust0, lambda0], dtype=np.float32)
+        self.kernel_params['f2tol'] = np.float32(f2tol)
+        self.kernel_params['niter'] = np.int32(niter)
+        self.newton_replicas_args = self.generate_kernel_args("rigid_body_folded_newton_replicas_kernel")
+        REPLICAS_WG = 128
+        global_size = (int(np.ceil(self.n_replicas / REPLICAS_WG) * REPLICAS_WG),)
+        local_size = (REPLICAS_WG,)
+        self.krnl_newton_replicas(self.queue, global_size, local_size, *self.newton_replicas_args)
+        self.queue.finish()
+        return self.download_outputs()
 
     def init_replicas(self, n_replicas, folded_coeffs, folded_kxyz, folded_atom_type, folded_lvec2d, folded_meta=None):
         """Initialize the replicas kernel for many copies of the same molecule.
@@ -718,22 +859,233 @@ void rigid_body_folded_replicas_kernel(
         self.kernel_params['folded_meta']   = folded_meta
         self.kernel_params['folded_lvec2d'] = lvec2d
         self.kernel_params['md_params']     = np.array([0.92, 0.88, 1.0, 1.0], dtype=np.float32)
+        self.kernel_params.setdefault('newton_params', np.array([0.1, 0.1, 0.5, 1e-2], dtype=np.float32))
+        self.kernel_params.setdefault('f2tol', np.float32(1e-10))
         self.replicas_args = self.generate_kernel_args("rigid_body_folded_replicas_kernel")
         self.krnl_folded_replicas = cl.Kernel(self.prg, "rigid_body_folded_replicas_kernel")
+        self.newton_replicas_args = self.generate_kernel_args("rigid_body_folded_newton_replicas_kernel")
+        self.krnl_newton_replicas = cl.Kernel(self.prg, "rigid_body_folded_newton_replicas_kernel")
         self.n_replicas = n_replicas
 
-    def run_folded_replicas(self, num_steps, dt, lin_damp=0.92, ang_damp=0.88, force_scale=1.0, torque_scale=1.0):
-        if self.replicas_args is None:
-            raise RuntimeError("Replicas kernel not initialized; call init_replicas(...) first")
-        self.kernel_params['dt'] = np.float32(dt)
-        self.kernel_params['niter'] = np.int32(num_steps)
-        self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, force_scale, torque_scale], dtype=np.float32)
-        self.replicas_args = self.generate_kernel_args("rigid_body_folded_replicas_kernel")
-        REPLICAS_WG = 128
-        global_size = (int(np.ceil(self.n_replicas / REPLICAS_WG) * REPLICAS_WG),)
-        local_size = (REPLICAS_WG,)
-        self.krnl_folded_replicas(self.queue, global_size, local_size, *self.replicas_args)
+    # ------------------------------------------------------------------
+    #  Relaxation: FIRE quench + trust-region Newton on 6×6 Hessian
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _quat_normalize(q):
+        q = np.asarray(q, dtype=np.float64)
+        return (q / max(np.linalg.norm(q), 1e-30)).astype(np.float32)
+
+    @staticmethod
+    def _quat_mul(q1, q2):
+        x1, y1, z1, w1 = np.asarray(q1, dtype=np.float64)
+        x2, y2, z2, w2 = np.asarray(q2, dtype=np.float64)
+        return np.array([
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2,
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        ], dtype=np.float64)
+
+    @staticmethod
+    def _quat_from_rotvec(th):
+        th = np.asarray(th, dtype=np.float64)
+        ang = float(np.linalg.norm(th))
+        if ang < 1e-14:
+            return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        axis = th / ang
+        s = np.sin(0.5 * ang)
+        return np.array([axis[0]*s, axis[1]*s, axis[2]*s, np.cos(0.5 * ang)], dtype=np.float64)
+
+    def _backend_run(self, backend, nstep, dt, lin_damp, ang_damp, fire):
+        if backend == 'folded':
+            self.run_folded(nstep, dt, lin_damp=lin_damp, ang_damp=ang_damp, fire=fire)
+        elif backend == 'gridff':
+            self.run_gridff(nstep, dt, lin_damp=lin_damp, ang_damp=ang_damp, fire=fire)
+        elif backend == 'generic':
+            self.run(nstep, dt, lin_damp=lin_damp, ang_damp=ang_damp, fire=fire)
+        else:
+            raise ValueError(f"Unknown backend '{backend}'")
+
+    def eval_force_torque(self, backend='folded', body_id=0):
+        """Force/torque at current pose without moving (dt=0). Returns F_world, T_world, T_body, E."""
+        self._backend_run(backend, 1, 0.0, 1.0, 1.0, fire=False)
+        out = self.download_outputs()
+        F = out['body_force'][body_id, :3].astype(np.float64)
+        Tw = out['body_torque'][body_id, :3].astype(np.float64)
+        R = _quat_to_matrix_np(out['quats'][body_id]).astype(np.float64)
+        Tb = R.T @ Tw
+        E = float(out['atom_positions'][body_id][:, 3].sum())
+        return F, Tw, Tb, E, out
+
+    def _set_pose(self, pos, quat, body_id=0, zero_vel=True):
+        pos4 = np.empty((self.n_bodies, 4), dtype=np.float32)
+        quat4 = np.empty((self.n_bodies, 4), dtype=np.float32)
+        self.fromGPU('poss', pos4)
+        self.fromGPU('qrots', quat4)
+        pos4[body_id, :3] = np.asarray(pos, dtype=np.float32)
+        quat4[body_id] = self._quat_normalize(quat)
+        self.toGPU('poss', pos4)
+        self.toGPU('qrots', quat4)
+        if zero_vel:
+            z = np.zeros((self.n_bodies, 4), dtype=np.float32)
+            self.toGPU('vposs', z)
+            self.toGPU('vrots', z)
         self.queue.finish()
+
+    def _apply_delta(self, dx, dtheta, body_id=0):
+        """pos += dx; q ← q ⊗ exp(dθ) with dθ in body frame."""
+        pos4 = np.empty((self.n_bodies, 4), dtype=np.float32)
+        quat4 = np.empty((self.n_bodies, 4), dtype=np.float32)
+        self.fromGPU('poss', pos4)
+        self.fromGPU('qrots', quat4)
+        pos4[body_id, :3] = pos4[body_id, :3] + np.asarray(dx, dtype=np.float32)
+        q = self._quat_mul(quat4[body_id], self._quat_from_rotvec(dtheta))
+        quat4[body_id] = self._quat_normalize(q)
+        self.toGPU('poss', pos4)
+        self.toGPU('qrots', quat4)
+        z = np.zeros((self.n_bodies, 4), dtype=np.float32)
+        self.toGPU('vposs', z)
+        self.toGPU('vrots', z)
+        self.queue.finish()
+
+    def hessian_fd(self, backend='folded', body_id=0, eps_t=0.1, eps_r=0.1):
+        """Central-difference 6×6 Hessian of E in (Δx, Δθ_body).
+
+        Uses G=[F, τ_body]=−∇E so H = −∂G/∂u. Symmetrized.
+        """
+        pos0 = np.empty((self.n_bodies, 4), dtype=np.float32)
+        quat0 = np.empty((self.n_bodies, 4), dtype=np.float32)
+        self.fromGPU('poss', pos0)
+        self.fromGPU('qrots', quat0)
+        p0 = pos0[body_id, :3].astype(np.float64).copy()
+        q0 = quat0[body_id].astype(np.float64).copy()
+        eps = np.array([eps_t, eps_t, eps_t, eps_r, eps_r, eps_r], dtype=np.float64)
+        H = np.zeros((6, 6), dtype=np.float64)
+        for i in range(6):
+            d = np.zeros(6); d[i] = eps[i]
+            self._set_pose(p0 + d[:3], self._quat_mul(q0, self._quat_from_rotvec(d[3:])), body_id)
+            Fp, _, Tp, _, _ = self.eval_force_torque(backend, body_id)
+            Gp = np.concatenate([Fp, Tp])
+            self._set_pose(p0 - d[:3], self._quat_mul(q0, self._quat_from_rotvec(-d[3:])), body_id)
+            Fm, _, Tm, _, _ = self.eval_force_torque(backend, body_id)
+            Gm = np.concatenate([Fm, Tm])
+            # G = −∇E ⇒ H_E = −∂G/∂u
+            H[:, i] = -(Gp - Gm) / (2.0 * eps[i])
+        self._set_pose(p0, q0, body_id)
+        return 0.5 * (H + H.T)
+
+    def relax_fire(self, max_steps=500, dt=0.05, damp0=0.1, backend='folded',
+                   f_tol=1e-4, t_tol=1e-4, batch=32, body_id=0, record=False):
+        """FIRE relaxation with host-side early exit on |F|,|τ|.
+
+        Kernel does v·F / ω·τ quench + velocity mixing (md_params.w < 0).
+        Velocities are preserved across host batches (required for FIRE inertia).
+        """
+        hist = [] if record else None
+        n_done = 0
+        Fmag = Tmag = E = np.inf
+        # Keep GPU-side FIRE state (adaptive dt/damp) by using large batches
+        batch = max(int(batch), 64)
+        while n_done < max_steps:
+            n = min(batch, max_steps - n_done)
+            self._backend_run(backend, n, dt, damp0, damp0, fire=True)
+            n_done += n
+            out = self.download_outputs()
+            F = out['body_force'][body_id, :3].astype(np.float64)
+            Tw = out['body_torque'][body_id, :3].astype(np.float64)
+            E = float(out['atom_positions'][body_id][:, 3].sum())
+            Fmag = float(np.linalg.norm(F))
+            Tmag = float(np.linalg.norm(Tw))
+            if record:
+                hist.append(dict(step=n_done, E=E, F=Fmag, T=Tmag,
+                                 pos=out['pos'][body_id].copy(), quat=out['quats'][body_id].copy()))
+            if Fmag < f_tol and Tmag < t_tol:
+                break
+        F, Tw, _, E, _ = self.eval_force_torque(backend, body_id)
+        z = np.zeros((self.n_bodies, 4), dtype=np.float32)
+        self.toGPU('vposs', z); self.toGPU('vrots', z); self.queue.finish()
+        Fmag = float(np.linalg.norm(F)); Tmag = float(np.linalg.norm(Tw))
+        return {
+            'steps': n_done, 'converged': Fmag < f_tol and Tmag < t_tol,
+            'F': Fmag, 'T': Tmag, 'E': E, 'history': hist,
+        }
+
+    def relax_newton_host(self, max_iter=40, trust0=0.5, backend='folded', body_id=0,
+                     f_tol=1e-5, t_tol=1e-5, eps_t=0.1, eps_r=0.1,
+                     lambda0=1e-2, rot_scale=1.0, fire_warmstart=0, record=False):
+        """HOST-SIDE Newton (debug only). Prefer ``run_folded_newton`` for production.
+
+        Each FD column is a separate OpenCL launch + NumPy 6×6 solve — far too
+        slow for imaging. Kept for parity checks against the GPU Newton kernel.
+        Default fire_warmstart=0 (pure Newton).
+        """
+        if fire_warmstart and fire_warmstart > 0:
+            self.relax_fire(max_steps=int(fire_warmstart), dt=0.05, damp0=0.1,
+                            backend=backend, body_id=body_id, f_tol=f_tol, t_tol=t_tol, batch=16)
+
+        sigma = float(rot_scale)
+        S = np.array([1.0, 1.0, 1.0, sigma, sigma, sigma], dtype=np.float64)
+        trust = float(trust0)
+        lam = float(lambda0)
+        recovery_used = False
+        hist = [] if record else None
+        F, Tw, Tb, E, out = self.eval_force_torque(backend, body_id)
+        for it in range(max_iter):
+            Fmag = float(np.linalg.norm(F))
+            Tmag = float(np.linalg.norm(Tw))
+            if record:
+                hist.append(dict(iter=it, E=E, F=Fmag, T=Tmag, trust=trust, lam=lam))
+            if Fmag < f_tol and Tmag < t_tol:
+                return {'iters': it, 'converged': True, 'F': Fmag, 'T': Tmag, 'E': E, 'history': hist}
+
+            H = self.hessian_fd(backend, body_id, eps_t=eps_t, eps_r=eps_r)
+            # Scale: H_y = S H S, rhs_y = S [F, τ]
+            Hs = (S[:, None] * H) * S[None, :]
+            rhs = S * np.concatenate([F, Tb])
+            accepted = False
+            for _try in range(10):
+                A = Hs + lam * np.eye(6)
+                try:
+                    dy = np.linalg.solve(A, rhs)
+                except np.linalg.LinAlgError:
+                    lam = max(lam * 10.0, lambda0)
+                    continue
+                # Δu = S Δy; limit ||Δy|| (scaled trust)
+                nrm = float(np.linalg.norm(dy))
+                if nrm > trust and nrm > 1e-30:
+                    dy = dy * (trust / nrm)
+                    nrm = trust
+                delta = S * dy
+                pos4 = np.empty((self.n_bodies, 4), dtype=np.float32)
+                quat4 = np.empty((self.n_bodies, 4), dtype=np.float32)
+                self.fromGPU('poss', pos4); self.fromGPU('qrots', quat4)
+                p_save = pos4[body_id].copy(); q_save = quat4[body_id].copy()
+                self._apply_delta(delta[:3], delta[3:], body_id)
+                F2, Tw2, Tb2, E2, _ = self.eval_force_torque(backend, body_id)
+                if E2 < E - 1e-14:
+                    E, F, Tw, Tb = E2, F2, Tw2, Tb2
+                    accepted = True
+                    recovery_used = False
+                    if nrm > 0.8 * trust:
+                        trust = min(trust * 2.0, trust0)
+                    lam = max(lam * 0.3, 1e-8)
+                    break
+                # Reject energy-increasing steps (avoids other local basins)
+                self.toGPU('poss', pos4); self.toGPU('qrots', quat4)
+                self.queue.finish()
+                trust = max(trust * 0.5, 1e-4)
+                lam = min(max(lam * 5.0, lambda0), 1e4)
+            if not accepted:
+                if recovery_used:
+                    return {'iters': it + 1, 'converged': False, 'F': Fmag, 'T': Tmag, 'E': E, 'history': hist}
+                trust = float(trust0)
+                lam = float(lambda0)
+                recovery_used = True
+
+        Fmag = float(np.linalg.norm(F)); Tmag = float(np.linalg.norm(Tw))
+        return {'iters': max_iter, 'converged': Fmag < f_tol and Tmag < t_tol,
+                'F': Fmag, 'T': Tmag, 'E': E, 'history': hist}
 
     def download_outputs(self):
         pos         = np.empty((self.n_bodies, 4), dtype=np.float32)
@@ -809,6 +1161,14 @@ void rigid_body_folded_replicas_kernel(
             self.fromGPU('body_torque', buf)
             self.last_body_torque = buf
             out['body_torque'] = buf
+        if 'fire_state' in req:
+            buf = np.empty((self.n_bodies, 4), dtype=np.float32)
+            self.fromGPU('fire_state', buf)
+            out['fire_state'] = buf
+        if 'newton_state' in req:
+            buf = np.empty((self.n_bodies, 4), dtype=np.float32)
+            self.fromGPU('newton_state', buf)
+            out['newton_state'] = buf
         self.queue.finish()
         return out
 
@@ -946,6 +1306,7 @@ void rigid_body_folded_replicas_kernel(
     def update_anchors(self, anchors_world):
         self.anchors = _ensure_float4(anchors_world, w_value=-1.0)
         self.upload_anchors()
+        self.reset_optimizer_state()
 
     def upload_anchors(self):
         self.toGPU('anchors', self.anchors)
