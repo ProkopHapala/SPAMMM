@@ -103,8 +103,9 @@ Topology (AtomicGraph SSOT) → Type Assignment → Force Fields → Surface Int
 
 | Module | Status | Tests | Notes |
 |--------|--------|-------|-------|
-| [SPAMMM_GUI.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/GUI/SPAMMM_GUI.py:0:0-0:0) | ✅ Active | No test | Main window, mouse dispatch, grid transforms (transpose/flip) |
-| [EditModeHandlers.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/GUI/EditModeHandlers.py:0:0-0:0) | ✅ Active | No test | Unified/Atom/Bond/Ring/Hex modes; Ring mode combines edge+corner+hex ring placement |
+| [SPAMMM_GUI.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/GUI/SPAMMM_GUI.py:0:0-0:0) | ✅ Active | No test | Main window; **`b2Dview` / Enter** ortho 2D↔3D; mouse dispatch; grid transforms |
+| [EditModeHandlers.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/GUI/EditModeHandlers.py:0:0-0:0) | ✅ Active | No test | Unified/Atom/Bond/Ring/Hex; Ring 3D = closest atom/bond/ring-COG along ray; hex 2D-only |
+| [VispyUtils.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/GUI/VispyUtils.py:0:0-0:0) | ✅ Active | No test | `AtomScene`: ortho camera, presets, RMB orbit, depth test in 3D |
 | [AFMExtension.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/GUI/AFMExtension.py:0:0-0:0) | ✅ Active | No pytest (manual GUI) | Dirty flags S1–S6; FDBM FAST_S3; plot z default 3.0 Å; atom overlay toggle + `'.'` dots |
 | [KekuleExtension.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/GUI/KekuleExtension.py:0:0-0:0) | ✅ Active | No test | Bond order visualization |
 | [FoldedRigidExtension.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/GUI/FoldedRigidExtension.py:0:0-0:0) | ✅ Active | No test (manual L2) | Interactive manipulation |
@@ -191,7 +192,8 @@ Plus: 42 topology editing tests, 5 folded rigid tests, 2 contact surface tests, 
 ## 5. What Works Well (Conference-Ready)
 
 - **Topology editing**: 42 tests, Kekule solver, ASCII art, heterocycle generation — all solid
-- **Ring placement (3 modes)**: unified in Ring mode — Numpad +/- controls ring size (3-12). Sensitive targets (priority order): (1) **bond** → edge ring sharing 1 bond, (2) **inner corner atom** (angle < 180°) → corner ring sharing 2 bonds via circumcircle (vector math, dot/cross products), (3) **hex grid center** → hexagonal ring on grid. Outer corners (>180°) fall through to edge/hex. RMB deletes bond.
+- **Ring placement (3 modes)**: unified in Ring mode — Numpad +/- controls ring size (3-12). **2D:** bond → corner atom → hex. **3D:** closest of bond / atom / ring-COG along mouse ray (hex disabled); ring side uses ray∩z=0. RMB deletes bond/atom or whole ring at COG.
+- **Ortho 2D/3D editor view**: `Enter` / `b2Dview` checkbox; RMB empty = rotate; digit presets (5=Top); depth test in 3D. Task: `doc/Tasks/GUI_Editor_3D_ViewMode.md`. Cheatsheet: `doc/GUI_CHEATSHEET.md`.
 - **Ewald2D surface electrostatics**: 11 tests, GPU-CPU parity, human-reviewed visual tests
 - **Morse/LJ AFM**: 9 tests, produces correct AFM contrast for pentacene/PTCDA
 - **Folded basis rigid body**: 5 tests, relaxation + manipulation on NaCl(100), reference data system
@@ -316,7 +318,7 @@ The repo has a well-organized documentation hierarchy:
 - NEB / H-transfer workflows (full)
 - Phonon / FTIR / Hessian
 - FMM long-range electrostatics
-- 3D viewer
-- Pentagon/heptagon drawing via corner ring (implemented), SMILES builder (not yet)
+- Molecular browser plugins + AFM thumbnails (Phase 1 VisPy browser exists)
+- Pentagon/heptagon via corner ring (implemented); SMILES builder (not yet)
 - LAMMPS/GROMACS export
 - `pyproject.toml` / `setup.py` (not pip-installable)

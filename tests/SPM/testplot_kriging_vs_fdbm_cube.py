@@ -118,10 +118,14 @@ def main():
     p.add_argument('--fit_pauli', action='store_true', default=True,
                    help='fit A,β so Pauli≈Kriging E (ignore ES/vdW); then rebuild E_total/F')
     p.add_argument('--no_fit_pauli', action='store_true', help='keep default/CLI A,β; skip fit')
+    p.add_argument('--fit_mode', choices=('contact', 'residual'), default='contact',
+                   help='contact: _fit_pauli_powerlaw (E_ref>0 wall); residual: _fit_pauli_powerlaw_residual (signed Kriging−ES−vdW)')
     p.add_argument('--fit_residual', action='store_true',
-                   help='fit Pauli to Kriging−ES−vdW (lets Pauli cancel bad ES — usually wrong)')
-    p.add_argument('--fit_zmin', type=float, default=1.5)
-    p.add_argument('--fit_zmax', type=float, default=2.0)
+                   help='alias for --fit_mode residual (Kriging−ES−vdW; AFM heights)')
+    p.add_argument('--fit_zmin', type=float, default=None,
+                   help='fit z min [Å]; default 1.5 (contact) or 2.5 (residual)')
+    p.add_argument('--fit_zmax', type=float, default=None,
+                   help='fit z max [Å]; default 2.0 (contact) or 5.0 (residual)')
     p.add_argument('--sigma_na', type=float, default=0.3,
                    help='Gaussian ρ_NA width [Å] for Δρ=ρ_scf−ρ_NA (default 0.3)')
     p.add_argument('--nxy', type=int, default=120)
@@ -129,6 +133,12 @@ def main():
     args = p.parse_args()
     if args.no_fit_pauli:
         args.fit_pauli = False
+    if args.fit_residual:
+        args.fit_mode = 'residual'
+    if args.fit_zmin is None:
+        args.fit_zmin = 2.5 if args.fit_mode == 'residual' else 1.5
+    if args.fit_zmax is None:
+        args.fit_zmax = 5.0 if args.fit_mode == 'residual' else 2.0
 
     import matplotlib
     matplotlib.use('Agg')
@@ -138,8 +148,12 @@ def main():
         load_clean_points, load_zscan, demo_paths, interpolate_volume_and_forces,
         grid_origin_step, MITHUN_FUKUI,
     )
-    from spammm.SPM.AFM_utils import build_fdbm_grid_from_cubes, _fit_pauli_powerlaw, _plot_pauli_fit
+    from spammm.SPM.AFM_utils import (
+        build_fdbm_grid_from_cubes, _fit_pauli_powerlaw, _fit_pauli_powerlaw_residual, _plot_pauli_fit,
+    )
     from spammm.SPM import AFM as afm_mod
+    _fit_fn = _fit_pauli_powerlaw_residual if args.fit_mode == 'residual' else _fit_pauli_powerlaw
+    _fit_fn_name = _fit_fn.__name__
 
     tag = f'{args.endgroup}-{args.tip}'
     if abs(float(args.sigma_na) - 0.3) > 1e-9:
@@ -268,11 +282,11 @@ def main():
 
     if args.fit_pauli and args.A is None and args.beta is None:
         z_lo, z_hi = float(args.fit_zmin), float(args.fit_zmax)
-        # Default: Pauli ≈ Kriging E (ignore ES/vdW). Residual fit can make Pauli cancel bad ES.
-        fit_to_kriging = not args.fit_residual
-        fit_mode = 'Kriging E (ignore ES/vdW)' if fit_to_kriging else 'Kriging−ES−vdW residual'
+        # contact: Pauli ≈ Kriging E (E>0 wall). residual: Pauli ≈ Kriging−ES−vdW (signed AFM range).
+        use_resid = (args.fit_mode == 'residual')
+        fit_mode = 'Kriging−ES−vdW residual (signed)' if use_resid else 'Kriging E contact wall (E_ref>0)'
         lines += [
-            f'Pauli FIT → {fit_mode}  z∈[{z_lo},{z_hi}]  (AFM_utils._fit_pauli_powerlaw)',
+            f'Pauli FIT → {fit_mode}  z∈[{z_lo},{z_hi}]  (AFM_utils.{_fit_fn_name})',
             f'NOTE: default A={A0:.2f} β={beta0:.4f} = PAULI_FITTED_DEFAULTS[pyscf_6-31g*] '
             f'from GAUSSIAN tip σ=0.7Å (NOT real CO)',
         ]
@@ -280,25 +294,25 @@ def main():
         for label, xy, style in sites:
             pr = profiles[label]
             Ek_on_f = np.interp(zf, zs_k, pr['Ek0'], left=np.nan, right=np.nan)
-            E_tgt = Ek_on_f if fit_to_kriging else (Ek_on_f - pr['Ee'] - pr['Ev'])
+            E_tgt = (Ek_on_f - pr['Ee'] - pr['Ev']) if use_resid else Ek_on_f
             try:
-                A_s, b_s, r2_s, _ = _fit_pauli_powerlaw(
-                    zf, pr['overlap'], E_tgt, z_min=z_lo, z_max=z_hi)
+                A_s, b_s, r2_s, _ = _fit_fn(zf, pr['overlap'], E_tgt, z_min=z_lo, z_max=z_hi)
                 per_site.append((label, float(A_s), float(b_s), float(r2_s)))
                 lines.append(f'  fit {label}: A={A_s:.4f}  beta={b_s:.4f}  R²={r2_s:.4f}')
-                m = ((zf >= z_lo) & (zf <= z_hi) & np.isfinite(E_tgt)
-                     & (pr['overlap'] > 1e-15) & (E_tgt > 1e-15))
+                m = ((zf >= z_lo) & (zf <= z_hi) & np.isfinite(E_tgt) & (pr['overlap'] > 1e-15))
+                if not use_resid:
+                    m = m & (E_tgt > 1e-15)
                 o_pool.append(pr['overlap'][m]); e_pool.append(E_tgt[m]); z_pool.append(zf[m])
                 _plot_pauli_fit(
                     zf, E_tgt, A_s * (pr['overlap'] ** b_s), A_s, b_s,
                     os.path.join(outdir, f'pauli_fit_{label}.png'),
                     f'{tag} {label}', z_min=z_lo, z_max=z_hi,
-                    ref_label=('Kriging E' if fit_to_kriging else 'Kriging−ES−vdW'))
+                    ref_label=('Kriging−ES−vdW' if use_resid else 'Kriging E'))
             except ValueError as ex:
                 lines.append(f'  fit {label}: FAILED ({ex})')
         if o_pool:
             o_all = np.concatenate(o_pool); e_all = np.concatenate(e_pool); z_all = np.concatenate(z_pool)
-            A_p, b_p, r2_p, _ = _fit_pauli_powerlaw(z_all, o_all, e_all, z_min=z_lo, z_max=z_hi)
+            A_p, b_p, r2_p, _ = _fit_fn(z_all, o_all, e_all, z_min=z_lo, z_max=z_hi)
             _apply_pauli(float(A_p), float(b_p))
             lines.append(f'  fit POOLED: A={A_pauli:.4f}  beta={beta_pauli:.4f}  R²={r2_p:.4f}')
             # post-fit channel check at z≈2
@@ -314,7 +328,9 @@ def main():
                 json.dump({
                     'tag': tag, 'tip': args.tip, 'endgroup': args.endgroup,
                     'A': A_pauli, 'beta': beta_pauli, 'R2_pooled': float(r2_p),
-                    'fit_target': 'Kriging' if fit_to_kriging else 'Kriging-ES-vdW',
+                    'fit_target': 'Kriging-ES-vdW' if use_resid else 'Kriging',
+                    'fit_mode': args.fit_mode,
+                    'fit_fn': _fit_fn_name,
                     'sigma_na': float(args.sigma_na),
                     'z_min': z_lo, 'z_max': z_hi,
                     'A_default_gaussian_tip': A0, 'beta_default_gaussian_tip': beta0,
@@ -333,7 +349,7 @@ def main():
     pauli_lbl = f'Pauli A={A_pauli:.2f} β={beta_pauli:.4f}'
     lines.insert(1, f'Pauli params: A={A_pauli:.4f}  beta={beta_pauli:.4f}  '
                  f'(Gaussian-tip default was A={A0:.2f} β={beta0:.4f})')
-    lines.insert(2, f'Fit target: {"Kriging E (ignore ES/vdW)" if not args.fit_residual else "Kriging−ES−vdW residual"}')
+    lines.insert(2, f'Fit mode: {args.fit_mode} ({_fit_fn_name})')
     lines.insert(3, '')
 
     n_sites = len(sites)

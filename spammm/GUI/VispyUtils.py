@@ -221,6 +221,13 @@ class AtomScene(QtCore.QObject):
         self.ring_preview_line.visible = False
         # Selection rectangle (Line visual) - create lazily to avoid initialization issues
         self.selection_rect = None
+        # Selection AABB + sticky δ (move) / φ (rotate) corner handles
+        self.sel_bbox_lines = visuals.Line(parent=self.view.scene, color=(0.2, 0.55, 1.0, 0.95), width=2.0, antialias=True, method='gl')
+        self.sel_handle_markers = visuals.Markers(parent=self.view.scene)
+        self.sel_handle_text = visuals.Text(parent=self.view.scene, color='black', font_size=14, anchor_x='center', anchor_y='center')
+        self.sel_bbox_lines.visible = False
+        self.sel_handle_markers.visible = False
+        self.sel_handle_text.visible = False
         # Fragment highlight visuals (dedicated — not shared with hex grid)
         self.frag_lines = visuals.Line(parent=self.view.scene, color=(1.0, 0.5, 0.0, 0.9), width=5.0, antialias=True, method='gl')
         self.frag_bbox_lines = visuals.Line(parent=self.view.scene, color=(0.2, 0.8, 0.2, 0.6), width=1.5, antialias=True, method='gl')
@@ -228,21 +235,23 @@ class AtomScene(QtCore.QObject):
         self.frag_bbox_lines.visible = False
 
         # Enforce z-order when supported
-        for o, v in enumerate((self.radius_markers, self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.bond_order_lines, self.atom_markers, self.axes, self.text_labels, self.bond_order_text, self.hover_bond_line, self.hover_ring_lines, self.hover_ring_markers, self.hover_ring_text, self.hover_atom_marker, self.link_line, self.ring_preview_line, self.frag_lines, self.frag_bbox_lines)):
+        for o, v in enumerate((self.radius_markers, self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.bond_order_lines, self.atom_markers, self.axes, self.text_labels, self.bond_order_text, self.hover_bond_line, self.hover_ring_lines, self.hover_ring_markers, self.hover_ring_text, self.hover_atom_marker, self.link_line, self.ring_preview_line, self.sel_bbox_lines, self.sel_handle_markers, self.sel_handle_text, self.frag_lines, self.frag_bbox_lines)):
             if hasattr(v, 'order'):
                 v.order = int(o)
 
         # GL state: radius translucent and never blocks other overlays
         try:
             self.radius_markers.set_gl_state('translucent', depth_test=False)
-            for v in (self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.bond_order_lines, self.hover_bond_line, self.hover_ring_lines, self.link_line, self.ring_preview_line, self.frag_lines, self.frag_bbox_lines):
+            for v in (self.bbox_lines, self.inbox_lines, self.halo_lines, self.neigh_lines, self.port_lines, self.port_target_lines, self.dpos_lines, self.dpos_neigh_lines, self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.bond_order_lines, self.hover_bond_line, self.hover_ring_lines, self.link_line, self.ring_preview_line, self.sel_bbox_lines, self.frag_lines, self.frag_bbox_lines):
                 v.set_gl_state('translucent', depth_test=False)
             self.atom_markers.set_gl_state('translucent', depth_test=False)
             self.hover_ring_markers.set_gl_state('translucent', depth_test=False)
             self.hover_atom_marker.set_gl_state('translucent', depth_test=False)
+            self.sel_handle_markers.set_gl_state('translucent', depth_test=False)
             self.text_labels.set_gl_state('translucent', depth_test=False)
             self.bond_order_text.set_gl_state('translucent', depth_test=False)
             self.hover_ring_text.set_gl_state('translucent', depth_test=False)
+            self.sel_handle_text.set_gl_state('translucent', depth_test=False)
         except Exception:
             pass
 
@@ -302,6 +311,7 @@ class AtomScene(QtCore.QObject):
         self._pick_idx = -1
         self._pick_id = -1  # Atom._id of picked atom (-1 = none)
         self._pick_z = 0.0
+        self._press_pos = None
         self.lock_drag = False       # Set True externally to suppress all atom drag
         self.pick_radius = 0.5       # Max distance (Angstroms) for RMB atom picking
 
@@ -309,13 +319,38 @@ class AtomScene(QtCore.QObject):
         self._lock_top_view = True
         self._clamp_xy = False
         self._fixed = None
+        self._allow_mouse_orbit = False  # v1: keyboard rotate only
+        self._depth_test = False
+        self._view_debug = False
+        self._cam_rot_key_speed = 5.0  # deg per arrow key in 3D
+
+        # Debug: mouse ray + hit point (for transform sanity)
+        self.debug_ray_line = visuals.Line(parent=self.view.scene, color=(1.0, 0.2, 0.2, 0.85), width=2.0, antialias=True, method='gl')
+        self.debug_ray_line.visible = False
+        self.debug_hit_marker = visuals.Markers(parent=self.view.scene)
+        self.debug_hit_marker.visible = False
+        try:
+            self.debug_ray_line.set_gl_state('translucent', depth_test=False)
+            self.debug_hit_marker.set_gl_state('translucent', depth_test=False)
+        except Exception:
+            pass
 
         # Selection state — uses Atom._id for robustness across topology changes
-        self._selection_mode = False  # If True, RMB drags to select atoms instead of camera rotation
+        self._selection_mode = False  # If True, Select-mode interaction (add/remove + bbox handles)
         self._selected_ids = set()  # set of Atom._id
         self._selection_start = None
         self._selection_end = None
         self._selected_colors_backup = None  # Store original colors for selected atoms
+        # Sticky selection transform: None | 'move' (δ) | 'rotate' (φ)
+        self._xform_mode = None
+        self._xform_last_xy = None
+        self._xform_com = None
+        self._xform_last_angle = None
+        self._sel_handle_move = None   # (2,) world xy of δ corner
+        self._sel_handle_rot = None    # (2,) world xy of φ corner
+        self._sel_handle_r = 0.55      # pick radius for handles (Å)
+        self._sel_bbox_pad = 0.45
+        self._box_sel_mode = 'add'     # 'add' | 'remove' for rubber-band box
 
         self._drag_plane_p0 = None
         self._drag_plane_n = None
@@ -338,6 +373,12 @@ class AtomScene(QtCore.QObject):
     def widget(self):
         return self.canvas.native
 
+    def _sync_fixed_mask(self):
+        """Keep _fixed length matched to _pos (topology changes invalidate old FF masks)."""
+        n = int(self._pos.shape[0])
+        if (self._fixed is None) or (self._fixed.shape[0] != n):
+            self._fixed = np.zeros((n,), dtype=bool)
+
     def set_data(self, pos, *, colors=None, sizes=None, bonds=None, forces=None, force_scale=1.0):
         pos = _as_f32(pos)
         if pos.ndim != 2 or pos.shape[1] != 3:
@@ -357,11 +398,20 @@ class AtomScene(QtCore.QObject):
             self._atom_ids = np.arange(len(pos), dtype=np.int64)
             self._id_to_idx = {i: i for i in range(len(pos))}
         self._render_mask = None
-        if (self._fixed is None) or (self._fixed.shape[0] != self._pos.shape[0]):
-            self._fixed = np.zeros((self._pos.shape[0],), dtype=bool)
-        self._colors = None if colors is None else _as_f32(colors)
-        self._colors_base = None if colors is None else _as_f32(colors)
-        self._sizes = None if sizes is None else _as_f32(sizes)
+        self._sync_fixed_mask()
+        n = int(self._pos.shape[0])
+        # colors/sizes must match _pos (backend may differ from the pos argument)
+        if colors is not None:
+            colors = _as_f32(colors)
+            if colors.shape[0] != n:
+                raise ValueError(f"AtomScene.set_data: colors.shape[0]={colors.shape[0]} != n_pos={n}")
+        if sizes is not None:
+            sizes = _as_f32(sizes)
+            if sizes.shape[0] != n:
+                raise ValueError(f"AtomScene.set_data: sizes.shape[0]={sizes.shape[0]} != n_pos={n}")
+        self._colors = None if colors is None else colors
+        self._colors_base = None if colors is None else colors.copy()
+        self._sizes = None if sizes is None else sizes
         self._bonds = None if bonds is None else np.asarray(bonds, dtype=np.int32)
         self._forces = None if forces is None else _as_f32(forces)
         self._force_scale = float(force_scale)
@@ -642,6 +692,73 @@ class AtomScene(QtCore.QObject):
         self._lock_top_view = bool(lock)
         self._apply_camera_mode()
 
+    def set_allow_mouse_orbit(self, allow):
+        self._allow_mouse_orbit = bool(allow)
+
+    def set_view_debug(self, enabled):
+        self._view_debug = bool(enabled)
+        if not self._view_debug:
+            self.debug_ray_line.visible = False
+            self.debug_hit_marker.visible = False
+            self.debug_ray_line.set_data(np.zeros((0, 3), dtype=np.float32))
+            self.debug_hit_marker.set_data(np.zeros((0, 3), dtype=np.float32))
+
+    def set_depth_test(self, enabled):
+        """Enable GL depth test on atoms/bonds (for tilted 3D view). Overlays stay depth-free."""
+        self._depth_test = bool(enabled)
+        try:
+            dt = self._depth_test
+            self.atom_markers.set_gl_state('translucent', depth_test=dt)
+            for v in (self.bond_lines, self.bond_colored_lines, self.ch_bond_lines, self.hbond_lines, self.force_lines, self.bond_order_lines):
+                v.set_gl_state('translucent', depth_test=dt)
+        except Exception:
+            pass
+
+    def set_camera_preset(self, name):
+        """Ortho standard views. name: top|bottom|front|back|left|right. Keeps fov=0."""
+        presets = {
+            'top':    (90.0, 0.0),
+            'bottom': (-90.0, 0.0),
+            'front':  (0.0, 0.0),
+            'back':   (0.0, 180.0),
+            'left':   (0.0, -90.0),
+            'right':  (0.0, 90.0),
+        }
+        key = str(name).lower()
+        if key not in presets:
+            raise ValueError(f"AtomScene.set_camera_preset: unknown {name!r}")
+        el, az = presets[key]
+        cam = self.view.camera
+        if cam is None:
+            return
+        cam.fov = 0
+        cam.elevation = el
+        cam.azimuth = az
+        cam.roll = 0
+        self.canvas.update()
+        self.sig_camera_changed.emit()
+        self._cam_print(f'preset:{key}')
+
+    def update_view_debug(self, mouse_pos, hit=None):
+        """Draw mouse ray and optional hit point (world)."""
+        if not self._view_debug:
+            return
+        r0, rd = self._ray_from_mouse(mouse_pos)
+        # Segment through scene: use camera center distance scale
+        cam = self.view.camera
+        dist = float(getattr(cam, 'distance', 50.0) or 50.0)
+        p0 = r0 - rd * dist
+        p1 = r0 + rd * dist
+        self.debug_ray_line.set_data(np.vstack([p0, p1]).astype(np.float32))
+        self.debug_ray_line.visible = True
+        if hit is not None:
+            h = np.asarray(hit, dtype=np.float32).reshape(1, 3)
+            self.debug_hit_marker.set_data(pos=h, symbol='disc', size=12, face_color=(1, 0.3, 0.1, 1), edge_color='black', edge_width=1)
+            self.debug_hit_marker.visible = True
+        else:
+            self.debug_hit_marker.set_data(np.zeros((0, 3), dtype=np.float32))
+            self.debug_hit_marker.visible = False
+
     def set_camera_debug(self, level=1):
         self._cam_debug = int(level)
 
@@ -702,13 +819,26 @@ class AtomScene(QtCore.QObject):
             return
         cam.azimuth = float(cam.azimuth) + float(dx_px) * float(self._cam_rot_speed)
         cam.elevation = float(cam.elevation) + float(dy_px) * float(self._cam_rot_speed)
-        if cam.elevation > 89.0:
-            cam.elevation = 89.0
-        if cam.elevation < -89.0:
-            cam.elevation = -89.0
-        self._redraw()
-        self.sig_camera_changed.emit()
+        if cam.elevation > 90.0:
+            cam.elevation = 90.0
+        if cam.elevation < -90.0:
+            cam.elevation = -90.0
+        # Camera-only update — do NOT _redraw() or emit sig_camera_changed here
+        # (that triggers refresh_view during mouse_move → VisPy EventEmitter loop).
+        self.canvas.update()
         self._cam_print('rotate')
+
+    def _cam_rotate_keys(self, daz, del_):
+        """Rotate by absolute degrees (keyboard)."""
+        if self._lock_top_view:
+            return
+        cam = self.view.camera
+        if cam is None:
+            return
+        cam.azimuth = float(cam.azimuth) + float(daz)
+        cam.elevation = float(np.clip(float(cam.elevation) + float(del_), -90.0, 90.0))
+        self.canvas.update()
+        self._cam_print('rotate_key')
 
     def _cam_zoom(self, delta):
         cam = self.view.camera
@@ -723,7 +853,7 @@ class AtomScene(QtCore.QObject):
         if z1 > self._cam_zoom_max:
             z1 = self._cam_zoom_max
         cam.scale_factor = z1
-        self._redraw()
+        self.canvas.update()
         if int(self._cam_debug) > 0:
             print(f"[CAM] zoom delta={float(delta):.6g} scale:{z0:.6g}->{z1:.6g}")
 
@@ -736,8 +866,7 @@ class AtomScene(QtCore.QObject):
         center[0] += float(dx) * float(self._cam_pan_speed)
         center[1] += float(dy) * float(self._cam_pan_speed)
         cam.center = tuple(center)
-        self._redraw()
-        self.sig_camera_changed.emit()
+        self.canvas.update()
         if int(self._cam_debug) > 0:
             print(f"[CAM] pan dx={float(dx):.3f} dy={float(dy):.3f} center={tuple(center)}")
 
@@ -759,6 +888,7 @@ class AtomScene(QtCore.QObject):
     def _pick_idx_from_ray(self, r0, rd):
         # closest point distance^2 to ray for each atom
         # d2 = |(p-r0) - rd*dot(rd,(p-r0))|^2
+        self._sync_fixed_mask()
         valid = np.isfinite(self._pos).all(axis=1)
         if self._fixed is not None:
             valid &= (~self._fixed)
@@ -829,6 +959,16 @@ class AtomScene(QtCore.QObject):
         # Don't sync _pos from backend here - causes stale bond index issues during camera changes
         # The GUI should call refresh_view() when atoms actually change
         # Camera changes should only re-render, not re-sync data
+        self._sync_fixed_mask()
+        # Drop stale per-atom arrays (e.g. overlay redraw before set_data after topology change)
+        n = int(self._pos.shape[0])
+        if self._colors is not None and self._colors.shape[0] != n:
+            debug_print(1, f"[REDRAW] drop stale _colors {self._colors.shape[0]} vs n={n}")
+            self._colors = None
+            self._colors_base = None
+        if self._sizes is not None and self._sizes.shape[0] != n:
+            debug_print(1, f"[REDRAW] drop stale _sizes {self._sizes.shape[0]} vs n={n}")
+            self._sizes = None
 
         if self._pos.size == 0:
             idx = np.array([], dtype=int)
@@ -989,6 +1129,12 @@ class AtomScene(QtCore.QObject):
                 self.bond_lines.set_data(np.zeros((0, 3), dtype=np.float32))
         else:
             self.bond_lines.set_data(np.zeros((0, 3), dtype=np.float32))
+
+        # During sticky δ/φ: keep CH/H-bond/BO/label/frag overlays hidden (stale vs moving atoms)
+        if self._xform_mode is not None:
+            self.hide_xform_overlays()
+            self.canvas.update()
+            return
 
         # Bond orders: render double bonds as parallel lines, aromatic in green
         if (self._bond_order_bonds is not None) and (self._bond_orders is not None) and (len(self._bond_orders) > 0):
@@ -1156,6 +1302,7 @@ class AtomScene(QtCore.QObject):
     def _pick_idx_from_mouse(self, pos):
         if self._pos.shape[0] == 0:
             return -1
+        self._sync_fixed_mask()
         if self._pick_mode == '2d':
             r0, rd = self._ray_from_mouse(pos)
             xy = self._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0,0,1]))
@@ -1178,6 +1325,7 @@ class AtomScene(QtCore.QObject):
         """Like _pick_idx_from_mouse but also returns squared distance. Returns (idx, d2)."""
         if self._pos.shape[0] == 0:
             return -1, 1e30
+        self._sync_fixed_mask()
         if self._pick_mode == '2d':
             r0, rd = self._ray_from_mouse(pos)
             xy = self._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0,0,1]))
@@ -1215,23 +1363,61 @@ class AtomScene(QtCore.QObject):
             return -1, float('inf')
         return self._idx_to_id(idx), float(np.sqrt(d2))
 
+    def _bond_near_mouse(self, pos, max_dist=None):
+        """True if a bond midpoint is within max_dist of the mouse ray (or XY hit in 2d)."""
+        if self._bonds is None or len(self._bonds) == 0 or self._pos.shape[0] == 0:
+            return False
+        max_dist = self.pick_radius if max_dist is None else float(max_dist)
+        r0, rd = self._ray_from_mouse(pos)
+        bonds = np.asarray(self._bonds)
+        for a, b in bonds:
+            ia, ib = int(a), int(b)
+            if ia < 0 or ib < 0 or ia >= len(self._pos) or ib >= len(self._pos):
+                continue
+            c = 0.5 * (self._pos[ia] + self._pos[ib])
+            if self._pick_mode == '2d':
+                xy = self._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0.0, 0.0, 1.0]))
+                if xy is None:
+                    continue
+                d = float(np.linalg.norm(c[:2] - xy[:2]))
+            else:
+                dp = c - r0
+                q = dp - rd * float(np.dot(dp, rd))
+                d = float(np.linalg.norm(q))
+            if d <= max_dist:
+                return True
+        return False
+
     def _on_mouse_press(self, ev):
         # Store Ctrl state for RMB bridge removal in GUI
         self._last_ctrl = 'Control' in ev.modifiers if isinstance(ev.modifiers, (tuple, list)) else False
         if ev.button in (2, 3):
             if self._selection_mode:
-                # Create selection rectangle (Line visual) on first use
+                # Sticky xform: RMB also commits/exits
+                if self._xform_mode is not None:
+                    self.exit_xform(commit=True)
+                    ev.handled = True
+                    return
+                # RMB on atom → remove from selection; empty → box-remove drag
+                atom_id, dist = self._pick_id_from_mouse(ev.pos, max_dist=self.pick_radius)
+                if atom_id >= 0:
+                    if atom_id in self._selected_ids:
+                        self._selected_ids.discard(atom_id)
+                        if not self._selected_ids:
+                            self.exit_xform(commit=False)
+                        self._highlight_selected()
+                        self._update_selection_bbox()
+                        self.sig_selection_changed.emit(self._selected_ids.copy())
+                        debug_print(2, f"[SEL] RMB remove id={atom_id} n={len(self._selected_ids)}")
+                    ev.handled = True
+                    return
                 if self.selection_rect is None:
-                    self.selection_rect = visuals.Line(parent=self.view.scene, color=(0.2, 0.6, 1.0, 1.0), width=2.0)
+                    self.selection_rect = visuals.Line(parent=self.view.scene, color=(0.9, 0.3, 0.3, 1.0), width=2.0)
                     self.selection_rect.visible = False
-                # Start selection rectangle - use same method as picking for consistency
-                r0, rd = self._ray_from_mouse(ev.pos)
-                p = self._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0,0,1]))
-                if p is not None:
-                    self._selection_start = np.array([p[0], p[1]], dtype=np.float32)
-                else:
-                    self._selection_start = self._mouse_to_world_xy(ev.pos, z=0.0)
+                p = self._mouse_xy_on_z0(ev.pos)
+                self._selection_start = np.asarray(p, dtype=np.float32)
                 self._selection_end = self._selection_start.copy()
+                self._box_sel_mode = 'remove'
                 self.selection_rect.visible = True
                 self._update_selection_rect()
                 ev.handled = True
@@ -1255,12 +1441,55 @@ class AtomScene(QtCore.QObject):
                         print(f"[RMB] miss mouse=({xy[0]:.2f},{xy[1]:.2f}) closest_d={np.sqrt(d2[best]):.3f} radius={self.pick_radius}")
                     else:
                         print(f"[RMB] miss (no atoms or ray miss)")
-            self._rmb_down = True
-            self._rmb_last = np.array(ev.pos, dtype=np.float32)
-            self._cam_print('rmb_down')
-            ev.handled = True
+            # 3D: RMB-drag rotate when no atom/bond under cursor (lowest priority)
+            if not self._lock_top_view:
+                if self._bond_near_mouse(ev.pos):
+                    return  # let GUI delete bond / other RMB actions
+                self._rmb_down = True
+                self._rmb_last = np.array(ev.pos, dtype=np.float32)
+                self._cam_print('rmb_down')
+                ev.handled = True
+                return
+            # 2D: leave miss for GUI (hex/bond/empty)
             return
         if ev.button != 1:
+            return
+
+        # ── Select mode LMB: handles / sticky xform / add-to-selection ──
+        if self._selection_mode:
+            handle = self._pick_sel_handle(ev.pos)
+            if self._xform_mode is not None:
+                # Click opposite handle → switch mode; same/elsewhere → commit exit
+                if handle is not None and handle != self._xform_mode:
+                    self.enter_xform(handle, mouse_pos=ev.pos)
+                else:
+                    self.exit_xform(commit=True)
+                ev.handled = True
+                return
+            if handle is not None:
+                self.enter_xform(handle, mouse_pos=ev.pos)
+                ev.handled = True
+                return
+            atom_id, dist = self._pick_id_from_mouse(ev.pos, max_dist=self.pick_radius)
+            if atom_id >= 0:
+                self._selected_ids.add(atom_id)
+                self._highlight_selected()
+                self._update_selection_bbox()
+                self.sig_selection_changed.emit(self._selected_ids.copy())
+                debug_print(2, f"[SEL] LMB add id={atom_id} n={len(self._selected_ids)}")
+                ev.handled = True
+                return
+            # Empty LMB: optional box-add
+            if self.selection_rect is None:
+                self.selection_rect = visuals.Line(parent=self.view.scene, color=(0.2, 0.6, 1.0, 1.0), width=2.0)
+                self.selection_rect.visible = False
+            p = self._mouse_xy_on_z0(ev.pos)
+            self._selection_start = np.asarray(p, dtype=np.float32)
+            self._selection_end = self._selection_start.copy()
+            self._box_sel_mode = 'add'
+            self.selection_rect.visible = True
+            self._update_selection_rect()
+            ev.handled = True
             return
 
         # Ctrl+LMB in link mode: start bond creation drag (rubber-band line)
@@ -1288,30 +1517,10 @@ class AtomScene(QtCore.QObject):
 
         # External lock: suppress all drag (e.g. Ring mode)
         if self.lock_drag:
-            i = self._pick_idx_from_mouse(ev.pos)
-            self._pick_idx = i  # still allow pick detection
-            self._pick_id = self._idx_to_id(i)
-            self._pick_active = False
-            return
-
-        # In selection mode, always drag selected atoms regardless of where you click
-        if self._selection_mode and self._selected_ids:
-            self._pick_active = True
-            self._pick_idx = -1  # No specific atom clicked
+            # Do not stash _pick_idx — release would treat it as a drag (no _press_pos).
+            self._pick_idx = -1
             self._pick_id = -1
-            self._pick_z = 0.0
-            # Store initial positions of all selected atoms (map IDs to current indices)
-            self._selected_initial_pos = {}
-            for aid in self._selected_ids:
-                idx = self._id_to_idx_safe(aid)
-                if idx >= 0:
-                    self._selected_initial_pos[idx] = self._pos[idx].copy()
-            # Store initial mouse position for delta calculation
-            r0, rd = self._ray_from_mouse(ev.pos)
-            self._drag_start_mouse = np.array(ev.pos, dtype=np.float32)
-            if int(self._cam_debug) > 0:
-                print(f"[DRAG] down selected={len(self._selected_ids)} atoms (selection mode)")
-            ev.handled = True
+            self._pick_active = False
             return
 
         i, d2 = self._pick_idx_with_dist(ev.pos)
@@ -1377,12 +1586,18 @@ class AtomScene(QtCore.QObject):
             if self._selection_mode and self.selection_rect is not None and self.selection_rect.visible:
                 # Finalize selection
                 self.selection_rect.visible = False
-                self._finalize_selection()
+                self._finalize_selection(mode=getattr(self, '_box_sel_mode', 'remove'))
                 ev.handled = True
                 return
             self._rmb_down = False
             self._rmb_last = None
             self._cam_print('rmb_up')
+            ev.handled = True
+            return
+        # LMB box-add release in Select mode
+        if ev.button == 1 and self._selection_mode and self.selection_rect is not None and self.selection_rect.visible:
+            self.selection_rect.visible = False
+            self._finalize_selection(mode=getattr(self, '_box_sel_mode', 'add'))
             ev.handled = True
             return
         # Handle link mode release (Ctrl+drag bond creation)
@@ -1400,7 +1615,10 @@ class AtomScene(QtCore.QObject):
                 # Released on same atom = click → change type
                 self.sig_atom_clicked.emit(from_id)
             else:
-                # Released on empty space → create new atom at release position + bond
+                # Released on empty space → create new atom at release position + bond (2D only)
+                if self._pick_mode != '2d':
+                    ev.handled = True
+                    return
                 r0, rd = self._ray_from_mouse(ev.pos)
                 p = self._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0,0,1]))
                 if p is not None:
@@ -1409,9 +1627,9 @@ class AtomScene(QtCore.QObject):
             ev.handled = True
             return
         self._pick_active = False
-        if self._pick_idx >= 0:
+        if self._pick_idx >= 0 and hasattr(self, '_press_pos') and self._press_pos is not None:
             # Click-vs-drag: if mouse barely moved, treat as click (emit sig_atom_clicked)
-            moved = np.linalg.norm(np.array(ev.pos, dtype=np.float32) - getattr(self, '_press_pos', np.array([1e9, 1e9])))
+            moved = np.linalg.norm(np.array(ev.pos, dtype=np.float32) - self._press_pos)
             if moved < 3:
                 debug_print(2, f"[SCENE_RELEASE] click (moved={moved:.1f}px) → sig_atom_clicked atom_id={self._pick_id}")
                 self.sig_atom_clicked.emit(int(self._pick_id))
@@ -1423,6 +1641,7 @@ class AtomScene(QtCore.QObject):
                 print(f"[DRAG] up id={self._pick_id} pos=({self._pos[i,0]:.3f},{self._pos[i,1]:.3f},{self._pos[i,2]:.3f})")
         self._pick_idx = -1
         self._pick_id = -1
+        self._press_pos = None
         self._drag_plane_p0 = None
         self._drag_plane_n = None
         # Clean up selected initial positions
@@ -1430,6 +1649,11 @@ class AtomScene(QtCore.QObject):
             del self._selected_initial_pos
 
     def _on_mouse_move(self, ev):
+        # Sticky δ/φ transform follows mouse with no button hold
+        if self._xform_mode is not None:
+            self._apply_xform_mouse(ev.pos)
+            ev.handled = True
+            return
         if self._link_active:
             # Update rubber-band line endpoint to mouse world position
             r0, rd = self._ray_from_mouse(ev.pos)
@@ -1530,8 +1754,9 @@ class AtomScene(QtCore.QObject):
                 p[i, :] = x
 
         # If using backend proxy, update _pos for rendering (but backend is authoritative)
+        # Always copy — a view into sys.apos desyncs _colors/_fixed after topology changes.
         if self.backend is not None:
-            self._pos = self.backend.sys.apos.astype(np.float32)
+            self._pos = self.backend.sys.apos.astype(np.float32).copy()
         else:
             self._pos = p
         # Emit signal for parent to track drag position
@@ -1588,32 +1813,228 @@ class AtomScene(QtCore.QObject):
         ev.handled = True
 
     def _on_key_press(self, ev):
-        """Handle keyboard events for camera panning with arrow keys."""
+        """Camera pan (2D / Shift) or rotate (3D); digit presets for ortho views."""
         if int(self._cam_debug) > 0:
             print(f"[KEY] key={ev.key} text={ev.text}")
-        if ev.key == 'ArrowUp':
-            self._cam_pan(0, 1)
+        mods = ev.modifiers if isinstance(ev.modifiers, (tuple, list)) else ()
+        shift = 'Shift' in mods
+
+        # View presets: 5=Top (default), 0=Bottom, 8=Back, 2=Front, 4=Left, 6=Right
+        preset_map = {
+            '5': 'top', 'KP_5': 'top',
+            '0': 'bottom', 'KP_0': 'bottom',
+            '8': 'back', 'KP_8': 'back',
+            '2': 'front', 'KP_2': 'front',
+            '4': 'left', 'KP_4': 'left',
+            '6': 'right', 'KP_6': 'right',
+        }
+        key = ev.key
+        if key in preset_map:
+            # In locked 2D top view only Top preset is allowed
+            if self._lock_top_view and preset_map[key] != 'top':
+                ev.handled = True
+                return
+            self.set_camera_preset(preset_map[key])
             ev.handled = True
-        elif ev.key == 'ArrowDown':
-            self._cam_pan(0, -1)
-            ev.handled = True
-        elif ev.key == 'ArrowLeft':
-            self._cam_pan(-1, 0)
-            ev.handled = True
-        elif ev.key == 'ArrowRight':
-            self._cam_pan(1, 0)
-            ev.handled = True
-        elif ev.key in ('Up', 'Down', 'Left', 'Right'):
-            # Try alternative key names
-            if ev.key == 'Up':
-                self._cam_pan(0, 1)
-            elif ev.key == 'Down':
-                self._cam_pan(0, -1)
-            elif ev.key == 'Left':
-                self._cam_pan(-1, 0)
-            elif ev.key == 'Right':
-                self._cam_pan(1, 0)
-            ev.handled = True
+            return
+
+        arrow_keys = ('ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Up', 'Down', 'Left', 'Right')
+        if key not in arrow_keys:
+            return
+
+        # Map to direction
+        if key in ('ArrowUp', 'Up'):
+            pan_dx, pan_dy, rot_az, rot_el = 0, 1, 0, self._cam_rot_key_speed
+        elif key in ('ArrowDown', 'Down'):
+            pan_dx, pan_dy, rot_az, rot_el = 0, -1, 0, -self._cam_rot_key_speed
+        elif key in ('ArrowLeft', 'Left'):
+            pan_dx, pan_dy, rot_az, rot_el = -1, 0, -self._cam_rot_key_speed, 0
+        else:
+            pan_dx, pan_dy, rot_az, rot_el = 1, 0, self._cam_rot_key_speed, 0
+
+        if self._lock_top_view or shift:
+            self._cam_pan(pan_dx, pan_dy)
+        else:
+            self._cam_rotate_keys(rot_az, rot_el)
+        ev.handled = True
+
+    def _mouse_xy_on_z0(self, mouse_pos):
+        r0, rd = self._ray_from_mouse(mouse_pos)
+        p = self._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0.0, 0.0, 1.0]))
+        if p is not None:
+            return np.array([p[0], p[1]], dtype=np.float64)
+        return np.asarray(self._mouse_to_world_xy(mouse_pos, z=0.0), dtype=np.float64)
+
+    def _selection_indices(self):
+        idxs = []
+        for aid in self._selected_ids:
+            i = self._id_to_idx_safe(aid)
+            if i >= 0:
+                idxs.append(i)
+        return idxs
+
+    def _selection_com(self):
+        idxs = self._selection_indices()
+        if not idxs:
+            return np.zeros(3, dtype=np.float64)
+        return self._pos[idxs].mean(axis=0).astype(np.float64)
+
+    def _hide_selection_bbox(self):
+        self.sel_bbox_lines.visible = False
+        self.sel_handle_markers.visible = False
+        self.sel_handle_text.visible = False
+        self._sel_handle_move = None
+        self._sel_handle_rot = None
+        self.sel_bbox_lines.set_data(np.zeros((0, 3), dtype=np.float32))
+        self.sel_handle_markers.set_data(np.zeros((0, 3), dtype=np.float32))
+        self.sel_handle_text.text = ''
+
+    def _update_selection_bbox(self):
+        """Draw AABB + δ (BL) / φ (TR) handles around selected atoms."""
+        idxs = self._selection_indices()
+        if not idxs:
+            self._hide_selection_bbox()
+            return
+        pts = self._pos[idxs]
+        pad = float(self._sel_bbox_pad)
+        xmin = float(pts[:, 0].min()) - pad
+        xmax = float(pts[:, 0].max()) + pad
+        ymin = float(pts[:, 1].min()) - pad
+        ymax = float(pts[:, 1].max()) + pad
+        if xmax - xmin < 0.8:
+            c = 0.5 * (xmin + xmax); xmin, xmax = c - 0.4, c + 0.4
+        if ymax - ymin < 0.8:
+            c = 0.5 * (ymin + ymax); ymin, ymax = c - 0.4, c + 0.4
+        z = float(pts[:, 2].mean()) + 0.05
+        box = np.array([[xmin, ymin, z], [xmax, ymin, z], [xmax, ymax, z], [xmin, ymax, z], [xmin, ymin, z]], dtype=np.float32)
+        self.sel_bbox_lines.set_data(pos=box, color=(0.15, 0.55, 1.0, 0.95), width=2.0)
+        self.sel_bbox_lines.visible = True
+        self._sel_handle_move = np.array([xmin, ymin], dtype=np.float64)
+        self._sel_handle_rot = np.array([xmax, ymax], dtype=np.float64)
+        hpos = np.array([[xmin, ymin, z], [xmax, ymax, z]], dtype=np.float32)
+        # Active handle: larger + warm; idle: cool cyan / magenta
+        move_on = self._xform_mode == 'move'
+        rot_on = self._xform_mode == 'rotate'
+        cols = np.array([
+            [1.0, 0.85, 0.1, 1.0] if move_on else [0.15, 0.75, 0.95, 1.0],
+            [1.0, 0.85, 0.1, 1.0] if rot_on else [0.85, 0.25, 0.9, 1.0],
+        ], dtype=np.float32)
+        sizes = np.array([22.0 if move_on else 14.0, 22.0 if rot_on else 14.0], dtype=np.float32)
+        try:
+            self.sel_handle_markers.set_data(hpos, face_color=cols, size=sizes, edge_width=1.5, edge_color='black', symbol='square')
+        except TypeError:
+            self.sel_handle_markers.set_data(hpos, face_color=cols, size=sizes, edge_width=1.5, edge_color='black', marker='square')
+        self.sel_handle_markers.visible = True
+        self.sel_handle_text.text = ['δ', 'φ']
+        self.sel_handle_text.pos = hpos
+        self.sel_handle_text.color = np.array([(0, 0, 0, 1), (0, 0, 0, 1)], dtype=np.float32)
+        self.sel_handle_text.visible = True
+        self.canvas.update()
+
+    def _pick_sel_handle(self, mouse_pos):
+        """Return 'move'|'rotate'|None for δ/φ corner under cursor."""
+        if self._sel_handle_move is None or self._sel_handle_rot is None:
+            return None
+        xy = self._mouse_xy_on_z0(mouse_pos)
+        r2 = float(self._sel_handle_r) ** 2
+        d_move = float(np.sum((xy - self._sel_handle_move) ** 2))
+        d_rot = float(np.sum((xy - self._sel_handle_rot) ** 2))
+        if d_move <= r2 and d_move <= d_rot:
+            return 'move'
+        if d_rot <= r2:
+            return 'rotate'
+        return None
+
+    def hide_xform_overlays(self):
+        """Hide CH/H-bond/label/hover/frag overlays during sticky move/rotate (stale otherwise)."""
+        empty = np.zeros((0, 3), dtype=np.float32)
+        for v in (self.ch_bond_lines, self.hbond_lines, self.bond_order_lines, self.bond_colored_lines,
+                  self.force_lines, self.hover_bond_line, self.hover_ring_lines, self.link_line,
+                  self.ring_preview_line, self.frag_lines, self.frag_bbox_lines):
+            v.set_data(empty)
+            v.visible = False
+        self.bond_order_text.visible = False
+        self.text_labels.visible = False
+        self.hover_ring_text.visible = False
+        self.hover_ring_text.text = ''
+        self.hover_atom_marker.set_data(empty)
+        self.hover_ring_markers.set_data(empty)
+
+    def enter_xform(self, mode, mouse_pos=None):
+        """Sticky transform toggle: mode='move'|'rotate'. Follows mouse until exit_xform."""
+        if mode not in ('move', 'rotate') or not self._selected_ids:
+            return
+        self._xform_mode = mode
+        xy = self._mouse_xy_on_z0(mouse_pos) if mouse_pos is not None else self._selection_com()[:2]
+        self._xform_last_xy = np.asarray(xy, dtype=np.float64)
+        self._xform_com = self._selection_com()
+        d = self._xform_last_xy - self._xform_com[:2]
+        self._xform_last_angle = float(np.arctan2(d[1], d[0]))
+        debug_print(2, f"[XFORM] enter mode={mode} n={len(self._selected_ids)}")
+        self.hide_xform_overlays()
+        self._update_selection_bbox()
+        self.sig_drag_state.emit(1, -1, self._xform_com.astype(np.float32))
+
+    def exit_xform(self, commit=True):
+        """End sticky move/rotate; optionally commit positions to graph via drag-end signal."""
+        if self._xform_mode is None:
+            return
+        mode = self._xform_mode
+        self._xform_mode = None
+        self._xform_last_xy = None
+        self._xform_last_angle = None
+        debug_print(2, f"[XFORM] exit mode={mode} commit={commit}")
+        if commit and self._selected_ids:
+            # atom_id=-1 → sync only (no single-atom merge heuristic)
+            self.sig_drag_state.emit(0, -1, self._selection_com().astype(np.float32))
+        self._update_selection_bbox()
+
+    def _apply_xform_mouse(self, mouse_pos):
+        """Follow mouse while sticky move/rotate is active (no button hold)."""
+        if self._xform_mode is None or not self._selected_ids:
+            return
+        xy = self._mouse_xy_on_z0(mouse_pos)
+        idxs = self._selection_indices()
+        if not idxs:
+            return
+        p = self.backend.sys.apos if self.backend is not None else self._pos
+        if self._xform_mode == 'move':
+            if self._xform_last_xy is None:
+                self._xform_last_xy = xy
+                return
+            delta = xy - self._xform_last_xy
+            self._xform_last_xy = xy
+            for i in idxs:
+                p[i, 0] += delta[0]
+                p[i, 1] += delta[1]
+            if self._xform_com is not None:
+                self._xform_com[0] += delta[0]
+                self._xform_com[1] += delta[1]
+        else:  # rotate about selection COM in XY
+            com = self._xform_com if self._xform_com is not None else self._selection_com()
+            d = xy - com[:2]
+            ang = float(np.arctan2(d[1], d[0]))
+            if self._xform_last_angle is None:
+                self._xform_last_angle = ang
+                return
+            dang = ang - self._xform_last_angle
+            # unwrap
+            if dang > np.pi: dang -= 2 * np.pi
+            if dang < -np.pi: dang += 2 * np.pi
+            self._xform_last_angle = ang
+            c, s = np.cos(dang), np.sin(dang)
+            for i in idxs:
+                dx = p[i, 0] - com[0]
+                dy = p[i, 1] - com[1]
+                p[i, 0] = com[0] + c * dx - s * dy
+                p[i, 1] = com[1] + s * dx + c * dy
+        if self.backend is not None:
+            self._pos = self.backend.sys.apos.astype(np.float32).copy()
+        else:
+            self._pos = np.asarray(p, dtype=np.float32)
+        self._redraw()
+        self._highlight_selected()
+        self._update_selection_bbox()
 
     def _update_selection_rect(self):
         """Update selection rectangle visualization (Line visual)."""
@@ -1635,29 +2056,33 @@ class AtomScene(QtCore.QObject):
         self.selection_rect.set_data(pos=vertices)
         self.canvas.update()
 
-    def _finalize_selection(self):
-        """Finalize selection and select atoms within rectangle."""
+    def _finalize_selection(self, mode='add'):
+        """Finalize box selection. mode='add' unions; mode='remove' subtracts."""
         if self._selection_start is None or self._selection_end is None:
             return
         x0, y0 = self._selection_start
         x1, y1 = self._selection_end
         x_min, x_max = min(x0, x1), max(x0, x1)
         y_min, y_max = min(y0, y1), max(y0, y1)
-
-        # Find atoms within rectangle — store as Atom._ids
-        selected = set()
+        # Tiny drag = click, not a box
+        if (x_max - x_min) < 1e-3 and (y_max - y_min) < 1e-3:
+            self._selection_start = None
+            self._selection_end = None
+            return
+        hit = set()
         for i in range(len(self._pos)):
             x, y = self._pos[i, 0], self._pos[i, 1]
             if x_min <= x <= x_max and y_min <= y <= y_max:
                 aid = self._idx_to_id(i)
                 if aid >= 0:
-                    selected.add(aid)
-
-        # Update selection
-        self._selected_ids = selected
+                    hit.add(aid)
+        if mode == 'remove':
+            self._selected_ids -= hit
+        else:
+            self._selected_ids |= hit
         self._highlight_selected()
-        self.sig_selection_changed.emit(selected)
-
+        self._update_selection_bbox()
+        self.sig_selection_changed.emit(self._selected_ids.copy())
         self._selection_start = None
         self._selection_end = None
 
@@ -1682,7 +2107,7 @@ class AtomScene(QtCore.QObject):
     def set_selection_mode(self, enabled):
         """Enable or disable selection mode."""
         self._selection_mode = enabled
-        # Clear selection when exiting selection mode
+        # Clear selection when exiting selection mode (commits sticky xform if active)
         if not enabled:
             self.clear_selection()
 
@@ -1698,20 +2123,24 @@ class AtomScene(QtCore.QObject):
         """Set selected atoms by Atom._id."""
         self._selected_ids = set(ids)
         self._highlight_selected()
+        self._update_selection_bbox()
         self.sig_selection_changed.emit(self._selected_ids)
 
     def set_selected_indices(self, indices):
         """Set selected atom indices (DEPRECATED: use set_selected_ids)."""
         self._selected_ids = {self._idx_to_id(i) for i in indices if self._idx_to_id(i) >= 0}
         self._highlight_selected()
+        self._update_selection_bbox()
         self.sig_selection_changed.emit(self._selected_ids)
 
     def clear_selection(self):
         """Clear selection and restore original colors."""
+        self.exit_xform(commit=True)
         self._selected_ids.clear()
+        self._hide_selection_bbox()
         if self._selected_colors_backup is not None:
             # Check shape consistency before restoring (atoms may have been added/removed)
-            if self._selected_colors_backup.shape == self._colors.shape:
+            if self._colors is not None and self._selected_colors_backup.shape == self._colors.shape:
                 self._colors[:] = self._selected_colors_backup
                 self.atom_markers.set_data(self._pos, edge_color=None, face_color=self._colors, size=self._sizes)
             else:

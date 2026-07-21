@@ -80,6 +80,9 @@ Helper: `afm_tip_probe_heights(5.5, 8.0, 0.5, bond_length=3.0)`.
 
 - **`aspect='equal'`** always (1 Å x = 1 Å y/z). Never `aspect='auto'`.
 - Tip density diagnostics: molecular frame **before** pad+roll; mark 1D cut on 2D; draw cube box if cube source.
+- **Same XY window size** when comparing methods: same Δx×Δy. Center on **that simulation’s molecule COM**.
+- For fair Kriging↔FDBM AFM: FDBM **GridFF** `margin_xy` ≥ **5.5–6 Å** (current default 4 Å → XY≈12.7 < Kriging≈13.7×14.7). PP scan should use **full GridFF XY** (Kriging does); the old ~8×8 Å imaging window was only ~2 Å past atoms.
+- Overlay **`apos` = molecule atoms only** (cyan dots). Never pass Kriging `points_clean` sample sites as `apos`.
 
 ### Tip × sample labeling
 
@@ -93,7 +96,8 @@ Always state **sample** and **tip** separately (DFT-cube vs DFTB). Matched vs cr
 |------|------|
 | One XY map on an Axes | `imshow_afm(ax, arr_nxny, extent=..., cmap='bwr')` |
 | Row of maps at selected heights | `plot_afm_height_panel(data, heights, iz=..., extent=..., label='Fz', fname=...)` |
-| **3-row Fz_u / Fz_r / df × nz** | `plot_afm_Fz_df_threerow(Fz_u, Fz_r, df, heights_tip, heights_probe, amp=…)` |
+| **3-row Fz_u / Fz_r / df × nz** | `plot_afm_Fz_df_threerow(..., scan_xs=, scan_ys=, view_extent=, apos=atoms)` |
+| Crop scan to shared XY | `crop_afm_xy(data, scan_xs, scan_ys, view_extent)` |
 | Tip/probe height ladders | `afm_tip_probe_heights(tip_min, tip_max, tip_step, bond_length)` |
 | Full height dump (all z) | `save_afm_images(df, scan_xs, scan_ys, heights, out_dir, prefix='df')` |
 | Dense multi-row height grid | `plot_grid_Fz(Fz, heights, label, fname, x_ext=..., y_ext=...)` |
@@ -138,6 +142,8 @@ Array convention: AFM volumes are **`(nx, ny, nz)`**. Helpers transpose for `ims
 - About to hardcode N/C/H-only bottom row for a new molecule → **STOP** → pass arbitrary `sites`
 - About to sample Fz/df at tip_z for AFM images → **STOP** → use probe_z; label tip=probe+L
 - About to call `compute_df_amp` on ≤5 coarse slices → **STOP** → dense z stack covering ±amp
+- About to pass Kriging `points_clean` as `apos` overlay → **STOP** → molecule atoms only
+- About to compare Kriging vs FDBM AFM without shared `view_extent` → **STOP** → crop to FDBM (or common) XY
 - About to paste a height-panel loop from another test → **STOP** → call SSOT, or generalize SSOT
 
 ## Pre-commit self-check

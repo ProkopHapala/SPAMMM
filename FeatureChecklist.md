@@ -179,15 +179,17 @@
 
 ## 7. GUI
 
+### ✅ Working
+- **SPAMMM_GUI / AtomScene** — VisPy + PyQt5 molecular editor; **ortho 2D/3D view mode** (`Enter` / `b2Dview`); Ring/atom/bond pick in 3D; hex 2D-only. See `doc/Tasks/GUI_Editor_3D_ViewMode.md`, `doc/GUI_CHEATSHEET.md`
+- **AFMExtension** — AFM panel with S1-S6 pipeline UI
+- **VispyUtils AtomScene** — reusable ortho scene: picking, drag, camera presets, depth test in 3D
+
 ### ⚠️ In Progress
-- **KekuleExplorerGUI** — VisPy + PyQt5 molecular editor, imports fixed, launch untested
-- **AFMExtension** — AFM panel with S1-S6 pipeline UI, imports fixed, untested
-- **VispyUtils AtomScene** — reusable 3D widget, implemented, untested
 - **MolecularBrowserVispy** — VisPy Phase 1 (thumbnail grid + 3D view), no plugin system yet
 
 ### 🔲 Planned
 - **Molecular browser plugin system** — port from FireCore `VispyMolBrowser.py` plugin architecture. See `doc/ARCHITECTURE_ROADMAP.md` §1
-- **3D viewer** — topology independent of hex grid
+- Topology fully independent of hex grid (hex as guideline only; off-grid atoms already OK)
 
 ---
 

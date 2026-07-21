@@ -3,7 +3,8 @@
 **Status:** investigating (not Done — awaiting USER confirmation)  
 **Date span:** 2026-07-20 … 2026-07-21  
 **Preferred system:** Mithun endgroup `N-h` (pyridine) + tip `CO_O`  
-**Primary artifacts:** `debug/afm_fdbm_diag_pyridine_gui_match/`  
+**Primary artifacts:** `debug/afm_fdbm_diag_pyridine_gui_match/` · HTML gallery [`index.html`](../../debug/afm_fdbm_diag_pyridine_gui_match/index.html)  
+**Day report (Pauli fits, residual method, N+C pool, packaging):** [`Kriging_FDBM_PauliFit_pyridine_2026-07-21.md`](Kriging_FDBM_PauliFit_pyridine_2026-07-21.md)  
 
 **Living task / design docs (read these first):**
 
@@ -182,8 +183,23 @@ USER clarification (2026-07-21) — agents repeatedly got this wrong:
 | Clamp tip ⊗ cube \(V\) | Still early attractive bend |
 | Opposite-C probe site | Fixed (carbon, not H) |
 | Plot helpers (n sites, tip/probe, 3-row AFM) | In `AFM_utils` + skill |
-| Prolonged tip Slater SA | **Not done** (planned) |
-| DFTB + spherical NA (vs diagonal ρ_NA) | **Not done** (planned) |
+| Prolonged tip Slater SA | **Not done** (sample-only prolonged run below) |
+| DFTB + spherical NA (vs diagonal ρ_NA) | **Sample-only AFM run** — see §7a artifacts (investigating) |
+
+### 7a. Experiments run 2026-07-21 (pyridine DFTB×DFTB, sample-only)
+
+Isolated as in §7 — tip stays stock DFTB CO. Artifacts under `debug/afm_fdbm_diag_pyridine_gui_match/`:
+
+| Exp | What changed | AFM PNG | Notes |
+|-----|--------------|---------|-------|
+| Stock baseline | Diagonal Denmat0 ρ_NA | `AFM_DFTB_stock_diagNA_df_Fz.png` | A,β=13.42/0.706 |
+| **1 — prolonged Pauli** | Same DM → `make_slater_tail_species_list` ρ for Pauli; **stock** V_ES | `AFM_DFTB_prolongedPauli_df_Fz.png` | ∫ρ≈39 ≠ 30 (not normalized); same A,β → weaker Fz (re-fit open) |
+| **2 — compact NA** | Δρ=ρ_scf−compact(\(Z_\mathrm{val}\)); stock Pauli ρ | `AFM_DFTB_compactNA_df_Fz.png` | V@8 still ~+0.13 (far-field leak vs diag) |
+
+Fields: `FDBM_DFTB_{stock_diagNA,compactNA,prolongedPauli}_fields.npz`. Note: `NOTE_DFTB_exp_prolonged_compactNA.out`.
+
+**Not Done** — awaiting USER review of images; tip prolonged + A,β re-fit still open.
+
 | Pauli \(A,\beta\) USER-approved for real CO | Fit exists; values not locked |
 | \(K_\mathrm{lat}\) magnitude | Units path OK; working N/m may need retune |
 

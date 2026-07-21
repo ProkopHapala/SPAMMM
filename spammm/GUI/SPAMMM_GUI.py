@@ -86,6 +86,7 @@ class SPAMMMWindow(BaseGUI):
         self.bond_orders = None  # pi bond orders array (set by KekuleExtension solver)
         self.bond_order_bonds = None  # (m,2) heavy-atom bond indices matching bond_orders
         self.show_bond_order_labels = False
+        self.b2Dview = True  # True: top planar edit; False: ortho 3D inspect/edit-lite
 
         # Output directory for saved images (screenshots, plots)
         _repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -210,7 +211,7 @@ class SPAMMMWindow(BaseGUI):
         self.debug_lines.order = 4  # Behind debug markers
 
         # Help / Status
-        self.statusBar().showMessage("LMB: Add/Toggle | RMB: Remove | Middle-Click: Toggle H | Scroll: Zoom | Arrow Keys: Pan")
+        self.statusBar().showMessage("LMB: Add/Toggle | RMB: Remove | Enter: 2D/3D | Space: Run FF | Scroll: Zoom | Arrows: Pan/Rotate")
         self.scene.lock_drag = False  # Default mode is Unified, allow dragging
         self.scene.canvas.events.mouse_press.connect(self.on_mouse_press)
         self.scene.canvas.events.mouse_move.connect(self.on_mouse_move)
@@ -225,6 +226,7 @@ class SPAMMMWindow(BaseGUI):
         self.error_raise = True      # Raise exception
         self.error_dialog = True     # Show QMessageBox
         self.error_statusbar = True  # Update status bar
+        self.apply_view_mode()
 
     def _raise(self, msg, title="Error", dialog_type="critical"):
         """Reusable error handling function.
@@ -336,6 +338,21 @@ class SPAMMMWindow(BaseGUI):
         self.debug_btn.setCheckable(True)
         self.debug_btn.setChecked(True)
         layout.addLayout(row3)
+
+        # 2D / 3D view mode
+        row_view = QtWidgets.QHBoxLayout()
+        self.b2Dview_chk = QtWidgets.QCheckBox("2D view (planar edit)")
+        self.b2Dview_chk.setChecked(True)
+        self.b2Dview_chk.setToolTip("Checked: top-down hex/empty edit. Unchecked: ortho 3D (Enter toggles). Space = run/stop FF.")
+        self.b2Dview_chk.toggled.connect(self._on_b2Dview_toggled)
+        row_view.addWidget(self.b2Dview_chk)
+        self.view_debug_chk = QtWidgets.QCheckBox("Ray debug")
+        self.view_debug_chk.setChecked(False)
+        self.view_debug_chk.setToolTip("Draw mouse ray + hit point (transform sanity)")
+        self.view_debug_chk.toggled.connect(lambda c: self.scene.set_view_debug(c))
+        row_view.addWidget(self.view_debug_chk)
+        row_view.addStretch()
+        layout.addLayout(row_view)
         
         # Export/Import buttons
         row4 = QtWidgets.QHBoxLayout()
@@ -834,6 +851,73 @@ class SPAMMMWindow(BaseGUI):
         self.refresh_view()
         debug_print(2, "Grid transform reset")
 
+    def _on_b2Dview_toggled(self, checked):
+        self.b2Dview = bool(checked)
+        self.apply_view_mode()
+
+    def apply_view_mode(self):
+        """Sync camera/pick/depth with b2Dview. Default True = current planar editor."""
+        if self.b2Dview:
+            self.scene.set_pick_mode('2d')
+            self.scene.set_lock_top_view(True)
+            self.scene.set_depth_test(False)
+            self.scene.set_camera_preset('top')
+            msg = "2D view: planar edit (hex/empty OK) | Enter: 3D | Space: Run FF"
+        else:
+            self.scene.set_pick_mode('3d')
+            self.scene.set_lock_top_view(False)
+            self.scene.set_depth_test(True)
+            msg = "3D ortho: RMB-drag empty=rotate | Arrows: rotate | Shift+Arrows: pan | 5:Top | Enter: 2D"
+        if hasattr(self, 'b2Dview_chk') and self.b2Dview_chk.isChecked() != self.b2Dview:
+            self.b2Dview_chk.blockSignals(True)
+            self.b2Dview_chk.setChecked(self.b2Dview)
+            self.b2Dview_chk.blockSignals(False)
+        self.statusBar().showMessage(msg)
+        debug_print(2, f"[VIEW] b2Dview={self.b2Dview} pick={self.scene._pick_mode} lock_top={self.scene._lock_top_view}")
+
+    def toggle_b2Dview(self):
+        self.b2Dview = not self.b2Dview
+        if hasattr(self, 'b2Dview_chk'):
+            self.b2Dview_chk.blockSignals(True)
+            self.b2Dview_chk.setChecked(self.b2Dview)
+            self.b2Dview_chk.blockSignals(False)
+        self.apply_view_mode()
+
+    def toggle_run_simulation(self):
+        """Space: toggle interactive FF / simulation if the FF panel exists."""
+        btn = getattr(self, 'relax_interactive_btn', None)
+        if btn is None:
+            self.statusBar().showMessage("Space: no interactive FF panel (enable FF extension)")
+            return
+        btn.click()
+
+    def _planar_ops_blocked(self):
+        if self.b2Dview:
+            return False
+        self.statusBar().showMessage("2D-only (hex/empty) — press Enter for 2D view")
+        return True
+
+    def _mouse_world_and_ray(self, event):
+        """Return (p_world, r0, rd).
+
+        Construction hit ``p_world`` is always ray ∩ z=0 (XY molecular plane) when
+        possible — needed for ring side / hex / planar topology even in tilted 3D.
+        Falls back to view-plane ∩ cam.center if the ray is parallel to XY.
+        """
+        r0, rd = self.scene._ray_from_mouse(event.pos)
+        self._last_r0, self._last_rd = r0, rd
+        self._last_mouse_pos = event.pos
+        p = self.scene._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0.0, 0.0, 1.0]))
+        if p is None and not self.b2Dview:
+            cam = self.scene.view.camera
+            center = np.array(cam.center, dtype=np.float32)
+            p = self.scene._intersect_ray_plane(r0, rd, center, rd)
+            if p is None:
+                p = center.copy()
+        if p is not None:
+            self._last_p_world = np.asarray(p, dtype=np.float64)
+        return p, r0, rd
+
     def set_pick_radius(self, value):
         self.pick_radius = value
         self.scene.pick_radius = value
@@ -890,6 +974,16 @@ class SPAMMMWindow(BaseGUI):
 
     def on_key_press(self, event):
         """Handle keyboard shortcuts."""
+        # Enter: 2D/3D view toggle; Space: run/stop interactive FF
+        if event.key in ('Enter', 'Return'):
+            self.toggle_b2Dview()
+            event.handled = True
+            return
+        if event.key in ('Space', ' '):
+            self.toggle_run_simulation()
+            event.handled = True
+            return
+
         selected = self.scene.get_selected_ids()
 
         # Check for Control modifier (Vispy uses tuple of strings)
@@ -956,10 +1050,9 @@ class SPAMMMWindow(BaseGUI):
         debug_print(2, f"Copied {len(indices)} atoms ({len(self.copied_packed.bonds)} bonds) to clipboard")
 
     def paste_copied_atoms(self):
-        """Paste atoms from internal PackedMolecule or parse Qt clipboard text."""
+        """Paste atoms from clipboard; switch to Select and enter sticky δ-move."""
         packed = self.copied_packed
         if packed is None:
-            # Try parsing Qt clipboard text as .xyz or .mol
             clip_text = QtWidgets.QApplication.clipboard().text()
             if clip_text.strip():
                 packed = PackedMolecule.from_text(clip_text)
@@ -968,27 +1061,71 @@ class SPAMMMWindow(BaseGUI):
         if packed is None:
             debug_print(2, "No atoms to paste")
             return
+        self._insert_packed(packed, status_fmt="Pasted {n} atoms — sticky δ-move on; LMB click to drop")
+
+    def _insert_packed(self, packed, status_fmt=None):
+        """Append PackedMolecule into current graph (like paste). Returns new atom ids."""
         self._push_undo()
-        # Add atoms from packed data to graph
+        src_com = packed.apos.mean(axis=0) if len(packed.apos) else np.zeros(3)
+        if getattr(self, '_last_p_world', None) is not None:
+            target = np.asarray(self._last_p_world, dtype=np.float64)
+            target[2] = float(src_com[2])
+        else:
+            target = src_com + np.array([1.5, 1.5, 0.0])
+        paste_shift = target - src_com
         new_atom_ids = []
         new_atoms = []
         for i in range(len(packed.etype)):
             z = int(packed.etype[i])
             ename = _z_to_ename(z)
             npi_i = int(packed.npi[i]) if i < len(packed.npi) else 1
-            pos = list(packed.apos[i].copy())
+            pos = list(packed.apos[i].copy() + paste_shift)
             a = self.backend._append_atom(pos=pos, ename=ename, pin=None, parent=None, npi=npi_i)
             new_atom_ids.append(a._id)
             new_atoms.append(a)
-        # Add internal bonds from packed data
         for col in packed.bonds:
             i, j = int(col[0]), int(col[1])
             if 0 <= i < len(new_atoms) and 0 <= j < len(new_atoms):
                 self.backend.graph.add_bond(new_atoms[i], new_atoms[j])
+        # XYZ clipboard may lack bonds — distance-bond the new heavy atoms
+        if len(packed.bonds) == 0:
+            self.backend._create_bonds_by_distance(atoms=[a for a in new_atoms if a.ename not in ('H', 'E') and a.npi != -1])
         self.backend.graph.sync_neighbor_lists()
+        self.backend._sync_sys()
         self.refresh_view()
-        self.scene.set_selected_ids(new_atom_ids)
-        debug_print(2, f"Pasted {len(new_atoms)} atoms ({len(packed.bonds)} bonds)")
+        msg = None
+        if status_fmt:
+            msg = status_fmt.format(n=len(new_atoms))
+        self._enter_select_manip(new_atom_ids, status=msg)
+        debug_print(2, f"[INSERT] n={len(new_atoms)} bonds={len(packed.bonds)} → sticky move")
+        return new_atom_ids
+
+    def _enter_select_manip(self, atom_ids, status=None):
+        """Force Select mode + select atoms + sticky δ-move (paste/import)."""
+        if self.edit_mode != 'Select':
+            self.set_edit_mode('Select')
+            if hasattr(self, 'mode_combo'):
+                idx = self.mode_combo.findText('Select')
+                if idx >= 0:
+                    self.mode_combo.blockSignals(True)
+                    self.mode_combo.setCurrentIndex(idx)
+                    self.mode_combo.blockSignals(False)
+        ids = list(atom_ids) if atom_ids is not None else []
+        self.scene.set_selected_ids(ids)
+        mouse = getattr(self, '_last_mouse_pos', None)
+        if ids:
+            self.scene.enter_xform('move', mouse_pos=mouse)
+        if status:
+            self.statusBar().showMessage(status)
+
+    def _hide_manip_overlays(self):
+        """Hide stale CH/H-bond/label/hover overlays while sticky δ/φ runs."""
+        self._clear_hover()
+        self.cursor_markers.visible = False
+        self.debug_markers.visible = False
+        self.debug_lines.visible = False
+        self.hover_markers.visible = False
+        self.scene.hide_xform_overlays()
 
     def _push_undo(self):
         """Push current graph state to undo stack before a mutation."""
@@ -1018,7 +1155,13 @@ class SPAMMMWindow(BaseGUI):
         and then to sys.apos via _sync_sys(). This ensures all geometry sources stay in sync.
         Then refresh view to update bond visualization immediately.
         """
+        if state == 1 and int(atom_id) < 0:
+            # Sticky δ/φ xform start — snapshot for Ctrl+Z; hide stale overlays
+            self._push_undo()
+            self._hide_manip_overlays()
+            return
         if state == 0:  # Drag end
+            self.cursor_markers.visible = True
             # Update AtomicGraph atom positions from scene._pos
             atom_list, enames, apos, atypes, bonds, bond_list, ring_list = self.backend.graph.to_arrays()
             scene_pos = self.scene._pos
@@ -1056,15 +1199,18 @@ class SPAMMMWindow(BaseGUI):
             self.scene.update_positions(self.backend.sys.apos.astype(np.float32))
             # Refresh view to update bond visualization immediately
             self.refresh_view()
+            if self.scene._selected_ids:
+                self.scene._highlight_selected()
+                self.scene._update_selection_bbox()
             self.sig_geometry_changed.emit()
             debug_print(2, f"Drag end: synced {len(atom_list)} atom positions to graph and sys")
 
     def on_mouse_move(self, event):
         """Update cursor cross + dispatch to mode handler for hover highlighting."""
-        r0, rd = self.scene._ray_from_mouse(event.pos)
-        p_world = self.scene._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0,0,1]))
+        p_world, r0, rd = self._mouse_world_and_ray(event)
         if p_world is None: return
         self.cursor_markers.set_data(pos=np.array([p_world]), symbol='cross', edge_width=2, edge_color='red', face_color='transparent', size=10)
+        self.scene.update_view_debug(event.pos, hit=p_world)
         self.backend.detect_geometry_rings()
         self._clear_hover()
         h = self.mode_handlers.get(self.edit_mode)
@@ -1080,8 +1226,7 @@ class SPAMMMWindow(BaseGUI):
         h = self.mode_handlers.get(self.edit_mode)
         if h is None or h.on_release is None: return
         ctrl = 'Control' in event.modifiers if isinstance(event.modifiers, (tuple, list)) else False
-        r0, rd = self.scene._ray_from_mouse(event.pos)
-        p_world = self.scene._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0,0,1]))
+        p_world, r0, rd = self._mouse_world_and_ray(event)
         if p_world is None: return
         h.on_release(event, p_world, ctrl)
 
@@ -1099,6 +1244,8 @@ class SPAMMMWindow(BaseGUI):
 
     def on_link_to_pos(self, from_id, x, y):
         """Signal callback: Ctrl+drag to empty space — create new atom at (x,y) + bond to from_id."""
+        if self._planar_ops_blocked():
+            return
         debug_print(2, f"[ON_LINK_TO_POS] from={from_id} pos=({x:.2f},{y:.2f}) type={self.cur_atom_type}")
         self._push_undo()
         self.backend._append_atom(pos=[x, y, 0.0], ename=self.cur_atom_type, pin=None, parent=None, npi=self.backend._get_element_default_npi(self.cur_atom_type))
@@ -1131,10 +1278,9 @@ class SPAMMMWindow(BaseGUI):
         h = self.mode_handlers.get(self.edit_mode)
         if h is None or h.on_press is None: return
         ctrl = 'Control' in event.modifiers if isinstance(event.modifiers, (tuple, list)) else False
-        r0, rd = self.scene._ray_from_mouse(event.pos)
-        p_world = self.scene._intersect_ray_plane(r0, rd, np.zeros(3), np.array([0,0,1]))
+        p_world, r0, rd = self._mouse_world_and_ray(event)
         if p_world is None: return
-        debug_print(2, f"[GUI_PRESS] mode={self.edit_mode} pos=({p_world[0]:.2f},{p_world[1]:.2f}) ctrl={ctrl}")
+        debug_print(2, f"[GUI_PRESS] mode={self.edit_mode} b2D={self.b2Dview} pos=({p_world[0]:.2f},{p_world[1]:.2f},{p_world[2]:.2f}) ctrl={ctrl}")
         h.on_press(event, p_world, ctrl)
 
     def reset_offsets(self):
@@ -1163,15 +1309,22 @@ class SPAMMMWindow(BaseGUI):
             debug_print(2, f"Exported to {fname}")
 
     def import_structure(self):
-        """Import structure from .xyz, .mol, or .mol2 file."""
+        """Import structure from file and APPEND to current graph (same as Ctrl+V)."""
         fname = self.fileDialog(mode="open", title="Import Structure",
                                 filter_str="Molecular Files (*.xyz *.mol *.mol2);;XYZ (*.xyz);;MOL (*.mol);;MOL2 (*.mol2)",
                                 start_dir=self.work_dir)
-        if fname:
-            self.backend.load_structure(fname)
-            self.refresh_view()
-            self.statusBar().showMessage(f"Imported from {fname}")
-            debug_print(2, f"Imported from {fname}")
+        if not fname:
+            return
+        # Load into a temp backend so we do not replace the current molecule
+        from spammm.topology.MoleculeEditorBackend import MoleculeEditorBackend
+        tmp = MoleculeEditorBackend()
+        tmp.load_structure(fname)
+        packed = PackedMolecule.from_graph(tmp.graph)
+        if packed is None or len(packed.etype) == 0:
+            self.statusBar().showMessage(f"Import failed / empty: {fname}")
+            return
+        self._insert_packed(packed, status_fmt=f"Imported {{n}} atoms from {fname} — sticky δ-move; LMB to drop")
+        debug_print(2, f"Imported append from {fname} n={len(packed.etype)}")
 
     def adjust_h(self):
         """Manually trigger H passivation."""
@@ -1341,6 +1494,9 @@ class SPAMMMWindow(BaseGUI):
             self.scene.hbond_lines.set_data(np.zeros((0, 3), dtype=np.float32))
 
         # Fragment extension: bond + bbox highlights via dedicated visuals
+        # Update atom markers FIRST — set_frag_highlights/_redraw must not run on stale _pos/_colors
+        self.scene.set_data(pos, colors=colors, sizes=sizes, bonds=bonds_arg)
+
         frag_data = getattr(self, '_frag_overlay', None)
         if frag_data:
             self.scene.set_frag_highlights(**frag_data)
@@ -1353,9 +1509,6 @@ class SPAMMMWindow(BaseGUI):
             self.scene.set_bond_orders(bo_bonds, bo_vals, show_labels=self.show_bond_order_labels)
         else:
             self.scene.set_bond_orders(None, None)
-
-        # Update atom markers
-        self.scene.set_data(pos, colors=colors, sizes=sizes, bonds=bonds_arg)
 
         # Labels based on label_mode
         lbl_pos, lbl_texts = generate_atom_labels(self.label_mode, pos, sys.enames, self.backend.atom_npi, self.backend, bonds_heavy)
@@ -1390,8 +1543,9 @@ if __name__ == "__main__":
     window.show()
     QtWidgets.QApplication.processEvents()
     if args.mol:
-        window.backend.load_structure(args.mol)
+        atom_ids = window.backend.load_structure(args.mol)
         window.refresh_view()
+        window._enter_select_manip(atom_ids, status=f"Loaded {args.mol} — sticky δ-move on; LMB click to drop")
         debug_print(2, f"Loaded molecule from CLI: {args.mol}")
         QtWidgets.QApplication.processEvents()
     if args.script:

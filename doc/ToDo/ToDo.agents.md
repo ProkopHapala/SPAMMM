@@ -103,7 +103,8 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
 - [ ] Phonon / FTIR / Hessian
 - [ ] FMM long-range electrostatics
 - [ ] Editor menu simplification + shortcuts
-- [ ] 3D viewer; topology independent of hex grid
+- [x] 3D editor view mode (`b2Dview` / Enter; ortho; Ring atom/bond/COG; hex 2D-only) — task `doc/Tasks/GUI_Editor_3D_ViewMode.md`
+- [ ] Topology fully independent of hex grid (hex is guideline only; atoms off-grid already OK)
 - [ ] SMILES builder (corner ring pentagon/heptagon drawing implemented)
 - [ ] Molecular browser + AFM thumbnails
 - [ ] Interactive MD drag constrained to mouse ray

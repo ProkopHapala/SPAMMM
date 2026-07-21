@@ -22,7 +22,7 @@
 
 - ASCII-art molecule builder, as well as smiles
 
-- move to 3D viewwe
+- [x] 3D view (ortho in `SPAMMM_GUI`: Enter toggles `b2Dview`; RMB empty = rotate; Ring mode ray pick) — see `doc/Tasks/GUI_Editor_3D_ViewMode.md`
 
 - Molecular Browser with thumbnails (also with AFM images)
 

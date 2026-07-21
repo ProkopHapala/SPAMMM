@@ -11,11 +11,33 @@
 
 | Key | Action |
 |-----|--------|
+| `Enter` | Toggle **2D / 3D** view (`b2Dview`) |
+| `Space` | Toggle interactive FF run/stop (if FF panel loaded) |
 | `Ctrl+Z` | Undo |
 | `Ctrl+C` | Copy selected atoms (Select mode) |
 | `Ctrl+V` | Paste atoms from clipboard |
 | `Delete` | Delete selected atoms (Select mode) |
 | `Scroll` | Zoom |
+| `Arrows` | **2D:** pan · **3D:** rotate view |
+| `Shift+Arrows` | Pan (both modes) |
+| `RMB` drag (empty) | **3D only:** rotate view (lowest priority — not on atom/bond) |
+| `5` / `KP_5` | Top view (XY) — default |
+| `2` / `8` / `4` / `6` / `0` | Front / Back / Left / Right / Bottom (3D only) |
+
+### 2D vs 3D view
+
+| | **2D** (default, `b2Dview`) | **3D** (ortho) |
+|--|----------------------------|----------------|
+| Toggle | `Enter` or *Editors → 2D view* checkbox | same |
+| Camera | Locked Top (el=90) | Free; `RMB`-drag empty / arrows rotate; Shift+arrows pan |
+| Depth test | Off | On |
+| Atom / bond pick & drag | ✓ | ✓ (ray pick) |
+| Ring mode (bond / corner / COG) | ✓ | ✓ (closest of atom/bond/ring-COG along ray; side = ray∩z=0) |
+| Hex grid add/remove | ✓ | **disabled** |
+| Empty-space add atom / Ctrl+link to empty | ✓ | **disabled** |
+| Debug | *Ray debug* checkbox draws mouse ray + hit | same |
+
+Presets (`5` Top, `2` Front, `8` Back, `4`/`6` Left/Right, `0` Bottom) apply in 3D; in 2D only Top (`5`) snaps.
 
 ## Edit Modes (dropdown in left panel)
 
@@ -60,16 +82,18 @@ Add fused n-gon rings. **Numpad +/-** changes ring size (3–12).
 |--------|--------|
 | LMB on **bond** | Add edge ring (shares 1 bond) |
 | LMB on **inner corner atom** (angle < 180°) | Add corner ring (shares 2 bonds) |
-| LMB on **hex grid center** | Add hexagonal ring on grid |
-| RMB on **existing ring** (hover shows yellow highlight) | Delete all atoms in that ring |
+| LMB on **hex grid center** | Add hexagonal ring on grid (**2D only**) |
+| RMB on **existing ring** (hover shows yellow highlight / COG) | Delete all atoms in that ring |
 | RMB on **bond** | Delete bond |
 | RMB on **atom** | Delete single atom (Ctrl+RMB: bridge neighbors) |
 | Numpad `+` / `=` | Increase ring size |
 | Numpad `-` / `_` | Decrease ring size |
 
-Ring placement priority (LMB): bond → corner atom → hex center.
-Ring deletion priority (RMB): existing ring → bond → atom.
-Outer corners (>180°) are ignored — falls through to hex/edge.
+**3D Ring hover/click:** closest of bond midpoint / atom / ring-COG along the mouse ray (so corners stay pickable). Ring side & corner geometry use ray ∩ z=0 (XY plane). Hex branch is 2D-only.
+
+Ring placement priority (LMB, 2D): bond → corner atom → hex center.  
+Ring deletion priority (RMB): bond/atom if nearer, else existing ring COG.  
+Outer corners (>180°) are ignored — falls through to hex/edge in 2D.  
 Debug View toggle shows all detected rings (yellow COG crosses + bounding circles).
 
 ### Pi
@@ -99,16 +123,24 @@ Add/remove preserving shared edges.
 | RMB on hex center | Remove hex ring (preserve shared) |
 
 ### Select
-Selection and copy/paste.
+Selection with sticky δ/φ transform handles.
 
 | Action | Effect |
 |--------|--------|
-| LMB | Select/deselect atom |
-| RMB drag | Box select |
-| `Delete` | Remove selected |
-| `Ctrl+C` | Copy selected to clipboard |
-| `Ctrl+V` | Paste from clipboard |
-| LMB drag selected | Move selected group |
+| LMB on atom | **Add** to selection |
+| RMB on atom | **Remove** from selection |
+| LMB-drag empty | Box-**add** |
+| RMB-drag empty | Box-**remove** |
+| Selection bbox | Drawn around selected atoms |
+| **δ** corner (bottom-left) | Toggle sticky **translate** (click again / elsewhere to drop) |
+| **φ** corner (top-right) | Toggle sticky **rotate** about selection COM |
+| Sticky move/rotate | Mouse moves selection with **no button hold**; LMB click commits |
+| `Ctrl+C` | Copy selected |
+| `Ctrl+V` | Paste at cursor → Select mode + sticky **δ-move** on |
+| Import / `--mol` | **Append** like Ctrl+V → Select + sticky δ-move (`--mol` on empty startup loads normally) |
+| `Delete` | Delete selected atoms |
+
+No Shift/Ctrl needed for add/remove — δ and φ are separate toggles.
 
 ## Grid Controls (left panel)
 

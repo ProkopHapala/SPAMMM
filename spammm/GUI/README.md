@@ -16,9 +16,11 @@ PyQt5 GUI for molecular editing and AFM simulation. Main window combines VisPy 3
 - **SPAMMM_GUI.py** — Main window; `--script` / `-s` runs control scripts after show (see `gui_script_runner.py`)
 - **BaseGUI.py** — Reusable PyQt5 widget helpers
 - **ExtensionManager.py** — Lazy-loading extensions (AFM, FF, QEq, Vibrations, Kekule, ASCII, **reaction_coord**, …)
-- **VispyUtils.py** — VisPy 3D scene (`AtomScene`), bond-length / Δlength coloring
-- **EditModeHandlers.py** — Per-mode mouse dispatch (incl. `rc_pin` spatial constraints)
+- **VispyUtils.py** — VisPy ortho scene (`AtomScene`): atoms/bonds, picking, drag, camera presets, **2D/3D view** (`lock_top` / depth test / RMB orbit)
+- **EditModeHandlers.py** — Per-mode mouse dispatch; Ring mode 3D ray pick (atom/bond/COG)
 - **plotutils.py** — Qt 2D plot dialog; re-exports `spammm.plotUtils` grid/ESP helpers
+
+**View mode:** default top-down planar edit (`b2Dview=True`). `Enter` toggles ortho 3D (hex/empty disabled; Ring/atom/bond OK). See `doc/GUI_CHEATSHEET.md`, `doc/Tasks/GUI_Editor_3D_ViewMode.md`.
 - **mpl_blit.py** — Fast matplotlib updates via blit on embedded Qt canvas; caveats in `doc/Takeways.md`
 
 ## Extensions

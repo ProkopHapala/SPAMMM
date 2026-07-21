@@ -47,6 +47,28 @@ def scan_extent(scan_xs, scan_ys):
     return [float(scan_xs[0]), float(scan_xs[-1]), float(scan_ys[0]), float(scan_ys[-1])]
 
 
+def crop_afm_xy(data, scan_xs, scan_ys, view_extent):
+    """Crop (nx,ny[,nz]) AFM volume + axes to [xmin,xmax,ymin,ymax] for fair side-by-side compare.
+
+    Returns (data_c, xs_c, ys_c, extent_c). If view_extent is None, returns inputs unchanged.
+    """
+    if view_extent is None:
+        return np.asarray(data), np.asarray(scan_xs), np.asarray(scan_ys), scan_extent(scan_xs, scan_ys)
+    xmin, xmax, ymin, ymax = [float(v) for v in view_extent]
+    xs = np.asarray(scan_xs, float)
+    ys = np.asarray(scan_ys, float)
+    ix0 = int(np.searchsorted(xs, xmin, side='left'))
+    ix1 = int(np.searchsorted(xs, xmax, side='right'))
+    iy0 = int(np.searchsorted(ys, ymin, side='left'))
+    iy1 = int(np.searchsorted(ys, ymax, side='right'))
+    ix0 = max(0, min(ix0, len(xs) - 1)); ix1 = max(ix0 + 1, min(ix1, len(xs)))
+    iy0 = max(0, min(iy0, len(ys) - 1)); iy1 = max(iy0 + 1, min(iy1, len(ys)))
+    d = np.asarray(data)
+    d = d[ix0:ix1, iy0:iy1, ...] if d.ndim >= 2 else d
+    xs_c, ys_c = xs[ix0:ix1], ys[iy0:iy1]
+    return d, xs_c, ys_c, scan_extent(xs_c, ys_c)
+
+
 def imshow_afm(ax, arr_nxny, extent=None, cmap='bwr', symmetric=True, pct=99, title='', colorbar=True, transpose=True):
     """SSOT: one AFM XY map. `arr_nxny` is (nx,ny) scan layout; transposed for imshow by default.
 
@@ -104,12 +126,14 @@ def plot_afm_df_Fz_tworow(
     df_relax, Fz_unrelax, heights_tip, heights_probe, extent=None, *,
     title=None, bond_length=None, cmap_df='gray', cmap_Fz='seismic',
     figsize_col=2.0, dpi=140, fname=None, save_dir='.', apos=None, Fz_relax=None,
+    scan_xs=None, scan_ys=None, view_extent=None,
 ):
-    """Backward-compat wrapper → `plot_afm_Fz_df_threerow` (omit Fz_relax for 2-row)."""
+    """ Backward-compat wrapper → `plot_afm_Fz_df_threerow` (omit Fz_relax for 2-row)."""
     return plot_afm_Fz_df_threerow(
         Fz_unrelax, Fz_relax, df_relax, heights_tip, heights_probe, extent=extent,
         title=title, bond_length=bond_length, cmap_df=cmap_df, cmap_Fz=cmap_Fz,
         figsize_col=figsize_col, dpi=dpi, fname=fname, save_dir=save_dir, apos=apos,
+        scan_xs=scan_xs, scan_ys=scan_ys, view_extent=view_extent,
     )
 
 
@@ -117,6 +141,7 @@ def plot_afm_Fz_df_threerow(
     Fz_unrelax, Fz_relax, df_relax, heights_tip, heights_probe, extent=None, *,
     title=None, bond_length=None, amp=None, cmap_df='gray', cmap_Fz='seismic',
     figsize_col=1.85, dpi=140, fname=None, save_dir='.', apos=None,
+    scan_xs=None, scan_ys=None, view_extent=None,
 ):
     """SSOT: up to 3×nz panel — Fz_unrelax / Fz_relax / df at probe plane.
 
@@ -124,16 +149,33 @@ def plot_afm_Fz_df_threerow(
     All maps at the **probe** plane. Pass `Fz_relax=None` to skip the middle row (2-row mode).
 
     Row order (top→bottom): Fz unrelax (GridFF) · Fz relax (PP OutFz) · df (amp-averaged).
+
+    Compare consistency:
+      - `view_extent=[xmin,xmax,ymin,ymax]` crops all rows to the same XY window (use FDBM
+        extent when overlaying Kriging). Prefer over mismatched full GridFF boxes.
+      - `apos` must be **atoms** (natoms×2/3), never Kriging `points_clean` sample sites.
     """
-    nz = int(Fz_unrelax.shape[2])
+    Fu, Fr, df = Fz_unrelax, Fz_relax, df_relax
+    if view_extent is not None:
+        if scan_xs is None or scan_ys is None:
+            raise ValueError('plot_afm_Fz_df_threerow: view_extent requires scan_xs and scan_ys')
+        Fu, xs_c, ys_c, extent = crop_afm_xy(Fu, scan_xs, scan_ys, view_extent)
+        if Fr is not None:
+            Fr, _, _, _ = crop_afm_xy(Fr, scan_xs, scan_ys, view_extent)
+        if df is not None:
+            df, _, _, _ = crop_afm_xy(df, scan_xs, scan_ys, view_extent)
+    elif extent is None and scan_xs is not None and scan_ys is not None:
+        extent = scan_extent(scan_xs, scan_ys)
+
+    nz = int(Fu.shape[2])
     assert len(heights_tip) == nz and len(heights_probe) == nz
-    rows = [('Fz unrelax', Fz_unrelax, cmap_Fz)]
-    if Fz_relax is not None:
-        assert Fz_relax.shape[2] == nz
-        rows.append(('Fz relax', Fz_relax, cmap_Fz))
-    if df_relax is not None:
-        assert df_relax.shape[2] == nz
-        rows.append(('df relax', df_relax, cmap_df))
+    rows = [('Fz unrelax', Fu, cmap_Fz)]
+    if Fr is not None:
+        assert Fr.shape[2] == nz
+        rows.append(('Fz relax', Fr, cmap_Fz))
+    if df is not None:
+        assert df.shape[2] == nz
+        rows.append(('df relax', df, cmap_df))
     nrows = len(rows)
     fig, axes = plt.subplots(nrows, nz, figsize=(figsize_col * nz, 2.15 * nrows), squeeze=False)
     Lnote = f'  L={float(bond_length):.2f}Å' if bond_length is not None else ''
@@ -149,7 +191,10 @@ def plot_afm_Fz_df_threerow(
                        title=(f'tip={ht:.1f}  probe={hp:.1f}' if row == 0 else ''),
                        transpose=True)
             if apos is not None:
-                ax.plot(apos[:, 0], apos[:, 1], 'c.', ms=1.2, alpha=0.55)
+                ax.plot(np.asarray(apos)[:, 0], np.asarray(apos)[:, 1], 'c.', ms=1.2, alpha=0.55)
+            if view_extent is not None:
+                ax.set_xlim(float(view_extent[0]), float(view_extent[1]))
+                ax.set_ylim(float(view_extent[2]), float(view_extent[3]))
             ax.set_xticks([]); ax.set_yticks([])
             if i == 0:
                 ax.set_ylabel(ylab, fontsize=8)
@@ -279,18 +324,21 @@ def afm_tip_probe_heights(tip_min, tip_max, tip_step, bond_length):
     return tip, tip - L
 
 
-def sample_field_z_profile(F, origin, step, xy, zs, zref=None):
-    """Nearest-grid sample of 3D field along z at fixed XY; optional subtract F(zref)."""
-    F = np.asarray(F)
+def sample_field_z_profile(F, origin, step, xy, zs, zref=None, order=1):
+    """Sample 3D field along z at fixed XY; optional subtract F(zref).
+
+    order=1 (default): trilinear via map_coordinates — smooth curves for plots.
+    order=0: nearest voxel (stair-steps; avoid for diagnostics).
+    """
+    from scipy.ndimage import map_coordinates
+    F = np.asarray(F, float)
     o = np.asarray(origin, float).ravel()[:3]
     s = float(np.asarray(step).reshape(-1)[0])
-    nx, ny, nz = F.shape
     zs = np.asarray(zs, float)
-    out = np.empty(len(zs), float)
-    for i, z in enumerate(zs):
-        ijk = np.round([(xy[0] - o[0]) / s, (xy[1] - o[1]) / s, (z - o[2]) / s]).astype(int)
-        ijk = np.clip(ijk, [0, 0, 0], [nx - 1, ny - 1, nz - 1])
-        out[i] = float(F[tuple(ijk)])
+    fx = np.full(len(zs), (xy[0] - o[0]) / s)
+    fy = np.full(len(zs), (xy[1] - o[1]) / s)
+    fz = (zs - o[2]) / s
+    out = map_coordinates(F, np.vstack([fx, fy, fz]), order=int(order), mode='nearest')
     if zref is not None:
         out = out - out[np.argmin(np.abs(zs - float(zref)))]
     return out
@@ -300,6 +348,65 @@ def _shade_zwell(ax, ylim, z0=2.5, z1=None):
     if z1 is None:
         z1 = ax.get_xlim()[1]
     ax.fill_betweenx([-ylim, ylim], z0, z1, color='yellow', alpha=0.08)
+
+
+def plot_fdbm_rho_E_sites(
+    sites, rho_curves, E_curves, *, mol_z=0.0,
+    z_rho=(-2.0, 2.0), z_E=(1.0, 6.0), zref_E=6.0, z_well=2.5,
+    ylim_E=0.2, n_z=321, title=None, figsize=None, fname=None, save_dir='.', dpi=140,
+):
+    """Two-row ρ + E z-profiles for a short probe-site list (default: N and para-H).
+
+    rho_curves / E_curves: list of (label, field, origin, step, style_dict).
+    style_dict keys go to Axes.plot (color, ls, lw, alpha, …).
+    E curves are zeroed at mol_z+zref_E. Yellow band on E: z ≥ mol_z+z_well.
+    ρ z-axis: [mol_z+z_rho[0], mol_z+z_rho[1]]; E: [mol_z+z_E[0], mol_z+z_E[1]].
+    """
+    sites = normalize_probe_sites(sites)
+    n = len(sites)
+    if figsize is None:
+        figsize = (max(7.5, 3.6 * n), 7.0)
+    zs_r = np.linspace(mol_z + float(z_rho[0]), mol_z + float(z_rho[1]), int(n_z))
+    zs_e = np.linspace(mol_z + float(z_E[0]), mol_z + float(z_E[1]), int(n_z))
+    zref = mol_z + float(zref_E)
+    fig, axes = plt.subplots(2, n, figsize=figsize, sharex='row', squeeze=False)
+    if title:
+        fig.suptitle(title, fontsize=10)
+    for ic, (name, xy, _col) in enumerate(sites):
+        ax = axes[0, ic]
+        for lab, F, origin, step, sty in rho_curves:
+            ax.plot(zs_r, sample_field_z_profile(F, origin, step, xy, zs_r),
+                    label=lab, **(sty or {}))
+        ax.axhline(0, color='k', lw=0.4)
+        ax.axvline(mol_z, color='gray', ls=':', lw=0.8)
+        ax.set_title(f'{name}  xy=({xy[0]:+.2f},{xy[1]:+.2f})', fontsize=9)
+        ax.set_xlim(zs_r[0], zs_r[-1])
+        if ic == 0:
+            ax.set_ylabel('ρ [e/Å³]', fontsize=8)
+            ax.legend(fontsize=6, loc='best')
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[1, ic]
+        for lab, F, origin, step, sty in E_curves:
+            ax.plot(zs_e, sample_field_z_profile(F, origin, step, xy, zs_e, zref=zref),
+                    label=lab, **(sty or {}))
+        ax.axhline(0, color='k', lw=0.4)
+        ax.axvspan(mol_z + float(z_well), zs_e[-1], color='yellow', alpha=0.08)
+        ax.set_ylim(-float(ylim_E), float(ylim_E))
+        ax.set_xlim(zs_e[0], zs_e[-1])
+        ax.set_xlabel('z [Å]')
+        if ic == 0:
+            ax.set_ylabel(f'E−E(+{float(zref_E):.0f}) [eV] (±{ylim_E})', fontsize=8)
+            ax.legend(fontsize=6, loc='best', ncol=2)
+        ax.grid(True, alpha=0.3)
+    fig.tight_layout(rect=[0, 0.02, 1, 0.94 if title else 0.98])
+    if fname:
+        import os
+        path = fname if os.path.isabs(fname) else os.path.join(save_dir, fname)
+        fig.savefig(path, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+        return path
+    return fig
 
 
 def plot_fdbm_vs_kriging_zlayout(
@@ -756,9 +863,10 @@ Hamiltonian = DFTB {{
 
     return {'rho_scf': rho_scf, 'rho_na': rho_na, 'rho_diff': rho_diff, 'V_ES': V_ES,
             'origin': origin, 'ngrid': ngrid, 'grid_spec': grid_spec,
-            'eigvecs': eigvecs, 'eigvals': eigvals,
+            'eigvecs': eigvecs, 'eigvals': eigvals, 'dm': dm_dense,
             'norb_per_atom': norb_per_atom, 'orb_offsets': orb_offsets, 'atoms_dict': atoms_dict,
-            'projector': projector}
+            'projector': projector, 'basis_ang': basis_ang, 'dftb_data': dftb_data,
+            'enames': enames, 'basis_hsd_path': basis_hsd_path}
 
 
 # Cache for atomic density matrices (neutral atom density computation)
@@ -967,17 +1075,8 @@ BOHR_TO_ANG = 0.529177249
 ANG_TO_BOHR = 1.0 / BOHR_TO_ANG
 
 
-def soft_clamp_density(rho, rho_max):
-    """Smooth clamp: ρ_c = ρ_max * tanh(ρ/ρ_max). C¹, no hard cutoff (avoids FFT ringing).
-
-    Asymptotically ρ_c → ρ_max; for ρ ≪ ρ_max, ρ_c ≈ ρ.
-    """
-    rho = np.asarray(rho, dtype=np.float64)
-    rho_max = float(rho_max)
-    if rho_max <= 0:
-        raise ValueError(f'soft_clamp_density: rho_max must be > 0, got {rho_max}')
-    return (rho_max * np.tanh(rho / rho_max)).astype(np.float32)
-
+# soft_clamp_density (tanh clamp) removed 2026-07-21 — only served deleted prepare_delta_rho_clamped.
+# All-electron clamp SSOT: soft_clamp_rational → delta_rho_clamp_compact_na.
 
 def soft_clamp_rational(y, y1, y2, dy=None):
     """Rational soft clamp (USER SSOT): above y1, approach y2 via 1/(1+z).
@@ -1097,79 +1196,10 @@ def delta_rho_clamp_compact_na(rho_scf, origin, step, atomPos, atomZ, *,
     }
 
 
-def prepare_delta_rho_clamped(rho_scf, rho_na, origin, step, atomPos, atomZ,
-                              rho_max=None, percentile=99.5, dV=None):
-    """Build ES-safe Δρ by soft-clamping nuclear spikes in ρ_scf — without double-counting.
-
-    Physics / algebra
-    -----------------
-    Raw Δρ = ρ_scf − ρ_NA has huge positive cores because Gaussian ρ_NA is much
-    smoother than the nuclear cusp. Those spikes are *core mismatch*, not valence
-    rearrangement relevant to AFM.
-
-    Naive "clamp SCF and add the removed charge to NA" **double-counts**:
-        ρ_c = clamp(ρ_scf),  Q_ex = ∫(ρ_scf−ρ_c)
-        Δρ ≟ ρ_c − (ρ_NA + Q_ex·g)  ⇒  ∫Δρ = ∫(ρ_scf−ρ_NA) − 2 Q_ex   ← wrong
-
-    Correct charge-conserving recipe used here:
-        1. ρ_c = soft_clamp(ρ_scf; ρ_max)          # smooth, C¹
-        2. Q_ex = ∫(ρ_scf − ρ_c) dV ≥ 0           # spike charge removed from grid
-        3. ρ_NA' = ρ_NA * (∫ρ_c / ∫ρ_NA)          # match NA to *clamped* total
-        4. Δρ = ρ_c − ρ_NA'                       # ⇒ ∫Δρ = 0 by construction
-
-    Interpretation: spike charge Q_ex is absorbed into unresolved nuclear/core
-    (not represented on the Δρ grid). Valence multipoles in Δρ are unchanged at
-    leading order; only the pathological nuclear cusps are removed.
-
-    Alternative (not implemented here): soft mask cores
-        Δρ = (ρ_scf−ρ_NA)·(1−m(r)) then monopole-strip — also valid.
-
-    Args:
-        rho_scf, rho_na: (nx,ny,nz) densities [e/Å³]
-        origin, step: grid
-        atomPos, atomZ: unused now (kept for Voronoi/per-atom extension)
-        rho_max: clamp scale [e/Å³]; default = percentile of ρ_scf
-        percentile: used if rho_max is None (default 99.5 → keeps valence, clips cores)
-        dV: voxel volume; default step³
-
-    Returns:
-        dict with rho_scf_clamped, rho_na_matched, rho_diff, rho_max, Q_excess, …
-    """
-    rho_scf = np.asarray(rho_scf, dtype=np.float64)
-    rho_na = np.asarray(rho_na, dtype=np.float64)
-    if np.ndim(step) == 0:
-        dV = float(step) ** 3 if dV is None else float(dV)
-    else:
-        dV = float(np.prod(step[:3])) if dV is None else float(dV)
-
-    if rho_max is None:
-        # percentile of positive density — cores sit in the extreme tail
-        pos = rho_scf[rho_scf > 0]
-        rho_max = float(np.percentile(pos, percentile)) if pos.size else 1.0
-
-    rho_c = soft_clamp_density(rho_scf, rho_max).astype(np.float64)
-    Q_scf = float(rho_scf.sum() * dV)
-    Q_c = float(rho_c.sum() * dV)
-    Q_ex = Q_scf - Q_c
-    Q_na = float(rho_na.sum() * dV)
-    if abs(Q_na) < 1e-30:
-        raise ValueError('prepare_delta_rho_clamped: ∫ρ_NA ≈ 0')
-    rho_na_m = rho_na * (Q_c / Q_na)
-    rho_diff = (rho_c - rho_na_m).astype(np.float32)
-    Q_diff = float(rho_diff.sum() * dV)
-
-    return {
-        'rho_scf_clamped': rho_c.astype(np.float32),
-        'rho_na_matched': rho_na_m.astype(np.float32),
-        'rho_diff': rho_diff,
-        'rho_max': float(rho_max),
-        'Q_scf': Q_scf,
-        'Q_clamped': Q_c,
-        'Q_excess': Q_ex,
-        'Q_na_matched': float(rho_na_m.sum() * dV),
-        'Q_diff': Q_diff,
-        'percentile': float(percentile),
-    }
+# REMOVED 2026-07-21: prepare_delta_rho_clamped (rescale cube ρ_NA to clamped ρ).
+# That recipe inverted V_ES morphology vs USER SSOT delta_rho_clamp_compact_na
+# (soft-clamp → rebuild compact NA from Z−Q_rem). Do not reintroduce.
+# All-electron Δρ SSOT: delta_rho_clamp_compact_na
 
 
 def make_gaussian_rho_na(atomPos, atomZ, origin, step, ngrid, sigma=0.3, rescale_to_q=None):
@@ -1618,7 +1648,7 @@ def build_fdbm_grid_from_cubes(sample_cube_dir, tip_cube_dir, *, step=0.1, margi
     """Build FDBM F_total on a tall AFM grid from sample+tip Dt cubes.
 
     Pipeline (dipole-safe):
-      1. Soft-clamp nuclear cusps in ρ_scf; match ρ_NA to ∫ρ_c → Δρ with ∫≈0, no core spikes
+      1. All-electron Δρ SSOT: delta_rho_clamp_compact_na (soft-clamp → rebuild compact NA)
       2. GPU *project* (trilinear scatter) onto dest grid — preserves charge + dipole
          (not scipy sample, which breaks ∫Δρ)
       3. z-box **symmetric** about the molecular plane by default (avoids fake pz from
@@ -1651,31 +1681,30 @@ def build_fdbm_grid_from_cubes(sample_cube_dir, tip_cube_dir, *, step=0.1, margi
     if apex_Z is None:
         apex_Z = int(d_t['atomZ'][np.argmax(d_t['atomZ'])])
 
-    # ── Sample Δρ: clamp cores on native cube (Pauli still uses full ρ_scf) ────
+    # ── Sample Δρ: USER SSOT clamp→compact NA (Pauli still uses full ρ_scf) ────
     if clamp_cores:
-        clamp_s = prepare_delta_rho_clamped(
-            d_s['rho_scf'], d_s['rho_na'], d_s['origin'], d_s['step'],
-            d_s['atomPos'], d_s['atomZ'], rho_max=clamp_rho_max, percentile=clamp_percentile)
+        clamp_s = delta_rho_clamp_compact_na(
+            d_s['rho_scf'], d_s['origin'], d_s['step'], d_s['atomPos'], d_s['atomZ'],
+            rc_na=float(rc_na), profile='r2')
         rho_diff_src = clamp_s['rho_diff']
         if verbosity >= 0:
-            print(f"  [fdbm-cube] sample core-clamp ρ_max={clamp_s['rho_max']:.3f} "
-                  f"Q_ex={clamp_s['Q_excess']:.3f}e  ∫Δρ={clamp_s['Q_diff']:.3e}")
+            print(f"  [fdbm-cube] sample Δρ=clamp→compact_NA  Q_scf={clamp_s['Q_scf']:.3f} "
+                  f"Q_c={clamp_s['Q_clamped']:.3f} ∫Δρ={clamp_s['Q_diff']:.3e}")
     else:
         rho_diff_src = d_s['rho_diff']
         clamp_s = None
 
-    # ── Tip: apex-down geometry, then clamp Δρ in that frame ───────────────────
+    # ── Tip: apex-down, then same Δρ SSOT (do NOT rescale cube ρ_NA) ───────────
     tip_rho, tip_apos, tip_origin, tip_reoriented = tip_density_apex_down(
         d_t['rho_scf'], d_t['atomPos'], d_t['atomZ'], apex_Z, d_t['origin'], d_t['step'])
-    tip_na_a, _, _, _ = tip_density_apex_down(
-        d_t['rho_na'], d_t['atomPos'], d_t['atomZ'], apex_Z, d_t['origin'], d_t['step'])
     if clamp_cores:
-        clamp_t = prepare_delta_rho_clamped(
-            tip_rho, tip_na_a, tip_origin, d_t['step'], tip_apos, d_t['atomZ'],
-            rho_max=clamp_rho_max, percentile=clamp_percentile)
+        clamp_t = delta_rho_clamp_compact_na(
+            tip_rho, tip_origin, d_t['step'], tip_apos, d_t['atomZ'],
+            rc_na=float(rc_na), profile='r2')
         tip_diff = clamp_t['rho_diff']
         if verbosity >= 0:
-            print(f"  [fdbm-cube] tip core-clamp Q_ex={clamp_t['Q_excess']:.3f}e  ∫Δρ={clamp_t['Q_diff']:.3e}")
+            print(f"  [fdbm-cube] tip Δρ=clamp→compact_NA  Q_scf={clamp_t['Q_scf']:.3f} "
+                  f"Q_c={clamp_t['Q_clamped']:.3f} ∫Δρ={clamp_t['Q_diff']:.3e}")
     else:
         tip_diff, _, _, _ = tip_density_apex_down(
             d_t['rho_diff'], d_t['atomPos'], d_t['atomZ'], apex_Z, d_t['origin'], d_t['step'])
@@ -1723,8 +1752,7 @@ def build_fdbm_grid_from_cubes(sample_cube_dir, tip_cube_dir, *, step=0.1, margi
     tip_tot, grids = _to_dest(tip_rho, tip_origin, d_t['step'], grids)
     tip_del, grids = _to_dest(tip_diff, tip_origin, d_t['step'], grids)
 
-    tip_tot = _pad_and_roll_co_tip(tip_tot, (nx, ny, nz))
-    tip_del = _pad_and_roll_co_tip(tip_del, (nx, ny, nz))
+    tip_tot, tip_del = _pad_and_roll_co_tip_pair(tip_tot, tip_del, (nx, ny, nz))
 
     q_scf = float(rho_scf.sum() * dV)
     q_diff = float(rho_diff.sum() * dV)
@@ -3295,23 +3323,39 @@ def _pad_and_roll_co_tip(co_rho, target_shape):
     FFT convolution convention: tip origin (O atom) must sit at array index (0,0,0).
     Finds the actual density peak after centering (robust to odd/even ngrid), then rolls.
     """
+    tip_tot, _ = _pad_and_roll_co_tip_pair(co_rho, None, target_shape)
+    return tip_tot
+
+
+def _pad_and_roll_co_tip_pair(tip_tot, tip_del, target_shape):
+    """Pad+roll tip_tot (and tip_del) so tip_tot peak → (0,0,0); **same** shift for both.
+
+    Never roll tip_del on its own |Δρ| peak — that misaligns ES vs Pauli (diagnosed 2026-07-21).
+    tip_del=None → only tip_tot returned as (tot, None).
+    """
     nx_t, ny_t, nz_t = target_shape
-    nx_c, ny_c, nz_c = co_rho.shape
 
-    # Center CO block in target grid
-    ox = (nx_t - nx_c) // 2
-    oy = (ny_t - ny_c) // 2
-    oz = (nz_t - nz_c) // 2
+    def _pad(src):
+        if src is None:
+            return None
+        src = np.asarray(src, dtype=np.float32)
+        nx_c, ny_c, nz_c = src.shape
+        ox = (nx_t - nx_c) // 2
+        oy = (ny_t - ny_c) // 2
+        oz = (nz_t - nz_c) // 2
+        padded = np.zeros(target_shape, dtype=np.float32)
+        padded[ox:ox + nx_c, oy:oy + ny_c, oz:oz + nz_c] = src
+        return padded
 
-    padded = np.zeros(target_shape, dtype=np.float32)
-    padded[ox:ox+nx_c, oy:oy+ny_c, oz:oz+nz_c] = co_rho
-
-    # Roll actual peak (O) to index (0,0,0) — not assumed n//2
-    peak = np.unravel_index(int(np.argmax(np.abs(padded))), padded.shape)
+    tot = _pad(tip_tot)
+    dele = _pad(tip_del)
+    peak = np.unravel_index(int(np.argmax(np.abs(tot))), tot.shape)
     for ax, p in enumerate(peak):
         if p != 0:
-            padded = np.roll(padded, -int(p), axis=ax)
-    return padded
+            tot = np.roll(tot, -int(p), axis=ax)
+            if dele is not None:
+                dele = np.roll(dele, -int(p), axis=ax)
+    return tot, dele
 
 
 def get_tip_densities(tip_mode, target_shape, step, margin=4.0, sigma=0.7,
@@ -3774,7 +3818,15 @@ def plot_diagnostic_slices(E_pauli, E_es, E_vdw, origin, step, heights, output_d
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _fit_pauli_powerlaw(z, overlap_raw, e_ref, z_min=2.0, z_max=3.5):
-    """Fit Pauli power-law model: E_ref(z) = A * overlap(z)^beta."""
+    """Contact-wall Pauli fit (original / default): E_ref(z) ≈ A * overlap(z)^beta.
+
+    Keeps only points with overlap>0 and E_ref>0 in [z_min, z_max] (typically
+    ~1.5–2.0 or 2.0–3.0 Å where Pauli dominates and ES/vdW are assumed small).
+    Seed: log-linear; refine: scipy curve_fit OLS on those positive points.
+
+    For AFM-range residual fit (Kriging−ES−vdW, signed, z~[2.5,5]) use
+    `_fit_pauli_powerlaw_residual` instead — do not change this function.
+    """
     from scipy.optimize import curve_fit
 
     z = np.asarray(z, dtype=np.float64)
@@ -3810,6 +3862,49 @@ def _fit_pauli_powerlaw(z, overlap_raw, e_ref, z_min=2.0, z_max=3.5):
         ss_res = np.sum((e_pos - e_pred)**2)
         ss_tot = np.sum((e_pos - np.mean(e_pos))**2)
         r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    return A_nls, beta_nls, r2, e_pred
+
+
+def _fit_pauli_powerlaw_residual(z, overlap_raw, e_ref, z_min=2.5, z_max=5.0):
+    """AFM-range residual Pauli fit: E_ref(z) ≈ A * overlap(z)^beta with signed E_ref.
+
+    Intended target: E_ref = Kriging − E_es − E_vdw on z ∈ [2.5, 5.0] Å (typical).
+    Allows negative E_ref (OLS over all finite points with overlap>0). Model A·S^β
+    stays ≥0, so negative residual regions pull toward weaker Pauli.
+
+    Switch vs contact wall: use `_fit_pauli_powerlaw` for close-range E_ref>0 only.
+    Returns (A, beta, R², e_pred_on_fit_mask) same as `_fit_pauli_powerlaw`.
+    """
+    from scipy.optimize import curve_fit
+
+    z = np.asarray(z, dtype=np.float64)
+    overlap_raw = np.asarray(overlap_raw, dtype=np.float64)
+    e_ref = np.asarray(e_ref, dtype=np.float64)
+    mask = ((z >= z_min) & (z <= z_max) & np.isfinite(overlap_raw) & np.isfinite(e_ref)
+            & (overlap_raw > 1e-15))
+    if mask.sum() < 3:
+        raise ValueError(f"Need >=3 points in residual fit range [{z_min},{z_max}]")
+    o_fit = overlap_raw[mask]
+    e_fit = e_ref[mask]
+    pos = e_fit > 1e-15
+    if pos.sum() >= 3:
+        beta_ll, lnA_ll = np.polyfit(np.log(o_fit[pos]), np.log(e_fit[pos]), 1)
+        A_ll, beta_ll = float(np.exp(lnA_ll)), float(beta_ll)
+    else:
+        A_ll, beta_ll = 10.0, 0.8
+    def model(overlap, A, beta):
+        return A * overlap**beta
+    try:
+        popt, _ = curve_fit(model, o_fit, e_fit, p0=[A_ll, beta_ll],
+                            bounds=([0.0, 0.0], [1e6, 5.0]))
+        A_nls, beta_nls = float(popt[0]), float(popt[1])
+    except Exception as e:
+        print(f"  WARNING: residual nonlinear fit failed ({e}), using seed")
+        A_nls, beta_nls = A_ll, beta_ll
+    e_pred = model(o_fit, A_nls, beta_nls)
+    ss_res = np.sum((e_fit - e_pred)**2)
+    ss_tot = np.sum((e_fit - np.mean(e_fit))**2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
     return A_nls, beta_nls, r2, e_pred
 
 

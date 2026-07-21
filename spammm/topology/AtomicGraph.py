@@ -265,7 +265,8 @@ class AtomicGraph:
                     b.neighbors.append(a)
                 return bond   # already exists (now alive)
         if order is None:
-            order = 1.5 if (a.npi > 0 and b.npi > 0) else 1.0
+            # Default single; aromatic/double come from Kekule or Bond-mode cycle — not a silent 1.5 token
+            order = 1.0
         bond = Bond(a, b, order)
         self.bonds[bond._id] = bond
         a.bonds.append(bond)
@@ -748,22 +749,29 @@ class AtomicGraph:
                 return bond
         return None
 
-    def pick_ring(self, pos, radius=1.0):
-        """Find ring whose COG is within radius of position. Returns Ring or None.
-        Uses ring's own circumradius as primary test, falls back to fixed radius for small rings."""
+    def pick_ring(self, pos, radius=1.0, interior_frac=None):
+        """Find ring under position. Returns Ring or None.
+
+        Default: hit if within circumradius OR within ``radius`` of COG (legacy).
+        If ``interior_frac`` is set (e.g. 0.45), only hit when
+        ``d < interior_frac * ring.radius`` (or ``d < radius``), so perimeter
+        bonds/atoms are not swallowed by the ring.
+        """
         pos = np.asarray(pos)
         best_ring = None
         best_dist = float('inf')
         for ring in self.rings.values():
             if not ring.alive:
                 continue
-            d = np.linalg.norm(ring.cog - pos)
-            # Point is inside ring if within circumradius; also accept if within fixed radius of cog
-            if d < ring.radius or d < radius:
-                # Prefer the closest ring (smallest cog distance)
-                if d < best_dist:
-                    best_dist = d
-                    best_ring = ring
+            d = float(np.linalg.norm(np.asarray(ring.cog) - pos))
+            if interior_frac is not None:
+                lim = max(float(radius), float(interior_frac) * float(ring.radius))
+                hit = d < lim
+            else:
+                hit = d < ring.radius or d < radius
+            if hit and d < best_dist:
+                best_dist = d
+                best_ring = ring
         return best_ring
 
     def format_table(self, pos=False, neighbors=True, bond_orders=False, charge=False, hyb=True, alive_only=True):

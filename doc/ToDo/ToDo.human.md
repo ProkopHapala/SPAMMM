@@ -11,7 +11,7 @@ Consolidation strategy: `doc/Tasks/RepoConsolidation.md` (eat FireCore/ppafm int
 
 # GUI
 
-- [ ] 3D view
+- [x] 3D view (ortho editor mode: `Enter` / `b2Dview`; Ring/atom/bond work; hex 2D-only) — `doc/Tasks/GUI_Editor_3D_ViewMode.md`
 - [ ] Molecuar Browser
 
 
@@ -36,4 +36,4 @@ Consolidation strategy: `doc/Tasks/RepoConsolidation.md` (eat FireCore/ppafm int
 # longer
 
 - [ ] reoranize the editor menu - a but overcomplicated and slow, key-sortcuts
-- [ ] 3D view
+- [x] 3D view

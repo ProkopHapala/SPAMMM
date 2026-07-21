@@ -262,7 +262,9 @@ Pre-defined edge terminations for ribbons:
 
 9. **Drag-to-merge:** In Atom mode, dragging an atom onto another (within `pick_radius`) triggers `merge_atoms` — the non-dragged atom survives, all heavy-atom bonds transfer (idempotent `add_bond` prevents duplicates), H caps are removed and readjusted. Undo (Ctrl+Z) reverts.
 
-10. **Ring mode ghost preview:** Hovering a bond in Ring mode shows a cyan n-gon outline on the mouse side of the bond. Numpad +/- changes ring size (3–12), synced with spinbox.
+10. **Ring mode ghost preview:** Hovering a bond in Ring mode shows a cyan n-gon outline on the mouse side of the bond. Numpad +/- changes ring size (3–12), synced with spinbox. In **3D view**, pick is closest of bond / atom / ring-COG along the mouse ray; side uses ray ∩ z=0; hex placement is 2D-only.
+
+11. **Ortho 2D/3D view (`b2Dview`):** Default locked Top. `Enter` (or Editors checkbox) unlocks free ortho view; `RMB`-drag on empty rotates; digit keys for presets (`5`=Top). Depth test on in 3D. Details: `doc/Tasks/GUI_Editor_3D_ViewMode.md`, `doc/GUI_CHEATSHEET.md`.
 
 See `doc/GUI_topology_edit.desing.md` for detailed internal design and bug history.
 

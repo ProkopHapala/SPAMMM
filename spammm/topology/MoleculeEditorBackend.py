@@ -1422,21 +1422,38 @@ class MoleculeEditorBackend:
     def _graph_bond_types_mol(self):
         """Build MOL V2000 bond-type array from Bond.order values on the graph.
 
-        Bond.order is total order (1.0=single, 1.5=aromatic, 2.0=double).
+        Bond.order is total order (1.0=single, 1.5=aromatic, 2.0=double, 3.0=triple).
+        MDL types: 1=single, 2=double, 3=triple, 4=aromatic.
         Returns (nbond,) int array or None if no bonds.
+        Note: MOL2 writer maps 4 → 'ar' (MOL2 must not write integer 4).
         """
         if self._bond_list is None or len(self._bond_list) == 0:
             return None
         bt = np.ones(len(self._bond_list), dtype=int)
         for i, bond in enumerate(self._bond_list):
-            o = bond.order
-            if o > 1.75:
+            o = float(bond.order)
+            if o > 2.5:
+                bt[i] = 3
+            elif o > 1.75:
                 bt[i] = 2
             elif o > 1.25:
-                bt[i] = 4
+                bt[i] = 4  # aromatic (MDL); save_mol2 converts to 'ar'
             else:
                 bt[i] = 1
         return bt
+
+    def _create_bonds_by_distance(self, atoms=None, bond_length=None, tol_factor=0.35):
+        """Bond all pairs of heavy atoms within distance threshold (not just nearest)."""
+        if atoms is None:
+            atoms = [a for a in self.graph.atoms.values()
+                     if a.alive and a.ename not in ('H', 'E') and a.npi != -1]
+        bl = float(self.a_CC if bond_length is None else bond_length)
+        thr2 = (bl * (1.0 + tol_factor)) ** 2
+        for i, a in enumerate(atoms):
+            for j in range(i + 1, len(atoms)):
+                b = atoms[j]
+                if float(np.sum((a.pos - b.pos) ** 2)) < thr2:
+                    self.graph.add_bond(a, b)
 
     def get_graph_bond_orders(self):
         """Return (pi_bonds, pi_orders) for rendering, from Bond.order on the graph."""
@@ -1452,12 +1469,12 @@ class MoleculeEditorBackend:
         return np.asarray(self.sys.bonds, dtype=np.int32)[pi], (orders[pi] - 1.0)
 
     def load_structure(self, fname):
-        """Load structure from file. Dispatch on extension: .xyz, .mol, .mol2."""
+        """Load structure from file. Returns list of Atom._id for selection/manip."""
         ext = fname.split('.')[-1].lower()
         if ext == 'xyz':
-            self.load_xyz(fname)
+            return self.load_xyz(fname)
         elif ext in ('mol', 'mol2'):
-            self.load_mol(fname)
+            return self.load_mol(fname)
         else:
             raise ValueError(f"Unknown import format: .{ext}")
 
@@ -1491,10 +1508,8 @@ class MoleculeEditorBackend:
                 if i in atoms_map and j in atoms_map:
                     self.graph.add_bond(atoms_map[i], atoms_map[j])
         else:
-            # No bonds in file — use distance heuristic
-            heavy_atoms = [a for a in self.graph.atoms.values() if a.alive and a.ename not in ('H', 'E')]
-            for a in heavy_atoms:
-                self._create_bond_to_nearest_heavy(a)
+            # No bonds in file — distance heuristic (all neighbors, not nearest-only)
+            self._create_bonds_by_distance()
         self.graph.sync_neighbor_lists()
         self._guess_rings()
         # Add H atoms
@@ -1511,10 +1526,12 @@ class MoleculeEditorBackend:
                                     elements.ELEMENT_DICT['H'][0],
                                     pin=None, parent=best_a, npi=-1)
                 a.charge = float(qs[i])
+                self.graph.add_bond(a, best_a, order=1.0)
         self.graph.sync_neighbor_lists()
         self._rings_dirty = True
         self.detect_geometry_rings()  # detect rings immediately after load
         self._sync_sys()
+        return [a._id for a in self.graph.atoms.values() if a.alive]
 
     def get_xyz_string(self):
         """Return the current system as an XYZ formatted string."""
@@ -1548,10 +1565,8 @@ class MoleculeEditorBackend:
                                 pin=nk, parent=None,
                                 npi=self._get_element_default_npi(e))
             a.charge = float(qs[i])
-        # Create bonds for all heavy atoms (no recalc_bonds!)
-        heavy_atoms = [a for a in self.graph.atoms.values() if a.alive and a.ename not in ('H', 'E')]
-        for a in heavy_atoms:
-            self._create_bond_to_nearest_heavy(a)
+        # All heavy–heavy pairs within cutoff (nearest-only left molecules underbonded)
+        self._create_bonds_by_distance()
         self.graph.sync_neighbor_lists()
         self._guess_rings()
         # Add H atoms, finding nearest heavy atom by object ref
@@ -1568,10 +1583,11 @@ class MoleculeEditorBackend:
                                     elements.ELEMENT_DICT['H'][0],
                                     pin=None, parent=best_a, npi=-1)
                 a.charge = float(qs[i])
+                self.graph.add_bond(a, best_a, order=1.0)
         # Sync after loading H atoms (bonds already created above)
         self.graph.sync_neighbor_lists()
         self._sync_sys()
-
+        return [a._id for a in self.graph.atoms.values() if a.alive]
     def _guess_rings(self):
         """Heuristic: infer ring axial coords from heavy atom positions via grid."""
         n2a = self.graph._pin_to_atom

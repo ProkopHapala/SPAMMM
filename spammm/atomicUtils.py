@@ -1925,13 +1925,25 @@ def save_mol2( fname, enames, apos, bonds, qs=None, comment="", lvec=None, atom_
         # Write the BOND section.
         fout.write("@<TRIPOS>BOND\n")
         if bonds is not None:
-            bond_types_ = np.asarray(bond_types, dtype=int) if bond_types is not None else None
+            # MOL2 bond types are strings: 1,2,3,ar,am,du,un,nc (NOT MDL ints; 4 is invalid)
+            _mdl_to_mol2 = {1: '1', 2: '2', 3: '3', 4: 'ar'}
+            if bond_types is None:
+                bond_types_ = None
+            else:
+                bond_types_ = list(bond_types)
             for i, bond in enumerate(bonds):
                 bond_id = i + 1
                 a1 = bond[0] + 1
                 a2 = bond[1] + 1
-                bond_type = int(bond_types_[i]) if (bond_types_ is not None) else 1
-                fout.write("{:>6d} {:>5d} {:>5d} {:>4d}\n".format(bond_id, a1, a2, bond_type))
+                if bond_types_ is None:
+                    btyp = '1'
+                else:
+                    raw = bond_types_[i]
+                    if isinstance(raw, str):
+                        btyp = raw.strip() or '1'
+                    else:
+                        btyp = _mdl_to_mol2.get(int(raw), '1')
+                fout.write("{:>6d} {:>5d} {:>5d} {:>4s}\n".format(bond_id, a1, a2, btyp))
 
 def save_xyz(fname, enames, apos, comment="Generated"):
     """Write XYZ file.

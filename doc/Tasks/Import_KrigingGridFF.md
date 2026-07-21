@@ -30,7 +30,7 @@ Longer goal (same task family): **compare** Kriging DFT GridFF to **FDBM from Ps
 | Cube → FDBM | `AFM_utils.get_density_from_cube`, `build_fdbm_grid_from_cubes` | Psi4 `Dt.cube` sample+tip → Pauli/ES/vdW |
 | Compare CLI | `tests/SPM/testplot_kriging_vs_fdbm_cube.py` | N-h + CO_O profiles, XY, Pauli fit |
 | GPU density project | `kernels/grids.cl`, `spammm/utils/GridsOCL.py`, `tests/utils/test_grids_ocl.py` | Charge+dipole-preserving resample (vs scipy sample that broke ∫Δρ) |
-| Soft core clamp | `prepare_delta_rho_clamped` / `soft_clamp_density` | Kill nuclear cusps on Δρ for ES (no double-count recipe) |
+| Soft core clamp | `delta_rho_clamp_compact_na` / `soft_clamp_rational` | All-electron Δρ SSOT (clamp → rebuild compact NA). Do **not** use removed `prepare_delta_rho_clamped` (rescale cube NA — inverted V_ES). |
 | DFTB control | `testplot_fdbm_relax.py` + ad-hoc runs | GUI-default FDBM for flat pyridine vs benzene |
 | PP K units in test script | `testplot_fdbm_relax.py --K_LAT` now **N/m** → `stiffness_Nm_to_eVA2` | Match GUI; Hapala 0.5 N/m ≈ 0.031 eV/Å² |
 
@@ -223,6 +223,18 @@ Fixed `Ees_tip_sample_swap.png` now labels XY and includes a diagnosis panel (pa
 - Far-field \(V_\mathrm{ES}\) zero at \(z\sim8\) Å; Gaussian \(\sigma_\mathrm{NA}\gtrsim0.6\) puts NA into tip region; default \(\sigma=0.3\); compact core \(r_c\le1\) flat for tip \(z\ge2\).
 - Do not confuse \(V_\mathrm{ES}\) plots with FDBM \(E_\mathrm{es}=\mathrm{tip}_{\Delta\rho}\otimes V\).
 
+
+### 2026-07-21 evening — Pauli fit criteria split + residual N+C + HTML
+
+Full write-up: `doc/Reports/Kriging_FDBM_PauliFit_pyridine_2026-07-21.md`.  
+Gallery: `debug/afm_fdbm_diag_pyridine_gui_match/index.html`.
+
+- Kept `_fit_pauli_powerlaw` (contact wall); added `_fit_pauli_powerlaw_residual` (Kriging−ES−vdW, z∈[2.5,5]).
+- CLI `--fit_mode contact|residual`.
+- Residual pools: N+C+H and N+C-only; AFM 3-row rebuilt; artifacts under `pauli_fit_kriging_3ways/fit_resid_{NCH,NC}/`.
+- Status remains **investigating**.
+
+
 ### CO guinea-pig (2026-07-21) — Δρ recipe + tip Slater
 
 **Why CO:** smallest tip with real multipoles; native cubes OK (`CO_O`/`CO_C`); DFTB CO valence tip in cache. Debug algorithms here **before** pyridine/sample.
@@ -311,7 +323,8 @@ Prolonged STOs today mostly on **sample**. USER: tip is **more** important for P
 ### Open issues (priority)
 
 1. **P0 — All-electron Δρ clamp→compact NA (CO tip)**  
-   Tune clamp/NA params until Δρ matches DFTB valence morphology on common axis; then port to sample. Wire into `build_fdbm_grid_from_cubes`.
+   Tune clamp/NA params until Δρ matches DFTB valence morphology on common axis; then sample.
+   `build_fdbm_grid_from_cubes` now calls `delta_rho_clamp_compact_na` (not the removed rescale recipe).
 
 2. **P0 — Tip prolonged Slater SA**  
    Fit prolonged tip ρ for Pauli; compare tip-only vs tip+sample vs sample-only.
