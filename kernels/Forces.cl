@@ -247,3 +247,27 @@ inline float4 getMorsePLQH( float3 dp, float4 REQH, float4 PLQH, float K, float 
     float frQ   = -EQ*ir2_;
     return (float4){ dp*(frP+frL+frQ), EP+EL+EQ };
 }
+
+// ---- Unified compact exponential (power n=8) + soft radius ----
+// Mirrors topics/NonBondingFFs/fit_radial.py::compact_exp_force_over_r
+//
+//   y = max(0, 1 - beta*(rho-R0)/8)^8
+//   V = E0 * y * (alpha*y - (1+alpha))
+//   rho = r^2 / (sqrt(r^2+w^2) + w)     // one sqrt; no r=sqrt(r2)
+//
+// Returns float2(E, f_over_r) with F_vec = f_over_r * dr.
+// alpha=1,w=0 → compact Morse; alpha=0,w>0 → blunt attractive well.
+inline float2 compact_exp_pair_EF( float3 dr, float R0, float E0, float alpha, float w, float beta ){
+    const float eps = 1e-12f;
+    float r2  = dot(dr, dr);
+    float rw  = sqrt(r2 + w*w);
+    float rho = r2 / fmax(rw + w, eps);
+    float u   = fmax(0.0f, 1.0f - (beta * 0.125f) * (rho - R0)); // /8
+    float u2  = u*u;
+    float u4  = u2*u2;
+    float y   = u4*u4;          // u^8
+    float u7  = u4*u2*u;        // u^7
+    float E   = E0 * y * (alpha*y - (1.0f + alpha));
+    float f_over_r = E0 * beta * (2.0f*alpha*y - (1.0f + alpha)) * u7 / fmax(rw, eps);
+    return (float2)(E, f_over_r);
+}

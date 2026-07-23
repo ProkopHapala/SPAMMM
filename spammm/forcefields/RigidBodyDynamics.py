@@ -1317,29 +1317,128 @@ void rigid_body_folded_newton_replicas_kernel(
 # ==================================================================
 #  RigidBodyPairFF — pairwise molecule-molecule rigid body dynamics
 # ==================================================================
+#
+#  Force model (GPU kernel: rigid_body_pairff_kernel in rigid.cl):
+#
+#    atom-atom (type=0 ↔ type=0):
+#      Morse:  E = E0 * [exp(2α(r-R0)) - 2*exp(α(r-R0))]
+#      Coulomb: E = kQ / sqrt(r^2 + R2SAFE)   (damped to avoid singularity)
+#      Mixing: R0 = Ri+Rj, E0 = sqrtEi*sqrtEj, Q = Qi*Qj
+#
+#    epair-atom (type=1 ↔ type=0, or type=0 ↔ type=1):
+#      Lorentzian Hbond: E = coeff * fcut(r/rc) * 1/(w^2 + r^2)
+#      fcut = smoothstep(1 - r/rc) = 3x^2 - 2x^3
+#      coeff = min(0, Q_atom * Q_epair)  [attractive only]
+#      Q_epair = He (pseudo-charge stored in REQ.z)
+#
+#    sigma-hole-atom (type=2 ↔ type=0):
+#      Same Lorentzian form, Q_sigmahole = Hs (pseudo-charge in REQ.z)
+#
+#    Z-harmonic constraint: F_z = -k_z * (z - z_target)
+#      Applied per-atom (produces both force AND torque on the body).
+#
+#  Design decisions:
+#    - Epairs and sigma-holes are treated as pseudo-atoms with R=0, E=0.
+#      They participate ONLY in Hbond/sigma-hole interactions, not in Morse/Coulomb.
+#      This avoids double-counting: the Morse potential between real atoms
+#      already captures Pauli+London; epairs add the directional Hbond correction.
+#    - The pseudo-charge (He, Hs) is stored in REQ.z (the charge slot) so the
+#      kernel can use the same REQ array for all interaction types.
+#    - n_static_atoms and n_dyn_atoms are passed separately to the kernel so
+#      it can skip epair-epair interactions (no Morse/Coulomb between epairs).
+#
+#  Open issues:
+#    - Epair/sigma-hole positions are fixed in the body frame at construction
+#      time. Changing epair_dist/sigma_dist via the GUI does NOT reposition
+#      them on the GPU — requires rebuilding the body. A future fix would
+#      recompute body-frame positions and re-upload.
+#    - No epair-epair or sigma-sigma interactions (intentional — these are
+#      directional corrections, not independent interaction sites).
+#    - MAX_STATIC_ATOMS=128 is a compile-time limit in the kernel.
+#
 
-def add_electron_pairs_via_atomic_system(apos, enames, qs=None):
-    """Add electron pairs using AtomicSystem.add_electron_pairs (reuses existing code).
-    Returns (extended_apos, extended_enames, type_flags) where type_flags[i]=0 for atoms, 1 for epairs."""
+def add_electron_pairs_via_atomic_system(apos, enames, qs=None, epair_dist=1.4, sigma_dist=1.0):
+    """Add electron pairs and sigma holes using AtomicSystem.
+
+    Electron pairs (lone pairs on O/N) are placed by AtomicSystem.add_electron_pairs()
+    at 0.5 Å from the host, then rescaled to epair_dist (default 1.4 Å for Hbond mode).
+    Sigma holes are placed on H atoms bonded to O or N, at sigma_dist along the
+    O-H / N-H bond direction (pointing away from the heavy atom).
+
+    The resulting array is sorted: real atoms first, then epairs, then sigma holes.
+    This ordering is CRITICAL for the GPU kernel's branch-free design — threads
+    determine their role by index comparison (atom_idx < n_atoms) rather than
+    per-pair type branching, which would cause warp divergence.
+
+    Args:
+        apos: (N,3) atom positions
+        enames: list of element names
+        qs: optional charges
+        epair_dist: distance of epair from host atom [Å] (default 1.4 for Hbond mode)
+        sigma_dist: distance of sigma hole from H atom [Å] (0 = disabled)
+
+    Returns (extended_apos, extended_enames, type_flags) where:
+        type_flags[i]=0 for atoms, 1 for epairs, 2 for sigma holes.
+    """
     from .. import elements
     atypes = [elements.ELEMENT_DICT[e][0] if e in elements.ELEMENT_DICT else 200 for e in enames]
     mol = AtomicSystem(apos=np.asarray(apos, dtype=np.float32).copy(),  atypes=atypes, enames=list(enames), qs=qs)
     mol.neighs(bBond=True)
     mol.add_electron_pairs()
+
+    # Rescale epair distances
+    if epair_dist != 0.5:
+        ep_mask = np.array([e == 'E' for e in mol.enames])
+        ep_indices = np.where(ep_mask)[0]
+        for i in ep_indices:
+            host = next(j for j in mol.ngs[i] if mol.enames[j] != 'E')
+            direction = mol.apos[i] - mol.apos[host]
+            norm = np.linalg.norm(direction)
+            if norm > 1e-10:
+                mol.apos[i] = mol.apos[host] + direction / norm * epair_dist
+
+    # Add sigma holes on H bonded to O/N (type 'Sh')
+    if sigma_dist > 0:
+        n_before = len(mol.enames)
+        for i, e in enumerate(mol.enames):
+            if e != 'H': continue
+            for j in mol.ngs[i]:
+                if mol.enames[j] in ('O', 'N'):
+                    direction = mol.apos[i] - mol.apos[j]
+                    norm = np.linalg.norm(direction)
+                    if norm > 1e-10:
+                        mol.place_electron_pair(i, direction / norm, distance=sigma_dist, ename='Sh')
+                    break
+
     n_total = len(mol.enames)
     types = np.zeros(n_total, dtype=np.int32)
     for i, e in enumerate(mol.enames):
         if e == 'E': types[i] = 1
+        elif e == 'Sh': types[i] = 2
     return np.asarray(mol.apos, dtype=np.float32), list(mol.enames), types
+
+
+PAIRFF_MODE_LEGACY = 'legacy'
+PAIRFF_MODE_UNIFIED = 'unified'
 
 
 class RigidBodyPairFF(RigidBodyDynamics):
     """Rigid body dynamics with pairwise molecule-molecule interactions.
 
-    Extends RigidBodyDynamics with a static molecule and pairwise forces
-    (Morse+Coulomb for atom-atom, Lorentzian Hbond for epair-atom).
-    The dynamic body interacts with the fixed static molecule via the
-    rigid_body_pairff_kernel. Supports z-harmonic constraint and anchor springs.
+    Extends RigidBodyDynamics with a static molecule and pairwise forces.
+    Two GPU force models (switch via pairff_mode):
+
+      legacy  — rigid_body_pairff_kernel: 4-loop Morse+Coulomb / Lorentzian
+      unified — rigid_body_pairff_unified_kernel: single compact-exp loop
+
+    Design decisions:
+        - Atoms and dummy atoms (epairs, sigma holes) are stored in a single
+          sorted array: [real_atoms, epairs, sigma_holes] (legacy kernel needs
+          this; unified does not, but layout is kept for rendering).
+        - Pseudo-charges (He, Hs) are stored in REQ.z for dummy atoms.
+          REQ.w stores blunt width w for unified soft-radius (0 for real atoms).
+        - Z-harmonic constraint is applied per-atom (not per-CoM).
+        - FIRE relaxation is supported with host-side early exit.
     """
 
     def __init__(self, debug=False):
@@ -1366,8 +1465,40 @@ void rigid_body_pairff_kernel(
     __global const float4*   static_REQ,
     __global const int*      static_type,
     const int                n_static,
+    const int                n_static_atoms,
+    const int                n_dyn_atoms,
     const float4             pairff_params,
     const float              morse_alpha,
+    const float              z_target,
+    const float              Hs,
+    const float              dt,
+    const float4             md_params,
+    const int                niter
+)"""
+        self.kernelheaders["rigid_body_pairff_unified_kernel"] = """__kernel
+void rigid_body_pairff_unified_kernel(
+    __global const int*      mols,
+    __global       float4*   poss,
+    __global       float4*   qrots,
+    __global       float4*   vposs,
+    __global       float4*   vrots,
+    __global       float4*   fire_state,
+    __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
+    __global const float4*   apos_body,
+    __global       float4*   apos_world,
+    __global const float4*   dyn_REQ,
+    __global const int*      dyn_type,
+    __global       float4*   atom_force,
+    __global       float4*   body_force,
+    __global       float4*   body_torque,
+    __global const float4*   anchors,
+    __global const float4*   static_apos,
+    __global const float4*   static_REQ,
+    __global const int*      static_type,
+    const int                n_static,
+    const float4             pairff_params,
+    const float              beta,
     const float              z_target,
     const float              dt,
     const float4             md_params,
@@ -1375,6 +1506,9 @@ void rigid_body_pairff_kernel(
 )"""
         self.pairff_args = None
         self.krnl_pairff = None
+        self.pairff_unified_args = None
+        self.krnl_pairff_unified = None
+        self.pairff_mode = PAIRFF_MODE_LEGACY
         self.static_n = 0
         self.static_apos_host = None
         self.static_REQ_host = None
@@ -1382,6 +1516,11 @@ void rigid_body_pairff_kernel(
         self.dyn_type_host = None
         self.dyn_REQ_host = None
         self.pairff_params_host = None
+        # Base REQs before He/Hs/w overlay (real-atom rows only, pre-extend)
+        self._dyn_REQ_base = None
+        self._static_REQ_base = None
+        self._dyn_enames = None
+        self._static_enames = None
 
     def alloc_pairff(self, n_static):
         """Allocate buffers for static atoms and dynamic atom types/REQ."""
@@ -1431,40 +1570,98 @@ void rigid_body_pairff_kernel(
         self.dyn_type_host = dtype_arr.copy()
         self.dyn_REQ_host  = req_arr.copy()
 
-    def init_pairff(self, He=-0.1, rc=3.0, w=0.7, k_z=0.0, morse_alpha=1.8, z_target=0.0):
+    def init_pairff(self, He=-0.1, rc=3.0, w=0.7, k_z=0.0, morse_alpha=1.8, z_target=0.0, Hs=1.0, epair_dist=1.4, sigma_dist=1.0, mode=None, beta=None):
         """Initialize pairff kernel parameters and generate argument list.
 
         Args:
-            He:   Hbond energy coefficient (negative = attractive)
-            rc:   Hbond cutoff radius [Angstrom]
-            w:    Hbond Lorentzian width [Angstrom]
-            k_z:  Z-harmonic constraint strength (0 = no constraint)
-            morse_alpha: Morse potential alpha parameter
-            z_target:    Target z for harmonic constraint
+            He:   Epair pseudo-charge (negative). Drives Hbond attraction with positive probes.
+            rc:   Hbond/sigma-hole cutoff radius [Å] (legacy Lorentzian only).
+            w:    Soft-radius / Lorentzian width [Å]. Unified: blunt width on dummy sites.
+            k_z:  Z-harmonic constraint strength per atom (0 = no constraint).
+            morse_alpha: Legacy Morse alpha [1/Å]. Also default beta for unified if beta=None.
+            z_target:    Target z for harmonic constraint.
+            Hs:   Sigma-hole pseudo-charge (positive).
+            epair_dist, sigma_dist: stored for GUI / rebuild.
+            mode: 'legacy' or 'unified' (default: keep current pairff_mode).
+            beta: Compact-exp beta for unified mode (default: morse_alpha, or 1.7).
         """
+        if mode is not None:
+            mode = str(mode).lower()
+            if mode not in (PAIRFF_MODE_LEGACY, PAIRFF_MODE_UNIFIED):
+                raise ValueError(f"Unknown pairff mode {mode!r}; use 'legacy' or 'unified'")
+            prev = self.pairff_mode
+            self.pairff_mode = mode
+            if prev != mode:
+                # Mode discontinuity: clear velocities / FIRE state
+                z = np.zeros((self.n_bodies, 4), dtype=np.float32)
+                self.toGPU('vposs', z)
+                self.toGPU('vrots', z)
+                if 'fire_state' in self.buffer_dict:
+                    self.toGPU('fire_state', z)
+                if hasattr(self, 'reset_optimizer_state'):
+                    self.reset_optimizer_state()
+
+        if beta is None:
+            beta = float(morse_alpha) if self.pairff_mode == PAIRFF_MODE_LEGACY else 1.7
+
+        # Refresh REQ.z (He/Hs) and REQ.w (blunt width) then re-upload
+        if self.dyn_type_host is not None and self._dyn_REQ_base is not None:
+            dyn_REQ = _extend_reqs_with_epairs(
+                self._dyn_REQ_base, self._dyn_enames, self.dyn_type_host, He=He, Hs=Hs, w=w)
+            self.upload_dyn_types_req(self.dyn_type_host, dyn_REQ)
+        if self.static_type_host is not None and self._static_REQ_base is not None:
+            static_REQ = _extend_reqs_with_epairs(
+                self._static_REQ_base, self._static_enames, self.static_type_host, He=He, Hs=Hs, w=w)
+            self.upload_static(self.static_apos_host, static_REQ, self.static_type_host)
+
         self.kernel_params['n_static'] = np.int32(self.static_n)
+        n_static_atoms = int((self.static_type_host == 0).sum()) if self.static_type_host is not None else 0
+        self.kernel_params['n_static_atoms'] = np.int32(n_static_atoms)
+        n_dyn_atoms = int((self.dyn_type_host == 0).sum()) if self.dyn_type_host is not None else 0
+        self.kernel_params['n_dyn_atoms'] = np.int32(n_dyn_atoms)
         self.kernel_params['pairff_params'] = np.array([He, rc, w, k_z], dtype=np.float32)
         self.kernel_params['morse_alpha'] = np.float32(morse_alpha)
+        self.kernel_params['beta'] = np.float32(beta)
         self.kernel_params['z_target'] = np.float32(z_target)
+        self.kernel_params['Hs'] = np.float32(Hs)
         self.kernel_params['md_params'] = np.array([0.92, 0.88, 1.0, 1.0], dtype=np.float32)
-        self.pairff_params_host = {'He': He, 'rc': rc, 'w': w, 'k_z': k_z, 'morse_alpha': morse_alpha, 'z_target': z_target}
+        self.pairff_params_host = {
+            'He': He, 'rc': rc, 'w': w, 'k_z': k_z, 'morse_alpha': morse_alpha,
+            'beta': beta, 'z_target': z_target, 'Hs': Hs,
+            'epair_dist': epair_dist, 'sigma_dist': sigma_dist,
+            'mode': self.pairff_mode,
+        }
         self.pairff_args = self.generate_kernel_args("rigid_body_pairff_kernel")
         self.krnl_pairff = cl.Kernel(self.prg, "rigid_body_pairff_kernel")
+        self.pairff_unified_args = self.generate_kernel_args("rigid_body_pairff_unified_kernel")
+        self.krnl_pairff_unified = cl.Kernel(self.prg, "rigid_body_pairff_unified_kernel")
 
     def run_pairff(self, num_steps, dt, lin_damp=0.92, ang_damp=0.88, fire=False):
-        """Run the pairwise force field kernel for num_steps."""
-        if self.pairff_args is None:
-            raise RuntimeError("PairFF kernel not initialized; call init_pairff(...) first")
+        """Run the active pairwise force field kernel for num_steps."""
+        if self.pairff_mode == PAIRFF_MODE_UNIFIED:
+            if self.pairff_unified_args is None:
+                raise RuntimeError("Unified PairFF kernel not initialized; call init_pairff(...) first")
+            kname = "rigid_body_pairff_unified_kernel"
+            krnl = self.krnl_pairff_unified
+        else:
+            if self.pairff_args is None:
+                raise RuntimeError("PairFF kernel not initialized; call init_pairff(...) first")
+            kname = "rigid_body_pairff_kernel"
+            krnl = self.krnl_pairff
         self.kernel_params['dt'] = np.float32(dt)
         self.kernel_params['niter'] = np.int32(num_steps)
         if fire:
             self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, -1.0], dtype=np.float32)
         else:
             self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, 1.0], dtype=np.float32)
-        self.pairff_args = self.generate_kernel_args("rigid_body_pairff_kernel")
+        args = self.generate_kernel_args(kname)
+        if self.pairff_mode == PAIRFF_MODE_UNIFIED:
+            self.pairff_unified_args = args
+        else:
+            self.pairff_args = args
         global_size = (self.roundUpGlobalSize(self.n_bodies * self.nloc),)
         local_size = (self.nloc,)
-        self.krnl_pairff(self.queue, global_size, local_size, *self.pairff_args)
+        krnl(self.queue, global_size, local_size, *args)
         self.queue.finish()
 
     def relax_pairff(self, max_steps=500, dt=0.05, damp0=0.1, f_tol=1e-4, t_tol=1e-4, batch=64, body_id=0, record=False):
@@ -1497,6 +1694,8 @@ void rigid_body_pairff_kernel(
     def from_two_molecules(cls, dyn_apos, dyn_enames, dyn_REQs, static_apos, static_enames, static_REQs,
                            n_bodies=1, body_pos=None, quat=None, mass_trans=1.0, mass_rot=None,
                            He=-0.1, rc=3.0, w=0.7, k_z=0.0, morse_alpha=1.8, z_target=None,
+                           epair_dist=1.4, sigma_dist=1.0, Hs=1.0,
+                           mode=PAIRFF_MODE_LEGACY, beta=None,
                            debug=False, type_map=None):
         """Build RigidBodyPairFF from two molecules (positions + names + REQs).
 
@@ -1516,11 +1715,15 @@ void rigid_body_pairff_kernel(
             mass_trans:  translational mass scaling
             mass_rot:    rotational mass scaling (default: same as mass_trans)
             He, rc, w, k_z, morse_alpha, z_target: pairff parameters
+            mode:        'legacy' or 'unified' force kernel
+            beta:        compact-exp beta for unified mode (default 1.7)
         """
-        dyn_apos, dyn_enames, dyn_types = add_electron_pairs_via_atomic_system(dyn_apos, dyn_enames)
-        static_apos, static_enames, static_types = add_electron_pairs_via_atomic_system(static_apos, static_enames)
-        dyn_REQs_ext = _extend_reqs_with_epairs(dyn_REQs, dyn_enames, dyn_types)
-        static_REQs_ext = _extend_reqs_with_epairs(static_REQs, static_enames, static_types)
+        dyn_REQs_base = np.asarray(dyn_REQs, dtype=np.float32).copy()
+        static_REQs_base = np.asarray(static_REQs, dtype=np.float32).copy()
+        dyn_apos, dyn_enames, dyn_types = add_electron_pairs_via_atomic_system(dyn_apos, dyn_enames, epair_dist=epair_dist, sigma_dist=sigma_dist)
+        static_apos, static_enames, static_types = add_electron_pairs_via_atomic_system(static_apos, static_enames, epair_dist=epair_dist, sigma_dist=sigma_dist)
+        dyn_REQs_ext = _extend_reqs_with_epairs(dyn_REQs_base, dyn_enames, dyn_types, He=He, Hs=Hs, w=w)
+        static_REQs_ext = _extend_reqs_with_epairs(static_REQs_base, static_enames, static_types, He=He, Hs=Hs, w=w)
         masses = _guess_mass([e for e, t in zip(dyn_enames, dyn_types) if t == 0])
         dyn_apos = np.asarray(dyn_apos, dtype=np.float32)
         com0 = (dyn_apos[:len(masses)] * masses[:, None]).sum(axis=0) / masses.sum()
@@ -1542,6 +1745,7 @@ void rigid_body_pairff_kernel(
         zero4 = np.zeros((n_bodies, 4), dtype=np.float32)
         atom_body = np.repeat(rel[None, :, :], n_bodies, axis=0).astype(np.float32)
         rbd = cls(debug=debug)
+        rbd.pairff_mode = mode
         rbd.realloc(n_bodies=n_bodies, num_atoms=n_dyn)
         rbd.enames = list(dyn_enames)
         rbd.atom_REQ = dyn_REQs_ext.copy()
@@ -1553,25 +1757,41 @@ void rigid_body_pairff_kernel(
                          np.repeat(Iinv_relax[None,:,:], n_bodies, axis=0), atom_body,
                          inertia=np.repeat(I_relax[None,:,:], n_bodies, axis=0))
         rbd.alloc_pairff(n_static=len(static_enames))
+        rbd._dyn_REQ_base = dyn_REQs_base
+        rbd._static_REQ_base = static_REQs_base
+        rbd._dyn_enames = list(dyn_enames)
+        rbd._static_enames = list(static_enames)
         rbd.upload_static(static_apos, static_REQs_ext, static_types)
         rbd.upload_dyn_types_req(dyn_types, dyn_REQs_ext)
-        rbd.init_pairff(He=He, rc=rc, w=w, k_z=k_z, morse_alpha=morse_alpha, z_target=z_target)
+        rbd.init_pairff(He=He, rc=rc, w=w, k_z=k_z, morse_alpha=morse_alpha, z_target=z_target, Hs=Hs,
+                        epair_dist=epair_dist, sigma_dist=sigma_dist, mode=mode, beta=beta)
         rbd.static_enames = list(static_enames)
         return rbd
 
 
-def _extend_reqs_with_epairs(reqs, enames, types):
-    """Extend REQ array with dummy entries for electron pair atoms.
-    Epairs get R=0, E=0, Q=0, H=0 (no atom-atom interaction; only epair-atom via Hbond)."""
+def _extend_reqs_with_epairs(reqs, enames, types, He=0.0, Hs=0.0, w=0.0):
+    """Extend REQ array with dummy entries for electron pair / sigma hole atoms.
+
+    Real atoms (type=0) keep their original [RvdW, sqrt(EvdW), Q, Hb] values
+    with .w forced to 0 (no soft-radius blunt).
+    Epairs (type=1) get R=0, E=0, Q=He, w=w — the pseudo-charge in Q (REQ.z)
+    drives Hbond / unified attraction; REQ.w is the soft-radius blunt width.
+    Sigma holes (type=2) get R=0, E=0, Q=Hs, w=w — same mechanism with Hs.
+
+    Storing the pseudo-charge in REQ.z enables branch-free GPU execution:
+    coeff = min(0, Qi*Qj) / attr = -min(0,Qi*Qj) works uniformly.
+    """
     reqs = np.asarray(reqs, dtype=np.float32)
-    n_atoms = len(enames)
     n_total = len(types)
     out = np.zeros((n_total, 4), dtype=np.float32)
     ia = 0
     for i in range(n_total):
         if types[i] == 0:
             out[i] = reqs[ia]
+            out[i, 3] = 0.0  # blunt width 0 for real atoms
             ia += 1
-        else:
-            out[i] = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        elif types[i] == 1:
+            out[i] = np.array([0.0, 0.0, He, w], dtype=np.float32)
+        elif types[i] == 2:
+            out[i] = np.array([0.0, 0.0, Hs, w], dtype=np.float32)
     return out

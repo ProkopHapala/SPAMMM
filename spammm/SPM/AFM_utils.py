@@ -33,6 +33,7 @@ import os
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 from matplotlib.colors import TwoSlopeNorm
 
 # Import core AFM physics
@@ -51,6 +52,211 @@ def safe_norm(data_2d, pct=99):
 def scan_extent(scan_xs, scan_ys):
     """[xmin,xmax,ymin,ymax] for imshow from 1D scan axes."""
     return [float(scan_xs[0]), float(scan_xs[-1]), float(scan_ys[0]), float(scan_ys[-1])]
+
+
+def afm_scan_probe_heights(afm, nz, dtip, mol_z=None, z_clearance=5.0):
+    """Tip / probe heights [Å above molecular zmax] for PP scan column index iz."""
+    apos = afm.atoms_arr[:, :3]
+    mol_z = float(apos[:, 2].max()) if mol_z is None else float(mol_z)
+    z0_tip = mol_z + float(z_clearance) + abs(float(afm.dpos0[2]))
+    h_tip = z0_tip + np.arange(int(nz)) * float(dtip) - mol_z
+    h_probe = h_tip + float(afm.dpos0[2])
+    return h_tip, h_probe
+
+
+def cell_alat_info(cell_lvs):
+    """Return |a|, |b|, angle_deg, area for 2D surface cell (rows = lattice vectors)."""
+    a = np.asarray(cell_lvs[0, :2], dtype=np.float64)
+    b = np.asarray(cell_lvs[1, :2], dtype=np.float64)
+    la, lb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+    ang = float(np.degrees(np.arccos(np.clip(np.dot(a, b) / max(la * lb, 1e-30), -1.0, 1.0))))
+    area = float(abs(a[0] * b[1] - a[1] * b[0]))
+    return la, lb, ang, area
+
+
+def wrap_atoms_to_cell(apos, cell_lvs, natoms_per_mol=None):
+    """Wrap into crystallographic cell [0,1)×[0,1). Prefer whole-molecule wrap if natoms_per_mol set.
+
+    Assembly C6 placements often sit as a ring around origin spanning frac ∈ (−1,1).
+    Molecule-COM wrap keeps each molecule intact (no bonds across cell edges).
+    """
+    apos = np.asarray(apos, dtype=np.float64).copy()
+    B = np.column_stack([np.asarray(cell_lvs[0, :2], float), np.asarray(cell_lvs[1, :2], float)])
+    Bi = np.linalg.inv(B)
+    if natoms_per_mol is not None and natoms_per_mol > 0 and len(apos) % int(natoms_per_mol) == 0:
+        n = int(natoms_per_mol)
+        for k in range(len(apos) // n):
+            sl = slice(k * n, (k + 1) * n)
+            com = apos[sl, :2].mean(axis=0)
+            f = Bi @ com
+            shift = -np.floor(f)
+            apos[sl, :2] += (B @ shift)
+    else:
+        frac = (Bi @ apos[:, :2].T).T
+        frac = frac - np.floor(frac)
+        apos[:, :2] = (B @ frac.T).T
+    return apos
+
+
+def replicate_cell_pbc(apos, enames, cell_lvs, n_pbc=1):
+    """Tile atoms over (2 n_pbc+1)² lattice images. Returns (apos_rep, enames_rep, n_primary)."""
+    apos = np.asarray(apos, dtype=np.float64)
+    a = np.asarray(cell_lvs[0], float)
+    b = np.asarray(cell_lvs[1], float)
+    chunks, names = [], []
+    for i in range(-n_pbc, n_pbc + 1):
+        for j in range(-n_pbc, n_pbc + 1):
+            shift = i * a[:2] + j * b[:2]
+            ap = apos.copy()
+            ap[:, 0] += shift[0]
+            ap[:, 1] += shift[1]
+            chunks.append(ap)
+            names.extend(list(enames))
+    return np.vstack(chunks), names, len(apos)
+
+
+def cell_scan_grid(cell_lvs, mol_z, z_clearance, dpos0_z, dx, margin=1.0):
+    """Scan covering crystallographic cell parallelogram AABB + margin [Å]."""
+    a = np.asarray(cell_lvs[0, :2], float)
+    b = np.asarray(cell_lvs[1, :2], float)
+    corners = np.array([[0., 0.], a, a + b, b])
+    x0 = float(corners[:, 0].min()) - margin
+    y0 = float(corners[:, 1].min()) - margin
+    x1 = float(corners[:, 0].max()) + margin
+    y1 = float(corners[:, 1].max()) + margin
+    nx = max(2, int(np.ceil((x1 - x0) / dx)) + 1)
+    ny = max(2, int(np.ceil((y1 - y0) / dx)) + 1)
+    z0_tip = float(mol_z) + float(z_clearance) + abs(float(dpos0_z))
+    scan_p0 = np.array([x0, y0, z0_tip], dtype=np.float32)
+    scan_da = np.array([dx, 0., 0.], dtype=np.float32)
+    scan_db = np.array([0., dx, 0.], dtype=np.float32)
+    extent = [x0, x0 + (nx - 1) * dx, y0, y0 + (ny - 1) * dx]
+    return (nx, ny), scan_p0, scan_da, scan_db, extent
+
+
+def set_axes_to_cell(ax, cell_lvs, cell_origin=(0.0, 0.0), margin=2.0):
+    """Crop view to unit-cell AABB + margin (Å)."""
+    o = np.asarray(cell_origin, float)[:2]
+    a = np.asarray(cell_lvs[0, :2], float)
+    b = np.asarray(cell_lvs[1, :2], float)
+    corners = np.array([o, o + a, o + a + b, o + b])
+    ax.set_xlim(corners[:, 0].min() - margin, corners[:, 0].max() + margin)
+    ax.set_ylim(corners[:, 1].min() - margin, corners[:, 1].max() + margin)
+    ax.set_aspect('equal')
+
+
+def overlay_afm_cell_pbc(ax, cell_lvs, cell_origin=(0.0, 0.0), n_rep=1, lw=0.9, color='0.45', ls='--', zorder=4):
+    """Draw n_rep×n_rep periodic unit-cell images (dashed) around primary cell."""
+    if cell_lvs is None or n_rep < 1:
+        return
+    o = np.asarray(cell_origin, dtype=np.float64)[:2]
+    a, b = np.asarray(cell_lvs[0, :2], float), np.asarray(cell_lvs[1, :2], float)
+    for i in range(-n_rep, n_rep + 1):
+        for j in range(-n_rep, n_rep + 1):
+            if i == 0 and j == 0:
+                continue
+            shift = i * a + j * b
+            cpts = np.array([o + shift, o + a + shift, o + a + b + shift, o + b + shift, o + shift])
+            ax.plot(cpts[:, 0], cpts[:, 1], color=color, ls=ls, lw=lw * 0.85, zorder=zorder)
+
+
+def molecule_com_sites(apos, natoms_per_mol, labels=None):
+    """List of (ix_name, x, y, z) per molecule COM in assembly."""
+    apos = np.asarray(apos, dtype=np.float64)
+    nmols = len(apos) // int(natoms_per_mol)
+    out = []
+    for k in range(nmols):
+        sl = slice(k * natoms_per_mol, (k + 1) * natoms_per_mol)
+        c = apos[sl].mean(axis=0)
+        lab = labels[k] if labels and k < len(labels) else f'M{k}'
+        out.append((lab, float(c[0]), float(c[1]), float(c[2])))
+    return out
+
+
+def plot_afm_sites_legend(arr_nxny, scan_xs, scan_ys, sites, extent=None, *, title='AFM sites',
+                          cmap='gray', fname=None, save_dir='.', apos=None, bonds=None, cell_lvs=None,
+                          cell_origin=(0.0, 0.0), show_bonds=False, show_cell=True, show_atoms=True, cell_pbc=1,
+                          bond_lw=0.35, bond_alpha=0.22, dpi=160):
+    """Single-panel map with numbered site markers + legend (sites = list of (name,x,y[,val]))."""
+    fig, ax = plt.subplots(figsize=(7.5, 7))
+    imshow_afm(ax, arr_nxny, extent=extent, cmap=cmap, symmetric=False if cmap == 'gray' else True, title=title)
+    overlay_afm_geometry(ax, apos=apos, bonds=bonds, cell_lvs=cell_lvs, cell_origin=cell_origin,
+                         show_bonds=show_bonds, show_cell=show_cell, show_atoms=show_atoms,
+                         bond_lw=bond_lw, bond_alpha=bond_alpha)
+    if show_cell and cell_lvs is not None and cell_pbc > 0:
+        overlay_afm_cell_pbc(ax, cell_lvs, cell_origin, n_rep=int(cell_pbc))
+    leg = []
+    for si, site in enumerate(sites):
+        name = site[0]
+        x, y = float(site[1]), float(site[2])
+        val = site[3] if len(site) > 3 else None
+        ax.plot(x, y, 'o', mec='k', mfc='none', ms=12, mew=1.5, zorder=10)
+        ax.annotate(name, (x, y), xytext=(6, 6), textcoords='offset points', fontsize=10, fontweight='bold', color='k',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='0.3', alpha=0.85), zorder=11)
+        leg.append(f'{name}: ({x:.1f}, {y:.1f})' + (f'  df={val:.3e}' if val is not None else ''))
+    fig.text(1.02, 0.98, '\n'.join(leg), transform=ax.transAxes, fontsize=8, va='top', ha='left',
+             bbox=dict(boxstyle='round', fc='white', alpha=0.9, ec='0.5'))
+    fig.tight_layout()
+    if fname:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, fname)
+        fig.savefig(path, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+        print(f'REVIEW: {path}')
+    return fig, ax
+
+
+def overlay_afm_geometry(ax, apos=None, bonds=None, cell_lvs=None, cell_origin=(0.0, 0.0),
+                         show_bonds=True, show_cell=True, show_atoms=False, bond_lw=0.35, bond_alpha=0.22,
+                         atom_ms=2.0, atom_alpha=0.55, atom_color='0.1',
+                         cell_lw=1.4, cell_color='lime', zorder=5):
+    """Unit cell boundary + optional bond skeleton / atom dots on AFM XY axes."""
+    if apos is not None:
+        apos = np.asarray(apos, dtype=np.float64)
+    if show_bonds and bonds is not None and apos is not None:
+        bonds = np.asarray(bonds, dtype=np.int32)
+        segs = [[apos[i, :2], apos[j, :2]] for i, j in bonds]
+        lc = LineCollection(segs, colors=[(0.2, 0.2, 0.2, float(bond_alpha))] * len(segs),
+                            linewidths=float(bond_lw), capstyle='round', zorder=zorder)
+        ax.add_collection(lc)
+    if show_atoms and apos is not None:
+        ax.plot(apos[:, 0], apos[:, 1], '.', color=atom_color, ms=float(atom_ms), alpha=float(atom_alpha), zorder=zorder + 1)
+    if show_cell and cell_lvs is not None:
+        o = np.asarray(cell_origin, dtype=np.float64)[:2]
+        a, b = np.asarray(cell_lvs[0, :2], float), np.asarray(cell_lvs[1, :2], float)
+        cpts = np.array([o, o + a, o + a + b, o + b, o])
+        ax.plot(cpts[:, 0], cpts[:, 1], color=cell_color, ls='-', lw=float(cell_lw), zorder=zorder + 2)
+
+
+def find_afm_map_extrema(arr_nxny, scan_xs, scan_ys, mode='min', n=3, exclude_edge=2):
+    """Return up to n pixel extrema as (ix, iy, x, y, value). mode='min'|'max'."""
+    a = np.asarray(arr_nxny, dtype=np.float64)
+    xs, ys = np.asarray(scan_xs, float), np.asarray(scan_ys, float)
+    mask = np.ones(a.shape, dtype=bool)
+    e = int(exclude_edge)
+    if e > 0:
+        mask[:e, :] = mask[-e:, :] = mask[:, :e] = mask[:, -e:] = False
+    work = np.where(mask, a, np.inf if mode == 'min' else -np.inf)
+    flat = work.ravel()
+    order = np.argsort(flat) if mode == 'min' else np.argsort(-flat)
+    out = []
+    for k in order:
+        if len(out) >= n:
+            break
+        v = flat[k]
+        if not np.isfinite(v):
+            break
+        ix, iy = np.unravel_index(int(k), a.shape)
+        if any(abs(ix - p[0]) < 3 and abs(iy - p[1]) < 3 for p in out):
+            continue
+        out.append((int(ix), int(iy), float(xs[ix]), float(ys[iy]), float(a[ix, iy])))
+    return out
+
+
+def scan_axes_from_pts(pts3):
+    """1D scan axes from run_scan* pts array (nx, ny, 3)."""
+    pts3 = np.asarray(pts3, dtype=np.float64)
+    return pts3[:, 0, 0], pts3[0, :, 1]
 
 
 def crop_afm_xy(data, scan_xs, scan_ys, view_extent):
@@ -91,12 +297,15 @@ def imshow_afm(ax, arr_nxny, extent=None, cmap='bwr', symmetric=True, pct=99, ti
     return im
 
 
-def plot_afm_height_panel(data, heights, iz=None, extent=None, label='Fz', cmap='bwr', fname=None, save_dir='.', figsize_col=2.8, dpi=150, ylabel=None, transpose=True):
+def plot_afm_height_panel(data, heights, iz=None, extent=None, label='Fz', cmap='bwr', fname=None, save_dir='.', figsize_col=2.8, dpi=150, ylabel=None, transpose=True, h_tip=None, height_label='probe', apos=None, bonds=None, cell_lvs=None, show_bonds=False, show_cell=False, show_atoms=False, cell_pbc=0, bond_lw=0.35, bond_alpha=0.22, cell_origin=(0.0, 0.0)):
     """SSOT: row of XY maps at selected heights. `data` is (nx,ny,nz).
 
     Args:
         data: (nx, ny, nz) E/Fz/df volume
-        heights: (nz,) probe heights [Å]
+        heights: (nz,) probe heights [Å above zmax] when height_label='probe', else tip heights
+        h_tip: optional (nz,) tip heights for subtitle when height_label='probe'
+        height_label: 'probe' | 'tip' — which height to print in panel titles
+        show_bonds / show_cell: optional geometry overlay (bond skeleton + unit cell)
         iz: list of z-indices (default: evenly spaced up to 6)
         extent: [xmin,xmax,ymin,ymax] or None
         label / ylabel: figure / left-axis label
@@ -114,7 +323,19 @@ def plot_afm_height_panel(data, heights, iz=None, extent=None, label='Fz', cmap=
     axes = axes[0]
     for ax, i in zip(axes, iz):
         h = float(heights[i]) if heights is not None else float(i)
-        imshow_afm(ax, data[:, :, i], extent=extent, cmap=cmap, title=f'h={h:.1f}Å', transpose=transpose)
+        if height_label == 'probe' and h_tip is not None:
+            title = f'probe {h:.1f}Å\ntip {float(h_tip[i]):.1f}Å'
+        elif height_label == 'tip':
+            title = f'tip {h:.1f}Å'
+        else:
+            title = f'h={h:.1f}Å'
+        imshow_afm(ax, data[:, :, i], extent=extent, cmap=cmap, title=title, transpose=transpose)
+        if show_bonds or show_cell or show_atoms:
+            overlay_afm_geometry(ax, apos=apos, bonds=bonds, cell_lvs=cell_lvs, cell_origin=cell_origin,
+                                 show_bonds=show_bonds, show_cell=show_cell, show_atoms=show_atoms,
+                                 bond_lw=bond_lw, bond_alpha=bond_alpha)
+            if show_cell and cell_lvs is not None and cell_pbc > 0:
+                overlay_afm_cell_pbc(ax, cell_lvs, cell_origin, n_rep=int(cell_pbc))
         ax.tick_params(labelsize=5)
     if ylabel or label:
         axes[0].set_ylabel(ylabel or label, fontsize=8)
