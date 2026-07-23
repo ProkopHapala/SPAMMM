@@ -241,7 +241,7 @@ Code + plots ≠ confirmation. Wait for USER before changing task status.
 2. If imaging parity is the goal: adopt **residual N+C** \(A,\beta\) per tip×sample combo as provisional GUI presets (still label as “fit to Kriging residual,” not ab initio Pauli).  
 3. If physics Pauli is the goal: keep **contact** fits; fix cube tip Δρ / ES before re-fitting.  
 4. Tip prolonged Slater SA + re-fit.  
-5. Optional: atom-type-resolved \(A_Z,\beta_Z\) (N vs C vs H) instead of one global pair.
+7. Optional: atom-type-resolved \(A_Z,\beta_Z\) (N vs C vs H) instead of one global pair — **elevated to task** `doc/Tasks/Pauli_A_beta_KrigingTransferability.md` (site maps + cross-molecule transferability).
 
 ---
 

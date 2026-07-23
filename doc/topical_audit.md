@@ -214,8 +214,10 @@ Compact alternative to 3D `img_FF` for aperiodic rigid PP-AFM: **separable B-spl
 **Parity (PTCDA Morse):** separable PP Fz RMSE ~14 meV/Å; PIC ~20 meV/Å vs 3D `run_scan`.
 L0: `tests/SPM/test_afm_contact_surface.py`. L2: `tests/testplot_contact_surface.py`.
 
+**Task SSOT:** [Tasks/Fast_2p5D_AFM_ContactSurface.md](Tasks/Fast_2p5D_AFM_ContactSurface.md) — variants (i) separable+\(h_0\), (ii) PIC, (iii) hybrid/folded TBD.
+
 **Open issues:** basis/fit-region tuning; PIC force loss; pipeline flag `{separable,pic,grid3d}`;
-no GUI integration yet.
+no GUI integration yet; elastic Phase 2 design-only.
 
 ## 4. AFM/STM Simulation
 
@@ -233,15 +235,27 @@ no GUI integration yet.
 - **Caveats:** K_LAT N/m vs eV/Å²; prefer `step ≤ 0.1 Å` (`doc/Tasks/AFMTesting.md`)
 
 ### 4b. STM Simulation
-- LCAO orbital projection, spectral function, DOS/STM current
+- LCAO orbital projection, spectral function / BR-STM; vacuum tails need prolonged basis
 - **Kernels:** `kernels/LCAO_STM.cl`, `kernels/LCAO_grid.cl`
+- **Python:** `AFM_utils.compute_stm`, `compute_bond_resolved_stm`; `Grid_dftb` orbital projectors; ModularPipeline S6
+- **Task (campaign):** [Tasks/STM_ExtendedBasis_OrbitalCompare.md](Tasks/STM_ExtendedBasis_OrbitalCompare.md) — mio vs 3ob vs prolonged vs pySCF HOMO/LUMO cubes (pentacene, PTCDA)
+- **Related:** prolonged WFC [Tasks/ProlongedRadialBasis_DFTB.md](Tasks/ProlongedRadialBasis_DFTB.md); Dyson later [Tasks/DysonOrbitals_DFTB_STM.md](Tasks/DysonOrbitals_DFTB_STM.md)
 - **Audit Document:** [afm_stm_simulation.md](afm_stm_simulation.md) (STM sections)
+- **Caveats:** no dedicated L0 STM pytest yet; GUI STM/Orbitals widgets often empty
+
+### 4c. Kriging GridFF ↔ FDBM Pauli
+- DFT z-scan → Wendland Kriging/RBF GridFF; compare to FDBM Pauli/ES/vdW; site Pauli fits
+- **Key files:** `spammm/SPM/KrigingGridFF.py`, `InterpolatorKriging.py`, `AFM_utils` Pauli fitters
+- **Tasks:** [Import_KrigingGridFF.md](Tasks/Import_KrigingGridFF.md), [Pauli_A_beta_KrigingTransferability.md](Tasks/Pauli_A_beta_KrigingTransferability.md) (site maps + transferability)
+- **Reports:** [Reports/Kriging_DFT_vs_DFTB_FDBM_pyridine.md](Reports/Kriging_DFT_vs_DFTB_FDBM_pyridine.md), [Kriging_FDBM_PauliFit_pyridine_2026-07-21.md](Reports/Kriging_FDBM_PauliFit_pyridine_2026-07-21.md)
+- **Topic:** [Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md](Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md)
 
 ## 5. QM Integration (DFTB+)
 
 - DFTB+ integration: subprocess, C-API, parsers, OpenCL grid projection, constrained scans
 - **Key files:** `spammm/quantum/DFTB/DFTBcore.py`, `spammm/quantum/DFTB/DFTBplusParser.py`, `spammm/quantum/DFTB/Grid_dftb.py`, `spammm/quantum/DFTB/basis_optimizer.py`, `spammm/quantum/DFTB_utils.py`, `spammm/quantum/hbond_scan.py`, `spammm/quantum/pySCF_utils.py`
 - **Hessian (vibrations):** `DFTB_utils.write_dftb_input_hessian` — used by `dynamics/Vibrations.py`
+- **Kekulé RI density (planned):** [Tasks/Kekule_ExponentialDensityFit.md](Tasks/Kekule_ExponentialDensityFit.md) — π orders → atom+bond exponentials vs DFT ρ
 - **Audit Document:** [afm_stm_simulation.md](afm_stm_simulation.md) (DFTB sections)
 - **Tests:** `tests/SPM/plot_dftb_vs_pyscf_basis.py`, `tests/SPM/plot_3ob_basis_tails.py`, `tests/topology/test_hbond_scan.py`
 

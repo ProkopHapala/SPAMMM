@@ -17,7 +17,7 @@ See also: `kernels/README.md` (GPU force fields consume topology via `AtomicSyst
 |------|---------|
 | `AtomicGraph.py` | Object-graph: stable Atom/Bond/Ring `_id`; `format_table()` for test dumps |
 | `MoleculeEditorBackend.py` | Editing engine: hex grid, passivation, rings, `_sync_sys()`, MOL/XYZ export |
-| `KekulePure.py` | Kekulé π-bond optimizer: feasibility, multi-seed localization, 6-ring validation |
+| `KekulePure.py` | Kekulé π-bond optimizer: feasibility, multi-seed localization, 6-ring validation; planned input to RI density (`doc/Tasks/Kekule_ExponentialDensityFit.md`) |
 | `PackedMolecule.py` | Dense NumPy snapshot of `AtomicGraph` for undo/clipboard |
 | `FFparams.py` | Parse UFF/SPFF `.dat` parameter files → atom types, REQs |
 | `HexGrid.py` | Hexagonal grid snapping and transforms |

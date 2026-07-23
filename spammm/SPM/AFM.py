@@ -1783,7 +1783,14 @@ def compute_df_amp(Fz, dz, amp=1.0):
     df(z) = -<dFz/dz>_amp = -∫_{-1}^{1} dFz/dz(z + amp*u) * (2/π)*sqrt(1-u^2) du
 
     Uses Gauss-Chebyshev quadrature with 9 points for the semi-circle weight.
-    Fz shape (nx,ny,nz), dz = z-step, amp = oscillation amplitude [Å].
+    Fz shape (nx,ny,nz), dz = z-step, amp = oscillation amplitude [Å] (**peak**, not p2p).
+
+    IMPORTANT (USER / Fukui panel 2026-07-23): df at labeled height h is NOT Fz(h).
+    Closest approach ≈ h − amp. Chemical contrast that appears in Fz near ~3 Å often
+    appears in df near ~4–5 Å when amp≈1.0 — apparent ~1 Å column shift is expected.
+    Prefer dense dz (≲0.1 Å) over the oscillation window; see skill:afm-plotting and
+    doc/Reports/Fukui_FDBM_panel_notes_2026-07-23.md. Do not compare Fz/df morphologies
+    in the same column without stating amp / closest approach.
     """
     from scipy.ndimage import map_coordinates
     nz = Fz.shape[2]

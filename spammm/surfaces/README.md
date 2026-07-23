@@ -6,6 +6,7 @@ Substrate and sample interaction modeling for molecule-on-surface / AFM simulati
 aperiodic rigid molecules — same relaxation loop, far fewer degrees of freedom.
 
 Design spec: [doc/Topics/AFM/ContactSurface_Static.md](../../doc/Topics/AFM/ContactSurface_Static.md)  
+Task SSOT: [doc/Tasks/Fast_2p5D_AFM_ContactSurface.md](../../doc/Tasks/Fast_2p5D_AFM_ContactSurface.md)  
 Debugging pitfalls: [doc/Takeways.md](../../doc/Takeways.md) (z alignment, F_ref layout, reg, weighting)
 
 ## File index
@@ -20,19 +21,19 @@ Debugging pitfalls: [doc/Takeways.md](../../doc/Takeways.md) (z alignment, F_ref
 - **SubstrateBuilder.py** — Crystal slab generation (NaCl, CaF₂): flat slabs and step edges
 - **surface_plots.py** — Matplotlib plots for relaxation trajectories, lateral scans, manipulation
 
-## Contact surface — two representations
+## Contact surface — variants (2.5D)
 
-| | Separable (Option A) | PIC radial (Option B) |
-|--|----------------------|------------------------|
-| **Form** | `Σ c_ijk B_i(x) B_j(y) φ_k(dz)` | `Σ_i Σ_m c_im φ_m(\|r−r_i\|)` |
-| **Storage** | `ncx×ncy×nz_modes` (~10⁴–10⁵) | `nat×nmodes` (~10²–10³) |
-| **Best for** | Moderate scan patches, smooth corrugation | Many surface atoms, large xy extent |
-| **Fit** | `fit_separable_cg` — Boltzmann + force rows OK | `fit_pic_cg` — unweighted, `reg≈1e-2` |
-| **PP scan** | `run_scan_contact` → `relaxStrokesTiltedContact` | `run_scan_pic` → `relaxStrokesTiltedPIC` |
-| **Kernel** | `evalSeparableBsplinePoly`, `cs_sep_Av/Atv*` | `evalRadialPIC`, `cs_pic_Av/Atv*`, `cs_pic_eval_tile16` |
+| | (i) Separable + \(h_0\) | (ii) PIC radial | (iii) Hybrid / other |
+|--|------------------------|-----------------|----------------------|
+| **Form** | `Σ c_ijk B_i(x) B_j(y) φ_k(dz−h₀)` | `Σ_i Σ_m c_im φ_m(\|r−r_i\|)` | Coarse A + PIC residual, or folded z-basis family — **not one API yet** |
+| **Storage** | `ncx×ncy×nz_modes` (~10⁴–10⁵) | `nat×nmodes` (~10²–10³) | TBD |
+| **Best for** | Moderate scan patches, smooth corrugation | Many surface atoms, large xy extent | Large systems / residual correction |
+| **Fit** | `fit_separable_cg` — Boltzmann + force rows OK | `fit_pic_cg` — unweighted, `reg≈1e-2` | — |
+| **PP scan** | `run_scan_contact` → `relaxStrokesTiltedContact` | `run_scan_pic` → `relaxStrokesTiltedPIC` | — |
+| **Kernel** | `evalSeparableBsplinePoly`, `cs_sep_Av/Atv*` | `evalRadialPIC`, `cs_pic_Av/Atv*`, `cs_pic_eval_tile16` | — |
 
 Shared: brute Morse reference (`cs_brute_afm_morse_c_points` via AFMulator), probe-z
-convention, `F = −∇E`, particle-in-cell only on PIC path.
+convention, `F = −∇E`, particle-in-cell only on PIC path. See task file for finish criteria.
 
 ### Library usage (AFMulator)
 

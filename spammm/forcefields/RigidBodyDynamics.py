@@ -25,6 +25,7 @@ import pyopencl as cl
 
 from ..utils.OpenCLBase import OpenCLBase
 from ..topology.FFparams import load_xyz_with_REQs
+from ..AtomicSystem import AtomicSystem
 
 
 DEFAULT_WORKGROUP_SIZE = 32
@@ -1311,3 +1312,266 @@ void rigid_body_folded_newton_replicas_kernel(
     def upload_anchors(self):
         self.toGPU('anchors', self.anchors)
         self.queue.finish()
+
+
+# ==================================================================
+#  RigidBodyPairFF — pairwise molecule-molecule rigid body dynamics
+# ==================================================================
+
+def add_electron_pairs_via_atomic_system(apos, enames, qs=None):
+    """Add electron pairs using AtomicSystem.add_electron_pairs (reuses existing code).
+    Returns (extended_apos, extended_enames, type_flags) where type_flags[i]=0 for atoms, 1 for epairs."""
+    from .. import elements
+    atypes = [elements.ELEMENT_DICT[e][0] if e in elements.ELEMENT_DICT else 200 for e in enames]
+    mol = AtomicSystem(apos=np.asarray(apos, dtype=np.float32).copy(),  atypes=atypes, enames=list(enames), qs=qs)
+    mol.neighs(bBond=True)
+    mol.add_electron_pairs()
+    n_total = len(mol.enames)
+    types = np.zeros(n_total, dtype=np.int32)
+    for i, e in enumerate(mol.enames):
+        if e == 'E': types[i] = 1
+    return np.asarray(mol.apos, dtype=np.float32), list(mol.enames), types
+
+
+class RigidBodyPairFF(RigidBodyDynamics):
+    """Rigid body dynamics with pairwise molecule-molecule interactions.
+
+    Extends RigidBodyDynamics with a static molecule and pairwise forces
+    (Morse+Coulomb for atom-atom, Lorentzian Hbond for epair-atom).
+    The dynamic body interacts with the fixed static molecule via the
+    rigid_body_pairff_kernel. Supports z-harmonic constraint and anchor springs.
+    """
+
+    def __init__(self, debug=False):
+        super().__init__(debug=debug)
+        self.kernelheaders["rigid_body_pairff_kernel"] = """__kernel
+void rigid_body_pairff_kernel(
+    __global const int*      mols,
+    __global       float4*   poss,
+    __global       float4*   qrots,
+    __global       float4*   vposs,
+    __global       float4*   vrots,
+    __global       float4*   fire_state,
+    __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
+    __global const float4*   apos_body,
+    __global       float4*   apos_world,
+    __global const float4*   dyn_REQ,
+    __global const int*      dyn_type,
+    __global       float4*   atom_force,
+    __global       float4*   body_force,
+    __global       float4*   body_torque,
+    __global const float4*   anchors,
+    __global const float4*   static_apos,
+    __global const float4*   static_REQ,
+    __global const int*      static_type,
+    const int                n_static,
+    const float4             pairff_params,
+    const float              morse_alpha,
+    const float              z_target,
+    const float              dt,
+    const float4             md_params,
+    const int                niter
+)"""
+        self.pairff_args = None
+        self.krnl_pairff = None
+        self.static_n = 0
+        self.static_apos_host = None
+        self.static_REQ_host = None
+        self.static_type_host = None
+        self.dyn_type_host = None
+        self.dyn_REQ_host = None
+        self.pairff_params_host = None
+
+    def alloc_pairff(self, n_static):
+        """Allocate buffers for static atoms and dynamic atom types/REQ."""
+        MAX_STATIC = 128
+        if n_static > MAX_STATIC:
+            raise ValueError(f"n_static={n_static} exceeds MAX_STATIC_ATOMS={MAX_STATIC}")
+        self.static_n = int(n_static)
+        float_size = np.float32().itemsize
+        int_size = np.int32().itemsize
+        mf = cl.mem_flags
+        self.create_buffer('static_apos',  MAX_STATIC * 4 * float_size, mf.READ_ONLY)
+        self.create_buffer('static_REQ',  MAX_STATIC * 4 * float_size, mf.READ_ONLY)
+        self.create_buffer('static_type', MAX_STATIC * int_size,        mf.READ_ONLY)
+        self.create_buffer('dyn_REQ',     self.total_atoms * 4 * float_size, mf.READ_ONLY)
+        self.create_buffer('dyn_type',    self.total_atoms * int_size,        mf.READ_ONLY)
+
+    def upload_static(self, static_apos, static_REQ, static_type):
+        """Upload static molecule data (world positions, REQ, type flags) to GPU."""
+        n = len(static_apos)
+        MAX_STATIC = 128
+        if n > MAX_STATIC:
+            raise ValueError(f"n_static={n} exceeds MAX_STATIC_ATOMS={MAX_STATIC}")
+        apos_pad = np.zeros((MAX_STATIC, 4), dtype=np.float32)
+        req_pad  = np.zeros((MAX_STATIC, 4), dtype=np.float32)
+        type_pad = np.zeros(MAX_STATIC, dtype=np.int32)
+        apos_pad[:n] = _ensure_float4(static_apos)
+        req_pad[:n]  = _ensure_float4(static_REQ)
+        type_pad[:n] = np.asarray(static_type, dtype=np.int32)
+        self.toGPU('static_apos',  apos_pad)
+        self.toGPU('static_REQ',   req_pad)
+        self.toGPU('static_type',  type_pad)
+        self.static_n = n
+        self.static_apos_host = apos_pad[:n].copy()
+        self.static_REQ_host  = req_pad[:n].copy()
+        self.static_type_host = type_pad[:n].copy()
+
+    def upload_dyn_types_req(self, dyn_type, dyn_REQ):
+        """Upload per-atom type flags (0=atom, 1=epair) and REQ for dynamic body."""
+        dtype_arr = np.asarray(dyn_type, dtype=np.int32)
+        req_arr = _ensure_float4(dyn_REQ)
+        if dtype_arr.shape[0] != self.total_atoms:
+            raise ValueError(f"dyn_type length {dtype_arr.shape[0]} != total_atoms {self.total_atoms}")
+        if req_arr.shape[0] != self.total_atoms:
+            raise ValueError(f"dyn_REQ length {req_arr.shape[0]} != total_atoms {self.total_atoms}")
+        self.toGPU('dyn_type', dtype_arr)
+        self.toGPU('dyn_REQ',  req_arr)
+        self.dyn_type_host = dtype_arr.copy()
+        self.dyn_REQ_host  = req_arr.copy()
+
+    def init_pairff(self, He=-0.1, rc=3.0, w=0.7, k_z=0.0, morse_alpha=1.8, z_target=0.0):
+        """Initialize pairff kernel parameters and generate argument list.
+
+        Args:
+            He:   Hbond energy coefficient (negative = attractive)
+            rc:   Hbond cutoff radius [Angstrom]
+            w:    Hbond Lorentzian width [Angstrom]
+            k_z:  Z-harmonic constraint strength (0 = no constraint)
+            morse_alpha: Morse potential alpha parameter
+            z_target:    Target z for harmonic constraint
+        """
+        self.kernel_params['n_static'] = np.int32(self.static_n)
+        self.kernel_params['pairff_params'] = np.array([He, rc, w, k_z], dtype=np.float32)
+        self.kernel_params['morse_alpha'] = np.float32(morse_alpha)
+        self.kernel_params['z_target'] = np.float32(z_target)
+        self.kernel_params['md_params'] = np.array([0.92, 0.88, 1.0, 1.0], dtype=np.float32)
+        self.pairff_params_host = {'He': He, 'rc': rc, 'w': w, 'k_z': k_z, 'morse_alpha': morse_alpha, 'z_target': z_target}
+        self.pairff_args = self.generate_kernel_args("rigid_body_pairff_kernel")
+        self.krnl_pairff = cl.Kernel(self.prg, "rigid_body_pairff_kernel")
+
+    def run_pairff(self, num_steps, dt, lin_damp=0.92, ang_damp=0.88, fire=False):
+        """Run the pairwise force field kernel for num_steps."""
+        if self.pairff_args is None:
+            raise RuntimeError("PairFF kernel not initialized; call init_pairff(...) first")
+        self.kernel_params['dt'] = np.float32(dt)
+        self.kernel_params['niter'] = np.int32(num_steps)
+        if fire:
+            self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, -1.0], dtype=np.float32)
+        else:
+            self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, 1.0], dtype=np.float32)
+        self.pairff_args = self.generate_kernel_args("rigid_body_pairff_kernel")
+        global_size = (self.roundUpGlobalSize(self.n_bodies * self.nloc),)
+        local_size = (self.nloc,)
+        self.krnl_pairff(self.queue, global_size, local_size, *self.pairff_args)
+        self.queue.finish()
+
+    def relax_pairff(self, max_steps=500, dt=0.05, damp0=0.1, f_tol=1e-4, t_tol=1e-4, batch=64, body_id=0, record=False):
+        """FIRE relaxation using the pairff kernel with host-side early exit."""
+        hist = [] if record else None
+        n_done = 0
+        Fmag = Tmag = E = np.inf
+        batch = max(int(batch), 64)
+        while n_done < max_steps:
+            n = min(batch, max_steps - n_done)
+            self.run_pairff(n, dt, lin_damp=damp0, ang_damp=damp0, fire=True)
+            n_done += n
+            out = self.download_outputs()
+            F = out['body_force'][body_id, :3].astype(np.float64)
+            Tw = out['body_torque'][body_id, :3].astype(np.float64)
+            E = float(out['atom_positions'][body_id][:, 3].sum())
+            Fmag = float(np.linalg.norm(F))
+            Tmag = float(np.linalg.norm(Tw))
+            if record:
+                hist.append(dict(step=n_done, E=E, F=Fmag, T=Tmag,
+                                 pos=out['pos'][body_id].copy(), quat=out['quats'][body_id].copy()))
+            if Fmag < f_tol and Tmag < t_tol:
+                break
+        z = np.zeros((self.n_bodies, 4), dtype=np.float32)
+        self.toGPU('vposs', z); self.toGPU('vrots', z); self.queue.finish()
+        return {'steps': n_done, 'converged': Fmag < f_tol and Tmag < t_tol,
+                'F': Fmag, 'T': Tmag, 'E': E, 'history': hist}
+
+    @classmethod
+    def from_two_molecules(cls, dyn_apos, dyn_enames, dyn_REQs, static_apos, static_enames, static_REQs,
+                           n_bodies=1, body_pos=None, quat=None, mass_trans=1.0, mass_rot=None,
+                           He=-0.1, rc=3.0, w=0.7, k_z=0.0, morse_alpha=1.8, z_target=None,
+                           debug=False, type_map=None):
+        """Build RigidBodyPairFF from two molecules (positions + names + REQs).
+
+        Electron pairs are automatically added to both molecules.
+        The dynamic molecule is centered at body_pos (default: origin).
+        The static molecule stays at its given positions.
+
+        Args:
+            dyn_apos:    (N_dyn, 3) positions of dynamic molecule atoms
+            dyn_enames:  list of element names for dynamic molecule
+            dyn_REQs:    (N_dyn, 4) REQ parameters (R, sqrt(E), Q, H)
+            static_apos: (N_stat, 3) positions of static molecule atoms
+            static_enames: list of element names for static molecule
+            static_REQs: (N_stat, 4) REQ parameters
+            body_pos:    (3,) initial CoM position for dynamic body
+            quat:        (4,) initial quaternion (default: identity)
+            mass_trans:  translational mass scaling
+            mass_rot:    rotational mass scaling (default: same as mass_trans)
+            He, rc, w, k_z, morse_alpha, z_target: pairff parameters
+        """
+        dyn_apos, dyn_enames, dyn_types = add_electron_pairs_via_atomic_system(dyn_apos, dyn_enames)
+        static_apos, static_enames, static_types = add_electron_pairs_via_atomic_system(static_apos, static_enames)
+        dyn_REQs_ext = _extend_reqs_with_epairs(dyn_REQs, dyn_enames, dyn_types)
+        static_REQs_ext = _extend_reqs_with_epairs(static_REQs, static_enames, static_types)
+        masses = _guess_mass([e for e, t in zip(dyn_enames, dyn_types) if t == 0])
+        dyn_apos = np.asarray(dyn_apos, dtype=np.float32)
+        com0 = (dyn_apos[:len(masses)] * masses[:, None]).sum(axis=0) / masses.sum()
+        rel = dyn_apos - com0[None, :]
+        mtot, I, Iinv = compute_mass_properties(rel[:len(masses)], masses)
+        if mass_rot is None: mass_rot = mass_trans
+        Iinv_relax = Iinv * (mtot / float(mass_rot))
+        I_relax = I * (float(mass_rot) / mtot)
+        if body_pos is None: body_pos = np.zeros(3, dtype=np.float32)
+        if quat is None: quat = np.array([0, 0, 0, 1], dtype=np.float32)
+        if z_target is None: z_target = float(body_pos[2]) if len(body_pos) >= 3 else 0.0
+        n_dyn = len(dyn_enames)
+        pos4 = np.zeros((n_bodies, 4), dtype=np.float32)
+        pos4[:, :3] = np.asarray(body_pos, dtype=np.float32)
+        pos4[:, 3] = float(mass_trans)
+        quat4 = np.zeros((n_bodies, 4), dtype=np.float32)
+        quat4[:] = np.asarray(quat, dtype=np.float32)
+        if quat4[0, 3] == 0 and np.linalg.norm(quat4[0]) < 1e-10: quat4[:, 3] = 1.0
+        zero4 = np.zeros((n_bodies, 4), dtype=np.float32)
+        atom_body = np.repeat(rel[None, :, :], n_bodies, axis=0).astype(np.float32)
+        rbd = cls(debug=debug)
+        rbd.realloc(n_bodies=n_bodies, num_atoms=n_dyn)
+        rbd.enames = list(dyn_enames)
+        rbd.atom_REQ = dyn_REQs_ext.copy()
+        rbd.atom_masses = masses.copy()
+        rbd.mass_physical = float(mtot)
+        rbd.mass_trans = float(mass_trans)
+        rbd.mass_rot = float(mass_rot)
+        rbd.upload_state(pos4, quat4, zero4, zero4, float(mass_trans), 1.0/float(mass_trans),
+                         np.repeat(Iinv_relax[None,:,:], n_bodies, axis=0), atom_body,
+                         inertia=np.repeat(I_relax[None,:,:], n_bodies, axis=0))
+        rbd.alloc_pairff(n_static=len(static_enames))
+        rbd.upload_static(static_apos, static_REQs_ext, static_types)
+        rbd.upload_dyn_types_req(dyn_types, dyn_REQs_ext)
+        rbd.init_pairff(He=He, rc=rc, w=w, k_z=k_z, morse_alpha=morse_alpha, z_target=z_target)
+        rbd.static_enames = list(static_enames)
+        return rbd
+
+
+def _extend_reqs_with_epairs(reqs, enames, types):
+    """Extend REQ array with dummy entries for electron pair atoms.
+    Epairs get R=0, E=0, Q=0, H=0 (no atom-atom interaction; only epair-atom via Hbond)."""
+    reqs = np.asarray(reqs, dtype=np.float32)
+    n_atoms = len(enames)
+    n_total = len(types)
+    out = np.zeros((n_total, 4), dtype=np.float32)
+    ia = 0
+    for i in range(n_total):
+        if types[i] == 0:
+            out[i] = reqs[ia]
+            ia += 1
+        else:
+            out[i] = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    return out

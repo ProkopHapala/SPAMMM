@@ -54,3 +54,7 @@ Full report: [`doc/Tasks/PerfBenchmark_FDBM.md`](../Tasks/PerfBenchmark_FDBM.md)
 - [ ] Optional interactive `step=0.15` (not quality default — hex symmetry / `q_diff`)
 - [ ] Optional skip F host download when `NO_IO` (S4 device-only)
 - [ ] Hex/rot60 image QA at coarse grids — `doc/Tasks/AFMTesting.md`
+- [ ] Site-resolved Pauli \(A,\beta\) vs Kriging (transferability) — `doc/Tasks/Pauli_A_beta_KrigingTransferability.md`
+- [ ] Prolonged / dual-basis Pauli (stock ES) — `doc/Tasks/ProlongedRadialBasis_DFTB.md`
+- [ ] **Fukui molecule panel FDBM:** cube vs DFTB stock vs prolonged for pentacene, PTCDA, azaindol_(iso)dimer, benzoicacid/amid dimers — `/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster/*_PBE_def2-SVP/`
+- [ ] Cube tip Δρ / ES morphology vs Kriging — `doc/Tasks/Import_KrigingGridFF.md`, reports `Kriging_*.md`

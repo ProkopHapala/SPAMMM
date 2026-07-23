@@ -413,6 +413,259 @@ def run_ptcda_stock_vs_sa(args):
     return variants
 
 
+# Fukui pySCF PBE/def2-SVP panel (USER 2026-07-23) — cube FDBM ref vs DFTB stock vs prolonged
+FUKUI_CUBE_ROOT = '/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster'
+FUKUI_PANEL = [
+    ('azaindol_dimer', 'data/xyz/azaindol_dimer.xyz'),
+    ('azaindol_isodimer', 'data/xyz/azaindol_isodimer.xyz'),
+    ('benzoicacid_dimer', 'data/xyz/benzoicacid_dimer.xyz'),
+    ('benzoicamid_dimer', 'data/xyz/benzoicamid_dimer.xyz'),
+    ('pentacene', 'data/xyz/pentacene.xyz'),
+    ('PTCDA', 'data/xyz/PTCDA.xyz'),
+]
+
+
+def _fft_friendly_grid_spec(atomPos, step, margin, z_extra):
+    """_make_grid_spec then round nx,ny,nz to clFFT-friendly sizes (pad extent)."""
+    from spammm.SPM import AFM as afm
+    from spammm.SPM.AFM_utils import _make_grid_spec
+    grid_spec, origin, ngrid, step = _make_grid_spec(atomPos, step, margin, z_extra)
+    nx, ny, nz = [int(x) for x in ngrid]
+    nx2 = afm._FDBMGpyFFT.round_fft_friendly(nx)
+    ny2 = afm._FDBMGpyFFT.round_fft_friendly(ny)
+    nz2 = afm._FDBMGpyFFT.round_fft_friendly(nz)
+    if (nx2, ny2, nz2) != (nx, ny, nz):
+        ngrid = (nx2, ny2, nz2)
+        grid_spec = {
+            'origin': origin, 'ngrid': ngrid,
+            'dA': [step, 0.0, 0.0], 'dB': [0.0, step, 0.0], 'dC': [0.0, 0.0, step],
+        }
+    return grid_spec, origin, ngrid, step
+
+
+def run_fukui_one(mol, xyz_rel, args):
+    """One molecule: DFT-cube FDBM + DFTB stock 3ob + DFTB Slater-tail prolonged (dual ES)."""
+    import matplotlib; matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from spammm.SPM import AFM as afm
+    from spammm.SPM import AFM_utils as afm_utils
+    from spammm.config_utils import get_dftb_basis_path
+    from spammm.quantum.DFTB.DFTBplusParser import (
+        parse_wfc_hsd, convert_wfc_to_species_list_ang, make_slater_tail_species_list,
+    )
+    import spammm.atomicUtils as au
+
+    os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
+    _ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    cube_dir = os.path.join(FUKUI_CUBE_ROOT, f'{mol}_PBE_def2-SVP')
+    xyz = xyz_rel if os.path.isabs(xyz_rel) else os.path.join(_ROOT, xyz_rel)
+    outdir = os.path.join(args.outdir, mol)
+    os.makedirs(outdir, exist_ok=True)
+
+    ELEM_Z = {'H': 1, 'C': 6, 'N': 7, 'O': 8}
+    pos, _, names, _, _ = au.load_xyz(xyz)
+    atomPos_xyz = np.array(pos, dtype=np.float64)
+    enames = list(names)
+    atomTypes_xyz = np.array([ELEM_Z.get(e, 6) for e in enames], dtype=np.int32)
+
+    lines = [
+        f'Fukui FDBM panel: {mol}',
+        f'cube_dir={cube_dir}',
+        f'xyz={xyz}',
+        f'step={args.step}  tip=co  basis=3ob-3-1',
+        'variants: cube (pySCF ρ_N) | stock 3ob | prolonged Slater-tail (Pauli only; ES=stock)',
+        '',
+    ]
+    print(f'\n######## {mol} ########')
+
+    # ── Cube density (atoms from cube header = density frame) ──
+    rho_cube = os.path.join(cube_dir, 'rho_N.cube')
+    if not os.path.isfile(rho_cube):
+        raise FileNotFoundError(rho_cube)
+    d_cube = afm_utils.get_density_from_cube(rho_cube, use_esp_cube=False, verbosity=0)
+    atomPos = np.asarray(d_cube['atomPos'], dtype=np.float64)
+    atomZ = np.asarray(d_cube['atomZ'], dtype=np.float64)
+    atomTypes = np.array([int(round(z)) for z in atomZ], dtype=np.int32)
+    # Prefer cube frame; fall back to xyz if atom count mismatch
+    if len(atomPos) != len(atomPos_xyz):
+        print(f'  WARNING: cube natom={len(atomPos)} != xyz {len(atomPos_xyz)}; using cube')
+    grid_spec, origin, ngrid, step = _fft_friendly_grid_spec(
+        atomPos, args.step, args.margin, z_extra=6.0)
+    nx, ny, nz = [int(x) for x in ngrid]
+    lines.append(f'grid={nx}x{ny}x{nz} step={step} origin={origin}')
+
+    rho_cube_g = afm_utils.resample_field_to_grid(
+        d_cube['rho_scf'], d_cube['origin'], d_cube['step'], origin, step, ngrid)
+    rho_diff_g = afm_utils.resample_field_to_grid(
+        d_cube['rho_diff'], d_cube['origin'], d_cube['step'], origin, step, ngrid)
+    # strip residual monopole after resample
+    dV = step ** 3
+    vol = float(nx * ny * nz) * dV
+    q_diff = float(rho_diff_g.sum() * dV)
+    if abs(q_diff) > 1e-4:
+        rho_diff_g = (rho_diff_g - q_diff / vol).astype(np.float32)
+    V_ES_cube = afm.fft_poisson_cpu(rho_diff_g, step)
+    lines.append(f'cube q_scf={float(rho_cube_g.sum()*dV):.2f} q_diff={float(rho_diff_g.sum()*dV):.3e}')
+
+    # ── DFTB stock on same grid ──
+    basis_hsd = get_dftb_basis_path('3ob-3-1')
+    args.basis = '3ob-3-1'
+    work_stock = os.path.join(outdir, 'dftb_work_stock')
+    print(f'\n[{mol}] DFTB stock 3ob...')
+    res_stock = afm_utils.get_density_from_dftb_dense(
+        atomPos, atomTypes, basis_hsd, work_stock, grid_spec=grid_spec,
+        step=step, verbosity=0)
+    rho_stock = res_stock['rho_scf']
+    V_ES = res_stock['V_ES']
+    dens_dir = os.path.join(_ROOT, 'debug', 'densities')
+    os.makedirs(dens_dir, exist_ok=True)
+    np.save(os.path.join(dens_dir, f'rho_{mol}_dftb_3ob.npy'), rho_stock)
+    np.savez(os.path.join(dens_dir, f'rho_{mol}_dftb_3ob.meta.npz'),
+             origin=origin, ngrid=ngrid, step=step,
+             atom_pos=atomPos, atom_names=np.array(enames[:len(atomPos)] if len(enames) >= len(atomPos) else enames))
+    lines.append(f'stock q_scf={float(rho_stock.sum()*dV):.2f}')
+
+    # ── Prolonged Slater-tail Pauli (dual basis: stock V_ES) ──
+    basis_data = parse_wfc_hsd(basis_hsd)
+    basis_ang = convert_wfc_to_species_list_ang(basis_data, resolution_bohr=0.04)
+    proj_prolonged = make_slater_tail_species_list(basis_ang)
+    work_prol = os.path.join(outdir, 'dftb_work_prolonged')
+    print(f'\n[{mol}] DFTB prolonged Slater-tail (Pauli ρ)...')
+    res_prol = afm_utils.get_density_from_dftb_dense(
+        atomPos, atomTypes, basis_hsd, work_prol, grid_spec=grid_spec,
+        step=step, verbosity=0, projection_basis_ang=proj_prolonged)
+    rho_prol = res_prol['rho_scf']
+    np.save(os.path.join(dens_dir, f'rho_{mol}_dftb_3ob_prolonged.npy'), rho_prol)
+    np.savez(os.path.join(dens_dir, f'rho_{mol}_dftb_3ob_prolonged.meta.npz'),
+             origin=origin, ngrid=ngrid, step=step, atom_pos=atomPos)
+    lines.append(f'prolonged q_scf={float(rho_prol.sum()*dV):.2f} (NOT charge-normalized; Pauli only)')
+
+    pa_cube = afm.PAULI_FITTED_DEFAULTS.get('pyscf_6-31g*', {'A': 40.0, 'beta': 1.15})
+    pa_3ob = afm.PAULI_FITTED_DEFAULTS.get('3ob-3-1', {'A': 124.84, 'beta': 1.433})
+    # PTCDA has site-refitted A,β — use those when available
+    if mol == 'PTCDA':
+        pa_stock = PTCDA_PAULI_FIT['stock']
+        pa_prol = PTCDA_PAULI_FIT['sa']
+    else:
+        pa_stock = pa_3ob
+        pa_prol = pa_3ob  # default prolonged; SA-refit later per molecule
+
+    variants = {}
+    specs = [
+        ('cube', rho_cube_g, V_ES_cube, pa_cube['A'], pa_cube['beta']),
+        ('stock', rho_stock, V_ES, pa_stock['A'], pa_stock['beta']),
+        ('prolonged', rho_prol, V_ES, pa_prol['A'], pa_prol['beta']),
+    ]
+    for key, rho, Ves, A, beta in specs:
+        r = _run_from_density(key, rho, Ves, atomPos, atomTypes, origin, step, ngrid,
+                              A, beta, 'co', outdir, args)
+        variants[key] = r
+        lines.append(f'[{key}] A={A:.3f} β={beta:.4f}  df=[{r["df"].min():.3e},{r["df"].max():.3e}]')
+
+    heights = variants['stock']['heights']
+    row_specs = [
+        ('df', 'cube', f'df  DFT cube\nA={pa_cube["A"]:.1f} β={pa_cube["beta"]:.2f}', args.df_cmap),
+        ('df', 'stock', f'df  stock 3ob\nA={pa_stock["A"]:.1f} β={pa_stock["beta"]:.2f}', args.df_cmap),
+        ('df', 'prolonged', f'df  prolonged\nA={pa_prol["A"]:.1f} β={pa_prol["beta"]:.2f}', args.df_cmap),
+        ('Fz', 'cube', 'Fz  DFT cube', args.cmap),
+        ('Fz', 'stock', 'Fz  stock 3ob', args.cmap),
+        ('Fz', 'prolonged', 'Fz  prolonged', args.cmap),
+    ]
+    title = (f'{mol} FDBM CO tip | DFT cube ρ_N vs DFTB stock 3ob vs Slater-tail prolonged\n'
+             f'DUAL BASIS: prolonged ρ → Pauli only; ES = stock Δρ  |  PBE/def2-SVP cubes')
+    # Keep common/per-column strip (variants comparable) + experimental per-image contrast
+    cmp = os.path.join(outdir, 'compare_cube_stock_prolonged.png')
+    afm_utils.plot_afm_variant_height_strip(
+        variants, row_specs, heights, cmp, scale='per_column', title=title,
+        dpi=140)
+    lines.append(f'REVIEW: {cmp}')
+    per_dir = os.path.join(outdir, 'per_image')
+    os.makedirs(per_dir, exist_ok=True)
+    cmp_pi = os.path.join(per_dir, 'compare_cube_stock_prolonged.png')
+    afm_utils.plot_afm_variant_height_strip(
+        variants, row_specs, heights, cmp_pi, scale='per_image', title=title,
+        dpi=140)
+    lines.append(f'REVIEW: {cmp_pi}')
+
+    np.savez(os.path.join(outdir, 'scan_cube_stock_prolonged.npz'),
+             heights=heights,
+             df_cube=variants['cube']['df'], Fz_cube=variants['cube']['Fz'],
+             df_stock=variants['stock']['df'], Fz_stock=variants['stock']['Fz'],
+             df_prolonged=variants['prolonged']['df'], Fz_prolonged=variants['prolonged']['Fz'],
+             A_cube=pa_cube['A'], beta_cube=pa_cube['beta'],
+             A_stock=pa_stock['A'], beta_stock=pa_stock['beta'],
+             A_prolonged=pa_prol['A'], beta_prolonged=pa_prol['beta'])
+
+    summary = os.path.join(outdir, 'SUMMARY.out')
+    lines += ['', f'REVIEW: {summary}', f'heights={list(map(float, heights))}']
+    open(summary, 'w').write('\n'.join(lines) + '\n')
+    print(f'REVIEW: {summary}')
+    return variants
+
+
+def replot_fukui_per_image(panel_dir, molecules=None, cmap='seismic', df_cmap='gray'):
+    """Replot existing scan_*.npz strips with per-image color scale (does not overwrite commons)."""
+    from spammm.SPM import AFM_utils as afm_utils
+    mols = molecules or [m for m, _ in FUKUI_PANEL]
+    lines = [f'Replot per_image from {panel_dir}', '']
+    for mol in mols:
+        npz = os.path.join(panel_dir, mol, 'scan_cube_stock_prolonged.npz')
+        if not os.path.isfile(npz):
+            print(f'  skip {mol}: missing {npz}')
+            continue
+        d = np.load(npz)
+        heights = d['heights']
+        variants = {
+            'cube': {'df': d['df_cube'], 'Fz': d['Fz_cube']},
+            'stock': {'df': d['df_stock'], 'Fz': d['Fz_stock']},
+            'prolonged': {'df': d['df_prolonged'], 'Fz': d['Fz_prolonged']},
+        }
+        A_c, b_c = float(d['A_cube']), float(d['beta_cube'])
+        A_s, b_s = float(d['A_stock']), float(d['beta_stock'])
+        A_p, b_p = float(d['A_prolonged']), float(d['beta_prolonged'])
+        row_specs = [
+            ('df', 'cube', f'df  DFT cube\nA={A_c:.1f} β={b_c:.2f}', df_cmap),
+            ('df', 'stock', f'df  stock 3ob\nA={A_s:.1f} β={b_s:.2f}', df_cmap),
+            ('df', 'prolonged', f'df  prolonged\nA={A_p:.1f} β={b_p:.2f}', df_cmap),
+            ('Fz', 'cube', 'Fz  DFT cube', cmap),
+            ('Fz', 'stock', 'Fz  stock 3ob', cmap),
+            ('Fz', 'prolonged', 'Fz  prolonged', cmap),
+        ]
+        title = (f'{mol} FDBM CO tip | DFT cube vs DFTB stock vs prolonged\n'
+                 f'(replot — per-image color scale)')
+        per_dir = os.path.join(panel_dir, mol, 'per_image')
+        os.makedirs(per_dir, exist_ok=True)
+        out = os.path.join(per_dir, 'compare_cube_stock_prolonged.png')
+        afm_utils.plot_afm_variant_height_strip(
+            variants, row_specs, heights, out, scale='per_image', title=title, dpi=140)
+        lines.append(f'REVIEW: {out}')
+    sum_path = os.path.join(panel_dir, 'SUMMARY_per_image.out')
+    open(sum_path, 'w').write('\n'.join(lines) + '\n')
+    print(f'REVIEW: {sum_path}')
+    return lines
+
+
+def run_fukui_panel(args):
+    """Run Fukui molecule panel (all or --molecule subset)."""
+    mols = FUKUI_PANEL
+    if getattr(args, 'molecule', None):
+        want = set(args.molecule)
+        mols = [(m, x) for m, x in FUKUI_PANEL if m in want]
+        missing = want - {m for m, _ in mols}
+        if missing:
+            raise ValueError(f'Unknown --molecule {missing}; choose from {[m for m,_ in FUKUI_PANEL]}')
+    os.makedirs(args.outdir, exist_ok=True)
+    panel_lines = [f'Fukui FDBM panel  outdir={args.outdir}', '']
+    for mol, xyz in mols:
+        run_fukui_one(mol, xyz, args)
+        panel_lines.append(f'REVIEW: {os.path.join(args.outdir, mol, "compare_cube_stock_prolonged.png")}')
+        panel_lines.append(f'REVIEW: {os.path.join(args.outdir, mol, "per_image", "compare_cube_stock_prolonged.png")}')
+    panel_sum = os.path.join(args.outdir, 'SUMMARY.out')
+    open(panel_sum, 'w').write('\n'.join(panel_lines) + '\n')
+    print(f'\nREVIEW: {panel_sum}')
+    print(f'REVIEW: {os.path.abspath(args.outdir)}/')
+
+
 def main():
     parser = argparse.ArgumentParser(description="FDBM diagnostic: tip_mode gaussian|co|both")
     parser.add_argument('--xyz', default='data/xyz/benzene.xyz')
@@ -436,7 +689,28 @@ def main():
     parser.add_argument('--ptcda-stock-vs-sa', action='store_true',
                         help='PTCDA: stock 3ob vs SA-prolonged with Ez-fitted Pauli A,β')
     parser.add_argument('--sa-params', default='debug/dftb_basis_sa_ptcda/PTCDA_sa_params.json')
+    parser.add_argument('--fukui-panel', action='store_true',
+                        help='Fukui pySCF cubes: cube vs DFTB stock vs prolonged Slater-tail')
+    parser.add_argument('--molecule', nargs='*', default=None,
+                        help='Subset of Fukui panel names (with --fukui-panel)')
+    parser.add_argument('--replot-fukui-per-image', action='store_true',
+                        help='Replot existing Fukui panel npz with per-image color scale into */per_image/')
     args = parser.parse_args()
+
+    if args.replot_fukui_per_image:
+        out = args.outdir if args.outdir != 'debug/afm_fdbm_diag' else 'debug/fdbm_fukui_panel'
+        replot_fukui_per_image(out, molecules=args.molecule, cmap=args.cmap, df_cmap=args.df_cmap)
+        return
+
+    if args.fukui_panel:
+        args.basis = '3ob-3-1'
+        args.tip_mode = 'co'
+        if args.outdir == 'debug/afm_fdbm_diag':
+            args.outdir = 'debug/fdbm_fukui_panel'
+        if args.h_min == 2.0 and args.h_max == 5.5 and args.h_step == 0.25:
+            args.h_min, args.h_max, args.h_step = 2.5, 5.7, 0.4
+        run_fukui_panel(args)
+        return
 
     if args.ptcda_stock_vs_sa:
         args.xyz = args.xyz if 'PTCDA' in args.xyz else 'data/xyz/PTCDA.xyz'

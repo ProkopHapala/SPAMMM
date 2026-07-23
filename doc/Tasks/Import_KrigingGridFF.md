@@ -8,6 +8,8 @@
 **Export SSOT:** `/home/prokop/git/ppafm/docs/export/interpolation.export.md`  
 **Science / data map:** `doc/Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md`  
 **Campaign report (2026-07-20…21):** `doc/Reports/Kriging_DFT_vs_DFTB_FDBM_pyridine.md` — physics findings, tip×sample matrix, dual-basis rules, next experiments.  
+**Pauli day report:** `doc/Reports/Kriging_FDBM_PauliFit_pyridine_2026-07-21.md`.  
+**Follow-on (site \(A,\beta\) maps + transferability):** `doc/Tasks/Pauli_A_beta_KrigingTransferability.md`.  
 **Plot SSOT:** skill:`afm-plotting` (`spammm/SPM/AFM_utils.py` — arbitrary probe sites, tip/probe heights, FDBM z-layout, 3-row AFM).
 
 ## Objective
@@ -135,6 +137,23 @@ Today: `testplot_fdbm_relax` CLI now takes **N/m** like the GUI. With 0.5 N/m 
 9. **Tip project margin:** crop CO tip with margin≲1 Å → fake \(q_{\Delta\rho}\sim-0.7\). Use ≥3–4 Å (or full AFM cell).
 10. **\(V_\mathrm{ES}\) ≠ \(E_\mathrm{es}\):** \(E_\mathrm{es}=\mathrm{tip}_{\Delta\rho}\otimes V\); similar \(V(z)\) can still give different \(E_\mathrm{es}\).
 11. **Probe sites:** “opposite C” = farthest **carbon** from N, never farthest of all atoms (that is para-H). Always print `xy=` on plot titles.
+
+### Fukui pySCF density panel (USER 2026-07-23) — expand cube-FDBM tests
+
+Beyond pyridine Mithun cubes, use **PBE/def2-SVP** sample densities at:
+
+`/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster/{mol}_PBE_def2-SVP/`  
+with `rho_N.{cube,npy}`, `esp_N.{cube,npy}` (and A/C for pentacene/PTCDA).
+
+| mol tag | XYZ in repo |
+|---------|-------------|
+| `pentacene`, `PTCDA` | `data/xyz/pentacene.xyz`, `PTCDA.xyz` |
+| `azaindol_dimer`, `azaindol_isodimer` | `data/xyz/azaindol_*.xyz` |
+| `benzoicacid_dimer`, `benzoicamid_dimer` | `data/xyz/benzoic*_dimer.xyz` |
+
+**Workflow:** cube FDBM (reference) ↔ DFTB stock ↔ DFTB prolonged — see `ProlongedRadialBasis_DFTB.md` § molecule panel and `Pauli_A_beta_KrigingTransferability.md`. Paths are **top-level** under `pyscf_fukui_cluster/`, not only legacy `jobs/results/`.
+
+**USER review of first panel run (2026-07-23) — notes only:** PTCDA **cube** row ES looks too strong / asymmetric (DFTB prolonged OK). Panel cube path used **Gaussian NA**, not clamp→compact-NA. Also df↔Fz apparent height shift ~1.4 Å with **amp=1.0 Å**. Full notes: `doc/Reports/Fukui_FDBM_panel_notes_2026-07-23.md`. Do not mark cube-FDBM Done.
 12. **CRITICAL — `aspect='equal'`** on every spatial density/potential `imshow` (1 Å x = 1 Å y/z). Never `aspect='auto'`. Tip maps: molecular frame before pad+roll; mark 1D cut on 2D. See `NOTE_plot_axis_equal.out`.
 
 ---

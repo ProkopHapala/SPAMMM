@@ -219,9 +219,15 @@ optimization focused and fast.
 
 ### Data Sources
 
-- GPAW densities: `/home/prokop/SIMULATIONS/Fukui_AFM/gpaw_fukui_cluster/jobs/results/{mol}/rho_N.npy`
-- PySCF densities: `/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster/jobs/results/{mol}/rho_N.npy`
+- GPAW densities (legacy job layout): `/home/prokop/SIMULATIONS/Fukui_AFM/gpaw_fukui_cluster/jobs/results/{mol}/rho_N.npy`
+- PySCF densities — **preferred FDBM panel (2026-07-23):** top-level dirs  
+  `/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster/{mol}_PBE_def2-SVP/`  
+  with `rho_N.{cube,npy}`, `esp_N.{cube,npy}` for  
+  `pentacene`, `PTCDA`, `azaindol_dimer`, `azaindol_isodimer`, `benzoicacid_dimer`, `benzoicamid_dimer`  
+  (SSOT task table: `doc/Tasks/ProlongedRadialBasis_DFTB.md` § molecule panel).  
+  Older scripts may still use `pyscf_fukui_cluster/jobs/results/{mol}/rho_N.npy`.
 - DFTB basis: resolved via `get_dftb_basis_path('3ob-3-1')`
+- Matching XYZ in SPAMMM: `data/xyz/{pentacene,PTCDA,azaindol_dimer,azaindol_isodimer,benzoicacid_dimer,benzoicamid_dimer}.xyz`
 
 ### Coordinate Systems
 

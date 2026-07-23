@@ -42,16 +42,25 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
 **P0 — conference critical**
 - [ ] **Prolonged DFTB radial basis (STM+AFM)** — analyze + wire existing fit (`basis_optimizer`, `testplot_3ob_basis_tails`); selectable WFC in projection (`doc/Tasks/ProlongedRadialBasis_DFTB.md`; `doc/DFTB_basis_fit.md`)
   - **Tip-first SA (2026-07-21):** prolonged Slater is **even more important for the tip** than sample; fit systematically on CO guinea-pig; try SA for tip / sample / both — tip-only may suffice (precomputed, simpler). Dual basis: stock ES + prolonged Pauli; never charge-normalize prolonged ρ.
+  - **Fukui FDBM panel (2026-07-23):** pySCF PBE/def2-SVP densities at `/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster/` — `pentacene`, `PTCDA`, **new** `azaindol_dimer`, `azaindol_isodimer`, `benzoicacid_dimer`, `benzoicamid_dimer` (`rho_N`/`esp_N`). Run cube-FDBM reference vs DFTB stock vs DFTB prolonged (same pattern as PTCDA strip). XYZ: `data/xyz/*.xyz`.
 - [ ] **All-electron Δρ (clamp → compact NA)** — CO tip guinea-pig first (`delta_rho_clamp_compact_na`); then sample. Distinguish all-e (Psi4/pySCF ∑Z) vs DFTB valence. See `Import_KrigingGridFF.md` §CO guinea-pig.
 - [ ] **Molecule-on-surface relax polish** — PTCDA+FAF USER review / charge dial-back; LFF GUI combo; FoldedRigid stability; instant GUI relax T02 (`doc/Tasks/PerfBenchmark_Relaxation.md`, `doc/Topics/ForceFields/LFF_ProjectiveRelax.md`)
 
 **P1 — packaging + AFM/STM demos**
-- [ ] **pip install / packaging** — `pyproject.toml`, kernels+data findable (`doc/Tasks/PipInstall_Packaging.md`)
-- [ ] **Kriging / RBF z-scan → GridFF** — port + FDBM-cube compare; **grid z/XY alignment is CRITICAL** (`doc/Tasks/Import_KrigingGridFF.md`; topic `doc/Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md`)
+- [ ] **Headless SPM CLI** — `run_spm.py` + `user_guide/SPM_CLI.md`: AFM (FDBM / Morse / Kriging) + STM (orbitals / current / panel) wired; gaps: BR-STM, substrate `relax`/dock, light-STM, charge-rings, FDBM↔Kriging compare entry, cube ES (`doc/Tasks/SPM_CLI_Headless.md`)
+- [ ] **Consolidate GUI↔CLI SPM backend + input protocol** — shared JSON `SPMJobSpec` → one `run_spm_job` (ModularPipeline S1–S6); GUI widgets / CLI argparse are adapters only; plots stay separate (matplotlib stills vs VisPy/blit interactive). **BR-STM:** already in GUI (`AFMExtension` S6); wire same path in CLI; verify GUI still works (`doc/Tasks/Consolidate_GUI_CLI_Backend_Input_Protocol.md`)
+- [ ] **pip install / packaging** — `pyproject.toml`, kernels+data findable (`doc/Tasks/PipInstall_Packaging.md`); expose `run_spm` console script
+- [ ] **Kriging / RBF z-scan → GridFF** — ported modules exist; FDBM-cube ES vs Kriging still open; **grid z/XY alignment is CRITICAL** (`doc/Tasks/Import_KrigingGridFF.md`; topic `doc/Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md`; reports `doc/Reports/Kriging_*.md`)
   - CO guinea-pig for ES Δρ + tip prolonged Pauli (notes in task file)
-- [ ] **Charge rings PME + Hubbard/MQCA** — OpenCL into SPAMMM (`doc/Tasks/Import_ChargeRings_PME.md`)
+- [ ] **Site-resolved Pauli \(A,\beta\) + transferability** — fit \(A\) (and β) at atoms/bonds/rings vs Kriging; optionally Kriging-interpolate parameter maps; spread across site types & molecules (`doc/Tasks/Pauli_A_beta_KrigingTransferability.md`)
+- [ ] **STM orbital compare (mio / 3ob / prolonged + pySCF cubes)** — pentacene + PTCDA HOMO/LUMO panels (`doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md`); CLI: `run_spm.py stm *`; depends on prolonged WFC
+- [ ] **Charge rings PME + Hubbard/MQCA** — OpenCL into SPAMMM; later CLI imaging (`doc/Tasks/Import_ChargeRings_PME.md`)
+- [ ] **Substrate pre-relax before imaging** — FF / DFTB / GridFF / FAF dock+relax as `run_spm.py relax|dock` (planned in `SPM_CLI_Headless.md`)
+- [ ] **Light-STM** — optically driven / excited-state STM channels (CLI ToDo; no module yet)
 
 **P2 — secondary if time**
+- [ ] **Kekulé → exponential RI density** — atom+bond Slater fit from Kekulé π orders vs DFT/DFTB (`doc/Tasks/Kekule_ExponentialDensityFit.md`)
+- [ ] **Fast 2.5D AFM (contact surface)** — harden separable + PIC; decide hybrid; L0 parity (`doc/Tasks/Fast_2p5D_AFM_ContactSurface.md`; design `ContactSurface_Static.md`)
 - [ ] **Frenkel Hamiltonian / TEPL** — design only today (`doc/Ideas/FrenkelRigidFF.chat.md`); no module yet
 
 ### Existing Soon
@@ -84,10 +93,8 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
 
 ### Repo consolidation (P3 / post-conference)
 
-- [ ] **Contact-surface (2.5D) AFM** — wire into AFMulator; L0 parity; elastic Phase 2 (`doc/Topics/AFM/ContactSurface_Static.md`, `ContactSurface_Elastic.md`, `kernels/contact_surface.cl`) (**P3**)
-- [ ] Wire contact surface into `AFMulator` / `RigidBodyAFM`
-- [ ] Contact-surface L0 pytest parity (brute vs separable/PIC)
-- [ ] **Dyson Level-1/2/3** — `doc/Tasks/DysonOrbitals_DFTB_STM.md` (**P3**)
+- [ ] **Contact-surface elastic Phase 2** — Winkler \(h,K_z\) (`ContactSurface_Elastic.md`); static 2.5D tracked under Soon P2 `Fast_2p5D_AFM_ContactSurface.md`
+- [ ] **Dyson Level-1/2/3** — `doc/Tasks/DysonOrbitals_DFTB_STM.md` (**P3**; after STM basis compare)
 - [ ] **OpenCL/JIT FF fit driver** — `doc/Tasks/FF_Optimizer_OpenCL_Driver.md` (**P3**)
 - [ ] **Stable Cosserat / cassette rods** — `doc/Tasks/Import_CosseratRods_PTCDA.md` (**P3**)
 - [ ] Charge-rings MC fit vs full experimental NPZ / QmeQ
@@ -95,7 +102,7 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
 
 ### Existing Later
 
-- [ ] Contact-surface elastic AFM (Winkler h, K_z, indentation solve)
+- [ ] **Refactor large modules** — analysis only for now: `doc/Tasks/Refactor_LargeModules.md` (`AFM_utils` ~5.3k L primary; Surface_utils / atomicUtils / editor / AFM.py secondary). **No code moves until USER approves split.**
 - [ ] FireCore port: RigidAtom XPBD / RRsp3
 - [ ] FireCore port: full ProjectiveDynamics / XPBD (LFF is the OpenCL spring-Jacobi path for adsorbates; broader XPBD still open)
 - [ ] Reactive rigid-atom FF
@@ -149,15 +156,15 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
 | Tests | `tests/topology/test_hbond_scan.py`, `test_scan_dataset.py`, `testplot_hbond_scan.py` |
 | Vibrations context | `doc/Topics/Vibrations.md` |
 
-### Contact surface (quasi-2D AFM)
+### Contact surface (quasi-2D / 2.5D AFM)
 | Item | Files |
 |------|-------|
+| **Task SSOT** | `doc/Tasks/Fast_2p5D_AFM_ContactSurface.md` |
 | Static design | `doc/Topics/AFM/ContactSurface_Static.md` |
 | Elastic design (Phase 2) | `doc/Topics/AFM/ContactSurface_Elastic.md` |
 | GPU + Python | `kernels/contact_surface.cl`, `spammm/surfaces/ContactSurface.py` |
-| Integration target | `spammm/SPM/AFM.py`, `kernels/AFM.cl` |
-| Visual test | `tests/testplot_contact_surface.py` |
-| Parity patterns | `tests/test_surface.py`, `tests/testplot_folded_surface_scan.py` |
+| Integration | `spammm/SPM/AFM.py` (`fit_*_contact*`, `run_scan_*`) |
+| L0 / L2 | `tests/SPM/test_afm_contact_surface.py`, `tests/testplot_contact_surface.py` |
 
 ### Assembly & surfaces
 | Item | Files |
@@ -197,6 +204,10 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
 | Modular pipeline + bench | `spammm/SPM/ModularPipeline.py`, `tests/SPM/bench_fdbm.py` |
 | FDBM tests | `tests/SPM/test_afm_fdbm.py` (incl. `test_fdbm_fast_s3_parity_pauli_es`), `tests/SPM/testplot_fdbm_relax.py` |
 | Perf report (T01) | `doc/Tasks/PerfBenchmark_FDBM.md` |
+| STM basis compare (new) | `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md` |
+| Pauli \(A,\beta\) maps (new) | `doc/Tasks/Pauli_A_beta_KrigingTransferability.md` |
+| Kekulé RI density (new) | `doc/Tasks/Kekule_ExponentialDensityFit.md` |
+| Kriging ↔ FDBM | `doc/Tasks/Import_KrigingGridFF.md`, `doc/Reports/Kriging_*.md` |
 
 ### Architecture & strategy
 | Item | Files |
@@ -224,10 +235,13 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
 | pip install (P1) | `doc/Tasks/PipInstall_Packaging.md` |
 | Prolonged DFTB basis (P0) | `doc/Tasks/ProlongedRadialBasis_DFTB.md`, `doc/DFTB_basis_fit.md` |
 | Kriging → GridFF (P1) | `doc/Tasks/Import_KrigingGridFF.md` |
+| Pauli \(A,\beta\) transferability (P1) | `doc/Tasks/Pauli_A_beta_KrigingTransferability.md` |
+| STM mio/3ob/prolonged + DFT cubes (P1) | `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md` |
 | Charge rings / PME / MQCA (P1) | `doc/Tasks/Import_ChargeRings_PME.md` |
+| Kekulé exponential RI density (P2) | `doc/Tasks/Kekule_ExponentialDensityFit.md` |
+| Fast 2.5D contact surface (P2) | `doc/Tasks/Fast_2p5D_AFM_ContactSurface.md` |
 | Frenkel / TEPL (P2) | `doc/Ideas/FrenkelRigidFF.chat.md` |
-| Contact surface (P3) | `doc/Topics/AFM/ContactSurface_Static.md`, `kernels/contact_surface.cl` |
-| Dyson STM (P3) | `doc/Tasks/DysonOrbitals_DFTB_STM.md`, `doc/Dyson_orbitals_STM.chat.md` |
+| Dyson STM (P3) | `doc/Tasks/DysonOrbitals_DFTB_STM.md`, `doc/Dyson_orbitals_STM.chat.md`
 | FF OpenCL fit driver (P3) | `doc/Tasks/FF_Optimizer_OpenCL_Driver.md` |
 | Cosserat / cassette PTCDA (P3) | `doc/Tasks/Import_CosseratRods_PTCDA.md` |
 

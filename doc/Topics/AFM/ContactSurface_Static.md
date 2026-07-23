@@ -9,6 +9,7 @@ timestamp: 2026-07-06
 # AFM Contact Surface — Static (Rigid Sample, Classical FF)
 
 **Status:** Prototype implemented and wired to `AFMulator`  
+**Task SSOT:** [../../Tasks/Fast_2p5D_AFM_ContactSurface.md](../../Tasks/Fast_2p5D_AFM_ContactSurface.md)  
 **Scope:** Memory-efficient **field representation** for rigid classical AFM (Morse/LJ); evaluated during PP relaxation, not a scan-image format.  
 **Pitfalls:** [Takeways.md](../../Takeways.md) · **Module index:** [spammm/surfaces/README.md](../../../spammm/surfaces/README.md)
 

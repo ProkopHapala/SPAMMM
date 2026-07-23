@@ -10,6 +10,8 @@
 
 Expose **Dyson-orbital (or controlled approximations)** as the STM imaging object instead of raw neutral HOMO/LUMO when charge-state / correlation matters — computed with DFTB+ where possible, projected on GPU with **prolonged radial basis** (`ProlongedRadialBasis_DFTB.md`).
 
+Prefer finishing the stock HOMO/LUMO basis panel first: `STM_ExtendedBasis_OrbitalCompare.md`.
+
 ## What the chat concludes (SSOT summary)
 
 DFTB+ does **not** ship correlated Dyson orbitals. Practical ladder:

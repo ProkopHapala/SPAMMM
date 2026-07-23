@@ -12,7 +12,7 @@ Key functionality:
   - Density providers: get_density_from_dftb(), get_density_from_pyscf(), get_density_from_cube()
   - CO tip: _co_tip_cache_dir(), _compute_co_tip_subprocess()
   - FDBM helpers: fft_poisson(), compute_pauli_field(), compute_es_conv_field()
-  - STM: compute_stm(), compute_bond_resolved_stm()
+  - STM: compute_stm(), compute_bond_resolved_stm(), compute_stm_basis_variants()
 
 Role in SPAMMM: AFM orchestration layer. Used by ModularPipeline.py for all
 stages and by AFMExtension.py for result visualization. Depends on AFM.py for
@@ -20,6 +20,12 @@ physics and DFTB/Grid_dftb.py for density projection.
 
 Design principle: AFM.py contains pure physics (no matplotlib, no QM).
 This module depends on AFM.py and adds plotting, I/O, and orchestration.
+
+Open issues / caveats:
+  - STM basis compare must use use_exp_basis=False so projector STO (stock vs prolonged)
+    is the imaging object; exp(β,r0) bypasses WFC and hides the prolonged-tail effect.
+  - Dual-basis AFM rule (prolonged Pauli only) does NOT apply to STM ψ — prolonged radial
+    is the map. See doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md.
 """
 
 import numpy as np
@@ -120,6 +126,112 @@ def plot_afm_height_panel(data, heights, iz=None, extent=None, label='Fz', cmap=
         fig.savefig(path, dpi=dpi, bbox_inches='tight'); plt.close(fig)
         print(f"  Saved {path}")
     return fig, axes
+
+
+def afm_panel_clim(arr, *, scale='per_image', pct=99.0, symmetric=False):
+    """Color limits for one AFM XY panel.
+
+    scale:
+      'per_image' — this array only (experimental-style relative contrast)
+      (common / per_column handled by caller who passes a pooled array)
+    symmetric: if True, return ±max(|lo|,|hi|) (diverging); else independent min/max.
+    """
+    a = np.asarray(arr, dtype=np.float64)
+    if a.size == 0:
+        return -1e-30, 1e-30
+    lo = float(np.percentile(a, 100.0 - float(pct)))
+    hi = float(np.percentile(a, float(pct)))
+    if not np.isfinite(lo): lo = float(np.nanmin(a)) if np.isfinite(np.nanmin(a)) else -1e-30
+    if not np.isfinite(hi): hi = float(np.nanmax(a)) if np.isfinite(np.nanmax(a)) else 1e-30
+    if hi <= lo:
+        hi = lo + 1e-30
+    if symmetric:
+        v = max(abs(lo), abs(hi), 1e-30)
+        return -v, v
+    return lo, hi
+
+
+def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
+                                  scale='per_image', title='', dpi=140, pct=99.0,
+                                  colorbar=True, figsize_col=1.55, figsize_row=1.35,
+                                  amp=None):
+    """Multi-row × multi-height AFM compare strip (df/Fz × methods).
+
+    Args:
+        variants: dict key → {'df': (nx,ny,nz), 'Fz': (nx,ny,nz), ...}
+        row_specs: list of (qty, key, ylabel, cmap) e.g. ('df','cube','df cube','gray')
+        heights: (nz,)  — probe heights; if both df and Fz rows are shown, remember
+          df(h) mixes Fz over ±amp (default panel amp=1.0 Å) so morphologies shift in z.
+          See compute_df_amp docstring / Fukui_FDBM_panel_notes_2026-07-23.md.
+        out_path: save path (.png)
+        scale:
+          'per_image'  — each panel its own min/max (experimental relative contrast)
+          'per_column' — shared clim across all variants at the same height+qty family
+          'common'     — one clim for all panels of the same qty (df vs Fz separate)
+        amp: if set, annotate title with peak oscillation amplitude [Å]
+        pct: percentile for clim (99 ≈ robust min/max)
+    """
+    heights = np.asarray(heights, dtype=np.float64)
+    n_h = len(heights)
+    n_r = len(row_specs)
+    fig, axes = plt.subplots(n_r, n_h,
+                             figsize=(figsize_col * n_h + 1.4, figsize_row * n_r + 1.2),
+                             squeeze=False)
+
+    # Precompute common / per_column clims
+    qty_keys = {}
+    for qty, key, _, _ in row_specs:
+        qty_keys.setdefault(qty, []).append(key)
+
+    common_clim = {}
+    if scale == 'common':
+        for qty, keys in qty_keys.items():
+            stack = np.concatenate([np.asarray(variants[k][qty], dtype=np.float64).ravel() for k in keys])
+            common_clim[qty] = afm_panel_clim(stack, pct=pct, symmetric=(qty != 'df'))
+
+    for ih in range(n_h):
+        col_clim = {}
+        if scale == 'per_column':
+            for qty, keys in qty_keys.items():
+                stack = np.concatenate([
+                    np.asarray(variants[k][qty][:, :, ih], dtype=np.float64).ravel() for k in keys])
+                col_clim[qty] = afm_panel_clim(stack, pct=pct, symmetric=(qty != 'df'))
+
+        for ir, (qty, key, ylab, cmap) in enumerate(row_specs):
+            ax = axes[ir, ih]
+            arr = np.asarray(variants[key][qty][:, :, ih], dtype=np.float64)
+            if scale == 'per_image':
+                # Experimental: relative contrast within this image (not zero-forced)
+                vmin, vmax = afm_panel_clim(arr, pct=pct, symmetric=False)
+            elif scale == 'per_column':
+                vmin, vmax = col_clim[qty]
+            else:
+                vmin, vmax = common_clim[qty]
+            im = ax.imshow(arr.T, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax, aspect='equal')
+            ax.set_xticks([]); ax.set_yticks([])
+            if ir == 0:
+                ax.set_title(f'h={heights[ih]:.2f}Å', fontsize=8)
+            if ih == 0:
+                ax.set_ylabel(ylab, fontsize=7)
+            if colorbar and ih == n_h - 1:
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    scale_note = {
+        'per_image': 'color scale = per panel min/max (relative contrast)',
+        'per_column': 'color scale = shared per column (variants comparable)',
+        'common': 'color scale = common across all panels of same qty',
+    }.get(scale, scale)
+    amp_note = ''
+    if amp is not None:
+        amp_note = (f'  |  df amp={float(amp):.2f}Å peak → mixes Fz over ±amp '
+                    f'(closest≈h−amp); do not equate Fz(h) with df(h)')
+    fig.suptitle(f'{title}\n{scale_note}{amp_note}', fontsize=10)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or '.', exist_ok=True)
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print(f'REVIEW: {out_path}')
+    return out_path
 
 
 def plot_afm_df_Fz_tworow(
@@ -690,7 +802,8 @@ def build_orbital_layout(basis_data, enames):
 
 def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
                                  grid_spec=None, step=0.1, margin=4.0, z_extra=6.0,
-                                 verbosity=0, max_shells=None, projection_basis_ang=None):
+                                 verbosity=0, max_shells=None, projection_basis_ang=None,
+                                 project_density=True):
     """Get density grids using DFTBcore dense matrix projection (supports d-orbitals).
 
     Uses direct DFTBcore library access (no file parsing) and dense density matrix
@@ -715,9 +828,12 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
               - Electrostatics MUST use stock Δρ → V_ES (call this function twice
                 or keep stock ρ_diff / V_ES from a separate stock projection).
               - See `make_slater_tail_species_list` docstring and `doc/DFTB_basis_fit.md`.
+        project_density: if False, skip ρ/V_ES (STM orbital-only path still returns
+            eigvecs + projector).
 
     Returns:
         dict with 'rho_scf', 'rho_na', 'rho_diff', 'V_ES', 'origin', 'ngrid', 'grid_spec'
+        (density keys None when project_density=False)
     """
     from spammm.quantum.DFTB.DFTBcore import DFTBcore
     from spammm.quantum.DFTB.DFTBplusParser import parse_wfc_hsd, convert_wfc_to_species_list_ang
@@ -829,37 +945,39 @@ Hamiltonian = DFTB {{
     finally:
         os.chdir(old_cwd)
 
-    # Project SCF density using dense method (supports d-orbitals)
-    rho_scf = projector.project_density_dense(dm_dense.astype(np.float32), norb_per_atom, orb_offsets, atoms_dict, grid_spec)
+    rho_scf = rho_na = rho_diff = V_ES = None
+    if project_density:
+        # Project SCF density using dense method (supports d-orbitals)
+        rho_scf = projector.project_density_dense(dm_dense.astype(np.float32), norb_per_atom, orb_offsets, atoms_dict, grid_spec)
 
-    # Build geo dict for neutral density projection (sparse method)
-    geo = {
-        'natoms': len(enames),
-        'species_per_atom': species_per_atom,
-        'species_names': enames,
-        'coords_bohr': coords_bohr
-    }
-    # Neutral-atom density: diagonal NA DM → one project_density_dense (same physics as AO loop)
-    rho_na = dg.project_neutral_density(
-        geo, projector, atoms_dict, grid_spec, proj_basis,
-        norb_per_atom=norb_per_atom, orb_offsets=orb_offsets)
+        # Build geo dict for neutral density projection (sparse method)
+        geo = {
+            'natoms': len(enames),
+            'species_per_atom': species_per_atom,
+            'species_names': enames,
+            'coords_bohr': coords_bohr
+        }
+        # Neutral-atom density: diagonal NA DM → one project_density_dense (same physics as AO loop)
+        rho_na = dg.project_neutral_density(
+            geo, projector, atoms_dict, grid_spec, proj_basis,
+            norb_per_atom=norb_per_atom, orb_offsets=orb_offsets)
 
-    rho_diff = (rho_scf - rho_na).astype(np.float32)
+        rho_diff = (rho_scf - rho_na).astype(np.float32)
 
-    # CRITICAL: Check charge conservation - rho_diff should integrate to ~0
-    # Both rho_scf and rho_na should contain the same total number of electrons
-    cell_volume = step**3
-    q_scf = rho_scf.sum() * cell_volume
-    q_na = rho_na.sum() * cell_volume
-    q_diff_val = rho_diff.sum() * cell_volume
-    print(f"  [CHARGE CHECK] step={step:.3f} Å, cell_vol={cell_volume:.6f} Å³")
-    print(f"  [CHARGE CHECK] rho_scf.sum={rho_scf.sum():.1f}, rho_na.sum={rho_na.sum():.1f}")
-    print(f"  [CHARGE CHECK] q_scf={q_scf:.3f}, q_na={q_na:.3f}, q_diff={q_diff_val:.6f} (should be ~0)")
-    if abs(q_diff_val) > 2.0:  # More than 2.0 electron discrepancy is serious
-        print(f"  WARNING: Large charge imbalance in rho_diff! Electrostatics may be unreliable.")
-        print(f"           Consider increasing grid resolution or checking basis consistency.")
+        # CRITICAL: Check charge conservation - rho_diff should integrate to ~0
+        # Both rho_scf and rho_na should contain the same total number of electrons
+        cell_volume = step**3
+        q_scf = rho_scf.sum() * cell_volume
+        q_na = rho_na.sum() * cell_volume
+        q_diff_val = rho_diff.sum() * cell_volume
+        print(f"  [CHARGE CHECK] step={step:.3f} Å, cell_vol={cell_volume:.6f} Å³")
+        print(f"  [CHARGE CHECK] rho_scf.sum={rho_scf.sum():.1f}, rho_na.sum={rho_na.sum():.1f}")
+        print(f"  [CHARGE CHECK] q_scf={q_scf:.3f}, q_na={q_na:.3f}, q_diff={q_diff_val:.6f} (should be ~0)")
+        if abs(q_diff_val) > 2.0:  # More than 2.0 electron discrepancy is serious
+            print(f"  WARNING: Large charge imbalance in rho_diff! Electrostatics may be unreliable.")
+            print(f"           Consider increasing grid resolution or checking basis consistency.")
 
-    V_ES = afm.fft_poisson(rho_diff, step)
+        V_ES = afm.fft_poisson(rho_diff, step)
 
     return {'rho_scf': rho_scf, 'rho_na': rho_na, 'rho_diff': rho_diff, 'V_ES': V_ES,
             'origin': origin, 'ngrid': ngrid, 'grid_spec': grid_spec,
@@ -1383,18 +1501,36 @@ def get_density_from_cube(cube_path_or_dir, *, esp_path=None, sigma_na=0.3,
     from spammm.quantum.DFTB.DFTBplusParser import read_cube
 
     path = cube_path_or_dir
+    _RHO_NAMES = ('Dt.cube', 'rho_N.cube', 'rho.cube')
+    _ESP_NAMES = ('ESP.cube', 'esp_N.cube', 'esp.cube')
     if os.path.isdir(path):
-        dt_path = os.path.join(path, 'Dt.cube')
-        if esp_path is None:
-            cand = os.path.join(path, 'ESP.cube')
+        dt_path = None
+        for name in _RHO_NAMES:
+            cand = os.path.join(path, name)
             if os.path.isfile(cand):
-                esp_path = cand
+                dt_path = cand
+                break
+        if dt_path is None:
+            raise FileNotFoundError(f"get_density_from_cube: no density cube in {path} (tried {_RHO_NAMES})")
+        if esp_path is None:
+            for name in _ESP_NAMES:
+                cand = os.path.join(path, name)
+                if os.path.isfile(cand):
+                    esp_path = cand
+                    break
     else:
         dt_path = path
         if esp_path is None:
-            cand = os.path.join(os.path.dirname(path), 'ESP.cube')
-            if os.path.isfile(cand):
-                esp_path = cand
+            dname = os.path.dirname(path)
+            base = os.path.basename(path)
+            # rho_N.cube → esp_N.cube; Dt.cube → ESP.cube
+            paired = None
+            if base.startswith('rho_') and base.endswith('.cube'):
+                paired = os.path.join(dname, 'esp_' + base[4:])
+            for cand in ([paired] if paired else []) + [os.path.join(dname, n) for n in _ESP_NAMES]:
+                if cand and os.path.isfile(cand):
+                    esp_path = cand
+                    break
     if not os.path.isfile(dt_path):
         raise FileNotFoundError(f"get_density_from_cube: missing Dt cube: {dt_path}")
 
@@ -1406,14 +1542,17 @@ def get_density_from_cube(cube_path_or_dir, *, esp_path=None, sigma_na=0.3,
     b3 = BOHR_TO_ANG ** 3
     rho_scf = (rho_b / b3).astype(np.float32)
     origin = np.asarray(origin_b, dtype=np.float64) * BOHR_TO_ANG
-    step_vec = np.asarray(step_b, dtype=np.float64) * BOHR_TO_ANG
-    if abs(step_vec[0] - step_vec[1]) > 1e-6 or abs(step_vec[0] - step_vec[2]) > 1e-6:
-        raise ValueError(f"get_density_from_cube: non-isotropic cube step {step_vec}")
-    step = float(step_vec[0])
+    step_vec = np.asarray(step_b, dtype=np.float64).ravel()[:3] * BOHR_TO_ANG
+    step_mean = float(np.mean(step_vec))
+    aniso = float(np.max(np.abs(step_vec - step_mean)) / max(step_mean, 1e-30))
+    # pySCF cubes often have ~0.1% axis anisotropy from cell rounding — accept and use mean step
+    if aniso > 0.01:
+        raise ValueError(f"get_density_from_cube: non-isotropic cube step {step_vec} (aniso={aniso:.3e})")
+    step = step_mean
     atomZ = np.array([a[0] for a in atoms_b], dtype=np.float64)
     atomPos = np.array([[a[1], a[2], a[3]] for a in atoms_b], dtype=np.float64) * BOHR_TO_ANG
 
-    dV = step ** 3
+    dV = float(np.prod(step_vec))  # exact voxel volume even if mildly anisotropic
     q_scf = float(rho_scf.sum() * dV)
     na_kind = str(na_kind).lower().strip()
     if na_kind == 'gaussian':
@@ -2705,10 +2844,14 @@ def compute_stm(projector, eigvecs, eigvals, scan_xs, scan_ys, heights,
     else:
         if lumo_offsets is None:
             lumo_offsets = [1, 2, 3]
-        occ = np.where(eigvals < 0.0)[0]
-        if len(occ) == 0:
-            raise ValueError("STM: No occupied states found (eigvals < 0)")
-        homo_idx = int(occ[-1])
+        # CAVEAT: never use eigvals<0 as HOMO for DFTB (see dftb_frontier_mo_indices).
+        if atoms_dict is not None and 'type' in atoms_dict:
+            homo_idx, _ = dftb_frontier_mo_indices(eigvals, atomTypes=atoms_dict['type'])
+        else:
+            raise ValueError(
+                "STM: need atoms_dict['type'] for valence HOMO; "
+                "eigvals<0 is wrong for DFTB (picks near-zero virtuals). "
+                "See dftb_frontier_mo_indices / doc/Reports/STM_ExtendedBasis_OrbitalCompare.md")
         mo_list = [homo_idx + int(off) for off in lumo_offsets]
 
     nmo = int(eigvecs.shape[0])
@@ -2783,10 +2926,13 @@ def compute_bond_resolved_stm(projector, eigvecs, eigvals, scan_xs, scan_ys, hei
     else:
         if lumo_offsets is None:
             lumo_offsets = [1, 2, 3]
-        occ = np.where(eigvals < 0.0)[0]
-        if len(occ) == 0:
-            raise ValueError("BR-STM: No occupied states found (eigvals < 0)")
-        homo_idx = int(occ[-1])
+        # CAVEAT: never use eigvals<0 as HOMO for DFTB (see dftb_frontier_mo_indices).
+        if atoms_dict is not None and 'type' in atoms_dict:
+            homo_idx, _ = dftb_frontier_mo_indices(eigvals, atomTypes=atoms_dict['type'])
+        else:
+            raise ValueError(
+                "BR-STM: need atoms_dict['type'] for valence HOMO; "
+                "eigvals<0 is wrong for DFTB. See dftb_frontier_mo_indices.")
         mo_list = [homo_idx + int(off) for off in lumo_offsets]
 
     nmo = int(eigvecs.shape[0])
@@ -2843,6 +2989,556 @@ def compute_bond_resolved_stm(projector, eigvecs, eigvals, scan_xs, scan_ys, hei
 
     print(f"  [BR-STM] STM grid shape: {stm_grid.shape}, range: [{stm_grid.min():.4e}, {stm_grid.max():.4e}]")
     return stm_grid
+
+
+def _set_projector_species_basis(projector, atoms_dict, species_list_ang, *, rc_max=None, max_shells=None):
+    """Reload/update STO radial table + atom Rcut for orbital projection.
+
+    Always load with rc_max covering prolonged tails (default ≥6 Å) so stock→prolonged
+    swaps via the same n_nodes grid; then Rcut matches per-atom orbital cutoffs.
+    """
+    if rc_max is None:
+        rc_max = max(float(orb['cutoff']) for sp in species_list_ang for orb in sp['orbitals'])
+        rc_max = max(rc_max, 6.0)
+    if max_shells is None:
+        max_shells = projector.basis_meta.get('max_shells', 2) if getattr(projector, 'basis_meta', None) else 2
+    projector.load_basis_sto(species_list_ang, rc_max=rc_max, max_shells=max_shells)
+    sp_by_nz = {sp['atomic_number']: sp for sp in species_list_ang}
+    cutoffs = []
+    for Z in atoms_dict['type']:
+        sp = sp_by_nz[int(Z)]
+        cutoffs.append(max(float(orb['cutoff']) for orb in sp['orbitals']))
+    atoms_dict['Rcut'] = np.asarray(cutoffs, dtype=np.float64)
+    return atoms_dict
+
+
+# DFTB+/mio/3ob valence electrons per element (SCC filling). Not Z!
+DFTB_VALENCE_ELEC = {'H': 1, 'C': 4, 'N': 5, 'O': 6, 'P': 5, 'S': 6, 'Br': 7, 'I': 7}
+
+
+def dftb_n_valence_electrons(enames=None, atomTypes=None):
+    """Total valence electrons for DFTB occupation (closed-shell → n_occ = n_elec//2)."""
+    if enames is not None:
+        return int(sum(DFTB_VALENCE_ELEC.get(str(e), 4) for e in enames))
+    if atomTypes is not None:
+        inv = {1: 'H', 6: 'C', 7: 'N', 8: 'O', 15: 'P', 16: 'S', 35: 'Br', 53: 'I'}
+        return int(sum(DFTB_VALENCE_ELEC.get(inv.get(int(z), 'C'), 4) for z in atomTypes))
+    raise ValueError('dftb_n_valence_electrons: need enames or atomTypes')
+
+
+def dftb_frontier_mo_indices(eigvals, n_elec=None, enames=None, atomTypes=None):
+    """HOMO / LUMO from valence electron count (NOT eigvals<0).
+
+    CAVEAT (SSOT — do not “fix” back to eigvals<0):
+      DFTB eigenvalues sit near the Fermi level (~−4 eV for aromatics). Using
+      ``eigvals < 0`` wrongly counts empty states between E_F and 0 as occupied and
+      returns a near-gap *virtual* as “HOMO” (e.g. pentacene #56 @ −0.18 eV instead of
+      #50 @ −4.79 eV). That broke STM/orbital morphology vs pySCF.
+      Always use valence n_elec // 2 (DFTB_VALENCE_ELEC / detailed.out “Nr. of up electrons”).
+      Report: doc/Reports/STM_ExtendedBasis_OrbitalCompare.md
+    """
+    eigvals = np.asarray(eigvals)
+    if n_elec is None:
+        n_elec = dftb_n_valence_electrons(enames=enames, atomTypes=atomTypes)
+    if n_elec % 2 != 0:
+        raise ValueError(f'dftb_frontier_mo_indices: odd n_elec={n_elec} (open shell not handled)')
+    n_occ = n_elec // 2
+    if n_occ < 1 or n_occ >= len(eigvals):
+        raise ValueError(f'dftb_frontier_mo_indices: n_occ={n_occ} invalid for nMO={len(eigvals)}')
+    homo = int(n_occ - 1)
+    lumo = homo + 1
+    return homo, lumo
+
+
+def project_mo_xy_slice(projector, coeffs, norb_per_atom, orb_offsets, atoms_dict,
+                        scan_xs, scan_ys, z_A, *, use_exp_basis=False):
+    """Project one DFTB MO onto a constant-height xy plane (Å). Returns (nx,ny) ψ.
+
+    DFTB STO via OpenCL ``project_orbital_dense_points`` (kernels/LCAO_grid.cl).
+    For pySCF / any GTO (incl. def2-SVP double-ζ) use
+    ``spammm.quantum.pySCF_utils-new.eval_mo_on_xy_slice`` — full ``numint.eval_ao``,
+    no AO truncation (not the DFTB STO kernels).
+    """
+    XX, YY = np.meshgrid(scan_xs, scan_ys, indexing='ij')
+    points = np.stack([XX.ravel(), YY.ravel(), np.full(XX.size, float(z_A))], axis=1).astype(np.float32)
+    c = np.asarray(coeffs, dtype=np.float32).ravel()
+    if use_exp_basis:
+        psi = projector.project_orbital_dense_points_exp(
+            points, c, norb_per_atom, orb_offsets, atoms_dict)
+    else:
+        psi = projector.project_orbital_dense_points(
+            points, c, norb_per_atom, orb_offsets, atoms_dict)
+    return psi.reshape(len(scan_xs), len(scan_ys))
+
+
+# STM tip orbital coeffs in OpenCL [px, py, pz, s] order (mo_overlap_points_exp_sk).
+# φ_tip selects which tip orbital; STM **current** is always ≥0: I ~ |⟨φ_s|H'|φ_t⟩|²
+# (kernel returns t and I=t²). Orbital **phase maps** use project_mo_xy_slice (signed ψ).
+STM_TIP_ORBITALS = {
+    's':  np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+    'pz': np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32),
+    'py': np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+}
+
+
+def project_mo_stm_sk_slice(projector, mo_coeff, atoms_dict, basis_ang, enames, species_per_atom,
+                            scan_xs, scan_ys, z_A, *, tip_orbital='s',
+                            beta=1.0, r0=3.0, rcut=8.0, intensity=True):
+    """DFTB MO-resolved STM **current** at constant z (always ≥0).
+
+    Point tip φ_t ∈ {s, pz, py} couples to sample MO φ_s via exp+SK (mo_overlap_points_exp_sk).
+    Returns (nx,ny) intensity I=t². Set ``intensity=False`` only for debugging (signed t).
+    For signed orbital ψ maps use ``project_mo_xy_slice`` (field='psi').
+    """
+    from spammm.quantum.DFTB.DFTBplusParser import evec_to_kernel_coeffs
+    tip_orbital = str(tip_orbital).lower()
+    if tip_orbital not in STM_TIP_ORBITALS:
+        raise ValueError(f"tip_orbital must be one of {tuple(STM_TIP_ORBITALS)}, got {tip_orbital!r}")
+    natoms = len(enames)
+    species_names = list(enames)
+    coeffs_smp = evec_to_kernel_coeffs(
+        np.asarray(mo_coeff, dtype=np.float64).ravel(), natoms,
+        species_per_atom, species_names, basis_ang)
+    coeffs_tip = np.tile(STM_TIP_ORBITALS[tip_orbital], (1, 1))
+    XX, YY = np.meshgrid(scan_xs, scan_ys, indexing='ij')
+    tip_centers = np.stack(
+        [XX.ravel(), YY.ravel(), np.full(XX.size, float(z_A))], axis=1).astype(np.float32)
+    tip_pos_rel = np.zeros((1, 3), dtype=np.float32)
+    smp_pos = np.asarray(atoms_dict['pos'][:natoms], dtype=np.float32)
+    t, I = projector.mo_overlap_points_exp_sk(
+        tip_centers, tip_pos_rel, smp_pos, coeffs_tip, coeffs_smp,
+        beta=float(beta), r0=float(r0), rcut=float(rcut))
+    nx, ny = len(scan_xs), len(scan_ys)
+    out = I if intensity else t
+    return out.reshape(nx, ny)
+
+
+def plot_eigspectrum_compare(E_dftb_eV, homo_d, E_pyscf_eV, homo_p, out_path, *,
+                             n_near=5, title=None, mark_indices_d=None, mark_indices_p=None):
+    """Side-by-side eigenvalue ladders. Energy grows **up** (unoccupied above occupied).
+
+    Prefer ``plot_spectrum_with_orbitals`` when orbital maps are available.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(9.0, 6.5), sharey=True)
+    specs = [
+        (axes[0], E_dftb_eV, homo_d, 'DFTB', mark_indices_d),
+        (axes[1], E_pyscf_eV, homo_p, 'pySCF', mark_indices_p),
+    ]
+    for ax, E, homo, tag, marks in specs:
+        E = np.asarray(E, dtype=np.float64)
+        nmo = len(E)
+        lumo = homo + 1
+        if marks is None:
+            lo = max(0, homo - n_near)
+            hi = min(nmo - 1, lumo + n_near)
+            marks = list(range(lo, hi + 1))
+        for i, e in enumerate(E):
+            ax.hlines(e, 0.10, 0.55, colors='0.8', lw=0.5, zorder=1)
+        for i in marks:
+            e = float(E[i])
+            col = 'C0' if i <= homo else 'C3'
+            ax.hlines(e, 0.15, 0.60, colors=col, lw=2.2, zorder=2)
+            rel = i - homo
+            if rel == 0:
+                lab = 'HOMO'
+            elif rel == 1:
+                lab = 'LUMO'
+            elif rel < 0:
+                lab = f'H{rel:+d}'
+            else:
+                lab = f'L+{rel-1}'
+            ax.annotate(f'{lab} #{i}\n{e:.2f} eV',
+                        xy=(0.60, e), xytext=(0.72, e),
+                        fontsize=6.5, color=col, va='center',
+                        arrowprops=dict(arrowstyle='->', color=col, lw=0.9))
+        ax.set_xlim(0, 1.35)
+        ax.set_xticks([])
+        ax.set_title(f'{tag}  HOMO#{homo}  gap={float(E[lumo]-E[homo]):.3f} eV', fontsize=9)
+        if tag == 'DFTB':
+            ax.set_ylabel('E (eV)  ↑')
+        ax.axhline(float(E[homo]), color='C0', ls=':', lw=0.8, alpha=0.4)
+        ax.axhline(float(E[lumo]), color='C3', ls=':', lw=0.8, alpha=0.4)
+        ymin = float(E[marks[0]]) - 1.0
+        ymax = float(E[marks[-1]]) + 1.0
+        ax.set_ylim(ymin, ymax)  # low E bottom, high E top
+    if title:
+        fig.suptitle(title, fontsize=10)
+    fig.tight_layout(rect=[0, 0, 1, 0.95] if title else None)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_spectrum_with_orbitals(E_dftb_eV, homo_d, maps_dftb, E_pyscf_eV, homo_p, maps_pyscf,
+                                mo_rel_indices, scan_xs, scan_ys, out_path, *,
+                                atom_pos=None, title=None, field='psi', layout='vertical'):
+    """Shared center spectrum + maps on both sides; sloped E↔map connectors.
+
+    ``field``:
+      - ``'psi'``  — **orbital** map: signed phase (RdBu). No STM tip coupling.
+      - ``'psi2'`` / ``'stm'`` / ``'ldos'`` — **STM current** (viridis, ≥0): I∝|matrix element|².
+
+    ``layout``: ``'vertical'`` (E↑) or ``'horizontal'`` (E→, ψ/STM upright).
+    """
+    from matplotlib.patches import ConnectionPatch
+    from matplotlib.ticker import MultipleLocator
+
+    def _lab(k):
+        if k == 0:
+            return 'HOMO'
+        if k == 1:
+            return 'LUMO'
+        if k < 0:
+            return f'H{k:+d}'
+        return f'L+{k-1}'
+
+    layout = str(layout).lower().strip()
+    if layout not in ('vertical', 'horizontal'):
+        raise ValueError(f"layout must be 'vertical' or 'horizontal', got {layout!r}")
+
+    rels_hi = sorted(mo_rel_indices, reverse=True)
+    rels_lo = sorted(mo_rel_indices)
+    n = len(rels_hi)
+    E_d = np.asarray(E_dftb_eV, dtype=np.float64)
+    E_p = np.asarray(E_pyscf_eV, dtype=np.float64)
+    e_marked = [float(E_d[homo_d + k]) for k in rels_hi] + [float(E_p[homo_p + k]) for k in rels_hi]
+    e_lo, e_hi = min(e_marked) - 0.15, max(e_marked) + 0.15
+    signed_map = str(field).lower() == 'psi'
+    cmap = 'RdBu_r' if signed_map else 'viridis'
+    xs0, xs1 = float(scan_xs[0]), float(scan_xs[-1])
+    ys0, ys1 = float(scan_ys[0]), float(scan_ys[-1])
+    Lx, Ly = xs1 - xs0, ys1 - ys0
+    e_ticks = np.arange(np.floor(e_lo * 2) / 2.0, np.ceil(e_hi * 2) / 2.0 + 1e-9, 0.5)
+
+    def _strip_spines(ax):
+        ax.set_frame_on(False)
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+        ax.patch.set_visible(False)
+
+    def _imshow_psi(ax, arr, *, rotate=False):
+        a = np.asarray(arr)
+        vmax = float(np.percentile(np.abs(a), 99)) or 1e-30
+        vmin = -vmax if signed_map else 0.0
+        if rotate:
+            ax.imshow(a, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax,
+                      extent=[ys0, ys1, xs0, xs1], aspect='auto')
+            if atom_pos is not None:
+                ax.scatter(atom_pos[:, 1], atom_pos[:, 0], c='k', s=1.2, alpha=0.3, zorder=5)
+        else:
+            ax.imshow(a.T, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax,
+                      extent=[xs0, xs1, ys0, ys1], aspect='auto')
+            if atom_pos is not None:
+                ax.scatter(atom_pos[:, 0], atom_pos[:, 1], c='k', s=1.2, alpha=0.3, zorder=5)
+        ax.set_xticks([]); ax.set_yticks([])
+        _strip_spines(ax)
+
+    def _paint_E_scale(ax, axis='y'):
+        if axis == 'y':
+            ax.set_yticks(e_ticks)
+            ax.set_yticklabels([])
+            ax.tick_params(axis='y', which='major', length=2.0, width=0.5, direction='in')
+            ax.yaxis.set_minor_locator(MultipleLocator(0.25))
+            ax.tick_params(axis='y', which='minor', length=1.0, width=0.4, direction='in')
+            for t in e_ticks:
+                if abs(t - round(t)) < 1e-9:
+                    ax.text(0.5, t, f'{t:.0f}', fontsize=4.2, ha='center', va='center',
+                            color='0.25', zorder=5, clip_on=True)
+        else:
+            ax.set_xticks(e_ticks)
+            ax.set_xticklabels([])
+            ax.tick_params(axis='x', which='major', length=2.0, width=0.5, direction='in')
+            ax.xaxis.set_minor_locator(MultipleLocator(0.25))
+            ax.tick_params(axis='x', which='minor', length=1.0, width=0.4, direction='in')
+            for t in e_ticks:
+                if abs(t - round(t)) < 1e-9:
+                    ax.text(t, 0.5, f'{t:.0f}', fontsize=4.2, ha='center', va='center',
+                            color='0.25', zorder=5, clip_on=True)
+        _strip_spines(ax)
+
+    if layout == 'vertical':
+        # small gap (inches) so sloped connectors are visible — not flush, not huge
+        gap_in = 0.10
+        panel_aspect = Ly / max(Lx, 1e-12)
+        row_h_in = 0.52
+        panel_w_in = row_h_in / max(panel_aspect, 1e-12)
+        spec_w_in = 0.30
+        fig_w = 2 * panel_w_in + spec_w_in + 2 * gap_in + 0.10
+        fig_h = row_h_in * n + 0.42
+        fig = plt.figure(figsize=(fig_w, fig_h))
+        top_m, bot_m, side_m = 0.045, 0.01, 0.012
+        usable_h = 1.0 - top_m - bot_m
+        row_h = usable_h / n
+        lab_h = 0.10 * row_h   # room above each ψ for label
+        img_h = row_h - lab_h
+        gap = gap_in / fig_w
+        spec_w = spec_w_in / fig_w
+        panel_w = panel_w_in / fig_w
+        left_x = side_m
+        spec_left = left_x + panel_w + gap
+        right_x = spec_left + spec_w + gap
+        ax_spec = fig.add_axes([spec_left, bot_m, spec_w, usable_h])
+        ax_spec.set_xlim(0.0, 1.0)
+        ax_spec.set_ylim(e_lo, e_hi)
+        ax_spec.set_xticks([])
+        _paint_E_scale(ax_spec, 'y')
+        ax_spec.text(0.22, e_hi, 'D', fontsize=5.5, ha='center', va='bottom', color='0.35')
+        ax_spec.text(0.78, e_hi, 'P', fontsize=5.5, ha='center', va='bottom', color='0.35')
+        ax_spec.axvline(0.5, color='0.85', ls=':', lw=0.3, zorder=0)
+        for e in E_d:
+            ax_spec.hlines(float(e), 0.00, 0.45, colors='0.9', lw=0.2, zorder=1)
+        for e in E_p:
+            ax_spec.hlines(float(e), 0.55, 1.00, colors='0.9', lw=0.2, zorder=1)
+
+        for ir, k in enumerate(rels_hi):
+            imo_d, imo_p = homo_d + k, homo_p + k
+            ed, ep = float(E_d[imo_d]), float(E_p[imo_p])
+            col = 'C0' if k <= 0 else 'C3'
+            ax_spec.hlines(ed, 0.00, 0.42, colors=col, lw=1.35, zorder=3)
+            ax_spec.hlines(ep, 0.58, 1.00, colors=col, lw=1.35, zorder=3)
+            y0 = bot_m + (n - 1 - ir) * row_h
+            ax_d = fig.add_axes([left_x, y0, panel_w, img_h])
+            ax_p = fig.add_axes([right_x, y0, panel_w, img_h])
+            _imshow_psi(ax_d, maps_dftb[imo_d])
+            _imshow_psi(ax_p, maps_pyscf[imo_p])
+            # labels in the lab strip above the image (not inside imshow axes)
+            fig.text(left_x + 0.5 * panel_w, y0 + img_h + 0.15 * lab_h,
+                     f'{_lab(k)} D#{imo_d} {ed:.2f}', fontsize=4.6, ha='center', va='bottom', color=col)
+            fig.text(right_x + 0.5 * panel_w, y0 + img_h + 0.15 * lab_h,
+                     f'{_lab(k)} P#{imo_p} {ep:.2f}', fontsize=4.6, ha='center', va='bottom', color=col)
+            fig.add_artist(ConnectionPatch(
+                xyA=(0.0, ed), coordsA=ax_spec.transData,
+                xyB=(1.0, 0.5), coordsB=ax_d.transAxes,
+                color=col, lw=0.7, alpha=0.9, zorder=4, arrowstyle='-'))
+            fig.add_artist(ConnectionPatch(
+                xyA=(1.0, ep), coordsA=ax_spec.transData,
+                xyB=(0.0, 0.5), coordsB=ax_p.transAxes,
+                color=col, lw=0.7, alpha=0.9, zorder=4, arrowstyle='-'))
+    else:
+        # DFTB = TOP half (ψ + ticks toward top); pySCF = BOTTOM half — no cross-midline links
+        gap_in = 0.08
+        panel_aspect = Lx / max(Ly, 1e-12)
+        col_w_in = 0.68
+        panel_h_in = col_w_in * panel_aspect
+        spec_h_in = 0.34
+        lab_in = 0.22          # label strip above DFTB / below pySCF
+        title_in = 0.28        # room for fig.suptitle — no overlap with labels
+        fig_w = col_w_in * n + 0.30
+        fig_h = 2 * panel_h_in + spec_h_in + 2 * gap_in + 2 * lab_in + title_in
+        fig = plt.figure(figsize=(fig_w, fig_h))
+        left_m, right_m = 0.02, 0.005
+        usable_w = 1.0 - left_m - right_m
+        col_w = usable_w / n
+        img_h = panel_h_in / fig_h
+        spec_h = spec_h_in / fig_h
+        gap = gap_in / fig_h
+        lab_h = lab_in / fig_h
+        title_h = title_in / fig_h
+        # top → bottom: title | lab_D | ψ_D | gap | spectrum | gap | ψ_P | lab_P
+        y_lab_d = 1.0 - title_h - lab_h
+        y_d = y_lab_d - img_h
+        y_spec = y_d - gap - spec_h
+        y_p = y_spec - gap - img_h
+        y_lab_p = y_p - lab_h
+        ax_spec = fig.add_axes([left_m, y_spec, usable_w, spec_h])
+        ax_spec.set_ylim(0.0, 1.0)
+        ax_spec.set_xlim(e_lo, e_hi)
+        ax_spec.set_yticks([])
+        _paint_E_scale(ax_spec, 'x')
+        # TOP half of spectrum = DFTB; BOTTOM half = pySCF
+        ax_spec.axhline(0.5, color='0.85', ls=':', lw=0.3, zorder=0)
+        ax_spec.text(e_lo, 0.78, 'DFTB', fontsize=5.5, ha='left', va='center', color='0.35')
+        ax_spec.text(e_lo, 0.22, 'pySCF', fontsize=5.5, ha='left', va='center', color='0.35')
+        for e in E_d:
+            ax_spec.vlines(float(e), 0.55, 1.00, colors='0.9', lw=0.2, zorder=1)
+        for e in E_p:
+            ax_spec.vlines(float(e), 0.00, 0.45, colors='0.9', lw=0.2, zorder=1)
+
+        for ic, k in enumerate(rels_lo):
+            imo_d, imo_p = homo_d + k, homo_p + k
+            ed, ep = float(E_d[imo_d]), float(E_p[imo_p])
+            col = 'C0' if k <= 0 else 'C3'
+            # DFTB ticks on TOP half; pySCF on BOTTOM half
+            ax_spec.vlines(ed, 0.55, 1.00, colors=col, lw=1.35, zorder=3)
+            ax_spec.vlines(ep, 0.00, 0.45, colors=col, lw=1.35, zorder=3)
+            x0 = left_m + ic * col_w + 0.01 * col_w
+            pw = 0.98 * col_w
+            ax_d = fig.add_axes([x0, y_d, pw, img_h])
+            ax_p = fig.add_axes([x0, y_p, pw, img_h])
+            _imshow_psi(ax_d, maps_dftb[imo_d], rotate=True)
+            _imshow_psi(ax_p, maps_pyscf[imo_p], rotate=True)
+            fig.text(x0 + 0.5 * pw, y_lab_d + 0.15 * lab_h,
+                     f'{_lab(k)} D#{imo_d}\n{ed:.2f}', fontsize=4.6, ha='center', va='bottom', color=col)
+            fig.text(x0 + 0.5 * pw, y_lab_p + 0.55 * lab_h,
+                     f'{_lab(k)} P#{imo_p}\n{ep:.2f}', fontsize=4.6, ha='center', va='top', color=col)
+            # connectors stay on their half: top edge of spectrum ↔ DFTB; bottom ↔ pySCF
+            fig.add_artist(ConnectionPatch(
+                xyA=(ed, 1.0), coordsA=ax_spec.transData,
+                xyB=(0.5, 0.0), coordsB=ax_d.transAxes,
+                color=col, lw=0.7, alpha=0.9, zorder=4, arrowstyle='-'))
+            fig.add_artist(ConnectionPatch(
+                xyA=(ep, 0.0), coordsA=ax_spec.transData,
+                xyB=(0.5, 1.0), coordsB=ax_p.transAxes,
+                color=col, lw=0.7, alpha=0.9, zorder=4, arrowstyle='-'))
+
+    if title:
+        fig.suptitle(title, fontsize=7.5, y=0.995)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+
+def plot_frontier_orbital_gallery(maps_dftb, maps_pyscf, mo_labels, scan_xs, scan_ys, z_A,
+                                  out_path, *, atom_pos=None, title=None, field='psi'):
+    """Rows = MO labels, cols = DFTB | pySCF. maps_*[label] = (nx,ny).
+
+    For energy-up spectrum↔orbital links use ``plot_spectrum_with_orbitals``.
+    """
+    nrows = len(mo_labels)
+    fig, axes = plt.subplots(nrows, 2, figsize=(7.2, 1.55 * nrows + 0.8), squeeze=False)
+    extent = [scan_xs[0], scan_xs[-1], scan_ys[0], scan_ys[-1]]
+    cmap = 'RdBu_r' if field == 'psi' else 'viridis'
+    for ir, lab in enumerate(mo_labels):
+        for ic, (tag, mp) in enumerate((('DFTB', maps_dftb), ('pySCF', maps_pyscf))):
+            ax = axes[ir, ic]
+            arr = np.asarray(mp[lab])
+            vmax = float(np.percentile(np.abs(arr), 99)) or 1e-30
+            vmin = -vmax if field == 'psi' else 0.0
+            im = ax.imshow(arr.T, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax,
+                           extent=extent, aspect='equal')
+            if ir == 0:
+                ax.set_title(tag, fontsize=10)
+            if ic == 0:
+                ax.set_ylabel(lab, fontsize=7)
+            if atom_pos is not None:
+                ax.scatter(atom_pos[:, 0], atom_pos[:, 1], c='k', s=3, alpha=0.35, zorder=5)
+            ax.set_xticks([]); ax.set_yticks([])
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+    if title is None:
+        title = f'Frontier orbitals ψ  z={z_A:.2f}Å (per-panel scale)'
+    fig.suptitle(title, fontsize=10)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(out_path, dpi=140)
+    plt.close(fig)
+    return out_path
+
+
+def compute_stm_basis_variants(atomPos, atomTypes, basis_hsd_path, work_dir,
+                               scan_xs, scan_ys, heights, *,
+                               projection_variants=None, zeta_override=None,
+                               cutoff_extend=6.0, field='psi2', verbosity=0):
+    """DFTB SCF once (stock WFC) → HOMO/LUMO STM maps for stock + prolonged projection.
+
+    SCF DM/MOs always from stock mio/3ob. Projection radial is swapped:
+      - 'stock'     : native multi-ζ WFC
+      - 'prolonged' : make_slater_tail_species_list (optional SA zeta_override)
+
+    STM uses the STO table (use_exp_basis=False) — not generic exp(β,r0).
+
+    Returns dict with eigvals, mo indices, and maps[variant][label] = (nx,ny,nz) float32.
+    """
+    from spammm.quantum.DFTB.DFTBplusParser import make_slater_tail_species_list
+
+    if projection_variants is None:
+        projection_variants = ('stock', 'prolonged')
+
+    d = get_density_from_dftb_dense(
+        atomPos, atomTypes, basis_hsd_path, work_dir,
+        step=0.5, margin=0.5, z_extra=0.5, verbosity=verbosity, project_density=False)
+    # Density unused — STM needs SCF MOs + projector only.
+    projector = d['projector']
+    atoms_dict = d['atoms_dict']
+    basis_ang = d['basis_ang']
+    eigvecs, eigvals = d['eigvecs'], d['eigvals']
+    norb_per_atom, orb_offsets = d['norb_per_atom'], d['orb_offsets']
+    enames = d.get('enames')
+    homo, lumo = dftb_frontier_mo_indices(eigvals, enames=enames, atomTypes=atomTypes)
+    mo_map = {'HOMO': homo, 'LUMO': lumo}
+
+    prolonged = None
+    if 'prolonged' in projection_variants:
+        prolonged = make_slater_tail_species_list(
+            basis_ang, zeta_override=zeta_override, cutoff_extend=cutoff_extend)
+
+    maps = {}
+    for variant in projection_variants:
+        if variant == 'stock':
+            _set_projector_species_basis(projector, atoms_dict, basis_ang, rc_max=cutoff_extend)
+        elif variant == 'prolonged':
+            if prolonged is None:
+                raise ValueError("projection_variants contains 'prolonged' but list not built")
+            _set_projector_species_basis(projector, atoms_dict, prolonged, rc_max=cutoff_extend)
+        else:
+            raise ValueError(f"unknown projection variant {variant!r} (use stock|prolonged)")
+
+        maps[variant] = {}
+        for lab, imo in mo_map.items():
+            stm = compute_stm(
+                projector, eigvecs, eigvals, scan_xs, scan_ys, heights,
+                norb_per_atom, orb_offsets, atoms_dict,
+                mo_indices=[imo], field=field, use_exp_basis=False)
+            maps[variant][lab] = stm
+            if verbosity:
+                print(f"  [STM-basis] {variant}/{lab} MO#{imo} range=[{stm.min():.3e},{stm.max():.3e}]")
+
+    return {
+        'maps': maps,
+        'homo': homo, 'lumo': lumo,
+        'eigvals': eigvals, 'eigvecs': eigvecs,
+        'E_homo': float(eigvals[homo]), 'E_lumo': float(eigvals[lumo]),
+        'basis_hsd_path': basis_hsd_path,
+        'zeta_override': zeta_override,
+        'field': field,
+        'dftb': d,
+    }
+
+
+def plot_stm_basis_compare_panel(maps_by_col, scan_xs, scan_ys, height, labels,
+                                 col_titles, out_path, *, field='psi2', atom_pos=None,
+                                 title=None, share_row_scale=False):
+    """L2 gallery: rows = HOMO/LUMO (labels), columns = basis channels.
+
+    maps_by_col: list of dict {label: (nx,ny) or (nx,ny,nz)}; 3D → slice [:,:,0].
+    share_row_scale: if True, one vmax per row (cross-column intensity). Default False
+        (per-column vmax) — absolute |ψ| scales differ DFTB↔pySCF; morphology needs local scale.
+    """
+    nrows, ncols = len(labels), len(maps_by_col)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(2.8 * ncols, 2.6 * nrows), squeeze=False)
+    extent = [scan_xs[0], scan_xs[-1], scan_ys[0], scan_ys[-1]]
+    cmap = 'RdBu_r' if field == 'psi' else 'viridis'
+    for ir, lab in enumerate(labels):
+        if share_row_scale:
+            row_abs = []
+            for j in range(ncols):
+                arr = maps_by_col[j][lab]
+                if arr.ndim == 3:
+                    arr = arr[:, :, 0]
+                row_abs.append(float(np.percentile(np.abs(arr), 99)))
+            shared_max = max(row_abs) or 1e-30
+        for ic, col in enumerate(maps_by_col):
+            ax = axes[ir, ic]
+            arr = col[lab]
+            if arr.ndim == 3:
+                arr = arr[:, :, 0]
+            vmax = shared_max if share_row_scale else (float(np.percentile(np.abs(arr), 99)) or 1e-30)
+            vmin = -vmax if field == 'psi' else 0.0
+            im = ax.imshow(arr.T, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax,
+                           extent=extent, aspect='equal')
+            if ir == 0:
+                ax.set_title(col_titles[ic], fontsize=9)
+            if ic == 0:
+                ax.set_ylabel(f'{lab}\nz={height:.1f}Å', fontsize=8)
+            if atom_pos is not None:
+                ax.scatter(atom_pos[:, 0], atom_pos[:, 1], c='k', s=4, alpha=0.4, zorder=5)
+            ax.set_xticks([]); ax.set_yticks([])
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    if title:
+        fig.suptitle(title, fontsize=10)
+    fig.tight_layout(rect=[0, 0, 1, 0.94] if title else None)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
 
 
 def plot_stm(stm_grid, scan_xs, scan_ys, heights, output_dir, prefix='stm'):
@@ -3151,9 +3847,13 @@ def run_afm_pipeline(
         bond_resolved = stm_params.get('bond_resolved', False)
         stm_field = stm_params.get('field', 'ldos')
 
-        occ = np.where(eigvals < 0.0)[0]
-        homo = int(occ[-1]) if len(occ) > 0 else None
-        lumo = (homo + 1) if (homo is not None and (homo + 1) < len(eigvals)) else None
+        if atoms_dict is not None and 'type' in atoms_dict:
+            homo, lumo = dftb_frontier_mo_indices(eigvals, atomTypes=atoms_dict['type'])
+            n_occ = int(homo) + 1
+        else:
+            raise ValueError(
+                "STM pipeline: need atoms_dict['type'] for valence HOMO; "
+                "eigvals<0 is wrong for DFTB. See dftb_frontier_mo_indices.")
         if mo_indices is not None:
             mo_list = [int(i) for i in mo_indices]
             mode = 'mo_indices'
@@ -3165,7 +3865,7 @@ def run_afm_pipeline(
         stm_meta = {
             'nmo': int(eigvecs.shape[0]),
             'norb': int(eigvecs.shape[1]),
-            'nocc': int(len(occ)),
+            'nocc': n_occ,
             'homo': homo,
             'lumo': lumo,
             'E_homo': E_homo,

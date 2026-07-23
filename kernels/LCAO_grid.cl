@@ -80,6 +80,11 @@
 //   where the vacuum decay is the physics of interest, but it means the
 //   kernel is O(natoms) per point with no early exit.
 //
+//   CAVEAT 5: These kernels evaluate DFTB/Fireball STO / numerical radial
+//   tables — NOT Gaussian AO (GTO). For pySCF / def2-SVP (double-ζ) orbital
+//   maps use host pyscf.dft.numint.eval_ao × mo_coeff (see pySCF_utils-new).
+//   Do not assume OpenCL projection covers GTO STM.
+//
 // Kernels:
 //   - project_density_sparse: Sparse density -> grid. 1 workgroup = 1 task block.
 //   - count_atoms_per_block: Count atoms overlapping each block. 1 thread = 1 atom.

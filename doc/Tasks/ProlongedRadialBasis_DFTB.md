@@ -56,7 +56,45 @@ See also: all-electron Δρ clamp recipe on the same CO tip (`Import_KrigingGrid
 
 **Gap:** tools are mostly `testplot_*` / examples — **few L0 asserts** that prolonged basis improves tail vs pySCF/GPAW or that STM/AFM pipelines pick the corrected WFC.
 
+**STM follow-on:** systematic HOMO/LUMO mio/3ob/prolonged vs pySCF cubes — `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md`  
+**STM L2 gallery (2026-07-23, awaiting USER review):** `debug/stm_orbital_compare/` + report `doc/Reports/STM_ExtendedBasis_OrbitalCompare.md` (`tests/SPM/testplot_stm_basis_compare.py`).
+
 **DFT reference progress (2026-07-20):** site-correct **pySCF GPU** CO z-scans for PTCDA (PBE/def2-SVP, z→15 Å) are archived in `tests/ref_data/CO_scan_pyscf_gpu/` with timing — see `doc/Reports/PySCF_GPU_CO_zscan_PTCDA.md`. Use these (not Fukui `jobs_CO_scan_pyscf_short`) when fitting prolonged-basis / FDBM Pauli vs DFT for large aromatics.
+
+## Reference molecule panel — pySCF Fukui densities (USER 2026-07-23)
+
+**Root:** `/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster/`  
+**Level:** PBE / **def2-SVP**. Neutral sample density+ESP for FDBM: `rho_N.{cube,npy}`, `esp_N.{cube,npy}` (pentacene/PTCDA also have anion/cation A/C for Fukui).
+
+| Dir (under root) | Local geometry | Notes |
+|------------------|----------------|-------|
+| `pentacene_PBE_def2-SVP/` | `data/xyz/pentacene.xyz` | older; N+A+C |
+| `PTCDA_PBE_def2-SVP/` | `data/xyz/PTCDA.xyz` | older; N+A+C; SA AFM strip already done |
+| `azaindol_dimer_PBE_def2-SVP/` | `data/xyz/azaindol_dimer.xyz` | **new**; N only |
+| `azaindol_isodimer_PBE_def2-SVP/` | `data/xyz/azaindol_isodimer.xyz` | **new**; N only |
+| `benzoicacid_dimer_PBE_def2-SVP/` | `data/xyz/benzoicacid_dimer.xyz` | **new**; N only |
+| `benzoicamid_dimer_PBE_def2-SVP/` | `data/xyz/benzoicamid_dimer.xyz` | **new**; N only |
+
+**Campaign (same pattern as PTCDA stock vs SA):** for each molecule
+
+1. **DFT-cube FDBM reference** — `get_density_from_cube` / `build_fdbm_grid_from_cubes` on `rho_N` (+ tip as usual); optional ESP cross-check via `esp_N`.  
+2. **DFTB+ FDBM stock** — 3ob (or mio) projection.  
+3. **DFTB+ FDBM extended / SA Slater** — dual basis: stock Δρ→ES, prolonged ρ→Pauli only.  
+4. L2: ρ / \(E_\mathrm{pauli}\) / Fz / df panels; refit \(A,\beta\) per molecule or site class when needed.
+
+Do **not** assume cubes live under legacy `jobs/results/` — these folders sit **directly** under `pyscf_fukui_cluster/`. Older GPAW/pySCF compare scripts still point at `jobs/results/`; update paths when wiring this panel.
+
+**Related:** transferability / site \(A,\beta\) → `Pauli_A_beta_KrigingTransferability.md`; cube↔DFTB ES caveats → `Import_KrigingGridFF.md`.
+
+### Open issues from USER review of `debug/fdbm_fukui_panel/` (2026-07-23) — notes only, no fix yet
+
+Full write-up: **`doc/Reports/Fukui_FDBM_panel_notes_2026-07-23.md`**.
+
+1. **Cube FDBM ES (esp. PTCDA):** DFTB prolonged looks reasonable; **cube row** looks overly strong / asymmetric ES. Suspect all-electron ρ − Gaussian ρ_NA (panel did **not** use pyridine clamp→compact-NA). Tip is DFTB CO × cube sample. Investigate after commit — do not mark Done.
+2. **df vs Fz height shift ~1.4 Å:** Chemical contrast / bond sharpening in **df** ~4.3–5.3 Å (sharpening ~4.5) vs **Fz** ~2.9–3.9 (sharpening ≲3.0). Panel used **`amp=1.0` Å** peak → df(\(h\)) mixes Fz over \([h-\mathrm{amp},\,h+\mathrm{amp}]\); closest approach ≈ \(h-\mathrm{amp}\). Primary explanation = oscillation amplitude; also coarse `h_step=0.4`, relaxed-only Fz (no Fz_unrelax row), per-image clim. Next: dense Δz=0.1 in 4.3–5.3 window; 3-row Fz_u/Fz_r/df like pyridine.
+3. **CLI / per-image strips:** `run_spm.py`, `user_guide/SPM_CLI.md`, `*/per_image/` — commit before further physics fixes.
+
+**CLI:** `python run_spm.py panel-fukui` · replot: `python run_spm.py replot-panel`
 
 ## Progress (2026-07-20) — PTCDA end-to-end (USER review)
 
@@ -70,6 +108,7 @@ See also: all-electron Δρ clamp recipe on the same CO tip (`Import_KrigingGrid
 | ✓ | L2 AFM strip: stock **3ob** vs **SA-prolonged** over 8 heights → `debug/fdbm_ptcda_stock_vs_sa/compare_stock3ob_vs_SAprolonged_heights.png` |
 | ✗ | L0 pytest for tails / WFC selection |
 | ✗ | GUI / ModularPipeline switch to prolonged WFC as default projection |
+| ~ | Extend stock-vs-SA FDBM panel to Fukui set: azaindol_(iso)dimer, benzoicacid/amid dimers (+ pentacene) — **ran** cube vs stock vs default Slater-tail prolonged → `debug/fdbm_fukui_panel/` (investigating; not SA-refit yet; not Done) |
 
 **Naming:** stock = multi-ζ **3ob-3-1** (not mio). **SA** = Simulated Annealing of single-exp Slater `(N,ζ)` for projection only.
 

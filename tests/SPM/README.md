@@ -22,6 +22,13 @@ See `doc/TEST_DESIGN.md` for L0/L1/L2 review levels.
 | `compute_densities.py` | CLI | Cache ρ for z-scan / Pauli / SA fit |
 | `testplot_3ob_basis_tails.py` | visual | 3ob basis tail diagnostics |
 | `testplot_dftb_vs_pyscf_basis.py` | visual | DFTB vs PySCF basis comparison |
+| `testplot_kriging_vs_fdbm_cube.py` | visual | Kriging DFT vs FDBM; Pauli fit modes |
+| `testplot_stm_basis_compare.py` | visual | STM HOMO/LUMO: mio/3ob stock vs prolonged vs pySCF → `debug/stm_orbital_compare/` |
+| `test_stm_basis_compare.py` | pytest | L0: prolonged ≠ stock at vacuum height (benzene, `@gpu @slow`) |
+
+**Open task scripts:** Pauli site maps → `doc/Tasks/Pauli_A_beta_KrigingTransferability.md`; contact-surface finish → `doc/Tasks/Fast_2p5D_AFM_ContactSurface.md`.
+
+**Fukui DFT densities (FDBM refs):** `/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster/{pentacene,PTCDA,azaindol_dimer,azaindol_isodimer,benzoicacid_dimer,benzoicamid_dimer}_PBE_def2-SVP/` — cube vs DFTB stock vs prolonged; see `doc/Tasks/ProlongedRadialBasis_DFTB.md`.
 
 Run visual demos: `python tests/SPM/testplot_fdbm_relax.py`  
 PTCDA stock vs SA: `SPAMMM_AFM_CPU_FFT=1 python tests/SPM/testplot_fdbm_relax.py --ptcda-stock-vs-sa`  

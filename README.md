@@ -36,15 +36,38 @@ Probe-particle model (PPM) and full-density-based model (FDBM) simulations, comb
 - `data/` — Element, atom, bond, angle, and dihedral parameter files plus test molecules and substrates.
 - `tests/` — Pytest suite (topology, surface/Ewald, forcefield, AFM, integration) with helpers.
 - `doc/` — Architectural and topical audit documents, test design, agent protocols.
+- `user_guide/` — End-user docs (CLI AFM/STM); start at [`user_guide/SPM_CLI.md`](user_guide/SPM_CLI.md).
+- [`run_spm.py`](run_spm.py) — Headless SPM imaging CLI (see user guide).
 
 ## Usage Modes
 
-- **Interactive GUI** — Launch the molecular editor to draw, relax, dock, and simulate images in a single visual workflow.
-- **Python scripting** — Call the workhorse modules directly to build batch pipelines, run high-throughput scans, or embed components into larger workflows.
+- **GUI** — interactive editor and AFM/STM (`spammm/GUI/`).
+- **CLI (headless)** — `python run_spm.py …` — see [`user_guide/SPM_CLI.md`](user_guide/SPM_CLI.md).
+- **Python scripting / tests** — call `spammm/` APIs or `tests/` for batch pipelines and regression.
+
+### Main entry points
+
+| Entry | What |
+|-------|------|
+| [`run_spm.py`](run_spm.py) | **User CLI** — AFM (FDBM, Morse+Coulomb, Kriging) and STM (orbitals, current, vacuum panel) without GUI |
+| [`user_guide/`](user_guide/) | **User documentation** (start at [`user_guide/SPM_CLI.md`](user_guide/SPM_CLI.md)) |
+| `spammm/GUI/` | Interactive VisPy + PyQt5 molecular editor / AFM–STM GUI |
+| `spammm/SPM/` | Physics SSOT (`AFM.py`, `AFM_utils.py`, `stm_compare.py`, `KrigingGridFF.py`, `ModularPipeline.py`) |
+| `tests/SPM/` | Developer diagnostics / L2 plots (thin wrappers; prefer CLI for routine imaging) |
+| `doc/Tasks/SPM_CLI_Headless.md` | CLI roadmap, gaps (BR-STM, substrate relax, light-STM, charge-rings, …) |
+
+```bash
+python run_spm.py --help
+python run_spm.py afm --xyz data/xyz/benzene.xyz --projection stock
+python run_spm.py afm-morse --xyz data/xyz/pentacene.xyz
+python run_spm.py stm orbitals --molecule pentacene --n-near 5
+python run_spm.py stm current --molecule pentacene --stm-tips s,pz,py
+```
 
 ## Documentation
 
-For the detailed file layout, dependency chains, and current architectural notes, see [`MANIFEST.md`](MANIFEST.md).
+- **Users:** [`user_guide/README.md`](user_guide/README.md) · [`user_guide/SPM_CLI.md`](user_guide/SPM_CLI.md)
+- **Developers / layout:** [`MANIFEST.md`](MANIFEST.md) · [`doc/`](doc/) · [`doc/ToDo/ToDo.agents.md`](doc/ToDo/ToDo.agents.md)
 
 ## License
 

@@ -44,7 +44,7 @@ Physical PPM: probe (CO O-apex) hangs **L** below tip apex (metal / C).
 `compute_df_amp(Fz, dz, amp)` uses **peak** amplitude `amp` (half of peak-to-peak).
 
 ```
-df(z) averages Fz over [z − amp, z + amp]
+df(z) averages ∂Fz/∂z over [z − amp, z + amp]  (Giessibl semi-circle weight)
 closest approach ≈ probe_z − amp
 ```
 
@@ -52,13 +52,17 @@ closest approach ≈ probe_z − amp
 |---------|-------|
 | `amp` | **1.0 Å** (peak) |
 
+**USER (Fukui panel / PTCDA, 2026-07-23):** bond / chemical contrast evolves in **df** near **h≈4.3–5.3** (sharpening ~4.5) but in **Fz** near **h≈2.9–3.9** (sharpening ≲3.0) — apparent shift **~1.4 Å**. With `amp=1.0` that is **expected to leading order** (df at \(h\) “sees” Fz down to ~\(h-\mathrm{amp}\)). Do **not** treat same-column Fz and df as the same tip–sample distance. See `doc/Reports/Fukui_FDBM_panel_notes_2026-07-23.md`.
+
+**Other reasons the shift can exceed ~amp:** coarse height stack for `compute_df_amp` (prefer dz≈0.1); comparing only **relaxed** Fz to df (pyridine SSOT: also show **Fz_unrelax**); per-image color scale exaggerating high-z df features.
+
 **Pitfalls (already hit this session):**
 
 - Computing df on a **short coarse** height stack (`mode='nearest'`) makes high-z columns inherit contact from low-z edges → df looks “way too close”.
 - **Fix:** dense PP scan with `dz≈0.1` over `[probe_min−amp, probe_max+amp]`, then extract df at display probe heights.
 - Expect df contrast to look ~`amp` closer than Fz in the same column — physical, not a lever bug.
-- For fair Fz↔df visual match, use smaller `amp` (e.g. 0.5) or label columns by closest approach.
-
+- For fair Fz↔df visual match, use smaller `amp` (e.g. 0.5), label columns by **closest approach** \(h-\mathrm{amp}\), or show Fz at \(h-\mathrm{amp}\) next to df at \(h\).
+- Experimental chemical window for **df** often **~4.3–5.3 Å** (Δz=0.1); matching **Fz** morphology lives ~**amp** lower.
 ### Recommended z ladders (pyridine / AFM)
 
 | Use | Tip_z | Probe_z (= tip−L, L=3) |
@@ -95,6 +99,7 @@ Always state **sample** and **tip** separately (DFT-cube vs DFTB). Matched vs cr
 | Need | Call |
 |------|------|
 | One XY map on an Axes | `imshow_afm(ax, arr_nxny, extent=..., cmap='bwr')` |
+| Multi-method height strip (df/Fz × variants) | `plot_afm_variant_height_strip(..., scale='per_image'\|'per_column'\|'common')` |
 | Row of maps at selected heights | `plot_afm_height_panel(data, heights, iz=..., extent=..., label='Fz', fname=...)` |
 | **3-row Fz_u / Fz_r / df × nz** | `plot_afm_Fz_df_threerow(..., scan_xs=, scan_ys=, view_extent=, apos=atoms)` |
 | Crop scan to shared XY | `crop_afm_xy(data, scan_xs, scan_ys, view_extent)` |

@@ -1,20 +1,3 @@
-I'll start by exploring the repository structure comprehensively. Let me do a broad sweep first.
-
-Let me now read the key documentation files and explore the full directory structure in parallel.
-
-Let me now dig deeper into the testing infrastructure, quantum backends, and key documentation.
-
-Let me explore the quantum backends, SPM test details, and GUI structure more deeply.
-
-Let me check a few more key areas to complete the audit.
-
-Let me check the remaining test results and examples to complete the picture.
-
-
-
-Now I have a comprehensive picture. Let me compile the audit report.
-
----
 
 # SPAMMM Repository Audit — Comprehensive Inventory
 
@@ -72,18 +55,35 @@ Topology (AtomicGraph SSOT) → Type Assignment → Force Fields → Surface Int
 | [SubstrateBuilder.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/surfaces/SubstrateBuilder.py:0:0-0:0) | ⚠️ Minimal | No test | NaCl/CaF2 only, no CIF parsing |
 | [Surface_utils.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/surfaces/Surface_utils.py:0:0-0:0) | ✅ Active | Implicit | Surface utilities |
 
-### 2.4 SPM / AFM / STM (✅ FDBM interactive; Morse solid)
+### 2.4 SPM / AFM / STM (✅ FDBM interactive; Morse solid; **CLI ready**)
 
 | Module | Status | Tests | Notes |
 |--------|--------|-------|-------|
 | `AFM.py` (AFMulator) | ✅ Morse + FDBM FAST_S3 | [test_afm_morse.py](cci:7://file:///home/prokop/git/SPAMMM/tests/SPM/test_afm_morse.py:0:0-0:0), [test_afm_fdbm.py](cci:7://file:///home/prokop/git/SPAMMM/tests/SPM/test_afm_fdbm.py:0:0-0:0) | Morse/LJ + Coulomb OK; FDBM R1+R2 perf (`SPAMMM_AFM_FAST_S3`); fused ES + GPU pad/scale |
-| `AFM_utils.py` | ✅ Active | FDBM + tip helpers | Tip `pad_mode='none'` for GPU roll; `compose_and_relax_total(reuse_fdbm_grid=…)` |
-| `ModularPipeline.py` | ✅ Active | `tests/SPM/bench_fdbm.py` | S1–S6 + `AFMBench`; dual S3 path (fast/legacy) |
-| `ScanUtils.py` | ✅ Active | Implicit | Scan utilities |
-| `ManipulationPathOpt.py` | ⚠️ Imports fixed | No test | Autonomous manipulation |
-| STM ([LCAO_STM.cl](cci:7://file:///home/prokop/git/SPAMMM/kernels/LCAO_STM.cl:0:0-0:0), [LCAO_grid.cl](cci:7://file:///home/prokop/git/SPAMMM/kernels/LCAO_grid.cl:0:0-0:0)) | ⚠️ Kernels exist | No dedicated STM L0 | Orbital projection — untested at L0 |
+| `AFM_utils.py` | ✅ Active | FDBM + tip helpers | Tip `pad_mode='none'` for GPU roll; `compose_and_relax_total(reuse_fdbm_grid=…)`; strip plots `plot_afm_variant_height_strip` |
+| `ModularPipeline.py` | ✅ Active | `tests/SPM/bench_fdbm.py` | S1–S6 + `AFMBench`; dual S3 path (fast/legacy); **not yet a CLI subcommand** |
+| `KrigingGridFF.py` | ✅ Active | kriging testplots | Mithun DFT → GridFF; CLI: `run_spm.py afm-kriging` |
+| `stm_compare.py` | ✅ Active | `testplot_stm_basis_compare.py` | SSOT for `run_spm.py stm {orbitals,current,panel}` |
+| STM kernels (`LCAO_STM.cl`, `LCAO_grid.cl`) | ⚠️ Kernels + `compute_stm` | No dedicated STM L0 | Campaign: `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md` |
+
+**Headless CLI (2026-07-23):** repo-root [`run_spm.py`](../../run_spm.py) + user docs [`user_guide/SPM_CLI.md`](../../user_guide/SPM_CLI.md). Task / gaps: [`doc/Tasks/SPM_CLI_Headless.md`](../Tasks/SPM_CLI_Headless.md).
+
+| CLI command | Status |
+|-------------|--------|
+| `afm` (FDBM stock/prolonged/cube) | ✅ wired |
+| `afm-morse` | ✅ wired (plot SSOT polish open) |
+| `afm-kriging` | ✅ wired |
+| `panel-fukui` / `replot-panel` | ✅ wired |
+| `stm orbitals` / `current` / `panel` | ✅ wired |
+| Bond-resolved STM (BR-STM) | GUI S6 ✅; CLI ✗ — consolidate task |
+| Shared GUI↔CLI job-spec protocol | ✗ ToDo (`Consolidate_GUI_CLI_Backend_Input_Protocol.md`) |
+| Substrate `relax`/`dock`; light-STM; charge-rings | ✗ ToDo |
+
 
 **FDBM perf (T01, 2026-07-19) — measured on RTX 3090:** benzene warm ~**0.18 s** (was ~1.65 s); flat_1 S2 NA **5.87→0.03 s**; S3 cache **~10→0.4 s**; flat_1 warm S3+S4 ~**1.4 s**. Spec: `doc/Tasks/PerfBenchmark_FDBM.md`.
+
+| `ScanUtils.py` | ✅ Active | Implicit | Scan utilities |
+| `ManipulationPathOpt.py` | ⚠️ Imports fixed | No test | Autonomous manipulation |
 
 ### 2.5 Quantum Backends (⚠️ Partially Working)
 
@@ -156,7 +156,12 @@ Plus: 42 topology editing tests, 5 folded rigid tests, 2 contact surface tests, 
 |------|-----|----------|
 | FDBM hex/rot60 image QA | Coarse `step=0.15` symmetry; see AFMTesting lessons | Medium |
 | ModularPipeline S1-S6 | Bench exists (`bench_fdbm.py`); more L0 E2E asserts welcome | Medium |
-| STM simulation | No dedicated L0 tests | **High** |
+| STM simulation | CLI `stm *` wired; L0 thin; basis campaign open | **High** — `STM_ExtendedBasis_OrbitalCompare.md`, `SPM_CLI_Headless.md` |
+| Headless SPM CLI gaps | BR-STM, substrate relax, light-STM, charge-rings | **High** — `SPM_CLI_Headless.md` |
+| Pauli \(A,\beta\) site maps | Global fits only; H≠N/C in pyridine | **High** — `Pauli_A_beta_KrigingTransferability.md` |
+| Fukui FDBM molecule panel | Ran cube/stock/prolonged; cube ES open; USER review | **High** — `ProlongedRadialBasis_DFTB.md`, `Fukui_FDBM_panel_notes_2026-07-23.md` |
+| Kekulé RI density | No atom+bond exponential fit yet | Medium — `Kekule_ExponentialDensityFit.md` |
+| 2.5D contact surface | Prototype OK; harden + hybrid decision | Medium — `Fast_2p5D_AFM_ContactSurface.md` |
 | DFTB+ density projection | Covered via FDBM tests; dedicated unit tests thin | Medium |
 | pySCF backend | No test | Medium |
 | GridFF construction/interpolation | No test | Medium |
@@ -285,7 +290,8 @@ The repo has a well-organized documentation hierarchy:
 - UFF force field (relaxation, EF correspondence, Newton's 3rd law)
 - SPFF force field (EF correspondence, pi-sigma bug fixed)
 - Ewald2D surface electrostatics (11 tests, GPU+CPU parity)
-- Morse/LJ AFM imaging (9 tests, pentacene/PTCDA images)
+- Morse/LJ AFM imaging (9 tests, pentacene/PTCDA images); CLI `afm-morse`
+- **Headless SPM CLI** (`run_spm.py`): FDBM / Morse / Kriging AFM + STM orbitals/current/panel — docs `user_guide/SPM_CLI.md` (science sign-off pending; gaps in `SPM_CLI_Headless.md`)
 - Folded basis rigid body relaxation + manipulation (5 tests, ref data)
 - Contact surface AFM (2 tests, separable + PIC)
 - DFTB+ SCF + GPU density projection
@@ -304,16 +310,24 @@ The repo has a well-organized documentation hierarchy:
 - **UFF NVE conservation**: Array shape mismatch
 - **Folded poly basis**: Power sequence wrong
 - **pySCF backend**: Minimal, no density grid test
-- **STM simulation**: Kernels exist, no tests
+- **STM simulation**: CLI `stm *` + `stm_compare`; systematic basis panel / L0 still open (`STM_ExtendedBasis_OrbitalCompare.md`)
+- **SPM CLI gaps**: bond-resolved STM, substrate pre-relax, light-STM, charge-rings (`SPM_CLI_Headless.md`)
+- **Pauli site maps / transferability**: global \(A,\beta\) only (`Pauli_A_beta_KrigingTransferability.md`)
+- **Kekulé RI density**: not started (`Kekule_ExponentialDensityFit.md`)
+- **2.5D contact surface**: prototype (separable+PIC); harden (`Fast_2p5D_AFM_ContactSurface.md`)
 - **GUI**: No automated tests
 - **Assembly**: No L0 pytest
 - **GridFF**: No tests
 - **SubstrateBuilder**: Minimal (no CIF parsing)
 
-### ❌ Not Yet Implemented:
-- Contact-surface elastic AFM (Winkler model)
+### ❌ Not Yet Implemented / Campaign backlog:
+- Contact-surface elastic AFM (Winkler model) — static 2.5D task: `Fast_2p5D_AFM_ContactSurface.md`
+- STM mio/3ob/prolonged vs pySCF cubes — `STM_ExtendedBasis_OrbitalCompare.md`
+- Bond-resolved STM + substrate `relax`/`dock` + light-STM + charge-ring imaging via CLI — `SPM_CLI_Headless.md`
+- Site-resolved Pauli \(A,\beta\) Kriging + transferability — `Pauli_A_beta_KrigingTransferability.md`
+- Kekulé π → exponential RI density — `Kekule_ExponentialDensityFit.md`
 - RigidAtom XPBD / RRsp3
-- ProjectiveDynamics implicit solver
+- ProjectiveDynamics implicit solver (beyond LFF)
 - Reactive rigid-atom FF
 - NEB / H-transfer workflows (full)
 - Phonon / FTIR / Hessian

@@ -1988,3 +1988,238 @@ void rigid_body_folded_newton_kernel(
         body_torque[gid]=(float4)(Ltorq[0].xyz, 0.0f);
     }
 }
+
+// ==================================================================
+//  Kernel 7: rigid_body_pairff_kernel (pairwise molecule-molecule)
+// ==================================================================
+//
+//  Forces from pairwise interactions between a dynamic rigid body and
+//  a static set of atoms (another molecule fixed in world space).
+//
+//  Interaction models:
+//    atom-atom:  Morse + damped Coulomb
+//      E_morse = E0 * (e^2 - 2e),  e = exp(-alpha*(r - R0))
+//      E_coul  = COULOMB_CONST * Q / sqrt(r^2 + R2SAFE)
+//      Mixing: R0 = R_i + R_j, E0 = E_i * E_j, Q = Q_i * Q_j
+//
+//    epair-atom: Lorentzian Hbond-like attractive well
+//      E = coeff * fcut(r) * lorenc(r)
+//      fcut  = smoothstep(1 - r/rc) = 3x^2 - 2x^3,  x = max(0, 1-r/rc)
+//      lorenc = 1/(w^2 + r^2)
+//      coeff  = min(0, Q_atom * He)   [He < 0 -> attractive]
+//
+//    epair-epair: skipped (no interaction)
+//
+//  Z-harmonic constraint on CoM:
+//    F_z += -k_z * (pos.z - z_target)
+//
+//  Same integration physics as other kernels (Euler + gyro + FIRE).
+//  Anchor springs for mouse picking are included.
+//
+//  Parallelism: 1 workgroup = 1 body, WORKGROUP_SIZE=32, atoms round-robin.
+
+#ifndef MAX_STATIC_ATOMS
+#define MAX_STATIC_ATOMS 128
+#endif
+
+__kernel
+void rigid_body_pairff_kernel(
+    __global const int*      mols,
+    __global       float4*   poss,
+    __global       float4*   qrots,
+    __global       float4*   vposs,
+    __global       float4*   vrots,
+    __global       float4*   fire_state,
+    __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
+    __global const float4*   apos_body,
+    __global       float4*   apos_world,
+    __global const float4*   dyn_REQ,
+    __global const int*      dyn_type,
+    __global       float4*   atom_force,
+    __global       float4*   body_force,
+    __global       float4*   body_torque,
+    __global const float4*   anchors,
+    __global const float4*   static_apos,
+    __global const float4*   static_REQ,
+    __global const int*      static_type,
+    const int                n_static,
+    const float4             pairff_params,
+    const float              morse_alpha,
+    const float              z_target,
+    const float              dt,
+    const float4             md_params,
+    const int                niter
+) {
+    const int gid   = get_group_id(0);
+    const int lid   = get_local_id(0);
+    const int lsize = get_local_size(0);
+    __local float4 pos;
+    __local float4 qrot;
+    __local float4 vpos;
+    __local float4 vrot;
+    __local float  inv_mass;
+    __local cl_Mat3 R;
+    __local cl_Mat3 Iinv_body;
+    __local cl_Mat3 Ibody;
+    __local float4 Ltorq [WORKGROUP_SIZE];
+    __local float4 Lforce[WORKGROUP_SIZE];
+    __local float4 Lstatic_pos[MAX_STATIC_ATOMS];
+    __local float4 Lstatic_REQ[MAX_STATIC_ATOMS];
+    __local int    Lstatic_type[MAX_STATIC_ATOMS];
+    const int ia0 = mols[gid];
+    const int na  = mols[gid+1] - ia0;
+    const float He   = pairff_params.x;
+    const float rc   = pairff_params.y;
+    const float w_hb = pairff_params.z;
+    const float k_z  = pairff_params.w;
+    const float damp0_lin = md_params.x, damp0_ang = md_params.y;
+    const float dtmin = dt * 0.1f, dtmax = dt * 10.0f;
+    const int use_fire = (md_params.w < 0.0f);
+    const float4 fstate = fire_state[gid];
+    const int resume_fire = use_fire && (fstate.x > 0.0f);
+    float dt_lin = resume_fire ? fstate.x : dt, dt_ang = resume_fire ? fstate.y : dt;
+    float damp_lin = resume_fire ? fstate.z : md_params.x, damp_ang = resume_fire ? fstate.w : md_params.y;
+
+    if (lid == 0) {
+        pos      = poss[gid];
+        qrot     = resume_fire ? qrots[gid] : normalize(qrots[gid]);
+        vpos     = vposs[gid];
+        vrot     = vrots[gid];
+        inv_mass = (pos.w > 1e-8f) ? (1.0f / pos.w) : 1.0f;
+        Iinv_body.a = I_body_inv[gid].a;
+        Iinv_body.b = I_body_inv[gid].b;
+        Iinv_body.c = I_body_inv[gid].c;
+        Ibody.a     = I_body[gid].a;
+        Ibody.b     = I_body[gid].b;
+        Ibody.c     = I_body[gid].c;
+    }
+    for (int j = lid; j < n_static; j += lsize) {
+        Lstatic_pos[j]  = static_apos[j];
+        Lstatic_REQ[j]  = static_REQ[j];
+        Lstatic_type[j] = static_type[j];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int step = 0; step < niter; ++step) {
+        if      (lid == 0) R.a = (float4){ quat_to_a(qrot), 0.f };
+        else if (lid == 1) R.b = (float4){ quat_to_b(qrot), 0.f };
+        else if (lid == 2) R.c = (float4){ quat_to_c(qrot), 0.f };
+        barrier(CLK_LOCAL_MEM_FENCE);
+        float4 total_torque = (float4)(0.0f);
+        float4 total_force  = (float4)(0.0f);
+        for (int i = 0; i < ATOMS_PER_THREAD; i++) {
+            const int atom_idx = lid + i*lsize;
+            if (atom_idx >= na) break;
+            const int ia = ia0 + atom_idx;
+            const float4 p_body = apos_body[ia];
+            const float3 r_world = rotate_vec_by_matrix(p_body.xyz, &R);
+            const float3 p_world = pos.xyz + r_world;
+            const float4 REQ_i = dyn_REQ[ia];
+            const int type_i = dyn_type[atom_idx];
+            float3 f = (float3)(0.0f);
+            float E = 0.0f;
+            for (int j = 0; j < n_static; j++) {
+                float3 dp = p_world - Lstatic_pos[j].xyz;
+                float r2 = dot(dp, dp);
+                float r  = sqrt(r2 + 1e-12f);
+                float inv_r = 1.0f / r;
+                const int s_typ = Lstatic_type[j];
+                if (type_i == 1 && s_typ == 1) continue;
+                if (type_i == 1 || s_typ == 1) {
+                    float Q_atom = (type_i == 1) ? Lstatic_REQ[j].z : REQ_i.z;
+                    float coeff = fmin(0.0f, Q_atom * He);
+                    if (coeff == 0.0f) continue;
+                    float x = 1.0f - r * (1.0f / rc);
+                    if (x <= 0.0f) continue;
+                    float fcut = 3.0f*x*x - 2.0f*x*x*x;
+                    float w2   = w_hb * w_hb;
+                    float lorenc = 1.0f / (w2 + r2);
+                    float dfcut_dr = -6.0f * x * (1.0f - x) / rc;
+                    float dlorenc_dr = -2.0f * r * lorenc * lorenc;
+                    float dE_dr = coeff * (dfcut_dr * lorenc + fcut * dlorenc_dr);
+                    E += coeff * fcut * lorenc;
+                    f += dp * (-dE_dr * inv_r);
+                } else {
+                    float R0 = REQ_i.x + Lstatic_REQ[j].x;
+                    float E0 = REQ_i.y * Lstatic_REQ[j].y;
+                    float Q  = REQ_i.z * Lstatic_REQ[j].z;
+                    float e = exp(-morse_alpha * (r - R0));
+                    float E_morse = E0 * (e*e - 2.0f*e);
+                    float dE_morse_dr = -2.0f * morse_alpha * E0 * e * (e - 1.0f);
+                    float r2d = r2 + R2SAFE;
+                    float ir2d = 1.0f / r2d;
+                    float sqr_ir2d = sqrt(ir2d);
+                    float E_coul = COULOMB_CONST * Q * sqr_ir2d;
+                    float dE_coul_dr = -COULOMB_CONST * Q * r * ir2d * sqr_ir2d;
+                    E += E_morse + E_coul;
+                    f += dp * (-(dE_morse_dr + dE_coul_dr) * inv_r);
+                }
+            }
+            float4 anchor = anchors[ia];
+            if (anchor.w > 0.0f) {
+                float3 d = p_world - anchor.xyz;
+                f += d * -anchor.w;
+                E += 0.5f * anchor.w * dot(d, d);
+            }
+            total_force.xyz  += f;
+            total_torque.xyz += cross(r_world, f);
+            apos_world[ia] = (float4)(p_world, E);
+            atom_force[ia] = (float4)(f, E);
+        }
+        Ltorq[lid]  = total_torque;
+        Lforce[lid] = total_force;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int stride = WORKGROUP_SIZE >> 1; stride > 0; stride >>= 1) {
+            if (lid < stride) {
+                Ltorq[lid]  += Ltorq [lid + stride];
+                Lforce[lid] += Lforce[lid + stride];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (lid == 0) {
+            float3 f = Lforce[0].xyz;
+            float3 tq_world = Ltorq[0].xyz;
+            f.z += -k_z * (pos.z - z_target);
+            body_force [gid] = (float4)(f, 0.0f);
+            body_torque[gid] = (float4)(tq_world, 0.0f);
+            const float3 tq_body   = mat3_dot_T(R, tq_world);
+            const float3 L_body     = mat3_dot(Ibody, vrot.xyz);
+            const float3 gyro       = cross(vrot.xyz, L_body);
+            const float3 alpha_body = mat3_dot(Iinv_body, tq_body - gyro);
+            if (use_fire) {
+                vpos.xyz = rigid_update_FIRE(f,       vpos.xyz, &dt_lin, &damp_lin, dtmin, dtmax, damp0_lin);
+                vrot.xyz = rigid_update_FIRE(tq_body, vrot.xyz, &dt_ang, &damp_ang, dtmin, dtmax, damp0_ang);
+            } else {
+                vpos.xyz *= damp_lin;
+                vrot.xyz *= damp_ang;
+            }
+            const float dtl = use_fire ? dt_lin : dt;
+            const float dta = use_fire ? dt_ang : dt;
+            vpos.xyz += f * (dtl * inv_mass);
+            vrot.xyz += alpha_body * dta;
+            pos.xyz  += vpos.xyz * dtl;
+            qrot = normalize(quat_mult(qrot, make_qrot_taylor(vrot.xyz * dta)));
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if      (lid == 0) R.a = (float4){ quat_to_a(qrot), 0.f };
+    else if (lid == 1) R.b = (float4){ quat_to_b(qrot), 0.f };
+    else if (lid == 2) R.c = (float4){ quat_to_c(qrot), 0.f };
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int i = 0; i < ATOMS_PER_THREAD; i++) {
+        const int atom_idx = lid + i*lsize;
+        if (atom_idx >= na) break;
+        const int ia = ia0 + atom_idx;
+        const float4 p_body = apos_body[ia];
+        const float3 p_world = pos.xyz + rotate_vec_by_matrix(p_body.xyz, &R);
+        apos_world[ia].xyz = p_world;
+    }
+    if (lid == 0) {
+        if (use_fire) fire_state[gid] = (float4)(dt_lin, dt_ang, damp_lin, damp_ang);
+        poss [gid] = pos;
+        qrots[gid] = qrot;
+        vposs[gid] = vpos;
+        vrots[gid] = vrot;
+    }
+}
