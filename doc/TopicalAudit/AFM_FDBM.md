@@ -15,9 +15,10 @@ GUI AFM uses the **Full Density-Based Model** only: DFTB densities → Pauli (ov
 
 | Language | Location | Status | Notes |
 |----------|----------|--------|-------|
-| Python | `spammm/SPM/AFM.py` | active | AFMulator, `AFMBench`, gpyFFT, `stage3_fdbm_fields_fast` |
+| Python | `run_spm.py` | active | Thin CLI: `afm` / `opt` / `smiles-afm`; amp-align strips; see `user_guide/SPM_CLI.md` |
+| Python | `spammm/SPM/AFM.py` | active | AFMulator, `AFMBench`, gpyFFT, `stage3_fdbm_fields_fast`, `compute_df_amp` |
 | Python | `spammm/SPM/ModularPipeline.py` | active | S1–S6; dual S3 (fast / `FAST_S3=0` legacy) |
-| Python | `spammm/SPM/AFM_utils.py` | active | Tips (`pad_mode`), compose/relax |
+| Python | `spammm/SPM/AFM_utils.py` | active | Tips (`pad_mode`), compose/relax; `plot_afm_variant_height_strip(amp_align=…)` |
 | Python | `spammm/GUI/AFMExtension.py` | active | GUI wiring; K_LAT in N/m |
 | Python | `spammm/quantum/DFTB/Grid_dftb.py` | active | Dense NA DM; GPU `build_tasks` |
 | OpenCL | `kernels/AFM.cl` | active | PP relax + `fdbm_*` Stage-3 helpers |
@@ -58,3 +59,5 @@ Full report: [`doc/Tasks/PerfBenchmark_FDBM.md`](../Tasks/PerfBenchmark_FDBM.md)
 - [ ] Prolonged / dual-basis Pauli (stock ES) — `doc/Tasks/ProlongedRadialBasis_DFTB.md`
 - [ ] **Fukui molecule panel FDBM:** cube vs DFTB stock vs prolonged for pentacene, PTCDA, azaindol_(iso)dimer, benzoicacid/amid dimers — `/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster/*_PBE_def2-SVP/`
 - [ ] Cube tip Δρ / ES morphology vs Kriging — `doc/Tasks/Import_KrigingGridFF.md`, reports `Kriging_*.md`
+- [ ] **All-electron Δρ / NA multipoles (open):** crude Gauss/compact NA → fake XY dipole → PBC V_ES L–R asymmetry. Control `ρ_N−ρ_NA.cube` is clean. SSOT caveats: [`doc/Caveats.md`](../Caveats.md). Diagnostic: `plot_cube_delta_rho_na_origin_diag` → `dipole_origin_bisect.png`. Report: [`Fukui_FDBM_panel_notes_2026-07-23.md`](../Reports/Fukui_FDBM_panel_notes_2026-07-23.md) §1b. **Do not mark fixed** without USER confirmation after wiring cube NA.
+- [~] **df↔Fz amp presentation (CLI):** `run_spm.py afm` defaults amp-align + dense z (Fukui notes §2). Panel-fukui 3-row Fz_u/Fz_r/df still open.

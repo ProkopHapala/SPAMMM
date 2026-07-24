@@ -719,6 +719,33 @@ class AFMulator(OpenCLBase):
         self._grid_bytes = grid_bytes
         return L
 
+    def setup_grid_world(self, p0_xyz, L_xyz, n):
+        """World-frame GridFF box (no atom shift) — for comparing scans in assembly/lab coords.
+
+        p0_xyz: (3,) lower corner [Å]; L_xyz: (3,) box size; n: (nx,ny,nz).
+        """
+        assert self.atoms_arr is not None, "call assign_params() first"
+        nx, ny, nz = [int(v) for v in n]
+        p0 = np.asarray(p0_xyz, dtype=np.float32).reshape(3)
+        L = np.asarray(L_xyz, dtype=np.float32).reshape(3)
+        if np.any(L <= 0) or min(nx, ny, nz) < 2:
+            raise ValueError(f'setup_grid_world: invalid p0={p0} L={L} n={n}')
+        self.n = np.array([nx, ny, nz], dtype=np.int32)
+        self.mol_shift = np.zeros(3, dtype=np.float32)
+        self.p0 = np.array([p0[0], p0[1], p0[2], 0.], dtype=np.float32)
+        self.dA = np.array([L[0] / nx, 0., 0., 0.], dtype=np.float32)
+        self.dB = np.array([0., L[1] / ny, 0., 0.], dtype=np.float32)
+        self.dC = np.array([0., 0., L[2] / nz, 0.], dtype=np.float32)
+        self.dinvA = np.array([1. / L[0], 0., 0., -p0[0] / L[0]], dtype=np.float32)
+        self.dinvB = np.array([0., 1. / L[1], 0., -p0[1] / L[1]], dtype=np.float32)
+        self.dinvC = np.array([0., 0., 1. / L[2], -p0[2] / L[2]], dtype=np.float32)
+        self.L = L
+        grid_bytes = int(nx * ny * nz * 4 * 4)
+        warn = "" if grid_bytes <= getattr(self, '_max_alloc', grid_bytes + 1) else " [exceeds device max_alloc!]"
+        print(f"AFMulator.setup_grid_world: n=({nx},{ny},{nz}) p0={p0} L={L} | FF image ~{_bytes_to_gb(grid_bytes):.3f} GB{warn}")
+        self._grid_bytes = grid_bytes
+        return L
+
     def setup_grid_lvec(self, n=(100, 100, 60), margin_z=2.0, z_top=12.0):
         """Set up primitive-cell force-field grid aligned with mol.lvec.
 

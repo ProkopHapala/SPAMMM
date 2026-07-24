@@ -88,6 +88,8 @@ Even after far-field \(p_z\) fix and tip-clamp diagnosis, **cube-FDBM** still do
 
 **Conclusion:** problem is **not** “pyridine physics” and **not** the PP relax path. It is **cube Δρ construction** (all-electron SCF − crude Gaussian NA on a ~0.1 a₀ / AFM grid), i.e. **core / cusp treatment**. DFTB never sees all-electron cores → ES stays small and sane.
 
+**2026-07-24 (Fukui pentacene smoking gun):** even clamp→compact leaves a large XY dipole; `ρ_N−ρ_NA.cube` does not. Global notes: [`doc/Caveats.md`](../Caveats.md); plot `dipole_origin_bisect.png`. Status still **investigating**.
+
 Hypotheses still open (ordered by likelihood):
 1. **Gaussian ρ_NA** cannot cancel Psi4 nuclear cusps → residual core multipoles / near-field junk on coarse grids. Soft clamp helps far-field but **reshapes valence multipoles** (sample \(p\) changes; tip \(p\) exploded when clamped).
 2. Wrong / inconsistent **charge convention** tip_del ↔ \(V_\mathrm{ES}\) (ESP.cube sign vs Poisson(Δρ) still muddy; valence corr(Poisson, ESP)≈−0.87 beyond 1.5 Å historically).

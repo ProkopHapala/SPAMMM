@@ -26,6 +26,10 @@ Open issues / caveats:
     is the imaging object; exp(β,r0) bypasses WFC and hides the prolonged-tail effect.
   - Dual-basis AFM rule (prolonged Pauli only) does NOT apply to STM ψ — prolonged radial
     is the map. See doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md.
+  - All-electron cube ES: fake Δρ dipoles from crude NA (Gauss/compact) dominate PBC V_ES
+    asymmetry — NOT the Poisson solver. Prefer ρ_N−ρ_NA.cube when available. Canonical
+    diagnostic: plot_cube_delta_rho_na_origin_diag → dipole_origin_bisect.png.
+    See doc/Caveats.md.
 """
 
 import numpy as np
@@ -55,13 +59,40 @@ def scan_extent(scan_xs, scan_ys):
 
 
 def afm_scan_probe_heights(afm, nz, dtip, mol_z=None, z_clearance=5.0):
-    """Tip / probe heights [Å above molecular zmax] for PP scan column index iz."""
+    """Tip / probe heights [Å above molecular zmax] for PP scan column index iz.
+
+    Reference: mol_z = max atom z (top of sample), NOT substrate.
+      z_tip(iz)   = mol_z + z_clearance + |dpos0_z| + iz*dtip
+      h_tip       = z_tip - mol_z
+      h_probe     = h_tip + dpos0_z   (dpos0_z < 0; lever length L=|dpos0_z|)
+    So iz=0 has h_probe = z_clearance (probe that far above zmax).
+    """
     apos = afm.atoms_arr[:, :3]
     mol_z = float(apos[:, 2].max()) if mol_z is None else float(mol_z)
     z0_tip = mol_z + float(z_clearance) + abs(float(afm.dpos0[2]))
     h_tip = z0_tip + np.arange(int(nz)) * float(dtip) - mol_z
     h_probe = h_tip + float(afm.dpos0[2])
     return h_tip, h_probe
+
+
+def afm_height_geometry_note(zmax, tip_R=1.452, R_sample=1.9255, L_lever=4.0, amp=1.0, z_clearance=None):
+    """Short SSOT blurb: where heights are measured + rough contact estimate.
+
+    Morse R0 ≈ tip_R + R_vdW(sample). Soft contact / repulsion onset when
+    probe–atom distance ~ R0 (laterally above a top atom ≈ h_probe).
+    df at labeled h mixes Fz over roughly [h−amp, h+amp] (peak amp).
+    """
+    R0 = float(tip_R) + float(R_sample)
+    lines = [
+        f'Heights are Å above molecular zmax={zmax:.3f} (highest atom), not substrate.',
+        f'Lever L=|dpos0_z|≈{float(L_lever):.2f}Å → tip = probe + L (labels: tip / probe).',
+        f'tip_R≈{float(tip_R):.3f}Å  R_vdW(C)≈{float(R_sample):.3f}Å  → Morse R0≈{R0:.2f}Å '
+        f'(probe≲R0 ≈ hard contact above a top atom).',
+        f'df amp={float(amp):.2f}Å mixes Fz over ±amp around the labeled probe height.',
+    ]
+    if z_clearance is not None:
+        lines.append(f'Scan starts at h_probe={float(z_clearance):.2f}Å (= --z-clearance).')
+    return '\n'.join(lines)
 
 
 def cell_alat_info(cell_lvs):
@@ -99,8 +130,15 @@ def wrap_atoms_to_cell(apos, cell_lvs, natoms_per_mol=None):
 
 
 def replicate_cell_pbc(apos, enames, cell_lvs, n_pbc=1):
-    """Tile atoms over (2 n_pbc+1)² lattice images. Returns (apos_rep, enames_rep, n_primary)."""
+    """Tile atoms over (2 n_pbc+1)² lattice images. Returns (apos_rep, enames_rep, n_primary).
+
+    enames must match apos length (one name per atom). Fail loud — do not zip-truncate.
+    """
     apos = np.asarray(apos, dtype=np.float64)
+    enames = list(enames)
+    if len(enames) != len(apos):
+        raise ValueError(f'replicate_cell_pbc: len(enames)={len(enames)} != len(apos)={len(apos)} '
+                         f'(pass per-atom names for the full primary cell, not one molecule template)')
     a = np.asarray(cell_lvs[0], float)
     b = np.asarray(cell_lvs[1], float)
     chunks, names = [], []
@@ -111,8 +149,11 @@ def replicate_cell_pbc(apos, enames, cell_lvs, n_pbc=1):
             ap[:, 0] += shift[0]
             ap[:, 1] += shift[1]
             chunks.append(ap)
-            names.extend(list(enames))
-    return np.vstack(chunks), names, len(apos)
+            names.extend(enames)
+    apos_rep = np.vstack(chunks)
+    if len(names) != len(apos_rep):
+        raise RuntimeError(f'replicate_cell_pbc internal: names={len(names)} apos={len(apos_rep)}')
+    return apos_rep, names, len(apos)
 
 
 def cell_scan_grid(cell_lvs, mol_z, z_clearance, dpos0_z, dx, margin=1.0):
@@ -175,16 +216,20 @@ def molecule_com_sites(apos, natoms_per_mol, labels=None):
 
 def plot_afm_sites_legend(arr_nxny, scan_xs, scan_ys, sites, extent=None, *, title='AFM sites',
                           cmap='gray', fname=None, save_dir='.', apos=None, bonds=None, cell_lvs=None,
-                          cell_origin=(0.0, 0.0), show_bonds=False, show_cell=True, show_atoms=True, cell_pbc=1,
-                          bond_lw=0.35, bond_alpha=0.22, dpi=160):
+                          cell_origin=(0.0, 0.0), show_bonds=False, show_cell=True, show_atoms=False,
+                          show_top_atoms=False, top_dz=0.25, cell_pbc=1,
+                          bond_lw=0.35, bond_alpha=0.22, dpi=160, **_extra):
     """Single-panel map with numbered site markers + legend (sites = list of (name,x,y[,val]))."""
     fig, ax = plt.subplots(figsize=(7.5, 7))
     imshow_afm(ax, arr_nxny, extent=extent, cmap=cmap, symmetric=False if cmap == 'gray' else True, title=title)
     overlay_afm_geometry(ax, apos=apos, bonds=bonds, cell_lvs=cell_lvs, cell_origin=cell_origin,
                          show_bonds=show_bonds, show_cell=show_cell, show_atoms=show_atoms,
+                         show_top_atoms=show_top_atoms, top_dz=top_dz,
                          bond_lw=bond_lw, bond_alpha=bond_alpha)
     if show_cell and cell_lvs is not None and cell_pbc > 0:
         overlay_afm_cell_pbc(ax, cell_lvs, cell_origin, n_rep=int(cell_pbc))
+    if cell_lvs is not None:
+        set_axes_to_cell(ax, cell_lvs, cell_origin, margin=2.0)
     leg = []
     for si, site in enumerate(sites):
         name = site[0]
@@ -206,11 +251,32 @@ def plot_afm_sites_legend(arr_nxny, scan_xs, scan_ys, sites, extent=None, *, tit
     return fig, ax
 
 
+def overlay_top_atoms(ax, apos, highlight_dz, ms=2.5, color='crimson', marker='.', zorder=15, label=None,
+                      cell_lvs=None, n_pbc=0):
+    """Mark atoms with z > zmax−highlight_dz (AFM contact proxy). Optional PBC images of tops."""
+    from spammm.forcefields.AssemblyPlot import select_top_atoms, top_atoms_with_pbc
+    apos = np.asarray(apos, dtype=np.float64)
+    idx, zmax, z_cut = select_top_atoms(apos, highlight_dz)
+    n_prim = len(idx)
+    if cell_lvs is not None and n_pbc > 0:
+        top_xyz, zmax, z_cut = top_atoms_with_pbc(apos, cell_lvs, highlight_dz, n_pbc=n_pbc)
+    else:
+        top_xyz = apos[idx] if n_prim else np.zeros((0, 3))
+    if len(top_xyz) == 0:
+        return top_xyz, zmax, z_cut
+    lab = label or f'top z>{z_cut:.2f} (n={n_prim}' + ('+PBC)' if n_pbc else ')')
+    ax.plot(top_xyz[:, 0], top_xyz[:, 1], marker, color=color, ms=float(ms), mew=0.0,
+            linestyle='none', zorder=zorder, label=lab)
+    return top_xyz, zmax, z_cut
+
+
 def overlay_afm_geometry(ax, apos=None, bonds=None, cell_lvs=None, cell_origin=(0.0, 0.0),
-                         show_bonds=True, show_cell=True, show_atoms=False, bond_lw=0.35, bond_alpha=0.22,
+                         show_bonds=True, show_cell=True, show_atoms=False, show_top_atoms=False,
+                         top_dz=0.4, bond_lw=0.35, bond_alpha=0.22,
                          atom_ms=2.0, atom_alpha=0.55, atom_color='0.1',
-                         cell_lw=1.4, cell_color='lime', zorder=5):
-    """Unit cell boundary + optional bond skeleton / atom dots on AFM XY axes."""
+                         top_ms=2.5, top_color='crimson', top_marker='.',
+                         cell_lw=0.5, cell_color='lime', zorder=5):
+    """Unit cell boundary + optional bond skeleton / atom dots / top-atom markers on AFM XY axes."""
     if apos is not None:
         apos = np.asarray(apos, dtype=np.float64)
     if show_bonds and bonds is not None and apos is not None:
@@ -221,6 +287,9 @@ def overlay_afm_geometry(ax, apos=None, bonds=None, cell_lvs=None, cell_origin=(
         ax.add_collection(lc)
     if show_atoms and apos is not None:
         ax.plot(apos[:, 0], apos[:, 1], '.', color=atom_color, ms=float(atom_ms), alpha=float(atom_alpha), zorder=zorder + 1)
+    if show_top_atoms and apos is not None and top_dz is not None:
+        overlay_top_atoms(ax, apos, top_dz, ms=top_ms, color=top_color, marker=top_marker, zorder=zorder + 3,
+                          cell_lvs=cell_lvs, n_pbc=1 if cell_lvs is not None else 0)
     if show_cell and cell_lvs is not None:
         o = np.asarray(cell_origin, dtype=np.float64)[:2]
         a, b = np.asarray(cell_lvs[0, :2], float), np.asarray(cell_lvs[1, :2], float)
@@ -297,7 +366,7 @@ def imshow_afm(ax, arr_nxny, extent=None, cmap='bwr', symmetric=True, pct=99, ti
     return im
 
 
-def plot_afm_height_panel(data, heights, iz=None, extent=None, label='Fz', cmap='bwr', fname=None, save_dir='.', figsize_col=2.8, dpi=150, ylabel=None, transpose=True, h_tip=None, height_label='probe', apos=None, bonds=None, cell_lvs=None, show_bonds=False, show_cell=False, show_atoms=False, cell_pbc=0, bond_lw=0.35, bond_alpha=0.22, cell_origin=(0.0, 0.0)):
+def plot_afm_height_panel(data, heights, iz=None, extent=None, label='Fz', cmap='bwr', fname=None, save_dir='.', figsize_col=2.8, dpi=150, ylabel=None, transpose=True, h_tip=None, height_label='probe', apos=None, bonds=None, cell_lvs=None, show_bonds=False, show_cell=False, show_atoms=False, show_top_atoms=False, top_dz=0.4, cell_pbc=0, bond_lw=0.35, bond_alpha=0.22, cell_origin=(0.0, 0.0), cell_lw=0.5, top_ms=2.5):
     """SSOT: row of XY maps at selected heights. `data` is (nx,ny,nz).
 
     Args:
@@ -330,12 +399,13 @@ def plot_afm_height_panel(data, heights, iz=None, extent=None, label='Fz', cmap=
         else:
             title = f'h={h:.1f}Å'
         imshow_afm(ax, data[:, :, i], extent=extent, cmap=cmap, title=title, transpose=transpose)
-        if show_bonds or show_cell or show_atoms:
+        if show_bonds or show_cell or show_atoms or show_top_atoms:
             overlay_afm_geometry(ax, apos=apos, bonds=bonds, cell_lvs=cell_lvs, cell_origin=cell_origin,
                                  show_bonds=show_bonds, show_cell=show_cell, show_atoms=show_atoms,
-                                 bond_lw=bond_lw, bond_alpha=bond_alpha)
+                                 show_top_atoms=show_top_atoms, top_dz=top_dz,
+                                 bond_lw=bond_lw, bond_alpha=bond_alpha, cell_lw=cell_lw, top_ms=top_ms)
             if show_cell and cell_lvs is not None and cell_pbc > 0:
-                overlay_afm_cell_pbc(ax, cell_lvs, cell_origin, n_rep=int(cell_pbc))
+                overlay_afm_cell_pbc(ax, cell_lvs, cell_origin, n_rep=int(cell_pbc), lw=float(cell_lw))
         ax.tick_params(labelsize=5)
     if ylabel or label:
         axes[0].set_ylabel(ylabel or label, fontsize=8)
@@ -346,6 +416,51 @@ def plot_afm_height_panel(data, heights, iz=None, extent=None, label='Fz', cmap=
         path = os.path.join(save_dir, fname)
         fig.savefig(path, dpi=dpi, bbox_inches='tight'); plt.close(fig)
         print(f"  Saved {path}")
+    return fig, axes
+
+
+def plot_afm_df_Fz_height_strip(df, Fz, heights_probe, extent=None, *, iz=None, h_tip=None,
+                                title='', apos=None, cell_lvs=None, cell_origin=(0.0, 0.0),
+                                top_dz=0.25, cell_lw=0.5, top_ms=2.2, cmap_df='gray', cmap_Fz='bwr',
+                                fname=None, save_dir='.', figsize_col=2.2, dpi=150, amp=None):
+    """SSOT assembly AFM panel: 2 rows (df, Fz) × selected heights; thin cell + top-atom dots only."""
+    nz = int(Fz.shape[2])
+    if iz is None:
+        n = min(6, nz)
+        iz = list(np.linspace(0, nz - 1, n, dtype=int))
+    else:
+        iz = [int(i) for i in iz if 0 <= int(i) < nz]
+    n_h = len(iz)
+    fig, axes = plt.subplots(2, n_h, figsize=(figsize_col * n_h, 4.6), squeeze=False)
+    rows = [('df', df, cmap_df, False), ('Fz', Fz, cmap_Fz, True)]
+    for col, i in enumerate(iz):
+        hp = float(heights_probe[i])
+        ht = float(h_tip[i]) if h_tip is not None else None
+        for row, (ylab, arr, cmap, sym) in enumerate(rows):
+            ax = axes[row, col]
+            ttl = ''
+            if row == 0:
+                ttl = f'probe {hp:.1f}Å' + (f'\ntip {ht:.1f}Å' if ht is not None else '')
+            imshow_afm(ax, arr[:, :, i], extent=extent, cmap=cmap, symmetric=sym, title=ttl,
+                       colorbar=(col == n_h - 1))
+            overlay_afm_geometry(ax, apos=apos, bonds=None, cell_lvs=cell_lvs, cell_origin=cell_origin,
+                                 show_bonds=False, show_cell=cell_lvs is not None, show_atoms=False,
+                                 show_top_atoms=apos is not None, top_dz=top_dz,
+                                 cell_lw=cell_lw, top_ms=top_ms)
+            if cell_lvs is not None:
+                set_axes_to_cell(ax, cell_lvs, cell_origin, margin=1.0)
+            ax.set_xticks([]); ax.set_yticks([])
+            if col == 0:
+                ax.set_ylabel(ylab, fontsize=9)
+    note = f'  amp={float(amp):.2f}Å' if amp is not None else ''
+    fig.suptitle((title or 'df / Fz') + note + '  (cell lw=0.5; red .= top atoms)', fontsize=10)
+    fig.tight_layout()
+    if fname is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, fname)
+        fig.savefig(path, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+        print(f'REVIEW: {path}')
     return fig, axes
 
 
@@ -375,22 +490,17 @@ def afm_panel_clim(arr, *, scale='per_image', pct=99.0, symmetric=False):
 def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
                                   scale='per_image', title='', dpi=140, pct=99.0,
                                   colorbar=True, figsize_col=1.55, figsize_row=1.35,
-                                  amp=None):
+                                  amp=None, apos=None, show_atoms=False, extent=None,
+                                  atom_ms=2.0, atom_alpha=0.55, amp_align=False):
     """Multi-row × multi-height AFM compare strip (df/Fz × methods).
 
     Args:
         variants: dict key → {'df': (nx,ny,nz), 'Fz': (nx,ny,nz), ...}
         row_specs: list of (qty, key, ylabel, cmap) e.g. ('df','cube','df cube','gray')
-        heights: (nz,)  — probe heights; if both df and Fz rows are shown, remember
-          df(h) mixes Fz over ±amp (default panel amp=1.0 Å) so morphologies shift in z.
-          See compute_df_amp docstring / Fukui_FDBM_panel_notes_2026-07-23.md.
-        out_path: save path (.png)
-        scale:
-          'per_image'  — each panel its own min/max (experimental relative contrast)
-          'per_column' — shared clim across all variants at the same height+qty family
-          'common'     — one clim for all panels of the same qty (df vs Fz separate)
-        amp: if set, annotate title with peak oscillation amplitude [Å]
-        pct: percentile for clim (99 ≈ robust min/max)
+        heights: (nz,)  — column labels = df probe heights when amp_align
+        amp_align: if True, Fz arrays are already sampled at h−amp (fair morph. match);
+          title notes this. If False, Fz and df share the same labeled h (expect ~amp shift).
+        amp: peak oscillation amplitude [Å] (annotation)
     """
     heights = np.asarray(heights, dtype=np.float64)
     n_h = len(heights)
@@ -428,10 +538,17 @@ def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
                 vmin, vmax = col_clim[qty]
             else:
                 vmin, vmax = common_clim[qty]
-            im = ax.imshow(arr.T, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax, aspect='equal')
+            im = ax.imshow(arr.T, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax, aspect='equal',
+                           extent=extent)
             ax.set_xticks([]); ax.set_yticks([])
+            if show_atoms and apos is not None:
+                overlay_afm_geometry(ax, apos=apos, show_bonds=False, show_cell=False, show_atoms=True,
+                                     atom_ms=atom_ms, atom_alpha=atom_alpha)
             if ir == 0:
-                ax.set_title(f'h={heights[ih]:.2f}Å', fontsize=8)
+                if amp_align and amp is not None:
+                    ax.set_title(f'df h={heights[ih]:.2f}\nFz@{heights[ih]-float(amp):.2f}', fontsize=7)
+                else:
+                    ax.set_title(f'h={heights[ih]:.2f}Å', fontsize=8)
             if ih == 0:
                 ax.set_ylabel(ylab, fontsize=7)
             if colorbar and ih == n_h - 1:
@@ -444,8 +561,12 @@ def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
     }.get(scale, scale)
     amp_note = ''
     if amp is not None:
-        amp_note = (f'  |  df amp={float(amp):.2f}Å peak → mixes Fz over ±amp '
-                    f'(closest≈h−amp); do not equate Fz(h) with df(h)')
+        if amp_align:
+            amp_note = (f'  |  amp={float(amp):.2f}Å: columns = df probe h; '
+                        f'Fz panels sampled at h−amp (closest-approach match)')
+        else:
+            amp_note = (f'  |  df amp={float(amp):.2f}Å peak → mixes Fz over ±amp '
+                        f'(closest≈h−amp); do not equate Fz(h) with df(h)')
     fig.suptitle(f'{title}\n{scale_note}{amp_note}', fontsize=10)
     fig.tight_layout(rect=[0, 0, 1, 0.93])
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or '.', exist_ok=True)
@@ -896,17 +1017,316 @@ def plot_fdbm_methods_zcompare_4panel(
     return fig, axes
 
 
-def plot_xy_slice(data, origin, step, iz, title, fname, save_dir, sym=False, cmap='magma'):
-    """Plot xy slice at given z-index. Prefer `imshow_afm` / `plot_afm_height_panel` for new code."""
-    nx, ny = data.shape[0], data.shape[1]
-    extent = [origin[0], origin[0] + nx * step, origin[1], origin[1] + ny * step]
-    fig, ax = plt.subplots(figsize=(6, 5))
-    imshow_afm(ax, data[:, :, iz], extent=extent, cmap=cmap, symmetric=sym, title=title)
-    ax.set_xlabel('x [A]'); ax.set_ylabel('y [A]')
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, fname), dpi=120, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved {fname}")
+def mirror_asymmetry_2d(arr, axis=0, center=None):
+    """Mirror asymmetry of a 2D map about a horizontal (axis=0) or vertical (axis=1) line.
+
+    axis=0: flip along x (rows) about `center` ix → left↔right asymmetry (molecule x-mirror).
+    axis=1: flip along y (cols) about `center` iy → top↔bottom.
+    center: pixel index; default = peak of |arr| (robust for localized maps) else geometric mid.
+    Returns float in [0, ~2]: max|arr−mirrored| / (max|arr|+eps).
+    """
+    a = np.asarray(arr, dtype=np.float64)
+    if a.ndim != 2:
+        raise ValueError(f'mirror_asymmetry_2d: need 2D, got {a.shape}')
+    peak = float(np.max(np.abs(a))) + 1e-30
+    if center is None:
+        ij = np.unravel_index(int(np.argmax(np.abs(a))), a.shape)
+        center = int(ij[axis])
+    c = int(center)
+    n = a.shape[axis]
+    r = int(min(c, n - 1 - c))
+    if r < 2:
+        return 1.0
+    if axis == 0:
+        crop = a[c - r:c + r + 1, :]
+        return float(np.max(np.abs(crop - crop[::-1, :])) / peak)
+    crop = a[:, c - r:c + r + 1]
+    return float(np.max(np.abs(crop - crop[:, ::-1])) / peak)
+
+
+def com_pixel_xy(arr_nxny, origin, step):
+    """Intensity-weighted COM of |arr| → (ix, iy) and (x, y) Å."""
+    a = np.abs(np.asarray(arr, dtype=np.float64))
+    nx, ny = a.shape
+    s = float(a.sum()) + 1e-30
+    ix = float((a.sum(axis=1) * np.arange(nx)).sum() / s)
+    iy = float((a.sum(axis=0) * np.arange(ny)).sum() / s)
+    x = float(origin[0] + ix * step)
+    y = float(origin[1] + iy * step)
+    return (ix, iy), (x, y)
+
+
+def plot_cube_es_chain_diag(
+    rho_scf, rho_diff, V_ES, E_ES, tip_tot, tip_del,
+    origin, step, atomPos, out_path, *,
+    z_above=(1.0, 5.0), title='', dpi=140,
+    rho_na=None, compare_VES=None, compare_label='DFTB V_ES'):
+    """XY(+XZ) diagnostic for cube FDBM electrostatic chain + tip.
+
+    Confirms path: V_ES = Poisson(Δρ), E_ES = tip_Δρ ⊗ V_ES (not locpot/ESP cube).
+    Reports mirror asymmetry about molecule COM for each field at each z_above.
+    Tip panels use geometric mid of fftshifted maps (not mol COM).
+    tip_tot/tip_del/E_ES may be None → field-only figure (native cube grid).
+    """
+    mol_z = float(np.asarray(atomPos)[:, 2].mean())
+    nx, ny, nz = rho_scf.shape
+    z_coords = origin[2] + np.arange(nz, dtype=np.float64) * float(step)
+    com_xy = np.asarray(atomPos, dtype=np.float64)[:, :2].mean(axis=0)
+    ix_c = int(np.clip(round((com_xy[0] - origin[0]) / step), 0, nx - 1))
+    iy_c = int(np.clip(round((com_xy[1] - origin[1]) / step), 0, ny - 1))
+    has_tip = tip_tot is not None and tip_del is not None
+    has_E = E_ES is not None
+
+    z_list = list(z_above)
+    n_z = len(z_list)
+    field_cols = [
+        ('ρ_scf', rho_scf, 'magma', False),
+        ('Δρ=ρ−ρ_NA', rho_diff, 'seismic', True),
+        ('V_ES=Poisson(Δρ)', V_ES, 'seismic', True),
+    ]
+    if has_E:
+        field_cols.append(('E_ES=tip_Δρ⊗V_ES', E_ES, 'seismic', True))
+    if compare_VES is not None:
+        field_cols.append((compare_label, compare_VES, 'seismic', True))
+    if rho_na is not None:
+        field_cols.insert(1, ('ρ_NA', rho_na, 'magma', False))
+
+    n_fc = len(field_cols)
+    n_extra = 2 if has_tip else 0
+    nrows = n_z + 1 + (1 if has_tip else 0)
+    fig, axes = plt.subplots(nrows, n_fc + n_extra, figsize=(2.2 * (n_fc + n_extra) + 1, 2.0 * nrows + 1.2),
+                             squeeze=False)
+    lines = [title or 'cube ES chain',
+             f'path: V_ES=fft_poisson(Δρ)  [NOT esp/locpot cube]; E_ES=conv(tip_Δρ,V_ES)',
+             f'grid={nx}x{ny}x{nz} step={step} origin={origin}  COM_xy={com_xy} ix,iy=({ix_c},{iy_c})',
+             '']
+
+    dV = float(step) ** 3
+    tip_q = f'  ∫tip={float(tip_tot.sum()*dV):.4f}  ∫tip_Δρ={float(tip_del.sum()*dV):.4e}' if has_tip else ''
+    lines.append(f'∫ρ={float(rho_scf.sum()*dV):.4f}  ∫Δρ={float(rho_diff.sum()*dV):.4e}{tip_q}')
+
+    def _show(ax, sl, cmap, sym, ttl, cx=None, cy=None):
+        v = max(float(np.percentile(np.abs(sl), 99)), 1e-30)
+        kw = dict(origin='lower', cmap=cmap, aspect='equal')
+        if sym:
+            kw['vmin'], kw['vmax'] = -v, v
+        else:
+            kw['vmin'], kw['vmax'] = 0.0, v
+        im = ax.imshow(np.asarray(sl).T, **kw)
+        ax.set_title(ttl, fontsize=7)
+        ax.set_xticks([]); ax.set_yticks([])
+        cx = ix_c if cx is None else int(cx)
+        cy = iy_c if cy is None else int(cy)
+        mx = mirror_asymmetry_2d(sl, axis=0, center=cx)
+        my = mirror_asymmetry_2d(sl, axis=1, center=cy)
+        ax.text(0.02, 0.98, f'mX={mx:.2e}\nmY={my:.2e}', transform=ax.transAxes,
+                va='top', fontsize=6, color='w',
+                bbox=dict(boxstyle='round', fc='k', alpha=0.45))
+        return im, mx, my
+
+    for iz_row, za in enumerate(z_list):
+        z_abs = mol_z + float(za)
+        iz = int(np.clip(np.argmin(np.abs(z_coords - z_abs)), 0, nz - 1))
+        lines.append(f'--- XY @ z_mol+{za:.2f} Å  (iz={iz}, z={z_coords[iz]:.3f}) ---')
+        for ic, (name, field, cmap, sym) in enumerate(field_cols):
+            sl = field[:, :, iz]
+            _, mx, my = _show(axes[iz_row, ic], sl, cmap, sym, f'{name}\nXY z+{za:.1f}')
+            lines.append(f'  {name:20s}  mirrorX={mx:.3e}  mirrorY={my:.3e}')
+        if has_tip:
+            tip_xy = np.fft.fftshift(tip_tot[:, :, 0])
+            tipd_xy = np.fft.fftshift(tip_del[:, :, 0])
+            mid = (tip_xy.shape[0] // 2, tip_xy.shape[1] // 2)
+            _, mx, my = _show(axes[iz_row, n_fc], tip_xy, 'magma', False, f'tip ρ XY@0\n(fftshift)', cx=mid[0], cy=mid[1])
+            lines.append(f'  tip ρ XY fftshift     mirrorX={mx:.3e}  mirrorY={my:.3e}')
+            _, mx, my = _show(axes[iz_row, n_fc + 1], tipd_xy, 'seismic', True, f'tip Δρ XY@0\n(fftshift)', cx=mid[0], cy=mid[1])
+            lines.append(f'  tip Δρ XY fftshift    mirrorX={mx:.3e}  mirrorY={my:.3e}')
+
+    ir = n_z
+    lines.append(f'--- XZ @ iy={iy_c} (COM) ---')
+    for ic, (name, field, cmap, sym) in enumerate(field_cols):
+        sl = field[:, iy_c, :]
+        _, mx, my = _show(axes[ir, ic], sl, cmap, sym, f'{name}\nXZ')
+        lines.append(f'  {name:20s}  XZ mirrorX={mx:.3e}')
+    if has_tip:
+        tip_xz = np.fft.fftshift(tip_tot[:, tip_tot.shape[1] // 2, :])
+        tipd_xz = np.fft.fftshift(tip_del[:, tip_del.shape[1] // 2, :])
+        mid_x = tip_xz.shape[0] // 2
+        _, mx, _ = _show(axes[ir, n_fc], tip_xz, 'magma', False, 'tip ρ XZ mid-y\n(fftshift)', cx=mid_x, cy=tip_xz.shape[1] // 2)
+        lines.append(f'  tip ρ XZ fftshift     mirrorX={mx:.3e}')
+        _, mx, _ = _show(axes[ir, n_fc + 1], tipd_xz, 'seismic', True, 'tip Δρ XZ\n(fftshift)', cx=mid_x, cy=tipd_xz.shape[1] // 2)
+        lines.append(f'  tip Δρ XZ fftshift    mirrorX={mx:.3e}')
+
+    if has_tip:
+        ir = n_z + 1
+        peak = np.unravel_index(int(np.argmax(np.abs(tip_tot))), tip_tot.shape)
+        lines.append(f'tip peak index={peak}  (expect near (0,0,0) after roll)')
+        for ic in range(n_fc):
+            axes[ir, ic].axis('off')
+        iz5 = min(5, tip_tot.shape[2] - 1)
+        _show(axes[ir, n_fc], tip_tot[:, :, iz5], 'magma', False, f'tip ρ XY iz={iz5}\n(no shift)',
+              cx=0, cy=0)
+        _show(axes[ir, n_fc + 1], tip_del[:, :, iz5], 'seismic', True, f'tip Δρ XY iz={iz5}',
+              cx=0, cy=0)
+
+    fig.suptitle(
+        (title or 'cube ES diagnostics') + '\n'
+        'V_ES = Poisson(Δρ)  |  E_ES = tip_Δρ ⊗ V_ES  |  mX/mY = mirror asym about mol COM',
+        fontsize=10)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or '.', exist_ok=True)
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print(f'REVIEW: {out_path}')
+    return lines, out_path
+
+
+def plot_cube_delta_rho_na_origin_diag(
+    rho_scf, origin, step, atomPos, atomZ, out_path, *,
+    rho_na_cube=None, z_above=1.0, title='', dpi=140, sigma_na=0.3, rc_na=0.6):
+    """Canonical diagnostic: where does the Δρ dipole / V_ES asymmetry come from?
+
+    **Preserve this plot** — regenerates the USER-approved smoking-gun figure
+    ``debug/fdbm_fukui_panel_flat/pentacene/es_diag/dipole_origin_bisect.png``
+    (2026-07-24). See ``doc/Caveats.md`` § all-electron Δρ / NA multipoles.
+
+    Approved 3×4 layout (native cube grid; **no** dipole strip; **no** FDBM project):
+      Row0: ρ_N | Δρ=N−NA_cube | Δρ=N−GaussCORNER | Δρ=clamp→compact
+      Row1: X-mirror resid of (NA_cube | GaussCORNER | GaussCENTER | clamp)
+      Row2: V_ES=Poisson of same four Δρ fields
+    CORNER = ``make_gaussian_rho_na`` (origin+i·h); CENTER = half-voxel offset
+    (GridsOCL project convention) — both slope V but differently (x vs diagonal).
+
+    Finding: asymmetry is **not** in the pySCF (ρ_N, ρ_NA) pair; it appears when
+    we subtract our Gaussian/compact NA. AFM / PBC Poisson is extremely sensitive.
+    """
+    from . import AFM as afm_mod
+
+    rho_scf = np.asarray(rho_scf, dtype=np.float64)
+    origin = np.asarray(origin, dtype=np.float64).ravel()[:3]
+    step = float(step)
+    atomPos = np.asarray(atomPos, dtype=np.float64)
+    atomZ = np.asarray(atomZ, dtype=np.float64).reshape(-1)
+    nx, ny, nz = rho_scf.shape
+    dV = step ** 3
+    com = atomPos.mean(axis=0)
+    mol_z = float(atomPos[:, 2].mean())
+    z_coords = origin[2] + step * np.arange(nz)
+    iz = int(np.clip(np.argmin(np.abs(z_coords - (mol_z + float(z_above)))), 0, nz - 1))
+    ix_c = int(np.clip(round((com[0] - origin[0]) / step), 0, nx - 1))
+
+    q_scf = float(rho_scf.sum() * dV)
+    rho_na_g = make_gaussian_rho_na(
+        atomPos, atomZ, origin, step, (nx, ny, nz), sigma=sigma_na, rescale_to_q=q_scf)
+    # CENTER-sampled Gauss (diagnostic only — cores miss corner-sampled ρ)
+    xs = origin[0] + step * (np.arange(nx) + 0.5)
+    ys = origin[1] + step * (np.arange(ny) + 0.5)
+    zs = origin[2] + step * (np.arange(nz) + 0.5)
+    norm = 1.0 / ((2.0 * np.pi * float(sigma_na) ** 2) ** 1.5)
+    inv2s2 = 1.0 / (2.0 * float(sigma_na) ** 2)
+    rho_na_gc = np.zeros_like(rho_scf)
+    for Zi, p in zip(atomZ, atomPos):
+        gx = np.exp(-(xs - p[0]) ** 2 * inv2s2)
+        gy = np.exp(-(ys - p[1]) ** 2 * inv2s2)
+        gz = np.exp(-(zs - p[2]) ** 2 * inv2s2)
+        rho_na_gc += float(Zi) * norm * gx[:, None, None] * gy[None, :, None] * gz[None, None, :]
+    qg = float(rho_na_gc.sum() * dV)
+    if qg > 1e-30:
+        rho_na_gc *= q_scf / qg
+    clamp = delta_rho_clamp_compact_na(
+        rho_scf.astype(np.float32), origin, step, atomPos, atomZ, rc_na=rc_na, R_sphere=rc_na)
+
+    if rho_na_cube is None:
+        raise ValueError(
+            'plot_cube_delta_rho_na_origin_diag requires rho_na_cube '
+            '(canonical control: Δρ=ρ_N−ρ_NA.cube). Prefer regenerating with pySCF NA cube.')
+    rd_cube = rho_scf - np.asarray(rho_na_cube, dtype=np.float64)
+    rd_corner = rho_scf - rho_na_g
+    rd_center = rho_scf - rho_na_gc
+    rd_clamp = np.asarray(clamp['rho_diff'], dtype=np.float64)
+
+    def _pxy(rd):
+        xs_ = origin[0] + step * (np.arange(nx) + 0.5)
+        ys_ = origin[1] + step * (np.arange(ny) + 0.5)
+        zs_ = origin[2] + step * (np.arange(nz) + 0.5)
+        X, Y, Z = np.meshgrid(xs_, ys_, zs_, indexing='ij')
+        q = float(np.asarray(rd).sum() * dV)
+        px = float((rd * X).sum() * dV) - q * com[0]
+        py = float((rd * Y).sum() * dV) - q * com[1]
+        return np.hypot(px, py)
+
+    def _resid_x(sl):
+        r = min(ix_c, sl.shape[0] - 1 - ix_c)
+        if r >= 2:
+            return sl[ix_c - r:ix_c + r + 1, :] - sl[ix_c - r:ix_c + r + 1, :][::-1, :]
+        return sl - sl[::-1, :]
+
+    def _imshow(ax, data, *, cmap, sym, title_s):
+        v = max(float(np.percentile(np.abs(data), 99)), 1e-30)
+        kw = dict(origin='lower', aspect='equal', cmap=cmap)
+        if sym:
+            kw['vmin'], kw['vmax'] = -v, v
+        else:
+            kw['vmin'], kw['vmax'] = 0.0, v
+        ax.imshow(data.T, **kw)
+        ax.set_title(title_s, fontsize=8)
+        ax.set_xticks([]); ax.set_yticks([])
+
+    # Row0 density columns; rows1–2 compare four Δρ recipes (CENTER only in resid/V)
+    row0 = [
+        ('ρ_N', rho_scf[:, :, iz], False, 'magma'),
+        ('Δρ=N−NA_cube', rd_cube[:, :, iz], True, 'seismic'),
+        ('Δρ=N−GaussCORNER', rd_corner[:, :, iz], True, 'seismic'),
+        ('Δρ=clamp→compact', rd_clamp[:, :, iz], True, 'seismic'),
+    ]
+    resid_fields = [
+        ('N−NA_cube resid', _resid_x(rd_cube[:, :, iz])),
+        ('N−GaussCORNER resid', _resid_x(rd_corner[:, :, iz])),
+        ('N−GaussCENTER resid', _resid_x(rd_center[:, :, iz])),
+        ('clamp resid', _resid_x(rd_clamp[:, :, iz])),
+    ]
+    v_fields = [
+        ('V(N−NA_cube)', rd_cube),
+        ('V(N−GaussCORNER)', rd_corner),
+        ('V(N−GaussCENTER)', rd_center),
+        ('V(clamp)', rd_clamp),
+    ]
+
+    fig, axes = plt.subplots(3, 4, figsize=(12.8, 9.0), squeeze=False)
+    lines = [
+        title or 'Δρ / NA origin diagnostic (NO dipole strip)',
+        'SSOT finding: V(N−NA_cube) clean; V(N−Gauss*) and V(clamp) carry fake dipole — see doc/Caveats.md',
+        f'grid={nx}x{ny}x{nz} step={step} iz={iz} z_mol+{z_above}',
+        '',
+    ]
+    for ic, (name, sl, sym, cmap) in enumerate(row0):
+        mx = mirror_asymmetry_2d(sl, axis=0, center=ix_c)
+        _imshow(axes[0, ic], sl, cmap=cmap, sym=sym, title_s=f'{name}\nmX={mx:.2e}')
+        lines.append(f'{name}: mX={mx:.3e}')
+
+    for ic, (name, resid) in enumerate(resid_fields):
+        _imshow(axes[1, ic], resid, cmap='seismic', sym=True,
+                title_s=f'{name}\nmax={np.max(np.abs(resid)):.2e}')
+
+    for ic, (name, rd) in enumerate(v_fields):
+        V = afm_mod.fft_poisson_cpu(np.asarray(rd, dtype=np.float32), step)
+        slv = V[:, :, iz]
+        mxv = mirror_asymmetry_2d(slv, axis=0, center=ix_c)
+        pxy = _pxy(rd)
+        _imshow(axes[2, ic], slv, cmap='seismic', sym=True,
+                title_s=f'{name}\nmX={mxv:.2e} |pxy|={pxy:.2e}')
+        lines.append(f'{name}: |pxy|={pxy:.3e}  V_mX@z+{z_above}={mxv:.3e}')
+
+    fig.suptitle(
+        (title or 'NATIVE: where does Δρ dipole come from? (NO manual dipole strip)') + '\n'
+        'our NA code uses CORNER samples; GridsOCL project uses CENTER — check misalignment. '
+        'See doc/Caveats.md',
+        fontsize=10)
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or '.', exist_ok=True)
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print(f'REVIEW: {out_path}')
+    return lines, out_path
 
 
 def save_afm_images(df, scan_xs, scan_ys, heights, out_dir, prefix='df', cmap='afmhot'):
@@ -979,9 +1399,84 @@ def plot_grid_Fz(Fz, heights, label, fname, x_ext=None, y_ext=None, ncols=7, sav
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _make_grid_spec(atomPos, step, margin, z_extra):
-    """Build grid_spec + return (grid_spec, origin, ngrid, step). Wraps afm.setup_density_grid."""
+    """Build grid_spec + return (grid_spec, origin, ngrid, step). Wraps afm.setup_density_grid.
+
+    NOTE: setup_density_grid adds z_extra only on +z → mol plane is NOT box-centered in z
+    (offset ≈ −z_extra/2). For cube ES / PBC Poisson use ``make_fdbm_grid_com_zsym`` instead.
+    """
     grid_spec, origin, ngrid = afm.setup_density_grid(atomPos, step=step, margin=margin, z_extra=z_extra)
     return grid_spec, origin, ngrid, step
+
+
+def make_fdbm_grid_com_zsym(atomPos, step, margin, z_vac=7.0):
+    """FDBM lattice with COM-centered XY and z-symmetric vacuum about the molecular plane.
+
+    Avoids the fake z-offset of ``setup_density_grid`` (z_extra only on +z), which breaks
+    PBC Poisson multipole neutrality for cube Δρ. ngrid rounded FFT-friendly.
+    Returns (grid_spec, origin, ngrid, step).
+    """
+    atomPos = np.asarray(atomPos, dtype=np.float64)
+    step = float(step); margin = float(margin); z_vac = float(z_vac)
+    com = atomPos.mean(axis=0)
+    mol_z = float(atomPos[:, 2].mean())
+    x0 = float(atomPos[:, 0].min()) - margin
+    x1 = float(atomPos[:, 0].max()) + margin
+    y0 = float(atomPos[:, 1].min()) - margin
+    y1 = float(atomPos[:, 1].max()) + margin
+    z0, z1 = mol_z - z_vac, mol_z + z_vac
+    nx = afm._FDBMGpyFFT.round_fft_friendly(int(np.ceil((x1 - x0) / step)) + 1)
+    ny = afm._FDBMGpyFFT.round_fft_friendly(int(np.ceil((y1 - y0) / step)) + 1)
+    nz = afm._FDBMGpyFFT.round_fft_friendly(int(np.ceil((z1 - z0) / step)) + 1)
+    origin = np.array([com[0] - 0.5 * nx * step, com[1] - 0.5 * ny * step, mol_z - 0.5 * nz * step],
+                      dtype=np.float64)
+    ngrid = (int(nx), int(ny), int(nz))
+    grid_spec = {
+        'origin': origin, 'ngrid': ngrid,
+        'dA': [step, 0.0, 0.0], 'dB': [0.0, step, 0.0], 'dC': [0.0, 0.0, step],
+    }
+    return grid_spec, origin, ngrid, step
+
+
+def strip_monopole_dipole(rho, origin, step, center=None):
+    """Remove monopole + dipole of a density about ``center`` (default: box geometric center).
+
+    ρ' = ρ − q/V − b·(r−c) with b chosen so ∫ρ'(r−c)=0 on a uniform grid.
+    Required before PBC FFT Poisson when Δρ carries *artificial* multipoles (truncated
+    all-electron cubes). Physical molecular dipoles are also removed — use only for
+    near-symmetric systems / when USER accepts multipole neutralization.
+
+    Returns (rho_stripped float32, info dict with q, p, b).
+    """
+    rho = np.asarray(rho, dtype=np.float64)
+    origin = np.asarray(origin, dtype=np.float64).ravel()[:3]
+    if np.ndim(step) == 0:
+        sx = sy = sz = float(step)
+    else:
+        sx, sy, sz = map(float, np.asarray(step).ravel()[:3])
+    nx, ny, nz = rho.shape
+    dV = sx * sy * sz
+    vol = float(nx * ny * nz) * dV
+    xs = origin[0] + sx * (np.arange(nx, dtype=np.float64) + 0.5)
+    ys = origin[1] + sy * (np.arange(ny, dtype=np.float64) + 0.5)
+    zs = origin[2] + sz * (np.arange(nz, dtype=np.float64) + 0.5)
+    if center is None:
+        center = np.array([xs.mean(), ys.mean(), zs.mean()], dtype=np.float64)
+    else:
+        center = np.asarray(center, dtype=np.float64).ravel()[:3]
+    X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
+    dx, dy, dz = X - center[0], Y - center[1], Z - center[2]
+    q = float(rho.sum() * dV)
+    px = float((rho * X).sum() * dV) - q * center[0]
+    py = float((rho * Y).sum() * dV) - q * center[1]
+    pz = float((rho * Z).sum() * dV) - q * center[2]
+    Ixx = float((dx * dx).sum() * dV)
+    Iyy = float((dy * dy).sum() * dV)
+    Izz = float((dz * dz).sum() * dV)
+    bx = px / Ixx if Ixx > 1e-30 else 0.0
+    by = py / Iyy if Iyy > 1e-30 else 0.0
+    bz = pz / Izz if Izz > 1e-30 else 0.0
+    out = (rho - q / vol - (bx * dx + by * dy + bz * dz)).astype(np.float32)
+    return out, {'q': q, 'p': np.array([px, py, pz]), 'b': np.array([bx, by, bz]), 'center': center}
 
 
 def _project_densities(geo, evecs, basis, grid_spec, verbosity=0):
@@ -1446,7 +1941,7 @@ def soft_clamp_rational(y, y1, y2, dy=None):
 def delta_rho_clamp_compact_na(rho_scf, origin, step, atomPos, atomZ, *,
                                y1=None, y2=None, R_sphere=0.6, rc_na=0.6,
                                profile='r2', valence_Z=None):
-    """All-electron Δρ recipe (CO guinea-pig SSOT): soft-clamp cores → compact NA.
+    """All-electron Δρ recipe (CO guinea-pig): soft-clamp cores → compact NA.
 
     Distinguishes **all-electron** (Psi4/pySCF cubes, ∫ρ≈∑Z) from **DFTB valence**
     (∫ρ≈∑Z_val) — this path is for all-electron; DFTB already has orbital ρ_NA.
@@ -1458,7 +1953,9 @@ def delta_rho_clamp_compact_na(rho_scf, origin, step, atomPos, atomZ, *,
          q_i = Z_i − Q_rem_i  ("NA charge − clamped charge")
       4. Δρ = ρ_c − ρ_NA; require |∫Δρ| small (neutrality check)
 
-    Plot valence region on a common axis with DFTB Δρ; ignore core spikes visually.
+    Caveat (2026-07-24 pentacene): better than bare Gauss but **still** leaves a
+    large XY dipole vs ρ_N−ρ_NA.cube — do **not** treat as fixed ES. Prefer cube
+    ρ_NA when available. See ``doc/Caveats.md``, ``plot_cube_delta_rho_na_origin_diag``.
 
     Returns dict: rho_clamped, rho_na, rho_diff, Q_*, y1,y2, per-atom Q_rem, …
     """
@@ -1544,19 +2041,14 @@ def delta_rho_clamp_compact_na(rho_scf, origin, step, atomPos, atomZ, *,
 def make_gaussian_rho_na(atomPos, atomZ, origin, step, ngrid, sigma=0.3, rescale_to_q=None):
     """Neutral-atom density as sum of spherical Gaussians centered on atoms.
 
+    Samples at voxel **corners** ``origin + i·h`` (same as OpenCL add_gaussian).
     Each atom Z contributes ∫ρ = Z (before optional rescale). Used for Δρ = ρ_scf − ρ_NA
-    so that ∫Δρ ≈ 0 (charge neutrality for FFT Poisson). Shape is not physical DFT NA —
-    only needs to cancel total charge and sit exactly on nuclear positions.
-    Default σ=0.3 Å (pyridine same-cell V_ES: σ≲0.5 saturates AFM-height V; wider NA worsens repulsion).
+    so that ∫Δρ ≈ 0 (charge neutrality for FFT Poisson). Shape is **not** physical DFT NA.
 
-    Args:
-        atomPos: (natoms, 3) Angstrom — must match density grid frame
-        atomZ: (natoms,) nuclear charges (electrons per Gaussian)
-        origin: (3,) grid origin Angstrom
-        step: float isotropic spacing Angstrom (or (3,) — uses step[0] if array)
-        ngrid: (nx, ny, nz)
-        sigma: Gaussian width [Å] (default 0.3)
-        rescale_to_q: if set, scale ρ_NA so ∫ρ_NA = rescale_to_q (exact neutrality)
+    Caveat (2026-07-24): all-e ρ − this Gauss leaves a huge fake XY dipole → PBC V_ES
+    L–R slope (CORNER: strong x; CENTER-sampled Gauss: smoother but diagonal slope).
+    Prefer ρ_N−ρ_NA.cube. Diagnostic: ``plot_cube_delta_rho_na_origin_diag``. See ``doc/Caveats.md``.
+    Default σ=0.3 Å (pyridine same-cell: σ≲0.5 saturates AFM-height V).
 
     Returns:
         rho_na: (nx, ny, nz) float32  e/Å³
@@ -1696,25 +2188,17 @@ def make_compact_rho_na(atomPos, atomZ, origin, step, ngrid, rc=0.5, rescale_to_
 def get_density_from_cube(cube_path_or_dir, *, esp_path=None, sigma_na=0.3,
                           rescale_na=True, use_esp_cube=False, verbosity=0,
                           na_kind='gaussian', rc_na=0.5):
-    """Load Dt.cube (+ optional ESP) → same dict as get_density_from_dftb_dense.
+    """Load Dt.cube / rho_N.cube (+ optional ESP) → density dict for FDBM.
 
-    ρ_scf from Dt (e/a0³ → e/Å³). ρ_NA from `na_kind`:
-      - 'gaussian': Σ Z_i Gaussians, width `sigma_na`
-      - 'compact': Σ Z_i (1-(r/rc_na)^4)^2 for r<rc_na (finite support)
-    ρ_diff = ρ_scf − ρ_NA with ∫ρ_diff forced ≈ 0 via rescale when `rescale_na=True`.
+    ρ_scf from cube (e/a0³ → e/Å³). Default ρ_NA is **synthetic** (`na_kind`):
+      - 'gaussian': Σ Z_i Gaussians (CORNER samples) — LEGACY for ES; see Caveats
+      - 'compact': Σ Z_i (1-(r/rc_na)^4)^2 for r<rc_na
+    ρ_diff = ρ_scf − ρ_NA; rescale_na forces ∫ρ_diff≈0.
 
-    Atom positions come from the **cube header** (not geom.xyz) so NA sits
-    on the density frame. Does not modify DFTB/pySCF providers.
-
-    Args:
-        cube_path_or_dir: path to Dt.cube or directory containing Dt.cube
-        esp_path: optional ESP.cube (default: sibling ESP.cube)
-        sigma_na: Gaussian NA width [Å] (default 0.3; used if na_kind='gaussian')
-        rc_na: compact core radius [Å] (default 0.5; used if na_kind='compact')
-        na_kind: 'gaussian' | 'compact'
-        rescale_na: scale ρ_NA so ∫ρ_NA = ∫ρ_scf (charge neutrality)
-        use_esp_cube: if True and ESP found, use it as V_ES; else fft_poisson(ρ_diff)
-        verbosity: print charge checks
+    Caveat: synthetic NA does **not** cancel multipoles of all-e ρ → fake dipole in
+    V_ES. Prefer sibling ``rho_NA.cube`` via ``plot_cube_delta_rho_na_origin_diag`` /
+    future cube-NA path. Atom positions from **cube header** (density frame).
+    See ``doc/Caveats.md``.
 
     Returns:
         dict with rho_scf, rho_na, rho_diff, V_ES, origin, ngrid, grid_spec, atomPos, atomZ, …
@@ -1935,7 +2419,14 @@ def plot_cube_density_diagnostics(d, save_dir, tag='cube', z_above=0.0):
 
 
 def resample_field_to_grid(field, origin_src, step_src, origin_dst, step_dst, ngrid_dst, order=1):
-    """Trilinear resample 3D field from src grid onto dst grid (Å)."""
+    """DEPRECATED for densities/Δρ — scipy trilinear *sample* (map_coordinates).
+
+    **Do not use for charge densities.** Sampling does not conserve ∫ρ or dipole
+    (pyridine lesson: broke ∫Δρ). For densities use ``project_density_to_grid``
+    (GridsOCL / kernels/grids.cl trilinear *scatter* with atomic_add).
+
+    Kept only for non-charge fields (e.g. already-solved V) or legacy tests.
+    """
     from scipy.ndimage import map_coordinates
     field = np.asarray(field, dtype=np.float64)
     origin_src = np.asarray(origin_src, dtype=np.float64).ravel()[:3]
@@ -1957,6 +2448,101 @@ def resample_field_to_grid(field, origin_src, step_src, origin_dst, step_dst, ng
     ], axis=0)
     out = map_coordinates(field, coords, order=order, mode='constant', cval=0.0)
     return out.astype(np.float32)
+
+
+def project_density_to_grid(field, origin_src, step_src, origin_dst, step_dst, ngrid_dst, *,
+                            grids=None):
+    """Charge+dipole-preserving densify/downsample via GridsOCL (grids.cl).
+
+    Each source voxel charge Q=ρ·dV is scattered onto 8 dest neighbors (trilinear
+    weights + atomic_add). This is the USER-approved method — **not**
+    ``resample_field_to_grid`` (scipy sample).
+
+    Returns (dst_field, grids_ocl_instance).
+    """
+    from spammm.utils.GridsOCL import GridsOCL
+    if grids is None:
+        grids = GridsOCL(preferred_vendor='nvidia')
+    dst = grids.project_density(
+        field, origin_src, step_src, origin_dst, step_dst, ngrid_dst)
+    return dst, grids
+
+
+def allelectron_cube_to_fdbm_grid(rho_scf, origin_src, step_src, atomPos, atomZ,
+                                 origin_dst, step_dst, ngrid_dst, *,
+                                 rc_na=0.6, R_sphere=0.6, profile='r2',
+                                 strip_dipole=False, verbosity=0, grids=None):
+    """All-electron cube → FDBM grid (clamp→compact + GridsOCL project).
+
+    1. ``delta_rho_clamp_compact_na`` on the **native** cube grid.
+    2. Optional ``strip_monopole_dipole`` (DEFAULT OFF — masks root cause; do not enable
+       as a "fix").
+    3. ``project_density_to_grid`` for ρ_scf (Pauli) and Δρ (ES) — GridsOCL scatter
+       (voxel **centers**). Native NA builders use **corners** — see ``doc/Caveats.md``.
+    4. Tiny monopole strip after project if |∫Δρ| still large.
+
+    Status (2026-07-24): better than Gauss+scipy-sample, but clamp NA still leaves
+    XY dipole vs ρ_N−ρ_NA.cube. Prefer cube ρ_NA when available.
+
+    Returns dict with rho_scf, rho_diff, clamp, q_*, p_diff, grids, …
+    """
+    from spammm.utils.GridsOCL import grid_moments_centers
+
+    atomPos = np.asarray(atomPos, dtype=np.float64)
+    com = atomPos.mean(axis=0)
+    clamp = delta_rho_clamp_compact_na(
+        rho_scf, origin_src, step_src, atomPos, atomZ,
+        rc_na=float(rc_na), R_sphere=float(R_sphere), profile=profile)
+    if verbosity >= 0:
+        print(f"  [cube-SSOT] clamp→compact_NA  Q_scf={clamp['Q_scf']:.3f} "
+              f"Q_c={clamp['Q_clamped']:.3f} ∫Δρ_native={clamp['Q_diff']:.3e} "
+              f"y1={clamp['y1']:.3g} y2={clamp['y2']:.3g} rc={rc_na}")
+
+    rho_diff_src = clamp['rho_diff']
+    strip_info = None
+    if strip_dipole:
+        rho_diff_src, strip_info = strip_monopole_dipole(
+            rho_diff_src, origin_src, step_src, center=com)
+        if verbosity >= 0:
+            p = strip_info['p']
+            print(f"  [cube-SSOT] strip monopole+dipole about COM  "
+                  f"q={strip_info['q']:.3e} p_before={p} |pxy|={np.hypot(p[0], p[1]):.3e}")
+
+    rho_scf_d, grids = project_density_to_grid(
+        rho_scf, origin_src, step_src, origin_dst, step_dst, ngrid_dst, grids=grids)
+    rho_diff_d, grids = project_density_to_grid(
+        rho_diff_src, origin_src, step_src, origin_dst, step_dst, ngrid_dst, grids=grids)
+
+    step = float(step_dst) if np.ndim(step_dst) == 0 else float(step_dst[0])
+    nx, ny, nz = [int(x) for x in ngrid_dst]
+    dV = step ** 3
+    vol = float(nx * ny * nz) * dV
+    q_diff = float(np.asarray(rho_diff_d, dtype=np.float64).sum() * dV)
+    if abs(q_diff) > 1e-4:
+        if verbosity >= 0:
+            print(f"  [cube-SSOT] strip monopole after project q_diff={q_diff:.3e}")
+        rho_diff_d = (rho_diff_d - q_diff / vol).astype(np.float32)
+        q_diff = float(np.asarray(rho_diff_d, dtype=np.float64).sum() * dV)
+    _, p_world = grid_moments_centers(rho_diff_d, origin_dst, step)
+    p_diff = p_world - q_diff * com
+    if verbosity >= 0:
+        print(f"  [cube-SSOT] after project: q_scf={float(rho_scf_d.sum()*dV):.3f} "
+              f"q_diff={q_diff:.3e} p_com={p_diff}")
+
+    return {
+        'rho_scf': rho_scf_d.astype(np.float32),
+        'rho_diff': rho_diff_d.astype(np.float32),
+        'rho_na_native': clamp['rho_na'],
+        'rho_diff_native': clamp['rho_diff'],
+        'rho_scf_clamped_native': clamp['rho_scf_clamped'],
+        'clamp': clamp,
+        'strip_info': strip_info,
+        'q_diff': q_diff,
+        'p_diff': p_diff,
+        'grids': grids,
+        'origin_src': np.asarray(origin_src, dtype=np.float64),
+        'step_src': float(step_src) if np.ndim(step_src) == 0 else float(np.asarray(step_src).ravel()[0]),
+    }
 
 
 def tip_density_apex_down(rho, atomPos, atomZ, apex_Z, origin, step, z_tol=0.15):
@@ -2100,10 +2686,9 @@ def build_fdbm_grid_from_cubes(sample_cube_dir, tip_cube_dir, *, step=0.1, margi
 
     def _to_dest(field, origin_src, step_src, grids=None):
         if use_gpu_project:
-            if grids is None:
-                from spammm.utils.GridsOCL import GridsOCL
-                grids = GridsOCL()
-            return grids.project_density(field, origin_src, step_src, origin, step, ngrid), grids
+            return project_density_to_grid(
+                field, origin_src, step_src, origin, step, ngrid, grids=grids)
+        # Explicit opt-out only — scipy sample breaks ∫Δρ (do not use for densities)
         return resample_field_to_grid(field, origin_src, step_src, origin, step, ngrid), None
 
     grids = None

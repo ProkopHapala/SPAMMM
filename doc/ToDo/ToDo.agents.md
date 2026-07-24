@@ -47,7 +47,11 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
 - [ ] **Molecule-on-surface relax polish** — PTCDA+FAF USER review / charge dial-back; LFF GUI combo; FoldedRigid stability; instant GUI relax T02 (`doc/Tasks/PerfBenchmark_Relaxation.md`, `doc/Topics/ForceFields/LFF_ProjectiveRelax.md`)
 
 **P1 — packaging + AFM/STM demos**
-- [ ] **Headless SPM CLI** — `run_spm.py` + `user_guide/SPM_CLI.md`: AFM (FDBM / Morse / Kriging) + STM (orbitals / current / panel) wired; gaps: BR-STM, substrate `relax`/dock, light-STM, charge-rings, FDBM↔Kriging compare entry, cube ES (`doc/Tasks/SPM_CLI_Headless.md`)
+- [ ] **Contact-surface Morse+Coulomb parity bisect (blocks helicene AFM)** — contact-sep looked too close / long-ranged vs GridFF+brute on helicene; **reuse** PTCDA `testplot_contact_surface` + `testplot_afm_contact_surface`; add **1-atom (q=0)** and **2-atom (charged)** E/Fz toys; report `doc/Reports/Assembly_ContactSurface_AFM_helicene_2026-07-24.md`; tasks `Fast_2p5D_AFM_ContactSurface.md`, `Assembly_AFM_Pipeline.md`; audit `doc/TopicalAudit/AFM_ContactSurface.md`
+- [ ] **Headless SPM CLI** — `run_spm.py` + `user_guide/SPM_CLI.md`: AFM/STM + **`opt` / `smiles-afm`** wired (amp-align heights, PCA planar); gaps: BR-STM, ASCII/.mol flags, light-STM, charge-rings, FDBM↔Kriging compare, cube ES (`doc/Tasks/SPM_CLI_Headless.md`)
+  - [~] **Gas-phase `opt`/`smiles-afm`** — `FFController.optimize_vacuum` (UFF/SPFF/LFF/DFTB); planar + `orientPCA`; **USER science OK** pending
+  - [~] **SMILES** — `spammm/topology/smiles.py` + CLI flags; remaining: ASCII / `.mol`/`.mol2` shared resolver; GUI text box
+  - [ ] **Substrate `dock` (GridFF / FAF)** — **future / harder**; thin-wrap only after USER prioritizes; task §E + `RigidBodyDynamicsWithFoldedBasisSubstrate.md`
 - [ ] **Consolidate GUI↔CLI SPM backend + input protocol** — shared JSON `SPMJobSpec` → one `run_spm_job` (ModularPipeline S1–S6); GUI widgets / CLI argparse are adapters only; plots stay separate (matplotlib stills vs VisPy/blit interactive). **BR-STM:** already in GUI (`AFMExtension` S6); wire same path in CLI; verify GUI still works (`doc/Tasks/Consolidate_GUI_CLI_Backend_Input_Protocol.md`)
 - [ ] **pip install / packaging** — `pyproject.toml`, kernels+data findable (`doc/Tasks/PipInstall_Packaging.md`); expose `run_spm` console script
 - [ ] **Kriging / RBF z-scan → GridFF** — ported modules exist; FDBM-cube ES vs Kriging still open; **grid z/XY alignment is CRITICAL** (`doc/Tasks/Import_KrigingGridFF.md`; topic `doc/Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md`; reports `doc/Reports/Kriging_*.md`)
@@ -55,12 +59,11 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
 - [ ] **Site-resolved Pauli \(A,\beta\) + transferability** — fit \(A\) (and β) at atoms/bonds/rings vs Kriging; optionally Kriging-interpolate parameter maps; spread across site types & molecules (`doc/Tasks/Pauli_A_beta_KrigingTransferability.md`)
 - [ ] **STM orbital compare (mio / 3ob / prolonged + pySCF cubes)** — pentacene + PTCDA HOMO/LUMO panels (`doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md`); CLI: `run_spm.py stm *`; depends on prolonged WFC
 - [ ] **Charge rings PME + Hubbard/MQCA** — OpenCL into SPAMMM; later CLI imaging (`doc/Tasks/Import_ChargeRings_PME.md`)
-- [ ] **Substrate pre-relax before imaging** — FF / DFTB / GridFF / FAF dock+relax as `run_spm.py relax|dock` (planned in `SPM_CLI_Headless.md`)
 - [ ] **Light-STM** — optically driven / excited-state STM channels (CLI ToDo; no module yet)
 
 **P2 — secondary if time**
 - [ ] **Kekulé → exponential RI density** — atom+bond Slater fit from Kekulé π orders vs DFT/DFTB (`doc/Tasks/Kekule_ExponentialDensityFit.md`)
-- [ ] **Fast 2.5D AFM (contact surface)** — harden separable + PIC; decide hybrid; L0 parity (`doc/Tasks/Fast_2p5D_AFM_ContactSurface.md`; design `ContactSurface_Static.md`)
+- [ ] **Fast 2.5D AFM (contact surface) finish** — hybrid decision; ND flag; L0 asserts — **parity bisect promoted to P1 above**; elastic stays Later (`doc/Tasks/Fast_2p5D_AFM_ContactSurface.md`)
 - [ ] **Frenkel Hamiltonian / TEPL** — design only today (`doc/Ideas/FrenkelRigidFF.chat.md`); no module yet
 
 ### Existing Soon
@@ -112,7 +115,7 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
 - [ ] Editor menu simplification + shortcuts
 - [x] 3D editor view mode (`b2Dview` / Enter; ortho; Ring atom/bond/COG; hex 2D-only) — task `doc/Tasks/GUI_Editor_3D_ViewMode.md`
 - [ ] Topology fully independent of hex grid (hex is guideline only; atoms off-grid already OK)
-- [ ] SMILES builder (corner ring pentagon/heptagon drawing implemented)
+- [~] SMILES builder → `AtomicGraph` — parser + CLI wired (`spammm/topology/smiles.py`, `smiles-afm`); GUI text box open — `SPM_CLI_Headless.md` §C + `ARCHITECTURE_ROADMAP` §9 / T07
 - [ ] Molecular browser + AFM thumbnails
 - [ ] Interactive MD drag constrained to mouse ray
 - [ ] LAMMPS/GROMACS export; fragment library
@@ -160,17 +163,22 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
 | Item | Files |
 |------|-------|
 | **Task SSOT** | `doc/Tasks/Fast_2p5D_AFM_ContactSurface.md` |
+| **Assembly AFM task** | `doc/Tasks/Assembly_AFM_Pipeline.md` |
+| **Report (helicene + compare)** | `doc/Reports/Assembly_ContactSurface_AFM_helicene_2026-07-24.md` |
+| **Topical audit** | `doc/TopicalAudit/AFM_ContactSurface.md` |
 | Static design | `doc/Topics/AFM/ContactSurface_Static.md` |
 | Elastic design (Phase 2) | `doc/Topics/AFM/ContactSurface_Elastic.md` |
 | GPU + Python | `kernels/contact_surface.cl`, `spammm/surfaces/ContactSurface.py` |
 | Integration | `spammm/SPM/AFM.py` (`fit_*_contact*`, `run_scan_*`) |
-| L0 / L2 | `tests/SPM/test_afm_contact_surface.py`, `tests/testplot_contact_surface.py` |
+| L0 / L2 PTCDA | `tests/SPM/test_afm_contact_surface.py`, `tests/testplot_contact_surface.py`, `tests/SPM/testplot_afm_contact_surface.py` |
+| L2 helicene compare | `run_assembly_afm.py --compare-dir` |
 
 ### Assembly & surfaces
 | Item | Files |
 |------|-------|
 | Assembly OCL | `spammm/forcefields/Assembly.py`, `kernels/assembly.cl` |
 | Assembly plots | `spammm/forcefields/AssemblyPlot.py`, `tests/testplot_assembly.py` |
+| Assembly→AFM CLI | `run_assembly_afm.py` |
 | GridFF / Ewald / FAF | `spammm/surfaces/GridFF.py`, `Ewald2D.py`, `FoldedRigid.py`, `kernels/surface.cl`, `kernels/gridFF.cl` |
 | Surface overview | `doc/surface_interactions.md`, `spammm/surfaces/README.md` |
 

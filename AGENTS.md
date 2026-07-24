@@ -46,6 +46,7 @@ SPAMMM (Scanning Probe Accelerated Modeling of Microscopy and Manipulation) is a
 - After implementing: update README.md + topical audits (skill:`doc-task-summary`)
 - Dedicated doc work: OKF format, extract/inline workflows (skill:`doc-audit`)
 - `doc/topical_audit.md` — cross-implementation maps per scientific topic
+- `doc/Caveats.md` — recurring scientific/numerical traps (all-e Δρ/NA multipoles, grid conventions)
 - `doc/AGENTS/skills/` — all skills; `doc/AGENTS/protocols/` — domain protocols
 - `README.md` per folder — local index; `CODEMAP.md` — repo structure
 - Visualization: separate compute from plotting; `plt.show()` only in CLI/main

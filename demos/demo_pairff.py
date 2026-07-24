@@ -5,6 +5,14 @@ Loads uracil (static) and HCOOH (dynamic) molecules, sets up pairwise
 force field interactions with electron pairs, and launches interactive
 Vispy visualization with mouse picking.
 
+Multi-body (Strategy M env kernel):
+    python3 demos/demo_pairff.py --bodies 4 --active 0
+    # N copies of HCOOH on a grid; click any molecule to make it mobile
+    python3 demos/demo_pairff.py --bodies 4 --active 2 --no-vis
+    # Mixed species (any XYZ list; formamide.xyz = HCONH2; no NTCDA.xyz yet → use PTCDA):
+    python3 demos/demo_pairff.py --mols PTCDA.xyz HCOOH.xyz formamide.xyz --spacing 12
+    python3 demos/demo_pairff.py --mols PTCDA.xyz HCOOH.xyz formamide.xyz --no-vis --steps 50
+
 Usage:
     python3 demos/demo_pairff.py                    # interactive Vispy (unified kernel)
     python3 demos/demo_pairff.py --pairff-mode legacy
@@ -15,9 +23,11 @@ Kernels (switchable from GUI or --pairff-mode):
   unified — rigid_body_pairff_unified_kernel: single compact-exp loop (default)
             (y=(1-b*rho)^8, rho=r2/(sqrt(r2+w*w)+w))
   legacy  — rigid_body_pairff_kernel: Morse+Coulomb / Lorentzian
+  multi   — rigid_body_pairff_unified_env_kernel when --bodies > 1 or --mols (Strategy M)
 See:
   - examples/density_comparison/HBondFF/fit_radial.py (--compact-exp-demo)
-  - kernels/rigid.cl (rigid_body_pairff_unified_kernel)
+  - doc/Tasks/PairFF_MultiBody_Kernel.md
+  - kernels/rigid.cl (rigid_body_pairff_unified_env_kernel)
 """
 import os
 import numpy as np
@@ -33,6 +43,55 @@ def load_molecule(fname):
     """Load XYZ molecule with REQ parameters."""
     apos, REQs, enames, Zs, lvec = load_xyz_with_REQs(fname)
     return np.asarray(apos, dtype=np.float32), REQs, enames
+
+
+def _resolve_xyz(path_or_name):
+    """Accept absolute/relative path or basename under data/xyz/."""
+    if os.path.isfile(path_or_name):
+        return os.path.abspath(path_or_name)
+    cand = os.path.join(DATA_XYZ, path_or_name)
+    if os.path.isfile(cand):
+        return cand
+    if not path_or_name.endswith('.xyz'):
+        cand2 = os.path.join(DATA_XYZ, path_or_name + '.xyz')
+        if os.path.isfile(cand2):
+            return cand2
+    raise FileNotFoundError(f"Molecule XYZ not found: {path_or_name} (tried {cand})")
+
+
+def _grid_positions(n, spacing=6.0, z=0.0):
+    """Place N CoMs on an XY grid centered at origin."""
+    nx = int(np.ceil(np.sqrt(n)))
+    pos = np.zeros((n, 3), dtype=np.float32)
+    for i in range(n):
+        ix, iy = i % nx, i // nx
+        pos[i, 0] = (ix - 0.5 * (nx - 1)) * spacing
+        pos[i, 1] = (iy - 0.5 * (nx - 1)) * spacing
+        pos[i, 2] = z
+    return pos
+
+
+def _build_multibody(molecules, labels, active, spacing, args):
+    """Shared constructor for identical or mixed multi-body scenes."""
+    n = len(molecules)
+    if active < 0 or active >= n:
+        raise SystemExit(f'--active {active} out of range for {n} molecules')
+    if args.pairff_mode != 'unified':
+        raise SystemExit('multi-body mode requires --pairff-mode unified')
+    body_pos = _grid_positions(n, spacing=spacing, z=0.0)
+    print(f"Multi-body PairFF: {n} molecules, active={active}, spacing={spacing}")
+    for i, lab in enumerate(labels):
+        print(f"  [{i}] {lab}  CoM={body_pos[i]}")
+    rbd = RigidBodyPairFF.from_molecules(
+        molecules, body_pos, active_body=active,
+        He=args.he, rc=args.rc, w=args.w, morse_alpha=args.alpha, k_z=args.kz,
+        z_target=0.0, Hs=args.hs,
+        epair_dist=args.epair_dist, sigma_dist=args.sigma_dist, beta=args.beta,
+    )
+    print(f"Active atoms+epairs: {len(rbd.enames)} — {rbd.enames}")
+    print(f"Env molecules: {rbd.n_env_mols}  env sites: {rbd.n_env_sites}")
+    print(f"Active types: {rbd.dyn_type_host}")
+    return rbd
 
 
 def main():
@@ -52,45 +111,61 @@ def main():
     parser.add_argument('--sigma-dist', type=float, default=1.0, help='Sigma hole distance from H [Å] (0=disabled)')
     parser.add_argument('--pairff-mode', choices=['legacy', 'unified'], default='unified',
                         help='Force kernel: legacy Morse+Lorentzian or unified compact-exp')
+    parser.add_argument('--bodies', type=int, default=0,
+                        help='Multi-body: N copies of HCOOH (uses env Strategy M). 0 = classic uracil+HCOOH')
+    parser.add_argument('--mols', nargs='+', default=None,
+                        help='Multi-body mixed species: XYZ paths or basenames under data/xyz/ '
+                             '(e.g. PTCDA.xyz HCOOH.xyz formamide.xyz). Overrides --bodies.')
+    parser.add_argument('--active', type=int, default=0, help='Active body index for multi-body mode')
+    parser.add_argument('--spacing', type=float, default=6.0, help='XY grid spacing for multi-body')
     args = parser.parse_args()
 
-    # --- Load molecules ---
-    static_apos, static_REQs, static_enames = load_molecule(os.path.join(DATA_XYZ, 'uracil.xyz'))
-    dyn_apos, dyn_REQs, dyn_enames = load_molecule(os.path.join(DATA_XYZ, 'HCOOH.xyz'))
+    if args.mols:
+        paths = [_resolve_xyz(p) for p in args.mols]
+        molecules, labels = [], []
+        for p in paths:
+            apos, REQs, enames = load_molecule(p)
+            molecules.append((apos, enames, REQs))
+            labels.append(os.path.basename(p))
+        rbd = _build_multibody(molecules, labels, int(args.active), args.spacing, args)
+    elif args.bodies and args.bodies > 1:
+        dyn_apos, dyn_REQs, dyn_enames = load_molecule(os.path.join(DATA_XYZ, 'HCOOH.xyz'))
+        n = int(args.bodies)
+        molecules = [(dyn_apos, dyn_enames, dyn_REQs)] * n
+        labels = [f'HCOOH#{i}' for i in range(n)]
+        rbd = _build_multibody(molecules, labels, int(args.active), args.spacing, args)
+    else:
+        # --- Classic: uracil static + HCOOH dynamic ---
+        static_apos, static_REQs, static_enames = load_molecule(os.path.join(DATA_XYZ, 'uracil.xyz'))
+        dyn_apos, dyn_REQs, dyn_enames = load_molecule(os.path.join(DATA_XYZ, 'HCOOH.xyz'))
 
-    print(f"Static (uracil): {len(static_enames)} atoms — {static_enames}")
-    print(f"Dynamic (HCOOH): {len(dyn_enames)} atoms — {dyn_enames}")
-    print(f"PairFF mode: {args.pairff_mode}")
+        print(f"Static (uracil): {len(static_enames)} atoms — {static_enames}")
+        print(f"Dynamic (HCOOH): {len(dyn_enames)} atoms — {dyn_enames}")
+        print(f"PairFF mode: {args.pairff_mode}")
 
-    # Position dynamic molecule above static molecule center
-    static_center = static_apos[:, :2].mean(axis=0)
-    body_pos = np.array([static_center[0], static_center[1], 3.0], dtype=np.float32)
+        static_center = static_apos[:, :2].mean(axis=0)
+        body_pos = np.array([static_center[0], static_center[1], 3.0], dtype=np.float32)
 
-    # --- Build RigidBodyPairFF ---
-    rbd = RigidBodyPairFF.from_two_molecules(
-        dyn_apos=dyn_apos, dyn_enames=dyn_enames, dyn_REQs=dyn_REQs,
-        static_apos=static_apos, static_enames=static_enames, static_REQs=static_REQs,
-        body_pos=body_pos,
-        He=args.he, rc=args.rc, w=args.w, morse_alpha=args.alpha, k_z=args.kz,
-        z_target=0.0, Hs=args.hs,
-        epair_dist=args.epair_dist, sigma_dist=args.sigma_dist,
-        mode=args.pairff_mode, beta=args.beta,
-    )
-
-    # Print electron pair info
-    print(f"Dynamic atoms+epairs: {len(rbd.enames)} — {rbd.enames}")
-    print(f"Static atoms+epairs: {len(rbd.static_enames)} — {rbd.static_enames}")
-    print(f"Dynamic types: {rbd.dyn_type_host}")
-    print(f"Static types:  {rbd.static_type_host}")
+        rbd = RigidBodyPairFF.from_two_molecules(
+            dyn_apos=dyn_apos, dyn_enames=dyn_enames, dyn_REQs=dyn_REQs,
+            static_apos=static_apos, static_enames=static_enames, static_REQs=static_REQs,
+            body_pos=body_pos,
+            He=args.he, rc=args.rc, w=args.w, morse_alpha=args.alpha, k_z=args.kz,
+            z_target=0.0, Hs=args.hs,
+            epair_dist=args.epair_dist, sigma_dist=args.sigma_dist,
+            mode=args.pairff_mode, beta=args.beta,
+        )
+        print(f"Dynamic atoms+epairs: {len(rbd.enames)} — {rbd.enames}")
+        print(f"Static atoms+epairs: {len(rbd.static_enames)} — {rbd.static_enames}")
+        print(f"Dynamic types: {rbd.dyn_type_host}")
+        print(f"Static types:  {rbd.static_type_host}")
 
     if args.no_vis:
-        # --- Headless relaxation test ---
         print(f"\nRunning FIRE relaxation (max {args.steps} steps, dt={args.dt})...")
         result = rbd.relax_pairff(max_steps=args.steps, dt=args.dt, f_tol=1e-4, t_tol=1e-4, record=True)
         print(f"Converged: {result['converged']} in {result['steps']} steps")
         print(f"  F={result['F']:.6f}  T={result['T']:.6f}  E={result['E']:.6f}")
 
-        # Print final positions
         out = rbd.download_outputs()
         print(f"\nFinal CoM pos: {out['pos'][0, :3]}")
         print(f"Final quat:    {out['quats'][0]}")
@@ -98,16 +173,20 @@ def main():
         for i, (e, t) in enumerate(zip(rbd.enames, rbd.dyn_type_host)):
             tag = 'epair' if t == 1 else ('sigma' if t == 2 else e)
             print(f"  [{i:2d}] {tag:6s}  {out['atom_positions'][0, i, :3]}")
+        if getattr(rbd, 'env_mode', False) and rbd._mb_packs is not None:
+            rbd.sync_active_pose_from_gpu()
+            print(f"Host multi-body CoMs:\n{rbd._mb_pos}")
     else:
-        # --- Interactive Vispy visualization ---
         from spammm.GUI.RigidBodyVispy import RigidBodyVispy
-        vis = RigidBodyVispy(rbd, dt=args.dt, steps_per_frame=10, fire=False)
+        vis = RigidBodyVispy(rbd, dt=args.dt, steps_per_frame=10, fire=True)
         print("\nVispy+PyQt5 window opened.")
         print("Controls:")
         print("  LMB click+drag atoms to pull (anchor springs)")
+        if getattr(rbd, 'env_mode', False):
+            print("  Multi-body: LMB on any molecule → make it active (others static + map rebuild)")
         print("  Mouse wheel = zoom, Arrow keys = pan")
         print("  SPACE = run/stop simulation")
-        print("  R = reset velocities, F = toggle FIRE")
+        print("  R = reset velocities, F = toggle FIRE (default ON)")
         print("  ESC = quit")
         print("  Side panel: Kernel mode, FF params, probe atom, potential map")
         vis.run()

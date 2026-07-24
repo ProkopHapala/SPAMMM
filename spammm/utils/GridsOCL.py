@@ -5,6 +5,11 @@ coarser FDBM lattice by *projecting* each source voxel as a point charge onto
 8 dest neighbors (trilinear weights) — preserves charge and dipole when the
 dest box covers the support.
 
+Caveat: project treats voxels as **centers** ``origin+(i+½)·h``; Gaussian NA
+builders / ``grid_moments`` default use **corners** ``origin+i·h``. Mixing
+conventions without care changes multipoles (see ``doc/Caveats.md``,
+``AFM_utils.plot_cube_delta_rho_na_origin_diag``).
+
 Also: Gaussian ρ_NA splat/add, axpy, subtract, fill.
 """
 from __future__ import annotations

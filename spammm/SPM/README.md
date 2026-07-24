@@ -3,13 +3,15 @@
 Scanning Probe Microscopy — AFM and STM. GPU-accelerated via PyOpenCL. FDBM path is the GUI engine (not Morse+point-charge).
 
 - **AFM.py** — AFMulator (LJ/Morse + FDBM), PP relax, df; **stiffness SSOT** `stiffness_Nm_to_eVA2` / `K_LAT_HAPALA_*` (internal eV/Å², GUI N/m). **Perf:** `AFMBench`, gpyFFT helpers, Round-2 `stage3_fdbm_fields_fast` / `fdbm_*` via shared AFMulator ctx. Switches: `SPAMMM_AFM_FAST_S3` (default 1), `SPAMMM_AFM_CPU_FFT`, `SPAMMM_AFM_CPU_TASKS`, `SPAMMM_AFM_BENCH`, `SPAMMM_AFM_BENCH_NO_IO`.
-- **AFM_utils.py** — Tip densities (`pad_mode='cpu'|'none'`), FDBM orchestration, STM/orbital helpers (`project_mo_xy_slice`, `project_mo_stm_sk_slice`, `plot_spectrum_with_orbitals`).
+- **AFM_utils.py** — Tip densities (`pad_mode='cpu'|'none'`), FDBM orchestration, STM/orbital helpers; strip plots `plot_afm_variant_height_strip` (**amp_align**: df @ h, Fz @ h−amp).
 - **stm_compare.py** — DFTB vs pySCF frontier orbitals / STM current / vacuum panels; SSOT for `run_spm.py stm *`.
 - **ModularPipeline.py** — Staged S1–S6 AFM/STM with disk cache; dual Stage-3 (fast vs `FAST_S3=0` legacy).
 - **KrigingGridFF.py** — DFT z-scan → GridFF `(nx,ny,nz,4)=(Fx,Fy,Fz,E)` for `setup_fdbm_grid`; Mithun loaders; deps NumPy/SciPy only
 - **InterpolatorKriging.py** / **InterpolatorRBF.py** / **interpy.py** — Wendland C2 Kriging/RBF (ported from ppafm)
 - **ManipulationPathOpt.py** — AFM tip-path optimization
 - **ScanUtils.py** — Trajectory generators (grid/line/rotational/tilted)
+
+**CLI:** repo-root `run_spm.py` — see [`user_guide/SPM_CLI.md`](../../user_guide/SPM_CLI.md). Defaults (FDBM): df window 3.7–4.7 Å @ dz=0.1, Fz amp-aligned at h−amp; `--plots compare,stage`; `opt` / `smiles-afm` for planar PCA geometries.
 
 **Campaigns / open tasks:** STM mio/3ob/prolonged vs pySCF cubes → `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md` (`tests/SPM/testplot_stm_basis_compare.py`, artifacts `debug/stm_orbital_compare/`); site Pauli \(A,\beta\) maps → `doc/Tasks/Pauli_A_beta_KrigingTransferability.md`; Kriging import → `doc/Tasks/Import_KrigingGridFF.md`. GPU pySCF notes: `doc/AGENTS/notes/pyscf-gpu-scf.md`.
 

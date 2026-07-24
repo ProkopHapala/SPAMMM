@@ -421,6 +421,34 @@ def assembly_composite_score(clash, z_span, min_dist, w_clash=20.0, w_z=4.0, w_p
     return w_clash * clash + w_z * z_span + w_pack * min_dist
 
 
+def annotate_score_twins(indices, clashes, z_spans, min_dists, eps_clash=1e-4, eps_z=1e-3, eps_d=1e-3):
+    """Flag score-twins among a ranked shortlist — keep all; annotate for human judgment.
+
+    Two configs are score-twins if |Δclash|, |Δz_span|, |Δmin_dist| all within eps.
+    Returns list of dicts aligned with `indices`:
+      twin_of_rank — 0-based rank of earlier twin in this list, or None
+      twin_of_idx  — config index of that earlier twin, or None
+    Does not drop entries (GPU atom-cloud match is a later Phase 2).
+    """
+    indices = np.asarray(indices, dtype=np.int32)
+    clashes = np.asarray(clashes, dtype=np.float64)
+    z_spans = np.asarray(z_spans, dtype=np.float64)
+    min_dists = np.asarray(min_dists, dtype=np.float64)
+    out = []
+    for r, idx in enumerate(indices):
+        twin_rank = twin_idx = None
+        for r0 in range(r):
+            j = int(indices[r0])
+            if (abs(float(clashes[idx]) - float(clashes[j])) < eps_clash
+                    and abs(float(z_spans[idx]) - float(z_spans[j])) < eps_z
+                    and abs(float(min_dists[idx]) - float(min_dists[j])) < eps_d):
+                twin_rank, twin_idx = r0, j
+                break
+        out.append({'rank': r, 'idx': int(idx), 'twin_of_rank': twin_rank, 'twin_of_idx': twin_idx,
+                    'clash': float(clashes[idx]), 'z_span': float(z_spans[idx]), 'min_dist': float(min_dists[idx])})
+    return out
+
+
 def run_assembly_search(mol, cell_lvs, ocl=None, *, cell_scale=1.0, nrot=16, rot_mode='tilt', n_tilt=5, tilt_range=0.25, nshift=10, shift_range=0.4, shift_region='triangle', shift_sum_max=0.8, n_pbc_test=2, n_pbc_xyz=1, n_sym=6, zspan_max=None, zspan_slack=1.15, clash_max=5.0, dist_min=1.0, dist_max=None, zpenalty=2.0, pack_weight=1.0, clash_weight=1.0, penalty=50.0, radius=1.0, export_max=100, top_k=10, dedup=False, align_flat=True, wg=128, device=0, simple=False):
     """End-to-end assembly search on a fixed experimental unit cell.
 

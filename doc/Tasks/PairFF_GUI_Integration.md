@@ -86,7 +86,7 @@ Thin wrapper: register `pairff` in `ExtensionManager`, embed or dock `RigidBodyV
 
 ## Recommended path
 
-1. **Short term (demo):** Extend `demos/demo_pairff.py` for multi-body + pick-one-active (`PairFF_MultiBody_Kernel.md`) using standalone `RigidBodyVispy`.
+1. **Short term (demo):** ~~Extend `demos/demo_pairff.py` for multi-body + pick-one-active~~ — **done in standalone Vispy** (`PairFF_MultiBody_Kernel.md`): `--bodies` / `--mols`, LMB selects active body + rebuilds env/map. Still **not** wired into main `SPAMMM_GUI`.
 2. **GUI phase:** **Option A** — add PairFF section to `FoldedRigidExtension` *or* rename panel to `SurfaceRigidExtension` if scope grows; keep `folded_rigid` registry key for backward compatibility.
 3. **Do not** merge PairFF into `FFExtension` without explicit USER decision.
 

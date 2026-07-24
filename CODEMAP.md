@@ -180,6 +180,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `AtomTypes.dat`, `BondTypes.dat`, `AngleTypes.dat`, `DihedralTypes.dat` — FF parameters
 
 ## doc/ — Documentation
+- `Caveats.md` — recurring scientific/numerical traps (all-e Δρ/NA, corner vs center, sample vs project)
 - `topical_audit.md` — cross-implementation maps per scientific topic
 - `Takeways.md` — resolved pitfalls (blit, GUI vs test geometry, DFTB, **contact-surface z/sign/buffers**)
 - `TEST_DESIGN.md` — test system design
@@ -187,6 +188,8 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `AGENTS/` — agent instructions, skills, protocols, workflows
 - `HowTo/` — how-to guides
 - `Tasks/` — task design documents (e.g. `ReactionCoordinateExtension_Design.md`)
+- `Reports/` — durable scientific handoffs (e.g. Fukui panel ES notes)
+- `TopicalAudit/` — per-topic implementation maps (e.g. `AFM_FDBM.md`)
 - `Topics/AFM/ContactSurface_Static.md` — **quasi-2D AFM field** (separable + PIC): API, tutorial, parity
 - `Topics/AFM/ContactSurface_Elastic.md` — elastic extension (future)
 - `Topics/ForceFields/LFF_ProjectiveRelax.md` — LFF projective Jacobi (springs + FAF outer); 3rd relax path

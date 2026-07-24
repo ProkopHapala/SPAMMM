@@ -68,12 +68,20 @@ See also: all-electron Δρ clamp recipe on the same CO tip (`Import_KrigingGrid
 
 | Dir (under root) | Local geometry | Notes |
 |------------------|----------------|-------|
-| `pentacene_PBE_def2-SVP/` | `data/xyz/pentacene.xyz` | older; N+A+C |
-| `PTCDA_PBE_def2-SVP/` | `data/xyz/PTCDA.xyz` | older; N+A+C; SA AFM strip already done |
-| `azaindol_dimer_PBE_def2-SVP/` | `data/xyz/azaindol_dimer.xyz` | **new**; N only |
-| `azaindol_isodimer_PBE_def2-SVP/` | `data/xyz/azaindol_isodimer.xyz` | **new**; N only |
-| `benzoicacid_dimer_PBE_def2-SVP/` | `data/xyz/benzoicacid_dimer.xyz` | **new**; N only |
-| `benzoicamid_dimer_PBE_def2-SVP/` | `data/xyz/benzoicamid_dimer.xyz` | **new**; N only |
+| `pentacene_PBE_def2-SVP/` | `data/xyz/pentacene.xyz` | flat z=0; N+A+C |
+| `PTCDA_PBE_def2-SVP/` | `data/xyz/PTCDA.xyz` | flat z=0; N+A+C |
+| `azaindol_dimer_PBE_def2-SVP/` | `data/xyz/azaindol_dimer.xyz` | flat z=0 (recomputed 2026-07-24) |
+| `azaindol_isodimer_PBE_def2-SVP/` | `data/xyz/azaindol_isodimer.xyz` | flat z=0 |
+| `benzoicacid_dimer_PBE_def2-SVP/` | `data/xyz/benzoicacid_dimer.xyz` | flat z=0 |
+| `benzoicamid_dimer_PBE_def2-SVP/` | `data/xyz/benzoicamid_dimer.xyz` | flat z=0 |
+| `phtalo_1-dftb-relax_PBE_def2-SVP/` | `data/xyz/phtalo_1.xyz` | **new**; flat; 50 atoms |
+| `phtalo_2-dftb-relax_PBE_def2-SVP/` | `data/xyz/phtalo_2.xyz` | **new**; flat; 50 atoms |
+
+**Flat recompute (2026-07-24):** USER removed z-corrugation (all atoms z=0). Gallery via CLI:
+
+`python run_spm.py panel-fukui --outdir debug/fdbm_fukui_panel_flat --h-min 2.5 --h-max 5.5 --h-step 0.2`
+
+→ `debug/fdbm_fukui_panel_flat/<mol>/compare_cube_stock_prolonged.png` (3×df + 3×Fz). Status investigating.
 
 **Campaign (same pattern as PTCDA stock vs SA):** for each molecule
 

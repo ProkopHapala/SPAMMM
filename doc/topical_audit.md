@@ -126,6 +126,15 @@ This **is** a supplement to:
 - **Kernels:** `kernels/nonbonded.cl`, `kernels/nonbonded_grid.cl`
 - **Audit Document:** [nonbonding_forcefields.md](nonbonding_forcefields.md)
 
+### 2b2. PairFF (rigid-body intermolecular)
+- Compact-exp / Morse pairwise FF with epair + σ-hole dummies; one active 6-DOF body + frozen env (Strategy M)
+- **Key files:** `spammm/forcefields/RigidBodyDynamics.py` (`RigidBodyPairFF`), `spammm/GUI/RigidBodyVispy.py`, `demos/demo_pairff.py`
+- **Kernels:** `kernels/rigid.cl` (kernels 7–9), `kernels/Forces.cl` (`compact_exp_pair_EF`)
+- **User manual:** [demos/PairFF_manual.md](../demos/PairFF_manual.md)
+- **Topical audit:** [TopicalAudit/PairFF_RigidBody.md](TopicalAudit/PairFF_RigidBody.md)
+- **Design report:** [Topics/ForceFields/PairFF.md](Topics/ForceFields/PairFF.md)
+- **Caveats:** multi-body needs unified mode + NVIDIA; ≤128 sites/env molecule; main GUI not wired yet
+
 ### 2c. Charge Equilibration
 - QEq charge transfer method
 - **Key files:** `spammm/forcefields/QEq.py`, `spammm/GUI/QEqExtension.py`
@@ -228,6 +237,7 @@ no GUI integration yet; elastic Phase 2 design-only.
 - **Kernel:** `kernels/AFM.cl` (incl. `fdbm_*` Stage-3 helpers)
 - **GUI:** `spammm/GUI/AFMExtension.py`
 - **Density:** `spammm/quantum/DFTB/Grid_dftb.py`
+- **CLI:** `run_spm.py` — FDBM defaults amp-align (df @ h, Fz @ h−amp); dense dz=0.1; `opt` / `smiles-afm` planar+PCA. Guide: [`user_guide/SPM_CLI.md`](../user_guide/SPM_CLI.md).
 - **Perf / tests:** `doc/Tasks/PerfBenchmark_FDBM.md`, `tests/SPM/bench_fdbm.py`, `tests/SPM/test_afm_morse.py`, `tests/SPM/test_afm_fdbm.py`
 - **Topical audit:** [TopicalAudit/AFM_FDBM.md](TopicalAudit/AFM_FDBM.md)
 - **Overview doc:** [afm_stm_simulation.md](afm_stm_simulation.md)
@@ -247,7 +257,8 @@ no GUI integration yet; elastic Phase 2 design-only.
 - DFT z-scan → Wendland Kriging/RBF GridFF; compare to FDBM Pauli/ES/vdW; site Pauli fits
 - **Key files:** `spammm/SPM/KrigingGridFF.py`, `InterpolatorKriging.py`, `AFM_utils` Pauli fitters
 - **Tasks:** [Import_KrigingGridFF.md](Tasks/Import_KrigingGridFF.md), [Pauli_A_beta_KrigingTransferability.md](Tasks/Pauli_A_beta_KrigingTransferability.md) (site maps + transferability)
-- **Reports:** [Reports/Kriging_DFT_vs_DFTB_FDBM_pyridine.md](Reports/Kriging_DFT_vs_DFTB_FDBM_pyridine.md), [Kriging_FDBM_PauliFit_pyridine_2026-07-21.md](Reports/Kriging_FDBM_PauliFit_pyridine_2026-07-21.md)
+- **Reports:** [Reports/Kriging_DFT_vs_DFTB_FDBM_pyridine.md](Reports/Kriging_DFT_vs_DFTB_FDBM_pyridine.md), [Kriging_FDBM_PauliFit_pyridine_2026-07-21.md](Reports/Kriging_FDBM_PauliFit_pyridine_2026-07-21.md), [Fukui_FDBM_panel_notes_2026-07-23.md](Reports/Fukui_FDBM_panel_notes_2026-07-23.md)
+- **Caveats (global):** [Caveats.md](Caveats.md) — all-e Δρ/NA multipoles, corner vs center, sample vs project
 - **Topic:** [Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md](Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md)
 
 ## 5. QM Integration (DFTB+)

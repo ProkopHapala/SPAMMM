@@ -135,3 +135,19 @@ The implementation is relatively small:
 - Reuse the existing [fit_folded_surface_basis()](cci:1://file:///home/prokop/git/SPAMMM/spammm/forcefields/MolecularDynamics.py:1185:4-1320:33) pipeline for coefficient preparation
 
 Shall I proceed with Option A?
+
+---
+
+# Future: headless CLI `dock` (do not start yet)
+
+Gas-phase molecule `opt` and multi-format loaders are tracked in [`SPM_CLI_Headless.md`](SPM_CLI_Headless.md) (§A–D). **Substrate dock / relax on GridFF or FAF is explicitly deferred** there (§E) — harder than vacuum FF/DFTB.
+
+When prioritized, `run_spm.py dock` must only thin-wrap existing APIs (no new physics in the CLI script):
+
+| Mode | Reuse |
+|------|--------|
+| Rigid + GridFF | `RigidBodyDynamics.from_xyz_and_grid` / `run_gridff` |
+| Rigid + FAF | `FoldedRigid.relax_folded` / folded `RigidBodyDynamics` (this task + `FoldedRigidExtension`) |
+| Flexible + FAF | SPFF/UFF `do_faf` + `FFController` folded upload |
+
+Also: agent ToDo `doc/ToDo/ToDo.agents.md` (SPM CLI → substrate `dock`); imaging stress report `Report_PTCDA_NaCl_FAF_RigidImaging.md`.

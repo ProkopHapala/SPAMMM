@@ -1421,6 +1421,41 @@ def add_electron_pairs_via_atomic_system(apos, enames, qs=None, epair_dist=1.4, 
 PAIRFF_MODE_LEGACY = 'legacy'
 PAIRFF_MODE_UNIFIED = 'unified'
 
+MAX_ENV_SITES = 4096
+MAX_ENV_MOLS = 64
+
+
+def _body_sites_world(rel, pos, quat):
+    """Body-frame sites (N,3/4) → world (N,3) given CoM pos and quaternion."""
+    rel = np.asarray(rel, dtype=np.float32)
+    R = _quat_to_matrix_np(np.asarray(quat, dtype=np.float32))
+    return np.asarray(pos, dtype=np.float32)[:3] + (rel[:, :3] @ R.T)
+
+
+def _prepare_molecule_pack(apos, enames, REQs, epair_dist=1.4, sigma_dist=1.0, He=-0.1, Hs=1.0, w=0.7):
+    """Add epairs/sigma, center at CoM, return pack dict for multi-body PairFF."""
+    REQs_base = np.asarray(REQs, dtype=np.float32).copy()
+    apos_ext, enames_ext, types = add_electron_pairs_via_atomic_system(
+        apos, enames, epair_dist=epair_dist, sigma_dist=sigma_dist)
+    REQs_ext = _extend_reqs_with_epairs(REQs_base, enames_ext, types, He=He, Hs=Hs, w=w)
+    masses = _guess_mass([e for e, t in zip(enames_ext, types) if t == 0])
+    apos_ext = np.asarray(apos_ext, dtype=np.float32)
+    com0 = (apos_ext[:len(masses)] * masses[:, None]).sum(axis=0) / masses.sum()
+    rel = apos_ext - com0[None, :]
+    mtot, I, Iinv = compute_mass_properties(rel[:len(masses)], masses)
+    return dict(
+        rel=rel.astype(np.float32),
+        enames=list(enames_ext),
+        types=np.asarray(types, dtype=np.int32),
+        REQ_base=REQs_base,
+        REQ_ext=REQs_ext,
+        masses=masses,
+        mtot=float(mtot),
+        I=I,
+        Iinv=Iinv,
+        com0=com0.astype(np.float32),
+    )
+
 
 class RigidBodyPairFF(RigidBodyDynamics):
     """Rigid body dynamics with pairwise molecule-molecule interactions.
@@ -1504,11 +1539,54 @@ void rigid_body_pairff_unified_kernel(
     const float4             md_params,
     const int                niter
 )"""
+        self.kernelheaders["rigid_body_pairff_unified_env_kernel"] = """__kernel
+void rigid_body_pairff_unified_env_kernel(
+    __global const int*      mols,
+    __global       float4*   poss,
+    __global       float4*   qrots,
+    __global       float4*   vposs,
+    __global       float4*   vrots,
+    __global       float4*   fire_state,
+    __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
+    __global const float4*   apos_body,
+    __global       float4*   apos_world,
+    __global const float4*   dyn_REQ,
+    __global const int*      dyn_type,
+    __global       float4*   atom_force,
+    __global       float4*   body_force,
+    __global       float4*   body_torque,
+    __global const float4*   anchors,
+    __global const float4*   env_apos,
+    __global const float4*   env_REQ,
+    __global const int*      env_type,
+    __global const int*      env_mols,
+    const int                n_env_mols,
+    const float4             pairff_params,
+    const float              beta,
+    const float              z_target,
+    const float              dt,
+    const float4             md_params,
+    const int                niter
+)"""
         self.pairff_args = None
         self.krnl_pairff = None
         self.pairff_unified_args = None
         self.krnl_pairff_unified = None
+        self.pairff_env_args = None
+        self.krnl_pairff_env = None
         self.pairff_mode = PAIRFF_MODE_LEGACY
+        self.env_mode = False
+        self.n_env_mols = 0
+        self.n_env_sites = 0
+        self.env_mols_host = None
+        self.env_apos_host = None
+        self.env_REQ_host = None
+        self.env_type_host = None
+        self._mb_packs = None
+        self._mb_pos = None
+        self._mb_quat = None
+        self.active_body = 0
         self.static_n = 0
         self.static_apos_host = None
         self.static_REQ_host = None
@@ -1570,6 +1648,162 @@ void rigid_body_pairff_unified_kernel(
         self.dyn_type_host = dtype_arr.copy()
         self.dyn_REQ_host  = req_arr.copy()
 
+    def alloc_pairff_env(self, max_env_sites=MAX_ENV_SITES, max_env_mols=MAX_ENV_MOLS):
+        """Allocate GPU buffers for multi-molecule environment (Strategy M tiling)."""
+        max_env_sites = int(max_env_sites)
+        max_env_mols = int(max_env_mols)
+        if max_env_sites > MAX_ENV_SITES:
+            raise ValueError(f"max_env_sites={max_env_sites} exceeds MAX_ENV_SITES={MAX_ENV_SITES}")
+        if max_env_mols > MAX_ENV_MOLS:
+            raise ValueError(f"max_env_mols={max_env_mols} exceeds MAX_ENV_MOLS={MAX_ENV_MOLS}")
+        float_size = np.float32().itemsize
+        int_size = np.int32().itemsize
+        mf = cl.mem_flags
+        self.create_buffer('env_apos',  MAX_ENV_SITES * 4 * float_size, mf.READ_ONLY)
+        self.create_buffer('env_REQ',   MAX_ENV_SITES * 4 * float_size, mf.READ_ONLY)
+        self.create_buffer('env_type',  MAX_ENV_SITES * int_size,        mf.READ_ONLY)
+        self.create_buffer('env_mols',  (MAX_ENV_MOLS + 1) * int_size,   mf.READ_ONLY)
+        self.create_buffer('dyn_REQ',   self.total_atoms * 4 * float_size, mf.READ_ONLY)
+        self.create_buffer('dyn_type',  self.total_atoms * int_size,        mf.READ_ONLY)
+        self.env_mode = True
+
+    def upload_env(self, env_apos, env_REQ, env_type, env_mols):
+        """Upload flat env sites + molecule offsets (Strategy M).
+
+        env_mols: length n_env_mols+1 cumulative offsets into the flat arrays.
+        Each molecule tile must have ≤ MAX_STATIC_ATOMS (128) sites.
+        """
+        env_mols = np.asarray(env_mols, dtype=np.int32).ravel()
+        if env_mols.ndim != 1 or len(env_mols) < 1:
+            raise ValueError("env_mols must be 1D offsets of length n_env_mols+1")
+        n_env_mols = len(env_mols) - 1
+        if n_env_mols < 0:
+            raise ValueError("env_mols must have length >= 1")
+        n_sites = int(env_mols[-1]) if n_env_mols >= 0 else 0
+        if n_env_mols == 0:
+            n_sites = 0
+            env_mols = np.array([0], dtype=np.int32)
+        if n_env_mols > MAX_ENV_MOLS:
+            raise ValueError(f"n_env_mols={n_env_mols} exceeds MAX_ENV_MOLS={MAX_ENV_MOLS}")
+        if n_sites > MAX_ENV_SITES:
+            raise ValueError(f"n_env_sites={n_sites} exceeds MAX_ENV_SITES={MAX_ENV_SITES}")
+        for em in range(n_env_mols):
+            nj = int(env_mols[em + 1] - env_mols[em])
+            if nj > 128:
+                raise ValueError(f"env molecule {em} has {nj} sites > MAX_STATIC_ATOMS=128")
+            if nj <= 0:
+                raise ValueError(f"env molecule {em} has empty site range")
+        apos_pad = np.zeros((MAX_ENV_SITES, 4), dtype=np.float32)
+        req_pad  = np.zeros((MAX_ENV_SITES, 4), dtype=np.float32)
+        type_pad = np.zeros(MAX_ENV_SITES, dtype=np.int32)
+        mols_pad = np.zeros(MAX_ENV_MOLS + 1, dtype=np.int32)
+        if n_sites > 0:
+            apos_pad[:n_sites] = _ensure_float4(env_apos)[:n_sites]
+            req_pad[:n_sites]  = _ensure_float4(env_REQ)[:n_sites]
+            type_pad[:n_sites] = np.asarray(env_type, dtype=np.int32)[:n_sites]
+        mols_pad[:len(env_mols)] = env_mols
+        self.toGPU('env_apos', apos_pad)
+        self.toGPU('env_REQ',  req_pad)
+        self.toGPU('env_type', type_pad)
+        self.toGPU('env_mols', mols_pad)
+        self.n_env_mols = n_env_mols
+        self.n_env_sites = n_sites
+        self.env_mols_host = env_mols.copy()
+        self.env_apos_host = apos_pad[:n_sites].copy()
+        self.env_REQ_host  = req_pad[:n_sites].copy()
+        self.env_type_host = type_pad[:n_sites].copy()
+        # Vispy / debug: expose env as "static" for rendering
+        self.static_n = n_sites
+        self.static_apos_host = self.env_apos_host
+        self.static_REQ_host = self.env_REQ_host
+        self.static_type_host = self.env_type_host
+        self.static_enames = ['E' if t == 1 else ('Sh' if t == 2 else '?') for t in self.env_type_host]
+
+    def _rebuild_env_from_mb(self):
+        """Rebuild env buffers from host multi-body packs excluding active_body."""
+        if self._mb_packs is None:
+            raise RuntimeError("No multi-body packs; call from_molecules() first")
+        a_list, r_list, t_list, offsets = [], [], [], [0]
+        enames_all = []
+        for j, pack in enumerate(self._mb_packs):
+            if j == self.active_body:
+                continue
+            world = _body_sites_world(pack['rel'], self._mb_pos[j], self._mb_quat[j])
+            a_list.append(world)
+            r_list.append(pack['REQ_ext'])
+            t_list.append(pack['types'])
+            enames_all.extend(pack['enames'])
+            offsets.append(offsets[-1] + len(pack['types']))
+        if len(a_list) == 0:
+            self.upload_env(np.zeros((0, 4), dtype=np.float32), np.zeros((0, 4), dtype=np.float32),
+                            np.zeros(0, dtype=np.int32), np.array([0], dtype=np.int32))
+            self.static_enames = []
+            return
+        env_apos = np.vstack(a_list)
+        env_REQ = np.vstack(r_list)
+        env_type = np.concatenate(t_list)
+        self.upload_env(env_apos, env_REQ, env_type, np.asarray(offsets, dtype=np.int32))
+        self.static_enames = list(enames_all)
+
+    def _upload_active_body_state(self, mass_trans=1.0, mass_rot=None):
+        """Upload active molecule as the single GPU rigid body."""
+        pack = self._mb_packs[self.active_body]
+        if mass_rot is None:
+            mass_rot = mass_trans
+        Iinv_relax = pack['Iinv'] * (pack['mtot'] / float(mass_rot))
+        I_relax = pack['I'] * (float(mass_rot) / pack['mtot'])
+        n_dyn = len(pack['enames'])
+        pos4 = np.zeros((1, 4), dtype=np.float32)
+        pos4[0, :3] = self._mb_pos[self.active_body]
+        pos4[0, 3] = float(mass_trans)
+        quat4 = np.zeros((1, 4), dtype=np.float32)
+        quat4[0] = self._mb_quat[self.active_body]
+        zero4 = np.zeros((1, 4), dtype=np.float32)
+        atom_body = pack['rel'][None, :, :].astype(np.float32)
+        self.realloc(n_bodies=1, num_atoms=n_dyn)
+        self.enames = list(pack['enames'])
+        self.atom_REQ = pack['REQ_ext'].copy()
+        self.atom_masses = pack['masses'].copy()
+        self.mass_physical = float(pack['mtot'])
+        self.mass_trans = float(mass_trans)
+        self.mass_rot = float(mass_rot)
+        self.upload_state(pos4, quat4, zero4, zero4, float(mass_trans), 1.0 / float(mass_trans),
+                          Iinv_relax[None, :, :], atom_body, inertia=I_relax[None, :, :])
+        self.alloc_pairff_env()
+        self.upload_dyn_types_req(pack['types'], pack['REQ_ext'])
+        self._dyn_REQ_base = pack['REQ_base']
+        self._dyn_enames = list(pack['enames'])
+
+    def sync_active_pose_from_gpu(self):
+        """Copy active body pose from GPU buffers into host multi-body state."""
+        if self._mb_packs is None:
+            return
+        out = self.download_outputs()
+        self._mb_pos[self.active_body] = out['pos'][0, :3].copy()
+        self._mb_quat[self.active_body] = out['quats'][0].copy()
+
+    def set_active_body(self, body_id, mass_trans=None, mass_rot=None):
+        """Switch which molecule integrates; rebuild env from the rest."""
+        if self._mb_packs is None:
+            raise RuntimeError("set_active_body requires from_molecules()")
+        body_id = int(body_id)
+        if body_id < 0 or body_id >= len(self._mb_packs):
+            raise ValueError(f"active_body={body_id} out of range [0,{len(self._mb_packs)})")
+        self.sync_active_pose_from_gpu()
+        mt = self.mass_trans if mass_trans is None else float(mass_trans)
+        mr = self.mass_rot if mass_rot is None else float(mass_rot)
+        self.active_body = body_id
+        self._upload_active_body_state(mass_trans=mt, mass_rot=mr)
+        self._rebuild_env_from_mb()
+        p = self.pairff_params_host or {}
+        self.init_pairff(
+            He=p.get('He', -0.1), rc=p.get('rc', 3.0), w=p.get('w', 0.7),
+            k_z=p.get('k_z', 0.0), morse_alpha=p.get('morse_alpha', 1.8),
+            z_target=p.get('z_target', 0.0), Hs=p.get('Hs', 1.0),
+            epair_dist=p.get('epair_dist', 1.4), sigma_dist=p.get('sigma_dist', 1.0),
+            mode=PAIRFF_MODE_UNIFIED, beta=p.get('beta', 1.7),
+        )
+
     def init_pairff(self, He=-0.1, rc=3.0, w=0.7, k_z=0.0, morse_alpha=1.8, z_target=0.0, Hs=1.0, epair_dist=1.4, sigma_dist=1.0, mode=None, beta=None):
         """Initialize pairff kernel parameters and generate argument list.
 
@@ -1605,20 +1839,31 @@ void rigid_body_pairff_unified_kernel(
             beta = float(morse_alpha) if self.pairff_mode == PAIRFF_MODE_LEGACY else 1.7
 
         # Refresh REQ.z (He/Hs) and REQ.w (blunt width) then re-upload
-        if self.dyn_type_host is not None and self._dyn_REQ_base is not None:
-            dyn_REQ = _extend_reqs_with_epairs(
-                self._dyn_REQ_base, self._dyn_enames, self.dyn_type_host, He=He, Hs=Hs, w=w)
-            self.upload_dyn_types_req(self.dyn_type_host, dyn_REQ)
-        if self.static_type_host is not None and self._static_REQ_base is not None:
-            static_REQ = _extend_reqs_with_epairs(
-                self._static_REQ_base, self._static_enames, self.static_type_host, He=He, Hs=Hs, w=w)
-            self.upload_static(self.static_apos_host, static_REQ, self.static_type_host)
+        if self.env_mode and self._mb_packs is not None:
+            for pack in self._mb_packs:
+                pack['REQ_ext'] = _extend_reqs_with_epairs(
+                    pack['REQ_base'], pack['enames'], pack['types'], He=He, Hs=Hs, w=w)
+            self._rebuild_env_from_mb()
+            pack_a = self._mb_packs[self.active_body]
+            self._dyn_REQ_base = pack_a['REQ_base']
+            self._dyn_enames = list(pack_a['enames'])
+            self.upload_dyn_types_req(pack_a['types'], pack_a['REQ_ext'])
+        else:
+            if self.dyn_type_host is not None and self._dyn_REQ_base is not None:
+                dyn_REQ = _extend_reqs_with_epairs(
+                    self._dyn_REQ_base, self._dyn_enames, self.dyn_type_host, He=He, Hs=Hs, w=w)
+                self.upload_dyn_types_req(self.dyn_type_host, dyn_REQ)
+            if self.static_type_host is not None and self._static_REQ_base is not None:
+                static_REQ = _extend_reqs_with_epairs(
+                    self._static_REQ_base, self._static_enames, self.static_type_host, He=He, Hs=Hs, w=w)
+                self.upload_static(self.static_apos_host, static_REQ, self.static_type_host)
 
         self.kernel_params['n_static'] = np.int32(self.static_n)
         n_static_atoms = int((self.static_type_host == 0).sum()) if self.static_type_host is not None else 0
         self.kernel_params['n_static_atoms'] = np.int32(n_static_atoms)
         n_dyn_atoms = int((self.dyn_type_host == 0).sum()) if self.dyn_type_host is not None else 0
         self.kernel_params['n_dyn_atoms'] = np.int32(n_dyn_atoms)
+        self.kernel_params['n_env_mols'] = np.int32(self.n_env_mols)
         self.kernel_params['pairff_params'] = np.array([He, rc, w, k_z], dtype=np.float32)
         self.kernel_params['morse_alpha'] = np.float32(morse_alpha)
         self.kernel_params['beta'] = np.float32(beta)
@@ -1630,15 +1875,28 @@ void rigid_body_pairff_unified_kernel(
             'beta': beta, 'z_target': z_target, 'Hs': Hs,
             'epair_dist': epair_dist, 'sigma_dist': sigma_dist,
             'mode': self.pairff_mode,
+            'env_mode': self.env_mode,
+            'active_body': self.active_body,
         }
-        self.pairff_args = self.generate_kernel_args("rigid_body_pairff_kernel")
-        self.krnl_pairff = cl.Kernel(self.prg, "rigid_body_pairff_kernel")
-        self.pairff_unified_args = self.generate_kernel_args("rigid_body_pairff_unified_kernel")
-        self.krnl_pairff_unified = cl.Kernel(self.prg, "rigid_body_pairff_unified_kernel")
+        if self.env_mode:
+            self.pairff_env_args = self.generate_kernel_args("rigid_body_pairff_unified_env_kernel")
+            self.krnl_pairff_env = cl.Kernel(self.prg, "rigid_body_pairff_unified_env_kernel")
+        else:
+            self.pairff_args = self.generate_kernel_args("rigid_body_pairff_kernel")
+            self.krnl_pairff = cl.Kernel(self.prg, "rigid_body_pairff_kernel")
+            self.pairff_unified_args = self.generate_kernel_args("rigid_body_pairff_unified_kernel")
+            self.krnl_pairff_unified = cl.Kernel(self.prg, "rigid_body_pairff_unified_kernel")
 
     def run_pairff(self, num_steps, dt, lin_damp=0.92, ang_damp=0.88, fire=False):
         """Run the active pairwise force field kernel for num_steps."""
-        if self.pairff_mode == PAIRFF_MODE_UNIFIED:
+        if self.env_mode:
+            if self.pairff_mode != PAIRFF_MODE_UNIFIED:
+                raise RuntimeError("Multi-body env kernel requires pairff_mode='unified'")
+            if self.pairff_env_args is None:
+                raise RuntimeError("Env PairFF kernel not initialized; call init_pairff(...) first")
+            kname = "rigid_body_pairff_unified_env_kernel"
+            krnl = self.krnl_pairff_env
+        elif self.pairff_mode == PAIRFF_MODE_UNIFIED:
             if self.pairff_unified_args is None:
                 raise RuntimeError("Unified PairFF kernel not initialized; call init_pairff(...) first")
             kname = "rigid_body_pairff_unified_kernel"
@@ -1650,12 +1908,15 @@ void rigid_body_pairff_unified_kernel(
             krnl = self.krnl_pairff
         self.kernel_params['dt'] = np.float32(dt)
         self.kernel_params['niter'] = np.int32(num_steps)
+        self.kernel_params['n_env_mols'] = np.int32(self.n_env_mols)
         if fire:
             self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, -1.0], dtype=np.float32)
         else:
             self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, 1.0], dtype=np.float32)
         args = self.generate_kernel_args(kname)
-        if self.pairff_mode == PAIRFF_MODE_UNIFIED:
+        if self.env_mode:
+            self.pairff_env_args = args
+        elif self.pairff_mode == PAIRFF_MODE_UNIFIED:
             self.pairff_unified_args = args
         else:
             self.pairff_args = args
@@ -1766,6 +2027,65 @@ void rigid_body_pairff_unified_kernel(
         rbd.init_pairff(He=He, rc=rc, w=w, k_z=k_z, morse_alpha=morse_alpha, z_target=z_target, Hs=Hs,
                         epair_dist=epair_dist, sigma_dist=sigma_dist, mode=mode, beta=beta)
         rbd.static_enames = list(static_enames)
+        return rbd
+
+    @classmethod
+    def from_molecules(cls, molecules, body_positions, quats=None, active_body=0,
+                       mass_trans=1.0, mass_rot=None,
+                       He=-0.1, rc=3.0, w=0.7, k_z=0.0, morse_alpha=1.8, z_target=None,
+                       epair_dist=1.4, sigma_dist=1.0, Hs=1.0, beta=None,
+                       debug=False):
+        """Build multi-body PairFF: one active integrator + fixed env neighbors (Strategy M).
+
+        molecules: list of (apos, enames, REQs) or dicts with those keys
+        body_positions: (N,3) CoM positions
+        quats: optional (N,4); default identity
+        active_body: which molecule integrates (others are frozen env tiles)
+        """
+        n = len(molecules)
+        if n < 1:
+            raise ValueError("from_molecules requires at least one molecule")
+        body_positions = np.asarray(body_positions, dtype=np.float32)
+        if body_positions.shape != (n, 3):
+            raise ValueError(f"body_positions shape {body_positions.shape} != ({n},3)")
+        if quats is None:
+            quats = np.tile(np.array([0, 0, 0, 1], dtype=np.float32), (n, 1))
+        else:
+            quats = np.asarray(quats, dtype=np.float32)
+            if quats.shape != (n, 4):
+                raise ValueError(f"quats shape {quats.shape} != ({n},4)")
+        active_body = int(active_body)
+        if active_body < 0 or active_body >= n:
+            raise ValueError(f"active_body={active_body} out of range [0,{n})")
+        if z_target is None:
+            z_target = float(body_positions[active_body, 2])
+        if mass_rot is None:
+            mass_rot = mass_trans
+        if beta is None:
+            beta = 1.7
+
+        packs = []
+        for mol in molecules:
+            if isinstance(mol, dict):
+                apos, enames, REQs = mol['apos'], mol['enames'], mol['REQs']
+            else:
+                apos, enames, REQs = mol
+            packs.append(_prepare_molecule_pack(
+                apos, enames, REQs, epair_dist=epair_dist, sigma_dist=sigma_dist,
+                He=He, Hs=Hs, w=w))
+
+        rbd = cls(debug=debug)
+        rbd.pairff_mode = PAIRFF_MODE_UNIFIED
+        rbd.env_mode = True
+        rbd._mb_packs = packs
+        rbd._mb_pos = body_positions.copy()
+        rbd._mb_quat = quats.copy()
+        rbd.active_body = active_body
+        rbd._upload_active_body_state(mass_trans=mass_trans, mass_rot=mass_rot)
+        rbd._rebuild_env_from_mb()
+        rbd.init_pairff(He=He, rc=rc, w=w, k_z=k_z, morse_alpha=morse_alpha, z_target=z_target,
+                        Hs=Hs, epair_dist=epair_dist, sigma_dist=sigma_dist,
+                        mode=PAIRFF_MODE_UNIFIED, beta=beta)
         return rbd
 
 

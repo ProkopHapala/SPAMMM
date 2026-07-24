@@ -8,6 +8,9 @@ Docs: user_guide/SPM_CLI.md
 
 Examples:
   python run_spm.py afm --xyz data/xyz/benzene.xyz --basis 3ob-3-1 --projection stock
+  python run_spm.py afm --smiles-example naphthalene --projection prolonged --show-atoms
+  python run_spm.py opt --smiles-example benzene --method uff
+  python run_spm.py smiles-afm --method uff          # all SMILES_EXAMPLES → planar opt → prolonged AFM
   python run_spm.py afm-morse --xyz data/xyz/pentacene.xyz
   python run_spm.py afm-kriging --endgroup HHO-h-p_1 --tip H2O_O
   python run_spm.py stm orbitals --molecule pentacene --n-near 5
@@ -32,11 +35,28 @@ def _abs_path(p: str | None) -> str | None:
     return p if os.path.isabs(p) else os.path.join(_ROOT, p)
 
 
+def _parse_plots(s: str | None) -> set[str]:
+    """Parse --plots CSV: compare,stage (default) | tip,df,fz,per_image | all | none."""
+    if s is None:
+        s = 'compare,stage'
+    parts = [p.strip().lower() for p in str(s).replace(';', ',').split(',') if p.strip()]
+    if not parts or 'none' in parts or 'off' in parts:
+        return set()
+    if 'all' in parts or 'debug' in parts:
+        return {'compare', 'stage', 'tip', 'df', 'fz', 'per_image'}
+    return set(parts)
+
+
 def _add_common_afm_args(p: argparse.ArgumentParser) -> None:
     g = p.add_argument_group('geometry / density')
-    g.add_argument('--xyz',      default='data/xyz/benzene.xyz',  help='Sample geometry (.xyz)')
+    g.add_argument('--xyz',      default=None,  help='Sample geometry (.xyz); default benzene if no SMILES')
+    g.add_argument('--smiles',   default=None,  help='SMILES string (alternative to --xyz)')
+    g.add_argument('--smiles-example', default=None, dest='smiles_example',
+                   help='Named SMILES from SMILES_EXAMPLES (e.g. benzene, naphthalene)')
     g.add_argument('--cube',     default=None,                    help='Sample density cube or directory')
     g.add_argument('--esp-cube', default=None,                    help='Optional ESP cube')
+    g.add_argument('--no-orient', action='store_true', dest='no_orient',
+                   help='Skip PCA long-axis→x orientation (default: orient)')
 
     b = p.add_argument_group('DFTB basis / projection')
     b.add_argument('--basis',      default='3ob-3-1',    choices=['3ob-3-1', 'mio-1-1'])
@@ -51,10 +71,16 @@ def _add_common_afm_args(p: argparse.ArgumentParser) -> None:
     grid.add_argument('--gpu-fft',     type=bool,  default=False)
 
     scan = p.add_argument_group('PP scan / df')
-    scan.add_argument('--h-min',       type=float, default=2.5)
-    scan.add_argument('--h-max',       type=float, default=5.7)
-    scan.add_argument('--h-step',      type=float, default=0.4)
+    # Display window = df probe heights; Fz panels use h−amp (amp-align) by default
+    scan.add_argument('--h-min', '--zmin', type=float, default=3.7, dest='h_min',
+                      help='df probe z_min [Å] (column labels; Fz shown at h−amp)')
+    scan.add_argument('--h-max', '--zmax', type=float, default=4.7, dest='h_max',
+                      help='df probe z_max [Å]')
+    scan.add_argument('--h-step', '--dz',  type=float, default=0.1, dest='h_step',
+                      help='Height step dz [Å]')
     scan.add_argument('--amp',         type=float, default=1.0)
+    scan.add_argument('--no-amp-align', action='store_true', dest='no_amp_align',
+                      help='Plot Fz at same h as df (default: Fz at h−amp for fair morph. match)')
     scan.add_argument('--K-LAT',       type=float, default=0.5,  dest='K_LAT')
     scan.add_argument('--K-RAD',       type=float, default=20.0,   dest='K_RAD')
     scan.add_argument('--bond-length', type=float, default=3.0)
@@ -64,12 +90,56 @@ def _add_common_afm_args(p: argparse.ArgumentParser) -> None:
     out.add_argument('--outdir',             default='debug/spm_afm')
     out.add_argument('--cmap',               default='seismic')
     out.add_argument('--df-cmap',            default='gray', dest='df_cmap')
-    out.add_argument('--height', type=float, default=2.5)
+    out.add_argument('--height', type=float, default=4.2,
+                     help='Stage-plot slice height above mol [Å]')
     out.add_argument('--scale',    default='per_column', choices=['per_image', 'per_column', 'common'])
+    out.add_argument('--plots', default='compare,stage',
+                     help='CSV: compare,stage (default); tip,df,fz,per_image; all; none')
+    out.add_argument('--show-atoms', action='store_true', dest='show_atoms',
+                     help='Overlay atom positions as small dots on AFM panels')
+
+
+def _resolve_geometry(args):
+    """Return (name, atomPos, atomTypes, enames, bonds_or_None, smiles_or_None) from CLI args."""
+    import numpy as np
+    from spammm.topology.smiles import SMILES_EXAMPLES, smiles_to_system, parse_smiles
+    ELEM_Z = {'H': 1, 'C': 6, 'N': 7, 'O': 8, 'S': 16, 'P': 15, 'F': 9, 'Cl': 17, 'Br': 35, 'I': 53}
+
+    smi = getattr(args, 'smiles', None)
+    ex = getattr(args, 'smiles_example', None)
+    if ex:
+        if ex not in SMILES_EXAMPLES:
+            raise SystemExit(f"Unknown --smiles-example {ex!r}; choose from {sorted(SMILES_EXAMPLES)}")
+        smi = SMILES_EXAMPLES[ex]
+        name = ex
+    elif smi:
+        name = 'smiles'
+    else:
+        smi = None
+        name = None
+
+    if smi is not None:
+        sys = smiles_to_system(smi, engine='pure')
+        atomPos = np.asarray(sys.apos, dtype=np.float64)
+        enames = list(sys.enames)
+        atomTypes = np.array([int(z) for z in sys.atypes], dtype=np.int32)
+        bonds = np.asarray(sys.bonds, dtype=np.int32) if sys.bonds is not None else None
+        if name is None:
+            name = 'smiles'
+        return name, atomPos, atomTypes, enames, bonds, smi
+
+    xyz = _abs_path(getattr(args, 'xyz', None) or 'data/xyz/benzene.xyz')
+    import spammm.atomicUtils as au
+    pos, _, names, _, _ = au.load_xyz(xyz)
+    atomPos = np.array(pos, dtype=np.float64)
+    enames = list(names)
+    atomTypes = np.array([ELEM_Z.get(e, 6) for e in enames], dtype=np.int32)
+    name = os.path.splitext(os.path.basename(xyz))[0]
+    return name, atomPos, atomTypes, enames, None, None
 
 
 def cmd_afm(args: argparse.Namespace) -> int:
-    """Single-molecule FDBM AFM (xyz and/or cube)."""
+    """Single-molecule FDBM AFM (xyz and/or cube / SMILES)."""
     import numpy as np
     from spammm.SPM import AFM as afm
     from spammm.SPM import AFM_utils as afm_utils
@@ -85,12 +155,10 @@ def cmd_afm(args: argparse.Namespace) -> int:
         os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
 
     os.makedirs(args.outdir, exist_ok=True)
-    xyz = _abs_path(args.xyz)
-    ELEM_Z = {'H': 1, 'C': 6, 'N': 7, 'O': 8, 'S': 16, 'P': 15, 'Br': 35, 'I': 53}
-    import spammm.atomicUtils as au
-    pos, _, names, _, _ = au.load_xyz(xyz)
-    atomPos = np.array(pos, dtype=np.float64)
-    atomTypes = np.array([ELEM_Z.get(e, 6) for e in names], dtype=np.int32)
+    plots = _parse_plots(getattr(args, 'plots', 'compare,stage'))
+    args._plots = plots  # consumed by diag._run_from_density
+    mol_name, atomPos, atomTypes, enames, bonds, smi = _resolve_geometry(args)
+    xyz = _abs_path(args.xyz) if args.xyz else None
 
     d_cube = None
     if args.cube:
@@ -99,10 +167,15 @@ def cmd_afm(args: argparse.Namespace) -> int:
         atomPos = np.asarray(d_cube['atomPos'], dtype=np.float64)
         atomTypes = np.array([int(round(z)) for z in d_cube['atomZ']], dtype=np.int32)
 
+    if not getattr(args, 'no_orient', False):
+        from spammm.forcefields.FFController import orient_long_axis_x
+        orient_long_axis_x(atomPos)
+        print(f'orientPCA long→x  span_xy=({atomPos[:,0].ptp():.3f},{atomPos[:,1].ptp():.3f})')
+
     grid_spec, origin, ngrid, step = diag._fft_friendly_grid_spec(
         atomPos, args.step, args.margin, z_extra=args.z_extra)
     nx, ny, nz = [int(x) for x in ngrid]
-    print(f'grid={nx}x{ny}x{nz} step={step} origin={origin}')
+    print(f'grid={nx}x{ny}x{nz} step={step} origin={origin} mol={mol_name}')
 
     variants = {}
     basis_hsd = get_dftb_basis_path(args.basis)
@@ -141,53 +214,160 @@ def cmd_afm(args: argparse.Namespace) -> int:
             pa_3ob['A'], pa_3ob['beta'], args.tip_mode, args.outdir, args)
 
     if d_cube is not None:
-        rho_g = afm_utils.resample_field_to_grid(
-            d_cube['rho_scf'], d_cube['origin'], d_cube['step'], origin, step, ngrid)
-        rho_d = afm_utils.resample_field_to_grid(
-            d_cube['rho_diff'], d_cube['origin'], d_cube['step'], origin, step, ngrid)
-        dV = step ** 3
-        vol = float(nx * ny * nz) * dV
-        qd = float(rho_d.sum() * dV)
-        if abs(qd) > 1e-4:
-            rho_d = (rho_d - qd / vol).astype(np.float32)
-        V_cube = afm.fft_poisson_cpu(rho_d, step)
+        # Pyridine SSOT: clamp→compact NA + GridsOCL project (not Gaussian + scipy sample)
+        prep = afm_utils.allelectron_cube_to_fdbm_grid(
+            d_cube['rho_scf'], d_cube['origin'], d_cube['step'],
+            d_cube['atomPos'], d_cube['atomZ'],
+            origin, step, ngrid, rc_na=0.6, R_sphere=0.6, verbosity=0)
+        V_cube = afm.fft_poisson_cpu(prep['rho_diff'], step)
         variants['cube'] = diag._run_from_density(
-            'cube', rho_g, V_cube, atomPos, atomTypes, origin, step, ngrid,
+            'cube', prep['rho_scf'], V_cube, atomPos, atomTypes, origin, step, ngrid,
             pa_cube['A'], pa_cube['beta'], args.tip_mode, args.outdir, args)
 
     if not variants:
         print('Nothing to run: set --projection and/or --cube', file=sys.stderr)
         return 1
 
-    order = [k for k in ('cube', 'stock', 'prolonged') if k in variants]
+    # Row order: cube → prolonged (DFT-like) → stock (short-range)
+    order = [k for k in ('cube', 'prolonged', 'stock') if k in variants]
+    amp_align = not getattr(args, 'no_amp_align', False)
+    amp = float(args.amp)
     row_specs = []
     for k in order:
         pa = pa_cube if k == 'cube' else pa_3ob
         row_specs.append(('df', k, f'df {k}\nA={pa["A"]:.1f} β={pa["beta"]:.2f}', args.df_cmap))
     for k in order:
-        row_specs.append(('Fz', k, f'Fz {k}', args.cmap))
+        fz_lab = f'Fz {k}\n@h−{amp:.1f}Å' if amp_align else f'Fz {k}'
+        row_specs.append(('Fz', k, fz_lab, args.cmap))
 
     heights = next(iter(variants.values()))['heights']
-    title = f'FDBM AFM  tip={args.tip_mode}  basis={args.basis}  projection={args.projection}'
-    out_png = os.path.join(args.outdir, f'compare_{args.scale}.png')
-    afm_utils.plot_afm_variant_height_strip(
-        variants, row_specs, heights, out_png, scale=args.scale, title=title, dpi=140)
-    if args.scale != 'per_image':
+    v0 = next(iter(variants.values()))
+    extent = None
+    if 'scan_xs' in v0 and 'scan_ys' in v0:
+        extent = afm_utils.scan_extent(v0['scan_xs'], v0['scan_ys'])
+    title = f'FDBM AFM  {mol_name}  tip={args.tip_mode}  basis={args.basis}  projection={args.projection}'
+    show_atoms = bool(getattr(args, 'show_atoms', False))
+    out_png = None
+    if 'compare' in plots:
+        scale = args.scale if args.scale != 'per_image' else 'per_column'
+        # Prefer fixed name compare_per_column.png when using default scale
+        out_png = os.path.join(args.outdir, f'compare_{scale}.png')
+        afm_utils.plot_afm_variant_height_strip(
+            variants, row_specs, heights, out_png, scale=scale, title=title, dpi=140,
+            apos=atomPos if show_atoms else None, show_atoms=show_atoms, extent=extent,
+            amp=args.amp, amp_align=amp_align)
+        print(f'REVIEW: {out_png}')
+    if 'per_image' in plots:
         per = os.path.join(args.outdir, 'per_image')
         os.makedirs(per, exist_ok=True)
+        pi = os.path.join(per, 'compare_per_image.png')
         afm_utils.plot_afm_variant_height_strip(
-            variants, row_specs, heights, os.path.join(per, 'compare_per_image.png'),
-            scale='per_image', title=title, dpi=140)
+            variants, row_specs, heights, pi, scale='per_image', title=title, dpi=140,
+            apos=atomPos if show_atoms else None, show_atoms=show_atoms, extent=extent,
+            amp=args.amp, amp_align=amp_align)
+        print(f'REVIEW: {pi}')
 
     summary = os.path.join(args.outdir, 'SUMMARY.out')
     with open(summary, 'w') as f:
         f.write(title + '\n')
         f.write(f'xyz={xyz}\n')
+        f.write(f'smiles={smi}\n')
         f.write(f'cube={args.cube}\n')
         f.write(f'grid={nx}x{ny}x{nz} step={step}\n')
-        f.write(f'REVIEW: {out_png}\n')
+        f.write(f'plots={sorted(plots)} h=[{args.h_min},{args.h_max}] dz={args.h_step}\n')
+        if out_png:
+            f.write(f'REVIEW: {out_png}\n')
+        for k, v in variants.items():
+            if v.get('stage_path'):
+                f.write(f'REVIEW: {v["stage_path"]}\n')
     print(f'REVIEW: {summary}')
     print(f'REVIEW: {os.path.abspath(args.outdir)}/')
+    return 0
+
+
+def cmd_opt(args: argparse.Namespace) -> int:
+    """Vacuum geometry optimization (UFF / SPFF / LFF / DFTB), optional planarize."""
+    import numpy as np
+    from spammm.AtomicSystem import AtomicSystem
+    from spammm.forcefields.FFController import optimize_vacuum
+    from spammm import atomicUtils as au
+    from spammm.topology.smiles import smiles_to_system, SMILES_EXAMPLES
+
+    os.makedirs(args.outdir, exist_ok=True)
+    if args.smiles_example:
+        smi = SMILES_EXAMPLES[args.smiles_example]
+        name = args.smiles_example
+        mol = smiles_to_system(smi, engine='pure')
+    elif args.smiles:
+        smi = args.smiles
+        name = 'smiles'
+        mol = smiles_to_system(smi, engine='pure')
+    else:
+        xyz = _abs_path(args.xyz or 'data/xyz/benzene.xyz')
+        name = os.path.splitext(os.path.basename(xyz))[0]
+        mol = AtomicSystem(fname=xyz)
+        if mol.bonds is None:
+            mol.findBonds()
+        smi = None
+
+    work = os.path.join(args.outdir, f'dftb_opt_{name}') if args.method == 'dftb' else args.outdir
+    info = optimize_vacuum(mol, method=args.method, nsteps=args.nsteps, fmax_tol=args.fmax,
+                           planar=not args.no_planar, orient_pca=not getattr(args, 'no_orient', False),
+                           workdir=work, sk_set=args.basis, verbose=True)
+    out_xyz = os.path.join(args.outdir, f'{name}_opt.xyz')
+    au.save_xyz(out_xyz, mol.enames, mol.apos, comment=f"opt method={args.method} {info}")
+    summary = os.path.join(args.outdir, 'SUMMARY.out')
+    with open(summary, 'w') as f:
+        f.write(f'opt {name} method={args.method}\n')
+        f.write(f'smiles={smi}\n')
+        for k, v in info.items():
+            f.write(f'{k}={v}\n')
+        f.write(f'REVIEW: {out_xyz}\n')
+    print(f'REVIEW: {out_xyz}')
+    print(f'REVIEW: {summary}')
+    return 0
+
+
+def cmd_smiles_afm(args: argparse.Namespace) -> int:
+    """SMILES → vacuum opt (planar) → prolonged FDBM AFM with atom-dot overlay."""
+    import numpy as np
+    from spammm.topology.smiles import SMILES_EXAMPLES, smiles_to_system
+    from spammm.forcefields.FFController import optimize_vacuum
+    from spammm import atomicUtils as au
+
+    names = args.example if args.example else list(SMILES_EXAMPLES.keys())
+    for name in names:
+        if name not in SMILES_EXAMPLES:
+            print(f'SKIP unknown example {name!r}', file=sys.stderr)
+            continue
+        outdir = os.path.join(args.outdir, name)
+        os.makedirs(outdir, exist_ok=True)
+        print(f'\n======== SMILES-AFM {name} ========')
+        mol = smiles_to_system(SMILES_EXAMPLES[name], engine='pure')
+        work = os.path.join(outdir, 'dftb_opt') if args.method == 'dftb' else outdir
+        info = optimize_vacuum(mol, method=args.method, nsteps=args.nsteps, fmax_tol=args.fmax,
+                               planar=True, orient_pca=not getattr(args, 'no_orient', False),
+                               workdir=work, sk_set=args.basis, verbose=True)
+        xyz_path = os.path.join(outdir, f'{name}_opt.xyz')
+        au.save_xyz(xyz_path, mol.enames, mol.apos,
+                    comment=f"{name} {SMILES_EXAMPLES[name]} opt={args.method} {info}")
+        print(f'REVIEW: {xyz_path}')
+
+        ns = argparse.Namespace(**vars(args))
+        ns.xyz = xyz_path
+        ns.smiles = None
+        ns.smiles_example = None
+        ns.outdir = outdir
+        ns.projection = 'prolonged'
+        ns.show_atoms = True
+        ns.cube = None
+        ns.esp_cube = None
+        # Already PCA-oriented in optimize_vacuum; skip second pass
+        ns.no_orient = True
+        rc = cmd_afm(ns)
+        if rc != 0:
+            return rc
+    print(f'\nREVIEW: {os.path.abspath(args.outdir)}/')
     return 0
 
 
@@ -294,6 +474,18 @@ def cmd_replot_panel(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_es_diag(args: argparse.Namespace) -> int:
+    """Cube ES chain diagnostics: ρ, Δρ, V_ES=Poisson(Δρ), E_ES, tip + mirror metrics."""
+    from tests.SPM import testplot_fdbm_relax as diag
+    os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
+    ns = argparse.Namespace(
+        step=args.step, margin=args.margin, outdir=args.outdir, basis=args.basis,
+        molecule=args.molecule, z_above=tuple(args.z_above),
+    )
+    diag.run_fukui_es_diag(ns)
+    return 0
+
+
 def _prepare_stm_outdir(args):
     args.outdir = _abs_path(args.outdir)
     os.makedirs(args.outdir, exist_ok=True)
@@ -337,6 +529,30 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_afm_args(p_afm)
     p_afm.set_defaults(func=cmd_afm)
 
+    p_opt = sub.add_parser('opt', help='Vacuum geometry opt (UFF/SPFF/LFF/DFTB); keep planar')
+    p_opt.add_argument('--xyz', default=None)
+    p_opt.add_argument('--smiles', default=None)
+    p_opt.add_argument('--smiles-example', default=None, dest='smiles_example')
+    p_opt.add_argument('--method', default='uff', choices=['uff', 'spff', 'lff', 'dftb'])
+    p_opt.add_argument('--nsteps', type=int, default=1000)
+    p_opt.add_argument('--fmax', type=float, default=0.05)
+    p_opt.add_argument('--basis', default='3ob-3-1', choices=['3ob-3-1', 'mio-1-1'])
+    p_opt.add_argument('--no-planar', action='store_true', dest='no_planar')
+    p_opt.add_argument('--no-orient', action='store_true', dest='no_orient',
+                       help='Skip PCA long-axis→x after opt')
+    p_opt.add_argument('--outdir', default='debug/spm_opt')
+    p_opt.set_defaults(func=cmd_opt)
+
+    p_safm = sub.add_parser('smiles-afm', help='SMILES → planar vacuum opt → prolonged FDBM AFM (+ atom dots)')
+    _add_common_afm_args(p_safm)
+    p_safm.add_argument('--example', nargs='*', default=None,
+                        help='SMILES_EXAMPLES names (default: all)')
+    p_safm.add_argument('--method', default='uff', choices=['uff', 'spff', 'lff', 'dftb'])
+    p_safm.add_argument('--nsteps', type=int, default=1000)
+    p_safm.add_argument('--fmax', type=float, default=0.05)
+    p_safm.set_defaults(func=cmd_smiles_afm, outdir='debug/spm_smiles_afm',
+                        projection='prolonged', show_atoms=True, xyz=None)
+
     p_morse = sub.add_parser('afm-morse', help='Classical Morse/LJ + Coulomb AFM (no density)')
     p_morse.add_argument('--xyz', default='data/xyz/benzene.xyz')
     p_morse.add_argument('--params', default=None, help='ElementTypes.dat path')
@@ -378,6 +594,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_rep.add_argument('--cmap', default='seismic')
     p_rep.add_argument('--df-cmap', default='gray', dest='df_cmap')
     p_rep.set_defaults(func=cmd_replot_panel)
+
+    p_es = sub.add_parser('es-diag', help='Cube ES chain diag: ρ, Δρ, V_ES, E_ES, tip + mirror asym')
+    p_es.add_argument('--molecule', nargs='*', default=None,
+                      help='Fukui panel names (default: all). e.g. PTCDA pentacene phtalo_1-dftb-relax')
+    p_es.add_argument('--outdir', default='debug/fdbm_fukui_panel_flat')
+    p_es.add_argument('--step', type=float, default=0.15)
+    p_es.add_argument('--margin', type=float, default=4.0)
+    p_es.add_argument('--basis', default='3ob-3-1', choices=['3ob-3-1', 'mio-1-1'])
+    p_es.add_argument('--z-above', nargs=2, type=float, default=[1.0, 5.0],
+                      help='Slice heights above molecule plane [Å]')
+    p_es.set_defaults(func=cmd_es_diag)
 
     p_stm = sub.add_parser('stm', help='STM / orbital imaging (DFTB vs pySCF)')
     stm_sub = p_stm.add_subparsers(dest='stm_mode', required=True)

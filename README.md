@@ -14,7 +14,7 @@ SPAMMM streamlines the full simulation pipeline for molecules on surfaces:
 
 - **Molecular structure design** — Draw or load molecules in 2D/3D; perform interactive topology editing (hexagonal rings, bond creation/deletion, atom passivation, pi/n-pi toggling) inside the GUI.
 - **Geometry relaxation** — Relax structures with fast GPU-accelerated force fields (UFF, SPFFsp3) or with DFTB, using FIRE or velocity-Verlet MD.
-- **Surface docking and assembly** — Drag and place molecules on substrates, build assemblies, and run rigid-body or flexible docking using GridFF, Ewald2D, and folded-atomic-function models.
+- **Surface docking and assembly** — Drag and place molecules on substrates, build assemblies, and run rigid-body or flexible docking using GridFF, Ewald2D, and folded-atomic-function models. **PairFF** adds GPU rigid-body molecule–molecule docking with directional H-bonds (epairs / σ-holes), interactive FIRE, and click-to-select active body — see [`demos/PairFF_manual.md`](demos/PairFF_manual.md).
 - **AFM simulation** — Generate AFM images using either a simple LJ/Morse + point-charge probe-particle model, or the full-density-based model (FDBM). For FDBM, electron density is projected onto a grid, Pauli and Hartree potentials are computed, and van der Waals contributions are added to build the total probe-sample interaction potential.
 - **STM simulation** — Project molecular orbitals onto a grid via DFTB local basis set or FFT-based approaches. Bond-resolved STM is achieved by sampling STM at the probe-particle positions obtained from AFM relaxation, which distorts the orbital images and highlights bond edges.
 - **Autonomous manipulation and optimization** — GPU-parallelized engines support global optimization of molecular geometries, AFM manipulation trajectories, and polymorph adsorption structures on surfaces, sampling millions of configurations per second.
@@ -33,6 +33,7 @@ Probe-particle model (PPM) and full-density-based model (FDBM) simulations, comb
 - `spammm/surfaces/` — GridFF, Ewald2D, SurfaceEwald, folded atomic functions, substrate builder.
 - `spammm/topology/` — Molecular topology, FF parameter parsing, Kekule editing backend.
 - `kernels/` — OpenCL kernels for relaxation, force fields, surface sampling, and density projection.
+- `demos/` — User-facing demos (PairFF Vispy); start at [`demos/README.md`](demos/README.md) · [`demos/PairFF_manual.md`](demos/PairFF_manual.md).
 - `data/` — Element, atom, bond, angle, and dihedral parameter files plus test molecules and substrates.
 - `tests/` — Pytest suite (topology, surface/Ewald, forcefield, AFM, integration) with helpers.
 - `doc/` — Architectural and topical audit documents, test design, agent protocols.
@@ -49,7 +50,8 @@ Probe-particle model (PPM) and full-density-based model (FDBM) simulations, comb
 
 | Entry | What |
 |-------|------|
-| [`run_spm.py`](run_spm.py) | **User CLI** — AFM (FDBM, Morse+Coulomb, Kriging) and STM (orbitals, current, vacuum panel) without GUI |
+| [`run_spm.py`](run_spm.py) | **User CLI** — AFM (FDBM, Morse+Coulomb, Kriging), `opt` / `smiles-afm`, and STM (orbitals, current, vacuum panel) without GUI |
+| [`demos/demo_pairff.py`](demos/demo_pairff.py) | **PairFF demo** — rigid-body H-bond docking (Vispy + FIRE); manual [`demos/PairFF_manual.md`](demos/PairFF_manual.md) |
 | [`user_guide/`](user_guide/) | **User documentation** (start at [`user_guide/SPM_CLI.md`](user_guide/SPM_CLI.md)) |
 | `spammm/GUI/` | Interactive VisPy + PyQt5 molecular editor / AFM–STM GUI |
 | `spammm/SPM/` | Physics SSOT (`AFM.py`, `AFM_utils.py`, `stm_compare.py`, `KrigingGridFF.py`, `ModularPipeline.py`) |
@@ -58,6 +60,7 @@ Probe-particle model (PPM) and full-density-based model (FDBM) simulations, comb
 
 ```bash
 python run_spm.py --help
+python run_spm.py smiles-afm --example naphthalene --method uff
 python run_spm.py afm --xyz data/xyz/benzene.xyz --projection stock
 python run_spm.py afm-morse --xyz data/xyz/pentacene.xyz
 python run_spm.py stm orbitals --molecule pentacene --n-near 5
@@ -66,8 +69,8 @@ python run_spm.py stm current --molecule pentacene --stm-tips s,pz,py
 
 ## Documentation
 
-- **Users:** [`user_guide/README.md`](user_guide/README.md) · [`user_guide/SPM_CLI.md`](user_guide/SPM_CLI.md)
-- **Developers / layout:** [`MANIFEST.md`](MANIFEST.md) · [`doc/`](doc/) · [`doc/ToDo/ToDo.agents.md`](doc/ToDo/ToDo.agents.md)
+- **Users:** [`user_guide/README.md`](user_guide/README.md) · [`user_guide/SPM_CLI.md`](user_guide/SPM_CLI.md) · [`demos/PairFF_manual.md`](demos/PairFF_manual.md) (rigid-body PairFF)
+- **Developers / layout:** [`MANIFEST.md`](MANIFEST.md) · [`doc/`](doc/) · [`doc/TopicalAudit/PairFF_RigidBody.md`](doc/TopicalAudit/PairFF_RigidBody.md) · [`doc/ToDo/ToDo.agents.md`](doc/ToDo/ToDo.agents.md)
 
 ## License
 

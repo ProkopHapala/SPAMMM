@@ -16,7 +16,7 @@ who implement, test, and report back.
 | T04 | Molecular browser plugin port | Medium | Design done | [`doc/ARCHITECTURE_ROADMAP.md`](ARCHITECTURE_ROADMAP.md) §1 |
 | T05 | GridFF consolidation (B-spline vs trilinear) | Medium | Design done | [`doc/ARCHITECTURE_ROADMAP.md`](ARCHITECTURE_ROADMAP.md) §6 |
 | T06 | GUI verbosity consolidation | Low | Design done | [`doc/ARCHITECTURE_ROADMAP.md`](ARCHITECTURE_ROADMAP.md) §10 |
-| T07 | SMILES builder | Low | Not started | [`doc/ARCHITECTURE_ROADMAP.md`](ARCHITECTURE_ROADMAP.md) §9 |
+| T07 | SMILES builder | Low | **Parser + CLI wired** (`smiles-afm` / `--smiles`); GUI text box open | [`spammm/topology/smiles.py`](../spammm/topology/smiles.py) · [`doc/ARCHITECTURE_ROADMAP.md`](ARCHITECTURE_ROADMAP.md) §9 · [`SPM_CLI_Headless.md`](Tasks/SPM_CLI_Headless.md) §C |
 
 ---
 

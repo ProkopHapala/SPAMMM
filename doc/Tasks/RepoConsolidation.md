@@ -32,7 +32,7 @@ duplicate physics       →     one OpenCLBase path, NVIDIA-first
 | — | Site Pauli \(A,\beta\) + transferability | `doc/Tasks/Pauli_A_beta_KrigingTransferability.md` | **P1** |
 | 3 | PME charge rings + MC / Hubbard / MQCA | `doc/Tasks/Import_ChargeRings_PME.md` | **P1** |
 | 8 | Kekulé π → exponential RI density | `doc/Tasks/Kekule_ExponentialDensityFit.md` | **P2** |
-| 9 | Fast 2.5D contact-surface AFM | `doc/Tasks/Fast_2p5D_AFM_ContactSurface.md` | **P2** |
+| 9 | Fast 2.5D contact-surface AFM | `doc/Tasks/Fast_2p5D_AFM_ContactSurface.md` | **P1** (parity bisect; was P2) |
 | — | Frenkel / TEPL | `doc/Ideas/FrenkelRigidFF.chat.md` (ideas only) | **P2** |
 | 5 | Dyson orbitals + DFTB+ for STM | `doc/Tasks/DysonOrbitals_DFTB_STM.md` | **P3** |
 | 6 | OpenCL/weave/jit FF optimizer driver | `doc/Tasks/FF_Optimizer_OpenCL_Driver.md` | **P3** |

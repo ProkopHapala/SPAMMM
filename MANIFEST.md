@@ -25,7 +25,7 @@ The platform is accessible through an interactive GUI or via Python scripting, e
 4. **Substrate interaction** — molecule-surface interactions via GridFF (B-spline), Ewald2D, folded atomic functions
 5. **AFM simulation** — both simple Morse+point-charge (AFMulator/AFM.cl) and FDBM (density-based via DFTB or pySCF backends)
 6. **STM simulation** — orbital projection, DOS, LDOS via DFTB `LCAO_grid.cl` (not Fireball)
-7. **Rigid body dynamics** — 6-DOF rigid body AFM manipulation (molecule-on-tip scanning)
+7. **Rigid body dynamics** — 6-DOF rigid body AFM manipulation (molecule-on-tip scanning); **PairFF** molecule–molecule docking with directional H-bonds (`demos/PairFF_manual.md`)
 8. **Molecular assembly** — place molecules on surfaces, build assemblies, manipulation path optimization
 
 ## Directory Structure
@@ -55,6 +55,8 @@ SPAMMM/
 │   ├── xyz/                    # Test molecules (benzene, water, pentacene, DNA bases, etc.)
 │   ├── mol/                    # Test molecules in MOL2 format
 │   └── substrates/             # Substrate surfaces (NaCl, CaF2)
+│
+├── demos/                      # User-facing demos (PairFF Vispy); PairFF_manual.md
 │
 ├── doc/                        # Audit documents + agent skills
 │   └── AGENTS/

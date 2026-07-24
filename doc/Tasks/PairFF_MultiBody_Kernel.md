@@ -1,6 +1,15 @@
 # Task: PairFF multi-body kernel — one active relaxer, many fixed neighbors
 
-**Status:** investigating — design + performance notes only (no implementation yet)  
+**Status:** investigating — USER confirmed Vispy click-to-select + mixed `--mols`; FIRE default ON; docs in `demos/PairFF_manual.md` (awaiting explicit Done before closing)  
+**Implemented:**
+- Kernel 9 in `kernels/rigid.cl` — per-`mol_j` local tiles
+- `RigidBodyPairFF.from_molecules` / `set_active_body` / `alloc_pairff_env` / `upload_env`
+- Vispy: LMB on any molecule → `set_active_body` + rebuild env + recompute potential map; **FIRE default ON**
+- Mixed species via `from_molecules` / demo `--mols`
+- Docs: `demos/PairFF_manual.md`, `doc/TopicalAudit/PairFF_RigidBody.md`, `doc/Topics/ForceFields/PairFF.md`
+- Demo:
+  - `python3 demos/demo_pairff.py --bodies 4 --active 0`
+  - `python3 demos/demo_pairff.py --mols PTCDA.xyz HCOOH.xyz formamide.xyz --spacing 12`
 **Priority:** P0 before GUI integration (`PairFF_GUI_Integration.md`)  
 **Depends on:** `RigidBodyPairFF`, `rigid_body_pairff_unified_kernel`, `demos/demo_pairff.py`  
 **Related:** `kernels/rigid.cl`, `kernels/assembly.cl` (tiled neighbor loops), `doc/Tasks/RigidBodyDynamicsWithFoldedBasisSubstrate.md`
@@ -13,9 +22,19 @@ Evolve the demo from **1 dynamic + 1 static** molecule to **N rigid molecules** 
 
 - **Exactly one** molecule is **active** (integrates translation + rotation; FIRE / MD).
 - All others are **fixed** (frozen pose) but still exert **PairFF forces** on the active body.
-- User picks which molecule is active (GUI later; CLI flag in demo first).
+- User picks which molecule is active (Vispy click; CLI `--active`).
 
 This matches the ultimate assembly application: many adsorbates, relax one at a time while others provide a frozen environment.
+
+### Mixed molecules (already supported)
+
+`from_molecules` takes a **list of independent** `(apos, enames, REQs)` packs — species need not match. Constraints:
+
+- Unified kernel only (`--pairff-mode unified`)
+- Each env molecule tile ≤ **128** sites (atoms + epairs + sigma holes)
+- Switching active body reallocates the dynamic body to that molecule’s site count
+
+There is **no** `data/xyz/NTCDA.xyz` yet (ASCII template exists in `ascii_art_heterocycle.py`); use `PTCDA.xyz` or export an XYZ. `formamide.xyz` = HCONH2.
 
 ---
 
@@ -56,13 +75,15 @@ __local float  Lstatic_g[MAX_STATIC_ATOMS];
 | Dummy atoms | Epairs (`type=1`), sigma holes (`type=2`) on every body; REQ packing unchanged |
 | Kernel default | **Unified** compact-exp (`rigid_body_pairff_unified_kernel`) |
 
-**Demo CLI (proposed):**
+**Demo CLI:**
 
 ```bash
+python3 demos/demo_pairff.py --bodies 4 --active 0          # identical HCOOH; click to switch
+python3 demos/demo_pairff.py --mols PTCDA.xyz HCOOH.xyz formamide.xyz --spacing 12
 python3 demos/demo_pairff.py --bodies 4 --active 2 --no-vis
 ```
 
-Load same or different XYZs; place at grid offsets; relax body 2 against bodies 0,1,3.
+Load same or different XYZs; place at grid offsets; relax / pick active against frozen neighbors.
 
 ---
 

@@ -370,7 +370,7 @@ relax them simultaneously without inter-molecular overlap.
 
 ## 9. Pentagon/Heptagon Drawing & SMILES Builder
 
-**Status:** N-gon ring drawing implemented (edge + corner). SMILES builder not yet implemented.
+**Status:** N-gon ring drawing implemented (edge + corner). SMILES **parser + CLI** wired (`spammm/topology/smiles.py`, `run_spm.py --smiles` / `smiles-afm`); GUI text box still open (`SPM_CLI_Headless.md` §C).
 
 **Current state:**
 - `heterocycle_generator.py` mentions pentagons/heptagons in comments (zigzag rows create them)
@@ -381,14 +381,14 @@ relax them simultaneously without inter-molecular overlap.
   - `RingMode` in `EditModeHandlers.py` unifies all 3: bond → corner atom → hex center (priority order)
   - Ring size selectable via spinbox (3-8+), works with any n_members ≥ 3
   - Fused ring systems with mixed ring sizes supported (e.g. pentagon fused to hexagon)
-- No SMILES parser or builder exists
-- `doc/Tasks/ToDO_GUI.md` lists "ASCII-art molecule builder, as well as smiles"
+- **SMILES:** `spammm/topology/smiles.py` — `parse_smiles` / `smiles_to_system` / `SMILES_EXAMPLES`; tests `tests/topology/test_smiles.py` (22 passed); CLI: `opt`, `afm --smiles*`, `smiles-afm`
+- `doc/Tasks/ToDO_GUI.md` lists GUI SMILES text box as remaining
 
 **Remaining plan:**
-1. SMILES builder: parse SMILES strings → AtomicGraph
-   - Use RDKit or hand-rolled parser
-   - SMILES → atom list + bonds → `AtomicGraph` → geometry assignment
-   - Integrate with Kekule solver for bond order validation
+1. ~~SMILES builder: parse SMILES strings → AtomicGraph~~ (done — pure parser)
+2. ~~Wire `--smiles` into `run_spm.py` / `opt` / `smiles-afm`~~ (done — USER science OK pending)
+3. GUI text box calling the same `parse_smiles`
+4. Optional: ASCII / `.mol`/`.mol2` shared resolver flags
 
 ---
 

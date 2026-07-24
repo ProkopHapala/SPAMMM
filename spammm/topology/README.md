@@ -23,6 +23,7 @@ See also: `kernels/README.md` (GPU force fields consume topology via `AtomicSyst
 | `HexGrid.py` | Hexagonal grid snapping and transforms |
 | `heterocycle_generator.py` | Build heterocycles from rectangular hex-lattice specs |
 | `ascii_art_heterocycle.py` | ASCII art → 2D geometry; `:` H-bond marks; `resolve_hbond_pairs()` |
+| `smiles.py` | SMILES → `AtomicGraph` (pure + optional RDKit); `SMILES_EXAMPLES`; CLI: `run_spm.py --smiles*` / `smiles-afm` |
 | `hbond_utils.py` | H-bond records on synced graphs; RC control→fraction mapping |
 | `scan_dataset.py` | `ScanDataset` `.npz` trajectories (geometry, charges, optional ESP) |
 | `scan_kekule.py` | C–C bond length vs control along scan paths |
@@ -30,14 +31,16 @@ See also: `kernels/README.md` (GPU force fields consume topology via `AtomicSyst
 ## Data flow
 
 ```
-ASCII art / GUI clicks
+ASCII art / SMILES / GUI clicks / .xyz|.mol|.mol2
        ↓
-  AtomicGraph  ←── MoleculeEditorBackend
+  AtomicGraph  ←── MoleculeEditorBackend (SSOT)
        ↓
   to_arrays() → AtomicSystem → SPFF/UFF MD (kernels/SPFF.cl, UFF.cl)
        ↓
   KekulePure.run_kekule_solver()  (π bond orders, optional)
 ```
+
+CLI: `run_spm.py opt` / `smiles-afm` / `afm --smiles*` — user guide `user_guide/SPM_CLI.md`; task `doc/Tasks/SPM_CLI_Headless.md`.
 
 ## Kekulé workflow
 
@@ -58,11 +61,6 @@ pytest tests/topology/test_editing_ops.py --develop -s   # + .out/.log + PNG
 ```
 
 Artifacts: `debug/test_editing_ops/`
-
-| `ascii_art_heterocycle.py` | ASCII art → 2D geometry; `:` H-bond marks; `resolve_hbond_pairs()` |
-| `hbond_utils.py` | H-bond records on synced graphs; RC control→fraction mapping |
-| `scan_dataset.py` | `ScanDataset` `.npz` trajectories (geometry, charges, optional ESP) |
-| `scan_kekule.py` | C–C bond length vs control along scan paths |
 
 ## Reaction-coordinate scan
 

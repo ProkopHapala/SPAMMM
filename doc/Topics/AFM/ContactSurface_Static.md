@@ -160,6 +160,8 @@ Program build: `common.cl` + `Forces.cl` + `contact_surface.cl` (+ `AFM.cl` when
 Fit config: `bspl_dx=0.2 Å`, `poly_R=5 Å`, `poly_z0=1 Å`, adaptive z fit 1–6 Å above `zmax`.
 Basis and fit-region tuning still open — current quality is usable, not optimal.
 
+**2026-07-24 caveat (helicene assembly):** separable contact-sep vs GridFF Morse+Coulomb showed **long-range / “too close” bias** (E well ~4 Å vs ~2.8 Å). Re-check PTCDA with current knobs; add 1–2 atom toys before trusting SAM screening. See `doc/Reports/Assembly_ContactSurface_AFM_helicene_2026-07-24.md`, `doc/TopicalAudit/AFM_ContactSurface.md`.
+
 ---
 
 ## 0. Primary deliverable (read this first)

@@ -1,8 +1,17 @@
+---
+type: Task
+title: Fast 2.5D AFM — contact-surface variants
+tags: [afm, contact-surface, morse, opencl]
+timestamp: 2026-07-24
+---
+
 # Task: Fast 2.5D AFM — contact-surface variants (inventory + finish)
 
-**Status:** investigating  
-**Priority:** P2 / P3 (speed story; prototype largely in-repo)  
+**Status:** investigating (**priority bump:** helicene assembly exposed long-range / “too close” bias vs Morse+Coulomb GridFF)  
+**Priority:** P1 (blocks Assembly AFM screening quality) / was P2  
 **Design:** `doc/Topics/AFM/ContactSurface_Static.md`, `ContactSurface_Elastic.md`  
+**Audit:** `doc/TopicalAudit/AFM_ContactSurface.md`  
+**Report (helicene):** `doc/Reports/Assembly_ContactSurface_AFM_helicene_2026-07-24.md`  
 **Pitfalls:** `doc/Takeways.md` (z alignment, F_ref layout, reg, weighting)  
 **Was:** scattered Later items in `ToDo.agents.md` — this file is the SSOT task
 
@@ -10,58 +19,49 @@
 
 Finish and document the **memory-efficient 2.5D AFM** approach that avoids a full 3D `img_FF` GridFF: store a **low-res 2D lateral field** plus a **few z-basis functions**, fit once, evaluate during PP relax.
 
-Inventory and harden the variants already attempted; wire a clear AFMulator / GUI path; keep elastic Phase 2 design-only unless prioritized.
+**Hard requirement:** separable (and PIC) must reproduce Morse+Coulomb **qualitatively** (E(z)/Fz(z) shape and onset height). Helicene assembly compare failed that bar — fix before trusting screening images.
 
-## Variants in the repo (current understanding)
+## Variants in the repo
 
-| # | Idea (USER) | Implementation | Status |
-|---|-------------|----------------|--------|
-| **(i)** | Smooth 2D **contact height** \(h_0(x,y)\) + z-curves from that height (B-spline xy × exponential / poly-of-exp in \(z-h_0\)) | **Separable** `SeparableParams` + `build_contact_height_map`; kernels `evalSeparableBsplinePoly`, `relaxStrokesTiltedContact` | **Prototype working** — PTCDA Morse parity ~14 meV/Å |
-| **(ii)** | Hybrid / short-range **atom-bounded** modes + grid cells | **Radial PIC** `PICParams` + PIC buckets; `evalRadialPIC`, `relaxStrokesTiltedPIC`, `cs_pic_eval_tile16` | **Prototype working** — parity ~20 meV/Å; needs `reg≈1e-2` |
-| **(iii)** | Other / hybrid | Related patterns: **folded surface** tensor×exp (`surface.cl` / FoldedRigid FAF-like z-basis); optional **A+B hybrid** (coarse separable + PIC residual) mentioned in design but **not shipped** as one API | **Investigate** — document what exists vs vaporware |
+| # | Idea | Implementation | Status |
+|---|------|----------------|--------|
+| **(i)** | Contact height \(h_0(x,y)\) + z-modes | Separable B-spline × poly-of-exp | Prototype — PTCDA PP Fz ~14 meV/Å; **helicene bias open** |
+| **(ii)** | Atom-bounded radial modes + PIC cells | Radial PIC | Prototype ~20 meV/Å; `reg≈1e-2` |
+| **(iii)** | Hybrid / folded | Not shipped as one API | Investigate / defer |
 
-**Code SSOT**
-
-| Path | Role |
-|------|------|
-| `kernels/contact_surface.cl` | Brute Morse ref, separable Av/Atv, PIC fit/eval, PP relax |
-| `spammm/surfaces/ContactSurface.py` | `ContactSurfaceCL`, fit helpers, params |
-| `spammm/SPM/AFM.py` | `fit_contact_surface`, `run_scan_contact`, `fit_pic_contact_surface`, `run_scan_pic` |
-| `spammm/surfaces/README.md` | Module index + knobs |
-| L0 | `tests/SPM/test_afm_contact_surface.py` |
-| L2 | `tests/testplot_contact_surface.py`, `tests/SPM/testplot_afm_contact_surface.py` |
-
-## Why
-
-3D GridFF for large aperiodic molecules is memory- and bandwidth-heavy. Contact surface keeps PP-AFM geometry but compresses \(z\) into 4–8 modes above \(h_0(x,y)\). Separable suits moderate windows; PIC scales with contact atoms.
+**Code SSOT:** `kernels/contact_surface.cl`, `spammm/surfaces/ContactSurface.py`, `spammm/SPM/AFM.py`  
+**L0:** `tests/SPM/test_afm_contact_surface.py`  
+**L2 PTCDA:** `tests/testplot_contact_surface.py`, `tests/SPM/testplot_afm_contact_surface.py` → `debug/testplot_contact_surface/`  
+**L2 helicene:** `run_assembly_afm.py --compare-dir …/rank09_idx2767`
 
 ## Work plan
 
-1. **Inventory note (this file)** — done above; keep updated if a third API appears.  
-2. **Parity hardening**  
-   - Expand L0: separable + PIC force stencil vs brute; optional vs 3D `run_scan` RMSE bounds.  
-   - Document default knobs (Boltzmann on separable only; PIC `reg=1e-2`).  
-3. **Pipeline flag**  
-   - Explicit mode `{separable, pic, grid3d}` in AFMulator / ModularPipeline (design already lists this).  
-4. **Hybrid (iii) — decide**  
-   - Either implement coarse separable + PIC residual correction, **or** formally defer and point to FoldedRigid / FAF as the “other” 2.5D family for **substrates** (periodic / folded), not aperiodic molecules.  
-5. **GUI** — optional later; not conference-blocking.  
-6. **Elastic Phase 2** — remains design-only (`ContactSurface_Elastic.md`); do not start unless USER asks.
+1. Inventory — done.  
+2. **Parity hardening (NOW — do not reinvent)**  
+   - Re-run PTCDA L2 with **current** knobs; compare to documented ~14 meV/Å.  
+   - **New:** 1-atom (q=0) and 2-atom (charged) E/Fz vs brute + GridFF (same spirit as helicene `--compare-dir`).  
+   - Bisect Boltzmann / fit-z / force weight / poly basis if toys fail.  
+3. Pipeline flag `{separable, pic, grid3d}`.  
+4. Hybrid (iii) — decide implement vs defer.  
+5. GUI — optional later.  
+6. Elastic Phase 2 — design-only unless USER asks.
 
 ## Deliverables
 
-- [ ] Updated topical audit row + `spammm/surfaces/README.md` listing all variants clearly  
+- [ ] Topical audit + surfaces README clear on variants  
 - [ ] L0 parity asserts with published RMSE targets  
-- [ ] Decision record on hybrid (iii): implement vs defer  
-- [ ] Optional: AFMulator `field_mode=` switch
+- [ ] 1-atom / 2-atom toy parity plots + `.out`  
+- [ ] Decision on hybrid (iii)  
+- [ ] Optional `field_mode=` switch  
+- [ ] USER confirms qualitative Morse+Coulomb match restored  
 
 ## Acceptance
 
-- USER confirms which variants are “demo-ready” vs experimental.  
+- USER confirms demo-ready vs experimental.  
 - Do not mark Done without confirmation.  
-- Elastic AFM stays Later unless promoted.
+- Elastic stays Later unless promoted.
 
 ## Out of scope
 
-- Replacing FDBM 3D density grids (different physics — Pauli overlap needs 3D ρ). Contact surface is for **classical Morse/LJ (and similar) PP fields**.  
-- Full GridFFRelaxedScan per-pixel MD.
+- FDBM 3D density grids (different physics).  
+- Full per-pixel GridFFRelaxedScan MD.

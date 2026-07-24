@@ -35,8 +35,9 @@ Topology (AtomicGraph SSOT) → Type Assignment → Force Fields → Surface Int
 | [SPFF_cl.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/SPFF_cl.py:0:0-0:0) | ⚠️ Partially | [test_forcefield.py](cci:7://file:///home/prokop/git/SPAMMM/tests/test_forcefield.py:0:0-0:0) | EF correspondence ✅ (pi-sigma bug fixed), relaxation stubs only, no non-bonded tests |
 | [UFFbuilder.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/UFFbuilder.py:0:0-0:0) | ✅ Active | Implicit | UFF parameter assignment |
 | [SPFFbuilder.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/SPFFbuilder.py:0:0-0:0) | ✅ Active | Implicit | SPFF topology builder |
-| [RigidBodyDynamics.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/RigidBodyDynamics.py:0:0-0:0) | ✅ Active | [test_folded_relax.py](cci:7://file:///home/prokop/git/SPAMMM/tests/test_folded_relax.py:0:0-0:0) (5 tests) | 6-DOF rigid body, GPU, folded basis |
+| [RigidBodyDynamics.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/RigidBodyDynamics.py:0:0-0:0) | ✅ Active | [test_folded_relax.py](cci:7://file:///home/prokop/git/SPAMMM/tests/test_folded_relax.py:0:0-0:0) (5 tests) | 6-DOF rigid body, GPU, folded basis + **PairFF** (`RigidBodyPairFF`, unified/env Strategy M) |
 | [RigidBodyAFM.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/RigidBodyAFM.py:0:0-0:0) | ✅ Active | [test_folded_relax.py](cci:7://file:///home/prokop/git/SPAMMM/tests/test_folded_relax.py:0:0-0:0) | Anchor springs, manipulation |
+| `GUI/RigidBodyVispy.py` + `demos/demo_pairff.py` | ✅ Active | Demo / headless | PairFF Vispy: FIRE default ON, click-to-select active, `--mols` mixed species — [PairFF_manual.md](../../demos/PairFF_manual.md) |
 | [QEq.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/QEq.py:0:0-0:0) | ✅ Active | No test | Charge equilibration |
 | [Assembly.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/Assembly.py:0:0-0:0) | ⚠️ Visual only | [testplot_assembly.py](cci:7://file:///home/prokop/git/SPAMMM/tests/testplot_assembly.py:0:0-0:0) (L2 only) | No L0 pytest yet |
 | [FFController.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/FFController.py:0:0-0:0) | ✅ Active | No direct test | FF orchestration |
@@ -66,18 +67,22 @@ Topology (AtomicGraph SSOT) → Type Assignment → Force Fields → Surface Int
 | `stm_compare.py` | ✅ Active | `testplot_stm_basis_compare.py` | SSOT for `run_spm.py stm {orbitals,current,panel}` |
 | STM kernels (`LCAO_STM.cl`, `LCAO_grid.cl`) | ⚠️ Kernels + `compute_stm` | No dedicated STM L0 | Campaign: `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md` |
 
-**Headless CLI (2026-07-23):** repo-root [`run_spm.py`](../../run_spm.py) + user docs [`user_guide/SPM_CLI.md`](../../user_guide/SPM_CLI.md). Task / gaps: [`doc/Tasks/SPM_CLI_Headless.md`](../Tasks/SPM_CLI_Headless.md).
+**Headless CLI (2026-07-24):** repo-root [`run_spm.py`](../../run_spm.py) + user docs [`user_guide/SPM_CLI.md`](../../user_guide/SPM_CLI.md). Task / gaps: [`doc/Tasks/SPM_CLI_Headless.md`](../Tasks/SPM_CLI_Headless.md).
 
 | CLI command | Status |
 |-------------|--------|
-| `afm` (FDBM stock/prolonged/cube) | ✅ wired |
+| `afm` (FDBM stock/prolonged/cube; SMILES; amp-align; `--plots`) | ✅ wired — defaults df 3.7–4.7 @ dz=0.1, Fz @ h−amp |
+| `opt` (UFF/SPFF/LFF/DFTB; planar + PCA long→x) | ✅ wired — science OK pending |
+| `smiles-afm` (SMILES → planar opt → prolonged AFM) | ✅ wired — gallery `debug/spm_smiles_afm/` |
 | `afm-morse` | ✅ wired (plot SSOT polish open) |
 | `afm-kriging` | ✅ wired |
 | `panel-fukui` / `replot-panel` | ✅ wired |
 | `stm orbitals` / `current` / `panel` | ✅ wired |
 | Bond-resolved STM (BR-STM) | GUI S6 ✅; CLI ✗ — consolidate task |
 | Shared GUI↔CLI job-spec protocol | ✗ ToDo (`Consolidate_GUI_CLI_Backend_Input_Protocol.md`) |
-| Substrate `relax`/`dock`; light-STM; charge-rings | ✗ ToDo |
+| Inputs: ASCII / `.mol`/`.mol2` shared flags | ✗ ToDo — SMILES done; ASCII builder exists (`SPM_CLI_Headless.md` §A/D) |
+| Substrate `dock` (GridFF / FAF) | ✗ **Future** — harder; see `SPM_CLI_Headless.md` §E + folded-basis task |
+| light-STM; charge-rings | ✗ ToDo |
 
 
 **FDBM perf (T01, 2026-07-19) — measured on RTX 3090:** benzene warm ~**0.18 s** (was ~1.65 s); flat_1 S2 NA **5.87→0.03 s**; S3 cache **~10→0.4 s**; flat_1 warm S3+S4 ~**1.4 s**. Spec: `doc/Tasks/PerfBenchmark_FDBM.md`.
@@ -274,7 +279,9 @@ The repo has a well-organized documentation hierarchy:
 - [doc/ToDo/ToDo.agents.md](cci:7://file:///home/prokop/git/SPAMMM/doc/ToDo/ToDo.agents.md:0:0-0:0) — agent task index (Done/Soon/Later)
 - [doc/AGENTS/skills/](cci:9://file:///home/prokop/git/SPAMMM/doc/AGENTS/skills:0:0-0:0) — 15 skill files for agent guidance
 - [doc/AGENTS/protocols/](cci:9://file:///home/prokop/git/SPAMMM/doc/AGENTS/protocols:0:0-0:0) — domain + general protocols
-- [doc/Topics/](cci:9://file:///home/prokop/git/SPAMMM/doc/Topics:0:0-0:0) — per-topic deep dives (AFM, Vibrations, RC Scan, RigidBody)
+- [doc/Topics/](cci:9://file:///home/prokop/git/SPAMMM/doc/Topics:0:0-0:0) — per-topic deep dives (AFM, Vibrations, RC Scan, RigidBody, PairFF)
+- [doc/TopicalAudit/PairFF_RigidBody.md](../TopicalAudit/PairFF_RigidBody.md) — PairFF inventory
+- [demos/PairFF_manual.md](../../demos/PairFF_manual.md) — PairFF user manual
 - [tests/TEST_RESULTS.md](cci:7://file:///home/prokop/git/SPAMMM/tests/TEST_RESULTS.md:0:0-0:0) — 1109-line detailed test report with human-reviewed sections
 - Per-module [README.md](cci:7://file:///home/prokop/git/SPAMMM/README.md:0:0-0:0) files in key directories
 - [doc/GUI_CHEATSHEET.md](cci:7://file:///home/prokop/git/SPAMMM/doc/GUI_CHEATSHEET.md:0:0-0:0) — keyboard & mouse controls cheatsheet
@@ -293,6 +300,7 @@ The repo has a well-organized documentation hierarchy:
 - Morse/LJ AFM imaging (9 tests, pentacene/PTCDA images); CLI `afm-morse`
 - **Headless SPM CLI** (`run_spm.py`): FDBM / Morse / Kriging AFM + STM orbitals/current/panel — docs `user_guide/SPM_CLI.md` (science sign-off pending; gaps in `SPM_CLI_Headless.md`)
 - Folded basis rigid body relaxation + manipulation (5 tests, ref data)
+- **PairFF rigid-body docking** — unified/env OpenCL kernels, Vispy demo (FIRE default, multi-body click-to-select, mixed XYZs); manual `demos/PairFF_manual.md`; main-GUI wire still open
 - Contact surface AFM (2 tests, separable + PIC)
 - DFTB+ SCF + GPU density projection
 - FDBM Pauli parameter fitting (global log-log, 3 basis sets)
@@ -311,7 +319,7 @@ The repo has a well-organized documentation hierarchy:
 - **Folded poly basis**: Power sequence wrong
 - **pySCF backend**: Minimal, no density grid test
 - **STM simulation**: CLI `stm *` + `stm_compare`; systematic basis panel / L0 still open (`STM_ExtendedBasis_OrbitalCompare.md`)
-- **SPM CLI gaps**: bond-resolved STM, substrate pre-relax, light-STM, charge-rings (`SPM_CLI_Headless.md`)
+- **SPM CLI gaps**: bond-resolved STM; gas-phase `opt` + ASCII/SMILES inputs; substrate GridFF/FAF `dock` (**future**); light-STM; charge-rings (`SPM_CLI_Headless.md`)
 - **Pauli site maps / transferability**: global \(A,\beta\) only (`Pauli_A_beta_KrigingTransferability.md`)
 - **Kekulé RI density**: not started (`Kekule_ExponentialDensityFit.md`)
 - **2.5D contact surface**: prototype (separable+PIC); harden (`Fast_2p5D_AFM_ContactSurface.md`)
@@ -323,7 +331,7 @@ The repo has a well-organized documentation hierarchy:
 ### ❌ Not Yet Implemented / Campaign backlog:
 - Contact-surface elastic AFM (Winkler model) — static 2.5D task: `Fast_2p5D_AFM_ContactSurface.md`
 - STM mio/3ob/prolonged vs pySCF cubes — `STM_ExtendedBasis_OrbitalCompare.md`
-- Bond-resolved STM + substrate `relax`/`dock` + light-STM + charge-ring imaging via CLI — `SPM_CLI_Headless.md`
+- Bond-resolved STM + gas-phase `opt` + ASCII/SMILES loaders + substrate GridFF/FAF `dock` (future) + light-STM + charge-ring imaging via CLI — `SPM_CLI_Headless.md`
 - Site-resolved Pauli \(A,\beta\) Kriging + transferability — `Pauli_A_beta_KrigingTransferability.md`
 - Kekulé π → exponential RI density — `Kekule_ExponentialDensityFit.md`
 - RigidAtom XPBD / RRsp3

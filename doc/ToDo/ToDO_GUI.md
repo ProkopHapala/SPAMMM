@@ -20,7 +20,8 @@
 
 - Drawing pentagon, hepagon etc ?
 
-- ASCII-art molecule builder, as well as smiles
+- [x] ASCII-art molecule builder — `AsciiArtExtension` + `ascii_art_heterocycle` (dedupe shared builder for CLI: `SPM_CLI_Headless.md` §A/D)
+- [ ] SMILES → `AtomicGraph` — parser + CLI done (`spammm/topology/smiles.py`, `run_spm.py --smiles*` / `smiles-afm`); **GUI text box** still open (`SPM_CLI_Headless.md` §C, `ARCHITECTURE_ROADMAP` §9 / T07)
 
 - [x] 3D view (ortho in `SPAMMM_GUI`: Enter toggles `b2Dview`; RMB empty = rotate; Ring mode ray pick) — see `doc/Tasks/GUI_Editor_3D_ViewMode.md`
 

@@ -27,6 +27,8 @@ Features:
   - Orthographic top-down (XY) camera, white background
   - Mouse wheel zoom, arrow key pan
   - LMB click+drag on dynamic atoms for anchor spring picking
+  - Multi-body: LMB click on any molecule (dyn or static) selects it as active —
+    that body becomes mobile; others become frozen env; potential map recomputed
   - Potential map background: Morse + epair Hbond + sigma-hole (no Coulomb),
     matching ff_map.py's morseH_only mode. Presets H+(q=+0.4) / O−(q=-0.4);
     R0, E0, Q editable; element combo still fills R0/E0 from AtomTypes.
@@ -34,7 +36,7 @@ Features:
   - Faint dummy-bond lines from epairs (cyan) and sigma holes (magenta) to host atoms
   - Real atom bonds rendered as independent line segments (connect='segments', not strip)
   - Changing any FF parameter triggers live map recompute via paramsChanged signal
-  - SPACE = run/stop, R = reset, F = FIRE, ESC = quit
+  - SPACE = run/stop, R = reset, F = FIRE (default ON), ESC = quit
 
 Caveats:
   - Potential map does NOT include Coulomb (matches ff_map.py 'morseH_only' mode).
@@ -57,6 +59,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 sys.path.insert(0, REPO_ROOT)
 
 from PyQt5 import QtWidgets, QtCore, QtGui
+from spammm.forcefields.RigidBodyDynamics import _body_sites_world
 
 # Element colors (CPK-like, RGBA)
 ELEM_COLORS = {
@@ -276,16 +279,21 @@ class ControlPanel(QtWidgets.QWidget):
         gl.addWidget(self.btn_reset, 0, 1)
         self.btn_fire = QtWidgets.QPushButton("FIRE")
         self.btn_fire.setCheckable(True)
+        self.btn_fire.setChecked(True)  # default: FIRE (snappy relax); toggle off for damped MD
         gl.addWidget(self.btn_fire, 0, 2)
 
-        self.lbl_status = QtWidgets.QLabel("RUNNING")
+        self.lbl_status = QtWidgets.QLabel("FIRE")
         self.lbl_status.setStyleSheet("font-weight: bold; color: green;")
         gl.addWidget(self.lbl_status, 1, 0, 1, 3)
 
         self.lbl_E = QtWidgets.QLabel("E=0.0  |F|=0.0")
         gl.addWidget(self.lbl_E, 2, 0, 1, 3)
 
-        gl.addWidget(QtWidgets.QLabel("Kernel:"), 3, 0)
+        self.lbl_active = QtWidgets.QLabel("Active: 0")
+        self.lbl_active.setToolTip("Click any molecule to select it as the mobile body")
+        gl.addWidget(self.lbl_active, 3, 0, 1, 3)
+
+        gl.addWidget(QtWidgets.QLabel("Kernel:"), 4, 0)
         self.cmb_mode = QtWidgets.QComboBox()
         self.cmb_mode.addItem("Legacy (Morse+Lorentz)", "legacy")
         self.cmb_mode.addItem("Unified (compact exp)", "unified")
@@ -294,7 +302,7 @@ class ControlPanel(QtWidgets.QWidget):
         if idx >= 0:
             self.cmb_mode.setCurrentIndex(idx)
         self.cmb_mode.currentIndexChanged.connect(self.on_param_changed)
-        gl.addWidget(self.cmb_mode, 3, 1, 1, 2)
+        gl.addWidget(self.cmb_mode, 4, 1, 1, 2)
 
         layout.addWidget(grp_sim)
 
@@ -527,6 +535,12 @@ class ControlPanel(QtWidgets.QWidget):
     def show_map(self):
         return self.chk_map.isChecked()
 
+    def set_active_label(self, body_id, n_bodies=None):
+        if n_bodies is None:
+            self.lbl_active.setText(f"Active: {body_id}")
+        else:
+            self.lbl_active.setText(f"Active: {body_id}/{n_bodies}")
+
 
 # ==================================================================
 #  Main Vispy+PyQt5 Window
@@ -550,7 +564,7 @@ class RigidBodyVispy:
     that's 12 ps/sec of simulated time.
     """
 
-    def __init__(self, rbd, dt=0.02, steps_per_frame=10, fire=False, title="RigidBodyPairFF"):
+    def __init__(self, rbd, dt=0.02, steps_per_frame=10, fire=True, title="RigidBodyPairFF"):
         self.rbd = rbd
         self.dt = dt
         self.steps_per_frame = steps_per_frame
@@ -628,7 +642,10 @@ class RigidBodyVispy:
         self.panel = ControlPanel(rbd, atom_types=self._atom_types)
         self.panel.btn_run.clicked.connect(self.on_run_toggle)
         self.panel.paramsChanged.connect(self._recompute_map)
+        self.panel.btn_fire.setChecked(bool(self.fire))
+        self.panel.lbl_status.setText("FIRE" if self.fire else "RUNNING")
         hlayout.addWidget(self.panel)
+        self._update_active_label()
 
         # --- Recompute potential map (needs panel) ---
         self._recompute_map()
@@ -735,8 +752,13 @@ class RigidBodyVispy:
 
     def _build_static(self):
         rbd = self.rbd
-        n = rbd.static_n
-        if n == 0: return
+        n = int(getattr(rbd, 'static_n', 0) or 0)
+        if n == 0:
+            empty = np.zeros((0, 3), dtype=np.float32)
+            self.static_markers.set_data(pos=empty)
+            self.static_bonds.set_data(empty)
+            self.static_dummy_bonds.set_data(empty)
+            return
         apos = rbd.static_apos_host[:, :3]
         types = rbd.static_type_host
         enames = rbd.static_enames if hasattr(rbd, 'static_enames') else ['?'] * n
@@ -891,6 +913,7 @@ class RigidBodyVispy:
         return pt
 
     def _pick_atom(self, mouse_pos):
+        """Pick nearest dynamic atom (classic 1+1 mode). Returns atom index or -1."""
         pt = self._mouse_to_world_xy(mouse_pos)
         if pt is None: return -1
         xy = pt[:2]
@@ -900,10 +923,83 @@ class RigidBodyVispy:
         if d2[idx] < 1.0: return idx
         return -1
 
+    def _is_multibody(self):
+        rbd = self.rbd
+        return bool(getattr(rbd, 'env_mode', False) and getattr(rbd, '_mb_packs', None) is not None)
+
+    def _update_active_label(self):
+        rbd = self.rbd
+        if self._is_multibody():
+            self.panel.set_active_label(rbd.active_body, len(rbd._mb_packs))
+        else:
+            self.panel.set_active_label(0)
+
+    def _world_sites_all_bodies(self):
+        """World-frame sites for every multi-body molecule. Syncs active pose from GPU."""
+        rbd = self.rbd
+        rbd.sync_active_pose_from_gpu()
+        sites = []
+        for j, pack in enumerate(rbd._mb_packs):
+            world = _body_sites_world(pack['rel'], rbd._mb_pos[j], rbd._mb_quat[j])
+            sites.append(world)
+        return sites
+
+    def _pick_body_atom(self, mouse_pos, thresh2=1.0):
+        """Pick nearest site across all multi-body molecules. Returns (body_id, atom_idx) or (-1, -1)."""
+        pt = self._mouse_to_world_xy(mouse_pos)
+        if pt is None:
+            return -1, -1
+        xy = pt[:2]
+        best_d2 = thresh2
+        best_body, best_atom = -1, -1
+        for j, world in enumerate(self._world_sites_all_bodies()):
+            d2 = np.sum((world[:, :2] - xy[None, :]) ** 2, axis=1)
+            ia = int(np.argmin(d2))
+            if d2[ia] < best_d2:
+                best_d2 = float(d2[ia])
+                best_body, best_atom = j, ia
+        return best_body, best_atom
+
+    def _select_active_body(self, body_id):
+        """Make body_id mobile; freeze others; refresh markers + potential map."""
+        rbd = self.rbd
+        if not self._is_multibody():
+            return
+        if int(body_id) == int(rbd.active_body):
+            return
+        # Clear any drag anchors before buffer realloc
+        if self.dragging:
+            self._clear_anchor(self.drag_atom)
+            self.dragging = False
+            self.drag_atom = -1
+            self.anchor_line.set_data(np.zeros((0, 3), dtype=np.float32))
+            self.anchor_marker.set_data(np.zeros((0, 3), dtype=np.float32))
+        rbd.set_active_body(int(body_id))
+        self.panel.rbd = rbd
+        self._build_static()
+        self._build_dynamic()
+        self._update_active_label()
+        self._recompute_map()
+        self.canvas.update()
+
     # --- Mouse events ---
 
     def on_mouse_press(self, event):
         if event.button != 1: return
+        if self._is_multibody():
+            body_id, atom_idx = self._pick_body_atom(event.pos)
+            if body_id < 0:
+                return
+            if body_id != self.rbd.active_body:
+                self._select_active_body(body_id)
+                # After switch, atom_idx is still valid in the new active body frame
+            # Start drag on the (now) active molecule
+            self.dragging = True
+            self.drag_atom = atom_idx
+            atom_pos = self._get_dyn_pos()[atom_idx]
+            world = self._nearest_point_on_ray(event.pos, atom_pos)
+            self._set_anchor(atom_idx, world)
+            return
         idx = self._pick_atom(event.pos)
         if idx >= 0:
             self.dragging = True

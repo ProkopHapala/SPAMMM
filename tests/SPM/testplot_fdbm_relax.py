@@ -208,9 +208,27 @@ def _grid_spec_from_meta(meta):
 
 
 def _run_from_density(tag, rho_scf, V_ES, atomPos, atomTypes, origin, step, ngrid, A, beta, tip_mode, outdir, args):
-    """PP-AFM scan from precomputed ρ / V_ES with explicit Pauli A,β."""
+    """PP-AFM scan from precomputed ρ / V_ES with explicit Pauli A,β.
+
+    Display heights = [h_min, h_max] step h_step. PP scan covers ±amp so ``compute_df_amp``
+    is well-defined at the display edges. Plots gated by ``args._plots`` / ``args.plots``.
+    """
     from spammm.SPM import AFM as afm
     from spammm.SPM import AFM_utils as afm_utils
+
+    plots = getattr(args, '_plots', None)
+    if plots is None:
+        raw = getattr(args, 'plots', None)
+        if raw is None:
+            plots = {'compare', 'stage', 'tip', 'df', 'fz'}  # diagnostic script defaults: keep old richness
+        else:
+            parts = [p.strip().lower() for p in str(raw).replace(';', ',').split(',') if p.strip()]
+            if 'all' in parts or 'debug' in parts:
+                plots = {'compare', 'stage', 'tip', 'df', 'fz', 'per_image'}
+            elif 'none' in parts or 'off' in parts:
+                plots = set()
+            else:
+                plots = set(parts)
 
     nx, ny, nz = rho_scf.shape
     mol_z = float(atomPos[:, 2].max())
@@ -222,7 +240,10 @@ def _run_from_density(tag, rho_scf, V_ES, atomPos, atomTypes, origin, step, ngri
         tip_mode=tip_mode, target_shape=(nx, ny, nz), step=step, margin=args.margin,
         basis=args.basis, output_dir=sub, backend='dftb',
     )
-    tip_info = _plot_tip(rho_tip, rho_tip_d, outdir, tag, step)
+    tip_info = _plot_tip(rho_tip, rho_tip_d, outdir, tag, step) if 'tip' in plots else {
+        'peak': None, 'q': float(rho_tip.sum() * step**3), 'dq': float(rho_tip_d.sum() * step**3),
+        'mirrorX': None, 'mirrorY': None, 'path': None,
+    }
 
     overlap = afm.compute_pauli_overlap(rho_scf, rho_tip, step, tip_rolled=True)
     E_pauli = afm.scale_pauli_field(overlap, step, A, beta, return_grads=False)
@@ -240,35 +261,62 @@ def _run_from_density(tag, rho_scf, V_ES, atomPos, atomTypes, origin, step, ngri
         'rho_scf': rho_scf, 'E_pauli': E_pauli, 'E_ES': E_ES, 'E_vdw': E_vdw,
         'E_total': E_total, 'Fz': -F_total[..., 2],
     }
-    stage_path = _plot_stages(fields, origin, step, atomPos, outdir, tag, z_above=args.height)
+    stage_path = _plot_stages(fields, origin, step, atomPos, outdir, tag, z_above=args.height) if 'stage' in plots else None
 
     scan_xs = np.arange(float(atomPos[:, 0].min() - args.scan_margin),
                         float(atomPos[:, 0].max() + args.scan_margin), step, dtype=np.float32)
     scan_ys = np.arange(float(atomPos[:, 1].min() - args.scan_margin),
                         float(atomPos[:, 1].max() + args.scan_margin), step, dtype=np.float32)
-    heights = np.arange(args.h_min, args.h_max + 0.5 * args.h_step, args.h_step, dtype=np.float32)
+    # Display window = df probe heights; optionally amp-align Fz at h−amp
+    def _h_stack(h0, h1, dz):
+        n = int(round((h1 - h0) / dz)) + 1
+        return (h0 + np.arange(n, dtype=np.float64) * dz).astype(np.float32)
+
+    amp = float(args.amp)
+    amp_align = not bool(getattr(args, 'no_amp_align', False))
+    h_df = _h_stack(args.h_min, args.h_max, args.h_step)
+    h_Fz = (h_df.astype(np.float64) - amp).astype(np.float32) if amp_align else h_df
+    # PP scan must cover df window ±amp (and thus also Fz@h−amp when aligned)
+    h_scan = _h_stack(float(h_df[0]) - amp, float(h_df[-1]) + amp, args.h_step)
+    if len(h_scan) < 3:
+        raise ValueError(f'Need denser heights for df amp={amp}: got {len(h_scan)} scan points')
     K_LAT_eV = afm.stiffness_Nm_to_eVA2(args.K_LAT)  # CLI: N/m → internal eV/Å²
     print(f"  K_LAT={args.K_LAT:.3f} N/m → {K_LAT_eV:.4f} eV/Å²  K_RAD={args.K_RAD} eV/Å²  L={args.bond_length} Å")
+    print(f"  df h=[{float(h_df[0]):.2f},{float(h_df[-1]):.2f}]  "
+          f"Fz h=[{float(h_Fz[0]):.2f},{float(h_Fz[-1]):.2f}]  "
+          f"scan=[{float(h_scan[0]):.2f},{float(h_scan[-1]):.2f}] dz={args.h_step} amp={amp} align={amp_align}")
     afmulator.setup_fdbm_grid(F_total, origin, step)
     FEs, tip_disp = afmulator.scan_fdbm(
-        scan_xs, scan_ys, heights, mol_z=mol_z,
+        scan_xs, scan_ys, h_scan, mol_z=mol_z,
         K_LAT=K_LAT_eV, K_RAD=args.K_RAD, bond_length=args.bond_length,
         ppm_mode=True, use_fire=True,
     )
-    Fz = FEs[:, :, :, 2]
-    df = afm.compute_df_amp(Fz, float(heights[1] - heights[0]), amp=args.amp)
+    Fz_full = FEs[:, :, :, 2]
+    dz = float(h_scan[1] - h_scan[0])
+    df_full = afm.compute_df_amp(Fz_full, dz, amp=amp)
+    idx_df = [int(np.argmin(np.abs(h_scan - h))) for h in h_df]
+    idx_Fz = [int(np.argmin(np.abs(h_scan - h))) for h in h_Fz]
+    Fz = Fz_full[:, :, idx_Fz]
+    df = df_full[:, :, idx_df]
+    heights = h_df  # column labels = df probe height
     x_ext = [float(scan_xs[0]), float(scan_xs[-1])]
     y_ext = [float(scan_ys[0]), float(scan_ys[-1])]
-    afm_utils.plot_grid_Fz(df, heights, f'df {tag} A={A:.2f} β={beta:.3f}', f'df_{tag}.png',
-                           x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap=args.df_cmap)
-    afm_utils.plot_grid_Fz(Fz, heights, f'Fz {tag} A={A:.2f} β={beta:.3f}', f'Fz_{tag}.png',
-                           x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap=args.cmap)
+    if 'df' in plots:
+        afm_utils.plot_grid_Fz(df, heights, f'df {tag} A={A:.2f} β={beta:.3f}', f'df_{tag}.png',
+                               x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap=args.df_cmap)
+    if 'fz' in plots:
+        afm_utils.plot_grid_Fz(Fz, h_Fz, f'Fz {tag} A={A:.2f} β={beta:.3f}', f'Fz_{tag}.png',
+                               x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap=args.cmap)
     ih = len(heights) // 2
-    print(f"  df @h={heights[ih]:.2f}: [{df.min():.3e},{df.max():.3e}]")
+    print(f"  df @h={heights[ih]:.2f} / Fz @h={float(h_Fz[ih]):.2f}: "
+          f"df=[{df.min():.3e},{df.max():.3e}] Fz=[{Fz.min():.3e},{Fz.max():.3e}]")
+    if stage_path:
+        print(f"  REVIEW: {stage_path}")
     return {
         'tip': tip_info, 'stage_path': stage_path, 'df': df, 'Fz': Fz, 'heights': heights,
+        'heights_Fz': h_Fz, 'amp_align': amp_align,
         'scan_xs': scan_xs, 'scan_ys': scan_ys, 'atomPos': atomPos, 'origin': origin, 'step': step,
-        'A': A, 'beta': beta, 'tag': tag,
+        'A': A, 'beta': beta, 'tag': tag, 'h_scan': h_scan,
     }
 
 
@@ -413,7 +461,8 @@ def run_ptcda_stock_vs_sa(args):
     return variants
 
 
-# Fukui pySCF PBE/def2-SVP panel (USER 2026-07-23) — cube FDBM ref vs DFTB stock vs prolonged
+# Fukui pySCF PBE/def2-SVP panel — cube FDBM vs DFTB stock vs prolonged
+# USER 2026-07-24: geometries enforced flat (z=0); cubes refreshed under FUKUI_CUBE_ROOT
 FUKUI_CUBE_ROOT = '/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster'
 FUKUI_PANEL = [
     ('azaindol_dimer', 'data/xyz/azaindol_dimer.xyz'),
@@ -422,25 +471,21 @@ FUKUI_PANEL = [
     ('benzoicamid_dimer', 'data/xyz/benzoicamid_dimer.xyz'),
     ('pentacene', 'data/xyz/pentacene.xyz'),
     ('PTCDA', 'data/xyz/PTCDA.xyz'),
+    # folder tag = <name>_PBE_def2-SVP; xyz short name for phtalo
+    ('phtalo_1-dftb-relax', 'data/xyz/phtalo_1.xyz'),
+    ('phtalo_2-dftb-relax', 'data/xyz/phtalo_2.xyz'),
 ]
 
 
 def _fft_friendly_grid_spec(atomPos, step, margin, z_extra):
-    """_make_grid_spec then round nx,ny,nz to clFFT-friendly sizes (pad extent)."""
-    from spammm.SPM import AFM as afm
-    from spammm.SPM.AFM_utils import _make_grid_spec
-    grid_spec, origin, ngrid, step = _make_grid_spec(atomPos, step, margin, z_extra)
-    nx, ny, nz = [int(x) for x in ngrid]
-    nx2 = afm._FDBMGpyFFT.round_fft_friendly(nx)
-    ny2 = afm._FDBMGpyFFT.round_fft_friendly(ny)
-    nz2 = afm._FDBMGpyFFT.round_fft_friendly(nz)
-    if (nx2, ny2, nz2) != (nx, ny, nz):
-        ngrid = (nx2, ny2, nz2)
-        grid_spec = {
-            'origin': origin, 'ngrid': ngrid,
-            'dA': [step, 0.0, 0.0], 'dB': [0.0, step, 0.0], 'dC': [0.0, 0.0, step],
-        }
-    return grid_spec, origin, ngrid, step
+    """FDBM grid for Fukui panel: COM-centered XY, z-symmetric vacuum (FFT-friendly ngrid).
+
+    ``z_extra`` is interpreted as half-span vacuum above AND below the mol plane
+    (total Lz ≈ 2*z_extra), NOT the old setup_density_grid one-sided +z pad.
+    """
+    from spammm.SPM import AFM_utils as afm_utils
+    z_vac = float(z_extra) if z_extra is not None else 7.0
+    return afm_utils.make_fdbm_grid_com_zsym(atomPos, step, margin, z_vac=z_vac)
 
 
 def run_fukui_one(mol, xyz_rel, args):
@@ -479,6 +524,8 @@ def run_fukui_one(mol, xyz_rel, args):
     print(f'\n######## {mol} ########')
 
     # ── Cube density (atoms from cube header = density frame) ──
+    # All-electron SSOT (pyridine): clamp→compact NA + GridsOCL project — NOT Gaussian NA
+    # and NOT scipy resample_field_to_grid (breaks ∫Δρ / dipole).
     rho_cube = os.path.join(cube_dir, 'rho_N.cube')
     if not os.path.isfile(rho_cube):
         raise FileNotFoundError(rho_cube)
@@ -493,19 +540,18 @@ def run_fukui_one(mol, xyz_rel, args):
         atomPos, args.step, args.margin, z_extra=6.0)
     nx, ny, nz = [int(x) for x in ngrid]
     lines.append(f'grid={nx}x{ny}x{nz} step={step} origin={origin}')
+    lines.append('cube ES: clamp→compact_NA + strip monopole/dipole + GridsOCL.project (pyridine+PBC)')
 
-    rho_cube_g = afm_utils.resample_field_to_grid(
-        d_cube['rho_scf'], d_cube['origin'], d_cube['step'], origin, step, ngrid)
-    rho_diff_g = afm_utils.resample_field_to_grid(
-        d_cube['rho_diff'], d_cube['origin'], d_cube['step'], origin, step, ngrid)
-    # strip residual monopole after resample
+    cube_prep = afm_utils.allelectron_cube_to_fdbm_grid(
+        d_cube['rho_scf'], d_cube['origin'], d_cube['step'], atomPos, atomZ,
+        origin, step, ngrid, rc_na=0.6, R_sphere=0.6, verbosity=0)
+    rho_cube_g = cube_prep['rho_scf']
+    rho_diff_g = cube_prep['rho_diff']
     dV = step ** 3
-    vol = float(nx * ny * nz) * dV
-    q_diff = float(rho_diff_g.sum() * dV)
-    if abs(q_diff) > 1e-4:
-        rho_diff_g = (rho_diff_g - q_diff / vol).astype(np.float32)
     V_ES_cube = afm.fft_poisson_cpu(rho_diff_g, step)
-    lines.append(f'cube q_scf={float(rho_cube_g.sum()*dV):.2f} q_diff={float(rho_diff_g.sum()*dV):.3e}')
+    lines.append(
+        f'cube q_scf={float(rho_cube_g.sum()*dV):.2f} q_diff={cube_prep["q_diff"]:.3e} '
+        f'p_diff={cube_prep["p_diff"]}  (native ∫Δρ={cube_prep["clamp"]["Q_diff"]:.3e})')
 
     # ── DFTB stock on same grid ──
     basis_hsd = get_dftb_basis_path('3ob-3-1')
@@ -563,28 +609,29 @@ def run_fukui_one(mol, xyz_rel, args):
         lines.append(f'[{key}] A={A:.3f} β={beta:.4f}  df=[{r["df"].min():.3e},{r["df"].max():.3e}]')
 
     heights = variants['stock']['heights']
+    # Row order: DFT cube → prolonged (DFT-like tails) → stock (short-range) — similar images adjacent
     row_specs = [
         ('df', 'cube', f'df  DFT cube\nA={pa_cube["A"]:.1f} β={pa_cube["beta"]:.2f}', args.df_cmap),
-        ('df', 'stock', f'df  stock 3ob\nA={pa_stock["A"]:.1f} β={pa_stock["beta"]:.2f}', args.df_cmap),
         ('df', 'prolonged', f'df  prolonged\nA={pa_prol["A"]:.1f} β={pa_prol["beta"]:.2f}', args.df_cmap),
+        ('df', 'stock', f'df  stock 3ob\nA={pa_stock["A"]:.1f} β={pa_stock["beta"]:.2f}', args.df_cmap),
         ('Fz', 'cube', 'Fz  DFT cube', args.cmap),
-        ('Fz', 'stock', 'Fz  stock 3ob', args.cmap),
         ('Fz', 'prolonged', 'Fz  prolonged', args.cmap),
+        ('Fz', 'stock', 'Fz  stock 3ob', args.cmap),
     ]
-    title = (f'{mol} FDBM CO tip | DFT cube ρ_N vs DFTB stock 3ob vs Slater-tail prolonged\n'
+    title = (f'{mol} FDBM CO tip | DFT cube → prolonged → stock 3ob\n'
              f'DUAL BASIS: prolonged ρ → Pauli only; ES = stock Δρ  |  PBE/def2-SVP cubes')
     # Keep common/per-column strip (variants comparable) + experimental per-image contrast
     cmp = os.path.join(outdir, 'compare_cube_stock_prolonged.png')
     afm_utils.plot_afm_variant_height_strip(
         variants, row_specs, heights, cmp, scale='per_column', title=title,
-        dpi=140)
+        dpi=140, amp=getattr(args, 'amp', None))
     lines.append(f'REVIEW: {cmp}')
     per_dir = os.path.join(outdir, 'per_image')
     os.makedirs(per_dir, exist_ok=True)
     cmp_pi = os.path.join(per_dir, 'compare_cube_stock_prolonged.png')
     afm_utils.plot_afm_variant_height_strip(
         variants, row_specs, heights, cmp_pi, scale='per_image', title=title,
-        dpi=140)
+        dpi=140, amp=getattr(args, 'amp', None))
     lines.append(f'REVIEW: {cmp_pi}')
 
     np.savez(os.path.join(outdir, 'scan_cube_stock_prolonged.npz'),
@@ -625,24 +672,203 @@ def replot_fukui_per_image(panel_dir, molecules=None, cmap='seismic', df_cmap='g
         A_p, b_p = float(d['A_prolonged']), float(d['beta_prolonged'])
         row_specs = [
             ('df', 'cube', f'df  DFT cube\nA={A_c:.1f} β={b_c:.2f}', df_cmap),
-            ('df', 'stock', f'df  stock 3ob\nA={A_s:.1f} β={b_s:.2f}', df_cmap),
             ('df', 'prolonged', f'df  prolonged\nA={A_p:.1f} β={b_p:.2f}', df_cmap),
+            ('df', 'stock', f'df  stock 3ob\nA={A_s:.1f} β={b_s:.2f}', df_cmap),
             ('Fz', 'cube', 'Fz  DFT cube', cmap),
-            ('Fz', 'stock', 'Fz  stock 3ob', cmap),
             ('Fz', 'prolonged', 'Fz  prolonged', cmap),
+            ('Fz', 'stock', 'Fz  stock 3ob', cmap),
         ]
-        title = (f'{mol} FDBM CO tip | DFT cube vs DFTB stock vs prolonged\n'
+        title = (f'{mol} FDBM CO tip | DFT cube → prolonged → stock\n'
                  f'(replot — per-image color scale)')
         per_dir = os.path.join(panel_dir, mol, 'per_image')
         os.makedirs(per_dir, exist_ok=True)
         out = os.path.join(per_dir, 'compare_cube_stock_prolonged.png')
         afm_utils.plot_afm_variant_height_strip(
             variants, row_specs, heights, out, scale='per_image', title=title, dpi=140)
+        # Also refresh shared-scale strip (same row order)
+        out_col = os.path.join(panel_dir, mol, 'compare_cube_stock_prolonged.png')
+        afm_utils.plot_afm_variant_height_strip(
+            variants, row_specs, heights, out_col, scale='per_column',
+            title=f'{mol} FDBM CO tip | DFT cube → prolonged → stock', dpi=140)
+        lines.append(f'REVIEW: {out_col}')
         lines.append(f'REVIEW: {out}')
     sum_path = os.path.join(panel_dir, 'SUMMARY_per_image.out')
     open(sum_path, 'w').write('\n'.join(lines) + '\n')
     print(f'REVIEW: {sum_path}')
     return lines
+
+
+def run_fukui_es_diag_one(mol, xyz_rel, args):
+    """Cube electrostatic chain diagnostics (ρ, Δρ, V_ES, E_ES, tip) + mirror metrics.
+
+    Compares legacy Gaussian+scipy-sample vs pyridine SSOT (clamp→compact + GridsOCL project).
+    Writes under ``<outdir>/<mol>/es_diag/``.
+    """
+    import matplotlib; matplotlib.use('Agg')
+    from spammm.SPM import AFM as afm
+    from spammm.SPM import AFM_utils as afm_utils
+    from spammm.config_utils import get_dftb_basis_path
+    from spammm.utils.GridsOCL import grid_moments_centers
+
+    os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
+    _ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    cube_dir = os.path.join(FUKUI_CUBE_ROOT, f'{mol}_PBE_def2-SVP')
+    outdir = os.path.join(args.outdir, mol, 'es_diag')
+    os.makedirs(outdir, exist_ok=True)
+    z_above = tuple(getattr(args, 'z_above', None) or (1.0, 5.0))
+
+    print(f'\n######## ES diag {mol} ########')
+    rho_cube = os.path.join(cube_dir, 'rho_N.cube')
+    if not os.path.isfile(rho_cube):
+        raise FileNotFoundError(rho_cube)
+    d_cube = afm_utils.get_density_from_cube(rho_cube, use_esp_cube=False, verbosity=1)
+    atomPos = np.asarray(d_cube['atomPos'], dtype=np.float64)
+    atomTypes = np.array([int(round(z)) for z in d_cube['atomZ']], dtype=np.int32)
+
+    # ── Native: Gaussian Δρ (legacy get_density_from_cube) vs clamp→compact ──
+    V_gauss = np.asarray(d_cube['V_ES'], dtype=np.float32)
+    lines_nat, png_nat = afm_utils.plot_cube_es_chain_diag(
+        d_cube['rho_scf'], d_cube['rho_diff'], V_gauss, None, None, None,
+        d_cube['origin'], d_cube['step'], atomPos,
+        os.path.join(outdir, 'es_chain_native_gaussNA.png'),
+        z_above=z_above, title=f'{mol} NATIVE + Gaussian NA (LEGACY — wrong)',
+        rho_na=d_cube.get('rho_na'))
+
+    clamp = afm_utils.delta_rho_clamp_compact_na(
+        d_cube['rho_scf'], d_cube['origin'], d_cube['step'],
+        atomPos, d_cube['atomZ'], rc_na=0.6, R_sphere=0.6)
+    V_clamp_nat = afm.fft_poisson_cpu(clamp['rho_diff'], d_cube['step'])
+    lines_cl, png_cl = afm_utils.plot_cube_es_chain_diag(
+        clamp['rho_scf_clamped'], clamp['rho_diff'], V_clamp_nat, None, None, None,
+        d_cube['origin'], d_cube['step'], atomPos,
+        os.path.join(outdir, 'es_chain_native_clamp_compact.png'),
+        z_above=z_above, title=f'{mol} NATIVE clamp→compact NA (pyridine SSOT)',
+        rho_na=clamp['rho_na'])
+
+    # ── Canonical NA-origin bisect (preserve dipole_origin_bisect.png) ──
+    lines_orig, png_orig = [], None
+    rho_na_path = os.path.join(cube_dir, 'rho_NA.cube')
+    if os.path.isfile(rho_na_path):
+        from spammm.quantum.DFTB.DFTBplusParser import read_cube
+        rho_na_b, _, _, _, _ = read_cube(rho_na_path)
+        rho_na_cube = (rho_na_b / (afm_utils.BOHR_TO_ANG ** 3)).astype(np.float64)
+        if rho_na_cube.shape != np.asarray(d_cube['rho_scf']).shape:
+            raise ValueError(
+                f'{mol}: rho_NA.cube shape {rho_na_cube.shape} != '
+                f'rho_N {np.asarray(d_cube["rho_scf"]).shape}')
+        lines_orig, png_orig = afm_utils.plot_cube_delta_rho_na_origin_diag(
+            d_cube['rho_scf'], d_cube['origin'], d_cube['step'],
+            atomPos, d_cube['atomZ'],
+            os.path.join(outdir, 'dipole_origin_bisect.png'),
+            rho_na_cube=rho_na_cube, z_above=float(z_above[0]),
+            title=f'{mol} NATIVE: where does Δρ dipole come from? (NO manual dipole strip)')
+        open(os.path.join(outdir, 'DIPOLE_ORIGIN.out'), 'w').write('\n'.join(lines_orig) + '\n')
+        print(f'REVIEW: {os.path.join(outdir, "DIPOLE_ORIGIN.out")}')
+    else:
+        print(f'[{mol}] skip dipole_origin_bisect (no {rho_na_path})')
+
+    # ── FDBM dest: pyridine SSOT project (not scipy sample) ──
+    grid_spec, origin, ngrid, step = _fft_friendly_grid_spec(
+        atomPos, args.step, args.margin, z_extra=6.0)
+    nx, ny, nz = [int(x) for x in ngrid]
+    prep = afm_utils.allelectron_cube_to_fdbm_grid(
+        d_cube['rho_scf'], d_cube['origin'], d_cube['step'], atomPos, d_cube['atomZ'],
+        origin, step, ngrid, rc_na=0.6, R_sphere=0.6, verbosity=1)
+    V_cube = afm.fft_poisson_cpu(prep['rho_diff'], step)
+
+    tip_tot, tip_del = afm_utils.get_tip_densities(
+        tip_mode='co', target_shape=(nx, ny, nz), step=step, margin=args.margin,
+        basis=getattr(args, 'basis', '3ob-3-1'), output_dir=outdir, backend='dftb')
+    tip_info = _plot_tip(tip_tot, tip_del, outdir, 'co', step)
+    E_ES = afm.compute_es_conv_field(V_cube, tip_del, step, tip_rolled=True, return_grads=False)
+
+    print(f'[{mol}] DFTB stock V_ES control...')
+    basis_hsd = get_dftb_basis_path(getattr(args, 'basis', '3ob-3-1'))
+    res_stock = afm_utils.get_density_from_dftb_dense(
+        atomPos, atomTypes, basis_hsd, os.path.join(outdir, 'dftb_work_stock'),
+        grid_spec=grid_spec, step=step, verbosity=0)
+    V_stock = res_stock['V_ES']
+    E_ES_stock = afm.compute_es_conv_field(V_stock, tip_del, step, tip_rolled=True, return_grads=False)
+
+    lines_f, png_f = afm_utils.plot_cube_es_chain_diag(
+        prep['rho_scf'], prep['rho_diff'], V_cube, E_ES, tip_tot, tip_del,
+        origin, step, atomPos,
+        os.path.join(outdir, 'es_chain_fdbm_grid.png'),
+        z_above=z_above,
+        title=f'{mol} FDBM: clamp→compact + GridsOCL.project (SSOT) + DFTB V',
+        compare_VES=V_stock, compare_label='DFTB V_ES')
+
+    com = atomPos.mean(0)
+    qg, p_gauss = grid_moments_centers(d_cube['rho_diff'], d_cube['origin'], d_cube['step'])
+    qc, p_cl = grid_moments_centers(clamp['rho_diff'], d_cube['origin'], d_cube['step'])
+    lines_stock_E = []
+    mol_z = float(atomPos[:, 2].mean())
+    z_coords = origin[2] + np.arange(nz) * step
+    ix_c = int(np.clip(round((com[0] - origin[0]) / step), 0, nx - 1))
+    iy_c = int(np.clip(round((com[1] - origin[1]) / step), 0, ny - 1))
+    for za in z_above:
+        iz = int(np.clip(np.argmin(np.abs(z_coords - (mol_z + za))), 0, nz - 1))
+        for name, field in [('E_ES cube SSOT', E_ES), ('E_ES DFTB', E_ES_stock)]:
+            sl = field[:, :, iz]
+            mx = afm_utils.mirror_asymmetry_2d(sl, axis=0, center=ix_c)
+            my = afm_utils.mirror_asymmetry_2d(sl, axis=1, center=iy_c)
+            lines_stock_E.append(f'XY z+{za:.1f}  {name:16s}  mX={mx:.3e}  mY={my:.3e}')
+
+    all_lines = [
+        f'ES diag {mol}',
+        f'cube_dir={cube_dir}',
+        'SSOT: V_ES=fft_poisson(Δρ); Δρ=clamp→compact_NA; grid xfer=GridsOCL.project (NOT scipy sample)',
+        f'LEGACY Gauss Δρ q={qg:.3e} |pxy|={np.hypot(p_gauss[0]-qg*com[0], p_gauss[1]-qg*com[1]):.3e}',
+        f'CLAMP Δρ q={qc:.3e} |pxy|={np.hypot(p_cl[0]-qc*com[0], p_cl[1]-qc*com[1]):.3e}',
+        f'project Δρ q={prep["q_diff"]:.3e} p_diff={prep["p_diff"]}',
+        f'FDBM grid={nx}x{ny}x{nz} step={step}',
+        f'tip peak={tip_info["peak"]} mX={tip_info["mirrorX"]:.3e} mY={tip_info["mirrorY"]:.3e}',
+        '',
+        '=== native Gaussian NA (LEGACY) ===',
+        *lines_nat,
+        '',
+        '=== native clamp→compact (SSOT) ===',
+        *lines_cl,
+        '',
+        '=== Δρ / NA origin bisect (canonical; see doc/Caveats.md) ===',
+        *(lines_orig if lines_orig else ['(skipped — no rho_NA.cube)']),
+        '',
+        '=== FDBM clamp+project (panel path) ===',
+        *lines_f,
+        '',
+        '=== E_ES cube vs DFTB ===',
+        *lines_stock_E,
+        f'REVIEW: {png_nat}',
+        f'REVIEW: {png_cl}',
+        *( [f'REVIEW: {png_orig}'] if png_orig else [] ),
+        f'REVIEW: {png_f}',
+        f'REVIEW: {tip_info["path"]}',
+    ]
+    sum_path = os.path.join(outdir, 'ES_ASYM.out')
+    open(sum_path, 'w').write('\n'.join(all_lines) + '\n')
+    print(f'REVIEW: {sum_path}')
+    return all_lines
+
+
+def run_fukui_es_diag(args):
+    """ES asymmetry diagnostics for Fukui panel molecules (or --molecule subset)."""
+    mols = FUKUI_PANEL
+    if getattr(args, 'molecule', None):
+        want = set(args.molecule)
+        mols = [(m, x) for m, x in FUKUI_PANEL if m in want]
+        missing = want - {m for m, _ in mols}
+        if missing:
+            raise ValueError(f'Unknown --molecule {missing}; choose from {[m for m, _ in FUKUI_PANEL]}')
+    os.makedirs(args.outdir, exist_ok=True)
+    panel_lines = [f'Fukui ES diag  outdir={args.outdir}', '']
+    for mol, xyz in mols:
+        run_fukui_es_diag_one(mol, xyz, args)
+        panel_lines.append(f'REVIEW: {os.path.join(args.outdir, mol, "es_diag", "es_chain_fdbm_grid.png")}')
+        panel_lines.append(f'REVIEW: {os.path.join(args.outdir, mol, "es_diag", "dipole_origin_bisect.png")}')
+        panel_lines.append(f'REVIEW: {os.path.join(args.outdir, mol, "es_diag", "ES_ASYM.out")}')
+    panel_sum = os.path.join(args.outdir, 'SUMMARY_es_diag.out')
+    open(panel_sum, 'w').write('\n'.join(panel_lines) + '\n')
+    print(f'\nREVIEW: {panel_sum}')
 
 
 def run_fukui_panel(args):
@@ -695,7 +921,19 @@ def main():
                         help='Subset of Fukui panel names (with --fukui-panel)')
     parser.add_argument('--replot-fukui-per-image', action='store_true',
                         help='Replot existing Fukui panel npz with per-image color scale into */per_image/')
+    parser.add_argument('--fukui-es-diag', action='store_true',
+                        help='Cube ES chain diagnostics (ρ, Δρ, V_ES, E_ES, tip) + mirror metrics')
+    parser.add_argument('--z-above', nargs=2, type=float, default=[1.0, 5.0],
+                        help='ES-diag slice heights above mol [Å]')
     args = parser.parse_args()
+
+    if args.fukui_es_diag:
+        args.basis = '3ob-3-1'
+        if args.outdir == 'debug/afm_fdbm_diag':
+            args.outdir = 'debug/fdbm_fukui_panel_flat'
+        args.z_above = tuple(args.z_above)
+        run_fukui_es_diag(args)
+        return
 
     if args.replot_fukui_per_image:
         out = args.outdir if args.outdir != 'debug/afm_fdbm_diag' else 'debug/fdbm_fukui_panel'

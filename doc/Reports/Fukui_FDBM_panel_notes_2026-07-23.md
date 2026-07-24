@@ -40,6 +40,60 @@ So the cube row is a **cross combo**: cube sample × DFTB tip. Asymmetry / huge 
 
 ---
 
+## 1b. ES asymmetry diagnostics (2026-07-24) — **investigating, not fixed**
+
+**CLI:** `python run_spm.py es-diag --molecule PTCDA pentacene phtalo_1-dftb-relax phtalo_2-dftb-relax`  
+**Outputs:** `debug/fdbm_fukui_panel_flat/<mol>/es_diag/`  
+(`es_chain_native_cube.png`, `es_chain_fdbm_grid.png`, `tip_co.png`, `ES_ASYM.out`)
+
+### Confirmed path
+`V_ES = fft_poisson(Δρ)` with `Δρ = ρ_scf − ρ_NA(Gaussian)`; **not** `esp_N` / locpot cube.  
+`E_ES = tip_Δρ ⊗ V_ES` (DFTB CO tip).
+
+### Verdict (mirror metrics about mol COM)
+
+| Suspect | Result |
+|---------|--------|
+| **CO tip** | **Innocent.** peak=(0,0,0), XY mX/mY ~ 1e−7, upright along z |
+| **ρ_scf / Δρ morphology** | Nearly symmetric (mX ~ 0.02–0.1) |
+| **V_ES = Poisson(Δρ)** | **Guilty.** Native cube already: mX ~ 0.6–1.1 (pentacene, phtalo); FDBM grid worse at z+5 |
+| **DFTB V_ES control** | Symmetric (mX ~ 0.03–0.05 at z+5) → same tip/grid; sample Δρ multipoles differ |
+
+### Root-cause evidence
+1. **Same `fft_poisson_cpu` for cube and DFTB** — Poisson is not the differentiator.
+2. **Differentiator = Δρ construction + grid transfer:**
+   - **LEGACY (wrong, was used in Fukui panel):** Gaussian NA + `resample_field_to_grid` (scipy *sample*)
+   - **SSOT (pyridine / now wired):** `delta_rho_clamp_compact_na` + `GridsOCL.project_density` (trilinear *scatter*, `kernels/grids.cl` atomic_add)
+3. Helper: `AFM_utils.allelectron_cube_to_fdbm_grid` — used by `run_fukui_one`, `run_spm.py afm --cube`, `es-diag`.
+4. **2026-07-24 deeper bisect (pentacene) — root cause of dipole (NO manual strip):**
+   - Manual `strip_monopole_dipole` **DEFAULT OFF** again (symptom mask only).
+   - **NOT the pySCF cube pair:** `Δρ = ρ_N − ρ_NA.cube` has `|p_xy|≈0.010`, native V mX@1≈**0.035** (clean).
+   - **IS our NA subtraction:** `ρ_N − Gauss(σ=0.3)` `|p_xy|≈1.90`, V mX≈**0.80**; clamp→compact `|p_xy|≈1.47`, V mX≈**0.60**.
+   - Decomposition: `p(ρ_N)≈p(ρ_NA_cube)` so they cancel; our Gauss/compact NA has wrong multipoles vs all-e ρ_N → leftover dipole.
+   - Grid centering: our NA uses **corner** samples `origin+i·h`; GridsOCL project uses **centers** `origin+(i+½)·h`. Native Δρ dipole of GaussCORNER is convention-independent (q≈0). GaussCENTER vs corner-sampled ρ_N is worse (half-voxel core miss).
+   - Nuclei↔sample: both conventions ~0.03–0.06 Å; pad Δx≈0.1 Å; face density nearly symmetric — not the main XY dipole.
+   - Artifacts: `…/es_diag/dipole_origin_bisect.png`, `DIPOLE_ORIGIN.out`.
+   - **USER (2026-07-24):** plot is the smoking gun — V(N−NA_cube) symmetric; V(N−Gauss CORNER) x-slope; V(N−Gauss CENTER) smoother but x+y slope; V(clamp) improved but not enough. Preserve in code + `doc/Caveats.md`.
+   - Status: **investigating** — next should use cube `ρ_NA` (or match it), not dipole strip.
+
+### Resample vs project (USER clarification)
+| Method | Code | Conserves ∫ρ, p? | Use for Δρ? |
+|--------|------|------------------|-------------|
+| scipy sample | `resample_field_to_grid` / `map_coordinates` | **No** | **Forbidden** |
+| trilinear scatter | `project_density_to_grid` → `GridsOCL` / `grids.cl` | **Yes** (in-bounds) | **Required** |
+
+Still need a taller FDBM dest grid for AFM (native cube too short in z) — that transfer must be **project**, not sample.
+
+### Fix candidates remaining (status: **investigating** — not fixed)
+- **Preferred:** wire cube path to `Δρ = ρ_N − ρ_NA.cube` (when present), same spirit as DFTB orbital NA — **not** dipole strip.
+- Clamp→compact + project remains better than Gauss+scipy-sample but **insufficient** (see §1b table).
+- Cross-check `esp_N.cube` only after Δρ multipoles are clean.
+- Global write-up: [`doc/Caveats.md`](../Caveats.md).
+
+**Preserve:** regenerate with `plot_cube_delta_rho_na_origin_diag` / `es-diag` — do not delete `dipole_origin_bisect.png` workflow.
+
+---
+
 ## 2. df vs Fz “height shift” (~1.4 Å) — chemical contrast window
 
 **USER observation (PTCDA / panel strips):**
@@ -72,11 +126,20 @@ Code: `spammm/SPM/AFM.py` → `compute_df_amp`; panel via `_run_from_density` �
 4. **Per-image color scale** — relative contrast can make high-z df look “feature-rich” while absolute Fz at the same \(h\) looks empty; does not create the ~1 Å physics shift but confuses visual matching.
 5. **Not tip vs probe mislabel here** — both df and Fz use the same `heights` probe ladder; L=3 is inside `scan_fdbm`, not double-counted. Still always print amp and L on figures.
 
-### Presentation TODO (after commit — do not implement now)
+### Presentation (CLI default 2026-07-24 — panel may differ)
 
-- Resample chemical window **h = 4.3 → 5.3** (df) with **Δz = 0.1 Å**; for Fz morphology show **2.9 → 3.9** and/or annotate \(h_\mathrm{ca}=h-\mathrm{amp}\).
-- Add **3-row** panels: **Fz_unrelax · Fz_relax · df** (pyridine SSOT) for prolonged (and cube after ES fix).
-- Put **amp=… Å** and “df mixes Fz over ±amp” in every compare-strip title (`plot_afm_variant_height_strip`).
+**`run_spm.py afm` / `smiles-afm` now:**
+
+- Dense chem window for **df**: default **h = 3.7 → 4.7** Å, **Δz = 0.1**
+- **Amp-align:** same columns show **Fz at h − amp** (default amp=1 → Fz **2.7 → 3.7**)
+- Column titles: `df h=…` / `Fz@…`; `--no-amp-align` restores same-h (misleading) layout
+- Title note via `plot_afm_variant_height_strip(..., amp_align=True)`
+- Default plots: `compare_per_column.png` + `stage_*.png` (`--plots compare,stage`)
+
+**Still open for Fukui `panel-fukui` / 3-row SSOT:**
+
+- Add **3-row** panels: **Fz_unrelax · Fz_relax · df** (pyridine SSOT) for prolonged (and cube after ES fix)
+- Bring panel-fukui onto the same amp-align + dense-z defaults (or document if kept coarser)
 
 ---
 

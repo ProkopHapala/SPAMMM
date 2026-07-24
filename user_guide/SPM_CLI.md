@@ -6,6 +6,8 @@ Headless AFM / STM imaging from the **repository root**, without opening the GUI
 |-------|------|
 | [`run_spm.py`](../run_spm.py) | User-facing CLI (this guide) |
 | `spammm/SPM/` | Physics + plotting SSOT (`AFM_utils`, `stm_compare`, `KrigingGridFF`) |
+| `spammm/topology/smiles.py` | SMILES → `AtomicGraph` / `AtomicSystem` |
+| `spammm/forcefields/FFController.py` | `optimize_vacuum` (UFF/SPFF/LFF/DFTB + planar + PCA) |
 | `tests/SPM/testplot_*.py` | Developer diagnostics / L2 plots (thin wrappers) |
 
 ---
@@ -14,7 +16,7 @@ Headless AFM / STM imaging from the **repository root**, without opening the GUI
 
 ```bash
 python run_spm.py --help
-python run_spm.py stm --help
+python run_spm.py smiles-afm --example naphthalene --method uff
 python run_spm.py stm orbitals --help
 ```
 
@@ -32,7 +34,9 @@ Awkward FDBM grid sizes: keep **CPU FFT** (`afm` default `--cpu-fft`).
 
 | Command | Physics | Status |
 |---------|---------|--------|
-| `afm` | FDBM (Pauli + ES), stock / prolonged / cube | **ready** |
+| `afm` | FDBM (Pauli + ES), stock / prolonged / cube; SMILES / xyz | **ready** |
+| `opt` | Gas-phase relax (UFF / SPFF / LFF / DFTB); planar + PCA | **ready** |
+| `smiles-afm` | SMILES → planar opt → prolonged FDBM (+ atom dots) | **ready** |
 | `panel-fukui` | Fukui DFT cube vs DFTB stock vs prolonged | **ready** |
 | `replot-panel` | Replot panel NPZ (per-image contrast) | **ready** |
 | `afm-morse` | Morse/LJ + point-charge Coulomb, no density | **ready** |
@@ -52,22 +56,105 @@ Both `stm orbitals` and `stm current` write **vertical** (E↑) and **horizontal
 
 ---
 
+## Molecule inputs
+
+| Flag | Meaning |
+|------|---------|
+| `--xyz PATH` | Geometry file |
+| `--smiles STRING` | OpenSMILES organic subset → `smiles_to_system` |
+| `--smiles-example NAME` | Named entry from `SMILES_EXAMPLES` (benzene, naphthalene, terephthalic_acid, thymine, …) |
+| `--cube` / `--esp-cube` | Density / ESP cubes (FDBM) |
+
+**Not yet:** `--ascii` / `--mol` / `--mol2` as first-class shared flags (ASCII builder exists in `topology/ascii_art_heterocycle`; wire later).
+
+**Default orientation (AFM / opt):** PCA long axis → **x** (`orientPCA` / `rotMatPCA`); skip with `--no-orient`.
+
+---
+
+## Geometry prep
+
+### `opt` — vacuum relax
+
+```bash
+python run_spm.py opt --smiles-example benzene --method uff
+python run_spm.py opt --xyz data/xyz/benzene.xyz --method spff --outdir debug/spm_opt
+python run_spm.py opt --smiles 'c1ccccc1' --method dftb --basis 3ob-3-1
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--method` | `uff` | `uff` \| `spff` \| `lff` \| `dftb` |
+| `--nsteps` / `--fmax` | 1000 / 0.05 | Relax stopping |
+| `--no-planar` | off | Keep 3D after opt (default: flatten to xy) |
+| `--no-orient` | off | Skip PCA long→x |
+
+After opt (when planar): all atoms share one z (`make_planar_xy` then `z = mean`), then PCA. Planarity is **forced** — AFM “buckling” contrast is not from atom z.
+
+Outputs: `{name}_opt.xyz`, `SUMMARY.out` under `--outdir`.
+
+### `smiles-afm` — SMILES → planar opt → prolonged AFM
+
+Batch-friendly path for aromatics:
+
+```bash
+python run_spm.py smiles-afm --method uff                    # all SMILES_EXAMPLES
+python run_spm.py smiles-afm --example naphthalene terephthalic_acid
+python run_spm.py smiles-afm --example thymine --method dftb
+```
+
+Per molecule under `debug/spm_smiles_afm/<name>/`:
+
+- `{name}_opt.xyz` — planar, long axis ‖ x
+- **`compare_per_column.png`** — default strip (df + Fz, amp-aligned)
+- **`stage_prolonged.png`** — light field diagnostics
+- `SUMMARY.out`
+
+---
+
 ## AFM
+
+### Height window, amplitude, and plots (important)
+
+Probe heights on the CLI are **df probe heights** above the molecule plane (`mol_z = max atom z`).
+
+| Parameter | Default | Notes |
+|-----------|---------|--------|
+| `--h-min` / `--zmin` | **3.7** Å | df window start |
+| `--h-max` / `--zmax` | **4.7** Å | df window end |
+| `--h-step` / `--dz` | **0.1** Å | dense stack for `compute_df_amp` |
+| `--amp` | **1.0** Å | peak oscillation amplitude |
+
+**Amp-align (default):** each column shows
+
+- **df** at labeled \(h\) (e.g. 3.7…4.7)
+- **Fz** at \(h - \mathrm{amp}\) (e.g. 2.7…3.7)
+
+so morphologies match closest-approach physics. Use `--no-amp-align` only if you want Fz and df at the **same** labeled \(h\) (expect ~1 Å visual mismatch).
+
+PP scan always covers `[h_min − amp, h_max + amp]` so df at the window edges is valid.
+
+**Which PNGs to write** (`--plots` CSV):
+
+| Value | Meaning |
+|-------|---------|
+| `compare,stage` | **default** — `compare_per_column.png` + `stage_*.png` |
+| `compare` | strip only |
+| `tip,df,fz,per_image` | deep debug grids |
+| `all` / `debug` | everything |
+| `none` | compute only |
 
 ### `afm` — FDBM (density-based)
 
 ```bash
 python run_spm.py afm --xyz data/xyz/benzene.xyz --basis 3ob-3-1 --projection stock
-python run_spm.py afm --xyz data/xyz/PTCDA.xyz --projection prolonged
-python run_spm.py afm --xyz data/xyz/pentacene.xyz --projection both --outdir debug/spm_pentacene
+python run_spm.py afm --smiles-example naphthalene --projection prolonged --show-atoms
+python run_spm.py afm --xyz data/xyz/PTCDA.xyz --projection both --plots all
 python run_spm.py afm --cube /path/to/rho_N.cube --xyz data/xyz/mol.xyz --projection both
 ```
 
-Key flags: `--basis`, `--projection` (`stock`|`prolonged`|`both`), `--tip-mode` (`co`|`gaussian`), `--h-min`/`--h-max`/`--h-step`, `--scale` (`per_column`|`per_image`|`common`).
+Key flags: `--basis`, `--projection` (`stock`|`prolonged`|`both`), `--tip-mode` (`co`|`gaussian`), `--scale` (`per_column`|`per_image`|`common`), `--show-atoms`, `--plots`, height / amp flags above.
 
 **Dual basis:** prolonged ρ is **Pauli only**; electrostatics always from stock Δρ.
-
-Outputs: `compare_*.png`, `df_*.png`, `Fz_*.png`, `SUMMARY.out`.
 
 ### `afm-morse` — classical force field
 
@@ -163,11 +250,13 @@ See `doc/AGENTS/skills/afm-plotting/SKILL.md`.
 
 ## Related docs
 
-- STM basis compare report — `doc/Reports/STM_ExtendedBasis_OrbitalCompare.md`
-- Task — `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md`
+- Task tracker — `doc/Tasks/SPM_CLI_Headless.md`
+- STM basis compare — `doc/Reports/STM_ExtendedBasis_OrbitalCompare.md` · `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md`
 - Prolonged basis — `doc/Tasks/ProlongedRadialBasis_DFTB.md`
 - Kriging import — `doc/Tasks/Import_KrigingGridFF.md`
-- Fukui panel notes — `doc/Reports/Fukui_FDBM_panel_notes_2026-07-23.md`
+- Fukui panel / df↔Fz amp — `doc/Reports/Fukui_FDBM_panel_notes_2026-07-23.md`
+- SMILES→AFM pipeline notes — `doc/Reports/SPM_CLI_smiles_afm_2026-07-24.md`
+- Features audit — `doc/ToDo/Features.audit.md`
 
 ---
 
@@ -175,28 +264,25 @@ See `doc/AGENTS/skills/afm-plotting/SKILL.md`.
 
 **Wired in CLI** (science campaigns stay *investigating* until you confirm):
 
-1. FDBM AFM (`afm`) — stock / prolonged / cube
-2. Fukui panel + per-image replot
-3. Morse/LJ + Coulomb AFM (`afm-morse`)
-4. Kriging GridFF AFM (`afm-kriging`)
-5. STM orbitals + STM current (DFTB + pySCF; vertical + horizontal layouts)
-6. STM HOMO/LUMO vacuum panel (`stm panel`)
+1. FDBM AFM (`afm`) — stock / prolonged / cube; SMILES; amp-aligned height strip
+2. Gas-phase `opt` + `smiles-afm` (planar + PCA long→x)
+3. Fukui panel + per-image replot
+4. Morse/LJ + Coulomb AFM (`afm-morse`)
+5. Kriging GridFF AFM (`afm-kriging`)
+6. STM orbitals + STM current + vacuum panel
 
-**Planned / not yet in CLI** (see also `doc/Tasks/SPM_CLI_Headless.md`):
+**Still open** (see `doc/Tasks/SPM_CLI_Headless.md`):
 
 | Priority | Item | Notes |
 |----------|------|-------|
-| Near | Bond-resolved STM (**BR-STM**) | GUI: `ModularPipeline` S6 already; CLI missing — share via job-spec runner (`Consolidate_GUI_CLI_Backend_Input_Protocol.md`) |
-| Near | **GUI↔CLI input protocol** | JSON `SPMJobSpec` + `run_spm_job`; widgets/argparse adapters only; plots separate (matplotlib stills vs VisPy/blit) |
-| Near | FDBM ↔ Kriging compare | One entry wrapping `testplot_kriging_vs_fdbm_cube` |
-| Near | Pauli \(A,\beta\) fit modes | Contact / residual vs Kriging |
-| Near | Cube FDBM ES fix | Strong/asymmetric ES (esp. PTCDA); clamp→compact-NA |
-| Near | df↔Fz presentation | Annotate amp; Fz_u / Fz_r / df; dense Δz in chem window |
-| Medium | **`relax` / `dock`** | Pre-optimize molecule on substrate (UFF/SPFF/LFF, DFTB, **GridFF**, **FAF**/folded) before imaging |
-| Later | **Light-STM** | Optically driven / excited-state STM channels |
-| Later | **Charge-ring imaging** | Ring-current / magnetic contrast (`Import_ChargeRings_PME.md`) |
-| Later | Full multi-channel STM sum | Σ\|⟨φ_s\|H'\|φ_t⟩\|² at fixed bias |
-| Later | Contact-surface / 2.5D AFM | Fast AFM path |
-| UX | pip console script | `run_spm` via `PipInstall_Packaging.md` |
+| Near | Bond-resolved STM (**BR-STM**) | GUI ModularPipeline S6; CLI missing |
+| Near | **GUI↔CLI input protocol** | JSON `SPMJobSpec` + `run_spm_job` |
+| Near | FDBM ↔ Kriging compare | Wrap `testplot_kriging_vs_fdbm_cube` |
+| Near | Cube FDBM ES / NA multipoles | Prefer cube `ρ_NA`; see Fukui notes §1b |
+| Near | Inputs: ASCII / `.mol` / `.mol2` | Shared resolver; ASCII builder exists |
+| Near | `afm-morse` plot SSOT | Still ad-hoc `imshow` |
+| Later | **`dock` (substrate)** | GridFF / FAF — deferred |
+| Later | Light-STM / charge-ring imaging | |
+| UX | pip console script | `run_spm` via packaging task |
 
 Task tracker: [`doc/Tasks/SPM_CLI_Headless.md`](../doc/Tasks/SPM_CLI_Headless.md) · consolidate GUI/CLI: [`doc/Tasks/Consolidate_GUI_CLI_Backend_Input_Protocol.md`](../doc/Tasks/Consolidate_GUI_CLI_Backend_Input_Protocol.md) · agent list: [`doc/ToDo/ToDo.agents.md`](../doc/ToDo/ToDo.agents.md).

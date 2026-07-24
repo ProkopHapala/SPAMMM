@@ -138,6 +138,124 @@ def _z_norm(z):
     return t, zmin, zmax
 
 
+def select_top_atoms(apos, highlight_dz):
+    """Indices of atoms with z > zmax − highlight_dz. Returns (idx, zmax, z_cut)."""
+    apos = np.asarray(apos, dtype=np.float64)
+    z = apos[:, 2]
+    zmax = float(z.max())
+    z_cut = zmax - float(highlight_dz)
+    idx = np.where(z > z_cut)[0]
+    return idx, zmax, z_cut
+
+
+def top_atoms_with_pbc(apos, cell_lvs, highlight_dz, n_pbc=1):
+    """Top atoms in primary cell plus lattice images that fall near the primary cell AABB."""
+    apos = np.asarray(apos, dtype=np.float64)
+    idx, zmax, z_cut = select_top_atoms(apos, highlight_dz)
+    if len(idx) == 0:
+        return np.zeros((0, 3)), zmax, z_cut
+    top = apos[idx]
+    a = np.asarray(cell_lvs[0, :2], float)
+    b = np.asarray(cell_lvs[1, :2], float)
+    chunks = [top]
+    for i in range(-n_pbc, n_pbc + 1):
+        for j in range(-n_pbc, n_pbc + 1):
+            if i == 0 and j == 0:
+                continue
+            t = top.copy()
+            t[:, 0] += i * a[0] + j * b[0]
+            t[:, 1] += i * a[1] + j * b[1]
+            chunks.append(t)
+    return np.vstack(chunks), zmax, z_cut
+
+
+def _draw_atoms_dots(ax, xy, colors, sizes, zorders=None):
+    """Lightweight atom markers ('.'-like small scatter, no edges)."""
+    xy = np.asarray(xy, dtype=np.float64)
+    if len(xy) == 0:
+        return
+    kw = dict(marker='.', linewidths=0, edgecolors='none')
+    if zorders is None:
+        ax.scatter(xy[:, 0], xy[:, 1], c=colors, s=sizes, **kw)
+    else:
+        order = np.argsort(zorders)
+        ax.scatter(xy[order, 0], xy[order, 1], c=np.asarray(colors)[order], s=np.asarray(sizes)[order], **kw)
+
+
+def plot_assembly_sideview_xz(ax, apos, bonds=None, highlight_dz=None, cmap_name='viridis', atom_size=8.0,
+                              bond_lw=0.3, title='', x_range=None, guide_lw=0.5, probe_z=None):
+    """Side view (x–z): transparent skeleton + '.' atoms; thin top-cut / zmax / probe guides."""
+    apos = np.asarray(apos, dtype=np.float64)
+    z = apos[:, 2]
+    t, zmin, zmax = _z_norm(z)
+    cmap = plt.get_cmap(cmap_name)
+    ax.set_facecolor('white')
+    ax.figure.patch.set_facecolor('white')
+
+    if bonds:
+        segs = [[(apos[i, 0], apos[i, 2]), (apos[j, 0], apos[j, 2])] for i, j in bonds]
+        lc = LineCollection(segs, colors=[(0.35, 0.35, 0.35, 0.18)], linewidths=bond_lw, zorder=1)
+        ax.add_collection(lc)
+
+    top_idx = np.array([], dtype=np.int32)
+    z_cut = None
+    if highlight_dz is not None:
+        top_idx, zmax, z_cut = select_top_atoms(apos, highlight_dz)
+    top_set = set(int(i) for i in top_idx)
+    mask = np.array([i not in top_set for i in range(len(apos))], dtype=bool)
+    colors = [(*cmap(float(t[j]))[:3], 0.2 + 0.55 * float(t[j])) for j in np.where(mask)[0]]
+    _draw_atoms_dots(ax, apos[mask][:, [0, 2]], colors, np.full(mask.sum(), atom_size), zorders=apos[mask, 1])
+    if len(top_idx):
+        _draw_atoms_dots(ax, apos[top_idx][:, [0, 2]], [(0.85, 0.12, 0.12, 0.95)] * len(top_idx),
+                         np.full(len(top_idx), atom_size * 1.8))
+
+    glw = float(guide_lw)
+    if z_cut is not None:
+        ax.axhline(z_cut, color='crimson', ls='--', lw=glw, zorder=20,
+                   label=f'top cut z={z_cut:.2f}Å  (zmax−{float(highlight_dz):.2f}, n={len(top_idx)})')
+        ax.axhline(zmax, color='0.2', ls=':', lw=glw, zorder=19, label=f'zmax={zmax:.2f}Å')
+    if probe_z is not None:
+        ax.axhline(float(probe_z), color='tab:blue', ls='-.', lw=glw, zorder=18, label=f'probe z={float(probe_z):.2f}Å')
+    if z_cut is not None or probe_z is not None:
+        ax.legend(loc='upper right', fontsize=7, framealpha=0.85)
+
+    if x_range is not None:
+        ax.set_xlim(x_range)
+    ax.set_xlabel('x [Å]')
+    ax.set_ylabel('z [Å]')
+    ax.set_aspect('equal')
+    if title:
+        ax.set_title(title, fontsize=10, pad=4)
+    return ax, zmax, z_cut
+
+
+def plot_assembly_xy_xz_panel(apos, bonds=None, cell_lvs=None, *, highlight_dz=0.25, cmap_name='viridis',
+                              n_pbc_super=1, atom_size=6.0, bond_lw=0.3, cell_lw=0.5, guide_lw=0.5,
+                              probe_z=None, title='', fname=None, dpi=160, figsize=(9.5, 10.5)):
+    """SSOT: stacked XY (top) + XZ (bottom), shared x; lightweight skeleton + '.' atoms.
+
+    Returns fig, (ax_xy, ax_xz), (zmax, z_cut).
+    """
+    apos = np.asarray(apos, dtype=np.float64)
+    fig, (ax_xy, ax_xz) = plt.subplots(2, 1, figsize=figsize, facecolor='white',
+                                       gridspec_kw={'height_ratios': [1.15, 0.55], 'hspace': 0.08})
+    plot_assembly_height(ax_xy, apos, bonds=bonds, cell_lvs=cell_lvs, n_pbc_super=n_pbc_super,
+                         cmap_name=cmap_name, atom_size=atom_size, bond_lw=bond_lw, cell_lw=cell_lw,
+                         title=title or 'xy', highlight_dz=highlight_dz, draw_supercell=True, lightweight=True)
+    x0, x1 = ax_xy.get_xlim()
+    _, zmax, z_cut = plot_assembly_sideview_xz(
+        ax_xz, apos, bonds=bonds, highlight_dz=highlight_dz, cmap_name=cmap_name,
+        atom_size=atom_size, bond_lw=bond_lw, guide_lw=guide_lw, probe_z=probe_z,
+        title='xz', x_range=(x0, x1))
+    ax_xy.set_xlabel('')
+    ax_xy.tick_params(labelbottom=False)
+    if fname is not None:
+        fig.savefig(fname, dpi=dpi, facecolor='white', bbox_inches='tight', pad_inches=0.05)
+        plt.close(fig)
+        print(f'REVIEW: {fname}')
+    return fig, (ax_xy, ax_xz), (zmax, z_cut)
+
+
 def replicate_bonds(base_bonds, natoms, n_replicas):
     """Replicate base (i,j) bonds across n_replicas molecules."""
     if base_bonds is None or len(base_bonds) == 0:
@@ -151,7 +269,7 @@ def replicate_bonds(base_bonds, natoms, n_replicas):
     return links
 
 
-def plot_assembly_height(ax, apos, bonds=None, cell_lvs=None, n_pbc_super=1, cmap_name='viridis', atom_size=12.0, bond_lw=0.5, title='', highlight_dz=None, draw_supercell=True):
+def plot_assembly_height(ax, apos, bonds=None, cell_lvs=None, n_pbc_super=1, cmap_name='viridis', atom_size=12.0, bond_lw=0.5, title='', highlight_dz=None, draw_supercell=True, cell_lw=0.5, lightweight=False):
     """Top-view (xy) assembly: skeleton sticks + height-shaded atoms on white background."""
     apos = np.asarray(apos, dtype=np.float64)
     z = apos[:, 2]
@@ -168,25 +286,37 @@ def plot_assembly_height(ax, apos, bonds=None, cell_lvs=None, n_pbc_super=1, cma
             zm = 0.5 * (z[i] + z[j])
             tn = (zm - zmin) / max(zmax - zmin, 1e-9)
             segs.append([p1, p2])
-            seg_alphas.append(0.06 + 0.40 * tn)
+            seg_alphas.append((0.08 + 0.20 * tn) if lightweight else (0.06 + 0.40 * tn))
         lc = LineCollection(segs, colors=[(0.25, 0.25, 0.25, a) for a in seg_alphas], linewidths=bond_lw, capstyle='round', zorder=1)
         ax.add_collection(lc)
 
-    order = np.argsort(z)
-    for j in order:
-        tn = float(t[j])
-        rgba = cmap(tn)
-        alpha = 0.12 + 0.88 * tn
-        s = atom_size
-        if highlight_dz is not None and z[j] > (zmax - highlight_dz):
-            ax.scatter(apos[j, 0], apos[j, 1], s=s * 1.5, c=[(0.85, 0.12, 0.12, 1.0)], edgecolors='none', zorder=12)
-        else:
-            ax.scatter(apos[j, 0], apos[j, 1], s=s, c=[(*rgba[:3], alpha)], edgecolors='none', zorder=5 + tn)
+    top_idx = np.array([], dtype=np.int32)
+    if highlight_dz is not None:
+        top_idx, _, _ = select_top_atoms(apos, highlight_dz)
+    top_set = set(int(i) for i in top_idx)
+    mask = np.array([i not in top_set for i in range(len(apos))], dtype=bool)
+    if lightweight:
+        colors = [(*cmap(float(t[j]))[:3], 0.15 + 0.55 * float(t[j])) for j in np.where(mask)[0]]
+        _draw_atoms_dots(ax, apos[mask, :2], colors, np.full(mask.sum(), atom_size), zorders=z[mask])
+        if len(top_idx):
+            _draw_atoms_dots(ax, apos[top_idx, :2], [(0.85, 0.12, 0.12, 0.95)] * len(top_idx),
+                             np.full(len(top_idx), atom_size * 1.6))
+    else:
+        order = np.argsort(z)
+        for j in order:
+            tn = float(t[j])
+            rgba = cmap(tn)
+            alpha = 0.12 + 0.88 * tn
+            s = atom_size
+            if j in top_set:
+                ax.scatter(apos[j, 0], apos[j, 1], s=s * 1.5, c=[(0.85, 0.12, 0.12, 1.0)], edgecolors='none', zorder=12)
+            else:
+                ax.scatter(apos[j, 0], apos[j, 1], s=s, c=[(*rgba[:3], alpha)], edgecolors='none', zorder=5 + tn)
 
     if cell_lvs is not None:
         a, b = cell_lvs[0, :2], cell_lvs[1, :2]
         cpts = np.array([[0, 0], a, a + b, b, [0, 0]])
-        ax.plot(cpts[:, 0], cpts[:, 1], color='0.15', ls='-', lw=1.2, zorder=20)
+        ax.plot(cpts[:, 0], cpts[:, 1], color='0.15', ls='-', lw=float(cell_lw), zorder=20)
         if draw_supercell and n_pbc_super >= 1:
             pts = np.array([
                 [-a[0] - b[0], -a[1] - b[1]],
@@ -195,7 +325,7 @@ def plot_assembly_height(ax, apos, bonds=None, cell_lvs=None, n_pbc_super=1, cma
                 [-a[0] + 2 * b[0], -a[1] + 2 * b[1]],
                 [-a[0] - b[0], -a[1] - b[1]],
             ])
-            ax.plot(pts[:, 0], pts[:, 1], color='0.45', ls='--', lw=1.0, zorder=19)
+            ax.plot(pts[:, 0], pts[:, 1], color='0.45', ls='--', lw=max(0.4, float(cell_lw) * 0.85), zorder=19)
 
     ax.set_aspect('equal')
     ax.axis('off')

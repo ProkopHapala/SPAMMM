@@ -101,12 +101,28 @@ class FFController:
         if self.ff_type == 'spff':
             return self._build_spff(sys)
         elif self.ff_type == 'uff':
-            # TODO: UFF path needs UFF_cl kernel integration with SPFF_cl
-            raise NotImplementedError("UFF relaxation path not yet integrated with MD engine")
+            return self._build_uff(sys)
         elif self.ff_type == 'lff':
             return self._build_lff(sys)
         else:
             raise ValueError(f"Unknown ff_type={self.ff_type!r}, expected 'spff', 'uff', or 'lff'")
+
+    def _build_uff(self, sys):
+        """Build UFF topology and init fused UFF_cl MD (relax_serial / relax_global)."""
+        if sys.ngs is None:
+            sys.neighs()
+        if sys.bonds is None:
+            sys.findBonds()
+        self.md = UFF_cl(bPrint=False)
+        self.md.toUFF(sys)
+        masses = np.array([MASS_MAP.get(e, 12.0) for e in sys.enames], dtype=np.float32)
+        self.md.upload_positions(np.asarray(sys.apos, dtype=np.float64), masses=masses)
+        self.sys = sys
+        self.natoms = int(self.md.natoms)
+        self._pinned_mask = np.zeros(self.natoms, dtype=bool)
+        self._pinned_positions = np.zeros((self.natoms, 3), dtype=np.float32)
+        self._built = True
+        return {'ff_type': 'uff', 'natoms': self.natoms, 'nbonds': int(self.md.nbonds)}
 
     def _build_lff(self, sys):
         """Build linearized LFF springs from UFF topology (projective Jacobi)."""
@@ -178,6 +194,13 @@ class FFController:
 
     def _can_use_serial(self, do_nb):
         """Check if relax_serial is applicable (single system, small enough, no non-bonded)."""
+        if self.ff_type == 'uff':
+            return (getattr(self.md, 'nSystems', 1) == 1
+                    and self.md.natoms <= 128
+                    and getattr(self.md, 'nangles', 0) <= 256
+                    and not do_nb)
+        if self.ff_type == 'lff':
+            return False
         from .SPFF_cl import SPFF_cl
         return (self.md.nSystems == 1
                 and self.md.nvecs <= SPFF_cl.SERIAL_MAX_NVEC
@@ -195,6 +218,14 @@ class FFController:
         _damp = damp if damp is not None else DEFAULT_DAMP
         _Flimit = Flimit if Flimit is not None else DEFAULT_FLIMIT
         _do_nb = do_nb if do_nb is not None else self.enable_nonbond
+        if self.ff_type == 'uff':
+            self.md.set_md_params(dt=_dt, damp=_damp, Flimit=_Flimit)
+            if self._can_use_serial(_do_nb):
+                self.md.relax_serial(nsteps=nsteps, dt=_dt, damp=_damp, Flimit=_Flimit)
+            else:
+                self.md.relax_global(nsteps=nsteps, dt=_dt, damp=_damp, Flimit=_Flimit)
+            E = self.md.get_total_energy()
+            return float(E[0]) if hasattr(E, '__len__') else float(E)
         if self._can_use_serial(_do_nb):
             self.md.relax_serial(nsteps=nsteps, dt=_dt, damp=_damp, Flimit=_Flimit)
         else:
@@ -206,7 +237,10 @@ class FFController:
         """Return max force magnitude across all atoms (convergence metric)."""
         if not self._built:
             raise RuntimeError("FF not built — call build_ff() first")
-        forces = self.md.get_forces()[:self.natoms, :3]
+        forces = self.md.get_forces()
+        if forces.ndim == 3:  # UFF: (nSystems, natoms, 3)
+            forces = forces[0]
+        forces = forces[:self.natoms, :3]
         return float(np.max(np.linalg.norm(forces, axis=1)))
 
     def relax_until_converged(self, fmax_tol=0.05, max_steps=5000, dt=None, damp=None, Flimit=None, do_nb=None, callback=None, batch_size=None):
@@ -234,18 +268,27 @@ class FFController:
         use_serial = self._can_use_serial(_do_nb)
         total = 0
         E = self.md.get_total_energy()
+        if hasattr(E, '__len__'):
+            E = float(E[0])
         fmax = self.get_fmax()
         # do-while: always run at least one batch (fmax=0 before any force eval → false "converged")
         first = True
         while first or (total < max_steps and fmax > fmax_tol):
             first = False
             n = min(batch, max_steps - total)
-            if use_serial:
+            if self.ff_type == 'uff':
+                if use_serial:
+                    self.md.relax_serial(nsteps=n, dt=_dt, damp=_damp, Flimit=_Flimit)
+                else:
+                    self.md.relax_global(nsteps=n, dt=_dt, damp=_damp, Flimit=_Flimit)
+            elif use_serial:
                 self.md.relax_serial(nsteps=n, dt=_dt, damp=_damp, Flimit=_Flimit)
             else:
                 self.md.relax_batch(nsteps=n, do_nb=_do_nb)
             total += n
             E = self.md.get_total_energy()
+            if hasattr(E, '__len__'):
+                E = float(E[0])
             fmax = self.get_fmax()
             if callback is not None and not callback(total, E, fmax):
                 break
@@ -413,3 +456,92 @@ class FFController:
             self._pinned_mask = old_mask
             self._pinned_positions = old_positions
             self._apply_pinned()
+
+
+def make_planar_xy(apos):
+    """Project atoms onto best-fit plane and rotate into the xy plane (z≈const)."""
+    apos = np.asarray(apos, dtype=np.float64).copy()
+    if len(apos) < 3:
+        apos[:, 2] = apos[:, 2].mean() if len(apos) else 0.0
+        return apos
+    c = apos.mean(axis=0)
+    p = apos - c
+    _, _, vt = np.linalg.svd(p, full_matrices=False)
+    n = vt[-1]
+    if abs(n[2]) < 1e-8:
+        n = np.array([0.0, 0.0, 1.0])
+    elif n[2] < 0:
+        n = -n
+    # Rodrigues: rotate n → z
+    z = np.array([0.0, 0.0, 1.0])
+    v = np.cross(n, z)
+    s = float(np.linalg.norm(v))
+    cdot = float(np.dot(n, z))
+    if s < 1e-12:
+        R = np.eye(3) if cdot > 0 else np.diag([1.0, -1.0, -1.0])
+    else:
+        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]], dtype=np.float64)
+        R = np.eye(3) + vx + vx @ vx * ((1.0 - cdot) / (s * s))
+    out = (p @ R.T) + c
+    out[:, 2] = out[:, 2].mean()
+    return out
+
+
+def orient_long_axis_x(apos):
+    """In-place: PCA orient so longest axis → x, next → y, shortest → z (``atomicUtils.orientPCA``)."""
+    from .. import atomicUtils as au
+    apos = np.asarray(apos, dtype=np.float64)
+    au.orientPCA(apos)
+    return apos
+
+
+def optimize_vacuum(sys, method='uff', nsteps=1000, fmax_tol=0.05, planar=True,
+                    orient_pca=True, workdir='debug/opt', sk_set='3ob-3-1', dt=None, damp=None, verbose=True):
+    """Gas-phase geometry optimization. Mutates ``sys.apos``. Returns info dict.
+
+    method: 'uff' | 'spff' | 'lff' | 'dftb'
+    planar: after opt, project onto xy (for AFM of flat aromatics)
+    orient_pca: after planar, PCA-align longest axis along +x (``orientPCA`` / ``rotMatPCA``)
+    """
+    import os
+
+    method = method.lower()
+    info = {'method': method, 'planar': bool(planar), 'orient_pca': bool(orient_pca)}
+    if method == 'dftb':
+        from ..quantum.DFTB_utils import run_dftb_relax
+        os.makedirs(workdir, exist_ok=True)
+        E_ha, apos = run_dftb_relax(workdir, list(sys.enames), np.asarray(sys.apos, float),
+                                    sk_set=sk_set, verbose=verbose)
+        sys.apos[:] = apos
+        info.update({'energy': float(E_ha) * 27.211386245988, 'energy_unit': 'eV', 'nsteps': None, 'fmax': None})
+    else:
+        ctrl = FFController(ff_type=method)
+        ctrl.build_ff(sys, ff_type=method)
+        res = ctrl.relax_until_converged(fmax_tol=fmax_tol, max_steps=nsteps,
+                                         dt=dt, damp=damp, batch_size=min(200, nsteps))
+        pos = ctrl.get_positions()
+        if pos.ndim == 3:
+            pos = pos[0]
+        sys.apos[:] = np.asarray(pos, dtype=np.float64)[:len(sys.apos), :3]
+        info.update({'energy': float(res['energy']), 'energy_unit': 'eV',
+                     'nsteps': int(res['nsteps']), 'fmax': float(res['fmax']),
+                     'converged': bool(res['converged'])})
+        ctrl.teardown()
+
+    zspan_before = float(sys.apos[:, 2].max() - sys.apos[:, 2].min())
+    if planar:
+        sys.apos[:] = make_planar_xy(sys.apos)
+    if orient_pca:
+        orient_long_axis_x(sys.apos)
+        # keep planar after PCA (numerical noise)
+        if planar:
+            sys.apos[:, 2] = sys.apos[:, 2].mean()
+    zspan = float(sys.apos[:, 2].max() - sys.apos[:, 2].min())
+    info['zspan_before'] = zspan_before
+    info['zspan'] = zspan
+    info['span_xy'] = (float(sys.apos[:, 0].ptp()), float(sys.apos[:, 1].ptp()))
+    if verbose:
+        print(f"optimize_vacuum method={method} E={info.get('energy')} "
+              f"nsteps={info.get('nsteps')} fmax={info.get('fmax')} zspan={zspan:.4f}Å "
+              f"span_xy={info['span_xy']}")
+    return info

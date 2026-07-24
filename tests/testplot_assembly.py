@@ -25,8 +25,8 @@ if _proj not in sys.path:
 from spammm.AtomicSystem import AtomicSystem
 from spammm.forcefields.Assembly import parse_lattice_vectors, run_assembly_search, min_z_span_oriented
 from spammm.forcefields.AssemblyPlot import (
-    plot_assembly_height, plot_translations, plot_rotations, plot_pareto, replicate_bonds,
-    plot_assembly_diagnostics, write_assembly_xyz,
+    plot_assembly_height, plot_assembly_xy_xz_panel, plot_translations, plot_rotations, plot_pareto, replicate_bonds,
+    plot_assembly_diagnostics, write_assembly_xyz, select_top_atoms,
 )
 
 PLOT_DIR = os.path.join(_proj, 'debug', 'testplot_assembly')
@@ -119,12 +119,14 @@ def run_one(args, mol_path, tag, outdir):
         for p in diag_paths:
             print(f'REVIEW: {p}')
         title = f'rank {rank+1}  clash={scores[idx]:.2f}  z={z_spans[idx]:.1f}Å  dmin={min_dists[idx]:.2f}Å  ({args.n_sym} sym/cell)'
-        fig, ax = plt.subplots(figsize=(10, 10), facecolor='white')
-        plot_assembly_height(ax, apos, bonds=bonds, cell_lvs=cell, n_pbc_super=args.nPBC_xyz, cmap_name=args.cmap, atom_size=args.atom_size, bond_lw=0.5, title=title, highlight_dz=args.z_highlight)
+        top_idx, zmax, z_cut = select_top_atoms(apos, args.z_highlight)
         img = f'{stem}.png'
-        fig.savefig(img, dpi=200, facecolor='white', bbox_inches='tight', pad_inches=0.05)
-        plt.close(fig)
-        print(f'REVIEW: {img}')
+        plot_assembly_xy_xz_panel(
+            apos, bonds=bonds, cell_lvs=cell, highlight_dz=args.z_highlight, n_pbc_super=args.nPBC_xyz,
+            cmap_name=args.cmap, atom_size=max(5.0, args.atom_size * 0.45), bond_lw=0.3, cell_lw=0.5,
+            guide_lw=0.5, title=f'{title}  top_dz={args.z_highlight:.2f}Å  n_top={len(top_idx)}',
+            fname=img, dpi=200)
+        print(f'  top atoms: n={len(top_idx)}  zmax={zmax:.3f}  z_cut={z_cut:.3f}  (z > zmax−{args.z_highlight:.2f})')
         with open(f'{stem}.diag', 'w') as df:
             df.write(f'# {meta}\n')
             df.write(f'clash_sum={clash.sum():.6f} max_atom={clash.max():.6f}\n')
