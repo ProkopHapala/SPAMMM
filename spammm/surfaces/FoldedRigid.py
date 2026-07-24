@@ -3,7 +3,9 @@ FoldedRigid.py — Core functions for folded-basis rigid-body molecular simulati
 
 Purpose: Workflow orchestration for fitting folded basis potentials, setting up
 rigid-body dynamics, running relaxations, lateral scans, and manipulation
-trajectories on periodic substrates.
+trajectories on periodic substrates. Also supplies **CPU FAF map helpers** used by
+PairFF Vispy (`eval_folded_potential_grid`, `faf_type_idx_for_probe`) so the
+background map can show E_PairFF + E_FAF at the same height.
 
 Key functionality:
   - fit_folded_for_molecule() — fit folded basis coefficients for molecule+substrate
@@ -18,9 +20,10 @@ Key functionality:
   - find_bonds() — find bonds by distance cutoff
   - save_xyz_trajectory() — save multi-frame XYZ with substrate context
   - random_quaternion() — random rotation quaternion
+  - eval_folded_potential(_slice|_grid) — CPU FAF eval for diagnostics / PairFF map
 
-Role in SPAMMM: Core simulation workflow module. Used by tests and user-facing
-scripts. Plotting functions are in surface_plots.py.
+Role in SPAMMM: Core simulation workflow module. Used by tests, FoldedRigid GUI,
+and PairFF `--faf` demo. Plotting functions are in surface_plots.py.
 """
 
 import os
@@ -668,6 +671,33 @@ def eval_folded_potential_slice(fit_result, atom_type_idx, plane='xy', fixed_val
         raise ValueError(f"plane must be 'xy', 'xz', or 'yz', got {plane!r}")
     E = eval_folded_potential(fit_result, atom_type_idx, xyz).reshape(n, n)
     return a, b, E
+
+
+def eval_folded_potential_grid(fit_result, atom_type_idx, xs, ys, z):
+    """FAF energy on an arbitrary XY grid (same layout as Vispy PairFF maps).
+
+    xs, ys: 1D axes; returns E with shape (len(ys), len(xs)) via meshgrid(xs, ys).
+    """
+    xs = np.asarray(xs, dtype=np.float64)
+    ys = np.asarray(ys, dtype=np.float64)
+    X, Y = np.meshgrid(xs, ys)
+    xyz = np.stack([X.ravel(), Y.ravel(), np.full(X.size, float(z))], axis=1)
+    return eval_folded_potential(fit_result, int(atom_type_idx), xyz).reshape(X.shape)
+
+
+def faf_type_idx_for_probe(fit_result, probe_R0, probe_E0, probe_q):
+    """Pick unique_REQs row closest to map-probe (R0, Q); E0 used as weak tie-break."""
+    ureq = fit_result.get('unique_REQs')
+    if ureq is None or len(ureq) == 0:
+        return 0
+    ureq = np.asarray(ureq, dtype=np.float64)
+    R0, E0, Q = float(probe_R0), float(probe_E0), float(probe_q)
+    best_i, best_d = 0, 1e99
+    for i, req in enumerate(ureq):
+        d = (req[0] - R0) ** 2 + 4.0 * (req[2] - Q) ** 2 + 0.05 * (req[1] ** 2 - E0) ** 2
+        if d < best_d:
+            best_d, best_i = d, i
+    return int(best_i)
 
 
 # =============================================================================

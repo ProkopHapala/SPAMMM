@@ -9,7 +9,7 @@
 6) make a little pyOpenCL weave / jit / codon driver for forcefield optimization → `doc/Tasks/FF_Optimizer_OpenCL_Driver.md`
 7) **STM** systematic HOMO/LUMO: mio vs 3ob vs extended Slater vs pySCF cubes (pentacene, PTCDA, …) → `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md`
 8) **Kekulé π → exponential RI density** (atom + bond centers) vs DFT/DFTB → `doc/Tasks/Kekule_ExponentialDensityFit.md`
-9) **Fast 2.5D AFM** (contact height + z-modes; PIC; hybrid?) → `doc/Tasks/Fast_2p5D_AFM_ContactSurface.md`
+9) **Fast 2.5D AFM** (contact height + z-modes; PIC; hybrid?) → task `doc/Tasks/Fast_2p5D_AFM_ContactSurface.md` · parity report `doc/Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md` (sphere h₀ / coarse dx; USER visual pending)
    - **Open (2026-07-24):** helicene assembly showed contact-sep too long-ranged vs Morse+Coulomb GridFF — report `doc/Reports/Assembly_ContactSurface_AFM_helicene_2026-07-24.md`; next = PTCDA re-check + 1/2-atom toys (do not reinvent parity stack)
    - Assembly pipeline task: `doc/Tasks/Assembly_AFM_Pipeline.md`
 

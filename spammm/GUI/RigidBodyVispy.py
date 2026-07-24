@@ -31,6 +31,7 @@ Features:
     that body becomes mobile; others become frozen env; potential map recomputed
   - Potential map background: Morse + epair Hbond + sigma-hole (no Coulomb),
     matching ff_map.py's morseH_only mode. Presets H+(q=+0.4) / O−(q=-0.4);
+    when ``rbd.faf_mode`` + ``rbd.faf_fit``, map is **PairFF + FAF** at active CoM z.
     R0, E0, Q editable; element combo still fills R0/E0 from AtomTypes.
   - Epairs rendered as cyan dots, sigma holes as magenta dots (same size, semi-transparent)
   - Faint dummy-bond lines from epairs (cyan) and sigma holes (magenta) to host atoms
@@ -44,8 +45,9 @@ Caveats:
     actual forces for visualization purposes only.
   - Bond computation uses a fixed 1.8 Å cutoff — may miss long bonds or include
     spurious ones for non-standard geometries.
-  - The map is computed at z=0 (molecular plane). For 3D molecules with atoms
-    out of plane, the map is a projection, not a true cross-section.
+  - Map plane z = active CoM (or ``rbd.map_z``); with ``faf_mode`` the map is
+    PairFF(static) + FAF(probe). Without env molecules, PairFF layer is empty
+    and only FAF (if enabled) fills the background.
 """
 
 import numpy as np
@@ -801,12 +803,23 @@ class RigidBodyVispy:
         dummy_segs, dummy_colors = self._compute_dummy_bonds(pos, self.rbd.dyn_type_host, self.rbd.enames)
         self.dyn_dummy_bonds.set_data(dummy_segs, color=dummy_colors)
         out = self.rbd.download_outputs()
+        a = int(getattr(self.rbd, 'active_body', 0))
         E = float(out['atom_positions'][0, :, 3].sum())
-        F = out['body_force'][0, :3]
+        F = out['body_force'][a, :3]
         Fmag = float(np.linalg.norm(F))
         self.panel.lbl_E.setText(f"E={E:.4f}  |F|={Fmag:.4f}")
 
     # --- Potential map ---
+
+    def _map_z_height(self):
+        """Map plane z: active CoM if available, else rbd.map_z / 0."""
+        rbd = self.rbd
+        try:
+            out = rbd.download_selected(('pos',))
+            a = int(getattr(rbd, 'active_body', 0))
+            return float(out['pos'][a, 2])
+        except Exception:
+            return float(getattr(rbd, 'map_z', 0.0) or 0.0)
 
     def _recompute_map(self):
         if not self.panel.show_map():
@@ -818,26 +831,50 @@ class RigidBodyVispy:
         rc = self.panel.spins['rc'].value()
         w = self.panel.spins['w'].value()
         mode = self.panel.get_pairff_mode()
-        if mode == 'unified':
-            beta = (self.rbd.pairff_params_host or {}).get('beta', 1.7)
-            Emap, xs, ys, extent = compute_potential_map_unified(
-                self.rbd.static_apos_host, self.rbd.static_REQ_host,
-                self.rbd.static_enames, self.rbd.static_type_host,
-                probe_R0, probe_E0, probe_q, z_height=0.0, margin=4.0, step=0.1,
-                He=He, Hs=Hs, w=w, beta=beta)
+        z_height = self._map_z_height()
+        rbd = self.rbd
+        n_static = int(getattr(rbd, 'static_n', 0) or 0)
+        if n_static > 0:
+            if mode == 'unified':
+                beta = (rbd.pairff_params_host or {}).get('beta', 1.7)
+                Emap, xs, ys, extent = compute_potential_map_unified(
+                    rbd.static_apos_host, rbd.static_REQ_host,
+                    rbd.static_enames, rbd.static_type_host,
+                    probe_R0, probe_E0, probe_q, z_height=z_height, margin=4.0, step=0.1,
+                    He=He, Hs=Hs, w=w, beta=beta)
+            else:
+                Emap, xs, ys, extent = compute_potential_map(
+                    rbd.static_apos_host, rbd.static_REQ_host,
+                    rbd.static_enames, rbd.static_type_host,
+                    probe_R0, probe_E0, probe_q, z_height=z_height, margin=4.0, step=0.1,
+                    He=He, Hs=Hs, rc=rc, w=w)
         else:
-            Emap, xs, ys, extent = compute_potential_map(
-                self.rbd.static_apos_host, self.rbd.static_REQ_host,
-                self.rbd.static_enames, self.rbd.static_type_host,
-                probe_R0, probe_E0, probe_q, z_height=0.0, margin=4.0, step=0.1,
-                He=He, Hs=Hs, rc=rc, w=w)
+            # No env molecules: empty PairFF layer; extent from active sites or FAF default
+            out = rbd.download_outputs()
+            apos = out['atom_positions'][0, :, :3]
+            margin, step = 4.0, 0.1
+            xmin, ymin = float(apos[:, 0].min() - margin), float(apos[:, 1].min() - margin)
+            xmax, ymax = float(apos[:, 0].max() + margin), float(apos[:, 1].max() + margin)
+            xs = np.arange(xmin, xmax + step, step)
+            ys = np.arange(ymin, ymax + step, step)
+            Emap = np.zeros((len(ys), len(xs)), dtype=np.float64)
+            extent = [xmin, xmax, ymin, ymax]
+
+        # Compose FAF substrate at the same z (diagnostic: E_PairFF + E_FAF)
+        fit = getattr(rbd, 'faf_fit', None)
+        if fit is not None and getattr(rbd, 'faf_mode', False):
+            from spammm.surfaces.FoldedRigid import eval_folded_potential_grid, faf_type_idx_for_probe
+            ityp = faf_type_idx_for_probe(fit, probe_R0, probe_E0, probe_q)
+            Efaf = eval_folded_potential_grid(fit, ityp, xs, ys, z_height)
+            Emap = Emap + Efaf
+
         rgba = potential_to_rgba(Emap)
         self.map_image.set_data(rgba)
         # Set transform to map image pixels to world coordinates
         # vispy Image renders row 0 at bottom by default, matching our data (ys[0]=ymin)
         x0, x1, y0, y1 = extent
-        dx = (x1 - x0) / (len(xs) - 1)
-        dy = (y1 - y0) / (len(ys) - 1)
+        dx = (x1 - x0) / max(len(xs) - 1, 1)
+        dy = (y1 - y0) / max(len(ys) - 1, 1)
         from vispy.visuals.transforms import STTransform
         self.map_image.transform = STTransform(
             translate=(x0, y0, -0.1), scale=(dx, dy, 1))
@@ -925,7 +962,8 @@ class RigidBodyVispy:
 
     def _is_multibody(self):
         rbd = self.rbd
-        return bool(getattr(rbd, 'env_mode', False) and getattr(rbd, '_mb_packs', None) is not None)
+        return bool(getattr(rbd, '_mb_packs', None) is not None and (
+            getattr(rbd, 'allmol_mode', False) or getattr(rbd, 'env_mode', False)))
 
     def _update_active_label(self):
         rbd = self.rbd
@@ -967,7 +1005,7 @@ class RigidBodyVispy:
             return
         if int(body_id) == int(rbd.active_body):
             return
-        # Clear any drag anchors before buffer realloc
+        # Clear any drag anchors before active switch
         if self.dragging:
             self._clear_anchor(self.drag_atom)
             self.dragging = False
@@ -1034,16 +1072,19 @@ class RigidBodyVispy:
     def _set_anchor(self, atom_idx, world_pos):
         """Upload anchor spring for one atom. anchors[i].w > 0 = active spring.
 
-        The entire anchors array is rewritten each call (only one atom active
-        at a time). This is simpler than incremental updates and costs negligible
-        bandwidth (total_atoms * 16 bytes, typically <200 bytes).
+        atom_idx is local to the active molecule. In allmol_mode the GPU buffer
+        is flat over all molecules, so we write at mol_offsets[active]+atom_idx.
         """
         rbd = self.rbd
         k = self.panel.get_anchor_k()
         anchors = np.zeros((rbd.total_atoms, 4), dtype=np.float32)
         anchors[:, 3] = -1.0
-        anchors[atom_idx, :3] = world_pos
-        anchors[atom_idx, 3] = k
+        i0 = 0
+        if getattr(rbd, 'allmol_mode', False) and getattr(rbd, 'mol_offsets', None) is not None:
+            i0 = int(rbd.mol_offsets[int(rbd.active_body)])
+        gi = i0 + int(atom_idx)
+        anchors[gi, :3] = world_pos
+        anchors[gi, 3] = k
         rbd.anchors = anchors
         rbd.upload_anchors()
         atom_pos = self._get_dyn_pos()[atom_idx]

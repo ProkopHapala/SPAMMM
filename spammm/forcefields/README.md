@@ -9,7 +9,7 @@ GPU-accelerated intramolecular FFs and MD. All OpenCL modules inherit from `util
 - **SPFF_cl.py** — SPFFsp3 + π-DOFs; fused `relax_serial` / `relax_global` (+ optional FAF); π–π/π–σ audit still open
 - **SPFFbuilder.py** — AtomicSystem → SPFF topology (neighbors, params, π-orbitals)
 - **LFFSolver.py** — Linearized projective Jacobi: UFF→K₁₂/K₁₃/K₁₄ springs, soft FAF outer, ~50 outer steps vs thousands of MD; kernel `kernels/LFF.cl`
-- **RigidBodyDynamics.py** — 6-DOF rigid body GPU dynamics; FIRE quench in-kernel (`fire=True`); pure GPU Newton with boundary-aware trust/LM recovery (`run_folded_newton` / `run_folded_newton_replicas`). Host FD Newton (`relax_newton_host`) is debug-only.
+- **RigidBodyDynamics.py** — 6-DOF rigid body GPU dynamics; FIRE quench in-kernel (`fire=True`); pure GPU Newton with boundary-aware trust/LM recovery (`run_folded_newton` / `run_folded_newton_replicas`). Host FD Newton (`relax_newton_host`) is debug-only. **PairFF:** `RigidBodyPairFF` — allmol shared multi-mol buffers, `attach_pairff_faf`, fused PairFF±FAF kernels.
 - **RigidBodyAFM.py** — Molecule-on-tip AFM vs substrate GridFF (future: ContactSurface)
 - **QEq.py** — Charge equilibration (Rappé–Goddard; Cholesky+Schur / LU)
 - **Assembly.py** — Hexagonal SAM packing: GPU clash + orchestration; kernel `kernels/assembly.cl`

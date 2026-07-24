@@ -8,14 +8,14 @@ timestamp: 2026-07-24
 
 # Report: Rigid Assembly → Contact-Surface AFM (helicene SAM)
 
-**Status:** investigating (figures reviewed OK for overlays/PBC; contact-sep vs GridFF mismatch **open**)  
+**Status:** investigating — PBC/overlays OK; `h₀` spheres + coarse dx fixed soft bias; see **parity SSOT** [`ContactSurface_2p5D_vs_GridFF_2026-07-24.md`](ContactSurface_2p5D_vs_GridFF_2026-07-24.md) (XY vs GridFF still sharper — USER review)  
 **Task SSOT:** [`doc/Tasks/Assembly_AFM_Pipeline.md`](../Tasks/Assembly_AFM_Pipeline.md), [`doc/Tasks/Fast_2p5D_AFM_ContactSurface.md`](../Tasks/Fast_2p5D_AFM_ContactSurface.md)  
 **Design:** [`doc/Topics/AFM/ContactSurface_Static.md`](../Topics/AFM/ContactSurface_Static.md)  
 **Audit:** [`doc/TopicalAudit/AFM_ContactSurface.md`](../TopicalAudit/AFM_ContactSurface.md)
 
 ## Essence
 
-Screen **hexagonal SAM assemblies** (6 C6 copies / cell) with a fast **separable 2.5D contact-surface** Morse+Coulomb PP-AFM path, then sanity-check against **3D GridFF Morse+Coulomb** on one rank. Geometry overlays and PBC atom loading are now trustworthy; **contact-sep looks systematically “too close” / too long-ranged** vs GridFF+brute — that is the next physics bug to bisect (reuse PTCDA parity harness, then 1–2 atom toys).
+Screen **hexagonal SAM assemblies** (6 C6 copies / cell) with a fast **separable 2.5D contact-surface** Morse+Coulomb PP-AFM path, then sanity-check against **3D GridFF Morse+Coulomb** on one rank. Geometry overlays and PBC atom loading are trustworthy. Soft/long-range bias traced to wrong `h₀` and sub-atomic sampling — **fixed in code**; remaining acceptance = USER visual on maps/profiles (see parity report).
 
 ## What was built (pipeline)
 
@@ -38,9 +38,10 @@ python run_assembly_afm.py --preset tetraceno --n-afm 10 --z-clearance 8 --nz-sc
 
 # One-rank: contact-sep vs GridFF Morse+Coulomb + E/Fz profiles at 2 tops
 python run_assembly_afm.py --compare-dir debug/helicene_afm_pipeline/rank09_idx2767 \
-  --z-clearance 8 --nz-scan 40 --scan-dx 0.2 --grid-dx 0.25
+  --h0-R-scale 0.75 --bspl-dx 1.0 --scan-dx 0.5 --z-clearance 8 --nz-scan 40 --grid-dx 0.25
 ```
 
+Parity details / caveats: [`ContactSurface_2p5D_vs_GridFF_2026-07-24.md`](ContactSurface_2p5D_vs_GridFF_2026-07-24.md).
 ## Bugs fixed this session (do not re-hunt)
 
 1. **Truncated PBC xyz** — `enames` was 1-molecule (84) while positions were 504×9; `zip` wrote 756 atoms with header 4536 → AFMulator imaged a broken layer while overlays used full cell. **Fix:** expand enames; fail-loud length checks; verify header==body; assert load count.  
@@ -65,6 +66,25 @@ python run_assembly_afm.py --compare-dir debug/helicene_afm_pipeline/rank09_idx2
 | GridFF raw ≈ brute Morse+Coulomb (except very close) | 3D path is the reference for classical Morse+Coulomb |
 
 **Do not treat contact-sep as “demo-ready” for quantitative height until this is resolved.**
+
+### Toy rigid-FF bisect (2026-07-24) — root cause: missing spherical contact h₀
+
+Harness: `python tests/testplot_contact_surface.py --toys` → `debug/testplot_contact_surface/toys/`  
+**Rigid only** — no PP. tip_R=0, tip_E=1.
+
+**Diagnosis (USER):** softness is not mainly a poly_R knob issue — legacy `h₀ = max atom-center z` is **not** a contact surface. Intended: ray vs nearby **spheres** (Morse R0) so `dz` is height above the tip–atom contact envelope.
+
+| h₀ mode | 1-atom Δh_well | best Fz shift | rmse_E_fit | rmse_Fz_fit |
+|---------|----------------|---------------|------------|-------------|
+| `atom_z` (legacy PTCDA knobs) | +0.20 Å | +0.21 Å | 7.9e-2 | 4.3e-1 |
+| **`spheres` (Morse R0)** | **+0.00 Å** | **+0.02 Å** | **2.0e-3** | **2.1e-3** |
+
+Implemented: `build_contact_height_map(..., Rs=R0)`, `fit_contact_surface(h0_mode='spheres')`, fit offsets above `h0_max`; `run_assembly_afm._fit` updated. Status stays **investigating** until USER confirms on toys + helicene.
+
+**REVIEW (open these):**
+- `…/toys/C1_q0_atomz_ptcda/rigid_EFz_profiles.png` — soft / shifted
+- `…/toys/C1_q0_spheres/rigid_EFz_profiles.png` — tracks brute
+- `…/toys/INDEX.out`
 
 ## Do not reinvent — existing PTCDA parity (reuse first)
 

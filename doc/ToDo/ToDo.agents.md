@@ -47,7 +47,7 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
 - [ ] **Molecule-on-surface relax polish** — PTCDA+FAF USER review / charge dial-back; LFF GUI combo; FoldedRigid stability; instant GUI relax T02 (`doc/Tasks/PerfBenchmark_Relaxation.md`, `doc/Topics/ForceFields/LFF_ProjectiveRelax.md`)
 
 **P1 — packaging + AFM/STM demos**
-- [ ] **Contact-surface Morse+Coulomb parity bisect (blocks helicene AFM)** — contact-sep looked too close / long-ranged vs GridFF+brute on helicene; **reuse** PTCDA `testplot_contact_surface` + `testplot_afm_contact_surface`; add **1-atom (q=0)** and **2-atom (charged)** E/Fz toys; report `doc/Reports/Assembly_ContactSurface_AFM_helicene_2026-07-24.md`; tasks `Fast_2p5D_AFM_ContactSurface.md`, `Assembly_AFM_Pipeline.md`; audit `doc/TopicalAudit/AFM_ContactSurface.md`
+- [~] **Contact-surface Morse+Coulomb parity** — sphere `h₀` + `h0_R_scale=0.75` + atom-scale `bspl/scan` dx done; E/Fz profiles track brute; XY still sharper vs GridFF. **USER visual pending.** Report `doc/Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md`; task `Fast_2p5D_AFM_ContactSurface.md`; helicene `Assembly_ContactSurface_AFM_helicene_2026-07-24.md`; Caveats §6
 - [ ] **Headless SPM CLI** — `run_spm.py` + `user_guide/SPM_CLI.md`: AFM/STM + **`opt` / `smiles-afm`** wired (amp-align heights, PCA planar); gaps: BR-STM, ASCII/.mol flags, light-STM, charge-rings, FDBM↔Kriging compare, cube ES (`doc/Tasks/SPM_CLI_Headless.md`)
   - [~] **Gas-phase `opt`/`smiles-afm`** — `FFController.optimize_vacuum` (UFF/SPFF/LFF/DFTB); planar + `orientPCA`; **USER science OK** pending
   - [~] **SMILES** — `spammm/topology/smiles.py` + CLI flags; remaining: ASCII / `.mol`/`.mol2` shared resolver; GUI text box
@@ -164,7 +164,9 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
 |------|-------|
 | **Task SSOT** | `doc/Tasks/Fast_2p5D_AFM_ContactSurface.md` |
 | **Assembly AFM task** | `doc/Tasks/Assembly_AFM_Pipeline.md` |
-| **Report (helicene + compare)** | `doc/Reports/Assembly_ContactSurface_AFM_helicene_2026-07-24.md` |
+| **Parity report (SSOT)** | `doc/Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md` |
+| **Report (helicene pipeline)** | `doc/Reports/Assembly_ContactSurface_AFM_helicene_2026-07-24.md` |
+| **Caveats** | `doc/Caveats.md` §6 |
 | **Topical audit** | `doc/TopicalAudit/AFM_ContactSurface.md` |
 | Static design | `doc/Topics/AFM/ContactSurface_Static.md` |
 | Elastic design (Phase 2) | `doc/Topics/AFM/ContactSurface_Elastic.md` |

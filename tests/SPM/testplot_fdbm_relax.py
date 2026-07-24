@@ -540,7 +540,7 @@ def run_fukui_one(mol, xyz_rel, args):
         atomPos, args.step, args.margin, z_extra=6.0)
     nx, ny, nz = [int(x) for x in ngrid]
     lines.append(f'grid={nx}x{ny}x{nz} step={step} origin={origin}')
-    lines.append('cube ES: clamp→compact_NA + strip monopole/dipole + GridsOCL.project (pyridine+PBC)')
+    lines.append('cube ES: clamp→element-invariant compact_NA + cube-node GridsOCL.project (no dipole strip)')
 
     cube_prep = afm_utils.allelectron_cube_to_fdbm_grid(
         d_cube['rho_scf'], d_cube['origin'], d_cube['step'], atomPos, atomZ,
@@ -708,7 +708,7 @@ def run_fukui_es_diag_one(mol, xyz_rel, args):
     from spammm.SPM import AFM as afm
     from spammm.SPM import AFM_utils as afm_utils
     from spammm.config_utils import get_dftb_basis_path
-    from spammm.utils.GridsOCL import grid_moments_centers
+    from spammm.utils.GridsOCL import grid_moments
 
     os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
     _ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -742,7 +742,7 @@ def run_fukui_es_diag_one(mol, xyz_rel, args):
         clamp['rho_scf_clamped'], clamp['rho_diff'], V_clamp_nat, None, None, None,
         d_cube['origin'], d_cube['step'], atomPos,
         os.path.join(outdir, 'es_chain_native_clamp_compact.png'),
-        z_above=z_above, title=f'{mol} NATIVE clamp→compact NA (pyridine SSOT)',
+        z_above=z_above, title=f'{mol} NATIVE clamp→element-invariant compact NA',
         rho_na=clamp['rho_na'])
 
     # ── Canonical NA-origin bisect (preserve dipole_origin_bisect.png) ──
@@ -795,17 +795,17 @@ def run_fukui_es_diag_one(mol, xyz_rel, args):
         origin, step, atomPos,
         os.path.join(outdir, 'es_chain_fdbm_grid.png'),
         z_above=z_above,
-        title=f'{mol} FDBM: clamp→compact + GridsOCL.project (SSOT) + DFTB V',
+        title=f'{mol} FDBM: clamp→element-invariant compact + cube-node project + DFTB V',
         compare_VES=V_stock, compare_label='DFTB V_ES')
 
     com = atomPos.mean(0)
-    qg, p_gauss = grid_moments_centers(d_cube['rho_diff'], d_cube['origin'], d_cube['step'])
-    qc, p_cl = grid_moments_centers(clamp['rho_diff'], d_cube['origin'], d_cube['step'])
+    qg, p_gauss = grid_moments(d_cube['rho_diff'], d_cube['origin'], d_cube['step'])
+    qc, p_cl = grid_moments(clamp['rho_diff'], d_cube['origin'], d_cube['step'])
     lines_stock_E = []
     mol_z = float(atomPos[:, 2].mean())
     z_coords = origin[2] + np.arange(nz) * step
-    ix_c = int(np.clip(round((com[0] - origin[0]) / step), 0, nx - 1))
-    iy_c = int(np.clip(round((com[1] - origin[1]) / step), 0, ny - 1))
+    ix_c = float(np.clip((com[0] - origin[0]) / step, 0, nx - 1))
+    iy_c = float(np.clip((com[1] - origin[1]) / step, 0, ny - 1))
     for za in z_above:
         iz = int(np.clip(np.argmin(np.abs(z_coords - (mol_z + za))), 0, nz - 1))
         for name, field in [('E_ES cube SSOT', E_ES), ('E_ES DFTB', E_ES_stock)]:
@@ -817,7 +817,7 @@ def run_fukui_es_diag_one(mol, xyz_rel, args):
     all_lines = [
         f'ES diag {mol}',
         f'cube_dir={cube_dir}',
-        'SSOT: V_ES=fft_poisson(Δρ); Δρ=clamp→compact_NA; grid xfer=GridsOCL.project (NOT scipy sample)',
+        'SSOT: V_ES=fft_poisson(Δρ); Δρ=clamp→element-invariant compact_NA; cube-node project (NOT scipy sample)',
         f'LEGACY Gauss Δρ q={qg:.3e} |pxy|={np.hypot(p_gauss[0]-qg*com[0], p_gauss[1]-qg*com[1]):.3e}',
         f'CLAMP Δρ q={qc:.3e} |pxy|={np.hypot(p_cl[0]-qc*com[0], p_cl[1]-qc*com[1]):.3e}',
         f'project Δρ q={prep["q_diff"]:.3e} p_diff={prep["p_diff"]}',

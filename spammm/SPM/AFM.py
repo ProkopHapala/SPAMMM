@@ -970,19 +970,23 @@ class AFMulator(OpenCLBase):
         cl.enqueue_copy(self.queue, out, self.cs_out_fe_cl)
         return out[:, 3], out[:, :3]
 
-    def fit_contact_surface(self, margin=2.0, bspl_dx=0.4, poly_R=10.0, poly_z0=0.0, m_start=4, nz=5, z_offset=1.2, fit_z_half=0.4, fit_z_stack=None, fit_z_adaptive=None, fit_dx=None, fit_dy=None, fit_dz=0.15, fit_boltzmann=True, fit_boltzmann_T=None, fit_force_weight=0.0, n_iter=80, plqh=(1.0, 1.0, 0.0, 0.0), brute_ref='afm', sep=None, bPrint=True):
+    def fit_contact_surface(self, margin=2.0, bspl_dx=0.4, poly_R=10.0, poly_z0=0.0, m_start=4, nz=5, z_offset=1.2, fit_z_half=0.4, fit_z_stack=None, fit_z_adaptive=None, fit_dx=None, fit_dy=None, fit_dz=0.15, fit_boltzmann=True, fit_boltzmann_T=None, fit_force_weight=0.0, n_iter=80, plqh=(1.0, 1.0, 0.0, 0.0), brute_ref='afm', sep=None, bPrint=True, h0_mode='spheres', h0_R_scale=0.75, h0_r_xy=8.0):
         """
         Fit quasi-2D separable field to replace img_FF for PP relaxation.
         Default reference matches evalMorseC_QZs_toImg (same cMs, tip charges, and force convention).
-        fit_z_adaptive=(z_lo,z_hi,dz_lo,dz_hi): offsets above z_max, dz ramps linearly dz_lo→dz_hi.
+        fit_z_adaptive=(z_lo,z_hi,dz_lo,dz_hi): offsets above contact reference z_ref
+          (h0_max for spheres, atom zmax for atom_z), dz ramps linearly dz_lo→dz_hi.
         poly_z0/poly_R: basis coordinate is (z - h0 - poly_z0) / poly_R.
+        h0_mode: 'spheres' = ray vs Morse-R0 spheres (true contact surface); 'atom_z' = legacy max atom z.
+        h0_R_scale: multiply Morse R0 for sphere radii. MUST be <1 so clamp sits in hard repulsion
+          (scale=1 puts h₀ at the Morse well → no repulsive wall in the basis). Default 0.75.
         fit_boltzmann: diagonal weights w=exp(-(E-E_min)/T) emphasizing low-energy (vdW-well) samples.
         fit_force_weight: optional Fx,Fy,Fz row weight in loss (1.0 = equal to E rows).
         Pass pre-fitted sep to only upload coeffs.
         """
         assert self.use_morse, "fit_contact_surface requires use_morse=True"
         assert self.atoms_arr is not None, "call assign_params() first"
-        from spammm.surfaces.ContactSurface import SeparableParams, make_fit_grid, make_fit_grid_zstack, make_fit_z_planes_adaptive, boltzmann_fit_weights, bspline_n_intervals
+        from spammm.surfaces.ContactSurface import SeparableParams, make_fit_grid, make_fit_grid_zstack, make_fit_z_planes_adaptive, boltzmann_fit_weights, bspline_n_intervals, build_contact_height_map
         apos = self.atoms_arr[:, :3]
         if sep is not None and sep.coeffs is not None:
             self.sep = sep
@@ -996,24 +1000,38 @@ class AFMulator(OpenCLBase):
         zmax = float(apos[:, 2].max())
         fit_dx = bspl_dx if fit_dx is None else fit_dx
         fit_dy = bspl_dx if fit_dy is None else fit_dy
+        bspl_nx = bspline_n_intervals(x1f - x0f, bspl_dx)
+        bspl_ny = bspline_n_intervals(y1f - y0f, bspl_dx)
+        # --- contact height h0 (build before fit z planes) ---
+        Rs = None
+        if h0_mode == 'spheres':
+            Rs = np.asarray(self.cLJs_arr[:, 0], dtype=np.float64) * float(h0_R_scale)  # Morse R0
+        elif h0_mode != 'atom_z':
+            raise ValueError(f"unknown h0_mode={h0_mode!r}; use 'spheres' or 'atom_z'")
+        h0_map = build_contact_height_map(apos, x0f, y0f, bspl_dx, bspl_dx, bspl_nx, bspl_ny, r_xy=h0_r_xy, Rs=Rs)
+        h0_max = float(np.max(h0_map))
+        h0_min = float(np.min(h0_map))
+        # Fit offsets are above CONTACT (h0_max), not bare atom zmax — otherwise samples sit inside the spheres
+        z_ref = h0_max if h0_mode == 'spheres' else zmax
         if fit_z_adaptive is not None:
             z_lo, z_hi, dz_lo, dz_hi = fit_z_adaptive
-            z_planes = zmax + make_fit_z_planes_adaptive(z_lo, z_hi, dz_lo, dz_hi)
+            z_planes = z_ref + make_fit_z_planes_adaptive(z_lo, z_hi, dz_lo, dz_hi)
             fit_pts = make_fit_grid_zstack(x0f, x1f, y0f, y1f, z_planes, fit_dx, fit_dy)
             z_fit_lo, z_fit_hi = float(z_planes.min()), float(z_planes.max())
         elif fit_z_stack is not None:
-            z_planes = zmax + np.asarray(fit_z_stack, dtype=np.float64)
+            z_planes = z_ref + np.asarray(fit_z_stack, dtype=np.float64)
             fit_pts = make_fit_grid_zstack(x0f, x1f, y0f, y1f, z_planes, fit_dx, fit_dy)
             z_fit_lo, z_fit_hi = float(z_planes.min()), float(z_planes.max())
         else:
-            z_scan = zmax + float(z_offset)
+            z_scan = z_ref + float(z_offset)
             z0_fit, z1_fit = z_scan - fit_z_half, z_scan + fit_z_half
             fit_pts = make_fit_grid(x0f, x1f, y0f, y1f, z0_fit, z1_fit, fit_dx, fit_dy, fit_dz)
             z_fit_lo, z_fit_hi = z0_fit, z1_fit
-        bspl_nx = bspline_n_intervals(x1f - x0f, bspl_dx)
-        bspl_ny = bspline_n_intervals(y1f - y0f, bspl_dx)
+            z_planes = None
         coeff_n = bspl_nx * bspl_ny * nz
+        R0_mean = float(np.mean(self.cLJs_arr[:, 0])) if self.cLJs_arr is not None else float('nan')
         print(f"AFMulator.fit_contact_surface: fit_pts={len(fit_pts)} z=[{z_fit_lo:.2f},{z_fit_hi:.2f}] bspl={bspl_nx}x{bspl_ny} nz={nz} coeffs={coeff_n}")
+        print(f"AFMulator.fit_contact_surface: h0_mode={h0_mode} h0=[{h0_min:.3f},{h0_max:.3f}] zmax={zmax:.3f} z_ref={z_ref:.3f} R0_mean={R0_mean:.3f} scale={h0_R_scale}")
         if brute_ref == 'afm':
             E_ref, F_ref = self._brute_afm_morse_c_queries(fit_pts)
         elif brute_ref == 'plqh':
@@ -1026,11 +1044,11 @@ class AFMulator(OpenCLBase):
             sample_weights, T, E_shift = boltzmann_fit_weights(E_ref, T=fit_boltzmann_T)
             if bPrint:
                 print(f"AFMulator.fit_contact_surface: Boltzmann weights T={T:.4f} eV  E_shift={E_shift:.4f} eV  w∈[{float(sample_weights.min()):.3e},{float(sample_weights.max()):.3e}]")
-        sep = SeparableParams(x0f, y0f, bspl_dx, bspl_dx, bspl_nx, bspl_ny, poly_R=poly_R, poly_z0=poly_z0, m_start=m_start, nz=nz, apos=apos)
+        sep = SeparableParams(x0f, y0f, bspl_dx, bspl_dx, bspl_nx, bspl_ny, poly_R=poly_R, poly_z0=poly_z0, m_start=m_start, nz=nz, apos=apos, h0_map=h0_map, h0_r_xy=h0_r_xy, Rs=Rs)
         F_ref_pass = F_ref if fit_force_weight > 0.0 else None
         rmse = self._cs_fit_helper().fit_separable_cg(sep, fit_pts, E_ref, F_ref=F_ref_pass, apos=apos, n_iter=n_iter, sample_weights=sample_weights, force_weight=fit_force_weight, bPrint=bPrint)
         if fit_z_adaptive is not None or fit_z_stack is not None:
-            sep.fit_z_offsets = np.asarray(z_planes - zmax, dtype=np.float64)
+            sep.fit_z_offsets = np.asarray(z_planes - z_ref, dtype=np.float64)
         else:
             sep.fit_z_offsets = None
         sep.fit_E_ref = np.asarray(E_ref, dtype=np.float64)
@@ -1038,6 +1056,9 @@ class AFMulator(OpenCLBase):
         sep.fit_boltzmann_T = T
         sep.fit_force_weight = float(fit_force_weight)
         sep.fit_pts_z = fit_pts[:, 2].astype(np.float64)
+        sep.h0_mode = h0_mode
+        sep.z_ref = z_ref
+        sep.h0_R_scale = float(h0_R_scale)
         self.sep = sep
         self.setup_contact_surface(sep)
         print(f"AFMulator.fit_contact_surface: done RMSE={rmse:.4e}")
@@ -1844,12 +1865,20 @@ def compute_df_amp(Fz, dz, amp=1.0):
     return df.astype(np.float32)
 
 def fft_poisson_cpu(rho, step):
-    """CPU NumPy FFT Poisson (parity / backup). V(r) from charge density rho(r)."""
+    """CPU NumPy FFT Poisson (parity / backup). V(r) from charge density rho(r).
+
+    ``step`` may be float (isotropic) or (3,) ``(sx,sy,sz)`` for anisotropic cubes.
+    Mild pySCF axis anisotropy (~0.1%) must use (3,) — mean-step warps NA vs ρ (see doc/Caveats.md).
+    """
     nx, ny, nz = rho.shape
+    if np.ndim(step) == 0:
+        sx = sy = sz = float(step)
+    else:
+        sx, sy, sz = (float(x) for x in np.asarray(step, dtype=np.float64).ravel()[:3])
     rho_k = np.fft.fftn(rho)
-    kx = 2*np.pi * np.fft.fftfreq(nx, d=step)
-    ky = 2*np.pi * np.fft.fftfreq(ny, d=step)
-    kz = 2*np.pi * np.fft.fftfreq(nz, d=step)
+    kx = 2*np.pi * np.fft.fftfreq(nx, d=sx)
+    ky = 2*np.pi * np.fft.fftfreq(ny, d=sy)
+    kz = 2*np.pi * np.fft.fftfreq(nz, d=sz)
     KX, KY, KZ = np.meshgrid(kx, ky, kz, indexing='ij')
     k2 = KX**2 + KY**2 + KZ**2;  k2[0,0,0] = 1.0
     V_k = 4.0*np.pi*COULOMB_CONST*rho_k / k2;  V_k[0,0,0] = 0.0

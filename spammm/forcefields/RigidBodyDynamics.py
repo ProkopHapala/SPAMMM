@@ -1,21 +1,20 @@
 """
 RigidBodyDynamics.py — 6-DOF rigid body dynamics on the GPU.
 
-Purpose: Simulate rigid bodies (molecules attached to AFM tips) with quaternion-based
-rotation and translational dynamics. Evaluates forces and torques from GridFF
-surface interactions and harmonic spring constraints.
+Purpose: Simulate rigid bodies (molecules / AFM tips) with quaternion-based
+rotation and translational dynamics. Force backends: GridFF, folded FAF,
+and **PairFF** (pairwise intermolecular + optional fused FAF).
 
 Key functionality:
-  - Quaternion-to-rotation-matrix conversion
-  - Per-atom local-frame position buffers rotated by quaternion
-  - GridFF sampling at rigid body position/orientation
-  - FIRE relaxation for rigid body (position + quaternion): zero v when v·F<0
-    (and ω when ω·τ<0), plus AFM-style velocity mixing / dt adaptation
-  - Trust-region Newton on the 6×6 rigid Hessian (3 translation + 3 rotation)
-  - Anchor springs: harmonic constraints on specific atoms
+  - Quaternion-to-rotation-matrix conversion; per-atom body-frame buffers
+  - GridFF / folded FAF sampling; FIRE / Verlet / Newton on 6-DOF
+  - Anchor springs on specific atoms
+  - **RigidBodyPairFF**: allmol shared multi-mol layout (`from_molecules`);
+    `set_active_body` = index only (persistent dynamics); `attach_pairff_faf`
+    for substrate; Vispy map uses `faf_fit`
 
-Role in SPAMMM: Rigid body engine for AFM manipulation. Used by RigidBodyAFM.py
-for tip-molecule scanning simulations. The rigid.cl kernel is loaded via OpenCLBase.
+Role in SPAMMM: Rigid engine for AFM manipulation (`RigidBodyAFM.py`) and
+interactive PairFF docking (`demos/demo_pairff.py`). Kernels in `rigid.cl`.
 """
 
 import os
@@ -459,6 +458,73 @@ void rigid_body_folded_newton_replicas_kernel(
             'md_params': np.array([0.92, 0.88, 1.0, 1.0], dtype=np.float32),
         }
         self.kernel_args = self.generate_kernel_args("rigid_body_dynamics_kernel")
+        self.gridff_args = None
+
+    def realloc_molecules(self, atom_counts):
+        """Allocate multi-molecule buffers with irregular per-mol site counts (flat packing).
+
+        mols[i0:i1] offsets into apos_body / anchors / dyn_*; n_bodies = n_mols poses.
+        total_atoms = sum(atom_counts). Unlike realloc(), does not assume uniform num_atoms.
+        """
+        counts = np.asarray(atom_counts, dtype=np.int32).ravel()
+        if counts.ndim != 1 or counts.size < 1:
+            raise ValueError("atom_counts must be a non-empty 1D array")
+        if np.any(counts <= 0):
+            raise ValueError(f"atom_counts must be positive, got {counts}")
+        if int(counts.max()) > self.max_atoms_per_body:
+            raise ValueError(f"max(atom_counts)={int(counts.max())} exceeds max_atoms_per_body={self.max_atoms_per_body}")
+        n_mols = int(counts.shape[0])
+        total = int(counts.sum())
+        self.n_bodies = n_mols
+        self.num_atoms = int(counts.max())  # legacy field: max sites/mol
+        self.total_atoms = total
+        self.atom_counts = counts.copy()
+        offsets = np.zeros(n_mols + 1, dtype=np.int32)
+        offsets[1:] = np.cumsum(counts)
+        self.mol_offsets = offsets
+
+        float_size = np.float32().itemsize
+        int_size = np.int32().itemsize
+        mat3_size = 3 * 4 * float_size
+        mf = cl.mem_flags
+        bytes_per_body = 4 * float_size
+
+        self.create_buffer('mols', (self.n_bodies + 1) * int_size, mf.READ_ONLY)
+        self.create_buffer('poss',   self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('qrots',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('vposs',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('vrots',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('fire_state', self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('newton_state', self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('I_body_inv', self.n_bodies * mat3_size, mf.READ_ONLY)
+        self.create_buffer('I_body',     self.n_bodies * mat3_size, mf.READ_ONLY)
+        self.create_buffer('anchors', self.total_atoms * 4 * float_size, mf.READ_ONLY)
+        total_atom_bytes = self.total_atoms * 4 * float_size
+        self.create_buffer('apos_body',  total_atom_bytes, mf.READ_ONLY)
+        self.create_buffer('apos_world', total_atom_bytes, mf.READ_WRITE)
+        self.create_buffer('atom_PLQ',   total_atom_bytes, mf.READ_ONLY)
+        self.create_buffer('atom_force', total_atom_bytes, mf.READ_WRITE)
+        self.create_buffer('body_force', self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('body_torque', self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        FOLDED_BASIS_MAX = 128
+        FOLDED_TYPES_MAX = 8
+        self.create_buffer('folded_coeffs',  FOLDED_TYPES_MAX * FOLDED_BASIS_MAX * 4 * float_size, mf.READ_ONLY)
+        self.create_buffer('folded_kxyz',    FOLDED_BASIS_MAX * 4 * float_size, mf.READ_ONLY)
+        self.create_buffer('folded_atom_type', self.total_atoms * int_size, mf.READ_ONLY)
+        self.create_buffer('dyn_REQ',  self.total_atoms * 4 * float_size, mf.READ_ONLY)
+        self.create_buffer('dyn_type', self.total_atoms * int_size, mf.READ_ONLY)
+
+        self.kernel_params = {
+            'natoms': np.int32(self.total_atoms),
+            'niter': np.int32(1),
+            'dt': np.float32(0.01),
+            'Efield': np.zeros(4, dtype=np.float32),
+            'md_params': np.array([0.92, 0.88, 1.0, 1.0], dtype=np.float32),
+            'n_mols': np.int32(n_mols),
+            'active_mol': np.int32(0),
+        }
+        self.toGPU('mols', offsets)
+        self.kernel_args = None
         self.gridff_args = None
 
     def realloc_replicas(self, n_replicas, num_atoms):
@@ -1108,8 +1174,14 @@ void rigid_body_folded_newton_replicas_kernel(
         self.fromGPU('body_torque', body_torque)
         self.queue.finish()
 
-        atoms_world = atoms_world.reshape(self.n_bodies, self.num_atoms, 4)
-        atom_force = atom_force.reshape(self.n_bodies, self.num_atoms, 4)
+        if getattr(self, 'allmol_mode', False) and getattr(self, 'mol_offsets', None) is not None:
+            a = int(self.active_body)
+            i0, i1 = int(self.mol_offsets[a]), int(self.mol_offsets[a + 1])
+            atoms_world = atoms_world[i0:i1][None, ...]
+            atom_force = atom_force[i0:i1][None, ...]
+        else:
+            atoms_world = atoms_world.reshape(self.n_bodies, self.num_atoms, 4)
+            atom_force = atom_force.reshape(self.n_bodies, self.num_atoms, 4)
         self.last_atom_force = atom_force
         self.last_body_force = body_force
         self.last_body_torque = body_torque
@@ -1569,14 +1641,152 @@ void rigid_body_pairff_unified_env_kernel(
     const float4             md_params,
     const int                niter
 )"""
+        self.kernelheaders["rigid_body_pairff_unified_faf_kernel"] = """__kernel
+void rigid_body_pairff_unified_faf_kernel(
+    __global const int*      mols,
+    __global       float4*   poss,
+    __global       float4*   qrots,
+    __global       float4*   vposs,
+    __global       float4*   vrots,
+    __global       float4*   fire_state,
+    __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
+    __global const float4*   apos_body,
+    __global       float4*   apos_world,
+    __global const float4*   dyn_REQ,
+    __global const int*      dyn_type,
+    __global       float4*   atom_force,
+    __global       float4*   body_force,
+    __global       float4*   body_torque,
+    __global const float4*   anchors,
+    __global const float4*   static_apos,
+    __global const float4*   static_REQ,
+    __global const int*      static_type,
+    const int                n_static,
+    const float4             pairff_params,
+    const float              beta,
+    const float              z_target,
+    __global const float*    folded_coeffs,
+    __global const float4*   folded_kxyz,
+    __global const int*      folded_atom_type,
+    const int4               folded_meta,
+    const float4             folded_lvec2d,
+    const float              dt,
+    const float4             md_params,
+    const int                niter
+)"""
+        self.kernelheaders["rigid_body_pairff_unified_env_faf_kernel"] = """__kernel
+void rigid_body_pairff_unified_env_faf_kernel(
+    __global const int*      mols,
+    __global       float4*   poss,
+    __global       float4*   qrots,
+    __global       float4*   vposs,
+    __global       float4*   vrots,
+    __global       float4*   fire_state,
+    __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
+    __global const float4*   apos_body,
+    __global       float4*   apos_world,
+    __global const float4*   dyn_REQ,
+    __global const int*      dyn_type,
+    __global       float4*   atom_force,
+    __global       float4*   body_force,
+    __global       float4*   body_torque,
+    __global const float4*   anchors,
+    __global const float4*   env_apos,
+    __global const float4*   env_REQ,
+    __global const int*      env_type,
+    __global const int*      env_mols,
+    const int                n_env_mols,
+    const float4             pairff_params,
+    const float              beta,
+    const float              z_target,
+    __global const float*    folded_coeffs,
+    __global const float4*   folded_kxyz,
+    __global const int*      folded_atom_type,
+    const int4               folded_meta,
+    const float4             folded_lvec2d,
+    const float              dt,
+    const float4             md_params,
+    const int                niter
+)"""
+        self.kernelheaders["rigid_body_pairff_unified_allmol_kernel"] = """__kernel
+void rigid_body_pairff_unified_allmol_kernel(
+    __global const int*      mols,
+    __global       float4*   poss,
+    __global       float4*   qrots,
+    __global       float4*   vposs,
+    __global       float4*   vrots,
+    __global       float4*   fire_state,
+    __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
+    __global const float4*   apos_body,
+    __global       float4*   apos_world,
+    __global const float4*   dyn_REQ,
+    __global const int*      dyn_type,
+    __global       float4*   atom_force,
+    __global       float4*   body_force,
+    __global       float4*   body_torque,
+    __global const float4*   anchors,
+    const int                n_mols,
+    const int                active_mol,
+    const float4             pairff_params,
+    const float              beta,
+    const float              z_target,
+    const float              dt,
+    const float4             md_params,
+    const int                niter
+)"""
+        self.kernelheaders["rigid_body_pairff_unified_allmol_faf_kernel"] = """__kernel
+void rigid_body_pairff_unified_allmol_faf_kernel(
+    __global const int*      mols,
+    __global       float4*   poss,
+    __global       float4*   qrots,
+    __global       float4*   vposs,
+    __global       float4*   vrots,
+    __global       float4*   fire_state,
+    __global const cl_Mat3*  I_body_inv,
+    __global const cl_Mat3*  I_body,
+    __global const float4*   apos_body,
+    __global       float4*   apos_world,
+    __global const float4*   dyn_REQ,
+    __global const int*      dyn_type,
+    __global       float4*   atom_force,
+    __global       float4*   body_force,
+    __global       float4*   body_torque,
+    __global const float4*   anchors,
+    const int                n_mols,
+    const int                active_mol,
+    const float4             pairff_params,
+    const float              beta,
+    const float              z_target,
+    __global const float*    folded_coeffs,
+    __global const float4*   folded_kxyz,
+    __global const int*      folded_atom_type,
+    const int4               folded_meta,
+    const float4             folded_lvec2d,
+    const float              dt,
+    const float4             md_params,
+    const int                niter
+)"""
         self.pairff_args = None
         self.krnl_pairff = None
         self.pairff_unified_args = None
         self.krnl_pairff_unified = None
         self.pairff_env_args = None
         self.krnl_pairff_env = None
+        self.pairff_unified_faf_args = None
+        self.krnl_pairff_unified_faf = None
+        self.pairff_env_faf_args = None
+        self.krnl_pairff_env_faf = None
+        self.pairff_allmol_args = None
+        self.krnl_pairff_allmol = None
+        self.pairff_allmol_faf_args = None
+        self.krnl_pairff_allmol_faf = None
         self.pairff_mode = PAIRFF_MODE_LEGACY
         self.env_mode = False
+        self.allmol_mode = False  # shared all-molecule buffers; active_mol index only
+        self.faf_mode = False  # when True, run_pairff uses fused PairFF+FAF kernels
         self.n_env_mols = 0
         self.n_env_sites = 0
         self.env_mols_host = None
@@ -1775,34 +1985,75 @@ void rigid_body_pairff_unified_env_kernel(
         self._dyn_enames = list(pack['enames'])
 
     def sync_active_pose_from_gpu(self):
-        """Copy active body pose from GPU buffers into host multi-body state."""
+        """Copy all molecule poses from GPU into host multi-body state."""
         if self._mb_packs is None:
             return
         out = self.download_outputs()
-        self._mb_pos[self.active_body] = out['pos'][0, :3].copy()
-        self._mb_quat[self.active_body] = out['quats'][0].copy()
+        self._mb_pos = out['pos'][:, :3].copy()
+        self._mb_quat = out['quats'].copy()
+
+    def _apply_active_view_hosts(self):
+        """Expose active molecule slices for Vispy (enames / dyn_type_host).
+
+        GPU keeps flat all-mol dyn_type/REQ; host view is active pack only.
+        """
+        pack = self._mb_packs[self.active_body]
+        self.enames = list(pack['enames'])
+        self.dyn_type_host = pack['types'].copy()
+        self._dyn_enames = list(pack['enames'])
+        self._dyn_REQ_base = pack['REQ_base']
+
+    def _refresh_static_view_hosts(self):
+        """Host world sites of all non-active molecules for potential map / markers."""
+        if self._mb_packs is None:
+            return
+        self.sync_active_pose_from_gpu()
+        a_list, r_list, t_list, enames_all = [], [], [], []
+        for j, pack in enumerate(self._mb_packs):
+            if j == self.active_body:
+                continue
+            world = _body_sites_world(pack['rel'], self._mb_pos[j], self._mb_quat[j])
+            a_list.append(world)
+            r_list.append(pack['REQ_ext'])
+            t_list.append(pack['types'])
+            enames_all.extend(pack['enames'])
+        if not a_list:
+            self.static_n = 0
+            self.static_apos_host = np.zeros((0, 4), dtype=np.float32)
+            self.static_REQ_host = np.zeros((0, 4), dtype=np.float32)
+            self.static_type_host = np.zeros(0, dtype=np.int32)
+            self.static_enames = []
+            return
+        self.static_apos_host = np.vstack(a_list).astype(np.float32)
+        self.static_REQ_host = np.vstack(r_list).astype(np.float32)
+        self.static_type_host = np.concatenate(t_list).astype(np.int32)
+        self.static_n = int(self.static_type_host.shape[0])
+        self.static_enames = list(enames_all)
 
     def set_active_body(self, body_id, mass_trans=None, mass_rot=None):
-        """Switch which molecule integrates; rebuild env from the rest."""
+        """Switch which molecule integrates — index only (no realloc / no env rebuild).
+
+        All poses, velocities, and FIRE state stay persistent on GPU; non-active
+        bodies are simply not integrated. Clears mouse anchors. FAF unchanged.
+        """
         if self._mb_packs is None:
             raise RuntimeError("set_active_body requires from_molecules()")
         body_id = int(body_id)
         if body_id < 0 or body_id >= len(self._mb_packs):
             raise ValueError(f"active_body={body_id} out of range [0,{len(self._mb_packs)})")
-        self.sync_active_pose_from_gpu()
-        mt = self.mass_trans if mass_trans is None else float(mass_trans)
-        mr = self.mass_rot if mass_rot is None else float(mass_rot)
         self.active_body = body_id
-        self._upload_active_body_state(mass_trans=mt, mass_rot=mr)
-        self._rebuild_env_from_mb()
-        p = self.pairff_params_host or {}
-        self.init_pairff(
-            He=p.get('He', -0.1), rc=p.get('rc', 3.0), w=p.get('w', 0.7),
-            k_z=p.get('k_z', 0.0), morse_alpha=p.get('morse_alpha', 1.8),
-            z_target=p.get('z_target', 0.0), Hs=p.get('Hs', 1.0),
-            epair_dist=p.get('epair_dist', 1.4), sigma_dist=p.get('sigma_dist', 1.0),
-            mode=PAIRFF_MODE_UNIFIED, beta=p.get('beta', 1.7),
-        )
+        self.kernel_params['active_mol'] = np.int32(body_id)
+        # Clear anchors only (mouse springs are per-active-site); dynamics stay
+        anc = np.zeros((self.total_atoms, 4), dtype=np.float32)
+        anc[:, 3] = -1.0
+        self.anchors = anc
+        self.toGPU('anchors', anc)
+        self._apply_active_view_hosts()
+        self._refresh_static_view_hosts()
+        if self.pairff_params_host is not None:
+            self.pairff_params_host['active_body'] = body_id
+            self.pairff_params_host['allmol_mode'] = self.allmol_mode
+
 
     def init_pairff(self, He=-0.1, rc=3.0, w=0.7, k_z=0.0, morse_alpha=1.8, z_target=0.0, Hs=1.0, epair_dist=1.4, sigma_dist=1.0, mode=None, beta=None):
         """Initialize pairff kernel parameters and generate argument list.
@@ -1839,7 +2090,16 @@ void rigid_body_pairff_unified_env_kernel(
             beta = float(morse_alpha) if self.pairff_mode == PAIRFF_MODE_LEGACY else 1.7
 
         # Refresh REQ.z (He/Hs) and REQ.w (blunt width) then re-upload
-        if self.env_mode and self._mb_packs is not None:
+        if self.allmol_mode and self._mb_packs is not None:
+            for pack in self._mb_packs:
+                pack['REQ_ext'] = _extend_reqs_with_epairs(
+                    pack['REQ_base'], pack['enames'], pack['types'], He=He, Hs=Hs, w=w)
+            req_flat = np.vstack([p['REQ_ext'] for p in self._mb_packs]).astype(np.float32)
+            type_flat = np.concatenate([p['types'] for p in self._mb_packs]).astype(np.int32)
+            self.upload_dyn_types_req(type_flat, req_flat)
+            self._apply_active_view_hosts()
+            self._refresh_static_view_hosts()
+        elif self.env_mode and self._mb_packs is not None:
             for pack in self._mb_packs:
                 pack['REQ_ext'] = _extend_reqs_with_epairs(
                     pack['REQ_base'], pack['enames'], pack['types'], He=He, Hs=Hs, w=w)
@@ -1864,6 +2124,8 @@ void rigid_body_pairff_unified_env_kernel(
         n_dyn_atoms = int((self.dyn_type_host == 0).sum()) if self.dyn_type_host is not None else 0
         self.kernel_params['n_dyn_atoms'] = np.int32(n_dyn_atoms)
         self.kernel_params['n_env_mols'] = np.int32(self.n_env_mols)
+        self.kernel_params['n_mols'] = np.int32(self.n_bodies)
+        self.kernel_params['active_mol'] = np.int32(self.active_body)
         self.kernel_params['pairff_params'] = np.array([He, rc, w, k_z], dtype=np.float32)
         self.kernel_params['morse_alpha'] = np.float32(morse_alpha)
         self.kernel_params['beta'] = np.float32(beta)
@@ -1876,32 +2138,172 @@ void rigid_body_pairff_unified_env_kernel(
             'epair_dist': epair_dist, 'sigma_dist': sigma_dist,
             'mode': self.pairff_mode,
             'env_mode': self.env_mode,
+            'allmol_mode': self.allmol_mode,
             'active_body': self.active_body,
         }
-        if self.env_mode:
+        if self.allmol_mode:
+            self.pairff_allmol_args = self.generate_kernel_args("rigid_body_pairff_unified_allmol_kernel")
+            self.krnl_pairff_allmol = cl.Kernel(self.prg, "rigid_body_pairff_unified_allmol_kernel")
+            self.pairff_allmol_faf_args = None
+            self.krnl_pairff_allmol_faf = None
+        elif self.env_mode:
             self.pairff_env_args = self.generate_kernel_args("rigid_body_pairff_unified_env_kernel")
             self.krnl_pairff_env = cl.Kernel(self.prg, "rigid_body_pairff_unified_env_kernel")
+            self.pairff_env_faf_args = None
+            self.krnl_pairff_env_faf = None
         else:
             self.pairff_args = self.generate_kernel_args("rigid_body_pairff_kernel")
             self.krnl_pairff = cl.Kernel(self.prg, "rigid_body_pairff_kernel")
             self.pairff_unified_args = self.generate_kernel_args("rigid_body_pairff_unified_kernel")
             self.krnl_pairff_unified = cl.Kernel(self.prg, "rigid_body_pairff_unified_kernel")
+            self.pairff_unified_faf_args = None
+            self.krnl_pairff_unified_faf = None
+        # Keep FAF bound across param refreshes (GUI spinboxes call init_pairff)
+        if self.faf_mode and getattr(self, 'folded_params', None) is not None:
+            self._bind_pairff_faf_kernels()
 
-    def run_pairff(self, num_steps, dt, lin_damp=0.92, ang_damp=0.88, fire=False):
-        """Run the active pairwise force field kernel for num_steps."""
-        if self.env_mode:
+    def _bind_pairff_faf_kernels(self):
+        """Generate fused PairFF+FAF kernel args (needs folded_meta / folded_lvec2d in kernel_params)."""
+        if 'folded_meta' not in self.kernel_params or 'folded_lvec2d' not in self.kernel_params:
+            raise RuntimeError("_bind_pairff_faf_kernels requires init_folded(...) first")
+        if self.allmol_mode:
+            self.pairff_allmol_faf_args = self.generate_kernel_args("rigid_body_pairff_unified_allmol_faf_kernel")
+            self.krnl_pairff_allmol_faf = cl.Kernel(self.prg, "rigid_body_pairff_unified_allmol_faf_kernel")
+        elif self.env_mode:
+            self.pairff_env_faf_args = self.generate_kernel_args("rigid_body_pairff_unified_env_faf_kernel")
+            self.krnl_pairff_env_faf = cl.Kernel(self.prg, "rigid_body_pairff_unified_env_faf_kernel")
+        else:
+            self.pairff_unified_faf_args = self.generate_kernel_args("rigid_body_pairff_unified_faf_kernel")
+            self.krnl_pairff_unified_faf = cl.Kernel(self.prg, "rigid_body_pairff_unified_faf_kernel")
+
+    def enable_pairff_faf(self, enabled=True):
+        """Switch run_pairff between PairFF-only and fused PairFF+FAF kernels.
+
+        Requires prior init_folded(...) with folded_atom_type length == total_atoms
+        (use -1 for epair/σ sites so FAF is skipped). Prefer k_z=0 when FAF is on.
+        """
+        self.faf_mode = bool(enabled)
+        if self.faf_mode:
+            if getattr(self, 'folded_params', None) is None:
+                raise RuntimeError("enable_pairff_faf(True) requires init_folded(...) first")
+            self._bind_pairff_faf_kernels()
+
+    @staticmethod
+    def folded_types_for_pairff_sites(dyn_type, real_folded_types):
+        """Map PairFF sites → FAF type indices: real atoms from real_folded_types, dummies → -1."""
+        dyn_type = np.asarray(dyn_type, dtype=np.int32).ravel()
+        real_folded_types = np.asarray(real_folded_types, dtype=np.int32).ravel()
+        n_real = int((dyn_type == 0).sum())
+        if real_folded_types.shape[0] != n_real:
+            raise ValueError(f"real_folded_types length {real_folded_types.shape[0]} != n_real_atoms {n_real}")
+        out = np.full(dyn_type.shape[0], -1, dtype=np.int32)
+        out[dyn_type == 0] = real_folded_types
+        return out
+
+    def _folded_types_all_sites(self, fit_result):
+        """Build folded_atom_type length == total_atoms (dummies -1) from fit atom_type_ids."""
+        at_fit = np.asarray(fit_result['atom_type_ids'], dtype=np.int32).ravel()
+        if self.allmol_mode and self._mb_packs is not None:
+            parts = []
+            for pack in self._mb_packs:
+                parts.append(self.folded_types_for_pairff_sites(pack['types'], at_fit))
+            out = np.concatenate(parts).astype(np.int32)
+        else:
+            out = self.folded_types_for_pairff_sites(self.dyn_type_host, at_fit)
+        if out.shape[0] != self.total_atoms:
+            raise ValueError(f"folded types length {out.shape[0]} != total_atoms {self.total_atoms}")
+        return out
+
+    def attach_pairff_faf(self, fit_result, z_init=3.5, k_z=0.0, enable=True):
+        """Bind FAF substrate to this PairFF instance (dynamics + Vispy map).
+
+        Raises all body CoMs to Z_SURF_TOP + z_init, sets k_z (default 0),
+        init_folded with dummy sites skipped, stores ``faf_fit`` for map compose.
+        Fit ``atom_type_ids`` must match real-atom count of each molecule pack
+        (identical copies OK).
+        """
+        from spammm.surfaces.FoldedRigid import Z_SURF_TOP
+        fit_result = dict(fit_result)
+        z = float(Z_SURF_TOP + z_init)
+        out = self.download_outputs()
+        pos = out['pos'].copy()
+        pos[:, 2] = z
+        self.toGPU('poss', pos)
+        if self._mb_pos is not None:
+            self._mb_pos[:, 2] = z
+        # Refresh PairFF params (k_z / z_target) without wiping FAF later
+        ph = self.pairff_params_host or {}
+        self.init_pairff(
+            He=ph.get('He', -1.0), rc=ph.get('rc', 3.0), w=ph.get('w', 0.7),
+            k_z=float(k_z), morse_alpha=ph.get('morse_alpha', 1.8),
+            z_target=z, Hs=ph.get('Hs', 1.0),
+            epair_dist=ph.get('epair_dist', 1.4), sigma_dist=ph.get('sigma_dist', 1.0),
+            mode=self.pairff_mode, beta=ph.get('beta', 1.7),
+        )
+        atype = self._folded_types_all_sites(fit_result)
+        coeffs = np.asarray(fit_result['coeffs'], dtype=np.float32)
+        kxyz = np.asarray(fit_result['basis_params'], dtype=np.float32)
+        lvec2d = np.asarray(fit_result['folded_lvec2d'], dtype=np.float32)
+        ntypes, nbasis = coeffs.shape
+        self.init_folded(coeffs, kxyz, atype, lvec2d,
+                         folded_meta=np.array([nbasis, ntypes, 0, 0], dtype=np.int32))
+        self.faf_fit = fit_result
+        self.map_z = z
+        if enable:
+            self.enable_pairff_faf(True)
+        if self.allmol_mode:
+            self._refresh_static_view_hosts()
+        return self
+
+    def run_pairff(self, num_steps, dt, lin_damp=0.92, ang_damp=0.88, fire=False, faf=None):
+        """Run PairFF (optional fused FAF) for num_steps inside one GPU launch.
+
+        faf: None → use self.faf_mode; True/False overrides for this call.
+        allmol_mode: 1 workgroup, active_mol index; all poses stay on GPU.
+        """
+        use_faf = self.faf_mode if faf is None else bool(faf)
+        if use_faf and getattr(self, 'folded_params', None) is None:
+            raise RuntimeError("FAF PairFF run requires init_folded(...) first")
+        if self.allmol_mode:
+            if self.pairff_mode != PAIRFF_MODE_UNIFIED:
+                raise RuntimeError("allmol kernel requires pairff_mode='unified'")
+            if use_faf:
+                if self.pairff_allmol_faf_args is None:
+                    raise RuntimeError("allmol+FAF kernel not bound; call enable_pairff_faf(True)")
+                kname = "rigid_body_pairff_unified_allmol_faf_kernel"
+                krnl = self.krnl_pairff_allmol_faf
+            else:
+                if self.pairff_allmol_args is None:
+                    raise RuntimeError("allmol PairFF kernel not initialized; call init_pairff(...) first")
+                kname = "rigid_body_pairff_unified_allmol_kernel"
+                krnl = self.krnl_pairff_allmol
+        elif self.env_mode:
             if self.pairff_mode != PAIRFF_MODE_UNIFIED:
                 raise RuntimeError("Multi-body env kernel requires pairff_mode='unified'")
-            if self.pairff_env_args is None:
-                raise RuntimeError("Env PairFF kernel not initialized; call init_pairff(...) first")
-            kname = "rigid_body_pairff_unified_env_kernel"
-            krnl = self.krnl_pairff_env
+            if use_faf:
+                if self.pairff_env_faf_args is None:
+                    raise RuntimeError("Env+FAF PairFF kernel not initialized; call init_pairff(...) first")
+                kname = "rigid_body_pairff_unified_env_faf_kernel"
+                krnl = self.krnl_pairff_env_faf
+            else:
+                if self.pairff_env_args is None:
+                    raise RuntimeError("Env PairFF kernel not initialized; call init_pairff(...) first")
+                kname = "rigid_body_pairff_unified_env_kernel"
+                krnl = self.krnl_pairff_env
         elif self.pairff_mode == PAIRFF_MODE_UNIFIED:
-            if self.pairff_unified_args is None:
-                raise RuntimeError("Unified PairFF kernel not initialized; call init_pairff(...) first")
-            kname = "rigid_body_pairff_unified_kernel"
-            krnl = self.krnl_pairff_unified
+            if use_faf:
+                if self.pairff_unified_faf_args is None:
+                    raise RuntimeError("Unified+FAF PairFF kernel not initialized; call init_pairff(...) first")
+                kname = "rigid_body_pairff_unified_faf_kernel"
+                krnl = self.krnl_pairff_unified_faf
+            else:
+                if self.pairff_unified_args is None:
+                    raise RuntimeError("Unified PairFF kernel not initialized; call init_pairff(...) first")
+                kname = "rigid_body_pairff_unified_kernel"
+                krnl = self.krnl_pairff_unified
         else:
+            if use_faf:
+                raise RuntimeError("FAF fusion requires pairff_mode='unified' (legacy not supported)")
             if self.pairff_args is None:
                 raise RuntimeError("PairFF kernel not initialized; call init_pairff(...) first")
             kname = "rigid_body_pairff_kernel"
@@ -1909,24 +2311,49 @@ void rigid_body_pairff_unified_env_kernel(
         self.kernel_params['dt'] = np.float32(dt)
         self.kernel_params['niter'] = np.int32(num_steps)
         self.kernel_params['n_env_mols'] = np.int32(self.n_env_mols)
+        self.kernel_params['n_mols'] = np.int32(self.n_bodies)
+        self.kernel_params['active_mol'] = np.int32(self.active_body)
         if fire:
             self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, -1.0], dtype=np.float32)
         else:
             self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, 1.0], dtype=np.float32)
         args = self.generate_kernel_args(kname)
-        if self.env_mode:
-            self.pairff_env_args = args
+        if self.allmol_mode:
+            if use_faf:
+                self.pairff_allmol_faf_args = args
+            else:
+                self.pairff_allmol_args = args
+            # One workgroup for the active molecule (generalizable to N later)
+            global_size = (self.roundUpGlobalSize(self.nloc),)
+        elif self.env_mode:
+            if use_faf:
+                self.pairff_env_faf_args = args
+            else:
+                self.pairff_env_args = args
+            global_size = (self.roundUpGlobalSize(self.n_bodies * self.nloc),)
         elif self.pairff_mode == PAIRFF_MODE_UNIFIED:
-            self.pairff_unified_args = args
+            if use_faf:
+                self.pairff_unified_faf_args = args
+            else:
+                self.pairff_unified_args = args
+            global_size = (self.roundUpGlobalSize(self.n_bodies * self.nloc),)
         else:
             self.pairff_args = args
-        global_size = (self.roundUpGlobalSize(self.n_bodies * self.nloc),)
+            global_size = (self.roundUpGlobalSize(self.n_bodies * self.nloc),)
         local_size = (self.nloc,)
         krnl(self.queue, global_size, local_size, *args)
         self.queue.finish()
 
-    def relax_pairff(self, max_steps=500, dt=0.05, damp0=0.1, f_tol=1e-4, t_tol=1e-4, batch=64, body_id=0, record=False):
-        """FIRE relaxation using the pairff kernel with host-side early exit."""
+    def relax_pairff(self, max_steps=500, dt=0.05, damp0=0.1, f_tol=1e-4, t_tol=1e-4, batch=64, body_id=None, record=False):
+        """FIRE relaxation using the pairff kernel with host-side early exit.
+
+        body_id: which pose to monitor (default: active_body). In allmol_mode,
+        atom_positions download is already the active slice at index 0.
+        """
+        if body_id is None:
+            body_id = int(getattr(self, 'active_body', 0))
+        else:
+            body_id = int(body_id)
         hist = [] if record else None
         n_done = 0
         Fmag = Tmag = E = np.inf
@@ -1938,7 +2365,9 @@ void rigid_body_pairff_unified_env_kernel(
             out = self.download_outputs()
             F = out['body_force'][body_id, :3].astype(np.float64)
             Tw = out['body_torque'][body_id, :3].astype(np.float64)
-            E = float(out['atom_positions'][body_id][:, 3].sum())
+            # allmol download_outputs returns active sites as atom_positions[0]
+            atom_E = out['atom_positions'][0] if getattr(self, 'allmol_mode', False) else out['atom_positions'][body_id]
+            E = float(atom_E[:, 3].sum())
             Fmag = float(np.linalg.norm(F))
             Tmag = float(np.linalg.norm(Tw))
             if record:
@@ -2035,12 +2464,12 @@ void rigid_body_pairff_unified_env_kernel(
                        He=-0.1, rc=3.0, w=0.7, k_z=0.0, morse_alpha=1.8, z_target=None,
                        epair_dist=1.4, sigma_dist=1.0, Hs=1.0, beta=None,
                        debug=False):
-        """Build multi-body PairFF: one active integrator + fixed env neighbors (Strategy M).
+        """Build multi-body PairFF with shared all-molecule GPU buffers.
 
-        molecules: list of (apos, enames, REQs) or dicts with those keys
-        body_positions: (N,3) CoM positions
-        quats: optional (N,4); default identity
-        active_body: which molecule integrates (others are frozen env tiles)
+        All molecules stay resident (poses + body-frame sites). Only ``active_body``
+        integrates; neighbors contribute via tiled PairFF (j != active). Switching
+        active is an index write — no realloc / env rebuild. Dynamics for all
+        molecules remain persistent (ready for future all-mobile MD).
         """
         n = len(molecules)
         if n < 1:
@@ -2074,18 +2503,60 @@ void rigid_body_pairff_unified_env_kernel(
                 apos, enames, REQs, epair_dist=epair_dist, sigma_dist=sigma_dist,
                 He=He, Hs=Hs, w=w))
 
+        counts = np.array([len(p['types']) for p in packs], dtype=np.int32)
         rbd = cls(debug=debug)
         rbd.pairff_mode = PAIRFF_MODE_UNIFIED
-        rbd.env_mode = True
+        rbd.allmol_mode = True
+        rbd.env_mode = False
         rbd._mb_packs = packs
         rbd._mb_pos = body_positions.copy()
         rbd._mb_quat = quats.copy()
         rbd.active_body = active_body
-        rbd._upload_active_body_state(mass_trans=mass_trans, mass_rot=mass_rot)
-        rbd._rebuild_env_from_mb()
+        rbd.realloc_molecules(counts)
+
+        # Flat body-frame sites + REQ/type for all molecules
+        rel_flat = np.vstack([p['rel'] for p in packs]).astype(np.float32)
+        req_flat = np.vstack([p['REQ_ext'] for p in packs]).astype(np.float32)
+        type_flat = np.concatenate([p['types'] for p in packs]).astype(np.int32)
+        apos4 = np.zeros((rbd.total_atoms, 4), dtype=np.float32)
+        apos4[:, :3] = rel_flat[:, :3]
+        rbd.toGPU('apos_body', apos4)
+        rbd.toGPU('apos_world', np.zeros((rbd.total_atoms, 4), dtype=np.float32))
+        rbd.toGPU('atom_force', np.zeros((rbd.total_atoms, 4), dtype=np.float32))
+        rbd.toGPU('anchors', np.zeros((rbd.total_atoms, 4), dtype=np.float32))
+        rbd.upload_dyn_types_req(type_flat, req_flat)
+
+        pos4 = np.zeros((n, 4), dtype=np.float32)
+        pos4[:, :3] = body_positions
+        pos4[:, 3] = float(mass_trans)
+        quat4 = quats.astype(np.float32).copy()
+        zero4 = np.zeros((n, 4), dtype=np.float32)
+        Iinv = np.zeros((n, 3, 3), dtype=np.float32)
+        I = np.zeros((n, 3, 3), dtype=np.float32)
+        for i, p in enumerate(packs):
+            Iinv[i] = p['Iinv'] * (p['mtot'] / float(mass_rot))
+            I[i] = p['I'] * (float(mass_rot) / p['mtot'])
+        rbd.toGPU('poss', pos4)
+        rbd.toGPU('qrots', quat4)
+        rbd.toGPU('vposs', zero4)
+        rbd.toGPU('vrots', zero4)
+        rbd.toGPU('fire_state', zero4)
+        rbd.toGPU('body_force', zero4)
+        rbd.toGPU('body_torque', zero4)
+        rbd.toGPU('I_body_inv', _ensure_cl_mat3(Iinv, n))
+        rbd.toGPU('I_body', _ensure_cl_mat3(I, n))
+        rbd.mass_trans = float(mass_trans)
+        rbd.mass_rot = float(mass_rot)
+        rbd.kernel_params['n_mols'] = np.int32(n)
+        rbd.kernel_params['active_mol'] = np.int32(active_body)
+        rbd._apply_active_view_hosts()
+        rbd._refresh_static_view_hosts()
         rbd.init_pairff(He=He, rc=rc, w=w, k_z=k_z, morse_alpha=morse_alpha, z_target=z_target,
                         Hs=Hs, epair_dist=epair_dist, sigma_dist=sigma_dist,
                         mode=PAIRFF_MODE_UNIFIED, beta=beta)
+        # n_env_mols used by Vispy label / debug: neighbors count
+        rbd.n_env_mols = n - 1
+        rbd.n_env_sites = int(rbd.static_n)
         return rbd
 
 

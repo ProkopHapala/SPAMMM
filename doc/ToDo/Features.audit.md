@@ -35,9 +35,9 @@ Topology (AtomicGraph SSOT) → Type Assignment → Force Fields → Surface Int
 | [SPFF_cl.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/SPFF_cl.py:0:0-0:0) | ⚠️ Partially | [test_forcefield.py](cci:7://file:///home/prokop/git/SPAMMM/tests/test_forcefield.py:0:0-0:0) | EF correspondence ✅ (pi-sigma bug fixed), relaxation stubs only, no non-bonded tests |
 | [UFFbuilder.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/UFFbuilder.py:0:0-0:0) | ✅ Active | Implicit | UFF parameter assignment |
 | [SPFFbuilder.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/SPFFbuilder.py:0:0-0:0) | ✅ Active | Implicit | SPFF topology builder |
-| [RigidBodyDynamics.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/RigidBodyDynamics.py:0:0-0:0) | ✅ Active | [test_folded_relax.py](cci:7://file:///home/prokop/git/SPAMMM/tests/test_folded_relax.py:0:0-0:0) (5 tests) | 6-DOF rigid body, GPU, folded basis + **PairFF** (`RigidBodyPairFF`, unified/env Strategy M) |
+| [RigidBodyDynamics.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/RigidBodyDynamics.py:0:0-0:0) | ✅ Active | [test_folded_relax.py](cci:7://file:///home/prokop/git/SPAMMM/tests/test_folded_relax.py:0:0-0:0) (5 tests) | 6-DOF rigid body, GPU, folded basis + **PairFF** (`RigidBodyPairFF`, allmol ± FAF) |
 | [RigidBodyAFM.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/RigidBodyAFM.py:0:0-0:0) | ✅ Active | [test_folded_relax.py](cci:7://file:///home/prokop/git/SPAMMM/tests/test_folded_relax.py:0:0-0:0) | Anchor springs, manipulation |
-| `GUI/RigidBodyVispy.py` + `demos/demo_pairff.py` | ✅ Active | Demo / headless | PairFF Vispy: FIRE default ON, click-to-select active, `--mols` mixed species — [PairFF_manual.md](../../demos/PairFF_manual.md) |
+| `GUI/RigidBodyVispy.py` + `demos/demo_pairff.py` | ✅ Active | Demo / headless | PairFF Vispy: FIRE ON, click-to-select, `--mols`, `--faf` map compose — [PairFF_manual.md](../../demos/PairFF_manual.md) |
 | [QEq.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/QEq.py:0:0-0:0) | ✅ Active | No test | Charge equilibration |
 | [Assembly.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/Assembly.py:0:0-0:0) | ⚠️ Visual only | [testplot_assembly.py](cci:7://file:///home/prokop/git/SPAMMM/tests/testplot_assembly.py:0:0-0:0) (L2 only) | No L0 pytest yet |
 | [FFController.py](cci:7://file:///home/prokop/git/SPAMMM/spammm/forcefields/FFController.py:0:0-0:0) | ✅ Active | No direct test | FF orchestration |
@@ -166,7 +166,7 @@ Plus: 42 topology editing tests, 5 folded rigid tests, 2 contact surface tests, 
 | Pauli \(A,\beta\) site maps | Global fits only; H≠N/C in pyridine | **High** — `Pauli_A_beta_KrigingTransferability.md` |
 | Fukui FDBM molecule panel | Ran cube/stock/prolonged; cube ES open; USER review | **High** — `ProlongedRadialBasis_DFTB.md`, `Fukui_FDBM_panel_notes_2026-07-23.md` |
 | Kekulé RI density | No atom+bond exponential fit yet | Medium — `Kekule_ExponentialDensityFit.md` |
-| 2.5D contact surface | Prototype OK; harden + hybrid decision | Medium — `Fast_2p5D_AFM_ContactSurface.md` |
+| 2.5D contact surface | Sphere h₀ + coarse dx; USER visual vs GridFF | Medium — `ContactSurface_2p5D_vs_GridFF_2026-07-24.md` |
 | DFTB+ density projection | Covered via FDBM tests; dedicated unit tests thin | Medium |
 | pySCF backend | No test | Medium |
 | GridFF construction/interpolation | No test | Medium |

@@ -7,17 +7,18 @@ aperiodic rigid molecules — same relaxation loop, far fewer degrees of freedom
 
 Design spec: [doc/Topics/AFM/ContactSurface_Static.md](../../doc/Topics/AFM/ContactSurface_Static.md)  
 Task SSOT: [doc/Tasks/Fast_2p5D_AFM_ContactSurface.md](../../doc/Tasks/Fast_2p5D_AFM_ContactSurface.md)  
-Debugging pitfalls: [doc/Takeways.md](../../doc/Takeways.md) (z alignment, F_ref layout, reg, weighting)
+Parity vs GridFF: [doc/Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md](../../doc/Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md)  
+Caveats: [doc/Caveats.md](../../doc/Caveats.md) §6 · Debugging: [doc/Takeways.md](../../doc/Takeways.md)
 
 ## File index
 
-- **ContactSurface.py** — GPU contact field: `ContactSurfaceCL` (brute reference, separable CG fit, PIC CG fit, eval); `SeparableParams`, `PICParams`, `select_contact_atoms`, `build_pic_buckets`, `build_contact_height_map`
+- **ContactSurface.py** — GPU contact field: sphere-envelope `h₀` (`build_contact_height_map` / `eval_sphere_contact_height`); `ContactSurfaceCL` (brute, separable CG, PIC); `SeparableParams`, `PICParams`
 - **GridFF.py** — PyOpenCL B-spline grid force field for periodic substrates (Pauli/London/Coulomb channels)
 - **SurfaceEwald.py** — GPU 2D Ewald summation for electrostatic potentials/fields above periodic surfaces
 - **Ewald2D.py** — NumPy 2D Ewald reference (plane-wave formulation, parity vs GPU)
 - **Surface_utils.py** — GridFF metadata, load precomputed grids, visualization, atom-position sampling
 - **GridFFRelaxedScan.py** — Relaxed PES scanning with full geometry relaxation at each grid point
-- **FoldedRigid.py** — Folded-basis rigid-body simulation (fit potentials, relaxation, manipulation, `setup_rigid_folded`)
+- **FoldedRigid.py** — Folded-basis rigid-body simulation (fit/load NaCl potentials, relaxation, manipulation, `setup_rigid_folded`); CPU map helpers `eval_folded_potential_grid` / `faf_type_idx_for_probe` for PairFF Vispy compose
 - **SubstrateBuilder.py** — Crystal slab generation (NaCl, CaF₂): flat slabs and step edges
 - **surface_plots.py** — Matplotlib plots for relaxation trajectories, lateral scans, manipulation
 
@@ -44,22 +45,17 @@ afm = AFMulator(use_morse=True, use_fire=False)
 afm.load_molecule('data/xyz/PTCDA.xyz')
 afm.assign_params(params_path='data/ElementTypes.dat', tip_R=0.0, tip_E=1.0)
 
-# --- Separable B-spline × poly ---
+# --- Separable B-spline × poly (atom-scale nodes; sphere h₀) ---
 sep = afm.fit_contact_surface(
-    margin=4.0, bspl_dx=0.2, poly_R=5.0, poly_z0=1.0, m_start=4, nz=6,
-    fit_z_adaptive=(1.0, 6.0, 0.1, 1.0),   # z offsets [Å] above zmax, adaptive dz
-    fit_dx=0.2, fit_force_weight=1.0,       # E + Fx,Fy,Fz rows, RMS-equalized
+    margin=4.0, bspl_dx=1.0, poly_R=4.0, poly_z0=0.0, m_start=4, nz=6,
+    fit_z_adaptive=(0.05, 4.0, 0.1, 0.8),
+    fit_dx=1.0, fit_force_weight=1.0,
+    h0_mode='spheres', h0_R_scale=0.75,   # clamp in hard repulsion, not at well
 )
-FEs, pts = afm.run_scan_contact(nxy=(99, 75), nz=25, dtip=-0.15, ...)
-
-# --- PIC radial (contact atoms) ---
-pic = afm.fit_pic_contact_surface(
-    margin=4.0, poly_R=5.0, m_start=4, nz=5, cell_size=10.0,
-    z_local=1.2, xy_radius=14.0, reg=1e-2,
-    fit_z_adaptive=(1.0, 6.0, 0.1, 1.0), fit_dx=0.2,
-)
-FEs_pic, pts = afm.run_scan_pic(nxy=(99, 75), nz=25, dtip=-0.15, ...)
+FEs, pts = afm.run_scan_contact(nxy=(…), nz=25, dtip=-0.15, ...)
 ```
+
+Assembly screening defaults: `--bspl-dx 1.0 --scan-dx 0.5 --h0-R-scale 0.75` (`run_assembly_afm.py`).
 
 Legacy 3D reference: `setup_grid()` → `make_forcefield()` → `run_scan()`.
 
@@ -67,20 +63,21 @@ Legacy 3D reference: `setup_grid()` → `make_forcefield()` → `run_scan()`.
 
 | Script | Level | Output |
 |--------|-------|--------|
-| `tests/testplot_contact_surface.py` | L1+L2 | `debug/testplot_contact_surface/` — fit, z-alignment, separable + PIC parity, PP relaxed |
-| `tests/SPM/test_afm_contact_surface.py` | L0 | Force-stencil parity, separable `run_scan_contact` smoke |
-| `tests/SPM/testplot_afm_contact_surface.py` | L2 | `debug/testplot_afm_contact_surface/` — PP Fz/df vs 3D |
-
-Run full visual stack: `RUN_CONTACT_PP=1 python tests/testplot_contact_surface.py`
+| `tests/testplot_contact_surface.py` | L1+L2 | `debug/testplot_contact_surface/` — fit, parity, `--toys` |
+| `tests/SPM/test_afm_contact_surface.py` | L0 | Force-stencil parity |
+| `tests/SPM/testplot_afm_contact_surface.py` | L2 | PP Fz/df vs 3D |
+| `run_assembly_afm.py --compare-dir` | L2 | helicene contact vs GridFF maps + E/Fz profiles |
 
 ### Key fit knobs
 
 | Parameter | Separable | PIC | Notes |
 |-----------|-----------|-----|-------|
-| Lateral sample/grid step | `bspl_dx`, `fit_dx` | `fit_dx` | 0.2 Å typical for PTCDA |
-| z fit range | `fit_z_adaptive` | same | Probe z = `zmax + offset`, not tip height |
-| Poly cutoff | `poly_R`, `poly_z0` | `poly_R` | `t = 1 − clamp((dz−z_poly0)/Rc,0,1)` |
-| Modes | `m_start`, `nz` | `m_start`, `nz` | Doubling powers `t^(m·2^k)` |
+| Lateral nodes | `bspl_dx` | `fit_dx` | **~1.0 Å** atom-scale (was 0.2 — too fine) |
+| Image pixels | `scan_dx` (CLI) | same | **~0.5 Å** default in assembly |
+| `h₀` | `h0_mode='spheres'`, `h0_R_scale=0.75` | — | Not `atom_z`; scale&lt;1 so clamp is repulsive |
+| z fit range | `fit_z_adaptive` | same | Offsets **above contact** `h₀`, not bare zmax |
+| Poly cutoff | `poly_R`, `poly_z0` | `poly_R` | |
+| Modes | `m_start`, `nz` | same | |
 | Regularization | global `0`, tiles `1e-2` | **`1e-2`** | PIC diverges at `1e-4` |
-| Sample weights | Boltzmann on | **off** (logged only) | See Takeways |
+| Sample weights | Boltzmann on | **off** | See Takeways |
 | Force loss | `fit_force_weight` | not yet | Planar `F_ref` upload critical |

@@ -1,18 +1,20 @@
 # Task: PairFF multi-body kernel — one active relaxer, many fixed neighbors
 
-**Status:** investigating — USER confirmed Vispy click-to-select + mixed `--mols`; FIRE default ON; docs in `demos/PairFF_manual.md` (awaiting explicit Done before closing)  
-**Implemented:**
-- Kernel 9 in `kernels/rigid.cl` — per-`mol_j` local tiles
-- `RigidBodyPairFF.from_molecules` / `set_active_body` / `alloc_pairff_env` / `upload_env`
-- Vispy: LMB on any molecule → `set_active_body` + rebuild env + recompute potential map; **FIRE default ON**
-- Mixed species via `from_molecules` / demo `--mols`
-- Docs: `demos/PairFF_manual.md`, `doc/TopicalAudit/PairFF_RigidBody.md`, `doc/Topics/ForceFields/PairFF.md`
+**Status:** Done (USER confirmed click-to-select + mixed `--mols` + allmol persistent dynamics; FAF path in `PairFF_FAF_Substrate.md`).  
+**Implemented (current SSOT = shared allmol buffers):**
+- Kernels 12–13 in `kernels/rigid.cl` — `rigid_body_pairff_unified_allmol[_faf]_kernel` (preferred)
+- Kernel 9 — `*_env_*` kept for compat (rebuild env on switch; not demo default)
+- `from_molecules` → flat packs + `realloc_molecules`; `set_active_body` = **index only** (no realloc / no vel zero)
+- Vispy: LMB → active; map rebuild; **FIRE default ON**; optional FAF compose
+- Mixed species via `--mols`; identical N via `--bodies`
+- Docs: `demos/PairFF_manual.md`, topical audit, design report, FAF task
 - Demo:
   - `python3 demos/demo_pairff.py --bodies 4 --active 0`
   - `python3 demos/demo_pairff.py --mols PTCDA.xyz HCOOH.xyz formamide.xyz --spacing 12`
+  - `python3 demos/demo_pairff.py --bodies 4 --faf`
 **Priority:** P0 before GUI integration (`PairFF_GUI_Integration.md`)  
-**Depends on:** `RigidBodyPairFF`, `rigid_body_pairff_unified_kernel`, `demos/demo_pairff.py`  
-**Related:** `kernels/rigid.cl`, `kernels/assembly.cl` (tiled neighbor loops), `doc/Tasks/RigidBodyDynamicsWithFoldedBasisSubstrate.md`
+**Depends on:** `RigidBodyPairFF`, `demos/demo_pairff.py`  
+**Related:** `kernels/rigid.cl`, `doc/Tasks/PairFF_FAF_Substrate.md`, `doc/Tasks/RigidBodyDynamicsWithFoldedBasisSubstrate.md`
 
 ---
 
@@ -31,8 +33,8 @@ This matches the ultimate assembly application: many adsorbates, relax one at a 
 `from_molecules` takes a **list of independent** `(apos, enames, REQs)` packs — species need not match. Constraints:
 
 - Unified kernel only (`--pairff-mode unified`)
-- Each env molecule tile ≤ **128** sites (atoms + epairs + sigma holes)
-- Switching active body reallocates the dynamic body to that molecule’s site count
+- Each molecule tile ≤ **128** sites (atoms + epairs + sigma holes)
+- Switching active body is an **index write** (allmol); irregular site counts via `mols[]` offsets — **no** realloc
 
 There is **no** `data/xyz/NTCDA.xyz` yet (ASCII template exists in `ascii_art_heterocycle.py`); use `PTCDA.xyz` or export an XYZ. `formamide.xyz` = HCONH2.
 

@@ -26,10 +26,9 @@ Open issues / caveats:
     is the imaging object; exp(β,r0) bypasses WFC and hides the prolonged-tail effect.
   - Dual-basis AFM rule (prolonged Pauli only) does NOT apply to STM ψ — prolonged radial
     is the map. See doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md.
-  - All-electron cube ES: fake Δρ dipoles from crude NA (Gauss/compact) dominate PBC V_ES
-    asymmetry — NOT the Poisson solver. Prefer ρ_N−ρ_NA.cube when available. Canonical
-    diagnostic: plot_cube_delta_rho_na_origin_diag → dipole_origin_bisect.png.
-    See doc/Caveats.md.
+  - All-electron cube ES: keep cube nodes and (sx,sy,sz); clamp unresolved core cusps,
+    then use element-invariant compact compensation. ρ_NA.cube is a diagnostic control,
+    not a production dependency. See plot_cube_delta_rho_na_origin_diag / doc/Caveats.md.
 """
 
 import numpy as np
@@ -1017,31 +1016,45 @@ def plot_fdbm_methods_zcompare_4panel(
     return fig, axes
 
 
+def mirror_difference_2d(arr, axis=0, center=None):
+    """Return ``arr-r(mirror)`` about a possibly fractional pixel center."""
+    a = np.asarray(arr, dtype=np.float64)
+    if a.ndim != 2 or axis not in (0, 1):
+        raise ValueError(f'mirror_difference_2d: need 2D and axis 0/1, got {a.shape}, axis={axis}')
+    if center is None:
+        ij = np.unravel_index(int(np.argmax(np.abs(a))), a.shape)
+        center = float(ij[axis])
+    c = float(center)
+    n = a.shape[axis]
+    i = np.arange(n, dtype=np.float64)
+    j = 2.0 * c - i
+    valid = (j >= 0.0) & (j <= n - 1)
+    j0 = np.floor(j[valid]).astype(np.intp)
+    j1 = np.minimum(j0 + 1, n - 1)
+    w = j[valid] - j0
+    if axis == 0:
+        mirrored = (1.0 - w)[:, None] * a[j0, :] + w[:, None] * a[j1, :]
+        return a[valid, :] - mirrored
+    mirrored = (1.0 - w)[None, :] * a[:, j0] + w[None, :] * a[:, j1]
+    return a[:, valid] - mirrored
+
+
 def mirror_asymmetry_2d(arr, axis=0, center=None):
     """Mirror asymmetry of a 2D map about a horizontal (axis=0) or vertical (axis=1) line.
 
     axis=0: flip along x (rows) about `center` ix → left↔right asymmetry (molecule x-mirror).
     axis=1: flip along y (cols) about `center` iy → top↔bottom.
-    center: pixel index; default = peak of |arr| (robust for localized maps) else geometric mid.
+    center: fractional pixel index; default = peak of |arr| (robust for localized maps).
     Returns float in [0, ~2]: max|arr−mirrored| / (max|arr|+eps).
     """
     a = np.asarray(arr, dtype=np.float64)
     if a.ndim != 2:
         raise ValueError(f'mirror_asymmetry_2d: need 2D, got {a.shape}')
     peak = float(np.max(np.abs(a))) + 1e-30
-    if center is None:
-        ij = np.unravel_index(int(np.argmax(np.abs(a))), a.shape)
-        center = int(ij[axis])
-    c = int(center)
-    n = a.shape[axis]
-    r = int(min(c, n - 1 - c))
-    if r < 2:
+    diff = mirror_difference_2d(a, axis=axis, center=center)
+    if diff.shape[axis] < 5:
         return 1.0
-    if axis == 0:
-        crop = a[c - r:c + r + 1, :]
-        return float(np.max(np.abs(crop - crop[::-1, :])) / peak)
-    crop = a[:, c - r:c + r + 1]
-    return float(np.max(np.abs(crop - crop[:, ::-1])) / peak)
+    return float(np.max(np.abs(diff)) / peak)
 
 
 def com_pixel_xy(arr_nxny, origin, step):
@@ -1067,13 +1080,18 @@ def plot_cube_es_chain_diag(
     Reports mirror asymmetry about molecule COM for each field at each z_above.
     Tip panels use geometric mid of fftshifted maps (not mol COM).
     tip_tot/tip_del/E_ES may be None → field-only figure (native cube grid).
+    ``step`` may be float or (3,) cube spacing.
     """
+    if np.ndim(step) == 0:
+        sx = sy = sz = float(step)
+    else:
+        sx, sy, sz = (float(x) for x in np.asarray(step, dtype=np.float64).ravel()[:3])
     mol_z = float(np.asarray(atomPos)[:, 2].mean())
     nx, ny, nz = rho_scf.shape
-    z_coords = origin[2] + np.arange(nz, dtype=np.float64) * float(step)
+    z_coords = origin[2] + np.arange(nz, dtype=np.float64) * sz
     com_xy = np.asarray(atomPos, dtype=np.float64)[:, :2].mean(axis=0)
-    ix_c = int(np.clip(round((com_xy[0] - origin[0]) / step), 0, nx - 1))
-    iy_c = int(np.clip(round((com_xy[1] - origin[1]) / step), 0, ny - 1))
+    ix_c = float(np.clip((com_xy[0] - origin[0]) / sx, 0, nx - 1))
+    iy_c = float(np.clip((com_xy[1] - origin[1]) / sy, 0, ny - 1))
     has_tip = tip_tot is not None and tip_del is not None
     has_E = E_ES is not None
 
@@ -1098,10 +1116,10 @@ def plot_cube_es_chain_diag(
                              squeeze=False)
     lines = [title or 'cube ES chain',
              f'path: V_ES=fft_poisson(Δρ)  [NOT esp/locpot cube]; E_ES=conv(tip_Δρ,V_ES)',
-             f'grid={nx}x{ny}x{nz} step={step} origin={origin}  COM_xy={com_xy} ix,iy=({ix_c},{iy_c})',
+             f'grid={nx}x{ny}x{nz} step=({sx:.5f},{sy:.5f},{sz:.5f}) origin={origin}  COM_xy={com_xy} ix,iy=({ix_c},{iy_c})',
              '']
 
-    dV = float(step) ** 3
+    dV = float(sx * sy * sz)
     tip_q = f'  ∫tip={float(tip_tot.sum()*dV):.4f}  ∫tip_Δρ={float(tip_del.sum()*dV):.4e}' if has_tip else ''
     lines.append(f'∫ρ={float(rho_scf.sum()*dV):.4f}  ∫Δρ={float(rho_diff.sum()*dV):.4e}{tip_q}')
 
@@ -1115,8 +1133,8 @@ def plot_cube_es_chain_diag(
         im = ax.imshow(np.asarray(sl).T, **kw)
         ax.set_title(ttl, fontsize=7)
         ax.set_xticks([]); ax.set_yticks([])
-        cx = ix_c if cx is None else int(cx)
-        cy = iy_c if cy is None else int(cy)
+        cx = ix_c if cx is None else float(cx)
+        cy = iy_c if cy is None else float(cy)
         mx = mirror_asymmetry_2d(sl, axis=0, center=cx)
         my = mirror_asymmetry_2d(sl, axis=1, center=cy)
         ax.text(0.02, 0.98, f'mX={mx:.2e}\nmY={my:.2e}', transform=ax.transAxes,
@@ -1142,9 +1160,10 @@ def plot_cube_es_chain_diag(
             lines.append(f'  tip Δρ XY fftshift    mirrorX={mx:.3e}  mirrorY={my:.3e}')
 
     ir = n_z
-    lines.append(f'--- XZ @ iy={iy_c} (COM) ---')
+    iy_slice = int(round(iy_c))
+    lines.append(f'--- XZ @ iy={iy_slice} (nearest COM index {iy_c:.3f}) ---')
     for ic, (name, field, cmap, sym) in enumerate(field_cols):
-        sl = field[:, iy_c, :]
+        sl = field[:, iy_slice, :]
         _, mx, my = _show(axes[ir, ic], sl, cmap, sym, f'{name}\nXZ')
         lines.append(f'  {name:20s}  XZ mirrorX={mx:.3e}')
     if has_tip:
@@ -1193,34 +1212,41 @@ def plot_cube_delta_rho_na_origin_diag(
       Row0: ρ_N | Δρ=N−NA_cube | Δρ=N−GaussCORNER | Δρ=clamp→compact
       Row1: X-mirror resid of (NA_cube | GaussCORNER | GaussCENTER | clamp)
       Row2: V_ES=Poisson of same four Δρ fields
-    CORNER = ``make_gaussian_rho_na`` (origin+i·h); CENTER = half-voxel offset
-    (GridsOCL project convention) — both slope V but differently (x vs diagonal).
+    CORNER = ``make_gaussian_rho_na`` (origin+i·h); CENTER is retained only as an
+    explicit half-voxel A/B diagnostic. Cube fields and reported moments use nodes.
 
-    Finding: asymmetry is **not** in the pySCF (ρ_N, ρ_NA) pair; it appears when
-    we subtract our Gaussian/compact NA. AFM / PBC Poisson is extremely sensitive.
+    The compact reference uses element-invariant core compensation because unresolved
+    cusp samples must not assign different nuclear charges to equivalent atoms.
     """
     from . import AFM as afm_mod
 
     rho_scf = np.asarray(rho_scf, dtype=np.float64)
     origin = np.asarray(origin, dtype=np.float64).ravel()[:3]
-    step = float(step)
+    if np.ndim(step) == 0:
+        sx = sy = sz = float(step)
+    else:
+        sx, sy, sz = (float(x) for x in np.asarray(step, dtype=np.float64).ravel()[:3])
+    step3 = np.array([sx, sy, sz], dtype=np.float64)
     atomPos = np.asarray(atomPos, dtype=np.float64)
     atomZ = np.asarray(atomZ, dtype=np.float64).reshape(-1)
     nx, ny, nz = rho_scf.shape
-    dV = step ** 3
+    dV = float(sx * sy * sz)
     com = atomPos.mean(axis=0)
     mol_z = float(atomPos[:, 2].mean())
-    z_coords = origin[2] + step * np.arange(nz)
+    z_coords = origin[2] + sz * np.arange(nz)
     iz = int(np.clip(np.argmin(np.abs(z_coords - (mol_z + float(z_above)))), 0, nz - 1))
-    ix_c = int(np.clip(round((com[0] - origin[0]) / step), 0, nx - 1))
+    ix_c = float(np.clip((com[0] - origin[0]) / sx, 0, nx - 1))
 
     q_scf = float(rho_scf.sum() * dV)
     rho_na_g = make_gaussian_rho_na(
-        atomPos, atomZ, origin, step, (nx, ny, nz), sigma=sigma_na, rescale_to_q=q_scf)
+        atomPos, atomZ, origin, step3, (nx, ny, nz), sigma=sigma_na, rescale_to_q=q_scf)
     # CENTER-sampled Gauss (diagnostic only — cores miss corner-sampled ρ)
-    xs = origin[0] + step * (np.arange(nx) + 0.5)
-    ys = origin[1] + step * (np.arange(ny) + 0.5)
-    zs = origin[2] + step * (np.arange(nz) + 0.5)
+    xs = origin[0] + sx * (np.arange(nx) + 0.5)
+    ys = origin[1] + sy * (np.arange(ny) + 0.5)
+    zs = origin[2] + sz * (np.arange(nz) + 0.5)
+    xs_node = origin[0] + sx * np.arange(nx)
+    ys_node = origin[1] + sy * np.arange(ny)
+    zs_node = origin[2] + sz * np.arange(nz)
     norm = 1.0 / ((2.0 * np.pi * float(sigma_na) ** 2) ** 1.5)
     inv2s2 = 1.0 / (2.0 * float(sigma_na) ** 2)
     rho_na_gc = np.zeros_like(rho_scf)
@@ -1233,7 +1259,7 @@ def plot_cube_delta_rho_na_origin_diag(
     if qg > 1e-30:
         rho_na_gc *= q_scf / qg
     clamp = delta_rho_clamp_compact_na(
-        rho_scf.astype(np.float32), origin, step, atomPos, atomZ, rc_na=rc_na, R_sphere=rc_na)
+        rho_scf.astype(np.float32), origin, step3, atomPos, atomZ, rc_na=rc_na, R_sphere=rc_na)
 
     if rho_na_cube is None:
         raise ValueError(
@@ -1245,20 +1271,14 @@ def plot_cube_delta_rho_na_origin_diag(
     rd_clamp = np.asarray(clamp['rho_diff'], dtype=np.float64)
 
     def _pxy(rd):
-        xs_ = origin[0] + step * (np.arange(nx) + 0.5)
-        ys_ = origin[1] + step * (np.arange(ny) + 0.5)
-        zs_ = origin[2] + step * (np.arange(nz) + 0.5)
-        X, Y, Z = np.meshgrid(xs_, ys_, zs_, indexing='ij')
+        X, Y, Z = np.meshgrid(xs_node, ys_node, zs_node, indexing='ij')
         q = float(np.asarray(rd).sum() * dV)
         px = float((rd * X).sum() * dV) - q * com[0]
         py = float((rd * Y).sum() * dV) - q * com[1]
         return np.hypot(px, py)
 
     def _resid_x(sl):
-        r = min(ix_c, sl.shape[0] - 1 - ix_c)
-        if r >= 2:
-            return sl[ix_c - r:ix_c + r + 1, :] - sl[ix_c - r:ix_c + r + 1, :][::-1, :]
-        return sl - sl[::-1, :]
+        return mirror_difference_2d(sl, axis=0, center=ix_c)
 
     def _imshow(ax, data, *, cmap, sym, title_s):
         v = max(float(np.percentile(np.abs(data), 99)), 1e-30)
@@ -1294,8 +1314,8 @@ def plot_cube_delta_rho_na_origin_diag(
     fig, axes = plt.subplots(3, 4, figsize=(12.8, 9.0), squeeze=False)
     lines = [
         title or 'Δρ / NA origin diagnostic (NO dipole strip)',
-        'SSOT finding: V(N−NA_cube) clean; V(N−Gauss*) and V(clamp) carry fake dipole — see doc/Caveats.md',
-        f'grid={nx}x{ny}x{nz} step={step} iz={iz} z_mol+{z_above}',
+        'SSOT: cube nodes + (sx,sy,sz); compact NA uses element-invariant core compensation',
+        f'grid={nx}x{ny}x{nz} step=({sx:.5f},{sy:.5f},{sz:.5f}) iz={iz} z_mol+{z_above}',
         '',
     ]
     for ic, (name, sl, sym, cmap) in enumerate(row0):
@@ -1308,7 +1328,7 @@ def plot_cube_delta_rho_na_origin_diag(
                 title_s=f'{name}\nmax={np.max(np.abs(resid)):.2e}')
 
     for ic, (name, rd) in enumerate(v_fields):
-        V = afm_mod.fft_poisson_cpu(np.asarray(rd, dtype=np.float32), step)
+        V = afm_mod.fft_poisson_cpu(np.asarray(rd, dtype=np.float32), step3)
         slv = V[:, :, iz]
         mxv = mirror_asymmetry_2d(slv, axis=0, center=ix_c)
         pxy = _pxy(rd)
@@ -1318,8 +1338,7 @@ def plot_cube_delta_rho_na_origin_diag(
 
     fig.suptitle(
         (title or 'NATIVE: where does Δρ dipole come from? (NO manual dipole strip)') + '\n'
-        'our NA code uses CORNER samples; GridsOCL project uses CENTER — check misalignment. '
-        'See doc/Caveats.md',
+        'cube nodes and (sx,sy,sz) retained; compact compensation averaged per element. doc/Caveats.md',
         fontsize=10)
     fig.tight_layout(rect=[0, 0, 1, 0.92])
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or '.', exist_ok=True)
@@ -1940,7 +1959,7 @@ def soft_clamp_rational(y, y1, y2, dy=None):
 
 def delta_rho_clamp_compact_na(rho_scf, origin, step, atomPos, atomZ, *,
                                y1=None, y2=None, R_sphere=0.6, rc_na=0.6,
-                               profile='r2', valence_Z=None):
+                               profile='r2', valence_Z=None, q_na_mode='element_mean'):
     """All-electron Δρ recipe (CO guinea-pig): soft-clamp cores → compact NA.
 
     Distinguishes **all-electron** (Psi4/pySCF cubes, ∫ρ≈∑Z) from **DFTB valence**
@@ -1948,14 +1967,15 @@ def delta_rho_clamp_compact_na(rho_scf, origin, step, atomPos, atomZ, *,
 
     Steps:
       1. ρ_c = soft_clamp_rational(ρ_scf; y1,y2) — kill nuclear spikes
-      2. Per nucleus, Q_rem_i = ∫(ρ_scf−ρ_c) inside sphere R_sphere (charge removed)
+      2. Per nucleus, Q_rem_i = ∫(ρ_scf−ρ_c) inside sphere R_sphere (diagnostic)
       3. ρ_NA from compact f(r)=(1-(r/rc)^2)^2 (profile='r2') with per-atom charge
-         q_i = Z_i − Q_rem_i  ("NA charge − clamped charge")
+         q_i = Z_i − mean_element(Q_rem_i). The element mean prevents sub-voxel
+         sampling of unresolved all-electron cores from assigning different nuclear
+         compensation to symmetry-equivalent atoms. q_na_mode='per_atom' is legacy.
       4. Δρ = ρ_c − ρ_NA; require |∫Δρ| small (neutrality check)
 
-    Caveat (2026-07-24 pentacene): better than bare Gauss but **still** leaves a
-    large XY dipole vs ρ_N−ρ_NA.cube — do **not** treat as fixed ES. Prefer cube
-    ρ_NA when available. See ``doc/Caveats.md``, ``plot_cube_delta_rho_na_origin_diag``.
+    This removes the dominant pentacene alias dipole without requiring rho_NA.cube;
+    rho_NA.cube remains a useful diagnostic reference when available.
 
     Returns dict: rho_clamped, rho_na, rho_diff, Q_*, y1,y2, per-atom Q_rem, …
     """
@@ -2005,7 +2025,16 @@ def delta_rho_clamp_compact_na(rho_scf, origin, step, atomPos, atomZ, *,
     # Prefer sphere accounting; fall back to global excess if spheres miss
     Q_ex_global = Q_scf - Q_c
     Z_use = atomZ if valence_Z is None else np.asarray(valence_Z, dtype=np.float64).reshape(-1)
-    q_na = np.maximum(Z_use - Q_rem, 0.0)
+    if q_na_mode == 'element_mean':
+        Q_comp = Q_rem.copy()
+        for Zi in np.unique(atomZ):
+            m = atomZ == Zi
+            Q_comp[m] = np.mean(Q_rem[m])
+    elif q_na_mode == 'per_atom':
+        Q_comp = Q_rem.copy()
+    else:
+        raise ValueError(f"delta_rho_clamp_compact_na: q_na_mode must be 'element_mean' or 'per_atom', got {q_na_mode!r}")
+    q_na = np.maximum(Z_use - Q_comp, 0.0)
     # If sphere Q_rem under-counts vs global excess, scale q_na to match Q_c
     # Target: ∫ρ_NA = Q_c  ⇒  ∫Δρ = 0
     q_na_sum = float(q_na.sum())
@@ -2025,7 +2054,8 @@ def delta_rho_clamp_compact_na(rho_scf, origin, step, atomPos, atomZ, *,
         'y1': float(y1), 'y2': float(y2),
         'R_sphere': R_sphere, 'rc_na': rc_na, 'profile': profile,
         'Q_scf': Q_scf, 'Q_clamped': Q_c, 'Q_ex_global': float(Q_ex_global),
-        'Q_rem_spheres': Q_rem, 'Q_rem_tot': Q_rem_tot,
+        'Q_rem_spheres': Q_rem, 'Q_rem_compensation': Q_comp, 'Q_rem_tot': Q_rem_tot,
+        'q_na_mode': q_na_mode,
         'q_na_per_atom': q_na, 'Q_na': float(np.asarray(rho_na).sum() * dV),
         'Q_diff': Q_diff,
         'atomPos': atomPos, 'atomZ': atomZ,
@@ -2034,8 +2064,8 @@ def delta_rho_clamp_compact_na(rho_scf, origin, step, atomPos, atomZ, *,
 
 # REMOVED 2026-07-21: prepare_delta_rho_clamped (rescale cube ρ_NA to clamped ρ).
 # That recipe inverted V_ES morphology vs USER SSOT delta_rho_clamp_compact_na
-# (soft-clamp → rebuild compact NA from Z−Q_rem). Do not reintroduce.
-# All-electron Δρ SSOT: delta_rho_clamp_compact_na
+# (soft-clamp → element-mean compact NA). Do not reintroduce per-atom Q_rem→q_i.
+# All-electron Δρ SSOT: delta_rho_clamp_compact_na(q_na_mode='element_mean')
 
 
 def make_gaussian_rho_na(atomPos, atomZ, origin, step, ngrid, sigma=0.3, rescale_to_q=None):
@@ -2250,14 +2280,15 @@ def get_density_from_cube(cube_path_or_dir, *, esp_path=None, sigma_na=0.3,
     step_vec = np.asarray(step_b, dtype=np.float64).ravel()[:3] * BOHR_TO_ANG
     step_mean = float(np.mean(step_vec))
     aniso = float(np.max(np.abs(step_vec - step_mean)) / max(step_mean, 1e-30))
-    # pySCF cubes often have ~0.1% axis anisotropy from cell rounding — accept and use mean step
-    if aniso > 0.01:
-        raise ValueError(f"get_density_from_cube: non-isotropic cube step {step_vec} (aniso={aniso:.3e})")
-    step = step_mean
+    # Keep full (sx,sy,sz). Collapsing to mean warps NA vs ρ and injects fake Δρ dipoles
+    # even at ~0.1% aniso (pentacene 2026-07-24). Fail only if wildly non-ortho-cubic.
+    if aniso > 0.05:
+        raise ValueError(f"get_density_from_cube: cube step too anisotropic {step_vec} (aniso={aniso:.3e})")
+    step = step_vec.copy()  # (3,) Å — SSOT for native cube ops
     atomZ = np.array([a[0] for a in atoms_b], dtype=np.float64)
     atomPos = np.array([[a[1], a[2], a[3]] for a in atoms_b], dtype=np.float64) * BOHR_TO_ANG
 
-    dV = float(np.prod(step_vec))  # exact voxel volume even if mildly anisotropic
+    dV = float(np.prod(step_vec))
     q_scf = float(rho_scf.sum() * dV)
     na_kind = str(na_kind).lower().strip()
     if na_kind == 'gaussian':
@@ -2280,7 +2311,8 @@ def get_density_from_cube(cube_path_or_dir, *, esp_path=None, sigma_na=0.3,
 
     if verbosity >= 0:
         print(f"  [cube] {dt_path}")
-        print(f"  [cube] grid={nx}x{ny}x{nz} step={step:.5f}Å origin={origin}")
+        print(f"  [cube] grid={nx}x{ny}x{nz} step_vec={step_vec} Å (mean={step_mean:.5f}, aniso={aniso:.3e})")
+        print(f"  [cube] origin={origin}")
         print(f"  [cube] natoms={len(atomZ)} Zsum={atomZ.sum():.1f} na_kind={na_kind} {na_tag}")
         print(f"  [CHARGE CHECK] q_scf={q_scf:.6f} q_na={q_na:.6f} q_diff={q_diff:.6e}")
         if abs(q_diff) > 0.05:
@@ -2300,13 +2332,14 @@ def get_density_from_cube(cube_path_or_dir, *, esp_path=None, sigma_na=0.3,
         # After resample onto FDBM-friendly grids, callers can re-Poisson on GPU.
         V_ES = afm.fft_poisson_cpu(rho_diff, step)
         if verbosity >= 0:
-            print(f"  [cube] V_ES from fft_poisson_cpu (native cube grid)")
+            print(f"  [cube] V_ES from fft_poisson_cpu (native cube grid, aniso kx/ky/kz)")
 
+    sx, sy, sz = (float(x) for x in step_vec)
     grid_spec = {
         'origin': origin.copy(),
-        'dA': np.array([step, 0.0, 0.0]),
-        'dB': np.array([0.0, step, 0.0]),
-        'dC': np.array([0.0, 0.0, step]),
+        'dA': np.array([sx, 0.0, 0.0]),
+        'dB': np.array([0.0, sy, 0.0]),
+        'dC': np.array([0.0, 0.0, sz]),
         'ngrid': np.array([nx, ny, nz], dtype=int),
     }
     return {
@@ -2317,7 +2350,8 @@ def get_density_from_cube(cube_path_or_dir, *, esp_path=None, sigma_na=0.3,
         'origin': origin,
         'ngrid': np.array([nx, ny, nz], dtype=int),
         'grid_spec': grid_spec,
-        'step': step,
+        'step': step,           # (3,) Å — never collapse mild cube aniso to a mean
+        'step_mean': step_mean, # convenience for isotropic FDBM dest sizing only
         'atomPos': atomPos,
         'atomZ': atomZ,
         'q_scf': q_scf,
@@ -2328,6 +2362,7 @@ def get_density_from_cube(cube_path_or_dir, *, esp_path=None, sigma_na=0.3,
         'na_kind': na_kind,
         'cube_path': dt_path,
         'esp_path': esp_path,
+        'aniso': aniso,
     }
 
 
@@ -2451,20 +2486,30 @@ def resample_field_to_grid(field, origin_src, step_src, origin_dst, step_dst, ng
 
 
 def project_density_to_grid(field, origin_src, step_src, origin_dst, step_dst, ngrid_dst, *,
-                            grids=None):
+                            grids=None, src_convention='nodes'):
     """Charge+dipole-preserving densify/downsample via GridsOCL (grids.cl).
 
-    Each source voxel charge Q=ρ·dV is scattered onto 8 dest neighbors (trilinear
-    weights + atomic_add). This is the USER-approved method — **not**
-    ``resample_field_to_grid`` (scipy sample).
+    Each source sample charge Q=ρ·dV is scattered onto 8 destination nodes. The
+    low-level kernel locates sources at ``origin+(i+1/2)step``; cube fields are
+    node-sampled, so the default adapter shifts the kernel origin by ``-step/2``.
+    Pass ``src_convention='centers'`` only for actual cell-centered input.
 
     Returns (dst_field, grids_ocl_instance).
     """
     from spammm.utils.GridsOCL import GridsOCL
     if grids is None:
         grids = GridsOCL(preferred_vendor='nvidia')
+    origin_project = np.asarray(origin_src, dtype=np.float64).ravel()[:3]
+    if np.ndim(step_src) == 0:
+        step3 = np.full(3, float(step_src), dtype=np.float64)
+    else:
+        step3 = np.asarray(step_src, dtype=np.float64).ravel()[:3]
+    if src_convention == 'nodes':
+        origin_project = origin_project - 0.5 * step3
+    elif src_convention != 'centers':
+        raise ValueError(f"project_density_to_grid: src_convention must be 'nodes' or 'centers', got {src_convention!r}")
     dst = grids.project_density(
-        field, origin_src, step_src, origin_dst, step_dst, ngrid_dst)
+        field, origin_project, step_src, origin_dst, step_dst, ngrid_dst)
     return dst, grids
 
 
@@ -2477,16 +2522,13 @@ def allelectron_cube_to_fdbm_grid(rho_scf, origin_src, step_src, atomPos, atomZ,
     1. ``delta_rho_clamp_compact_na`` on the **native** cube grid.
     2. Optional ``strip_monopole_dipole`` (DEFAULT OFF — masks root cause; do not enable
        as a "fix").
-    3. ``project_density_to_grid`` for ρ_scf (Pauli) and Δρ (ES) — GridsOCL scatter
-       (voxel **centers**). Native NA builders use **corners** — see ``doc/Caveats.md``.
+    3. ``project_density_to_grid`` for ρ_scf (Pauli) and Δρ (ES); its cube-node
+       adapter matches the center-source convention of the low-level kernel.
     4. Tiny monopole strip after project if |∫Δρ| still large.
-
-    Status (2026-07-24): better than Gauss+scipy-sample, but clamp NA still leaves
-    XY dipole vs ρ_N−ρ_NA.cube. Prefer cube ρ_NA when available.
 
     Returns dict with rho_scf, rho_diff, clamp, q_*, p_diff, grids, …
     """
-    from spammm.utils.GridsOCL import grid_moments_centers
+    from spammm.utils.GridsOCL import grid_moments
 
     atomPos = np.asarray(atomPos, dtype=np.float64)
     com = atomPos.mean(axis=0)
@@ -2494,7 +2536,7 @@ def allelectron_cube_to_fdbm_grid(rho_scf, origin_src, step_src, atomPos, atomZ,
         rho_scf, origin_src, step_src, atomPos, atomZ,
         rc_na=float(rc_na), R_sphere=float(R_sphere), profile=profile)
     if verbosity >= 0:
-        print(f"  [cube-SSOT] clamp→compact_NA  Q_scf={clamp['Q_scf']:.3f} "
+        print(f"  [cube-SSOT] clamp→compact_NA[{clamp['q_na_mode']}]  Q_scf={clamp['Q_scf']:.3f} "
               f"Q_c={clamp['Q_clamped']:.3f} ∫Δρ_native={clamp['Q_diff']:.3e} "
               f"y1={clamp['y1']:.3g} y2={clamp['y2']:.3g} rc={rc_na}")
 
@@ -2523,7 +2565,7 @@ def allelectron_cube_to_fdbm_grid(rho_scf, origin_src, step_src, atomPos, atomZ,
             print(f"  [cube-SSOT] strip monopole after project q_diff={q_diff:.3e}")
         rho_diff_d = (rho_diff_d - q_diff / vol).astype(np.float32)
         q_diff = float(np.asarray(rho_diff_d, dtype=np.float64).sum() * dV)
-    _, p_world = grid_moments_centers(rho_diff_d, origin_dst, step)
+    _, p_world = grid_moments(rho_diff_d, origin_dst, step)
     p_diff = p_world - q_diff * com
     if verbosity >= 0:
         print(f"  [cube-SSOT] after project: q_scf={float(rho_scf_d.sum()*dV):.3f} "
@@ -2611,7 +2653,7 @@ def build_fdbm_grid_from_cubes(sample_cube_dir, tip_cube_dir, *, step=0.1, margi
     cube path is tip_Δρ ⊗ V_sample; see `doc/Tasks/Import_KrigingGridFF.md` session notes.
     """
     from . import AFM as afm_mod
-    from spammm.utils.GridsOCL import grid_moments_centers
+    from spammm.utils.GridsOCL import grid_moments
 
     d_s = get_density_from_cube(
         sample_cube_dir, sigma_na=sigma_na, rescale_na=True,
@@ -2660,11 +2702,13 @@ def build_fdbm_grid_from_cubes(sample_cube_dir, tip_cube_dir, *, step=0.1, margi
     spos = d_s['atomPos']
     z_mol = float(spos[:, 2].mean())
     # XY: union of atom bbox and density cube footprint
-    so, ss, sn = d_s['origin'], float(d_s['step']), d_s['rho_scf'].shape
+    so, ss, sn = d_s['origin'], np.asarray(d_s['step'], dtype=np.float64).ravel()[:3], d_s['rho_scf'].shape
+    if ss.size == 1:
+        ss = np.array([float(ss), float(ss), float(ss)])
     x0 = min(float(spos[:, 0].min()) - margin_xy, so[0] - 0.5)
-    x1 = max(float(spos[:, 0].max()) + margin_xy, so[0] + (sn[0] - 1) * ss + 0.5)
+    x1 = max(float(spos[:, 0].max()) + margin_xy, so[0] + (sn[0] - 1) * ss[0] + 0.5)
     y0 = min(float(spos[:, 1].min()) - margin_xy, so[1] - 0.5)
-    y1 = max(float(spos[:, 1].max()) + margin_xy, so[1] + (sn[1] - 1) * ss + 0.5)
+    y1 = max(float(spos[:, 1].max()) + margin_xy, so[1] + (sn[1] - 1) * ss[1] + 0.5)
     Lz = float(z_max - z_min)
     if Lz < 12.0:
         raise ValueError(
@@ -2702,7 +2746,7 @@ def build_fdbm_grid_from_cubes(sample_cube_dir, tip_cube_dir, *, step=0.1, margi
     q_scf = float(rho_scf.sum() * dV)
     q_diff = float(rho_diff.sum() * dV)
     q_tip_del = float(tip_del.sum() * dV)
-    _, p_diff = grid_moments_centers(rho_diff, origin, step)
+    _, p_diff = grid_moments(rho_diff, origin, step)
     # Only strip monopole if large; on a z-symmetric box this does not inject fake pz
     if abs(q_diff) > 1e-4:
         if verbosity >= 0:
@@ -2714,7 +2758,7 @@ def build_fdbm_grid_from_cubes(sample_cube_dir, tip_cube_dir, *, step=0.1, margi
             print(f"  [fdbm-cube] WARNING stripping tip monopole q_tip_del={q_tip_del:.3e}")
         tip_del = (tip_del - q_tip_del / vol).astype(np.float32)
         q_tip_del = float(tip_del.sum() * dV)
-    _, p_diff = grid_moments_centers(rho_diff, origin, step)
+    _, p_diff = grid_moments(rho_diff, origin, step)
 
     if A_pauli is None or beta_pauli is None:
         pa = afm_mod.PAULI_FITTED_DEFAULTS.get('pyscf_6-31g*', {'A': 40.0, 'beta': 1.15})

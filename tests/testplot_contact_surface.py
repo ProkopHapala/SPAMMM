@@ -33,15 +33,18 @@ PARAMS = os.path.join(_proj, 'data', 'ElementTypes.dat')
 PLOT_DIR = os.path.join(_proj, 'debug', 'testplot_contact_surface')
 MARGIN = 4.0
 SCAN_MARGIN = 4.0
-FIT_Z_LO, FIT_Z_HI = 1.0, 6.0
-FIT_DZ_LO, FIT_DZ_HI = 0.1, 1.0
+# Spherical Morse-R0 contact h₀; fit offsets are above h0_max (not bare atom zmax)
+H0_MODE = 'spheres'
+H0_R_SCALE = 0.75  # <1 so z0 clamp sits in hard repulsion (1.0 = Morse well → no wall)
+FIT_Z_LO, FIT_Z_HI = 0.05, 4.0
+FIT_DZ_LO, FIT_DZ_HI = 0.1, 0.8
 FIT_BOLTZMANN_T = None
 FIT_FORCE_WEIGHT = 1.0
 FIT_Z_PLANES = make_fit_z_planes_adaptive(FIT_Z_LO, FIT_Z_HI, FIT_DZ_LO, FIT_DZ_HI)
 ALPHA_MORSE = 1.8
 R_DAMP = 0.1
-POLY_Z0 = FIT_Z_LO
-POLY_R = FIT_Z_HI - FIT_Z_LO
+POLY_Z0 = 0.0
+POLY_R = 4.0
 M_START = 4
 NZ = 6
 PIC_CELL = 10.0
@@ -52,10 +55,11 @@ PIC_XY_RADIUS = 14.0
 PIC_REG = 1e-2
 BSPL_DX = 0.2
 FIT_DX, FIT_DY = BSPL_DX, BSPL_DX
-CLOSE_Z_OFFS = (1.0, 1.2, 1.5)
-PROFILE_Z_OFFS = np.arange(0.6, 7.01, 0.05)
+# Absolute h = z−zmax; tip_R=0 → R0≈1.7–2.0 Å, so these sit at/above contact
+CLOSE_Z_OFFS = (2.0, 2.5, 3.0)
+PROFILE_Z_OFFS = np.arange(1.5, 7.01, 0.05)
 ZSTACK_Z_OFFS = tuple(np.arange(2.0, 6.01, 0.5))
-FAR_Z_OFF = 3.0
+FAR_Z_OFF = 3.5
 PLOT_DX = 0.05
 ZSTACK_PLOT_DX = 0.15
 FZ_ACTIVE_THRESH = 0.01
@@ -168,18 +172,19 @@ def phase1_fit_close(afm, apos):
     x1f = float(apos[:, 0].max()) + MARGIN
     y0f = float(apos[:, 1].min()) - MARGIN
     y1f = float(apos[:, 1].max()) + MARGIN
-    print(f'  Phase1 fit: AFM brute  z∈[{FIT_Z_LO},{FIT_Z_HI}]Å  dz {FIT_DZ_LO}→{FIT_DZ_HI}Å  {len(FIT_Z_PLANES)} planes  dx={BSPL_DX}Å  Boltzmann T={FIT_BOLTZMANN_T or "auto"}  force_weight={FIT_FORCE_WEIGHT} (E,Fx,Fy,Fz)')
-    sep = afm.fit_contact_surface(margin=MARGIN, bspl_dx=BSPL_DX, poly_R=POLY_R, poly_z0=POLY_Z0, m_start=M_START, nz=NZ, fit_z_adaptive=(FIT_Z_LO, FIT_Z_HI, FIT_DZ_LO, FIT_DZ_HI), fit_dx=FIT_DX, fit_dy=FIT_DY, fit_boltzmann=True, fit_boltzmann_T=FIT_BOLTZMANN_T, fit_force_weight=FIT_FORCE_WEIGHT, n_iter=120, brute_ref='afm', bPrint=True)
+    print(f'  Phase1 fit: h0_mode={H0_MODE}  AFM brute  z∈[{FIT_Z_LO},{FIT_Z_HI}]Å above contact  dz {FIT_DZ_LO}→{FIT_DZ_HI}Å  {len(FIT_Z_PLANES)} planes  dx={BSPL_DX}Å  Boltzmann T={FIT_BOLTZMANN_T or "auto"}  force_weight={FIT_FORCE_WEIGHT} (E,Fx,Fy,Fz)')
+    sep = afm.fit_contact_surface(margin=MARGIN, bspl_dx=BSPL_DX, poly_R=POLY_R, poly_z0=POLY_Z0, m_start=M_START, nz=NZ, fit_z_adaptive=(FIT_Z_LO, FIT_Z_HI, FIT_DZ_LO, FIT_DZ_HI), fit_dx=FIT_DX, fit_dy=FIT_DY, fit_boltzmann=True, fit_boltzmann_T=FIT_BOLTZMANN_T, fit_force_weight=FIT_FORCE_WEIGHT, n_iter=120, brute_ref='afm', bPrint=True, h0_mode=H0_MODE, h0_R_scale=H0_R_SCALE)
     h0 = sep.h0_map
-    print(f'  h0: min={h0.min():.3f} max={h0.max():.3f} std={h0.std():.4f}  (flat mol → constant h₀; dz=z-h₀(x,y))')
+    z_ref = float(getattr(sep, 'z_ref', zmax))
+    print(f'  h0: min={h0.min():.3f} max={h0.max():.3f} std={h0.std():.4f}  z_ref={z_ref:.3f}  (spheres → corrugated envelope; dz=z−h₀)')
     plot_fit_weighting(sep, zmax)
 
     out_txt = os.path.join(PLOT_DIR, 'contact_surface_fit.out')
     with open(out_txt, 'w') as f:
-        f.write(f'molecule: PTCDA  atoms={len(apos)}  zmax={zmax:.3f}\n')
+        f.write(f'molecule: PTCDA  atoms={len(apos)}  zmax={zmax:.3f}  h0_mode={H0_MODE}  h0_R_scale={H0_R_SCALE}\n')
         f.write(f'fit reference: AFM evalMorseC_QZs_toImg-equivalent brute (cMs + tip charges)\n')
-        f.write(f'fit z adaptive offsets=[{FIT_Z_LO},{FIT_Z_HI}] dz={FIT_DZ_LO}..{FIT_DZ_HI}  planes={list(np.round(FIT_Z_PLANES, 4))}\n')
-        f.write(f'abs z=[{zmax + FIT_Z_LO:.2f},{zmax + FIT_Z_HI:.2f}]  poly_z0={POLY_Z0:.3f} poly_R={POLY_R:.3f} Boltzmann T={sep.fit_boltzmann_T:.4f} eV  force_weight={FIT_FORCE_WEIGHT} (E,Fx,Fy,Fz)\n')
+        f.write(f'fit z adaptive offsets above contact z_ref=[{FIT_Z_LO},{FIT_Z_HI}] dz={FIT_DZ_LO}..{FIT_DZ_HI}  planes={list(np.round(FIT_Z_PLANES, 4))}\n')
+        f.write(f'z_ref={z_ref:.3f}  abs z=[{z_ref + FIT_Z_LO:.2f},{z_ref + FIT_Z_HI:.2f}]  poly_z0={POLY_Z0:.3f} poly_R={POLY_R:.3f} Boltzmann T={sep.fit_boltzmann_T:.4f} eV  force_weight={FIT_FORCE_WEIGHT} (E,Fx,Fy,Fz)\n')
         f.write(f'bspl={sep.ncx}x{sep.ncy}  nz={NZ}  n_coeff={sep.n_coeff}\n')
         f.write(f'h0 min={h0.min():.4f} max={h0.max():.4f} std={h0.std():.6f}\n')
     print(f'REVIEW: {out_txt}')
@@ -804,7 +809,298 @@ def phase3_pp_afm_pic(pic, apos):
     return rmse_fz
 
 
-def main():
+# ---------------------------------------------------------------------------
+# Toy systems: rigid FF parity (brute vs contact-sep vs GridFF) — no PP relax
+# ---------------------------------------------------------------------------
+
+TOY_DIR = os.path.join(PLOT_DIR, 'toys')
+
+# PTCDA-tuned atom-z legacy vs assembly-old vs spherical contact (intended)
+FIT_KNOBS = {
+    'atomz_ptcda': dict(margin=4.0, bspl_dx=0.2, poly_R=5.0, poly_z0=1.0, m_start=4, nz=6,
+                        fit_z_adaptive=(1.0, 6.0, 0.1, 1.0), fit_force_weight=1.0, n_iter=80,
+                        h0_mode='atom_z'),
+    'atomz_assembly_old': dict(margin=3.0, bspl_dx=0.2, poly_R=10.0, poly_z0=0.0, m_start=4, nz=5,
+                               fit_z_adaptive=(1.0, 5.0, 0.2, 0.8), fit_force_weight=0.5, n_iter=60,
+                               h0_mode='atom_z'),
+    'spheres': dict(margin=4.0, bspl_dx=0.2, poly_R=4.0, poly_z0=0.0, m_start=4, nz=6,
+                    fit_z_adaptive=(0.05, 4.0, 0.1, 0.8), fit_force_weight=1.0, n_iter=80,
+                    h0_mode='spheres', h0_R_scale=0.75),
+}
+
+TOY_XY_ZOFFS = (2.0, 3.0, 4.0)  # h_probe = z - zmax for xy slices
+TOY_PROFILE_H = np.arange(0.8, 8.01, 0.05)
+
+
+def _write_toy_xyz(path, apos, enames, qs):
+    apos = np.asarray(apos, dtype=np.float64).reshape(-1, 3)
+    qs = np.asarray(qs, dtype=np.float64).reshape(-1)
+    with open(path, 'w') as f:
+        f.write(f'{len(apos)}\n')
+        f.write('toy contact-surface FF parity\n')
+        for i, en in enumerate(enames):
+            x, y, z = apos[i]
+            f.write(f'{en} {x:.6f} {y:.6f} {z:.6f} {qs[i]:.6f}\n')
+
+
+def _make_afm_from_xyz(xyz_path, tip_R=0.0, tip_E=1.0, zero_tip_q=True):
+    from spammm.SPM.AFM import AFMulator
+    afm = AFMulator(use_morse=True, use_fire=False)
+    afm.load_molecule(xyz_path)
+    afm.assign_params(params_path=PARAMS, tip_R=tip_R, tip_E=tip_E)
+    if zero_tip_q:
+        afm.tipQs[:] = 0.0
+    return afm
+
+
+def _fit_sep(afm, knobs):
+    kw = dict(knobs)
+    return afm.fit_contact_surface(**kw, fit_boltzmann=True, brute_ref='afm', bPrint=True)
+
+
+def _ensure_gridff(afm, dx=0.25, margin=4.0, z_top=10.0):
+    """Build 3D img_FF once in world frame (shift_atoms=False)."""
+    if getattr(afm, '_toy_gridff_ready', False):
+        return
+    n_grid = _grid_n(afm.atoms_arr[:, :3], margin, z_top, dx)
+    afm.setup_grid(n=n_grid, margin=margin, z_top=z_top, shift_atoms=False)
+    afm.make_forcefield()
+    afm._toy_gridff_ready = True
+    print(f'  GridFF ready n={tuple(int(v) for v in afm.n)} dx≈{dx}Å (world frame)')
+
+
+def _sample_gridff_raw(afm, queries):
+    """Sample existing GridFF at absolute probe positions via get_raw_FE (tip+dpos0)."""
+    queries = np.ascontiguousarray(queries, dtype=np.float32).reshape(-1, 3)
+    d0 = float(afm.dpos0[2])
+    out_E = np.zeros(len(queries), dtype=np.float64)
+    out_Fz = np.zeros(len(queries), dtype=np.float64)
+    xy = np.round(queries[:, :2], 6)
+    keys = {}
+    for i, (x, y) in enumerate(xy):
+        keys.setdefault((float(x), float(y)), []).append(i)
+    zd = np.zeros(3, dtype=np.float32)
+    for (x, y), idxs in keys.items():
+        zs = queries[idxs, 2]
+        order = np.argsort(-zs)  # top → bottom
+        idxs_o = [idxs[j] for j in order]
+        zs_o = zs[order]
+        if len(zs_o) == 1:
+            dtip, nz, hp0 = -0.05, 1, float(zs_o[0])
+        else:
+            dtip, nz, hp0 = float(zs_o[1] - zs_o[0]), len(zs_o), float(zs_o[0])
+        scan0 = np.array([x, y, hp0 - d0], dtype=np.float32)
+        Fraw, _ = afm.get_raw_FE(nxy=(1, 1), nz=nz, dtip=dtip, scan_p0=scan0, scan_da=zd, scan_db=zd)
+        for k, ii in enumerate(idxs_o):
+            out_E[ii] = float(Fraw[0, 0, k, 3])
+            out_Fz[ii] = float(Fraw[0, 0, k, 2])
+    return out_E, out_Fz
+
+
+def run_one_toy(name, apos, enames, qs, knobs_name, knobs, tip_R=0.0, tip_E=1.0):
+    """Rigid FF: brute vs contact-sep vs GridFF — xy maps + E/Fz(z) at atom.
+    tip_R=0, tip_E=1 matches PTCDA harness (deeper Morse well; easier visual parity)."""
+    sub = os.path.join(TOY_DIR, f'{name}_{knobs_name}')
+    os.makedirs(sub, exist_ok=True)
+    xyz = os.path.join(sub, 'toy.xyz')
+    _write_toy_xyz(xyz, apos, enames, qs)
+
+    afm = _make_afm_from_xyz(xyz, tip_R=tip_R, tip_E=tip_E, zero_tip_q=True)
+    apos_w = afm.atoms_arr[:, :3].copy()
+    zmax = float(apos_w[:, 2].max())
+    R0 = float(afm.cLJs_arr[0, 0])  # Morse R0 of first atom
+    print(f'\n=== TOY {name} / knobs={knobs_name}  nat={len(apos_w)} zmax={zmax:.3f} R0[0]={R0:.3f} ===')
+    print(f'  knobs: poly_z0={knobs["poly_z0"]} poly_R={knobs["poly_R"]} nz={knobs["nz"]} '
+          f'bspl_dx={knobs["bspl_dx"]} fit_z={knobs["fit_z_adaptive"]} force_w={knobs["fit_force_weight"]}')
+
+    sep = _fit_sep(afm, knobs)
+    h0 = sep.h0_map
+    print(f'  sep: bspl={sep.ncx}x{sep.ncy} nz={sep.nz} n_coeff={sep.n_coeff}  '
+          f'h0=[{h0.min():.3f},{h0.max():.3f}]  poly_z0={sep.poly_z0} poly_R={sep.poly_R}  '
+          f'h0_mode={getattr(sep, "h0_mode", "?")} z_ref={getattr(sep, "z_ref", float("nan")):.3f}')
+
+    margin = float(knobs['margin'])
+    _ensure_gridff(afm, dx=0.25, margin=margin + 1.0, z_top=10.0)
+
+    # --- 1D profile above atom 0 (and midpoint for 2-atom) ---
+    sites = [('atom0', apos_w[0, :2])]
+    if len(apos_w) >= 2:
+        mid = 0.5 * (apos_w[0, :2] + apos_w[1, :2])
+        sites.append(('mid', mid))
+        sites.append(('atom1', apos_w[1, :2]))
+
+    hp = TOY_PROFILE_H
+    fig, axes = plt.subplots(2, len(sites), figsize=(4.2 * len(sites), 7.2), sharex=True, squeeze=False)
+    summary = []
+    z_ref = float(getattr(sep, 'z_ref', zmax))
+    # fit_z_adaptive offsets are above z_ref (=h0_max for spheres, zmax for atom_z)
+    flo = (z_ref - zmax) + knobs['fit_z_adaptive'][0]
+    fhi = (z_ref - zmax) + knobs['fit_z_adaptive'][1]
+    for si, (sname, xy) in enumerate(sites):
+        x, y = float(xy[0]), float(xy[1])
+        zq = np.column_stack([np.full(len(hp), x), np.full(len(hp), y), zmax + hp]).astype(np.float32)
+        E_br, F_br = afm._brute_afm_morse_c_queries(zq)
+        E_cs, F_cs = afm._cs_fit_helper().eval_separable(zq, sep)
+        E_g, Fz_g = _sample_gridff_raw(afm, zq)
+        Fz_br, Fz_cs = F_br[:, 2], F_cs[:, 2]
+
+        mask = (hp >= flo) & (hp <= fhi)
+        shifts = np.linspace(-1.5, 1.5, 601)
+        best = (float('inf'), 0.0)
+        for dz in shifts:
+            shifted = np.interp(hp[mask], hp + dz, Fz_cs, left=np.nan, right=np.nan)
+            ok = np.isfinite(shifted)
+            if np.any(ok):
+                err = _rmse(shifted[ok], Fz_br[mask][ok])
+                if err < best[0]:
+                    best = (err, float(dz))
+
+        i_well_br = int(np.argmin(np.where(mask, E_br, np.inf)))
+        i_well_cs = int(np.argmin(np.where(mask, E_cs, np.inf)))
+        line = (f'{sname} xy=({x:.2f},{y:.2f})  Ewell_br={E_br[i_well_br]:.4f}@{hp[i_well_br]:.2f}Å  '
+                f'Ewell_cs={E_cs[i_well_cs]:.4f}@{hp[i_well_cs]:.2f}Å  '
+                f'Δh_well={hp[i_well_cs]-hp[i_well_br]:+.3f}Å  best_Fz_shift={best[1]:+.3f}Å  '
+                f'rmse_E_fit={_rmse(E_cs[mask], E_br[mask]):.3e} rmse_Fz_fit={_rmse(Fz_cs[mask], Fz_br[mask]):.3e}  '
+                f'rmse_E_g_fit={_rmse(E_g[mask], E_br[mask]):.3e} rmse_Fz_g_fit={_rmse(Fz_g[mask], Fz_br[mask]):.3e}')
+        summary.append(line)
+        print(f'  {line}')
+
+        axE, axF = axes[0, si], axes[1, si]
+        axE.plot(hp, E_br, 'k-', lw=1.8, label='brute')
+        axE.plot(hp, E_cs, 'C0--', lw=1.3, label='contact-sep')
+        axE.plot(hp, E_g, 'C1-.', lw=1.2, label='GridFF raw')
+        axE.axvline(R0, color='0.5', ls=':', lw=0.8, label=f'R0={R0:.2f}')
+        axE.axvline(h0.max() - zmax, color='C2', ls='-.', lw=1.0, alpha=0.8, label=f'h0_max−zmax={h0.max()-zmax:.2f}')
+        axE.axvline(sep.poly_z0 + (h0.max() - zmax), color='C3', ls=':', lw=0.8, alpha=0.7, label='h0+poly_z0')
+        axE.axvline(sep.poly_z0 + sep.poly_R + (h0.max() - zmax), color='C3', ls='--', lw=0.7, alpha=0.5, label='h0+z0+Rc')
+        axE.axvspan(flo, fhi, color='0.9', alpha=0.45)
+        # Zoom to fit-window energy scale (Pauli wall below z0 dwarfs meV well on full scale)
+        e_win = np.concatenate([E_br[mask], E_cs[mask], E_g[mask]])
+        e_lo = float(np.min(e_win))
+        e_hi = float(np.percentile(e_win, 99))
+        pad = max(0.05 * (e_hi - e_lo), 1e-3)
+        axE.set_ylim(e_lo - pad, e_hi + pad)
+        axE.set_xlim(flo - 0.2, fhi + 0.5)
+        axE.set_title(f'{sname}')
+        axE.set_ylabel('E [eV]')
+        axE.legend(fontsize=6); axE.grid(True, alpha=0.3); axE.axhline(0, color='k', lw=0.4)
+
+        axF.plot(hp, Fz_br, 'k-', lw=1.8, label='brute Fz')
+        axF.plot(hp, Fz_cs, 'C0--', lw=1.3, label='contact Fz')
+        axF.plot(hp, Fz_g, 'C1-.', lw=1.2, label='GridFF Fz')
+        axF.axvline(R0, color='0.5', ls=':', lw=0.8)
+        axF.axvspan(flo, fhi, color='0.9', alpha=0.45)
+        f_win = np.concatenate([Fz_br[mask], Fz_cs[mask], Fz_g[mask]])
+        fv = max(float(np.percentile(np.abs(f_win), 99)), 1e-6)
+        axF.set_ylim(-1.2 * fv, 1.2 * fv)
+        axF.set_xlim(flo - 0.2, fhi + 0.5)
+        axF.set_xlabel('h_probe = z − zmax [Å]  (zoom=fit window)')
+        axF.set_ylabel('Fz [eV/Å]')
+        axF.legend(fontsize=6); axF.grid(True, alpha=0.3); axF.axhline(0, color='k', lw=0.4)
+
+    fig.suptitle(f'{name} / {knobs_name}  rigid FF  poly_z0={sep.poly_z0} Rc={sep.poly_R} nz={sep.nz}  '
+                 f'bspl={sep.ncx}×{sep.ncy}@{sep.dx}Å', fontsize=10)
+    fig.tight_layout()
+    out_prof = os.path.join(sub, 'rigid_EFz_profiles.png')
+    fig.savefig(out_prof, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'REVIEW: {out_prof}')
+
+    # --- XY slices: brute | contact | Δ  (GridFF≈brute checked on profiles) ---
+    x0f = float(apos_w[:, 0].min()) - margin
+    x1f = float(apos_w[:, 0].max()) + margin
+    y0f = float(apos_w[:, 1].min()) - margin
+    y1f = float(apos_w[:, 1].max()) + margin
+    extent = [x0f, x1f, y0f, y1f]
+    dx_plot = 0.1
+
+    def eval_brute(pts):
+        E, F = afm._brute_afm_morse_c_queries(pts)
+        return E.astype(np.float64), F.astype(np.float64)
+
+    def eval_sep(pts):
+        E, F = afm._cs_fit_helper().eval_separable(pts, sep)
+        return E.astype(np.float64), F.astype(np.float64)
+
+    n_z = len(TOY_XY_ZOFFS)
+    fig, axes = plt.subplots(3, n_z, figsize=(3.6 * n_z, 9.5), squeeze=False)
+    for col, zoff in enumerate(TOY_XY_ZOFFS):
+        z_scan = zmax + zoff
+        _, _, _, Fz_br = _eval_slice_maps(eval_brute, x0f, x1f, y0f, y1f, z_scan, dx_plot, dx_plot)
+        _, _, _, Fz_cs = _eval_slice_maps(eval_sep, x0f, x1f, y0f, y1f, z_scan, dx_plot, dx_plot)
+        dFz = Fz_cs - Fz_br
+        fv = max(float(np.percentile(np.abs(Fz_br), 99)), 1e-9)
+        ev = max(float(np.percentile(np.abs(dFz), 99)), 1e-12)
+        for row, (data, ylab, vmin, vmax) in enumerate([
+            (Fz_br, 'brute Fz', -fv, fv),
+            (Fz_cs, 'contact Fz', -fv, fv),
+            (dFz, 'Δ Fz (cs−br)', -3 * ev, 3 * ev),
+        ]):
+            ax = axes[row, col]
+            im = ax.imshow(data.T, origin='lower', extent=extent, cmap='RdBu_r', vmin=vmin, vmax=vmax, aspect='equal')
+            ax.scatter(apos_w[:, 0], apos_w[:, 1], c='k', s=18, marker='x', zorder=5)
+            if row == 0:
+                ax.set_title(f'h={zoff:.1f}Å', fontsize=9)
+            if col == 0:
+                ax.set_ylabel(ylab, fontsize=8)
+            ax.set_xticks([]); ax.set_yticks([])
+            plt.colorbar(im, ax=ax, fraction=0.046)
+        print(f'  xy h={zoff:.1f}: rmse_Fz(cs)={_rmse(Fz_cs, Fz_br):.3e}')
+    fig.suptitle(f'{name}/{knobs_name} rigid Fz(xy) — brute | contact-sep | Δ  (GridFF on profiles)', fontsize=11)
+    fig.tight_layout()
+    out_xy = os.path.join(sub, 'rigid_Fz_xy.png')
+    fig.savefig(out_xy, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'REVIEW: {out_xy}')
+
+    out_txt = os.path.join(sub, 'SUMMARY.out')
+    with open(out_txt, 'w') as f:
+        f.write(f'toy={name} knobs={knobs_name}\n')
+        f.write(f'nat={len(apos_w)} zmax={zmax:.4f} R0[0]={R0:.4f} tipQs=0\n')
+        f.write(f'poly_z0={sep.poly_z0} poly_R={sep.poly_R} nz={sep.nz} m_start={sep.m_start}\n')
+        f.write(f'bspl={sep.ncx}x{sep.ncy} dx={sep.dx} n_coeff={sep.n_coeff}\n')
+        f.write(f'h0 min/max={h0.min():.4f}/{h0.max():.4f}\n')
+        f.write(f'fit_z_adaptive={knobs["fit_z_adaptive"]} force_weight={knobs["fit_force_weight"]}\n')
+        f.write('NOTE: dz_basis = z - h0(x,y) - poly_z0; field→0 for dz > poly_z0+poly_R\n')
+        f.write('NOTE: rigid FF only (eval_separable / brute / get_raw_FE) — no PP relax\n')
+        for line in summary:
+            f.write(line + '\n')
+        f.write(f'REVIEW: {out_prof}\nREVIEW: {out_xy}\n')
+    print(f'REVIEW: {out_txt}')
+    return summary
+
+
+def run_toys():
+    """1-atom (q=0) and 2-atom (charged) rigid FF parity under both fit knob sets."""
+    os.makedirs(TOY_DIR, exist_ok=True)
+    print(f'Toy rigid FF parity → {TOY_DIR}')
+    print('Method recall: E(x,y,z)=Σ_kz B_xy(x,y)·c_kz · φ_kz(dz), dz=z−h0(x,y)−poly_z0')
+    print('  φ: doubling poly in t=1−clip((dz−poly_z0)/poly_R); B: cubic B-spline on ncx×ncy knots')
+
+    cases = [
+        ('C1_q0', [[0., 0., 0.]], ['C'], [0.0]),
+        ('C2_qpm', [[-1.2, 0., 0.], [1.2, 0., 0.]], ['C', 'C'], [+0.5, -0.5]),
+    ]
+    # Focus: atom_z (soft) vs spheres (intended contact). Skip full matrix of old assembly.
+    knobs_run = {k: FIT_KNOBS[k] for k in ('atomz_ptcda', 'spheres')}
+    all_lines = []
+    for name, apos, enames, qs in cases:
+        for knobs_name, knobs in knobs_run.items():
+            lines = run_one_toy(name, apos, enames, qs, knobs_name, knobs)
+            all_lines.extend([f'[{name}/{knobs_name}] {L}' for L in lines])
+
+    index = os.path.join(TOY_DIR, 'INDEX.out')
+    with open(index, 'w') as f:
+        f.write('Rigid FF toys. Softness root cause: legacy h0=max atom-z (not spherical contact).\n')
+        f.write('spheres: h0 = ray vs Morse-R0 spheres; fit offsets above h0_max.\n')
+        f.write('Compare Δh_well / Fz shape: spheres should be much less soft than atomz_*.\n\n')
+        for L in all_lines:
+            f.write(L + '\n')
+    print(f'REVIEW: {index}')
+    print('Toys done.')
+
+
+def main_ptcda():
     os.makedirs(PLOT_DIR, exist_ok=True)
     print(f'PTCDA contact surface — close-contact fit + parity → {PLOT_DIR}')
     apos, reqs, enames, lvec, qs = load_atom_data(PTCDA)
@@ -827,12 +1123,25 @@ def main():
         print('Skipping Phase2 PP-relaxed parity by default; set RUN_CONTACT_PP=1 after raw E/Fz parity is satisfactory.')
 
     print('--- PIC (radial atom basis) ---')
-    pic = phase_pic_fit_and_parity(afm, apos, enames, bbox)
-    if os.environ.get('RUN_CONTACT_PP', '0') == '1':
-        phase3_pp_afm_pic(pic, apos)
+    if os.environ.get('RUN_CONTACT_PIC', '0') == '1':
+        pic = phase_pic_fit_and_parity(afm, apos, enames, bbox)
+        if os.environ.get('RUN_CONTACT_PP', '0') == '1':
+            phase3_pp_afm_pic(pic, apos)
     else:
-        print('Skipping Phase3 PIC PP scan; set RUN_CONTACT_PP=1 to compare relaxed PIC vs 3D.')
+        print('Skipping PIC by default; set RUN_CONTACT_PIC=1 to fit/compare radial PIC.')
     print('Done.')
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description='Contact-surface fit/parity (PTCDA or toy rigid FF)')
+    p.add_argument('--toys', action='store_true',
+                   help='1-atom / 2-atom rigid FF: brute vs contact vs GridFF (PTCDA + assembly knobs)')
+    args = p.parse_args()
+    if args.toys:
+        run_toys()
+    else:
+        main_ptcda()
 
 
 if __name__ == '__main__':

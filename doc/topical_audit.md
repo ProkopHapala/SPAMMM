@@ -127,13 +127,14 @@ This **is** a supplement to:
 - **Audit Document:** [nonbonding_forcefields.md](nonbonding_forcefields.md)
 
 ### 2b2. PairFF (rigid-body intermolecular)
-- Compact-exp / Morse pairwise FF with epair + σ-hole dummies; one active 6-DOF body + frozen env (Strategy M)
-- **Key files:** `spammm/forcefields/RigidBodyDynamics.py` (`RigidBodyPairFF`), `spammm/GUI/RigidBodyVispy.py`, `demos/demo_pairff.py`
-- **Kernels:** `kernels/rigid.cl` (kernels 7–9), `kernels/Forces.cl` (`compact_exp_pair_EF`)
+- Compact-exp / Morse pairwise FF with epair + σ-hole dummies; shared allmol GPU buffers; one active 6-DOF body; optional fused FAF substrate
+- **Key files:** `spammm/forcefields/RigidBodyDynamics.py` (`RigidBodyPairFF`), `spammm/GUI/RigidBodyVispy.py`, `spammm/surfaces/FoldedRigid.py`, `demos/demo_pairff.py`
+- **Kernels:** `kernels/rigid.cl` (7–13; prefer allmol ± FAF), `kernels/Forces.cl` (`compact_exp_pair_EF`)
 - **User manual:** [demos/PairFF_manual.md](../demos/PairFF_manual.md)
 - **Topical audit:** [TopicalAudit/PairFF_RigidBody.md](TopicalAudit/PairFF_RigidBody.md)
 - **Design report:** [Topics/ForceFields/PairFF.md](Topics/ForceFields/PairFF.md)
-- **Caveats:** multi-body needs unified mode + NVIDIA; ≤128 sites/env molecule; main GUI not wired yet
+- **Tasks:** [Tasks/PairFF_MultiBody_Kernel.md](Tasks/PairFF_MultiBody_Kernel.md) (Done), [Tasks/PairFF_FAF_Substrate.md](Tasks/PairFF_FAF_Substrate.md) (Done)
+- **Caveats:** multi-body/FAF need unified mode + NVIDIA; ≤128 sites/molecule; map omits Coulomb; main GUI not wired yet
 
 ### 2c. Charge Equilibration
 - QEq charge transfer method
@@ -206,27 +207,28 @@ Interactive rigid-body dynamics of a small molecule on a periodic substrate usin
 ## 3c. Contact Surface (quasi-2D static AFM)
 
 Compact alternative to 3D `img_FF` for aperiodic rigid PP-AFM: **separable B-spline×poly**
-(global corrugation) and **radial PIC** (per-atom compact support).
+(global corrugation) and **radial PIC** (per-atom compact support). **Design intent:** atom-scale
+nodes (`bspl_dx~1 Å`), sphere-envelope `h₀` with `h0_R_scale~0.75`.
 
 **Design:** [Topics/AFM/ContactSurface_Static.md](Topics/AFM/ContactSurface_Static.md)  
-**Pitfalls:** [Takeways.md](Takeways.md) (z alignment, F_ref layout, reg, weighting, GPU buffer reuse)  
-**Module README:** [spammm/surfaces/README.md](../spammm/surfaces/README.md)
+**Parity vs GridFF:** [Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md](Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md)  
+**Caveats:** [Caveats.md](Caveats.md) §6 · **Pitfalls:** [Takeways.md](Takeways.md)  
+**Module README:** [spammm/surfaces/README.md](../spammm/surfaces/README.md) · **Audit:** [TopicalAudit/AFM_ContactSurface.md](TopicalAudit/AFM_ContactSurface.md)
 
 | Location | Status | Notes |
 |----------|--------|-------|
-| `spammm/surfaces/ContactSurface.py` | active | `ContactSurfaceCL`, `SeparableParams`, `PICParams`, CG fit/eval |
-| `kernels/contact_surface.cl` | active | Brute, separable Av/Atv, PIC, PP relaxation kernels |
-| `spammm/SPM/AFM.py` | active | `fit_contact_surface`, `run_scan_contact`, `fit_pic_contact_surface`, `run_scan_pic` |
-| `kernels/AFM.cl` | active | Legacy `interpFE` + `relaxStrokesTilted` (3D reference) |
-| `spammm/surfaces/GridFF.py` | active | Dense 3D reference for periodic substrates (different use case) |
+| `spammm/surfaces/ContactSurface.py` | active | Sphere `h₀`, separable/PIC CG |
+| `kernels/contact_surface.cl` | active | Brute, Av/Atv, PIC, PP contact |
+| `spammm/SPM/AFM.py` | active | `fit_contact_surface`, `run_scan_contact` |
+| `run_assembly_afm.py` | experimental | Coarse defaults + `--compare-dir` |
+| `spammm/surfaces/GridFF.py` | active | Dense 3D classical reference |
 
-**Parity (PTCDA Morse):** separable PP Fz RMSE ~14 meV/Å; PIC ~20 meV/Å vs 3D `run_scan`.
-L0: `tests/SPM/test_afm_contact_surface.py`. L2: `tests/testplot_contact_surface.py`.
+**Parity:** E/Fz profiles vs brute improved (2026-07-24); XY vs GridFF still sharper — USER visual pending.  
+L0: `tests/SPM/test_afm_contact_surface.py`. L2: `tests/testplot_contact_surface.py`, assembly compare.
 
-**Task SSOT:** [Tasks/Fast_2p5D_AFM_ContactSurface.md](Tasks/Fast_2p5D_AFM_ContactSurface.md) — variants (i) separable+\(h_0\), (ii) PIC, (iii) hybrid/folded TBD.
+**Task SSOT:** [Tasks/Fast_2p5D_AFM_ContactSurface.md](Tasks/Fast_2p5D_AFM_ContactSurface.md)
 
-**Open issues:** basis/fit-region tuning; PIC force loss; pipeline flag `{separable,pic,grid3d}`;
-no GUI integration yet; elastic Phase 2 design-only.
+**Open issues:** USER confirm maps; residual XY sharpness; PIC re-validate; pipeline flag; elastic Phase 2.
 
 ## 4. AFM/STM Simulation
 
@@ -258,7 +260,8 @@ no GUI integration yet; elastic Phase 2 design-only.
 - **Key files:** `spammm/SPM/KrigingGridFF.py`, `InterpolatorKriging.py`, `AFM_utils` Pauli fitters
 - **Tasks:** [Import_KrigingGridFF.md](Tasks/Import_KrigingGridFF.md), [Pauli_A_beta_KrigingTransferability.md](Tasks/Pauli_A_beta_KrigingTransferability.md) (site maps + transferability)
 - **Reports:** [Reports/Kriging_DFT_vs_DFTB_FDBM_pyridine.md](Reports/Kriging_DFT_vs_DFTB_FDBM_pyridine.md), [Kriging_FDBM_PauliFit_pyridine_2026-07-21.md](Reports/Kriging_FDBM_PauliFit_pyridine_2026-07-21.md), [Fukui_FDBM_panel_notes_2026-07-23.md](Reports/Fukui_FDBM_panel_notes_2026-07-23.md)
-- **Caveats (global):** [Caveats.md](Caveats.md) — all-e Δρ/NA multipoles, corner vs center, sample vs project
+- **Caveats (global):** [Caveats.md](Caveats.md) — aniso cubes; AE core alias → **element-invariant** clamp NA; node vs center project; sample vs project
+- **ES dipole report (SSOT):** [Reports/Cube_ES_DeltaRho_NA_dipole.md](Reports/Cube_ES_DeltaRho_NA_dipole.md) · handoff [Cube_ES_DeltaRho_NA_Codex_handoff_2026-07-24.md](Reports/Cube_ES_DeltaRho_NA_Codex_handoff_2026-07-24.md) (implemented; USER visual pending)
 - **Topic:** [Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md](Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md)
 
 ## 5. QM Integration (DFTB+)
@@ -332,7 +335,7 @@ no GUI integration yet; elastic Phase 2 design-only.
 | Topic | Issue | Related Files | Priority |
 |-------|-------|---------------|----------|
 | **GridFF variants** | `GridFF.py` vs `GridFFRelaxedScan.py` — overlapping functionality, needs consolidation | `spammm/surfaces/GridFF.py`, `spammm/surfaces/GridFFRelaxedScan.py` | Medium |
-| **Contact surface** | Separable + PIC wired; PP parity ~14–20 meV/Å Fz (PTCDA); basis tuning open | [ContactSurface_Static.md](Topics/AFM/ContactSurface_Static.md), [Takeways.md](Takeways.md) | Medium |
+| **Contact surface** | Sphere h₀ + coarse dx; profiles OK; XY vs GridFF USER pending | [ContactSurface_2p5D_vs_GridFF_2026-07-24.md](Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md), [Caveats.md](Caveats.md) §6 | Medium |
 | **Substrate builder** | `SubstrateBuilder.py` is minimal — no CIF parsing, lattice replication, or slab cutting | `spammm/surfaces/SubstrateBuilder.py` | Low |
 | **File I/O** | XYZ, MOL2 parsing in `atomicUtils.py` — no CIF or extended XYZ with Lattice support | `spammm/atomicUtils.py` | Low |
 | **Vibrations** | Absolute UFF/DFTB frequencies vs experiment not calibrated; phonon bands unported | `dynamics/Vibrations.py`, `doc/FireCore_migration_codemap.md` | Low |

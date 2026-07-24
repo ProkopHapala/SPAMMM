@@ -6,7 +6,7 @@ Phase 1 (doc/Tasks/Assembly_AFM_Pipeline.md):
   - Per rank: outdir/rankXX_idxYY/{geometry_xy_xz.png, afm_df_Fz_heights.png, …}
 
 Examples:
-  python run_assembly_afm.py --preset tetraceno --n-afm 10 --scan-dx 0.15
+  python run_assembly_afm.py --preset tetraceno --n-afm 10 --bspl-dx 1.0 --scan-dx 0.5
   python run_assembly_afm.py --xyz debug/helicene_afm_pipeline/assembly_unitcell.xyz
 """
 from __future__ import annotations
@@ -69,11 +69,13 @@ def _load_bonds(mol: AtomicSystem, natoms_per_mol: int):
     return replicate_bonds(np.asarray(tpl.bonds, dtype=np.int32), natoms_per_mol, nmols)
 
 
-def _fit(afm: AFMulator, method: str, margin: float, bspl_dx: float, n_iter: int, pic_reg: float):
+def _fit(afm: AFMulator, method: str, margin: float, bspl_dx: float, n_iter: int, pic_reg: float, h0_R_scale: float = 0.75):
     t0 = time.time()
     if method == 'contact-sep':
-        afm.fit_contact_surface(margin=margin, bspl_dx=bspl_dx, fit_z_adaptive=(1.0, 5.0, 0.2, 0.8),
-                                m_start=4, nz=5, n_iter=n_iter, fit_force_weight=0.5, bPrint=True)
+        # Spherical contact h₀ with R < Morse R0 so clamp is in HARD repulsion (not at the well)
+        afm.fit_contact_surface(margin=margin, bspl_dx=bspl_dx, poly_R=4.0, poly_z0=0.0, m_start=4, nz=6,
+                                fit_z_adaptive=(0.05, 4.0, 0.1, 0.8), fit_force_weight=1.0, n_iter=n_iter,
+                                h0_mode='spheres', h0_R_scale=h0_R_scale, bPrint=True)
     elif method == 'contact-pic':
         afm.fit_pic_contact_surface(margin=margin, poly_R=4.0, m_start=4, nz=4, cell_size=10.0,
                                     fit_z_adaptive=(1.0, 5.0, 0.2, 0.8), n_iter=n_iter, reg=pic_reg, bPrint=True)
@@ -167,7 +169,7 @@ def run_afm_one(args, apos_primary, xyz_ff, bonds, cell_lvs, outdir, tag, title_
     afm.assign_params(params_path=PARAMS)
     mol_z = float(np.max(apos_primary[:, 2]))
     print(f'\nAFM method: {method}  tag={tag}')
-    _fit(afm, method, args.margin, args.bspl_dx, args.n_iter, args.pic_reg)
+    _fit(afm, method, args.margin, args.bspl_dx, args.n_iter, args.pic_reg, h0_R_scale=getattr(args, 'h0_R_scale', 0.75))
 
     cell_origin = (0.0, 0.0)
     if cell_lvs is not None and args.wrap_cell:
@@ -304,7 +306,7 @@ def compare_contact_vs_gridff(args, rank_dir: str) -> int:
     afm_c.load_molecule(xyz_ff)
     afm_c.assign_params(params_path=PARAMS)
     print(f'AFM FF atoms (contact): {afm_c.mol.natoms}')
-    _fit(afm_c, 'contact-sep', args.margin, args.bspl_dx, args.n_iter, args.pic_reg)
+    _fit(afm_c, 'contact-sep', args.margin, args.bspl_dx, args.n_iter, args.pic_reg, h0_R_scale=getattr(args, 'h0_R_scale', 0.75))
     # fix dpos0 lever for height labels
     scan_p0 = scan_p0.copy()
     scan_p0[2] = mol_z + args.z_clearance + abs(float(afm_c.dpos0[2]))
@@ -366,6 +368,10 @@ def compare_contact_vs_gridff(args, rank_dir: str) -> int:
     print(f'REVIEW: {out_maps}')
 
     # --- E(z), Fz(z) at 2 tops: brute + contact-raw + grid-raw ---
+    from spammm.surfaces.ContactSurface import eval_sphere_contact_height
+    Rs = np.asarray(afm_c.cLJs_arr[:, 0], dtype=np.float64) * float(getattr(args, 'h0_R_scale', 0.75))
+    R0s = np.asarray(afm_c.cLJs_arr[:, 0], dtype=np.float64)  # full Morse R0 (well)
+    apos_ff = afm_c.atoms_arr[:, :3]
     hp = np.arange(float(args.profile_h_max), float(args.profile_h_min) - 1e-9, -abs(args.profile_dh))
     fig, axes = plt.subplots(2, 2, figsize=(11, 8), sharex=True)
     # axes: [0,0] E site0; [0,1] E site1; [1,0] Fz site0; [1,1] Fz site1
@@ -385,24 +391,35 @@ def compare_contact_vs_gridff(args, rank_dir: str) -> int:
         E_g, Fz_g1 = Fraw_g[0, 0, :, 3], Fraw_g[0, 0, :, 2]
         Fz_pp_c, Fz_pp_g = Fpp_c[0, 0, :, 2], Fpp_g[0, 0, :, 2]
 
+        # Local contact height h0 (clamp) and Morse well apex (R0 sphere) in h_probe coords
+        h0_abs = eval_sphere_contact_height(apos_ff, Rs, x, y, z_fallback=float(p[2]))
+        hR0_abs = eval_sphere_contact_height(apos_ff, R0s, x, y, z_fallback=float(p[2]))
+        h0_hp = float(h0_abs) - mol_z
+        hR0_hp = float(hR0_abs) - mol_z
+        print(f'  {name}: h0(z0)={h0_abs:.3f} abs → h_probe={h0_hp:.3f}Å  R0_sphere={hR0_hp:.3f}Å  (scale={getattr(args, "h0_R_scale", 0.75)})')
+
         axE, axF = axes[0, si], axes[1, si]
         axE.plot(hp, E_br, 'k-', lw=1.8, label='brute Morse+Coul')
         axE.plot(hp, E_c, 'C0--', lw=1.3, label='contact-sep raw')
         axE.plot(hp, E_g, 'C1-.', lw=1.3, label='GridFF raw')
+        axE.axvline(h0_hp, color='C3', ls='-', lw=1.4, label=f'z0≡h0 (clamp) {h0_hp:.2f}Å')
+        axE.axvline(hR0_hp, color='0.4', ls=':', lw=1.0, label=f'R0 sphere {hR0_hp:.2f}Å')
         axE.set_title(f'{name}  xy=({x:.2f},{y:.2f})  z_atom={p[2]:.2f}')
         axE.set_ylabel('E [eV]')
-        axE.legend(fontsize=7); axE.grid(True, alpha=0.3); axE.axhline(0, color='k', lw=0.4)
+        axE.legend(fontsize=6); axE.grid(True, alpha=0.3); axE.axhline(0, color='k', lw=0.4)
 
         axF.plot(hp, Fz_br, 'k-', lw=1.8, label='brute Fz')
         axF.plot(hp, Fz_c1, 'C0--', lw=1.3, label='contact raw Fz')
         axF.plot(hp, Fz_g1, 'C1-.', lw=1.3, label='GridFF raw Fz')
         axF.plot(hp, Fz_pp_c, 'C0:', lw=1.2, label='contact PP Fz')
         axF.plot(hp, Fz_pp_g, 'C1:', lw=1.2, label='GridFF PP Fz')
+        axF.axvline(h0_hp, color='C3', ls='-', lw=1.4, label=f'z0≡h0 {h0_hp:.2f}Å')
+        axF.axvline(hR0_hp, color='0.4', ls=':', lw=1.0, label=f'R0 sphere {hR0_hp:.2f}Å')
         axF.set_xlabel('h_probe [Å above zmax]')
         axF.set_ylabel('Fz [eV/Å]')
-        axF.legend(fontsize=7); axF.grid(True, alpha=0.3); axF.axhline(0, color='k', lw=0.4)
-        axF.axvline(3.38, color='0.5', ls=':', lw=0.8, label='R0≈3.38')
-    fig.suptitle('Forcefield E(z) / Fz(z) at top atoms — brute vs contact-sep vs GridFF', fontsize=11)
+        axF.legend(fontsize=6); axF.grid(True, alpha=0.3); axF.axhline(0, color='k', lw=0.4)
+    scale = float(getattr(args, 'h0_R_scale', 0.75))
+    fig.suptitle(f'Forcefield E(z)/Fz(z) — brute vs contact-sep vs GridFF  (h0_R_scale={scale}: clamp in hard repulsion)', fontsize=10)
     fig.tight_layout()
     out_prof = os.path.join(rank_dir, 'compare_contact_vs_gridff_profiles.png')
     fig.savefig(out_prof, dpi=150, bbox_inches='tight')
@@ -425,6 +442,8 @@ def compare_contact_vs_gridff(args, rank_dir: str) -> int:
 def run_afm(args) -> int:
     if getattr(args, 'compare_dir', None):
         return compare_contact_vs_gridff(args, args.compare_dir)
+    if getattr(args, 'rerun_ranks', False):
+        return rerun_ranks(args)
     out_root = _abs(args.outdir)
     os.makedirs(out_root, exist_ok=True)
     method = args.method
@@ -515,11 +534,52 @@ def run_afm(args) -> int:
     return 0
 
 
+def rerun_ranks(args) -> int:
+    """Re-AFM existing rank*_idx* dirs under --outdir (keeps assembly xyz; no search)."""
+    import glob
+    out_root = _abs(args.outdir)
+    rank_dirs = sorted(glob.glob(os.path.join(out_root, 'rank*_idx*')))
+    if not rank_dirs:
+        raise SystemExit(f'no rank*_idx* under {out_root}')
+    cell_lvs = parse_lattice_vectors(args.cell)
+    print(f'Re-AFM {len(rank_dirs)} ranks in {out_root}  method={args.method}  h0=spheres')
+    lines = [f'mode=rerun_ranks method={args.method} n={len(rank_dirs)} h0_mode=spheres']
+    for rank_dir in rank_dirs:
+        tag = os.path.basename(rank_dir)
+        xyz_w = os.path.join(rank_dir, 'assembly_wrapped.xyz')
+        xyz_ff = os.path.join(rank_dir, f'assembly_wrapped_pbc{args.ff_pbc}.xyz')
+        if not os.path.isfile(xyz_w):
+            print(f'  SKIP {tag}: missing {xyz_w}')
+            continue
+        if args.ff_pbc > 0 and not os.path.isfile(xyz_ff):
+            print(f'  SKIP {tag}: missing {xyz_ff}')
+            continue
+        if args.ff_pbc <= 0:
+            xyz_ff = xyz_w
+        mol_w = AtomicSystem(fname=xyz_w)
+        apos_p = mol_w.apos[:, :3].copy()
+        natoms_per_mol = mol_w.natoms // max(1, args.n_mols)
+        bonds = _load_bonds(mol_w, natoms_per_mol)
+        print(f'\n=== {tag}  primary={mol_w.natoms}  ff={xyz_ff} ===')
+        run_afm_one(args, apos_p, xyz_ff, bonds, cell_lvs, rank_dir, tag)
+        lines.append(f'{tag}')
+        lines.append(f'  REVIEW: {rank_dir}/geometry_xy_xz.png')
+        lines.append(f'  REVIEW: {rank_dir}/afm_df_Fz_heights.png')
+    summary = os.path.join(out_root, 'SUMMARY.out')
+    with open(summary, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+        f.write('# Regenerated with spherical Morse-R0 contact h0 (no re-search).\n')
+    print(f'REVIEW: {summary}')
+    return 0
+
+
 def build_parser():
     p = argparse.ArgumentParser(description='Assembly → AFM (multi-rank)', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('--xyz', help='Single assembly .xyz (skips search)')
     p.add_argument('--compare-dir', dest='compare_dir', default=None,
                    help='Compare contact-sep vs Morse+Coulomb GridFF for one rank dir (needs *_wrapped*.xyz)')
+    p.add_argument('--rerun-ranks', action='store_true',
+                   help='Re-AFM existing rank*_idx* under --outdir (no assembly search)')
     p.add_argument('--grid-dx', type=float, default=0.25, help='GridFF voxel step [Å] for --compare-dir')
     p.add_argument('--profile-h-max', type=float, default=10.0)
     p.add_argument('--profile-h-min', type=float, default=2.0)
@@ -531,10 +591,14 @@ def build_parser():
     p.add_argument('--cell', default=HELICENE_CELL)
     p.add_argument('--n-mols', type=int, default=6)
     p.add_argument('--margin', type=float, default=3.0)
-    p.add_argument('--bspl-dx', type=float, default=0.2)
+    p.add_argument('--bspl-dx', type=float, default=1.0,
+                   help='Contact B-spline / h0 node step [Å]; ~atom-scale (was 0.2 = sub-atomic)')
+    p.add_argument('--h0-R-scale', type=float, default=0.75, dest='h0_R_scale',
+                   help='Sphere radius = scale×Morse_R0. Use <1 so z0 clamp is in hard repulsion (1.0 = well = wrong)')
     p.add_argument('--n-iter', type=int, default=60)
     p.add_argument('--pic-reg', type=float, default=1e-2)
-    p.add_argument('--scan-dx', type=float, default=0.15)
+    p.add_argument('--scan-dx', type=float, default=0.5,
+                   help='AFM image pixel step [Å]; ~atom-scale (was 0.15 = sub-atomic)')
     p.add_argument('--scan-margin', type=float, default=3.0)
     p.add_argument('--nz-scan', type=int, default=40)
     p.add_argument('--dtip', type=float, default=-0.1)

@@ -57,7 +57,7 @@
 - **SPFF pi-sigma orthogonalization** — fixed copy-paste bug, verified
 - **MD invariants conservation** — energy, linear momentum, angular momentum conserved (CH4, CH2NH, semi-implicit Euler)
 - **Energy-force correspondence tests** — `F = -dE/dx` verified for UFF and SPFF via finite differences
-- **PairFF rigid-body nonbonded** — `RigidBodyPairFF` + `rigid.cl` unified/env kernels (Strategy M: one active body, frozen neighbors); epair/σ-hole H-bonds; Vispy demo with FIRE default, click-to-select active, `--mols` mixed species. Manual: `demos/PairFF_manual.md`. Main `SPAMMM_GUI` integration still planned (`doc/Tasks/PairFF_GUI_Integration.md`).
+- **PairFF rigid-body nonbonded** — `RigidBodyPairFF` + `rigid.cl` allmol kernels (shared buffers; one active body; persistent dynamics); epair/σ-hole H-bonds; optional **FAF** substrate (`--faf`, fused kernels + Vispy map = PairFF+FAF @ CoM z). Vispy FIRE default, click-to-select, `--mols` mixed species. Manual: `demos/PairFF_manual.md`. Main `SPAMMM_GUI` integration still planned (`doc/Tasks/PairFF_GUI_Integration.md`).
 
 ### ⚠️ In Progress
 - **UFF relaxation (CH4)** — bond assertion failure for methane; likely topology/parameter issue in `UFFbuilder.py`
@@ -71,7 +71,7 @@
 - **MolecularDynamics velocity Verlet** — implemented, no test
 - **MolecularDynamics multi-system** — buffer management exists, no test
 - **SPFF with pi-orbital rotation** — `getSPFFf4_rot` / `updateAtomsSPFFf4_rot` exist, untested
-- **FAF substrate relaxation** — use ForcedAtomicFunction instead of GridFF for on-surface relaxation. See `doc/ARCHITECTURE_ROADMAP.md` §5
+- **FAF substrate relaxation** — ForcedAtomicFunction on-surface path for flexible UFF/SPFF/LFF (see `doc/ARCHITECTURE_ROADMAP.md` §5). **Also:** rigid PairFF+FAF docking demo (`demos/demo_pairff.py --faf`) — Done.
 
 ### ✅ Working (updated)
 - **QEq module** — `spammm/forcefields/QEq.py` + GUI extension (`QEqExtension.py`)
@@ -153,7 +153,8 @@
 - **RigidBodyAFM anchor springs** — harmonic constraint on specific atoms, tested (manipulation H2O + PTCDA)
 - **RigidBody folded basis** — `init_folded()` / `run_folded()` for folded atomic function surface interaction, tested
 - **Folded basis relaxation + manipulation** — 5 tests, reference data system, trail plots
-- **PairFF multi-body docking** — one active rigid molecule vs frozen neighbors (Strategy M env kernel); Vispy click-to-select; FIRE default; mixed `--mols`. Manual: `demos/PairFF_manual.md`
+- **PairFF multi-body docking** — shared allmol buffers; one active rigid molecule vs frozen neighbors; Vispy click-to-select; FIRE default; mixed `--mols`; optional `--faf` (PairFF+FAF map @ CoM z). Manual: `demos/PairFF_manual.md`. Tasks: `PairFF_MultiBody_Kernel.md`, `PairFF_FAF_Substrate.md` (Done).
+- **PairFF + FAF substrate** — fused allmol±FAF kernels; `attach_pairff_faf`; demo `--faf`; fit cache `data/fits/hcooh_nacl.npz`
 
 ### 🔲 Planned
 - **Assembly collision** — `testplot_assembly.py` visual demo + XYZ/diag artifacts (`Assembly.py`, `AssemblyPlot.py`, `assembly.cl`); pytest L0 pending

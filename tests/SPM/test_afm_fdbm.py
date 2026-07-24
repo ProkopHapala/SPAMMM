@@ -191,6 +191,32 @@ def _run_fdbm_pipeline(xyz_path, basis='mio-1-1', step=STEP, margin=MARGIN, z_ex
 
 # ─── Tests ───────────────────────────────────────────────────────────────────
 
+def test_mirror_asymmetry_fractional_center():
+    """A map symmetric about a half-pixel physical center must report zero asymmetry."""
+    from spammm.SPM.AFM_utils import mirror_asymmetry_2d
+    c = 4.5
+    x = 10.0 - np.abs(np.arange(10, dtype=np.float64) - c)
+    a = x[:, None] * np.ones((1, 7), dtype=np.float64)
+    assert mirror_asymmetry_2d(a, axis=0, center=c) < 1e-12
+    assert mirror_asymmetry_2d(a.T, axis=1, center=c) < 1e-12
+
+
+def test_clamp_compensation_is_element_invariant():
+    """Equivalent atoms get one element-level compact charge despite sampled-core aliasing."""
+    from spammm.SPM.AFM_utils import delta_rho_clamp_compact_na
+    step = 0.1
+    origin = np.array([-2.0, -2.0, -2.0])
+    xs = origin[0] + step * np.arange(41)
+    X, Y, Z = np.meshgrid(xs, xs, xs, indexing='ij')
+    atomPos = np.array([[-0.60, 0.0, 0.0], [0.65, 0.0, 0.0]])
+    atomZ = np.array([6, 6])
+    rho = sum(300.0 * np.exp(-((X - p[0]) ** 2 + Y ** 2 + Z ** 2) / (2 * 0.04 ** 2)) for p in atomPos).astype(np.float32)
+    d = delta_rho_clamp_compact_na(rho, origin, step, atomPos, atomZ, y1=5.0, y2=10.0, q_na_mode='element_mean')
+    assert abs(d['Q_rem_spheres'][0] - d['Q_rem_spheres'][1]) > 1e-3
+    assert d['q_na_per_atom'][0] == pytest.approx(d['q_na_per_atom'][1], abs=1e-12)
+    assert d['q_na_mode'] == 'element_mean'
+
+
 @pytest.fixture(scope="module")
 def fdbm_results():
     """Run FDBM pipeline once for all tests (module-scoped fixture)."""

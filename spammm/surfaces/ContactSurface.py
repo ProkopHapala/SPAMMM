@@ -10,11 +10,13 @@ Design:
 - **Separable:** coeffs on B-spline xy grid × doubling poly modes in dz = z−h₀−poly_z0;
   matrix-free CG (cs_sep_Av/Atv); optional Boltzmann weights + Fx,Fy,Fz force rows.
 - **PIC:** per-atom radial modes + particle-in-cell buckets; CG with Tikhonov reg≈1e-2.
-- **h₀(x,y):** max atom z in r_xy neighborhood per B-spline node (chain rule in forces).
+- **h₀(x,y):** spherical contact envelope (ray vs Morse-R0 spheres) on B-spline nodes;
+  legacy atom-center max-z still available via `h0_mode='atom_z'`. Chain rule in forces.
 - **F = −∇E** throughout; F_ref GPU upload is planar [Fx…][Fy…][Fz…] not interleaved.
 
 Open issues:
-- Basis/fit-region tuning open (PTCDA ~14–20 meV/Å PP Fz RMSE — workable, not optimal).
+- USER visual pending on contact-sep vs GridFF XY (profiles improved). See
+  doc/Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md; Caveats §6.
 - PIC: no force-loss rows yet; Boltzmann weights hurt close contact (fit unweighted).
 - Tile CG (`fit_separable_tiles`) experimental; global CG preferred.
 - PIC tiled eval caps local preload (`CS_PIC_LOCAL_MAX`).
@@ -22,7 +24,8 @@ Open issues:
 
 AFMulator: fit_contact_surface / run_scan_contact (separable);
 fit_pic_contact_surface / run_scan_pic (PIC).
-Design: doc/Topics/AFM/ContactSurface_Static.md · pitfalls: doc/Takeways.md
+Design: doc/Topics/AFM/ContactSurface_Static.md · parity report:
+doc/Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md · pitfalls: doc/Takeways.md
 """
 
 import os
@@ -79,19 +82,79 @@ def build_pic_buckets(atom_pos, x0, y0, x1, y1, cell_size):
     return np.array(flat, dtype=np.int32), np.array(offsets, dtype=np.int32), nx, ny
 
 
-def build_contact_height_map(apos, x0, y0, dx, dy, ncx, ncy, r_xy=8.0):
-    """Contact height h0(ix,iy) = max atom z within r_xy of B-spline node (stored on coeff xy grid)."""
+def eval_sphere_contact_height(apos, Rs, x, y, z_fallback=None):
+    """h₀(x,y) = max over spheres: z_i + sqrt(R_i²−ρ²) if ρ<R_i; else z_fallback or nan."""
     apos = np.asarray(apos, dtype=np.float64)
-    h0 = np.full(ncx * ncy, float(np.min(apos[:, 2])), dtype=np.float32)
-    r2 = float(r_xy) ** 2
+    Rs = np.asarray(Rs, dtype=np.float64).reshape(-1)
+    best = None
+    for i in range(len(apos)):
+        R = float(Rs[i])
+        if R <= 0.0:
+            continue
+        rho2 = (float(apos[i, 0]) - float(x)) ** 2 + (float(apos[i, 1]) - float(y)) ** 2
+        if rho2 < R * R:
+            h = float(apos[i, 2]) + float(np.sqrt(R * R - rho2))
+            best = h if best is None else max(best, h)
+    if best is not None:
+        return best
+    if z_fallback is not None:
+        return float(z_fallback)
+    return float('nan')
+
+
+def build_contact_height_map(apos, x0, y0, dx, dy, ncx, ncy, r_xy=8.0, Rs=None):
+    """Contact height h₀ on B-spline nodes.
+
+    Modes:
+      Rs is None  — legacy: max atom-center z within r_xy (NOT a true contact surface).
+      Rs given    — spherical envelope (the intended contact surface):
+                    h = max_i [ z_i + sqrt(R_i² − ρ_i²) ] for ρ_i < R_i,
+                    else fallback to max nearby atom z.
+                    R_i should be Morse R0 (= tip_R + R_vdW) so the apex is tip–atom contact.
+    """
+    apos = np.asarray(apos, dtype=np.float64)
+    zmin = float(np.min(apos[:, 2]))
+    h0 = np.full(ncx * ncy, zmin, dtype=np.float32)
+    if Rs is None:
+        r2 = float(r_xy) ** 2
+        for iy in range(ncy):
+            cy = y0 + iy * dy
+            for ix in range(ncx):
+                cx = x0 + ix * dx
+                d2 = (apos[:, 0] - cx) ** 2 + (apos[:, 1] - cy) ** 2
+                mask = d2 < r2
+                if np.any(mask):
+                    h0[iy * ncx + ix] = float(np.max(apos[mask, 2]))
+        return h0
+    Rs = np.asarray(Rs, dtype=np.float64).reshape(-1)
+    assert len(Rs) == len(apos), f'Rs length {len(Rs)} != natoms {len(apos)}'
+    Rmax = float(np.max(Rs)) if len(Rs) else 0.0
+    r_search = max(float(r_xy), Rmax + 0.5)
+    r2_search = r_search ** 2
     for iy in range(ncy):
         cy = y0 + iy * dy
         for ix in range(ncx):
             cx = x0 + ix * dx
             d2 = (apos[:, 0] - cx) ** 2 + (apos[:, 1] - cy) ** 2
-            mask = d2 < r2
-            if np.any(mask):
-                h0[iy * ncx + ix] = float(np.max(apos[mask, 2]))
+            near = d2 < r2_search
+            if not np.any(near):
+                continue
+            best = zmin
+            hit = False
+            for ia in np.where(near)[0]:
+                rho2 = float(d2[ia])
+                R = float(Rs[ia])
+                if R <= 0.0:
+                    continue
+                if rho2 < R * R:
+                    h = float(apos[ia, 2]) + float(np.sqrt(R * R - rho2))
+                    if h > best:
+                        best = h
+                    hit = True
+            if hit:
+                h0[iy * ncx + ix] = best
+            else:
+                h0[iy * ncx + ix] = float(np.max(apos[near, 2]))
     return h0
 
 
@@ -103,7 +166,7 @@ def bspline_n_intervals(length_ang, dx):
 class SeparableParams:
     """B-spline(xy) × poly(z - h0(x,y) - poly_z0) with doubling powers t^(m_start*2^k)."""
 
-    def __init__(self, x0, y0, dx, dy, ncx, ncy, poly_R=10.0, m_start=4, nz=5, poly_z0=0.0, h0_map=None, apos=None, h0_r_xy=8.0):
+    def __init__(self, x0, y0, dx, dy, ncx, ncy, poly_R=10.0, m_start=4, nz=5, poly_z0=0.0, h0_map=None, apos=None, h0_r_xy=8.0, Rs=None):
         self.x0 = float(x0); self.y0 = float(y0)
         self.dx = float(dx); self.dy = float(dy)
         self.ncx = int(ncx); self.ncy = int(ncy)
@@ -112,10 +175,11 @@ class SeparableParams:
         self.m_start = int(m_start)
         self.nz = int(nz)
         self.poly_powers = np.array([m_start * (2 ** k) for k in range(nz)], dtype=np.float32)
+        self.h0_Rs = None if Rs is None else np.asarray(Rs, dtype=np.float64).reshape(-1)
         if h0_map is not None:
             self.h0_map = np.ascontiguousarray(h0_map, dtype=np.float32).reshape(-1)
         elif apos is not None:
-            self.h0_map = build_contact_height_map(apos, self.x0, self.y0, self.dx, self.dy, self.ncx, self.ncy, r_xy=h0_r_xy)
+            self.h0_map = build_contact_height_map(apos, self.x0, self.y0, self.dx, self.dy, self.ncx, self.ncy, r_xy=h0_r_xy, Rs=self.h0_Rs)
         else:
             self.h0_map = None
         self.coeffs = None

@@ -5,13 +5,17 @@ Loads uracil (static) and HCOOH (dynamic) molecules, sets up pairwise
 force field interactions with electron pairs, and launches interactive
 Vispy visualization with mouse picking.
 
-Multi-body (Strategy M env kernel):
+Multi-body (shared allmol buffers):
     python3 demos/demo_pairff.py --bodies 4 --active 0
     # N copies of HCOOH on a grid; click any molecule to make it mobile
     python3 demos/demo_pairff.py --bodies 4 --active 2 --no-vis
     # Mixed species (any XYZ list; formamide.xyz = HCONH2; no NTCDA.xyz yet → use PTCDA):
     python3 demos/demo_pairff.py --mols PTCDA.xyz HCOOH.xyz formamide.xyz --spacing 12
     python3 demos/demo_pairff.py --mols PTCDA.xyz HCOOH.xyz formamide.xyz --no-vis --steps 50
+
+FAF substrate (NaCl folded basis; map = PairFF + FAF at molecule z):
+    python3 demos/demo_pairff.py --bodies 4 --faf
+    python3 demos/demo_pairff.py --bodies 4 --faf --faf-fit data/fits/hcooh_nacl.npz --z-init 3.5
 
 Usage:
     python3 demos/demo_pairff.py                    # interactive Vispy (unified kernel)
@@ -23,17 +27,19 @@ Kernels (switchable from GUI or --pairff-mode):
   unified — rigid_body_pairff_unified_kernel: single compact-exp loop (default)
             (y=(1-b*rho)^8, rho=r2/(sqrt(r2+w*w)+w))
   legacy  — rigid_body_pairff_kernel: Morse+Coulomb / Lorentzian
-  multi   — rigid_body_pairff_unified_env_kernel when --bodies > 1 or --mols (Strategy M)
+  multi   — allmol shared buffers when --bodies > 1 or --mols
 See:
   - examples/density_comparison/HBondFF/fit_radial.py (--compact-exp-demo)
-  - doc/Tasks/PairFF_MultiBody_Kernel.md
-  - kernels/rigid.cl (rigid_body_pairff_unified_env_kernel)
+  - doc/Tasks/PairFF_FAF_Substrate.md
+  - kernels/rigid.cl (rigid_body_pairff_unified_allmol[_faf]_kernel)
 """
 import os
 import numpy as np
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_XYZ = os.path.join(REPO_ROOT, 'data', 'xyz')
+DATA_FITS = os.path.join(REPO_ROOT, 'data', 'fits')
+DEFAULT_HCOOH_FIT = os.path.join(DATA_FITS, 'hcooh_nacl.npz')
 
 from spammm.topology.FFparams import load_xyz_with_REQs
 from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF
@@ -94,6 +100,31 @@ def _build_multibody(molecules, labels, active, spacing, args):
     return rbd
 
 
+def _load_or_fit_faf(mol_xyz, fit_path=None):
+    """Load cached FAF fit or fit HCOOH@NaCl and save under data/fits/."""
+    from spammm.surfaces.FoldedRigid import fit_folded_for_molecule, load_fit, save_fit
+    path = fit_path or DEFAULT_HCOOH_FIT
+    if os.path.isfile(path):
+        print(f"Loading FAF fit: {path}")
+        return load_fit(path)
+    print(f"Fitting FAF for {mol_xyz} → {path} (first run; may take a minute)...")
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    fit = fit_folded_for_molecule(mol_xyz)
+    save_fit(fit, path)
+    print(f"Saved FAF fit: {path}")
+    return fit
+
+
+def _attach_faf(rbd, args, mol_xyz_for_fit):
+    """Raise to surface, bind FAF, enable fused kernels (map uses rbd.faf_fit)."""
+    from spammm.surfaces.FoldedRigid import Z_SURF_TOP
+    fit = _load_or_fit_faf(mol_xyz_for_fit, args.faf_fit)
+    rbd.attach_pairff_faf(fit, z_init=args.z_init, k_z=0.0, enable=True)
+    print(f"FAF ON: z = Z_SURF_TOP({Z_SURF_TOP}) + {args.z_init} = {rbd.map_z:.3f}  k_z=0")
+    print(f"  map = PairFF(env) + FAF(probe) at z=active CoM; types={fit['coeffs'].shape[0]}")
+    return rbd
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='RigidBodyPairFF demo')
@@ -106,18 +137,24 @@ def main():
     parser.add_argument('--alpha', type=float, default=1.8, help='Morse alpha (legacy) / ignored if --beta set')
     parser.add_argument('--beta', type=float, default=None, help='Compact-exp beta (unified; default 1.7)')
     parser.add_argument('--w', type=float, default=0.7, help='Soft-radius / Lorentzian width')
-    parser.add_argument('--kz', type=float, default=5.0, help='Z-constraint strength')
+    parser.add_argument('--kz', type=float, default=5.0, help='Z-constraint strength (ignored / set 0 when --faf)')
     parser.add_argument('--epair-dist', type=float, default=1.4, help='Epair distance from host [Å]')
     parser.add_argument('--sigma-dist', type=float, default=1.0, help='Sigma hole distance from H [Å] (0=disabled)')
     parser.add_argument('--pairff-mode', choices=['legacy', 'unified'], default='unified',
                         help='Force kernel: legacy Morse+Lorentzian or unified compact-exp')
     parser.add_argument('--bodies', type=int, default=0,
-                        help='Multi-body: N copies of HCOOH (uses env Strategy M). 0 = classic uracil+HCOOH')
+                        help='Multi-body: N copies of HCOOH (shared allmol buffers). 0 = classic uracil+HCOOH')
     parser.add_argument('--mols', nargs='+', default=None,
                         help='Multi-body mixed species: XYZ paths or basenames under data/xyz/ '
                              '(e.g. PTCDA.xyz HCOOH.xyz formamide.xyz). Overrides --bodies.')
     parser.add_argument('--active', type=int, default=0, help='Active body index for multi-body mode')
     parser.add_argument('--spacing', type=float, default=6.0, help='XY grid spacing for multi-body')
+    parser.add_argument('--faf', action='store_true',
+                        help='Enable FAF NaCl substrate (fused PairFF+FAF; map shows PairFF+FAF)')
+    parser.add_argument('--faf-fit', default=None,
+                        help='Path to FAF .npz fit (default: data/fits/hcooh_nacl.npz; fit if missing)')
+    parser.add_argument('--z-init', type=float, default=3.5,
+                        help='Molecule height above surface top when --faf (Å); CoM = Z_SURF_TOP + z_init')
     args = parser.parse_args()
 
     if args.mols:
@@ -128,12 +165,14 @@ def main():
             molecules.append((apos, enames, REQs))
             labels.append(os.path.basename(p))
         rbd = _build_multibody(molecules, labels, int(args.active), args.spacing, args)
+        faf_mol = paths[0]
     elif args.bodies and args.bodies > 1:
         dyn_apos, dyn_REQs, dyn_enames = load_molecule(os.path.join(DATA_XYZ, 'HCOOH.xyz'))
         n = int(args.bodies)
         molecules = [(dyn_apos, dyn_enames, dyn_REQs)] * n
         labels = [f'HCOOH#{i}' for i in range(n)]
         rbd = _build_multibody(molecules, labels, int(args.active), args.spacing, args)
+        faf_mol = os.path.join(DATA_XYZ, 'HCOOH.xyz')
     else:
         # --- Classic: uracil static + HCOOH dynamic ---
         static_apos, static_REQs, static_enames = load_molecule(os.path.join(DATA_XYZ, 'uracil.xyz'))
@@ -159,6 +198,12 @@ def main():
         print(f"Static atoms+epairs: {len(rbd.static_enames)} — {rbd.static_enames}")
         print(f"Dynamic types: {rbd.dyn_type_host}")
         print(f"Static types:  {rbd.static_type_host}")
+        faf_mol = os.path.join(DATA_XYZ, 'HCOOH.xyz')
+
+    if args.faf:
+        if args.pairff_mode != 'unified':
+            raise SystemExit('--faf requires --pairff-mode unified')
+        rbd = _attach_faf(rbd, args, faf_mol)
 
     if args.no_vis:
         print(f"\nRunning FIRE relaxation (max {args.steps} steps, dt={args.dt})...")
@@ -167,13 +212,14 @@ def main():
         print(f"  F={result['F']:.6f}  T={result['T']:.6f}  E={result['E']:.6f}")
 
         out = rbd.download_outputs()
-        print(f"\nFinal CoM pos: {out['pos'][0, :3]}")
-        print(f"Final quat:    {out['quats'][0]}")
+        a = int(getattr(rbd, 'active_body', 0))
+        print(f"\nFinal CoM pos [active={a}]: {out['pos'][a, :3]}")
+        print(f"Final quat:    {out['quats'][a]}")
         print(f"Final atom positions (world):")
         for i, (e, t) in enumerate(zip(rbd.enames, rbd.dyn_type_host)):
             tag = 'epair' if t == 1 else ('sigma' if t == 2 else e)
             print(f"  [{i:2d}] {tag:6s}  {out['atom_positions'][0, i, :3]}")
-        if getattr(rbd, 'env_mode', False) and rbd._mb_packs is not None:
+        if getattr(rbd, '_mb_packs', None) is not None:
             rbd.sync_active_pose_from_gpu()
             print(f"Host multi-body CoMs:\n{rbd._mb_pos}")
     else:
@@ -182,8 +228,10 @@ def main():
         print("\nVispy+PyQt5 window opened.")
         print("Controls:")
         print("  LMB click+drag atoms to pull (anchor springs)")
-        if getattr(rbd, 'env_mode', False):
-            print("  Multi-body: LMB on any molecule → make it active (others static + map rebuild)")
+        if getattr(rbd, '_mb_packs', None) is not None:
+            print("  Multi-body: LMB on any molecule → make it active (index only; poses persist)")
+        if getattr(rbd, 'faf_mode', False):
+            print("  Map = PairFF(env molecules) + FAF(NaCl) at active CoM height")
         print("  Mouse wheel = zoom, Arrow keys = pan")
         print("  SPACE = run/stop simulation")
         print("  R = reset velocities, F = toggle FIRE (default ON)")

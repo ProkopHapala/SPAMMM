@@ -82,6 +82,32 @@ def test_project_with_translation(grids):
     assert np.linalg.norm(p1 - p_expect) / max(np.linalg.norm(p_expect), 1e-6) < 2e-3
 
 
+def test_cube_node_adapter_preserves_charge_and_dipole(grids):
+    """Cube nodes must be adapted to the center-source convention of the OpenCL kernel."""
+    from spammm.SPM.AFM_utils import project_density_to_grid
+    from spammm.utils.GridsOCL import grid_moments
+
+    step_s = np.array([0.08, 0.09, 0.11])
+    origin_s = np.array([-1.2, -1.1, -1.3])
+    n_s = (30, 28, 24)
+    xs = origin_s[0] + step_s[0] * np.arange(n_s[0])
+    ys = origin_s[1] + step_s[1] * np.arange(n_s[1])
+    zs = origin_s[2] + step_s[2] * np.arange(n_s[2])
+    X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
+    rho = np.exp(-((X - 0.21) ** 2 + (Y + 0.17) ** 2 + (Z - 0.09) ** 2) / (2 * 0.18 ** 2)).astype(np.float32)
+
+    origin_d = np.array([-1.6, -1.5, -1.7])
+    step_d = 0.1
+    n_d = (36, 34, 36)
+    q0, p0 = grid_moments(rho, origin_s, step_s)
+    dst, same_grids = project_density_to_grid(rho, origin_s, step_s, origin_d, step_d, n_d, grids=grids)
+    q1, p1 = grid_moments(dst, origin_d, step_d)
+
+    assert same_grids is grids
+    assert abs(q1 - q0) / q0 < 1e-4
+    assert np.linalg.norm(p1 - p0) / max(np.linalg.norm(p0), 1e-6) < 2e-3
+
+
 def test_gaussian_splat_integral(grids):
     """∫ ρ_NA ≈ Σ Z for one atom on a fine enough grid."""
     step = 0.1

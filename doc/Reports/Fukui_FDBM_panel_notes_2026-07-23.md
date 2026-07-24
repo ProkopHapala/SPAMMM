@@ -1,6 +1,7 @@
 # Notes: Fukui FDBM panel — cube ES + df↔Fz height shift (2026-07-23)
 
-**Status:** investigating — USER review. **No fix yet** (commit CLI / panel first).  
+**Status:** investigating — USER review. **No fix yet** for cube-row morphology (aniso step bug fixed; Gauss/clamp still inadequate).  
+**ES dipole investigation SSOT:** [`doc/Reports/Cube_ES_DeltaRho_NA_dipole.md`](Cube_ES_DeltaRho_NA_dipole.md)  
 **Gallery:** `debug/fdbm_fukui_panel/` · CLI: `run_spm.py panel-fukui` · task: `doc/Tasks/ProlongedRadialBasis_DFTB.md`
 
 ---
@@ -66,15 +67,13 @@ So the cube row is a **cross combo**: cube sample × DFTB tip. Asymmetry / huge 
    - **SSOT (pyridine / now wired):** `delta_rho_clamp_compact_na` + `GridsOCL.project_density` (trilinear *scatter*, `kernels/grids.cl` atomic_add)
 3. Helper: `AFM_utils.allelectron_cube_to_fdbm_grid` — used by `run_fukui_one`, `run_spm.py afm --cube`, `es-diag`.
 4. **2026-07-24 deeper bisect (pentacene) — root cause of dipole (NO manual strip):**
-   - Manual `strip_monopole_dipole` **DEFAULT OFF** again (symptom mask only).
-   - **NOT the pySCF cube pair:** `Δρ = ρ_N − ρ_NA.cube` has `|p_xy|≈0.010`, native V mX@1≈**0.035** (clean).
-   - **IS our NA subtraction:** `ρ_N − Gauss(σ=0.3)` `|p_xy|≈1.90`, V mX≈**0.80**; clamp→compact `|p_xy|≈1.47`, V mX≈**0.60**.
-   - Decomposition: `p(ρ_N)≈p(ρ_NA_cube)` so they cancel; our Gauss/compact NA has wrong multipoles vs all-e ρ_N → leftover dipole.
-   - Grid centering: our NA uses **corner** samples `origin+i·h`; GridsOCL project uses **centers** `origin+(i+½)·h`. Native Δρ dipole of GaussCORNER is convention-independent (q≈0). GaussCENTER vs corner-sampled ρ_N is worse (half-voxel core miss).
-   - Nuclei↔sample: both conventions ~0.03–0.06 Å; pad Δx≈0.1 Å; face density nearly symmetric — not the main XY dipole.
-   - Artifacts: `…/es_diag/dipole_origin_bisect.png`, `DIPOLE_ORIGIN.out`.
-   - **USER (2026-07-24):** plot is the smoking gun — V(N−NA_cube) symmetric; V(N−Gauss CORNER) x-slope; V(N−Gauss CENTER) smoother but x+y slope; V(clamp) improved but not enough. Preserve in code + `doc/Caveats.md`.
-   - Status: **investigating** — next should use cube `ρ_NA` (or match it), not dipole strip.
+   - Manual `strip_monopole_dipole` **DEFAULT OFF** (symptom mask only).
+   - **Primary bug (code fixed):** collapsing mild cube aniso (~0.2%) to `mean(sx,sy,sz)` warped Gauss vs ρ → `|p_xy|~1.9`, V mX~0.80. With true `(sx,sy,sz)`: `|p|~0.28`, V mX~0.42. `get_density_from_cube` now keeps `(3,)`.
+   - **Control:** `Δρ=ρ_N−ρ_NA.cube` still `|p|≈0.01`, V mX≈0.035 (clean).
+   - **Leftover after aniso:** `p(N−G)=p(N−NA)+p(NA−G)` exactly — leftover is **ρ_NA−Gauss** shape mismatch; σ-insensitive 0.15–0.5; dipole weight at molecular r~4–8 Å (not cores); H Voronoi cells > C. Prefer cube NA for ES.
+   - FDBM dest stays isotropic; GridsOCL project accepts aniso `step_s`. See `doc/Caveats.md` §1.
+   - Artifacts: `…/es_diag/dipole_origin_bisect.png`, `DIPOLE_ORIGIN.out` (regenerated with aniso).
+   - Status: **investigating** — aniso fixed; leftover Gauss open; wire cube `ρ_NA` for panel ES.
 
 ### Resample vs project (USER clarification)
 | Method | Code | Conserves ∫ρ, p? | Use for Δρ? |

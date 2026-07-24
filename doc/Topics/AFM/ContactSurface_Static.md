@@ -8,10 +8,10 @@ timestamp: 2026-07-06
 
 # AFM Contact Surface — Static (Rigid Sample, Classical FF)
 
-**Status:** Prototype implemented and wired to `AFMulator`  
+**Status:** Prototype in `AFMulator`; parity vs GridFF **investigating** (sphere `h₀` + coarse dx — see [ContactSurface_2p5D_vs_GridFF_2026-07-24.md](../../Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md))  
 **Task SSOT:** [../../Tasks/Fast_2p5D_AFM_ContactSurface.md](../../Tasks/Fast_2p5D_AFM_ContactSurface.md)  
 **Scope:** Memory-efficient **field representation** for rigid classical AFM (Morse/LJ); evaluated during PP relaxation, not a scan-image format.  
-**Pitfalls:** [Takeways.md](../../Takeways.md) · **Module index:** [spammm/surfaces/README.md](../../../spammm/surfaces/README.md)
+**Pitfalls:** [Takeways.md](../../Takeways.md) · **Caveats:** [Caveats.md](../../Caveats.md) §6 · **Module index:** [spammm/surfaces/README.md](../../../spammm/surfaces/README.md)
 
 **Related:** [ContactSurface_Elastic.md](ContactSurface_Elastic.md) · [../../surface_interactions.md](../../surface_interactions.md) · [../../afm_stm_simulation.md](../../afm_stm_simulation.md)
 

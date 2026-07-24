@@ -2,39 +2,43 @@
 type: TopicalAudit
 title: AFM Contact Surface (quasi-2D / 2.5D)
 tags: [afm, contact-surface, morse, opencl, parity]
+timestamp: 2026-07-24
 ---
 
 # Topical Audit: AFM Contact Surface
 
 ## Summary
 
-Quasi-2D **contact-surface** replaces dense 3D `img_FF` for classical Morse/LJ (+ Coulomb) PP-AFM: fit a lateral field (separable B-spline × z-modes, or radial PIC) once, then evaluate during tip relaxation. Designed to reproduce Morse+Coulomb **qualitatively**; PTCDA harnesses exist. Helicene assembly screening (2026-07-24) found separable contact-sep **too long-ranged / too sharp** vs GridFF+brute — treat as open parity regression until minimal-atom bisect closes it.
+Quasi-2D **contact-surface** replaces dense 3D `img_FF` for classical Morse/LJ (+ Coulomb) PP-AFM: fit a lateral field (separable B-spline × z-modes, or radial PIC) once, then evaluate during tip relaxation. **Design intent:** atom-scale B-spline nodes (`bspl_dx~1 Å`) with high-order modes — not sub-atomic voxels. Parity target is Morse+Coulomb **onset / E(z) shape** (brute or GridFF). 2026-07-24: sphere `h₀` + `h0_R_scale=0.75` + coarse dx fixed the soft/long-range bug; XY still sharper than GridFF — **USER visual pending**.
 
 ## Implementations
 
 | Language | Location | Status | Notes |
 |----------|----------|--------|-------|
 | OpenCL | `kernels/contact_surface.cl` | active | Brute Morse ref, separable Av/Atv/eval, PIC, PP relax |
-| Python | `spammm/surfaces/ContactSurface.py` | active | `SeparableParams`, `PICParams`, fit helpers |
-| Python | `spammm/SPM/AFM.py` | active | `fit_contact_surface`, `run_scan_contact`, GridFF `run_scan` |
-| Python | `run_assembly_afm.py` | experimental | Helicene SAM pipeline + `--compare-dir` |
+| Python | `spammm/surfaces/ContactSurface.py` | active | Sphere `h₀`, `SeparableParams`, `PICParams` |
+| Python | `spammm/SPM/AFM.py` | active | `fit_contact_surface(h0_mode='spheres')`, `run_scan_contact` |
+| Python | `run_assembly_afm.py` | experimental | Defaults: `bspl_dx=1.0`, `scan_dx=0.5`, `h0_R_scale=0.75` |
 | Design | `doc/Topics/AFM/ContactSurface_Static.md` | active | SSOT physics + API |
-| Design | `doc/Topics/AFM/ContactSurface_Elastic.md` | unfinished | Phase 2 Winkler — do not start unasked |
+| Design | `doc/Topics/AFM/ContactSurface_Elastic.md` | unfinished | Phase 2 Winkler |
+| Report | `doc/Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md` | active | **Parity SSOT** vs GridFF |
 
 ## Parity Status
 
 | Pair | Tolerance / metric | Test / artifact | Status |
 |------|--------------------|-----------------|--------|
 | Separable eval vs force stencil | RMSE < 1e-4 | `tests/SPM/test_afm_contact_surface.py` | verified (L0) |
-| Separable / PIC fit vs brute Morse+Coulomb (PTCDA) | E fit ~7 meV sep; close E ~8 meV | `tests/testplot_contact_surface.py` → `debug/testplot_contact_surface/` | prototype OK |
-| Separable PP Fz vs 3D `img_FF` (PTCDA) | ~14 meV/Å mean | `tests/SPM/testplot_afm_contact_surface.py` | prototype OK |
-| contact-sep vs GridFF+brute (helicene assembly) | qualitative fail: long-range / deep well | `rank09…/compare_contact_vs_gridff_*.png` | **open** |
-| 1-atom / 2-atom toy | TBD | planned | not started |
+| Toys: spheres vs atom_z vs brute | well/Fz shift ~0 | `testplot_contact_surface.py --toys` | spheres+0.75 OK |
+| PTCDA fit / close parity | RMSE_E ~0.01–0.03 eV | `debug/testplot_contact_surface/` | regenerated scale=0.75 |
+| Helicene E/Fz(z) vs brute | qualitative track | `rank09…/compare_*_profiles.png` | improved |
+| Helicene XY vs GridFF | morphology | `rank09…/compare_*_maps.png` | still sharper; **USER review** |
+| Separable PP Fz vs 3D `img_FF` (PTCDA) | ~14 meV/Å (old knobs) | `testplot_afm_contact_surface.py` | re-check with new defaults |
 
 ## Open Issues
 
-- Helicene: contact-sep E(z) well shifted out vs brute (~4 Å vs ~2.8 Å) — why? Boltzmann weights, fit-z window, basis, or Coulomb channel?
-- Re-validate PTCDA with **current** default knobs before rewriting fit code.
-- Minimal 1-atom (q=0) and 2-atom (charged) bisect — **next**; do not invent a second parity stack.
-- Assembly GPU atom-cloud dedup deferred (`Assembly_AFM_Pipeline.md` Phase 2).
-- ND `--contact-surface {separable,pic,grid3d}` flag still open.
+- [~] USER confirm PTCDA + helicene maps/profiles (`ContactSurface_2p5D_vs_GridFF_2026-07-24.md`)
+- Residual XY sharpness vs GridFF at close approach
+- Re-run PP-relaxed PTCDA parity with `bspl_dx=1.0` / sphere `h₀`
+- PIC + sphere `h₀` / coarse dx not re-validated
+- ND `--contact-surface {separable,pic,grid3d}` flag still open
+- Assembly GPU atom-cloud dedup deferred
