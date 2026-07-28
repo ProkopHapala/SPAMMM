@@ -2,6 +2,8 @@
 
 **Goal:** End-to-end FDBM AFM image generation interactive (~0.1 s).
 
+**Status (2026-07-28):** Round-1 + Round-2 shipped. **CLI legacy Stage3–4 ↔ Modular FAST_S3 parity USER-confirmed** (~5.5× S3+S4 on pentacene/PTCDA) — see [`../TopicalAudit/AFM_FDBM.md`](../TopicalAudit/AFM_FDBM.md). **Next:** remove CLI `_run_from_density` fork; default product path = ModularPipeline only.
+
 **Status (2026-07-19):** Round-1 + Round-2 **shipped and measured**. Benzene warm ~**0.18 s**; large-mol (flat_1) warm S3+S4 ~**1.4 s**. Fast S3 default (`SPAMMM_AFM_FAST_S3=1`); legacy via `=0`.  
 `AFMBench` SSOT: `spammm/SPM/AFM.py` (not `globals.py`).
 
@@ -12,7 +14,22 @@ SPAMMM_AFM_BENCH=1 SPAMMM_AFM_BENCH_NO_IO=1 SPAMMM_VERBOSITY=0 AFM_DEBUG_PLOT_LE
   python tests/SPM/bench_fdbm.py --mol data/xyz/benzene.xyz --tip co --step 0.1 --scan-step 0.1 --repeats 2
 # Legacy S3 for comparison:
 #   SPAMMM_AFM_FAST_S3=0 ...
+# CLI legacy vs FAST_S3 parity + timing (pentacene / PTCDA):
+python tests/SPM/testplot_cli_vs_modular_parity.py
 ```
+
+---
+
+## CLI legacy vs Modular FAST_S3 (2026-07-28, RTX 3090)
+
+Shared SCF/ρ/tip/scan/FIRE; only Stage3–4 differ. USER confirmed REVIEW PNGs.
+
+| Mol | LEGACY (CPU FFT Stage3) | FAST_S3 | Speedup | df corr |
+|-----|-------------------------|---------|---------|---------|
+| pentacene | 1.23 s | 0.23 s | **5.45×** | 0.9996 |
+| PTCDA | 1.16 s | 0.21 s | **5.47×** | 0.9996 |
+
+**Implication:** do **not** promote `_run_from_density` into the GUI. Fold CLI `afm` onto ModularPipeline and delete/deprecate the NumPy Stage-3 product path.
 
 ---
 

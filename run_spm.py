@@ -96,7 +96,8 @@ def _add_common_afm_args(p: argparse.ArgumentParser) -> None:
     out.add_argument('--df-cmap',            default='gray', dest='df_cmap')
     out.add_argument('--height', type=float, default=4.2,
                      help='Stage-plot slice height above mol [Å]')
-    out.add_argument('--scale',    default='per_column', choices=['per_image', 'per_column', 'common'])
+    out.add_argument('--scale',    default='per_image', choices=['per_image', 'per_column', 'common'],
+                     help='Color scale (default per_image; df always per-panel clim)')
     out.add_argument('--plots', default='compare,stage',
                      help='CSV: compare,stage (default); tip,df,fz,per_image; all; none')
     out.add_argument('--show-atoms', action='store_true', dest='show_atoms',
@@ -255,22 +256,21 @@ def cmd_afm(args: argparse.Namespace) -> int:
     show_atoms = bool(getattr(args, 'show_atoms', False))
     out_png = None
     if 'compare' in plots:
-        scale = args.scale if args.scale != 'per_image' else 'per_column'
-        # Prefer fixed name compare_per_column.png when using default scale
+        scale = getattr(args, 'scale', 'per_image') or 'per_image'
         out_png = os.path.join(args.outdir, f'compare_{scale}.png')
         afm_utils.plot_afm_variant_height_strip(
             variants, row_specs, heights, out_png, scale=scale, title=title, dpi=140,
             apos=atomPos if show_atoms else None, show_atoms=show_atoms, extent=extent,
-            amp=args.amp, amp_align=amp_align)
+            amp=args.amp, amp_align=amp_align, long_axis_vertical=True, tight=True)
         print(f'REVIEW: {out_png}')
-    if 'per_image' in plots:
+    if 'per_image' in plots and getattr(args, 'scale', 'per_image') != 'per_image':
         per = os.path.join(args.outdir, 'per_image')
         os.makedirs(per, exist_ok=True)
         pi = os.path.join(per, 'compare_per_image.png')
         afm_utils.plot_afm_variant_height_strip(
             variants, row_specs, heights, pi, scale='per_image', title=title, dpi=140,
             apos=atomPos if show_atoms else None, show_atoms=show_atoms, extent=extent,
-            amp=args.amp, amp_align=amp_align)
+            amp=args.amp, amp_align=amp_align, long_axis_vertical=True, tight=True)
         print(f'REVIEW: {pi}')
 
     summary = os.path.join(args.outdir, 'SUMMARY.out')
@@ -705,7 +705,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_br.add_argument('--cmap', default='seismic')
     p_br.add_argument('--df-cmap', default='gray', dest='df_cmap')
     p_br.add_argument('--stm-cmap', default='viridis', dest='stm_cmap')
-    p_br.add_argument('--scale', default='per_column', choices=['per_image', 'per_column', 'common'])
+    p_br.add_argument('--scale', default='per_image', choices=['per_image', 'per_column', 'common'])
     p_br.add_argument('--show-atoms', action='store_true', dest='show_atoms')
     p_br.add_argument('--pp-stride', type=int, default=4, dest='pp_stride',
                       help='Every Nth pixel for PP xy red-dot overlay (ppafm plotDistortions)')

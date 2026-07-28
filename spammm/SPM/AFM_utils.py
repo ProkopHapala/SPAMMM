@@ -497,27 +497,66 @@ def _afm_strip_symmetric(qty):
 
 def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
                                   scale='per_image', title='', dpi=140, pct=99.0,
-                                  colorbar=True, figsize_col=1.55, figsize_row=1.35,
+                                  colorbar=None, figsize_col=None, figsize_row=None,
                                   amp=None, apos=None, show_atoms=False, extent=None,
-                                  atom_ms=2.0, atom_alpha=0.55, amp_align=False):
+                                  atom_ms=2.0, atom_alpha=0.55, amp_align=False,
+                                  long_axis_vertical=True, tight=True):
     """Multi-row × multi-height AFM compare strip (df/Fz/STM/BR-STM × methods).
 
+    USER SSOT defaults (do not regress — skill:`afm-plotting`):
+      - scale='per_image': each panel has its own vmin/vmax (esp. df — never shared df clim)
+      - long_axis_vertical=True: transpose so molecular long axis is vertical (more z-columns on screen)
+      - tight=True: figure aspect matches data so aspect='equal' fills axes (no letterbox gaps)
+
     Args:
-        variants: dict key → {'df': (nx,ny,nz), 'Fz': (nx,ny,nz), 'stm':..., 'br_stm':..., ...}
-        row_specs: list of (qty, key, ylabel, cmap) e.g. ('df','cube','df cube','gray')
-        heights: (nz,)  — column labels = df probe heights when amp_align
-        amp_align: if True, Fz arrays are already sampled at h−amp (fair morph. match);
-          title notes this. STM/BR-STM stay at labeled df probe h (same imaging window).
-        amp: peak oscillation amplitude [Å] (annotation)
+        variants: dict key → {'df': (nx,ny,nz), 'Fz': (nx,ny,nz), ...}
+        row_specs: list of (qty, key, ylabel, cmap)
+        heights: (nz,) column labels = df probe heights when amp_align
+        scale: 'per_image' (default) | 'per_column' | 'common'
+        long_axis_vertical: if True, display so max(nx,ny) is the vertical image axis
+        tight: pack panels; figure inches ∝ display pixels so no empty bands inside axes
+        colorbar: None → False when scale=='per_image' or tight; else True
     """
     heights = np.asarray(heights, dtype=np.float64)
     n_h = len(heights)
     n_r = len(row_specs)
-    fig, axes = plt.subplots(n_r, n_h,
-                             figsize=(figsize_col * n_h + 1.4, figsize_row * n_r + 1.2),
-                             squeeze=False)
 
-    # Precompute common / per_column clims
+    q0, k0, _, _ = row_specs[0]
+    a0 = np.asarray(variants[k0][q0][:, :, 0])
+    nx0, ny0 = int(a0.shape[0]), int(a0.shape[1])
+    # imshow(arr.T): horiz=nx, vert=ny. If nx>=ny and long_axis_vertical → imshow(arr): vert=nx.
+    rot90_long = bool(long_axis_vertical) and (nx0 >= ny0)
+    disp_h = nx0 if rot90_long else ny0  # image rows
+    disp_w = ny0 if rot90_long else nx0  # image cols
+
+    # Figure size from data pixels so aspect='equal' fills each axes (no white letterbox)
+    inch_per_px = 0.011
+    label_w, title_h = (0.55, 0.42) if tight else (1.2, 0.9)
+    if figsize_col is not None and figsize_row is not None:
+        fig_w = figsize_col * n_h + label_w
+        fig_h = figsize_row * n_r + title_h
+    else:
+        fig_w = disp_w * inch_per_px * n_h + label_w
+        fig_h = disp_h * inch_per_px * n_r + title_h
+
+    if colorbar is None:
+        colorbar = not (tight or scale == 'per_image')
+    if colorbar:
+        fig_w += 0.7
+
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    # Grid cells match data aspect (fig inches ∝ disp pixels) → no letterbox; wspace/hspace≈0
+    gs = fig.add_gridspec(
+        n_r, n_h,
+        left=(0.06 if tight else 0.08), right=(0.995 if not colorbar else 0.92),
+        bottom=(0.01 if tight else 0.04), top=(0.90 if title else 0.96),
+        wspace=(0.0 if tight else 0.05), hspace=(0.0 if tight else 0.08),
+    )
+    axes = np.empty((n_r, n_h), dtype=object)
+    for ir in range(n_r):
+        for ih in range(n_h):
+            axes[ir, ih] = fig.add_subplot(gs[ir, ih])
+
     qty_keys = {}
     for qty, key, _, _ in row_specs:
         qty_keys.setdefault(qty, []).append(key)
@@ -532,6 +571,8 @@ def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
         col_clim = {}
         if scale == 'per_column':
             for qty, keys in qty_keys.items():
+                if qty == 'df':
+                    continue  # df never shares column clim
                 stack = np.concatenate([
                     np.asarray(variants[k][qty][:, :, ih], dtype=np.float64).ravel() for k in keys])
                 col_clim[qty] = afm_panel_clim(stack, pct=pct, symmetric=_afm_strip_symmetric(qty))
@@ -539,46 +580,59 @@ def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
         for ir, (qty, key, ylab, cmap) in enumerate(row_specs):
             ax = axes[ir, ih]
             arr = np.asarray(variants[key][qty][:, :, ih], dtype=np.float64)
-            if scale == 'per_image':
-                # Experimental: relative contrast within this image (not zero-forced)
-                vmin, vmax = afm_panel_clim(arr, pct=pct, symmetric=False)
+            # df: always per-image vmin/vmax (full image range — USER SSOT, never shared df clim)
+            if qty == 'df':
+                vmin = float(np.min(arr)); vmax = float(np.max(arr))
+                if not np.isfinite(vmin): vmin = -1e-30
+                if not np.isfinite(vmax) or vmax <= vmin: vmax = vmin + 1e-30
+            elif scale == 'per_image':
+                vmin, vmax = afm_panel_clim(arr, pct=pct, symmetric=_afm_strip_symmetric(qty))
             elif scale == 'per_column':
                 vmin, vmax = col_clim[qty]
             else:
                 vmin, vmax = common_clim[qty]
-            im = ax.imshow(arr.T, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax, aspect='equal',
-                           extent=extent)
+            view = arr if rot90_long else arr.T
+            ext = extent
+            if ext is not None and rot90_long:
+                ext = (ext[2], ext[3], ext[0], ext[1])
+            im = ax.imshow(view, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax, aspect='equal',
+                           extent=ext, interpolation='nearest')
+            ax.set_box_aspect(disp_h / max(disp_w, 1))  # no letterbox gaps
             ax.set_xticks([]); ax.set_yticks([])
+            for _sp in ax.spines.values():
+                _sp.set_linewidth(0.3)
             if show_atoms and apos is not None:
-                overlay_afm_geometry(ax, apos=apos, show_bonds=False, show_cell=False, show_atoms=True,
-                                     atom_ms=atom_ms, atom_alpha=atom_alpha)
-            if ir == 0:
-                if amp_align and amp is not None:
-                    ax.set_title(f'df h={heights[ih]:.2f}\nFz@{heights[ih]-float(amp):.2f}', fontsize=7)
+                ap = np.asarray(apos, dtype=np.float64)
+                if rot90_long and ap.ndim == 2 and ap.shape[1] >= 2:
+                    ap_disp = ap.copy()
+                    ap_disp[:, 0], ap_disp[:, 1] = ap[:, 1], ap[:, 0]
+                    overlay_afm_geometry(ax, apos=ap_disp, show_bonds=False, show_cell=False,
+                                         show_atoms=True, atom_ms=atom_ms, atom_alpha=atom_alpha)
                 else:
-                    ax.set_title(f'h={heights[ih]:.2f}Å', fontsize=8)
+                    overlay_afm_geometry(ax, apos=apos, show_bonds=False, show_cell=False, show_atoms=True,
+                                         atom_ms=atom_ms, atom_alpha=atom_alpha)
+            if ir == 0:
+                ax.set_title(f'{heights[ih]:.2f}', fontsize=6, pad=1)
             if ih == 0:
-                ax.set_ylabel(ylab, fontsize=7)
+                ax.set_ylabel(ylab, fontsize=6)
             if colorbar and ih == n_h - 1:
-                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
 
     scale_note = {
-        'per_image': 'color scale = per panel min/max (relative contrast)',
-        'per_column': 'color scale = shared per column (variants comparable)',
-        'common': 'color scale = common across all panels of same qty',
+        'per_image': 'clim=per panel (df always)',
+        'per_column': 'Fz clim=shared/column; df=per panel',
+        'common': 'clim=common per qty (df still per panel)',
     }.get(scale, scale)
     amp_note = ''
-    if amp is not None:
-        if amp_align:
-            amp_note = (f'  |  amp={float(amp):.2f}Å: columns = df probe h; '
-                        f'Fz panels sampled at h−amp (closest-approach match)')
-        else:
-            amp_note = (f'  |  df amp={float(amp):.2f}Å peak → mixes Fz over ±amp '
-                        f'(closest≈h−amp); do not equate Fz(h) with df(h)')
-    fig.suptitle(f'{title}\n{scale_note}{amp_note}', fontsize=10)
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    if amp is not None and amp_align:
+        amp_note = f' | amp={float(amp):.2f}Å Fz@h−amp'
+    elif amp is not None:
+        amp_note = f' | amp={float(amp):.2f}Å'
+    rot_note = ' | long→vertical' if rot90_long else ''
+    fig.suptitle(f'{title}\n{scale_note}{amp_note}{rot_note}', fontsize=8, y=0.995)
+    # packing already set via gridspec; do not call tight_layout (reopens gaps)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or '.', exist_ok=True)
-    fig.savefig(out_path, dpi=dpi)
+    fig.savefig(out_path, dpi=dpi, bbox_inches='tight', pad_inches=0.03)
     plt.close(fig)
     print(f'REVIEW: {out_path}')
     return out_path
@@ -3061,12 +3115,16 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
             debug_print(1, "  [compose_and_relax_total] GPU relaxStrokes spherical PPM "
                   f"(L={bond_length}Å, K_LAT={K_LAT:.4f} eV/Å² = {afm.stiffness_eVA2_to_Nm(K_LAT):.2f} N/m, K_RAD={K_RAD})")
             if afmulator is None:
-                afmulator = afm.AFMulator(use_morse=False, nloc=32, use_fire=False)
+                afmulator = afm.AFMulator(use_morse=False, nloc=32, use_fire=True)
             if not reuse_fdbm_grid:
                 afmulator.setup_fdbm_grid(F_total, origin, step)
-            # Smaller dt=0.1, damp=0.3 for stability with weak forces (probe far from surface)
-            relax_pars_ppm = [0.1, 0.1, 0.03, 0.1]  # dt, damp, alpha, dt_fire
-            FEs_relax, tip_disp = afmulator.scan_fdbm( scan_xs, scan_ys, heights, mol_z=mol_z,  K_LAT=K_LAT, K_RAD=K_RAD, bond_length=bond_length,  relax_pars=relax_pars_ppm )
+            # CLI / GUI SSOT: FIRE defaults (same as AFMulator.scan_fdbm use_fire=True).
+            # Do NOT soft-override relax_pars — that broke GUI↔CLI tip_disp / sharpness parity.
+            FEs_relax, tip_disp = afmulator.scan_fdbm(
+                scan_xs, scan_ys, heights, mol_z=mol_z,
+                K_LAT=K_LAT, K_RAD=K_RAD, bond_length=bond_length,
+                ppm_mode=True, use_fire=True,
+            )
             # Diagnostic: report maximum displacement for each z-height
             from spammm.globals import DEBUG_PRINT_LEVEL
             if DEBUG_PRINT_LEVEL >= 2:
@@ -4202,11 +4260,12 @@ def run_br_stm_afm_panel(atomPos, enames, outdir, *,
     ]
     png_afm = os.path.join(outdir, '02_afm_df_tipdisp.png')
     plot_afm_variant_height_strip(
-        variants_afm, row_specs_afm, h_df, png_afm, scale=scale if scale != 'per_image' else 'per_column',
+        variants_afm, row_specs_afm, h_df, png_afm,         scale=scale if scale in ('per_image', 'per_column', 'common') else 'per_image',
         title=(f'Stage 2 — AFM  tip={tip_mode} K_LAT={K_LAT_Nm:.2f} N/m L={bond_length:.1f}Å  '
                f'columns=df h; Fz & |dxy| morph. at h−amp when amp_align'),
         dpi=140, apos=atomPos if show_atoms else None, show_atoms=show_atoms,
         extent=extent, amp=amp_f, amp_align=bool(amp_align), figsize_row=1.3,
+        long_axis_vertical=True, tight=True,
     )
     # also full tip_disp gallery at Fz heights (where bending is large)
     plot_tip_displacement(tip_disp_Fz, pipe.scan_xs, pipe.scan_ys, h_Fz, outdir,

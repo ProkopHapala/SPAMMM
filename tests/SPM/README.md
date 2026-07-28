@@ -12,7 +12,10 @@ See `doc/TEST_DESIGN.md` for L0/L1/L2 review levels.
 | `test_afm_fdbm.py` | pytest | FDBM pipeline: DFTB SCF, density projection, relaxed scan |
 | `testplot_density_projection.py` | visual | DFTB+ density projection, 2D slices + `.cub` |
 | `testplot_fdbm_potentials.py` | visual | FDBM potential plots (Pauli, ES, dispersion) |
-| `testplot_fdbm_relax.py` | visual | FDBM + PP relaxation: Fz, df; **`--ptcda-stock-vs-sa`** → 8-height stock 3ob vs SA-prolonged |
+| `testplot_fdbm_relax.py` | visual | FDBM + PP relaxation; **legacy** `_run_from_density` (deprecated for product CLI — see parity script) |
+| `testplot_cli_vs_modular_parity.py` | visual | **LEGACY CLI Stage3–4 vs Modular FAST_S3** parity + timing → `debug/cli_vs_modular_parity/` |
+| `bench_fdbm.py` | bench | ModularPipeline `AFMBench` segment timings |
+| `run_afm_cli_fdbm_gallery.py` | CLI | Fukui gallery via `panel-fukui` (still on legacy until cutover) |
 | `testplot_afm_morse.py` | visual | Morse AFM energy/Fz/df maps |
 | `test_afm_contact_surface.py` | pytest | Contact-surface AFM: separable + PIC parity |
 | `testplot_afm_contact_surface.py` | visual | Contact-surface fit + PP relaxed scan |

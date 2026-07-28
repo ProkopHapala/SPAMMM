@@ -55,6 +55,14 @@ One subfolder per molecule. Strip = **6 rows**: df(cube, prolonged, stock) + Fz(
 | amp | **1.0 Å** (peak) |
 | Fz columns | **amp-aligned** @ **h − amp** → **2.7 – 3.7 Å** |
 
+## Display SSOT (overview strip)
+
+| | Value |
+|--|-------|
+| df / Fz clim | **per panel** (`vmin`/`vmax` each image; never shared df colorbar) |
+| long axis | **vertical** (transpose when nx≥ny) |
+| packing | **tight** (minimal gaps, no colorbar gutters) |
+
 ## Pauli A,β SSOT (evaluation — transferable)
 
 | | Value |
@@ -103,7 +111,7 @@ def main(argv=None) -> int:
         # height SSOT: omit overrides → CLI defaults 3.7–4.7 / dz=0.1 / amp-align
         '--basis', '3ob-3-1',
         '--tip-mode', 'co',
-        '--scale', 'per_column',
+        '--scale', 'per_image',
         '--df-cmap', 'gray',
         '--cmap', 'seismic',
     ]

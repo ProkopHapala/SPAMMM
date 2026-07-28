@@ -62,7 +62,7 @@ Topology (AtomicGraph SSOT) → Type Assignment → Force Fields → Surface Int
 |--------|--------|-------|-------|
 | `AFM.py` (AFMulator) | ✅ Morse + FDBM FAST_S3 | [test_afm_morse.py](cci:7://file:///home/prokop/git/SPAMMM/tests/SPM/test_afm_morse.py:0:0-0:0), [test_afm_fdbm.py](cci:7://file:///home/prokop/git/SPAMMM/tests/SPM/test_afm_fdbm.py:0:0-0:0) | Morse/LJ + Coulomb OK; FDBM R1+R2 perf (`SPAMMM_AFM_FAST_S3`); fused ES + GPU pad/scale |
 | `AFM_utils.py` | ✅ Active | FDBM + tip helpers | Tip `pad_mode='none'` for GPU roll; `compose_and_relax_total(reuse_fdbm_grid=…)`; strip plots `plot_afm_variant_height_strip` |
-| `ModularPipeline.py` | ✅ Active | `tests/SPM/bench_fdbm.py` | S1–S6 + `AFMBench`; dual S3 path (fast/legacy); **not yet a CLI subcommand** |
+| `ModularPipeline.py` | ✅ Active **SSOT** | `bench_fdbm.py`, `testplot_cli_vs_modular_parity.py` | S1–S6 + FAST_S3; GUI + `stm br`; CLI `afm` still on deprecated `_run_from_density` until cutover |
 | `KrigingGridFF.py` | ✅ Active | kriging testplots | Mithun DFT → GridFF; CLI: `run_spm.py afm-kriging` |
 | `stm_compare.py` | ✅ Active | `testplot_stm_basis_compare.py` | SSOT for `run_spm.py stm {orbitals,current,panel}` |
 | STM kernels (`LCAO_STM.cl`, `LCAO_grid.cl`) | ⚠️ Kernels + `compute_stm` | No dedicated STM L0 | Campaign: `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md` |
@@ -78,7 +78,8 @@ Topology (AtomicGraph SSOT) → Type Assignment → Force Fields → Surface Int
 | `afm-kriging` | ✅ wired |
 | `panel-fukui` / `replot-panel` | ✅ wired |
 | `stm orbitals` / `current` / `panel` | ✅ wired |
-| Bond-resolved STM (BR-STM) | GUI S6 ✅; CLI ✗ — consolidate task |
+| Bond-resolved STM (BR-STM) | GUI S6 ✅; CLI `stm br` ✅ |
+| Remove legacy CLI FDBM (`_run_from_density`) | ✗ ToDo — FAST_S3 parity USER-confirmed; fold `afm` onto ModularPipeline |
 | Shared GUI↔CLI job-spec protocol | ✗ ToDo (`Consolidate_GUI_CLI_Backend_Input_Protocol.md`) |
 | Inputs: ASCII / `.mol`/`.mol2` shared flags | ✗ ToDo — SMILES done; ASCII builder exists (`SPM_CLI_Headless.md` §A/D) |
 | Substrate `dock` (GridFF / FAF) | ✗ **Future** — harder; see `SPM_CLI_Headless.md` §E + folded-basis task |

@@ -212,6 +212,10 @@ def _grid_spec_from_meta(meta):
 def _run_from_density(tag, rho_scf, V_ES, atomPos, atomTypes, origin, step, ngrid, A, beta, tip_mode, outdir, args):
     """PP-AFM scan from precomputed ρ / V_ES with explicit Pauli A,β.
 
+    DEPRECATED for product CLI (`run_spm.py afm`): prefer ModularPipeline FAST_S3.
+    Kept for diagnostics / parity (`testplot_cli_vs_modular_parity.py`) until cutover.
+    Uses host NumPy FFT when ``SPAMMM_AFM_CPU_FFT=1`` (CLI afm default today — slow).
+
     Display heights = [h_min, h_max] step h_step. PP scan covers ±amp so ``compute_df_amp``
     is well-defined at the display edges. Plots gated by ``args._plots`` / ``args.plots``.
     """
@@ -666,15 +670,16 @@ def run_fukui_one(mol, xyz_rel, args):
     cmp_name = 'compare_cube_stock_prolonged.png' if has_cube else 'compare_stock_prolonged.png'
     cmp = os.path.join(outdir, cmp_name)
     afm_utils.plot_afm_variant_height_strip(
-        variants, row_specs, heights, cmp, scale='per_column', title=title,
-        dpi=140, amp=amp, amp_align=amp_align)
+        variants, row_specs, heights, cmp, scale='per_image', title=title,
+        dpi=140, amp=amp, amp_align=amp_align, long_axis_vertical=True, tight=True)
     lines.append(f'REVIEW: {cmp}')
-    per_dir = os.path.join(outdir, 'per_image')
+    # Optional diagnostic: shared Fz clim / column (df still per-image inside helper)
+    per_dir = os.path.join(outdir, 'per_column_Fz')
     os.makedirs(per_dir, exist_ok=True)
     cmp_pi = os.path.join(per_dir, cmp_name)
     afm_utils.plot_afm_variant_height_strip(
-        variants, row_specs, heights, cmp_pi, scale='per_image', title=title,
-        dpi=140, amp=amp, amp_align=amp_align)
+        variants, row_specs, heights, cmp_pi, scale='per_column', title=title + ' [Fz per_column]',
+        dpi=140, amp=amp, amp_align=amp_align, long_axis_vertical=True, tight=True)
     lines.append(f'REVIEW: {cmp_pi}')
     lines.append(f'height SSOT: df=[{float(heights[0]):.2f},{float(heights[-1]):.2f}] dz={args.h_step} '
                  f'amp={amp} amp_align={amp_align}  (Fz@h−amp when align)')
@@ -699,10 +704,10 @@ def run_fukui_one(mol, xyz_rel, args):
 
 
 def replot_fukui_per_image(panel_dir, molecules=None, cmap='seismic', df_cmap='gray'):
-    """Replot existing scan_*.npz strips with per-image color scale (does not overwrite commons)."""
+    """Replot existing scan_*.npz strips with SSOT display defaults (per-image clim, long→vertical, tight)."""
     from spammm.SPM import AFM_utils as afm_utils
     mols = molecules or [m for m, _ in FUKUI_PANEL]
-    lines = [f'Replot per_image from {panel_dir}', '']
+    lines = [f'Replot SSOT display from {panel_dir}', '']
     for mol in mols:
         npz = os.path.join(panel_dir, mol, 'scan_cube_stock_prolonged.npz')
         if not os.path.isfile(npz):
@@ -726,21 +731,23 @@ def replot_fukui_per_image(panel_dir, molecules=None, cmap='seismic', df_cmap='g
             ('Fz', 'prolonged', 'Fz  prolonged', cmap),
             ('Fz', 'stock', 'Fz  stock 3ob', cmap),
         ]
-        title = (f'{mol} FDBM CO tip | DFT cube → prolonged → stock\n'
-                 f'(replot — per-image color scale)')
-        per_dir = os.path.join(panel_dir, mol, 'per_image')
-        os.makedirs(per_dir, exist_ok=True)
-        out = os.path.join(per_dir, 'compare_cube_stock_prolonged.png')
+        title = f'{mol} FDBM CO tip | DFT cube → prolonged → stock'
+        # Main overview = SSOT (per-image, long→vertical, tight)
+        out_main = os.path.join(panel_dir, mol, 'compare_cube_stock_prolonged.png')
         afm_utils.plot_afm_variant_height_strip(
-            variants, row_specs, heights, out, scale='per_image', title=title, dpi=140)
-        # Also refresh shared-scale strip (same row order)
-        out_col = os.path.join(panel_dir, mol, 'compare_cube_stock_prolonged.png')
+            variants, row_specs, heights, out_main, scale='per_image', title=title, dpi=140,
+            long_axis_vertical=True, tight=True, amp=1.0, amp_align=True)
+        lines.append(f'REVIEW: {out_main}')
+        # Optional diagnostic: Fz shared per column
+        per_dir = os.path.join(panel_dir, mol, 'per_column_Fz')
+        os.makedirs(per_dir, exist_ok=True)
+        out_col = os.path.join(per_dir, 'compare_cube_stock_prolonged.png')
         afm_utils.plot_afm_variant_height_strip(
             variants, row_specs, heights, out_col, scale='per_column',
-            title=f'{mol} FDBM CO tip | DFT cube → prolonged → stock', dpi=140)
+            title=f'{title} [Fz per_column]', dpi=140,
+            long_axis_vertical=True, tight=True, amp=1.0, amp_align=True)
         lines.append(f'REVIEW: {out_col}')
-        lines.append(f'REVIEW: {out}')
-    sum_path = os.path.join(panel_dir, 'SUMMARY_per_image.out')
+    sum_path = os.path.join(panel_dir, 'SUMMARY_replot.out')
     open(sum_path, 'w').write('\n'.join(lines) + '\n')
     print(f'REVIEW: {sum_path}')
     return lines
@@ -935,7 +942,7 @@ def run_fukui_panel(args):
         run_fukui_one(mol, xyz, args)
         panel_lines.append(f'REVIEW: {os.path.join(args.outdir, mol, "compare_cube_stock_prolonged.png")}')
         panel_lines.append(f'REVIEW: {os.path.join(args.outdir, mol, "compare_stock_prolonged.png")}')
-        panel_lines.append(f'REVIEW: {os.path.join(args.outdir, mol, "per_image", "compare_cube_stock_prolonged.png")}')
+        panel_lines.append(f'REVIEW: {os.path.join(args.outdir, mol, "per_column_Fz", "compare_cube_stock_prolonged.png")}')
         panel_lines.append(f'REVIEW: {os.path.join(args.outdir, mol, "SUMMARY.out")}')
     panel_sum = os.path.join(args.outdir, 'SUMMARY.out')
     open(panel_sum, 'w').write('\n'.join(panel_lines) + '\n')

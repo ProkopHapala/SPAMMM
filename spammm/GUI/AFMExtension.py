@@ -1447,7 +1447,8 @@ def build_ui(window):
     scan_grid = QtWidgets.QGridLayout(scan_group)
     scan_grid.addWidget(QtWidgets.QLabel("Range:"), 0, 0)
     window.afm_scan_range_spin = QtWidgets.QDoubleSpinBox()
-    window.afm_scan_range_spin.setRange(1.0, 10.0); window.afm_scan_range_spin.setValue(3.0)
+    window.afm_scan_range_spin.setRange(1.0, 10.0); window.afm_scan_range_spin.setValue(2.0)
+    window.afm_scan_range_spin.setToolTip("Lateral pad beyond molecule bbox [Å] (CLI --scan-margin SSOT = 2.0).")
     scan_grid.addWidget(window.afm_scan_range_spin, 0, 1)
     scan_grid.addWidget(QtWidgets.QLabel("H min:"), 1, 0)
     window.afm_hmin_spin = QtWidgets.QDoubleSpinBox()
@@ -1477,11 +1478,16 @@ def build_ui(window):
     physics_grid = QtWidgets.QGridLayout(physics_group)
     physics_grid.addWidget(QtWidgets.QLabel("Pauli A [eV]:"), 0, 0)
     window.afm_pauli_a_spin = QtWidgets.QDoubleSpinBox()
-    window.afm_pauli_a_spin.setRange(0.1, 2000.0); window.afm_pauli_a_spin.setValue(787.22); window.afm_pauli_a_spin.setDecimals(2)
+    from spammm.SPM import AFM as _afm_pauli
+    _pa3 = _afm_pauli.PAULI_FITTED_DEFAULTS['3ob-3-1']
+    _pam = _afm_pauli.PAULI_FITTED_DEFAULTS['mio-1-1']
+    window.afm_pauli_a_spin.setRange(0.1, 2000.0); window.afm_pauli_a_spin.setValue(_pa3['A']); window.afm_pauli_a_spin.setDecimals(2)
+    window.afm_pauli_a_spin.setToolTip("Pauli A — SSOT AFM.PAULI_FITTED_DEFAULTS (3ob: 124.84). Old 509.28 was obsolete.")
     physics_grid.addWidget(window.afm_pauli_a_spin, 0, 1)
     physics_grid.addWidget(QtWidgets.QLabel("Beta [-]:"), 1, 0)
     window.afm_pauli_beta_spin = QtWidgets.QDoubleSpinBox()
-    window.afm_pauli_beta_spin.setRange(0.5, 3.0); window.afm_pauli_beta_spin.setValue(1.2371); window.afm_pauli_beta_spin.setDecimals(4)
+    window.afm_pauli_beta_spin.setRange(0.5, 3.0); window.afm_pauli_beta_spin.setValue(_pa3['beta']); window.afm_pauli_beta_spin.setDecimals(4)
+    window.afm_pauli_beta_spin.setToolTip("Pauli β — SSOT (3ob: 1.4330). Old 1.0586 was obsolete single-atom fit.")
     physics_grid.addWidget(window.afm_pauli_beta_spin, 1, 1)
     physics_grid.addWidget(QtWidgets.QLabel("C6 [eV·Å⁶]:"), 2, 0)
     window.afm_vdw_c6_spin = QtWidgets.QDoubleSpinBox()
@@ -1522,13 +1528,13 @@ def build_ui(window):
         basis = window.afm_basis_combo.currentText()
         window._afm_dirty.mark_geometry_changed()
         _refresh_dirty_label()
-        if basis == 'mio-1-1':
-            window.afm_pauli_a_spin.setValue(787.22); window.afm_pauli_beta_spin.setValue(1.2371)
-        elif basis == '3ob-3-1':
-            window.afm_pauli_a_spin.setValue(509.28); window.afm_pauli_beta_spin.setValue(1.0586)
+        from spammm.SPM import AFM as afm_mod
+        pa = afm_mod.PAULI_FITTED_DEFAULTS.get(basis, afm_mod.PAULI_FITTED_DEFAULTS['3ob-3-1'])
+        window.afm_pauli_a_spin.setValue(float(pa['A']))
+        window.afm_pauli_beta_spin.setValue(float(pa['beta']))
     window.afm_basis_combo.currentIndexChanged.connect(on_basis_changed)
-    # Default basis is 3ob — sync Pauli spins
-    window.afm_pauli_a_spin.setValue(509.28); window.afm_pauli_beta_spin.setValue(1.0586)
+    # Default basis is 3ob — sync Pauli spins from SSOT (already set above; re-assert)
+    on_basis_changed(0)
 
     def on_backend_changed(_idx=None):
         be = window.afm_backend_combo.currentText()

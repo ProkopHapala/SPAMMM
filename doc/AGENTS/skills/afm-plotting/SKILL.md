@@ -50,6 +50,21 @@ See `user_guide/SPM_CLI.md` § Height window; `doc/Reports/Fukui_FDBM_panel_note
 
 ---
 
+## HARD RULE — overview strip display (panel-fukui / afm compare)
+
+Permanent defaults in `plot_afm_variant_height_strip` — **do not override back to loose/common**:
+
+| Setting | Default | Why |
+|---------|---------|-----|
+| **df clim** | **per panel** `vmin=min`, `vmax=max` of that image | Experimental relative contrast; **never** a shared df colorbar |
+| **scale** CLI default | **`per_image`** | Fz uses ±pct per panel when `per_image`; `--scale per_column` only if USER asks |
+| **long axis** | **vertical** (`long_axis_vertical=True`) | If nx≥ny, display so long axis is vertical → narrower panels → more z-columns on screen |
+| **packing** | **tight** (GridSpec wspace/hspace≈0, fig inches ∝ pixels, `set_box_aspect`) | 6×N overview without letterbox gutters |
+
+**Forbidden regressions:** defaulting CLI `--scale` to `per_column`; code that does `scale = … if scale != 'per_image' else 'per_column'`; shared df clim; loose `tight_layout` that reopens gaps on the main gallery strip.
+
+---
+
 ## HARD RULE
 
 **Never** write ad-hoc `imshow` / `plt.plot` for AFM **E / Fz / df** maps or z-profiles in tests or new code.

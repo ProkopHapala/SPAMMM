@@ -120,7 +120,7 @@ python run_spm.py smiles-afm --example thymine --method dftb
 Per molecule under `debug/spm_smiles_afm/<name>/`:
 
 - `{name}_opt.xyz` — planar, long axis ‖ x
-- **`compare_per_column.png`** — default strip (df + Fz, amp-aligned)
+- **`compare_per_image.png`** — default strip (df + Fz, amp-aligned; **per-panel clim**, long→vertical, tight)
 - **`stage_prolonged.png`** — light field diagnostics
 - `SUMMARY.out`
 
@@ -152,9 +152,9 @@ PP scan always covers `[h_min − amp, h_max + amp]` so df at the window edges i
 
 | Value | Meaning |
 |-------|---------|
-| `compare,stage` | **default** — `compare_per_column.png` + `stage_*.png` |
+| `compare,stage` | **default** — `compare_per_image.png` + `stage_*.png` |
 | `compare` | strip only |
-| `tip,df,fz,per_image` | deep debug grids |
+| `tip,df,fz` | deep debug grids |
 | `all` / `debug` | everything |
 | `none` | compute only |
 
@@ -167,7 +167,9 @@ python run_spm.py afm --xyz data/xyz/PTCDA.xyz --projection both --plots all
 python run_spm.py afm --cube /path/to/rho_N.cube --xyz data/xyz/mol.xyz --projection both
 ```
 
-Key flags: `--basis`, `--projection` (`stock`|`prolonged`|`both`), `--tip-mode` (`co`|`gaussian`), `--scale` (`per_column`|`per_image`|`common`), `--show-atoms`, `--plots`, height / amp flags above.
+Key flags: `--basis`, `--projection` (`stock`|`prolonged`|`both`), `--tip-mode` (`co`|`gaussian`), `--scale` (`per_image` default | `per_column` | `common`), `--show-atoms`, `--plots`, height / amp flags above.
+
+**Strip display SSOT:** df clim = **per panel**; long molecular axis **vertical**; panels **tightly packed**. See skill:`afm-plotting`.
 
 **Dual basis:** prolonged ρ is **Pauli only**; electrostatics always from stock Δρ.
 
@@ -341,6 +343,8 @@ See `doc/AGENTS/skills/afm-plotting/SKILL.md`.
 
 | Priority | Item | Notes |
 |----------|------|-------|
+| **Near** | **Replace legacy CLI FDBM Stage-3** | `afm` still uses `_run_from_density` + default `SPAMMM_AFM_CPU_FFT=1`. FAST_S3 parity **USER-confirmed** (~5.5×); fold onto ModularPipeline. See [`Consolidate_GUI_CLI_Backend_Input_Protocol.md`](../doc/Tasks/Consolidate_GUI_CLI_Backend_Input_Protocol.md), [`TopicalAudit/AFM_FDBM.md`](../doc/TopicalAudit/AFM_FDBM.md). |
+| Near | **GUI↔CLI param SSOT** | GUI Pauli spins were obsolete (509/1.06 vs 124.84/1.433); heights/amp fixed; FIRE relax / scan margin remaining |
 | Near | **GUI↔CLI input protocol** | JSON `SPMJobSpec` + `run_spm_job` |
 | Near | FDBM ↔ Kriging compare | Wrap `testplot_kriging_vs_fdbm_cube` |
 | Near | Cube FDBM ES / NA multipoles | Prefer cube `ρ_NA`; see Fukui notes §1b |
@@ -349,5 +353,7 @@ See `doc/AGENTS/skills/afm-plotting/SKILL.md`.
 | Later | **`dock` (substrate)** | GridFF / FAF — deferred |
 | Later | Light-STM / charge-ring imaging | |
 | UX | pip console script | `run_spm` via packaging task |
+
+**Parity gate (done):** `python tests/SPM/testplot_cli_vs_modular_parity.py` → `debug/cli_vs_modular_parity/`.
 
 Task tracker: [`doc/Tasks/SPM_CLI_Headless.md`](../doc/Tasks/SPM_CLI_Headless.md) · consolidate GUI/CLI: [`doc/Tasks/Consolidate_GUI_CLI_Backend_Input_Protocol.md`](../doc/Tasks/Consolidate_GUI_CLI_Backend_Input_Protocol.md) · agent list: [`doc/ToDo/ToDo.agents.md`](../doc/ToDo/ToDo.agents.md).
