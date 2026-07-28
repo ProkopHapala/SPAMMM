@@ -71,8 +71,10 @@ def _add_common_afm_args(p: argparse.ArgumentParser) -> None:
                       help='Density/FF grid spacing [Å] (GUI SSOT = 0.1)')
     grid.add_argument('--margin',      type=float, default=4.0)
     grid.add_argument('--z-extra',     type=float, default=6.0)
-    grid.add_argument('--cpu-fft',     type=bool,  default=True,  dest='cpu_fft')
-    grid.add_argument('--gpu-fft',     type=bool,  default=False)
+    grid.add_argument('--cpu-fft', action='store_true', dest='cpu_fft',
+                      help='Force NumPy FFT Stage-3 (slow; parity). Default: FAST_S3 GPU.')
+    grid.add_argument('--gpu-fft', action='store_true', dest='gpu_fft',
+                      help='Deprecated no-op (GPU FAST_S3 is already the default).')
 
     scan = p.add_argument_group('PP scan / df')
     # Display window = df probe heights; Fz panels use h−amp (amp-align) by default
@@ -144,7 +146,12 @@ def _resolve_geometry(args):
 
 
 def cmd_afm(args: argparse.Namespace) -> int:
-    """Single-molecule FDBM AFM (xyz and/or cube / SMILES)."""
+    """Single-molecule FDBM AFM (xyz and/or cube / SMILES).
+
+    Physics: ``AFM_utils.run_fdbm_pp_from_density`` (FAST_S3 GPU = ModularPipeline Stage3–4).
+    Plotting: ``plot_afm_variant_height_strip`` (skill:`afm-plotting` SSOT).
+    No dependency on ``tests/SPM/testplot_fdbm_relax``.
+    """
     import numpy as np
     from spammm.SPM import AFM as afm
     from spammm.SPM import AFM_utils as afm_utils
@@ -152,16 +159,15 @@ def cmd_afm(args: argparse.Namespace) -> int:
     from spammm.quantum.DFTB.DFTBplusParser import (
         parse_wfc_hsd, convert_wfc_to_species_list_ang, make_slater_tail_species_list,
     )
-    from tests.SPM import testplot_fdbm_relax as diag
 
-    if args.gpu_fft:
+    use_fast = not bool(getattr(args, 'cpu_fft', False))
+    if use_fast:
         os.environ.pop('SPAMMM_AFM_CPU_FFT', None)
     else:
         os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
 
     os.makedirs(args.outdir, exist_ok=True)
     plots = _parse_plots(getattr(args, 'plots', 'compare,stage'))
-    args._plots = plots  # consumed by diag._run_from_density
     mol_name, atomPos, atomTypes, enames, bonds, smi = _resolve_geometry(args)
     xyz = _abs_path(args.xyz) if args.xyz else None
 
@@ -177,20 +183,37 @@ def cmd_afm(args: argparse.Namespace) -> int:
         orient_long_axis_x(atomPos)
         print(f'orientPCA long→x  span_xy=({atomPos[:,0].ptp():.3f},{atomPos[:,1].ptp():.3f})')
 
-    grid_spec, origin, ngrid, step = diag._fft_friendly_grid_spec(
-        atomPos, args.step, args.margin, z_extra=args.z_extra)
+    z_vac = float(args.z_extra) if args.z_extra is not None else 6.0
+    grid_spec, origin, ngrid, step = afm_utils.make_fdbm_grid_com_zsym(
+        atomPos, args.step, args.margin, z_vac=z_vac)
     nx, ny, nz = [int(x) for x in ngrid]
-    print(f'grid={nx}x{ny}x{nz} step={step} origin={origin} mol={mol_name}')
+    print(f'grid={nx}x{ny}x{nz} step={step} origin={origin} mol={mol_name}  '
+          f'Stage3={"FAST_S3" if use_fast else "LEGACY_CPU_FFT"}')
 
     variants = {}
     basis_hsd = get_dftb_basis_path(args.basis)
-    # EVAL SSOT: one transferable (A,β) for every ρ row (cube|stock|prolonged).
-    # Do not mix pyscf vs 3ob defaults in one compare strip.
     pa = afm.PAULI_FITTED_DEFAULTS.get(args.basis, afm.PAULI_FITTED_DEFAULTS['3ob-3-1'])
     A_pauli, beta_pauli = float(pa['A']), float(pa['beta'])
     print(f'Pauli EVAL defaults ({args.basis}): A={A_pauli:.3f} β={beta_pauli:.4f}')
 
+    plot_diag = plots & {'tip', 'stage', 'df', 'fz'}
+
+    def _pp(tag, rho_scf, rho_diff, V_ES=None):
+        return afm_utils.run_fdbm_pp_from_density(
+            tag, rho_scf, atomPos, atomTypes, origin, step, ngrid,
+            A_pauli, beta_pauli, args.tip_mode, args.outdir,
+            rho_diff=rho_diff, V_ES=V_ES,
+            basis=args.basis, margin=args.margin,
+            h_min=args.h_min, h_max=args.h_max, h_step=args.h_step,
+            amp=args.amp, amp_align=not getattr(args, 'no_amp_align', False),
+            K_LAT_Nm=args.K_LAT, K_RAD=args.K_RAD, bond_length=args.bond_length,
+            scan_margin=args.scan_margin, plots=plot_diag,
+            df_cmap=args.df_cmap, cmap=args.cmap, stage_height=args.height,
+            use_fast_s3=use_fast,
+        )
+
     V_ES_stock = None
+    rho_diff_stock = None
     need_stock_es = args.projection in ('stock', 'both', 'prolonged') or not args.cube
     if need_stock_es and (args.projection in ('stock', 'both', 'prolonged')):
         work = os.path.join(args.outdir, 'dftb_work_stock')
@@ -198,45 +221,39 @@ def cmd_afm(args: argparse.Namespace) -> int:
         res = afm_utils.get_density_from_dftb_dense(
             atomPos, atomTypes, basis_hsd, work, grid_spec=grid_spec, step=step, verbosity=0)
         V_ES_stock = res['V_ES']
+        rho_diff_stock = res['rho_diff']
         if args.projection in ('stock', 'both'):
-            variants['stock'] = diag._run_from_density(
-                'stock', res['rho_scf'], V_ES_stock, atomPos, atomTypes, origin, step, ngrid,
-                A_pauli, beta_pauli, args.tip_mode, args.outdir, args)
+            variants['stock'] = _pp('stock', res['rho_scf'], rho_diff_stock, V_ES_stock)
 
     if args.projection in ('prolonged', 'both'):
         basis_data = parse_wfc_hsd(basis_hsd)
         basis_ang = convert_wfc_to_species_list_ang(basis_data, resolution_bohr=0.04)
         prol = make_slater_tail_species_list(basis_ang)
         work = os.path.join(args.outdir, 'dftb_work_prolonged')
-        print('DFTB prolonged (Pauli ρ; ES=stock)...')
-        if V_ES_stock is None:
+        print('DFTB prolonged (Pauli ρ; ES=stock Δρ)...')
+        if rho_diff_stock is None:
             res0 = afm_utils.get_density_from_dftb_dense(
                 atomPos, atomTypes, basis_hsd, os.path.join(args.outdir, 'dftb_work_stock'),
                 grid_spec=grid_spec, step=step, verbosity=0)
             V_ES_stock = res0['V_ES']
+            rho_diff_stock = res0['rho_diff']
         res_p = afm_utils.get_density_from_dftb_dense(
             atomPos, atomTypes, basis_hsd, work, grid_spec=grid_spec, step=step,
             verbosity=0, projection_basis_ang=prol)
-        variants['prolonged'] = diag._run_from_density(
-            'prolonged', res_p['rho_scf'], V_ES_stock, atomPos, atomTypes, origin, step, ngrid,
-            A_pauli, beta_pauli, args.tip_mode, args.outdir, args)
+        variants['prolonged'] = _pp('prolonged', res_p['rho_scf'], rho_diff_stock, V_ES_stock)
 
     if d_cube is not None:
-        # Pyridine SSOT: clamp→compact NA + GridsOCL project (not Gaussian + scipy sample)
         prep = afm_utils.allelectron_cube_to_fdbm_grid(
             d_cube['rho_scf'], d_cube['origin'], d_cube['step'],
             d_cube['atomPos'], d_cube['atomZ'],
             origin, step, ngrid, rc_na=0.6, R_sphere=0.6, verbosity=0)
-        V_cube = afm.fft_poisson_cpu(prep['rho_diff'], step)
-        variants['cube'] = diag._run_from_density(
-            'cube', prep['rho_scf'], V_cube, atomPos, atomTypes, origin, step, ngrid,
-            A_pauli, beta_pauli, args.tip_mode, args.outdir, args)
+        V_cube = afm.fft_poisson_cpu(prep['rho_diff'], step) if not use_fast else None
+        variants['cube'] = _pp('cube', prep['rho_scf'], prep['rho_diff'], V_cube)
 
     if not variants:
         print('Nothing to run: set --projection and/or --cube', file=sys.stderr)
         return 1
 
-    # Row order: cube → prolonged (DFT-like) → stock (short-range)
     order = [k for k in ('cube', 'prolonged', 'stock') if k in variants]
     amp_align = not getattr(args, 'no_amp_align', False)
     amp = float(args.amp)
@@ -279,7 +296,7 @@ def cmd_afm(args: argparse.Namespace) -> int:
         f.write(f'xyz={xyz}\n')
         f.write(f'smiles={smi}\n')
         f.write(f'cube={args.cube}\n')
-        f.write(f'grid={nx}x{ny}x{nz} step={step}\n')
+        f.write(f'grid={nx}x{ny}x{nz} step={step} Stage3={"FAST_S3" if use_fast else "LEGACY"}\n')
         f.write(f'plots={sorted(plots)} h=[{args.h_min},{args.h_max}] dz={args.h_step}\n')
         if out_png:
             f.write(f'REVIEW: {out_png}\n')
@@ -423,34 +440,34 @@ def cmd_afm_kriging(args: argparse.Namespace) -> int:
 def cmd_panel_fukui(args: argparse.Namespace) -> int:
     """Fukui cube vs DFTB stock vs prolonged — same height SSOT as ``afm``.
 
-    SSOT heights (do NOT override without USER intent):
-      df window = h_min…h_max (default **3.7–4.7** Å, dz=**0.1**)
-      Fz panels = **amp-aligned** at h−amp (amp=1 → Fz **2.7–3.7**)
-    Rows: DFT cube | prolonged | stock  (df then Fz → 6 rows when cube present).
-    Pauli: one transferable (A,β) from ``PAULI_FITTED_DEFAULTS[basis]`` for all mols/rows
-      (3ob-3-1 → A=124.84, β=1.4330). No per-molecule fits in this path.
-    See ``user_guide/SPM_CLI.md``, ``doc/AGENTS/skills/afm-plotting/SKILL.md``.
+    Physics: ``AFM_utils.run_fukui_panel`` → ``run_fdbm_pp_from_density`` (FAST_S3 default).
+    Plotting: ``plot_afm_variant_height_strip`` (skill:`afm-plotting` SSOT).
+    No dependency on ``tests/SPM/testplot_fdbm_relax``.
     """
-    from tests.SPM import testplot_fdbm_relax as diag
-    os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
-    ns = argparse.Namespace(
-        xyz='data/xyz/PTCDA.xyz', basis='3ob-3-1', step=args.step, margin=args.margin,
-        tip_mode='co', outdir=args.outdir, K_LAT=args.K_LAT, K_RAD=args.K_RAD,
-        bond_length=args.bond_length, h_min=args.h_min, h_max=args.h_max, h_step=args.h_step,
-        amp=args.amp, no_amp_align=getattr(args, 'no_amp_align', False),
+    from spammm.SPM import AFM_utils as afm_utils
+
+    use_fast = not bool(getattr(args, 'cpu_fft', False))
+    if use_fast:
+        os.environ.pop('SPAMMM_AFM_CPU_FFT', None)
+    else:
+        os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
+    afm_utils.run_fukui_panel(
+        args.outdir, molecules=args.molecule, use_fast_s3=use_fast,
+        step=args.step, margin=args.margin, basis='3ob-3-1', tip_mode='co',
+        h_min=args.h_min, h_max=args.h_max, h_step=args.h_step,
+        amp=args.amp, amp_align=not getattr(args, 'no_amp_align', False),
+        K_LAT=args.K_LAT, K_RAD=args.K_RAD, bond_length=args.bond_length,
         scan_margin=args.scan_margin, height=args.height,
-        cmap=args.cmap, df_cmap=args.df_cmap, molecule=args.molecule,
-        sa_params='debug/dftb_basis_sa_ptcda/PTCDA_sa_params.json',
+        cmap=args.cmap, df_cmap=args.df_cmap,
     )
-    diag.run_fukui_panel(ns)
     return 0
 
 
 def cmd_replot_panel(args: argparse.Namespace) -> int:
-    from tests.SPM import testplot_fdbm_relax as diag
+    from spammm.SPM import AFM_utils as afm_utils
     if args.scale != 'per_image':
         print('Note: replot-panel currently writes per_image strips (experimental contrast).')
-    diag.replot_fukui_per_image(
+    afm_utils.replot_fukui_per_image(
         args.panel_dir, molecules=args.molecule, cmap=args.cmap, df_cmap=args.df_cmap)
     return 0
 
@@ -561,7 +578,12 @@ def cmd_basis_tails(args) -> int:
         A_pauli=args.A,
         beta_pauli=args.beta,
         z_max=args.z_max,
+        dz=args.dz,
         formats=formats,
+        pyscf_basis=args.pyscf_basis,
+        pyscf_xc=args.pyscf_xc,
+        pyscf_z_extra=args.pyscf_z_extra,
+        force_pyscf=bool(args.force_pyscf),
         verbosity=1,
     )
     return 0
@@ -726,6 +748,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument('--A', type=float, default=1.0, help='Pauli A (same for all ρ; 1→raw overlap)')
     p_bt.add_argument('--beta', type=float, default=1.0, help='Pauli β (same for all ρ)')
     p_bt.add_argument('--z-max', type=float, default=3.0, dest='z_max')
+    p_bt.add_argument('--dz', type=float, default=0.05, help='z sampling step [Å] (finer → smoother)')
+    p_bt.add_argument('--pyscf-basis', default='def2-SVP', dest='pyscf_basis',
+                      help='pySCF GTO basis for live dens (not Fukui cube)')
+    p_bt.add_argument('--pyscf-xc', default='pbe', dest='pyscf_xc')
+    p_bt.add_argument('--pyscf-z-extra', type=float, default=6.0, dest='pyscf_z_extra',
+                      help='Vacuum padding above mol for live pySCF grid [Å]')
+    p_bt.add_argument('--force-pyscf', action='store_true', dest='force_pyscf',
+                      help='Recompute live pySCF ρ even if cache exists')
     p_bt.add_argument('--formats', default='svg,png', help='Output formats CSV')
     p_bt.set_defaults(func=cmd_basis_tails)
 

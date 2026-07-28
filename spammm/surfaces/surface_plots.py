@@ -1,21 +1,19 @@
 """
-surface_plots.py — Visualization functions for molecule-on-substrate simulations.
+surface_plots.py — Visualization for molecule-on-substrate + PairFF tip-pull.
 
-Purpose: Plotting utilities for relaxation trajectories, lateral scans,
-manipulation trajectories, and relaxed scans. All functions use matplotlib
-with non-interactive backend for headless use.
+Purpose: Matplotlib (Agg) plots for FoldedRigid trajectories/scans and PairFF
+tip-pull stills/movies. Compute stays in FoldedRigid / RigidBodyPairFF.
 
-Key functionality:
-  - plot_relaxation() — energy/force/torque vs step
-  - plot_molecule_substrate_xy() / _xz() — top/side view of molecule on substrate
-  - plot_relax_overview() — comprehensive relaxation visualization
-  - plot_force_map() — lateral force map
-  - plot_manipulation() — manipulation trajectory snapshots
-  - plot_relaxed_scan() — relaxed scan snapshots + force/torque curves
-  - plot_manipulation_trail() — pin/opp atom trail visualization
+Open issues / caveats:
+  - PairFF+FAF tip-pull helpers (`plot_pairff_faf_background`,
+    `render_pairff_tip_pull_movie`) currently take a pre-baked Esum + caller vmax.
+    Display must reuse Vispy `potential_to_rgba` (attractive |Emin| scale) —
+    see doc/Tasks/PairFF_MapDisplay_SSOT.md. Do not softclip PairFF then add FAF
+    as a new recipe.
+  - Always lock axes from explicit extent (xlim/ylim) so movie frames do not jump.
 
-Role in SPAMMM: Visualization layer for FoldedRigid.py workflows.
-Separated from core compute to keep modules focused.
+Key helpers: plot_relaxation, plot_force_map, plot_manipulation,
+plot_pairff_faf_background, render_pairff_tip_pull_movie, save_pairff_xyz_trajectory.
 """
 
 import os
@@ -396,3 +394,118 @@ def plot_manipulation_trail(traj, mol_enames, sub_apos, sub_enames, save_dir, na
     fig_d.tight_layout()
     fig_d.savefig(os.path.join(save_dir, f'{name}_dist_tilt.png'), dpi=150)
     plt.close(fig_d)
+
+
+def plot_pairff_faf_background(Esum, extent, vmax, apos_fixed, enames_fixed,
+                               apos_mobile=None, enames_mobile=None,
+                               trail_com=None, trail_pin=None, tip_target=None,
+                               title='', save_path=None, figsize=(7.5, 6.5)):
+    """Still / frame: soft-clipped FAF+PairFF map with molecule overlays and tip trail.
+
+    Matches presentation style of ``debug/pairff_faf_map/pairff_faf_map_sum.*``.
+    """
+    from spammm.plotUtils import overlay_atoms
+    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+    x0, x1, y0, y1 = [float(v) for v in extent]
+    im = ax.imshow(Esum, origin='lower', extent=[x0, x1, y0, y1], cmap='RdBu_r',
+                   vmin=-vmax, vmax=vmax, aspect='equal', interpolation='bilinear')
+    if apos_fixed is not None and len(apos_fixed):
+        overlay_atoms(ax, apos_fixed, enames_fixed, label_heavy=False, marker='o', markersize=3.5)
+    if apos_mobile is not None and len(apos_mobile):
+        overlay_atoms(ax, apos_mobile, enames_mobile, label_heavy=False, marker='o', markersize=4.5)
+        ax.plot(apos_mobile[:, 0], apos_mobile[:, 1], 'o', mfc='none', mec='lime',
+                mew=0.8, ms=5.5, zorder=6, label='mobile')
+    if trail_com is not None and len(trail_com):
+        ax.plot(trail_com[:, 0], trail_com[:, 1], '-', color='lime', lw=1.8, alpha=0.9, label='CoM trail', zorder=7)
+        ax.plot(trail_com[0, 0], trail_com[0, 1], '^', color='lime', ms=8, zorder=8)
+        ax.plot(trail_com[-1, 0], trail_com[-1, 1], 'v', color='lime', ms=8, zorder=8)
+    if trail_pin is not None and len(trail_pin):
+        ax.plot(trail_pin[:, 0], trail_pin[:, 1], '--', color='magenta', lw=1.4, alpha=0.85, label='tip/pin trail', zorder=7)
+    if tip_target is not None:
+        ax.plot(float(tip_target[0]), float(tip_target[1]), 'x', color='magenta', ms=10, mew=2, label='tip target', zorder=9)
+    # Lock axes so animation frames do not jump when trails/atoms move
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
+    ax.set_aspect('equal')
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel('x [Å]'); ax.set_ylabel('y [Å]')
+    if any(x is not None for x in (apos_mobile, trail_com, trail_pin, tip_target)):
+        ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='E [eV]')
+    if save_path:
+        fig.savefig(save_path, dpi=200)
+        plt.close(fig)
+        return save_path
+    return fig
+
+
+def render_pairff_tip_pull_movie(traj, Esum, extent, vmax, active_body, save_dir,
+                                 name='tip_pull', every=1):
+    """PNG frame sequence + still with full trail; returns list of frame paths."""
+    os.makedirs(save_dir, exist_ok=True)
+    frames_dir = os.path.join(save_dir, 'frames')
+    os.makedirs(frames_dir, exist_ok=True)
+    paths = []
+    n = len(traj['frames'])
+    for i in range(0, n, max(int(every), 1)):
+        fr = traj['frames'][i]
+        fixed_apos, fixed_enames = [], []
+        for j, body in enumerate(fr):
+            if j == active_body:
+                continue
+            fixed_apos.append(body['world'][:, :3])
+            fixed_enames.extend(body['enames'])
+        fixed_apos = np.vstack(fixed_apos) if fixed_apos else np.zeros((0, 3))
+        mob = fr[active_body]
+        tip = traj['path'][min(i, len(traj['path']) - 1)]
+        p = os.path.join(frames_dir, f'{name}_{i:04d}.png')
+        plot_pairff_faf_background(
+            Esum, extent, vmax, fixed_apos, fixed_enames,
+            apos_mobile=mob['world'][:, :3], enames_mobile=mob['enames'],
+            trail_com=traj['pos'][:i + 1], trail_pin=traj['pin'][:i + 1],
+            tip_target=tip, title=f'{name}  frame {i}/{n - 1}  E={traj["E"][i]:.3f} eV',
+            save_path=p)
+        paths.append(p)
+        print(f'REVIEW: {p}')
+    # Still with full trajectory
+    fr = traj['frames'][-1]
+    fixed_apos, fixed_enames = [], []
+    for j, body in enumerate(fr):
+        if j == active_body:
+            continue
+        fixed_apos.append(body['world'][:, :3])
+        fixed_enames.extend(body['enames'])
+    fixed_apos = np.vstack(fixed_apos) if fixed_apos else np.zeros((0, 3))
+    mob = fr[active_body]
+    still = os.path.join(save_dir, f'{name}_trajectory.png')
+    plot_pairff_faf_background(
+        Esum, extent, vmax, fixed_apos, fixed_enames,
+        apos_mobile=mob['world'][:, :3], enames_mobile=mob['enames'],
+        trail_com=traj['pos'], trail_pin=traj['pin'],
+        title=f'{name}  tip-pull trajectory (CoM + pin)  ·  soft-clipped map',
+        save_path=still)
+    print(f'REVIEW: {still}')
+    # SVG twin
+    still_svg = os.path.join(save_dir, f'{name}_trajectory.svg')
+    plot_pairff_faf_background(
+        Esum, extent, vmax, fixed_apos, fixed_enames,
+        apos_mobile=mob['world'][:, :3], enames_mobile=mob['enames'],
+        trail_com=traj['pos'], trail_pin=traj['pin'],
+        title=f'{name}  tip-pull trajectory (CoM + pin)',
+        save_path=still_svg)
+    print(f'REVIEW: {still_svg}')
+    return paths, still
+
+
+def save_pairff_xyz_trajectory(filename, traj, comments_prefix='tip_pull'):
+    """Multi-frame XYZ: all real atoms of all bodies each frame (no substrate)."""
+    frames = traj['frames']
+    with open(filename, 'w') as f:
+        for i, fr in enumerate(frames):
+            n = sum(len(b['enames']) for b in fr)
+            f.write(f'{n}\n{comments_prefix} frame={i} E={traj["E"][i]:.6f} '
+                    f'CoM={traj["pos"][i,0]:.3f},{traj["pos"][i,1]:.3f},{traj["pos"][i,2]:.3f}\n')
+            for b in fr:
+                for e, p in zip(b['enames'], b['world']):
+                    f.write(f'{e:2s} {p[0]:12.6f} {p[1]:12.6f} {p[2]:12.6f}\n')
+    return filename

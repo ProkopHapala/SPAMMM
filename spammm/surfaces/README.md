@@ -19,8 +19,8 @@ Caveats: [doc/Caveats.md](../../doc/Caveats.md) §6 · Debugging: [doc/Takeways.
 - **Surface_utils.py** — GridFF metadata, load precomputed grids, visualization, atom-position sampling
 - **GridFFRelaxedScan.py** — Relaxed PES scanning with full geometry relaxation at each grid point
 - **FoldedRigid.py** — Folded-basis rigid-body simulation (fit/load NaCl potentials, relaxation, manipulation, `setup_rigid_folded`); CPU map helpers `eval_folded_potential_grid` / `faf_type_idx_for_probe` for PairFF Vispy compose
+- **surface_plots.py** — Matplotlib: FoldedRigid traj/scans + PairFF tip-pull movies; **map display must reuse Vispy `potential_to_rgba`** (`doc/Tasks/PairFF_MapDisplay_SSOT.md`)
 - **SubstrateBuilder.py** — Crystal slab generation (NaCl, CaF₂): flat slabs and step edges
-- **surface_plots.py** — Matplotlib plots for relaxation trajectories, lateral scans, manipulation
 
 ## Contact surface — variants (2.5D)
 

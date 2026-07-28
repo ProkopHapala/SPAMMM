@@ -22,6 +22,8 @@ python3 demos/demo_pairff.py --bodies 4 --active 2 --no-vis --steps 300
 python3 demos/demo_pairff.py --bodies 4 --faf --no-vis --steps 80
 ```
 
-Fit cache (created on first `--faf` if missing): `data/fits/hcooh_nacl.npz`.
+Fit cache (created on first `--faf` if missing): `data/fits/hcooh_nacl.npz`. PTCDI@NaCl (QEq element-mean): `data/fits/ptcdi_nacl.npz`.
+
+**Map display SSOT:** Vispy `potential_to_rgba` (scale to attractive `|Emin|`). Offline tip-pull movies must reuse it — task [`doc/Tasks/PairFF_MapDisplay_SSOT.md`](../doc/Tasks/PairFF_MapDisplay_SSOT.md); session report [`doc/Reports/PairFF_TipPull_PTCDI_QEq_2026-07-28.md`](../doc/Reports/PairFF_TipPull_PTCDI_QEq_2026-07-28.md).
 
 Developer notes: [`doc/Tasks/PairFF_MultiBody_Kernel.md`](../doc/Tasks/PairFF_MultiBody_Kernel.md) · [`doc/Tasks/PairFF_FAF_Substrate.md`](../doc/Tasks/PairFF_FAF_Substrate.md) · audit [`doc/TopicalAudit/PairFF_RigidBody.md`](../doc/TopicalAudit/PairFF_RigidBody.md).

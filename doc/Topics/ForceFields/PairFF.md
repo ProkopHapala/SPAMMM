@@ -1,8 +1,8 @@
 ---
 type: TopicReport
 title: PairFF — design report
-tags: [PairFF, rigid-body, OpenCL, FIRE, FAF]
-timestamp: 2026-07-24
+tags: [PairFF, rigid-body, OpenCL, FIRE, FAF, tip-pull, QEq]
+timestamp: 2026-07-28
 ---
 
 # PairFF — design report
@@ -28,9 +28,14 @@ active_mol index → rigid_body_pairff_unified_allmol[_faf]_kernel
      (tile j≠active; integrate only active; optional FAF on real atoms)
      ↓
 Vispy: download active sites; map = PairFF(static view) [+ FAF(probe)] @ CoM z
+         display = potential_to_rgba(Emap)   # vmax = |Emin| — clip Pauli cores
 ```
 
 **SSOT poses:** GPU holds **all** molecules. Host `_mb_pos` / `_mb_quat` / `_mb_packs` mirror for picking/map. `set_active_body(k)` writes `active_mol` only — **no** realloc, **no** velocity zeroing, FAF stays bound.
+
+**SSOT map display:** `spammm/GUI/RigidBodyVispy.potential_to_rgba` — scale to attractive well depth so FAF corrugation (~0.1 eV) and PairFF basins remain visible under huge Pauli walls. Offline tip-pull movies must **reuse this**, not softclip reinvent ([`../Tasks/PairFF_MapDisplay_SSOT.md`](../Tasks/PairFF_MapDisplay_SSOT.md)).
+
+**Charges:** default XYZ REQs often have `Q=0` → Coulomb/Hbond silent. Physical QEq for PTCDI/HBond: negate `solve_from_elements` (see HBondFF `ff_map.py`). Tip-pull session report: [`../Reports/PairFF_TipPull_PTCDI_QEq_2026-07-28.md`](../Reports/PairFF_TipPull_PTCDI_QEq_2026-07-28.md).
 
 Legacy path (compat): `*_env_*` kernels with world-frame `env_*` rebuilt on switch — superseded for the demo by allmol.
 
@@ -54,6 +59,8 @@ Constraint: each molecule tile ≤ `MAX_STATIC_ATOMS` (128).
 - `set_active_body(k)` — index only; persistent dynamics.
 - `attach_pairff_faf(fit, z_init=…, k_z=0)` — raise to `Z_SURF_TOP+z_init`, `init_folded`, enable fused kernel, store `faf_fit` for map.
 - `run_pairff(..., fire=…, faf=…)` / `relax_pairff(...)` — monitor `active_body` by default.
+- `tip_pull_scan(pin_local_idx, path, …)` — AFM-like spring on one active atom; inactive neighbors still force.
+- `world_sites_all_bodies(real_only=…)` — host frames for movies / XYZ.
 
 ## Interactive demo
 
@@ -67,6 +74,7 @@ python3 demos/demo_pairff.py --bodies 4 --faf
 ## Status & next steps
 
 - Multi-body allmol + click-to-select: USER confirmed.
-- `--faf` map compose: USER confirmed.
+- `--faf` Vispy map compose+display: USER confirmed.
+- Tip-pull PTCDI+QEq: API + energy OK; **matplotlib display pending** [`PairFF_MapDisplay_SSOT.md`](../Tasks/PairFF_MapDisplay_SSOT.md) (tomorrow).
 - Main GUI: not wired — [`PairFF_GUI_Integration.md`](../Tasks/PairFF_GUI_Integration.md).
 - Optional later: all-mobile MD (drop active gate); Strategy C tiling; L0 pytest.

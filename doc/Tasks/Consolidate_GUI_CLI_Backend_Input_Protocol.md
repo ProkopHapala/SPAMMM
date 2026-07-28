@@ -1,6 +1,6 @@
 # Task: Consolidate GUI ↔ CLI SPM backend + input protocol
 
-**Status:** investigating — **FAST_S3 ↔ CLI-legacy Stage3–4 parity USER-confirmed (2026-07-28)**. Next: remove legacy CLI pipeline; finish GUI param SSOT. **Do not mark Done** until CLI cutover + GUI param parity verified by USER.
+**Status:** investigating — **CLI FAST_S3 cutover landed (2026-07-28)**; await USER REVIEW of smoke/gallery before Done. Parity gate was USER-confirmed earlier same day.
 
 **Related:** [`SPM_CLI_Headless.md`](SPM_CLI_Headless.md) · [`user_guide/SPM_CLI.md`](../../user_guide/SPM_CLI.md) · topical [`../TopicalAudit/AFM_FDBM.md`](../TopicalAudit/AFM_FDBM.md) · GUI `spammm/GUI/AFMExtension.py` · `spammm/SPM/ModularPipeline.py`
 
@@ -13,17 +13,19 @@
 | Can Modular FAST_S3 reproduce CLI `_run_from_density` Stage3–4? | **Yes** — corr ≥ 0.9996 on df; fields ~1.0 (pentacene, PTCDA) |
 | Is FAST faster? | **Yes** — **~5.5×** on warm S3+S4 (RTX 3090) |
 | Put CLI path into GUI? | **No** — CLI Stage-3 is the slow NumPy fork |
-| Put ModularPipeline into CLI? | **Yes — required next** |
+| Put ModularPipeline into CLI? | **Yes — done** via `AFM_utils.run_fdbm_pp_from_density` |
 
 Parity script: `tests/SPM/testplot_cli_vs_modular_parity.py`  
 Artifacts: `debug/cli_vs_modular_parity/{pentacene,PTCDA}/` — USER: “definitely good”.
 
-### Remove legacy (todo — not Done)
+### Cutover (landed — awaiting USER confirm)
 
-1. Rewrite `run_spm.py afm` to call ModularPipeline / shared runner (FAST_S3, GPU FFT default — drop `SPAMMM_AFM_CPU_FFT=1` as default).
-2. Point `panel-fukui` / `run_afm_cli_fdbm_gallery.py` at the same runner (keep multi-row compare as thin plotting).
-3. Mark `testplot_fdbm_relax._run_from_density` **deprecated** (parity-only or delete after cutover).
-4. Keep `SPAMMM_AFM_FAST_S3=0` / `SPAMMM_AFM_CPU_FFT=1` only as explicit debug switches.
+1. **`run_spm.py afm`** → `AFM_utils.run_fdbm_pp_from_density` (FAST_S3 / GPU FFT default; `--cpu-fft` for legacy).
+2. **`panel-fukui` / `replot-panel`** → `AFM_utils.run_fukui_panel` / `replot_fukui_per_image` (no `tests/` import).
+3. **`testplot_fdbm_relax._run_from_density`** → thin wrap of shared runner (demo/parity only).
+4. Debug switches: `--cpu-fft` / `SPAMMM_AFM_CPU_FFT=1` only when explicit.
+
+Smoke: `python run_spm.py afm --xyz data/xyz/pentacene.xyz --projection prolonged --outdir debug/spm_afm_fast_smoke` → `Stage3=FAST_S3` on RTX 3090.
 
 ---
 
@@ -53,7 +55,7 @@ Physics code path for GUI FDBM is already ModularPipeline (correct/fast). Mismat
 | GUI df / heights / amp | Fixed (CLI SSOT) |
 | CLI `afm` projection/step defaults | Aligned prolonged / 0.1 |
 | **FAST_S3 ↔ CLI Stage3–4 parity** | **USER confirmed** |
-| **CLI `afm` still `_run_from_density`** | **Must remove** (see Decision) |
+| **CLI `afm` / `panel-fukui` → FAST_S3** | **Landed** — await USER REVIEW (`debug/spm_afm_fast_smoke/`) |
 | GUI Pauli spins vs SSOT | **Fixed** → `PAULI_FITTED_DEFAULTS` |
 | GUI soft `relax_pars` vs CLI FIRE | **Fixed** → FIRE defaults in `compose_and_relax_total` |
 | GUI `scan_range` vs CLI `scan_margin` | **Fixed** → default 2.0 |
@@ -63,7 +65,7 @@ Physics code path for GUI FDBM is already ModularPipeline (correct/fast). Mismat
 
 | Mode | Shared | CLI | GUI |
 |------|--------|-----|-----|
-| FDBM product | ModularPipeline FAST_S3 | `stm br` ✓; `afm` **legacy until cutover** | AFM / BR-STM |
+| FDBM product | `run_fdbm_pp_from_density` (FAST_S3) | `afm`, `panel-fukui`, `stm br` | AFM / BR-STM |
 | Morse | `run_morse_coulomb_afm` | `afm-morse` | AFM when Morse selected |
 
 ---

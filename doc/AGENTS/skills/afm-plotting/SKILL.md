@@ -52,16 +52,38 @@ See `user_guide/SPM_CLI.md` § Height window; `doc/Reports/Fukui_FDBM_panel_note
 
 ## HARD RULE — overview strip display (panel-fukui / afm compare)
 
-Permanent defaults in `plot_afm_variant_height_strip` — **do not override back to loose/common**:
+**USER-approved plotting policy (2026-07-28).** Implement only in
+`spammm/SPM/AFM_utils.py` → `plot_afm_variant_height_strip` (defaults below).
+CLI / `panel-fukui` / `AFM_CLI_FDBM` must call this helper — never reimplement strips.
 
-| Setting | Default | Why |
-|---------|---------|-----|
-| **df clim** | **per panel** `vmin=min`, `vmax=max` of that image | Experimental relative contrast; **never** a shared df colorbar |
-| **scale** CLI default | **`per_image`** | Fz uses ±pct per panel when `per_image`; `--scale per_column` only if USER asks |
-| **long axis** | **vertical** (`long_axis_vertical=True`) | If nx≥ny, display so long axis is vertical → narrower panels → more z-columns on screen |
-| **packing** | **tight** (GridSpec wspace/hspace≈0, fig inches ∝ pixels, `set_box_aspect`) | 6×N overview without letterbox gutters |
+### Defaults (do not regress)
 
-**Forbidden regressions:** defaulting CLI `--scale` to `per_column`; code that does `scale = … if scale != 'per_image' else 'per_column'`; shared df clim; loose `tight_layout` that reopens gaps on the main gallery strip.
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| **df clim** | **per panel** `vmin=min(arr)`, `vmax=max(arr)` | Experimental relative contrast. **Never** a shared / common / per-column df colorbar |
+| **Fz clim** | with CLI `--scale per_image`: ±pct per panel (diverging); optional `--scale per_column` for shared Fz | df still stays per-panel even if Fz is shared |
+| **CLI `--scale`** | **`per_image`** | Forbidden: default `per_column`, or `if scale=='per_image': use per_column` |
+| **long axis** | **vertical** (`long_axis_vertical=True`) | If scan `nx≥ny`, display so molecular long axis is **vertical** → each panel narrower → **more z-height columns fit on screen** |
+| **packing** | **tight** (`tight=True`) | GridSpec `wspace/hspace≈0`, figure inches ∝ data pixels, `set_box_aspect` — no letterbox gutters / empty bands between panels |
+| **overview colorbars** | **off** when tight / per_image | Colorbar gutters waste space; clim is per panel anyway |
+
+### Row order (Fukui / density compare)
+
+When cube exists: **df** cube → prolonged → stock, then **Fz** cube → prolonged → stock → **6 rows**. Columns = df probe heights (default 3.7…4.7); Fz amp-aligned at h−amp.
+
+### Gallery
+
+`debug/AFM_CLI_FDBM/<mol>/compare_cube_stock_prolonged.png` — main overview uses this policy.
+Optional diagnostic only: `*/per_column_Fz/` (shared Fz clim; df still per-panel).
+
+### Forbidden regressions
+
+- Shared df colorbar / common clim across heights or variants for df
+- Landscape molecule (long axis horizontal) on overview strips when nx≥ny
+- Loose `tight_layout` / fat colorbars that reopen empty gaps on the main strip
+- Ad-hoc `imshow` loops in tests/CLI instead of `plot_afm_variant_height_strip`
+
+See also `user_guide/SPM_CLI.md` § Strip display SSOT.
 
 ---
 

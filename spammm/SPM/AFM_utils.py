@@ -9,6 +9,9 @@ orchestration on top of AFM.py's pure physics.
 Key functionality:
   - Plotting: AFM frequency shift maps, tip trajectories, orbital densities
   - FDBM vs Kriging z-layout SSOT: plot_fdbm_vs_kriging_zlayout(), plot_fdbm_methods_zcompare_4panel()
+  - FDBM runners: run_fdbm_pp_from_density() (FAST_S3 Stage3–4), run_fukui_panel() / run_fukui_one()
+    (cube|stock|prolonged strips), run_morse_coulomb_afm()
+  - Plotting SSOT: plot_afm_variant_height_strip(), plot_afm_tip_debug(), plot_afm_fdbm_stages()
   - Density providers: get_density_from_dftb(), get_density_from_pyscf(), get_density_from_cube()
   - CO tip: _co_tip_cache_dir(), _compute_co_tip_subprocess()
   - FDBM helpers: fft_poisson(), compute_pauli_field(), compute_es_conv_field()
@@ -3166,6 +3169,528 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
 
     df = afm.compute_df(FEs_relax[:,:,:,2], heights[1]-heights[0])
     return df, tip_disp, FEs_relax
+
+
+def _afm_mirror_asym(sl, axis=0):
+    """Mirror asymmetry about the peak of a 2D slice (crop), not array center."""
+    a = np.asarray(sl, float)
+    if a.ndim != 2:
+        return float('nan')
+    peak_ij = np.unravel_index(int(np.argmax(np.abs(a))), a.shape)
+    r = int(min(peak_ij[0], peak_ij[1], a.shape[0] - 1 - peak_ij[0], a.shape[1] - 1 - peak_ij[1], 20))
+    if r < 2:
+        return 1.0
+    c = a[peak_ij[0] - r:peak_ij[0] + r + 1, peak_ij[1] - r:peak_ij[1] + r + 1]
+    peak = np.max(np.abs(c)) + 1e-30
+    if axis == 0:
+        return float(np.max(np.abs(c - c[::-1, :])) / peak)
+    return float(np.max(np.abs(c - c[:, ::-1])) / peak)
+
+
+def plot_afm_tip_debug(rho, rho_d, outdir, tag, step):
+    """Debug tip total/delta XY/XZ/YZ (fftshift wrap). Shared CLI/GUI diagnostic."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    peak = np.unravel_index(int(np.argmax(np.abs(rho))), rho.shape)
+    q = float(rho.sum() * step ** 3)
+    qd = float(rho_d.sum() * step ** 3)
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+
+    def show_wrap(ax, sl, title):
+        im = ax.imshow(np.fft.fftshift(sl).T, origin='lower', cmap='magma')
+        ax.set_title(title)
+        plt.colorbar(im, ax=ax, fraction=0.046)
+
+    show_wrap(axes[0, 0], rho[:, :, 0], f'{tag} total XY@z=0 (fftshift)')
+    show_wrap(axes[0, 1], rho[:, 0, :], f'{tag} total XZ@y=0')
+    show_wrap(axes[0, 2], rho[0, :, :], f'{tag} total YZ@x=0')
+    show_wrap(axes[1, 0], rho_d[:, :, 0], f'{tag} delta XY@z=0')
+    show_wrap(axes[1, 1], rho_d[:, 0, :], f'{tag} delta XZ@y=0')
+    show_wrap(axes[1, 2], rho_d[0, :, :], f'{tag} delta YZ@x=0')
+    mx = _afm_mirror_asym(np.fft.fftshift(rho[:, :, 0]), 0)
+    my = _afm_mirror_asym(np.fft.fftshift(rho[:, :, 0]), 1)
+    n = np.asarray(rho.shape, int).ravel()[:3]
+    fig.suptitle(
+        f'Tip {tag}: peak={peak} q={q:.3f} Δq={qd:.4f}  XY mX={mx:.2e} mY={my:.2e}\n'
+        f'dstep={step:.3f}Å  ngrid={n[0]}×{n[1]}×{n[2]}',
+        fontsize=10)
+    fig.tight_layout()
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, f'tip_{tag}.png')
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    print(f'REVIEW: {path}')
+    return {'peak': peak, 'q': q, 'dq': qd, 'mirrorX': mx, 'mirrorY': my, 'path': path}
+
+
+def plot_afm_fdbm_stages(fields, origin, step, atomPos, outdir, tag, z_above=2.5):
+    """Stage XY/XZ debug strip (ρ, Pauli, ES, vdW, E_tot, Fz). Shared CLI diagnostic."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    mol_z = float(atomPos[:, 2].max())
+    nz = next(iter(fields.values())).shape[2]
+    z_coords = origin[2] + np.arange(nz) * step
+    iz = int(np.clip(np.argmin(np.abs(z_coords - (mol_z + z_above))), 0, nz - 1))
+    names = ['rho_scf', 'E_pauli', 'E_ES', 'E_vdw', 'E_total', 'Fz']
+    fig, axes = plt.subplots(2, len(names), figsize=(3.2 * len(names), 6.5))
+    for col, name in enumerate(names):
+        data = fields[name]
+        xy = data[:, :, iz]
+        xz = data[:, data.shape[1] // 2, :]
+        for row, (sl, lab) in enumerate([(xy, f'XY z={z_coords[iz] - mol_z:.1f}Å'), (xz, 'XZ mid-y')]):
+            ax = axes[row, col]
+            vmax = np.percentile(np.abs(sl), 99) or 1e-30
+            cmap = 'magma' if name.startswith('rho') or name == 'E_pauli' else 'seismic'
+            if name == 'E_vdw':
+                im = ax.imshow(sl.T, origin='lower', cmap='viridis')
+            else:
+                im = ax.imshow(sl.T, origin='lower', cmap=cmap, vmin=-vmax, vmax=vmax)
+            ax.set_title(f'{name}\n{lab}', fontsize=8)
+            ax.set_xticks([]); ax.set_yticks([])
+            plt.colorbar(im, ax=ax, fraction=0.046)
+            if row == 0:
+                ax.text(0.02, 0.98, f'mX={_afm_mirror_asym(sl, 0):.2e}', transform=ax.transAxes,
+                        va='top', fontsize=7, color='w',
+                        bbox=dict(boxstyle='round', fc='k', alpha=0.4))
+    shape = next(iter(fields.values())).shape
+    n = np.asarray(shape, int).ravel()[:3]
+    o = np.asarray(origin, float).ravel()
+    fig.suptitle(
+        f'Stages tip_mode={tag}  (iz={iz})\n'
+        f'dstep={step:.3f}Å  ngrid={n[0]}×{n[1]}×{n[2]}  origin=({o[0]:.2f},{o[1]:.2f},{o[2]:.2f})',
+        fontsize=10)
+    fig.tight_layout()
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, f'stage_{tag}.png')
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    print(f'REVIEW: {path}')
+    return path
+
+
+def run_fdbm_pp_from_density(tag, rho_scf, atomPos, atomTypes, origin, step, ngrid,
+                             A, beta, tip_mode, outdir, *,
+                             rho_diff=None, V_ES=None,
+                             basis='3ob-3-1', margin=4.0,
+                             h_min=3.7, h_max=4.7, h_step=0.1, amp=1.0, amp_align=True,
+                             K_LAT_Nm=0.5, K_RAD=20.0, bond_length=3.0, scan_margin=2.0,
+                             plots=None, df_cmap='gray', cmap='seismic', stage_height=4.2,
+                             use_fast_s3=True, C6_CO=30.0):
+    """Shared CLI/GUI FDBM Stage3–4 from precomputed ρ (FAST_S3 by default).
+
+    Product path (default ``use_fast_s3=True``): ``stage3_fdbm_fields_fast`` + FIRE ``scan_fdbm``
+    + ``compute_df_amp`` — same physics as ModularPipeline / GUI. Requires ``rho_diff`` for ES.
+
+    Dual-basis: pass prolonged ``rho_scf`` for Pauli and **stock** ``rho_diff`` for ES.
+
+    ``plots``: set/list of {'tip','stage','df','fz'} — optional diagnostic PNGs (SSOT helpers).
+    Returns dict with df, Fz, heights, scan_xs/ys, tip_disp, … for ``plot_afm_variant_height_strip``.
+    """
+    rho_scf = np.asarray(rho_scf, dtype=np.float32)
+    atomPos = np.asarray(atomPos, dtype=np.float64)
+    atomTypes = np.asarray(atomTypes, dtype=np.int32)
+    origin = np.asarray(origin, dtype=np.float64).ravel()[:3]
+    step = float(step)
+    ngrid = tuple(int(x) for x in ngrid[:3])
+    plots = set(plots or ())
+    os.makedirs(outdir, exist_ok=True)
+    sub = os.path.join(outdir, tag)
+    os.makedirs(sub, exist_ok=True)
+    print(f"\n=== {tag}  A={A:.3f} β={beta:.4f}  tip={tip_mode}  grid={ngrid}  "
+          f"path={'FAST_S3' if use_fast_s3 else 'LEGACY'} ===")
+
+    tip_tot, tip_del = get_tip_densities(
+        tip_mode=tip_mode, target_shape=ngrid, step=step, margin=margin,
+        basis=basis, output_dir=sub, backend='dftb', pad_mode='cpu',
+    )
+    tip_info = plot_afm_tip_debug(tip_tot, tip_del, outdir, tag, step) if 'tip' in plots else {
+        'peak': None, 'q': float(tip_tot.sum() * step ** 3),
+        'dq': float(tip_del.sum() * step ** 3), 'mirrorX': None, 'mirrorY': None, 'path': None,
+    }
+
+    afmulator = afm.AFMulator(use_morse=False, nloc=32, use_fire=True)
+    if use_fast_s3:
+        if rho_diff is None:
+            raise ValueError("run_fdbm_pp_from_density(use_fast_s3=True) requires rho_diff for fused ES")
+        rho_diff = np.asarray(rho_diff, dtype=np.float32)
+        # Ensure GPU FFT path (FAST_S3 disabled when SPAMMM_AFM_CPU_FFT=1)
+        os.environ.pop('SPAMMM_AFM_CPU_FFT', None)
+        afm.AFM_CPU_FFT = 0
+        afm.AFM_FAST_S3 = 1
+        need_E = 'stage' in plots
+        _V, E_pauli, E_ES, E_vdw, F_total = afm.stage3_fdbm_fields_fast(
+            afmulator, rho_scf, rho_diff, tip_tot, tip_del,
+            origin, step, ngrid, atomPos, atomTypes, float(A), float(beta), C6_CO=float(C6_CO),
+            tip_already_rolled=True, download_fields=need_E,
+        )
+        afmulator.queue.finish()
+        reuse_grid = True
+    else:
+        # Legacy host FFT path (parity / --cpu-fft)
+        os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
+        afm.AFM_CPU_FFT = 1
+        if V_ES is None:
+            if rho_diff is None:
+                raise ValueError("legacy path needs V_ES or rho_diff")
+            V_ES = afm.fft_poisson(np.asarray(rho_diff, dtype=np.float32), step)
+        overlap = afm.compute_pauli_overlap(rho_scf, tip_tot, step, tip_rolled=True)
+        E_pauli = afm.scale_pauli_field(overlap, step, A, beta, return_grads=False)
+        E_ES = afm.compute_es_conv_field(V_ES, tip_del, step, tip_rolled=True, return_grads=False)
+        E_vdw = afm.compute_dispersion_grid(
+            atomPos, atomTypes, origin, step, ngrid, C6_CO=C6_CO, return_grads=False, afmulator=afmulator)
+        E_total = E_pauli + E_ES + E_vdw
+        F_total = afmulator.compute_gradient_cl(E_total, step, bAlloc=True)
+        afmulator.queue.finish()
+        afmulator.setup_fdbm_grid(F_total, origin, step)
+        reuse_grid = True
+
+    stage_path = None
+    if 'stage' in plots:
+        E_total = E_pauli + E_ES + E_vdw
+        fields = {
+            'rho_scf': rho_scf, 'E_pauli': E_pauli, 'E_ES': E_ES, 'E_vdw': E_vdw,
+            'E_total': E_total, 'Fz': -F_total[..., 2],
+        }
+        stage_path = plot_afm_fdbm_stages(fields, origin, step, atomPos, outdir, tag, z_above=float(stage_height))
+
+    h_df, h_Fz, h_scan = afm_df_height_stacks(h_min, h_max, h_step, amp=amp, amp_align=amp_align)
+    scan_xs = np.arange(float(atomPos[:, 0].min() - scan_margin),
+                        float(atomPos[:, 0].max() + scan_margin), step, dtype=np.float32)
+    scan_ys = np.arange(float(atomPos[:, 1].min() - scan_margin),
+                        float(atomPos[:, 1].max() + scan_margin), step, dtype=np.float32)
+    mol_z = float(atomPos[:, 2].max())
+    K_LAT = afm.stiffness_Nm_to_eVA2(float(K_LAT_Nm))
+    print(f"  K_LAT={K_LAT_Nm:.3f} N/m → {K_LAT:.4f} eV/Å²  K_RAD={K_RAD}  L={bond_length} Å")
+    print(f"  df h=[{float(h_df[0]):.2f},{float(h_df[-1]):.2f}]  "
+          f"Fz h=[{float(h_Fz[0]):.2f},{float(h_Fz[-1]):.2f}]  "
+          f"scan=[{float(h_scan[0]):.2f},{float(h_scan[-1]):.2f}] amp={amp} align={amp_align}")
+
+    if not reuse_grid:
+        afmulator.setup_fdbm_grid(F_total, origin, step)
+    FEs, tip_disp = afmulator.scan_fdbm(
+        scan_xs, scan_ys, h_scan, mol_z=mol_z,
+        K_LAT=K_LAT, K_RAD=float(K_RAD), bond_length=float(bond_length),
+        ppm_mode=True, use_fire=True,
+    )
+    afmulator.queue.finish()
+    Fz_full = FEs[:, :, :, 2]
+    dz = float(h_scan[1] - h_scan[0])
+    df_full = afm.compute_df_amp(Fz_full, dz, amp=float(amp))
+    idx_df = [int(np.argmin(np.abs(h_scan - h))) for h in h_df]
+    idx_Fz = [int(np.argmin(np.abs(h_scan - h))) for h in h_Fz]
+    Fz = Fz_full[:, :, idx_Fz]
+    df = df_full[:, :, idx_df]
+    heights = h_df
+    x_ext = [float(scan_xs[0]), float(scan_xs[-1])]
+    y_ext = [float(scan_ys[0]), float(scan_ys[-1])]
+    if 'df' in plots:
+        plot_grid_Fz(df, heights, f'df {tag} A={A:.2f} β={beta:.3f}', f'df_{tag}.png',
+                     x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap=df_cmap)
+    if 'fz' in plots:
+        plot_grid_Fz(Fz, h_Fz, f'Fz {tag} A={A:.2f} β={beta:.3f}', f'Fz_{tag}.png',
+                     x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap=cmap)
+    ih = len(heights) // 2
+    print(f"  df @h={heights[ih]:.2f} / Fz @h={float(h_Fz[ih]):.2f}: "
+          f"df=[{df.min():.3e},{df.max():.3e}] Fz=[{Fz.min():.3e},{Fz.max():.3e}]")
+    return {
+        'tip': tip_info, 'stage_path': stage_path, 'df': df, 'Fz': Fz, 'heights': heights,
+        'heights_Fz': h_Fz, 'amp_align': bool(amp_align),
+        'scan_xs': scan_xs, 'scan_ys': scan_ys, 'atomPos': atomPos, 'origin': origin, 'step': step,
+        'A': A, 'beta': beta, 'tag': tag, 'h_scan': h_scan, 'tip_disp': tip_disp,
+        'FEs': FEs, 'path': 'FAST_S3' if use_fast_s3 else 'LEGACY',
+    }
+
+
+# ── Fukui panel: cube | prolonged | stock (product CLI + gallery) ─────────────
+# USER 2026-07-24: flat geometries; cubes under FUKUI_CUBE_ROOTS
+# USER 2026-07-27: H-bonded dimers under …/Fukui_AFM/new
+FUKUI_CUBE_ROOTS = [
+    '/home/prokop/SIMULATIONS/Fukui_AFM/new',
+    '/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster',
+]
+FUKUI_CUBE_ROOT = FUKUI_CUBE_ROOTS[0]
+_FUKUI_NEW = '/home/prokop/SIMULATIONS/Fukui_AFM/new'
+FUKUI_PANEL = [
+    ('adenine-uracil', f'{_FUKUI_NEW}/adenine-uracil_PBE_def2-SVP/adenine-uracil_opt.xyz'),
+    ('adenine-uracil-iso', f'{_FUKUI_NEW}/adenine-uracil-iso_PBE_def2-SVP/adenine-uracil-iso_opt.xyz'),
+    ('azaindol_dimer', f'{_FUKUI_NEW}/azaindol_dimer_PBE_def2-SVP/azaindol_dimer_opt.xyz'),
+    ('azaindol_isodimer', f'{_FUKUI_NEW}/azaindol_isodimer_PBE_def2-SVP/azaindol_isodimer_opt.xyz'),
+    ('benzoicacid_dimer', 'data/xyz/benzoicacid_dimer.xyz'),
+    ('benzoicamid_dimer', 'data/xyz/benzoicamid_dimer.xyz'),
+    ('pentacene', 'data/xyz/pentacene.xyz'),
+    ('PTCDA', 'data/xyz/PTCDA.xyz'),
+    ('phtalo_1-dftb-relax', 'data/xyz/phtalo_1.xyz'),
+    ('phtalo_2-dftb-relax', 'data/xyz/phtalo_2.xyz'),
+]
+
+
+def fukui_cube_dir(mol):
+    """First root with ``rho_N.cube`` for ``<mol>_PBE_def2-SVP``, else preferred path."""
+    tag = f'{mol}_PBE_def2-SVP'
+    for root in FUKUI_CUBE_ROOTS:
+        d = os.path.join(root, tag)
+        if os.path.isfile(os.path.join(d, 'rho_N.cube')):
+            return d
+    return os.path.join(FUKUI_CUBE_ROOTS[0], tag)
+
+
+def run_fukui_one(mol, xyz_rel, outdir_root, *,
+                  step=0.15, margin=4.0, z_vac=6.0, basis='3ob-3-1', tip_mode='co',
+                  h_min=3.7, h_max=4.7, h_step=0.1, amp=1.0, amp_align=True,
+                  K_LAT=0.5, K_RAD=20.0, bond_length=3.0, scan_margin=2.0, height=4.2,
+                  cmap='seismic', df_cmap='gray', use_fast_s3=True, plots=None,
+                  repo_root=None):
+    """One molecule: DFT-cube FDBM + DFTB stock + prolonged (dual ES). FAST_S3 by default.
+
+    Shared by ``run_spm.py panel-fukui`` and visual demos — not a test-only helper.
+    """
+    from spammm.config_utils import get_dftb_basis_path
+    from spammm.quantum.DFTB.DFTBplusParser import (
+        parse_wfc_hsd, convert_wfc_to_species_list_ang, make_slater_tail_species_list,
+    )
+    import spammm.atomicUtils as au
+
+    if repo_root is None:
+        repo_root = os.path.realpath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    cube_dir = fukui_cube_dir(mol)
+    xyz = xyz_rel if os.path.isabs(xyz_rel) else os.path.join(repo_root, xyz_rel)
+    outdir = os.path.join(outdir_root, mol)
+    os.makedirs(outdir, exist_ok=True)
+    plots = set(plots or ())
+
+    ELEM_Z = {'H': 1, 'C': 6, 'N': 7, 'O': 8}
+    pos, _, names, _, _ = au.load_xyz(xyz)
+    atomPos_xyz = np.array(pos, dtype=np.float64)
+    enames = list(names)
+    atomTypes_xyz = np.array([ELEM_Z.get(e, 6) for e in enames], dtype=np.int32)
+
+    lines = [
+        f'Fukui FDBM panel: {mol}',
+        f'cube_dir={cube_dir}',
+        f'xyz={xyz}',
+        f'step={step}  tip={tip_mode}  basis={basis}  Stage3={"FAST_S3" if use_fast_s3 else "LEGACY"}',
+        'variants: cube (pySCF ρ_N) | stock 3ob | prolonged Slater-tail (Pauli only; ES=stock)',
+        '',
+    ]
+    print(f'\n######## {mol} ########')
+
+    rho_cube_path = os.path.join(cube_dir, 'rho_N.cube')
+    has_cube = os.path.isfile(rho_cube_path)
+    if has_cube:
+        d_cube = get_density_from_cube(rho_cube_path, use_esp_cube=False, verbosity=0)
+        atomPos = np.asarray(d_cube['atomPos'], dtype=np.float64)
+        atomZ = np.asarray(d_cube['atomZ'], dtype=np.float64)
+        atomTypes = np.array([int(round(z)) for z in atomZ], dtype=np.int32)
+        if len(atomPos) != len(atomPos_xyz):
+            print(f'  WARNING: cube natom={len(atomPos)} != xyz {len(atomPos_xyz)}; using cube')
+    else:
+        print(f'  WARNING: no rho_N.cube under {cube_dir} — DFTB stock+prolonged only')
+        lines.append(f'WARNING: missing {rho_cube_path} — skipped DFT cube variant')
+        atomPos = atomPos_xyz
+        atomTypes = atomTypes_xyz
+        atomZ = atomTypes.astype(np.float64)
+        d_cube = None
+
+    grid_spec, origin, ngrid, step = make_fdbm_grid_com_zsym(atomPos, step, margin, z_vac=float(z_vac))
+    nx, ny, nz = [int(x) for x in ngrid]
+    lines.append(f'grid={nx}x{ny}x{nz} step={step} origin={origin}')
+    dV = float(step) ** 3
+
+    rho_cube_g = rho_diff_cube = V_ES_cube = None
+    if has_cube:
+        lines.append('cube ES: clamp→compact_NA + GridsOCL.project')
+        cube_prep = allelectron_cube_to_fdbm_grid(
+            d_cube['rho_scf'], d_cube['origin'], d_cube['step'], atomPos, atomZ,
+            origin, step, ngrid, rc_na=0.6, R_sphere=0.6, verbosity=0)
+        rho_cube_g = cube_prep['rho_scf']
+        rho_diff_cube = cube_prep['rho_diff']
+        V_ES_cube = None if use_fast_s3 else afm.fft_poisson_cpu(rho_diff_cube, step)
+        lines.append(
+            f'cube q_scf={float(rho_cube_g.sum()*dV):.2f} q_diff={cube_prep["q_diff"]:.3e} '
+            f'p_diff={cube_prep["p_diff"]}')
+    else:
+        lines.append('cube ES: SKIPPED (no rho_N.cube)')
+
+    basis_hsd = get_dftb_basis_path(basis)
+    print(f'\n[{mol}] DFTB stock {basis}...')
+    res_stock = get_density_from_dftb_dense(
+        atomPos, atomTypes, basis_hsd, os.path.join(outdir, 'dftb_work_stock'),
+        grid_spec=grid_spec, step=step, verbosity=0)
+    rho_stock = res_stock['rho_scf']
+    rho_diff_stock = res_stock['rho_diff']
+    V_ES = res_stock['V_ES']
+    dens_dir = os.path.join(repo_root, 'debug', 'densities')
+    os.makedirs(dens_dir, exist_ok=True)
+    np.save(os.path.join(dens_dir, f'rho_{mol}_dftb_3ob.npy'), rho_stock)
+    np.savez(os.path.join(dens_dir, f'rho_{mol}_dftb_3ob.meta.npz'),
+             origin=origin, ngrid=ngrid, step=step,
+             atom_pos=atomPos, atom_names=np.array(enames[:len(atomPos)] if len(enames) >= len(atomPos) else enames))
+    lines.append(f'stock q_scf={float(rho_stock.sum()*dV):.2f}')
+
+    basis_data = parse_wfc_hsd(basis_hsd)
+    basis_ang = convert_wfc_to_species_list_ang(basis_data, resolution_bohr=0.04)
+    proj_prolonged = make_slater_tail_species_list(basis_ang)
+    print(f'\n[{mol}] DFTB prolonged Slater-tail (Pauli ρ)...')
+    res_prol = get_density_from_dftb_dense(
+        atomPos, atomTypes, basis_hsd, os.path.join(outdir, 'dftb_work_prolonged'),
+        grid_spec=grid_spec, step=step, verbosity=0, projection_basis_ang=proj_prolonged)
+    rho_prol = res_prol['rho_scf']
+    np.save(os.path.join(dens_dir, f'rho_{mol}_dftb_3ob_prolonged.npy'), rho_prol)
+    np.savez(os.path.join(dens_dir, f'rho_{mol}_dftb_3ob_prolonged.meta.npz'),
+             origin=origin, ngrid=ngrid, step=step, atom_pos=atomPos)
+    lines.append(f'prolonged q_scf={float(rho_prol.sum()*dV):.2f} (NOT charge-normalized; Pauli only)')
+
+    pa = dict(afm.PAULI_FITTED_DEFAULTS.get(basis, afm.PAULI_FITTED_DEFAULTS['3ob-3-1']))
+    A, beta = float(pa['A']), float(pa['beta'])
+    lines.append(f'Pauli EVAL defaults ({basis}): A={A:.3f} β={beta:.4f}  '
+                 f'(same for cube|stock|prolonged)')
+
+    plot_diag = plots & {'tip', 'stage', 'df', 'fz'}
+    variants = {}
+    specs = []
+    if has_cube:
+        specs.append(('cube', rho_cube_g, rho_diff_cube, V_ES_cube))
+    specs += [
+        ('stock', rho_stock, rho_diff_stock, V_ES),
+        ('prolonged', rho_prol, rho_diff_stock, V_ES),
+    ]
+    for key, rho, rho_d, Ves in specs:
+        r = run_fdbm_pp_from_density(
+            key, rho, atomPos, atomTypes, origin, step, ngrid, A, beta, tip_mode, outdir,
+            rho_diff=rho_d, V_ES=Ves, basis=basis, margin=margin,
+            h_min=h_min, h_max=h_max, h_step=h_step, amp=amp, amp_align=amp_align,
+            K_LAT_Nm=K_LAT, K_RAD=K_RAD, bond_length=bond_length, scan_margin=scan_margin,
+            plots=plot_diag, df_cmap=df_cmap, cmap=cmap, stage_height=height,
+            use_fast_s3=use_fast_s3,
+        )
+        variants[key] = r
+        lines.append(f'[{key}] A={A:.3f} β={beta:.4f}  df=[{r["df"].min():.3e},{r["df"].max():.3e}]')
+
+    heights = variants['stock']['heights']
+    row_specs = []
+    if has_cube:
+        row_specs.append(('df', 'cube', f'df  DFT cube\nA={A:.1f} β={beta:.2f}', df_cmap))
+    row_specs += [
+        ('df', 'prolonged', f'df  prolonged\nA={A:.1f} β={beta:.2f}', df_cmap),
+        ('df', 'stock', f'df  stock 3ob\nA={A:.1f} β={beta:.2f}', df_cmap),
+    ]
+    if has_cube:
+        fz_c = f'Fz  DFT cube\n@h−{amp:.1f}Å' if amp_align else 'Fz  DFT cube'
+        row_specs.append(('Fz', 'cube', fz_c, cmap))
+    for k, lab in (('prolonged', 'prolonged'), ('stock', 'stock 3ob')):
+        fz_lab = f'Fz  {lab}\n@h−{amp:.1f}Å' if amp_align else f'Fz  {lab}'
+        row_specs.append(('Fz', k, fz_lab, cmap))
+
+    title = (f'{mol} FDBM {tip_mode} tip | '
+             + ('DFT cube → ' if has_cube else '(no cube) ')
+             + f'prolonged → stock 3ob\n'
+             f'DUAL BASIS: prolonged ρ → Pauli only; ES = stock Δρ'
+             + ('  |  PBE/def2-SVP cubes' if has_cube else '  |  DFTB-only'))
+    cmp_name = 'compare_cube_stock_prolonged.png' if has_cube else 'compare_stock_prolonged.png'
+    cmp = os.path.join(outdir, cmp_name)
+    plot_afm_variant_height_strip(
+        variants, row_specs, heights, cmp, scale='per_image', title=title,
+        dpi=140, amp=amp, amp_align=amp_align, long_axis_vertical=True, tight=True)
+    lines.append(f'REVIEW: {cmp}')
+    per_dir = os.path.join(outdir, 'per_column_Fz')
+    os.makedirs(per_dir, exist_ok=True)
+    cmp_pi = os.path.join(per_dir, cmp_name)
+    plot_afm_variant_height_strip(
+        variants, row_specs, heights, cmp_pi, scale='per_column', title=title + ' [Fz per_column]',
+        dpi=140, amp=amp, amp_align=amp_align, long_axis_vertical=True, tight=True)
+    lines.append(f'REVIEW: {cmp_pi}')
+    lines.append(f'height SSOT: df=[{float(heights[0]):.2f},{float(heights[-1]):.2f}] dz={h_step} '
+                 f'amp={amp} amp_align={amp_align}')
+
+    save_kw = dict(
+        heights=heights,
+        df_stock=variants['stock']['df'], Fz_stock=variants['stock']['Fz'],
+        df_prolonged=variants['prolonged']['df'], Fz_prolonged=variants['prolonged']['Fz'],
+        A_stock=A, beta_stock=beta, A_prolonged=A, beta_prolonged=beta,
+        has_cube=has_cube, cube_dir=cube_dir, xyz=xyz,
+    )
+    if has_cube:
+        save_kw.update(df_cube=variants['cube']['df'], Fz_cube=variants['cube']['Fz'],
+                       A_cube=A, beta_cube=beta)
+    np.savez(os.path.join(outdir, 'scan_cube_stock_prolonged.npz'), **save_kw)
+    summary = os.path.join(outdir, 'SUMMARY.out')
+    lines += ['', f'REVIEW: {summary}', f'heights={list(map(float, heights))}']
+    open(summary, 'w').write('\n'.join(lines) + '\n')
+    print(f'REVIEW: {summary}')
+    return variants
+
+
+def run_fukui_panel(outdir, *, molecules=None, use_fast_s3=True, **kwargs):
+    """Run Fukui molecule panel (all or subset of ``FUKUI_PANEL`` names)."""
+    mols = FUKUI_PANEL
+    if molecules:
+        want = set(molecules)
+        mols = [(m, x) for m, x in FUKUI_PANEL if m in want]
+        missing = want - {m for m, _ in mols}
+        if missing:
+            raise ValueError(f'Unknown molecule {missing}; choose from {[m for m, _ in FUKUI_PANEL]}')
+    os.makedirs(outdir, exist_ok=True)
+    panel_lines = [f'Fukui FDBM panel  outdir={outdir}  Stage3={"FAST_S3" if use_fast_s3 else "LEGACY"}', '']
+    for mol, xyz in mols:
+        run_fukui_one(mol, xyz, outdir, use_fast_s3=use_fast_s3, **kwargs)
+        panel_lines.append(f'REVIEW: {os.path.join(outdir, mol, "compare_cube_stock_prolonged.png")}')
+        panel_lines.append(f'REVIEW: {os.path.join(outdir, mol, "compare_stock_prolonged.png")}')
+        panel_lines.append(f'REVIEW: {os.path.join(outdir, mol, "per_column_Fz", "compare_cube_stock_prolonged.png")}')
+        panel_lines.append(f'REVIEW: {os.path.join(outdir, mol, "SUMMARY.out")}')
+    panel_sum = os.path.join(outdir, 'SUMMARY.out')
+    open(panel_sum, 'w').write('\n'.join(panel_lines) + '\n')
+    print(f'\nREVIEW: {panel_sum}')
+    print(f'REVIEW: {os.path.abspath(outdir)}/')
+    return panel_sum
+
+
+def replot_fukui_per_image(panel_dir, molecules=None, cmap='seismic', df_cmap='gray'):
+    """Replot existing scan_*.npz strips with SSOT display defaults."""
+    mols = molecules or [m for m, _ in FUKUI_PANEL]
+    lines = [f'Replot SSOT display from {panel_dir}', '']
+    for mol in mols:
+        npz = os.path.join(panel_dir, mol, 'scan_cube_stock_prolonged.npz')
+        if not os.path.isfile(npz):
+            print(f'  skip {mol}: missing {npz}')
+            continue
+        d = np.load(npz)
+        heights = d['heights']
+        variants = {
+            'cube': {'df': d['df_cube'], 'Fz': d['Fz_cube']},
+            'stock': {'df': d['df_stock'], 'Fz': d['Fz_stock']},
+            'prolonged': {'df': d['df_prolonged'], 'Fz': d['Fz_prolonged']},
+        }
+        A_c, b_c = float(d['A_cube']), float(d['beta_cube'])
+        A_s, b_s = float(d['A_stock']), float(d['beta_stock'])
+        A_p, b_p = float(d['A_prolonged']), float(d['beta_prolonged'])
+        row_specs = [
+            ('df', 'cube', f'df  DFT cube\nA={A_c:.1f} β={b_c:.2f}', df_cmap),
+            ('df', 'prolonged', f'df  prolonged\nA={A_p:.1f} β={b_p:.2f}', df_cmap),
+            ('df', 'stock', f'df  stock 3ob\nA={A_s:.1f} β={b_s:.2f}', df_cmap),
+            ('Fz', 'cube', 'Fz  DFT cube', cmap),
+            ('Fz', 'prolonged', 'Fz  prolonged', cmap),
+            ('Fz', 'stock', 'Fz  stock 3ob', cmap),
+        ]
+        title = f'{mol} FDBM CO tip | DFT cube → prolonged → stock'
+        out_main = os.path.join(panel_dir, mol, 'compare_cube_stock_prolonged.png')
+        plot_afm_variant_height_strip(
+            variants, row_specs, heights, out_main, scale='per_image', title=title, dpi=140,
+            long_axis_vertical=True, tight=True, amp=1.0, amp_align=True)
+        lines.append(f'REVIEW: {out_main}')
+        per_dir = os.path.join(panel_dir, mol, 'per_column_Fz')
+        os.makedirs(per_dir, exist_ok=True)
+        out_col = os.path.join(per_dir, 'compare_cube_stock_prolonged.png')
+        plot_afm_variant_height_strip(
+            variants, row_specs, heights, out_col, scale='per_column',
+            title=f'{title} [Fz per_column]', dpi=140,
+            long_axis_vertical=True, tight=True, amp=1.0, amp_align=True)
+        lines.append(f'REVIEW: {out_col}')
+    sum_path = os.path.join(panel_dir, 'SUMMARY_replot.out')
+    open(sum_path, 'w').write('\n'.join(lines) + '\n')
+    print(f'REVIEW: {sum_path}')
+    return lines
 
 
 def run_morse_coulomb_afm(xyz_path, outdir, *,
@@ -6986,6 +7511,22 @@ def _basis_tails_pauli_line(rho, origin, step, tip_mode, sigma, A, beta, xy, zs,
     return sample_field_z_profile(E, o, s, xy, zs)
 
 
+
+def _basis_tails_rho_line(rho, origin, step, xy, zs):
+    """Trilinear ρ(z) sample (avoids nearest-voxel stair-steps / kinks)."""
+    s = float(np.asarray(step).reshape(-1)[0]) if np.size(step) == 1 else None
+    o = np.asarray(origin, float).ravel()[:3]
+    if s is None:
+        # anisotropic step → use map_coordinates with per-axis spacing
+        from scipy.ndimage import map_coordinates
+        st = np.asarray(step, float).ravel()[:3]
+        fx = np.full(len(zs), (xy[0] - o[0]) / st[0])
+        fy = np.full(len(zs), (xy[1] - o[1]) / st[1])
+        fz = (np.asarray(zs, float) - o[2]) / st[2]
+        return np.maximum(map_coordinates(np.asarray(rho, float), np.vstack([fx, fy, fz]), order=1, mode='nearest'), 1e-30)
+    return np.maximum(sample_field_z_profile(rho, o, s, xy, zs), 1e-30)
+
+
 def run_basis_tails_compare(
     molecules=('pentacene', 'PTCDA'),
     outdir='debug/presentation_basis_tails',
@@ -6995,17 +7536,22 @@ def run_basis_tails_compare(
     A_pauli=1.0,
     beta_pauli=1.0,
     z_max=3.0,
-    dz=0.1,
+    dz=0.05,
     ylim_rho=(1e-5, 1e1),
     formats=('svg', 'png'),
     gpaw_dir=None,
     pyscf_dir=None,
     dftb_step=0.1,
+    pyscf_basis='def2-SVP',
+    pyscf_xc='pbe',
+    pyscf_z_extra=6.0,
+    force_pyscf=False,
     verbosity=1,
 ):
     """Central-carbon ρ(z) + Pauli E(z) on log scale: GPAW / pySCF / DFTB stock / prolonged.
 
     Talk / presentation SSOT. Writes SVG+PNG under ``outdir``.
+    pySCF ρ via ``get_density_from_pyscf`` (tall ``pyscf_z_extra``, not Fukui short cube).
     Pauli uses the same (A,β) for all channels so tails track density (default A=β=1 → raw overlap).
     """
     from spammm.config_utils import get_dftb_basis_path
@@ -7035,7 +7581,10 @@ def run_basis_tails_compare(
         raise ValueError('No molecules given')
 
     tip_cache = {}
-    order = ['GPAW PBE', 'pySCF PBE/def2-SVP', 'DFTB 3ob stock', 'DFTB prolonged']
+    pyscf_label = f'pySCF {pyscf_xc.upper()}/{pyscf_basis}'
+    order = ['GPAW PBE', pyscf_label, 'DFTB 3ob stock', 'DFTB prolonged']
+    _BASIS_TAILS_COLORS[pyscf_label] = '#2ca02c'
+
     summary_lines = [
         'Central-C ρ(z) + Pauli log (fit 0.5–1.5 Å)',
         f'basis={basis} tip={tip_mode} σ={sigma} A={A_pauli} β={beta_pauli}',
@@ -7060,13 +7609,14 @@ def run_basis_tails_compare(
             print(f'  central C atom {ci} @ ({ca[2]:.3f},{ca[3]:.3f},{ca[4]:.3f})', flush=True)
 
         channels = []
+        cube_z_end = 1e9
         z_vals = np.arange(0.0, z_max + dz / 2, dz)
         zs_abs = z0 + z_vals
 
         rho_gpaw = np.load(os.path.join(gdir, 'rho_N.npy'))
-        gpaw_profs, _ = extract_z_profiles(rho_gpaw, atoms, np.zeros(3), dL_gpaw, fine_grid, z0, z_max, dz)
+        rho_g = _basis_tails_rho_line(rho_gpaw, np.zeros(3), dL_gpaw, xy, zs_abs)
         E_g = _basis_tails_pauli_line(rho_gpaw, np.zeros(3), dL_gpaw, tip_mode, sigma, A_pauli, beta_pauli, xy, zs_abs, tip_cache)
-        channels.append(('GPAW PBE', gpaw_profs[ci], E_g))
+        channels.append(('GPAW PBE', rho_g, E_g))
         del rho_gpaw
 
         atomPos = np.array([[a[2], a[3], a[4]] for a in atoms], dtype=np.float64)
@@ -7083,31 +7633,41 @@ def run_basis_tails_compare(
             atomPos, atomTypes, basis_hsd, work + '_prol',
             step=dftb_step, margin=6.0, z_extra=6.0, verbosity=0,
             projection_basis_ang=prol_basis)
-        stock_profs, _ = extract_z_profiles(
-            d_stock['rho_scf'], atoms, d_stock['origin'], dftb_step, d_stock['ngrid'], z0, z_max, dz)
-        prol_profs, _ = extract_z_profiles(
-            d_prol['rho_scf'], atoms, d_prol['origin'], dftb_step, d_prol['ngrid'], z0, z_max, dz)
         E_s = _basis_tails_pauli_line(
             d_stock['rho_scf'], d_stock['origin'], dftb_step, tip_mode, sigma, A_pauli, beta_pauli, xy, zs_abs, tip_cache)
         E_p = _basis_tails_pauli_line(
             d_prol['rho_scf'], d_prol['origin'], dftb_step, tip_mode, sigma, A_pauli, beta_pauli, xy, zs_abs, tip_cache)
-        channels.append(('DFTB 3ob stock', stock_profs[ci], E_s))
-        channels.append(('DFTB prolonged', prol_profs[ci], E_p))
+        channels.append(('DFTB 3ob stock', _basis_tails_rho_line(d_stock['rho_scf'], d_stock['origin'], dftb_step, xy, zs_abs), E_s))
+        channels.append(('DFTB prolonged', _basis_tails_rho_line(d_prol['rho_scf'], d_prol['origin'], dftb_step, xy, zs_abs), E_p))
 
-        pdir = os.path.join(pyscf_dir, meta['pyscf'])
-        rho_pyscf = np.load(os.path.join(pdir, 'rho_N.npy')) / (0.529177 ** 3)
-        pyscf_atoms, pyscf_origin, dL_pyscf, pyscf_ngrid = _basis_tails_parse_cube(os.path.join(pdir, 'rho_N.cube'))
-        z0_p = float(np.mean([a[3] for a in pyscf_atoms]))
-        pyscf_fmt = [(i, z_to_sym.get(a[0], '?'), a[1], a[2], a[3]) for i, a in enumerate(pyscf_atoms)]
-        pC = [(i, a) for i, a in enumerate(pyscf_fmt) if a[1] == 'C']
-        pxy = np.array([[a[2], a[3]] for _, a in pC])
-        pi = pC[int(np.argmin(np.linalg.norm(pxy - pxy.mean(0), axis=1)))][0]
-        pyscf_profs, _ = extract_z_profiles(rho_pyscf, pyscf_fmt, pyscf_origin, dL_pyscf, pyscf_ngrid, z0_p, z_max, dz)
-        xy_p = (pyscf_fmt[pi][2], pyscf_fmt[pi][3])
-        zs_p = z0_p + z_vals
+        # Live pySCF on same geometry — tall vacuum (z_extra), NOT Fukui short cube
+        pyscf_cache = os.path.join(outdir, f'{label}_pyscf_live_rho.npz')
+        if os.path.isfile(pyscf_cache) and not force_pyscf:
+            if verbosity:
+                print(f'  pySCF: load cache {pyscf_cache}', flush=True)
+            c = np.load(pyscf_cache)
+            rho_pyscf = c['rho_scf']; pyscf_origin = c['origin']; pyscf_step = float(c['step'])
+        else:
+            if verbosity:
+                print(f'  pySCF live SCF+ρ  basis={pyscf_basis} xc={pyscf_xc} z_extra={pyscf_z_extra}...', flush=True)
+            d_py = get_density_from_pyscf(
+                atomPos, atomTypes, step=dftb_step, margin=6.0, z_extra=pyscf_z_extra,
+                basis=pyscf_basis, method='RKS', xc=pyscf_xc, verbosity=0, skip_na=True, use_df=True)
+            # eval_rho is e/a0³ → e/Å³ for parity with GPAW/DFTB
+            b3 = 0.529177249 ** 3
+            rho_pyscf = (d_py['rho_scf'] / b3).astype(np.float32)
+            pyscf_origin = np.asarray(d_py['origin'], float)
+            pyscf_step = float(dftb_step)
+            np.savez_compressed(pyscf_cache, rho_scf=rho_pyscf, origin=pyscf_origin, step=pyscf_step,
+                                basis=pyscf_basis, xc=pyscf_xc)
+            if verbosity:
+                print(f'  pySCF cache → {pyscf_cache}  shape={rho_pyscf.shape} q≈{rho_pyscf.sum()*pyscf_step**3:.2f}', flush=True)
+            del d_py
         E_y = _basis_tails_pauli_line(
-            rho_pyscf, pyscf_origin, dL_pyscf, tip_mode, sigma, A_pauli, beta_pauli, xy_p, zs_p, tip_cache)
-        channels.append(('pySCF PBE/def2-SVP', pyscf_profs[pi], E_y))
+            rho_pyscf, pyscf_origin, pyscf_step, tip_mode, sigma, A_pauli, beta_pauli, xy, zs_abs, tip_cache)
+        channels.append((f'pySCF {pyscf_xc.upper()}/{pyscf_basis}',
+                         _basis_tails_rho_line(rho_pyscf, pyscf_origin, pyscf_step, xy, zs_abs), E_y))
+        cube_z_end = 1e9  # live grid has tall vacuum — no cube cliff
         del rho_pyscf
 
         ch_map = {n: (r, e) for n, r, e in channels}
@@ -7139,6 +7699,8 @@ def run_basis_tails_compare(
             ax.set_yscale('log'); ax.set_ylim(*ylim); ax.set_xlim(0, z_max)
             ax.set_xlabel('z above plane (Å)'); ax.set_ylabel(ylab)
             ax.set_title('ρ(z)' if kind == 'rho' else 'Pauli E(z) (same tip, all ρ)')
+            if cube_z_end < z_max:
+                ax.axvline(cube_z_end, color='0.4', ls=':', lw=1.0, alpha=0.8, label=f'pySCF cube end {cube_z_end:.1f}Å')
             ax.legend(fontsize=7.5, loc='upper right', framealpha=0.92)
             ax.grid(True, which='major', alpha=0.35); ax.grid(True, which='minor', alpha=0.15)
         fig.suptitle(f'{label}: central C (atom {ci}) — stock dies; prolonged ≈ DFT  (log, 6 decades)', fontsize=12)
@@ -7168,6 +7730,8 @@ def run_basis_tails_compare(
             ttl = (f'{label}: ρ(z) above central C (atom {ci})\nstock cuts off; prolonged ≈ GPAW/pySCF'
                    if kind == 'rho' else
                    f'{label}: Pauli E(z) above central C (atom {ci})\ntip={tip_mode}  A={A_pauli:g} β={beta_pauli:g}  (tracks ρ tails)')
+            if cube_z_end < z_max:
+                ax.axvline(cube_z_end, color='0.4', ls=':', lw=1.0, alpha=0.8, label=f'pySCF cube end {cube_z_end:.1f}Å')
             ax.set_title(ttl, fontsize=12)
             ax.legend(fontsize=8.5, loc='upper right'); ax.grid(True, which='both', alpha=0.25)
             if kind == 'rho':

@@ -57,7 +57,9 @@ Do **not** put substrate atoms into PairFF env when FAF models the surface (doub
 
 ## Follow-ups (not blocking Done)
 
+- **[Tomorrow — P0]** Offline tip-pull / report maps must reuse Vispy display SSOT (`potential_to_rgba`), not softclip+add — [`PairFF_MapDisplay_SSOT.md`](PairFF_MapDisplay_SSOT.md); report [`../Reports/PairFF_TipPull_PTCDI_QEq_2026-07-28.md`](../Reports/PairFF_TipPull_PTCDI_QEq_2026-07-28.md)
 - Main `SPAMMM_GUI` PairFF panel still design-only (`PairFF_GUI_Integration.md`)
 - Mixed `--mols` + single HCOOH fit: `atom_type_ids` must match each pack’s real-atom count
 - Optional: substrate atom markers in Vispy; coulomb-channel-only map overlay
 - Formal L0 pytest for FAF+PairFF parity still thin (demo / headless smoke used)
+- PTCDI FAF cache `data/fits/ptcdi_nacl.npz` (element-mean QEq); tip-pull API `tip_pull_scan` — viz pending MapDisplay task

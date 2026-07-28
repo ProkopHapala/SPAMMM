@@ -32,6 +32,9 @@ Features:
   - Potential map background: Morse + epair Hbond + sigma-hole (no Coulomb),
     matching ff_map.py's morseH_only mode. Presets H+(q=+0.4) / O−(q=-0.4);
     when ``rbd.faf_mode`` + ``rbd.faf_fit``, map is **PairFF + FAF** at active CoM z.
+    **Display SSOT:** ``potential_to_rgba`` uses ``vmax=max(|Emin|,0.01)`` so Pauli
+    cores clip and FAF corrugation stays visible — offline plots must reuse this
+    (``doc/Tasks/PairFF_MapDisplay_SSOT.md``).
     R0, E0, Q editable; element combo still fills R0/E0 from AtomTypes.
   - Epairs rendered as cyan dots, sigma holes as magenta dots (same size, semi-transparent)
   - Faint dummy-bond lines from epairs (cyan) and sigma holes (magenta) to host atoms

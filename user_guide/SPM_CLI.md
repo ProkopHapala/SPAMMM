@@ -169,7 +169,16 @@ python run_spm.py afm --cube /path/to/rho_N.cube --xyz data/xyz/mol.xyz --projec
 
 Key flags: `--basis`, `--projection` (`stock`|`prolonged`|`both`), `--tip-mode` (`co`|`gaussian`), `--scale` (`per_image` default | `per_column` | `common`), `--show-atoms`, `--plots`, height / amp flags above.
 
-**Strip display SSOT:** df clim = **per panel**; long molecular axis **vertical**; panels **tightly packed**. See skill:`afm-plotting`.
+**Strip display SSOT** (skill:`afm-plotting` § overview strip display, USER 2026-07-28):
+
+| | Policy |
+|--|--------|
+| df clim | **per panel** min/max (never shared df colorbar) |
+| long axis | **vertical** on overview strips |
+| packing | **tight** 6×N (no empty gutters) |
+| CLI `--scale` | default **`per_image`** |
+
+Helper: `AFM_utils.plot_afm_variant_height_strip`.
 
 **Dual basis:** prolonged ρ is **Pauli only**; electrostatics always from stock Δρ.
 
@@ -343,8 +352,8 @@ See `doc/AGENTS/skills/afm-plotting/SKILL.md`.
 
 | Priority | Item | Notes |
 |----------|------|-------|
-| **Near** | **Replace legacy CLI FDBM Stage-3** | `afm` still uses `_run_from_density` + default `SPAMMM_AFM_CPU_FFT=1`. FAST_S3 parity **USER-confirmed** (~5.5×); fold onto ModularPipeline. See [`Consolidate_GUI_CLI_Backend_Input_Protocol.md`](../doc/Tasks/Consolidate_GUI_CLI_Backend_Input_Protocol.md), [`TopicalAudit/AFM_FDBM.md`](../doc/TopicalAudit/AFM_FDBM.md). |
-| Near | **GUI↔CLI param SSOT** | GUI Pauli spins were obsolete (509/1.06 vs 124.84/1.433); heights/amp fixed; FIRE relax / scan margin remaining |
+| **Near** | **GUI↔CLI param SSOT** | Heights/amp/Pauli/FIRE/scan-margin fixed in GUI; residual: scan sampling `arange` vs `linspace` |
+| Near | **Confirm CLI FAST_S3 cutover** | `afm` + `panel-fukui` now use `AFM_utils.run_fdbm_pp_from_density` (FAST_S3 default). Smoke: `debug/spm_afm_fast_smoke/`. Await USER REVIEW before marking Done. |
 | Near | **GUI↔CLI input protocol** | JSON `SPMJobSpec` + `run_spm_job` |
 | Near | FDBM ↔ Kriging compare | Wrap `testplot_kriging_vs_fdbm_cube` |
 | Near | Cube FDBM ES / NA multipoles | Prefer cube `ρ_NA`; see Fukui notes §1b |

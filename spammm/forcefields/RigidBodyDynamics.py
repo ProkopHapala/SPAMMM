@@ -11,7 +11,8 @@ Key functionality:
   - Anchor springs on specific atoms
   - **RigidBodyPairFF**: allmol shared multi-mol layout (`from_molecules`);
     `set_active_body` = index only (persistent dynamics); `attach_pairff_faf`
-    for substrate; Vispy map uses `faf_fit`
+    for substrate; `tip_pull_scan` / `world_sites_all_bodies` for AFM-like pulls;
+    Vispy map uses `faf_fit` + `potential_to_rgba` display SSOT
 
 Role in SPAMMM: Rigid engine for AFM manipulation (`RigidBodyAFM.py`) and
 interactive PairFF docking (`demos/demo_pairff.py`). Kernels in `rigid.cl`.
@@ -2379,6 +2380,83 @@ void rigid_body_pairff_unified_allmol_faf_kernel(
         self.toGPU('vposs', z); self.toGPU('vrots', z); self.queue.finish()
         return {'steps': n_done, 'converged': Fmag < f_tol and Tmag < t_tol,
                 'F': Fmag, 'T': Tmag, 'E': E, 'history': hist}
+
+    def world_sites_all_bodies(self, real_only=False):
+        """Host world-frame sites for every multi-body molecule (syncs active pose)."""
+        if self._mb_packs is None:
+            raise RuntimeError("world_sites_all_bodies requires from_molecules()")
+        self.sync_active_pose_from_gpu()
+        out = []
+        for j, pack in enumerate(self._mb_packs):
+            world = _body_sites_world(pack['rel'], self._mb_pos[j], self._mb_quat[j])
+            types = pack['types']
+            enames = pack['enames']
+            if real_only:
+                m = types == 0
+                world = world[m]
+                enames = [e for e, t in zip(enames, types) if t == 0]
+                types = types[m]
+            out.append({'world': world, 'enames': list(enames), 'types': np.asarray(types), 'pos': self._mb_pos[j].copy(), 'quat': self._mb_quat[j].copy()})
+        return out
+
+    def tip_pull_scan(self, pin_local_idx, path, k_spring=20.0, n_relax=100, dt=0.02,
+                      fire=True, record_every=1):
+        """AFM-like tip pull: spring on one active-molecule atom, move target along path.
+
+        ``pin_local_idx`` is local to the active molecule (0..na-1). In allmol_mode the
+        GPU anchor is written at ``mol_offsets[active] + pin_local_idx``.
+        Uses ``run_pairff`` (optional FAF). Inactive bodies stay frozen but force the active one.
+
+        Returns dict with CoM/quat/pin trails, per-frame world sites (real atoms), tip path.
+        """
+        path = np.asarray(path, dtype=np.float32)
+        if path.ndim != 2 or path.shape[1] != 3:
+            raise ValueError(f"path must be (N,3), got {path.shape}")
+        a = int(self.active_body)
+        i0 = int(self.mol_offsets[a]) if getattr(self, 'allmol_mode', False) and self.mol_offsets is not None else 0
+        gi = i0 + int(pin_local_idx)
+        if gi < 0 or gi >= self.total_atoms:
+            raise ValueError(f"pin global index {gi} out of range [0,{self.total_atoms})")
+
+        positions, quats, pin_xyz, E_list, frames = [], [], [], [], []
+        for ip, target in enumerate(path):
+            anchors = np.zeros((self.total_atoms, 4), dtype=np.float32)
+            anchors[:, 3] = -1.0
+            anchors[gi, :3] = target
+            anchors[gi, 3] = float(k_spring)
+            self.anchors = anchors
+            self.upload_anchors()
+            self.run_pairff(int(n_relax), float(dt), lin_damp=0.9, ang_damp=0.88, fire=fire)
+            out = self.download_outputs()
+            sites = self.world_sites_all_bodies(real_only=True)
+            pin_w = sites[a]['world'][int(pin_local_idx), :3].copy()
+            # Energy of active sites (PairFF+FAF stored in apos_world.w)
+            atom_E = out['atom_positions'][0]
+            E = float(atom_E[:, 3].sum())
+            if (ip % max(int(record_every), 1)) == 0:
+                positions.append(out['pos'][a, :3].copy())
+                quats.append(out['quats'][a].copy())
+                pin_xyz.append(pin_w)
+                E_list.append(E)
+                frames.append(sites)
+            print(f"  tip_pull {ip+1}/{len(path)}  CoM={out['pos'][a,:3]}  pin={pin_w}  E={E:.4f}")
+
+        # clear tip spring
+        anc = np.zeros((self.total_atoms, 4), dtype=np.float32)
+        anc[:, 3] = -1.0
+        self.anchors = anc
+        self.upload_anchors()
+        return {
+            'path': path,
+            'pos': np.asarray(positions, dtype=np.float32),
+            'quat': np.asarray(quats, dtype=np.float32),
+            'pin': np.asarray(pin_xyz, dtype=np.float32),
+            'E': np.asarray(E_list, dtype=np.float64),
+            'frames': frames,
+            'active_body': a,
+            'pin_local_idx': int(pin_local_idx),
+            'k_spring': float(k_spring),
+        }
 
     @classmethod
     def from_two_molecules(cls, dyn_apos, dyn_enames, dyn_REQs, static_apos, static_enames, static_REQs,

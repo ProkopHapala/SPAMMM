@@ -40,6 +40,7 @@ High-level status for agent-driven work. Details in linked docs — do not dupli
 SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoConsolidation.md`.
 
 **P0 — conference critical**
+- [ ] **PairFF+FAF map display SSOT (tomorrow)** — tip-pull/report movies must reuse Vispy `potential_to_rgba` (attractive `|Emin|` scale), not softclip+add; rebuild PTCDI GIF after (`doc/Tasks/PairFF_MapDisplay_SSOT.md`; report `doc/Reports/PairFF_TipPull_PTCDI_QEq_2026-07-28.md`)
 - [ ] **Prolonged DFTB radial basis (STM+AFM)** — analyze + wire existing fit (`basis_optimizer`, `testplot_3ob_basis_tails`); selectable WFC in projection (`doc/Tasks/ProlongedRadialBasis_DFTB.md`; `doc/DFTB_basis_fit.md`)
   - **Tip-first SA (2026-07-21):** prolonged Slater is **even more important for the tip** than sample; fit systematically on CO guinea-pig; try SA for tip / sample / both — tip-only may suffice (precomputed, simpler). Dual basis: stock ES + prolonged Pauli; never charge-normalize prolonged ρ.
   - **Fukui FDBM panel (2026-07-23):** pySCF PBE/def2-SVP densities at `/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster/` — `pentacene`, `PTCDA`, **new** `azaindol_dimer`, `azaindol_isodimer`, `benzoicacid_dimer`, `benzoicamid_dimer` (`rho_N`/`esp_N`). Run cube-FDBM reference vs DFTB stock vs DFTB prolonged (same pattern as PTCDA strip). XYZ: `data/xyz/*.xyz`.

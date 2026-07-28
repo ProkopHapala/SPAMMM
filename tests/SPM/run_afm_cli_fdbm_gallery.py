@@ -55,13 +55,16 @@ One subfolder per molecule. Strip = **6 rows**: df(cube, prolonged, stock) + Fz(
 | amp | **1.0 Å** (peak) |
 | Fz columns | **amp-aligned** @ **h − amp** → **2.7 – 3.7 Å** |
 
-## Display SSOT (overview strip)
+## Display SSOT (overview strip) — USER 2026-07-28
+
+Locked in skill:`afm-plotting` and `plot_afm_variant_height_strip`:
 
 | | Value |
 |--|-------|
-| df / Fz clim | **per panel** (`vmin`/`vmax` each image; never shared df colorbar) |
-| long axis | **vertical** (transpose when nx≥ny) |
-| packing | **tight** (minimal gaps, no colorbar gutters) |
+| df clim | **per panel** min/max (never shared df colorbar) |
+| long axis | **vertical** (more z-columns on screen) |
+| packing | **tight** (no letterbox gutters) |
+| CLI scale | **`per_image`** |
 
 ## Pauli A,β SSOT (evaluation — transferable)
 

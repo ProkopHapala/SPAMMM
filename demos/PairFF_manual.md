@@ -2,14 +2,16 @@
 type: UserGuide
 title: PairFF rigid-body demo — user manual
 tags: [PairFF, rigid-body, Vispy, FIRE, H-bond, FAF, demo]
-timestamp: 2026-07-24
+timestamp: 2026-07-28
 ---
 
 # PairFF demo — user manual
 
-**Essence.** GPU rigid-body PairFF docks and rearranges molecules that interact through **nonbonded** sites (compact-exp / Morse + directional H-bonds via epair + optional σ-hole dummies), while each molecule stays **internally rigid**. Exactly one body integrates; the rest still force it via PairFF. Optional **FAF** adds a crystalline substrate (e.g. NaCl); the background map then shows **PairFF + FAF** at the molecule height — the diagnostic view for on-surface docking.
+**Essence.** GPU rigid-body PairFF docks and rearranges molecules that interact through **nonbonded** sites (compact-exp / Morse + directional H-bonds via epair + optional σ-hole dummies), while each molecule stays **internally rigid**. Exactly one body integrates; the rest still force it via PairFF. Optional **FAF** adds a crystalline substrate (e.g. NaCl); the background map then shows **PairFF + FAF** at the molecule height — the diagnostic view for on-surface docking. **Display** scales to the attractive well (`potential_to_rgba`: `vmax=|Emin|`) so FAF corrugation is visible under Pauli cores — do not replace this with ad-hoc softclip in offline plots.
 
 **Entry point:** [`demo_pairff.py`](demo_pairff.py) · viewer [`spammm/GUI/RigidBodyVispy.py`](../spammm/GUI/RigidBodyVispy.py) · physics [`RigidBodyPairFF`](../spammm/forcefields/RigidBodyDynamics.py).
+
+**Charges:** many `data/xyz/*.xyz` ship with `Q=0`. Coulomb and H-bond terms need nonzero `REQs[:,2]` — use physical QEq (negate `solve_from_elements`, same as HBondFF). Tip-pull / PTCDI session: [`doc/Reports/PairFF_TipPull_PTCDI_QEq_2026-07-28.md`](../doc/Reports/PairFF_TipPull_PTCDI_QEq_2026-07-28.md). Offline map fix (tomorrow): [`doc/Tasks/PairFF_MapDisplay_SSOT.md`](../doc/Tasks/PairFF_MapDisplay_SSOT.md).
 
 ---
 
@@ -56,7 +58,7 @@ Basenames resolve under `data/xyz/`. Absolute/relative paths also work.
 | **Sites** | Real atoms + optional epair (`E`) / σ-hole (`Sh`) dummies |
 | **Unified kernel** | Compact-exp PairFF; required for multi-body / FAF |
 | **FAF** | Folded substrate potential (NaCl); fused into dynamics when `--faf` |
-| **Potential map** | CPU 2D probe scan: PairFF over **static** sites; **+ FAF** when `--faf`, plane at **active CoM z** |
+| **Potential map** | CPU 2D probe scan: PairFF over **static** sites; **+ FAF** when `--faf`, plane at **active CoM z**; colored via `potential_to_rgba` (`vmax=\|Emin\|`) |
 
 **Multi-body rule:** one active integrator; neighbors tiled from shared body-frame sites (`rigid_body_pairff_unified_allmol[_faf]_kernel`). Each molecule ≤ **128** sites (atoms + dummies). Poses/velocities of inactive bodies **persist** across switches.
 
@@ -146,8 +148,9 @@ rbd.relax_pairff(max_steps=300)
 
 - Multi-body / FAF require **unified** mode and an **NVIDIA** GPU.
 - No `data/xyz/NTCDA.xyz` yet — use `PTCDA.xyz`; `formamide.xyz` = HCONH2.
-- Map is CPU; PairFF layer uses **static** sites only (not the active molecule); omits Coulomb.
+- Map is CPU; PairFF layer uses **static** sites only (not the active molecule); Vispy display uses `potential_to_rgba` (`vmax=|Emin|`).
 - Do not put substrate atoms into PairFF env when FAF is on (double-count).
+- XYZ often has `Q=0` — assign physical QEq before expecting Coulomb/H-bonds.
 - Not yet inside main `SPAMMM_GUI` — see [`doc/Tasks/PairFF_GUI_Integration.md`](../doc/Tasks/PairFF_GUI_Integration.md).
 
 ---
@@ -159,5 +162,7 @@ rbd.relax_pairff(max_steps=300)
 | [`doc/TopicalAudit/PairFF_RigidBody.md`](../doc/TopicalAudit/PairFF_RigidBody.md) | Cross-module inventory |
 | [`doc/Topics/ForceFields/PairFF.md`](../doc/Topics/ForceFields/PairFF.md) | Design report |
 | [`doc/Tasks/PairFF_FAF_Substrate.md`](../doc/Tasks/PairFF_FAF_Substrate.md) | FAF+PairFF task (Done) |
+| [`doc/Tasks/PairFF_MapDisplay_SSOT.md`](../doc/Tasks/PairFF_MapDisplay_SSOT.md) | **Tomorrow:** offline maps reuse Vispy display |
+| [`doc/Reports/PairFF_TipPull_PTCDI_QEq_2026-07-28.md`](../doc/Reports/PairFF_TipPull_PTCDI_QEq_2026-07-28.md) | Tip-pull PTCDI+QEq session |
 | [`doc/Tasks/PairFF_MultiBody_Kernel.md`](../doc/Tasks/PairFF_MultiBody_Kernel.md) | Multi-body / allmol design notes |
 | [`examples/density_comparison/HBondFF/`](../examples/density_comparison/HBondFF/) | CPU radial / map reference |
