@@ -162,7 +162,11 @@ class ModularAFMPipeline:
         scan_points_y = int(np.ceil((y_max - y_min) / self.scan_step))
         self.scan_xs = np.linspace(x_min, x_max, scan_points_x)
         self.scan_ys = np.linspace(y_min, y_max, scan_points_y)
-        self.heights  = np.arange(self.height_range[0], self.height_range[1], self.height_step)
+        # Inclusive height ladder (arange would exclude height_range[1])
+        h0, h1 = float(self.height_range[0]), float(self.height_range[1])
+        dz = float(self.height_step)
+        n_h = int(round((h1 - h0) / dz)) + 1
+        self.heights = np.round(h0 + np.arange(max(n_h, 1), dtype=np.float64) * dz, 6)
         
         # Setup projector / backend-specific initialization
         if self.backend == 'dftb':
@@ -663,10 +667,12 @@ Hamiltonian = DFTB {{
             return out
             
         k_ev = relax_params['K_LAT']
+        K_RAD = float(relax_params.get('K_RAD', 20.0))
+        bond_length = float(relax_params.get('bond_length', 3.0))  # AFM CLI SSOT (was 4.0 compose default)
         from spammm.SPM import AFM as afm_mod
         k_nm = afm_mod.stiffness_eVA2_to_Nm(k_ev)
         debug_print(1, f"\n[ModularPipeline] Running Stage 4 (probe relaxation) "
-              f"K_LAT={k_ev:.4f} eV/Å² (= {k_nm:.2f} N/m)...")
+              f"K_LAT={k_ev:.4f} eV/Å² (= {k_nm:.2f} N/m) L={bond_length:.2f}Å...")
         _bench_stage_start('Stage 4 probe relaxation')
         afmulator = self._get_afmulator()
         
@@ -675,6 +681,7 @@ Hamiltonian = DFTB {{
             F_total,
             self.scan_xs, self.scan_ys, self.heights,
             self.origin, self.step, self.atomPos, K_LAT=relax_params['K_LAT'],
+            K_RAD=K_RAD, bond_length=bond_length,
             use_gpu_relax=True, ppm_mode=ppm_mode, afmulator=afmulator,
             reuse_fdbm_grid=bool(getattr(self, '_fdbm_grid_ready', False)),
         )
@@ -731,3 +738,38 @@ Hamiltonian = DFTB {{
             lumo_offsets=lumo_offsets, mo_indices=mo_indices, field=field,
             use_exp_basis=use_exp_basis, exp_beta=exp_beta, exp_r0=exp_r0
         )
+
+    def project_pauli_rho(self, dm_dense, projection='stock', rho_scf_stock=None):
+        """Density used for Pauli/FDBM: stock STO or prolonged Slater-tail (dual-basis).
+
+        ES must keep stock Δρ (pass ``rho_diff`` from Stage 2 stock). Prolonged ρ is
+        for Pauli only — same dual-basis rule as ``run_br_stm_afm_panel``.
+        """
+        projection = str(projection).lower()
+        if projection not in ('stock', 'prolonged'):
+            raise ValueError(f"projection must be 'stock' or 'prolonged', got {projection!r}")
+        if projection == 'stock':
+            if rho_scf_stock is not None:
+                return rho_scf_stock
+            return self.projector.project_density_dense(
+                dm_dense.astype(np.float32), self.norb_per_atom, self.orb_offsets,
+                self.atoms_dict, self.grid_spec)
+        from spammm.config_utils import get_dftb_basis_path
+        from spammm.quantum.DFTB.DFTBplusParser import (
+            parse_wfc_hsd, convert_wfc_to_species_list_ang, make_slater_tail_species_list,
+        )
+        basis_hsd = get_dftb_basis_path(self.basis if hasattr(self, 'basis') else self.slako_prefix)
+        if basis_hsd is None:
+            basis_name = self.slako_prefix.rstrip('/').split('/')[-1] or '3ob-3-1'
+            basis_hsd = get_dftb_basis_path(basis_name)
+        basis_data = parse_wfc_hsd(basis_hsd)
+        basis_ang = convert_wfc_to_species_list_ang(basis_data, resolution_bohr=0.04)
+        prol_ang = make_slater_tail_species_list(basis_ang)
+        afm_utils._set_projector_species_basis(self.projector, self.atoms_dict, prol_ang, rc_max=6.0)
+        rho = self.projector.project_density_dense(
+            dm_dense.astype(np.float32), self.norb_per_atom, self.orb_offsets,
+            self.atoms_dict, self.grid_spec)
+        if hasattr(self.projector, 'queue'):
+            self.projector.queue.finish()
+        debug_print(1, f"  [dual-basis] prolonged Pauli ρ projected  shape={rho.shape}")
+        return rho

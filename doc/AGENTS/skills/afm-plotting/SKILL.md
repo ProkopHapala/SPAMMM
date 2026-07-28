@@ -10,6 +10,46 @@ trigger:
     - "**/*zscan*"
 ---
 
+## HARD RULE — default z window (CLI / panel-fukui / afm)
+
+**Do not invent height ladders.** SSOT (USER-approved, 2026-07-24):
+
+| | Default |
+|--|---------|
+| **df** probe window | **`--h-min 3.7` … `--h-max 4.7`**, **`--h-step 0.1`** |
+| **amp** | **1.0 Å** (peak) |
+| **Fz** in same columns | **amp-aligned** at **h − amp** → **2.7 … 3.7 Å** |
+| Flag to disable | `--no-amp-align` only (same-h Fz — usually wrong for morphology) |
+
+Applies to `run_spm.py afm`, **`panel-fukui`**, `smiles-afm`. Never override to coarse `h_step=0.4` or `2.5–5.7` unless USER explicitly asks.
+
+Fukui panel rows when cube exists: **cube | prolonged | stock** for df and for Fz → **6 rows**. Never drop the DFT cube row when `rho_N.cube` is available.
+
+See `user_guide/SPM_CLI.md` § Height window; `doc/Reports/Fukui_FDBM_panel_notes_2026-07-23.md` §2.
+
+---
+
+## HARD RULE — Pauli A,β: fit vs evaluate
+
+**Two different jobs. Do not mix them.**
+
+| Job | Where | A,β policy |
+|-----|-------|------------|
+| **Fitting** | dedicated scripts (`run_ptcda_stock_vs_sa`, `--fit_pauli`, …) | Search A,β vs DFT/Kriging; may be molecule-specific while exploring |
+| **Evaluation** | `afm`, `panel-fukui`, `AFM_CLI_FDBM` gallery | **One transferable** `(A,β)` for **all molecules** and **all ρ rows** (cube / stock / prolonged) |
+
+**SSOT defaults** — `spammm/SPM/AFM.py` → `PAULI_FITTED_DEFAULTS` (do not change casually; promote a new global fit only with USER OK):
+
+| Key (basis) | A | β | Role |
+|-------------|---|---|------|
+| **`3ob-3-1`** | **124.84** | **1.4330** | **CLI / DFTB / panel-fukui default** |
+| `mio-1-1` | 155.33 | 1.5507 | mio basis |
+| `pyscf_6-31g*` | 39.53 | 1.1544 | historical cube-only fit (Gaussian-tip heritage) — **not** for multi-ρ compare strips |
+
+**Forbidden in evaluation paths:** `if mol == 'PTCDA':` (or any mol) swapping in `PTCDA_PAULI_FIT` / site-refits. That table is **fitting-only** (`run_ptcda_stock_vs_sa`). Multi-ρ strips must share one `(A,β)` so differences are density, not Pauli knobs.
+
+---
+
 ## HARD RULE
 
 **Never** write ad-hoc `imshow` / `plt.plot` for AFM **E / Fz / df** maps or z-profiles in tests or new code.

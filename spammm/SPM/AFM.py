@@ -2583,12 +2583,20 @@ def pp_relax_2d_cl(afmulator, F_total, origin, step,
 # Molecules: C2H4, CH2O, H2O, NH3, CH2NH, benzene, pyridine, pyrrole, PTCDA
 # See: tests/ref_data/Ez_FDBM/pauli_fit_results.json
 #
-# WARNING: these defaults are NOT for real tip densities (CO_O, H2O_O, …).
-# For cube/CO tips re-fit with AFM_utils._fit_pauli_powerlaw vs Kriging/DFT
-# (e.g. tests/SPM/testplot_kriging_vs_fdbm_cube.py --fit_pauli, z∈[1.5,2.0]).
+# SSOT for FDBM **evaluation** (AFM images / panel-fukui / CLI): pick the entry for
+# the active basis and keep it fixed across molecules. Do NOT override per molecule.
+#
+# **Fit vs evaluate (HARD):**
+#   - Fitting scripts may search A,β (and write reports / PTCDA_PAULI_FIT-like tables).
+#   - Simulation/evaluation must use these transferable defaults until USER promotes a
+#     new global fit into this dict. Never special-case PTCDA (or any mol) in eval paths.
+#
+# WARNING: Gaussian-tip heritage for some entries — for real CO_O / H2O_O tips, re-fit
+# with AFM_utils._fit_pauli_powerlaw vs Kriging/DFT, then update THIS dict (global),
+# do not branch in panel code. See tests/SPM/testplot_kriging_vs_fdbm_cube.py --fit_pauli.
 PAULI_FITTED_DEFAULTS = {
     'mio-1-1':    {'A': 155.33, 'beta': 1.5507},   # global log-log fit, R²=0.963, 120 points
-    '3ob-3-1':    {'A': 124.84, 'beta': 1.4330},   # global log-log fit, R²=0.961, 120 points
+    '3ob-3-1':    {'A': 124.84, 'beta': 1.4330},   # global log-log fit, R²=0.961, 120 points  ← CLI default
     'pyscf_6-31g*': {'A': 39.53, 'beta': 1.1544},  # avg of PBE (A=39.95,β=1.169) & B3LYP (A=39.11,β=1.140), R²≈0.94
     # Old values (pentacene single-atom fit, kept for reference):
     # 'mio-1-1':    {'A': 787.22, 'beta': 1.2371},

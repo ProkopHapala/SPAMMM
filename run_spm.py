@@ -16,7 +16,9 @@ Examples:
   python run_spm.py stm orbitals --molecule pentacene --n-near 5
   python run_spm.py stm current --molecule pentacene --stm-tips s,pz,py
   python run_spm.py stm panel --molecule pentacene,PTCDA
+  python run_spm.py stm br --xyz data/xyz/PTCDA.xyz --show-atoms
   python run_spm.py panel-fukui --molecule PTCDA pentacene
+  python run_spm.py basis-tails --molecule pentacene,PTCDA
 """
 from __future__ import annotations
 
@@ -60,11 +62,13 @@ def _add_common_afm_args(p: argparse.ArgumentParser) -> None:
 
     b = p.add_argument_group('DFTB basis / projection')
     b.add_argument('--basis',      default='3ob-3-1',    choices=['3ob-3-1', 'mio-1-1'])
-    b.add_argument('--projection', default='stock',      choices=['stock', 'prolonged', 'both'])
+    b.add_argument('--projection', default='prolonged', choices=['stock', 'prolonged', 'both'],
+                   help='Pauli ρ basis (GUI/BR-STM SSOT = prolonged; ES always stock Δρ)')
     b.add_argument('--tip-mode',   default='co',         choices=['co', 'gaussian'])
 
     grid = p.add_argument_group('grid')
-    grid.add_argument('--step',        type=float, default=0.15)
+    grid.add_argument('--step',        type=float, default=0.1,
+                      help='Density/FF grid spacing [Å] (GUI SSOT = 0.1)')
     grid.add_argument('--margin',      type=float, default=4.0)
     grid.add_argument('--z-extra',     type=float, default=6.0)
     grid.add_argument('--cpu-fft',     type=bool,  default=True,  dest='cpu_fft')
@@ -179,8 +183,11 @@ def cmd_afm(args: argparse.Namespace) -> int:
 
     variants = {}
     basis_hsd = get_dftb_basis_path(args.basis)
-    pa_3ob = afm.PAULI_FITTED_DEFAULTS.get(args.basis, afm.PAULI_FITTED_DEFAULTS['3ob-3-1'])
-    pa_cube = afm.PAULI_FITTED_DEFAULTS.get('pyscf_6-31g*', {'A': 40.0, 'beta': 1.15})
+    # EVAL SSOT: one transferable (A,β) for every ρ row (cube|stock|prolonged).
+    # Do not mix pyscf vs 3ob defaults in one compare strip.
+    pa = afm.PAULI_FITTED_DEFAULTS.get(args.basis, afm.PAULI_FITTED_DEFAULTS['3ob-3-1'])
+    A_pauli, beta_pauli = float(pa['A']), float(pa['beta'])
+    print(f'Pauli EVAL defaults ({args.basis}): A={A_pauli:.3f} β={beta_pauli:.4f}')
 
     V_ES_stock = None
     need_stock_es = args.projection in ('stock', 'both', 'prolonged') or not args.cube
@@ -193,7 +200,7 @@ def cmd_afm(args: argparse.Namespace) -> int:
         if args.projection in ('stock', 'both'):
             variants['stock'] = diag._run_from_density(
                 'stock', res['rho_scf'], V_ES_stock, atomPos, atomTypes, origin, step, ngrid,
-                pa_3ob['A'], pa_3ob['beta'], args.tip_mode, args.outdir, args)
+                A_pauli, beta_pauli, args.tip_mode, args.outdir, args)
 
     if args.projection in ('prolonged', 'both'):
         basis_data = parse_wfc_hsd(basis_hsd)
@@ -211,7 +218,7 @@ def cmd_afm(args: argparse.Namespace) -> int:
             verbosity=0, projection_basis_ang=prol)
         variants['prolonged'] = diag._run_from_density(
             'prolonged', res_p['rho_scf'], V_ES_stock, atomPos, atomTypes, origin, step, ngrid,
-            pa_3ob['A'], pa_3ob['beta'], args.tip_mode, args.outdir, args)
+            A_pauli, beta_pauli, args.tip_mode, args.outdir, args)
 
     if d_cube is not None:
         # Pyridine SSOT: clamp→compact NA + GridsOCL project (not Gaussian + scipy sample)
@@ -222,7 +229,7 @@ def cmd_afm(args: argparse.Namespace) -> int:
         V_cube = afm.fft_poisson_cpu(prep['rho_diff'], step)
         variants['cube'] = diag._run_from_density(
             'cube', prep['rho_scf'], V_cube, atomPos, atomTypes, origin, step, ngrid,
-            pa_cube['A'], pa_cube['beta'], args.tip_mode, args.outdir, args)
+            A_pauli, beta_pauli, args.tip_mode, args.outdir, args)
 
     if not variants:
         print('Nothing to run: set --projection and/or --cube', file=sys.stderr)
@@ -234,8 +241,7 @@ def cmd_afm(args: argparse.Namespace) -> int:
     amp = float(args.amp)
     row_specs = []
     for k in order:
-        pa = pa_cube if k == 'cube' else pa_3ob
-        row_specs.append(('df', k, f'df {k}\nA={pa["A"]:.1f} β={pa["beta"]:.2f}', args.df_cmap))
+        row_specs.append(('df', k, f'df {k}\nA={A_pauli:.1f} β={beta_pauli:.2f}', args.df_cmap))
     for k in order:
         fz_lab = f'Fz {k}\n@h−{amp:.1f}Å' if amp_align else f'Fz {k}'
         row_specs.append(('Fz', k, fz_lab, args.cmap))
@@ -372,58 +378,22 @@ def cmd_smiles_afm(args: argparse.Namespace) -> int:
 
 
 def cmd_afm_morse(args: argparse.Namespace) -> int:
-    """Morse + point-charge Coulomb AFM (no electron density)."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import numpy as np
-    from spammm.SPM.AFM import AFMulator, compute_df
+    """Morse + point-charge Coulomb AFM (no electron density).
+
+    Shared backend with GUI: ``AFM_utils.run_morse_coulomb_afm`` (no fork).
+    """
+    from spammm.SPM import AFM_utils as afm_utils
 
     os.makedirs(args.outdir, exist_ok=True)
     xyz = _abs_path(args.xyz)
     params = _abs_path(args.params) or os.path.join(_ROOT, 'data', 'ElementTypes.dat')
-    afm = AFMulator(use_morse=not args.lj)
-    afm.load_molecule(xyz)
-    afm.assign_params(params_path=params)
-    afm.setup_grid(n=(args.nx, args.ny, args.nz), margin=args.margin, z_top=args.z_top)
-    afm.make_forcefield()
-
-    nz_scan, dtip = args.nz_scan, args.dtip
-    nxy = (args.scan_nx, args.scan_ny)
-    FEs, _pts = afm.run_scan(nxy=nxy, nz=nz_scan, dtip=dtip)
-    Fz = FEs[:, :, :, 2]
-    df = compute_df(Fz, abs(dtip))
-    mol_z = afm.mol_z
-    z0_tip = mol_z + 5.0 + abs(float(afm.dpos0[2]))
-    heights = z0_tip + np.arange(nz_scan) * dtip - mol_z
-
-    sel = [i for i in args.slice_indices if 0 <= i < nz_scan]
-    mol_tag = os.path.splitext(os.path.basename(xyz))[0]
-    pot = 'Morse' if afm.use_morse else 'LJ'
-
-    for kind, data, cmap in (('Fz', Fz, 'bwr'), ('df', df, 'bwr')):
-        fig, axes = plt.subplots(1, len(sel), figsize=(3 * len(sel), 3))
-        if len(sel) == 1:
-            axes = [axes]
-        for ax, iz in zip(axes, sel):
-            arr = data[:, :, iz].T
-            vabs = max(float(np.percentile(np.abs(arr), 99)), 1e-6)
-            im = ax.imshow(arr, origin='lower', cmap=cmap, aspect='equal', vmin=-vabs, vmax=vabs)
-            ax.set_title(f'{kind} h={heights[iz]:.2f}Å', fontsize=8)
-            plt.colorbar(im, ax=ax, shrink=0.8)
-        fig.suptitle(f'AFM {kind} ({pot}+Coulomb) — {mol_tag}', fontsize=10)
-        fig.tight_layout()
-        out_png = os.path.join(args.outdir, f'afm_{kind}_{mol_tag}.png')
-        fig.savefig(out_png, dpi=140)
-        plt.close(fig)
-        print(f'REVIEW: {out_png}')
-
-    np.savez(os.path.join(args.outdir, f'afm_morse_{mol_tag}.npz'),
-             Fz=Fz, df=df, heights=heights)
-    summary = os.path.join(args.outdir, 'SUMMARY.out')
-    open(summary, 'w').write(
-        f'AFM {pot}+Coulomb  xyz={xyz}\nREVIEW: {args.outdir}/\n')
-    print(f'REVIEW: {summary}')
+    afm_utils.run_morse_coulomb_afm(
+        xyz, args.outdir,
+        params_path=params, use_morse=not args.lj,
+        n=(args.nx, args.ny, args.nz), margin=args.margin, z_top=args.z_top,
+        nxy=(args.scan_nx, args.scan_ny), nz_scan=args.nz_scan, dtip=args.dtip,
+        slice_indices=list(args.slice_indices), save_png=True,
+    )
     return 0
 
 
@@ -451,13 +421,24 @@ def cmd_afm_kriging(args: argparse.Namespace) -> int:
 
 
 def cmd_panel_fukui(args: argparse.Namespace) -> int:
+    """Fukui cube vs DFTB stock vs prolonged — same height SSOT as ``afm``.
+
+    SSOT heights (do NOT override without USER intent):
+      df window = h_min…h_max (default **3.7–4.7** Å, dz=**0.1**)
+      Fz panels = **amp-aligned** at h−amp (amp=1 → Fz **2.7–3.7**)
+    Rows: DFT cube | prolonged | stock  (df then Fz → 6 rows when cube present).
+    Pauli: one transferable (A,β) from ``PAULI_FITTED_DEFAULTS[basis]`` for all mols/rows
+      (3ob-3-1 → A=124.84, β=1.4330). No per-molecule fits in this path.
+    See ``user_guide/SPM_CLI.md``, ``doc/AGENTS/skills/afm-plotting/SKILL.md``.
+    """
     from tests.SPM import testplot_fdbm_relax as diag
     os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
     ns = argparse.Namespace(
         xyz='data/xyz/PTCDA.xyz', basis='3ob-3-1', step=args.step, margin=args.margin,
         tip_mode='co', outdir=args.outdir, K_LAT=args.K_LAT, K_RAD=args.K_RAD,
         bond_length=args.bond_length, h_min=args.h_min, h_max=args.h_max, h_step=args.h_step,
-        amp=args.amp, scan_margin=args.scan_margin, height=args.height,
+        amp=args.amp, no_amp_align=getattr(args, 'no_amp_align', False),
+        scan_margin=args.scan_margin, height=args.height,
         cmap=args.cmap, df_cmap=args.df_cmap, molecule=args.molecule,
         sa_params='debug/dftb_basis_sa_ptcda/PTCDA_sa_params.json',
     )
@@ -512,6 +493,77 @@ def cmd_stm_panel(args: argparse.Namespace) -> int:
     _prepare_stm_outdir(args)
     for mol_name, pos, names, types, info in stm.resolve_molecules(args.molecule, xyz=args.xyz):
         stm.run_stm_vacuum_panel(mol_name, pos, names, types, info, args)
+    return 0
+
+
+def cmd_stm_br(args: argparse.Namespace) -> int:
+    """Three-stage BR-STM: (1) pure STM, (2) df+|dxy|, (3) STM vs BR-STM."""
+    import numpy as np
+    from spammm.SPM import AFM_utils as afm_utils
+    from spammm import atomicUtils as au
+
+    xyz = _abs_path(args.xyz or 'data/xyz/PTCDA.xyz')
+    name = os.path.splitext(os.path.basename(xyz))[0]
+    outdir = _abs_path(args.outdir) or os.path.join(_ROOT, 'debug', 'spm_brstm', name)
+    os.makedirs(outdir, exist_ok=True)
+
+    pos, _, names, _, _ = au.load_xyz(xyz)
+    atomPos = np.asarray(pos, dtype=np.float64)
+    enames = list(names)
+    if not getattr(args, 'no_orient', False):
+        from spammm.AtomicSystem import AtomicSystem
+        mol = AtomicSystem(fname=xyz)
+        if hasattr(mol, 'orientPCA'):
+            mol.orientPCA()
+            atomPos = np.asarray(mol.apos, dtype=np.float64)
+            enames = list(mol.enames)
+        atomPos = atomPos.copy()
+        atomPos[:, 2] = float(atomPos[:, 2].mean())
+
+    mo_rel = [int(x) for x in str(args.mo).replace(',', ' ').split() if x.strip()]
+    if not mo_rel:
+        mo_rel = [0, 1]  # HOMO + LUMO
+    stm_heights = tuple(float(x) for x in str(args.stm_heights).replace(',', ' ').split() if x.strip())
+    amp_align = not bool(getattr(args, 'no_amp_align', False))
+    os.environ.setdefault('SPAMMM_AFM_CPU_FFT', '1')
+
+    res = afm_utils.run_br_stm_afm_panel(
+        atomPos, enames, outdir,
+        basis=args.basis, step=args.step, margin=args.margin, z_extra=args.z_extra,
+        scan_range=args.scan_range, scan_step=args.scan_step,
+        h_min=args.h_min, h_max=args.h_max, h_step=args.h_step,
+        amp=args.amp, amp_align=amp_align, stm_heights=stm_heights,
+        K_LAT_Nm=args.K_LAT, K_RAD=args.K_RAD, bond_length=args.bond_length,
+        mo_relative=mo_rel, field=args.field, projection=args.projection,
+        tip_mode=args.tip_mode,
+        df_cmap=args.df_cmap, fz_cmap=args.cmap, stm_cmap=args.stm_cmap,
+        scale=args.scale, show_atoms=bool(args.show_atoms),
+        force_recompute=bool(args.force), pp_stride=int(args.pp_stride),
+    )
+    print(f'REVIEW: {os.path.abspath(outdir)}/')
+    print(f'REVIEW: {res["png_stm"]}')
+    print(f'REVIEW: {res["png_afm"]}')
+    print(f'REVIEW: {res["png_brstm"]}')
+    return 0
+
+
+def cmd_basis_tails(args) -> int:
+    """Central-C ρ(z) + Pauli E(z) log compare: GPAW / pySCF / DFTB stock / prolonged."""
+    from spammm.SPM import AFM_utils as afm_utils
+    mols = args.molecule or ['pentacene', 'PTCDA']
+    formats = tuple(x.strip() for x in str(args.formats).split(',') if x.strip())
+    afm_utils.run_basis_tails_compare(
+        molecules=mols,
+        outdir=_abs_path(args.outdir) or args.outdir,
+        basis=args.basis,
+        tip_mode=args.tip_mode,
+        sigma=args.sigma,
+        A_pauli=args.A,
+        beta_pauli=args.beta,
+        z_max=args.z_max,
+        formats=formats,
+        verbosity=1,
+    )
     return 0
 
 
@@ -623,6 +675,59 @@ def build_parser() -> argparse.ArgumentParser:
     stm.add_stm_common_args(p_stmp)
     stm.add_panel_args(p_stmp)
     p_stmp.set_defaults(func=cmd_stm_panel)
+
+    p_br = stm_sub.add_parser('br', help='3-stage BR-STM: pure STM → df+|dxy| → STM vs BR-STM')
+    p_br.add_argument('--xyz', default='data/xyz/PTCDA.xyz')
+    p_br.add_argument('--outdir', default=None, help='Default: debug/spm_brstm/<mol>')
+    p_br.add_argument('--basis', default='3ob-3-1', choices=['3ob-3-1', 'mio-1-1'])
+    p_br.add_argument('--projection', default='prolonged', choices=['stock', 'prolonged'],
+                      help='AFM Pauli (+ Stage1 STM STO table)')
+    p_br.add_argument('--tip-mode', default='co', choices=['co', 'gaussian'], dest='tip_mode')
+    p_br.add_argument('--step', type=float, default=0.1)
+    p_br.add_argument('--margin', type=float, default=4.0)
+    p_br.add_argument('--z-extra', type=float, default=6.0, dest='z_extra')
+    p_br.add_argument('--scan-range', type=float, default=3.0, dest='scan_range')
+    p_br.add_argument('--scan-step', type=float, default=0.1, dest='scan_step')
+    p_br.add_argument('--h-min', '--zmin', type=float, default=3.7, dest='h_min',
+                      help='AFM df window start [Å]')
+    p_br.add_argument('--h-max', '--zmax', type=float, default=4.7, dest='h_max')
+    p_br.add_argument('--h-step', '--dz', type=float, default=0.1, dest='h_step')
+    p_br.add_argument('--amp', type=float, default=1.0)
+    p_br.add_argument('--no-amp-align', action='store_true', dest='no_amp_align')
+    p_br.add_argument('--stm-heights', default='0.5,1.5,2.5', dest='stm_heights',
+                      help='Stage1 pure-STM heights [Å] (0.5 matches frontier orbital diag)')
+    p_br.add_argument('--K-LAT', type=float, default=0.5, dest='K_LAT')
+    p_br.add_argument('--K-RAD', type=float, default=20.0, dest='K_RAD')
+    p_br.add_argument('--bond-length', type=float, default=3.0, dest='bond_length')
+    p_br.add_argument('--mo', default='0 1',
+                      help='MO offsets vs HOMO for Stage1 (default: HOMO and LUMO)')
+    p_br.add_argument('--field', default='psi2', choices=['ldos', 'psi2', 'psi'])
+    p_br.add_argument('--cmap', default='seismic')
+    p_br.add_argument('--df-cmap', default='gray', dest='df_cmap')
+    p_br.add_argument('--stm-cmap', default='viridis', dest='stm_cmap')
+    p_br.add_argument('--scale', default='per_column', choices=['per_image', 'per_column', 'common'])
+    p_br.add_argument('--show-atoms', action='store_true', dest='show_atoms')
+    p_br.add_argument('--pp-stride', type=int, default=4, dest='pp_stride',
+                      help='Every Nth pixel for PP xy red-dot overlay (ppafm plotDistortions)')
+    p_br.add_argument('--no-orient', action='store_true', dest='no_orient')
+    p_br.add_argument('--force', action='store_true')
+    p_br.set_defaults(func=cmd_stm_br)
+
+    p_bt = sub.add_parser(
+        'basis-tails',
+        help='Central-C ρ(z)+Pauli log: GPAW / pySCF / DFTB stock vs prolonged (SVG talk plots)')
+    p_bt.add_argument('--molecule', nargs='*', default=['pentacene', 'PTCDA'],
+                      help='pentacene and/or PTCDA (comma or space separated)')
+    p_bt.add_argument('--outdir', default='debug/presentation_basis_tails')
+    p_bt.add_argument('--basis', default='3ob-3-1', choices=['3ob-3-1', 'mio-1-1'])
+    p_bt.add_argument('--tip-mode', default='gaussian', choices=['gaussian', 'co'], dest='tip_mode',
+                      help='Pauli tip (gaussian correlates ρ tails cleanly)')
+    p_bt.add_argument('--sigma', type=float, default=0.35, help='Gaussian tip σ [Å] (small → tracks ρ tails)')
+    p_bt.add_argument('--A', type=float, default=1.0, help='Pauli A (same for all ρ; 1→raw overlap)')
+    p_bt.add_argument('--beta', type=float, default=1.0, help='Pauli β (same for all ρ)')
+    p_bt.add_argument('--z-max', type=float, default=3.0, dest='z_max')
+    p_bt.add_argument('--formats', default='svg,png', help='Output formats CSV')
+    p_bt.set_defaults(func=cmd_basis_tails)
 
     return p
 

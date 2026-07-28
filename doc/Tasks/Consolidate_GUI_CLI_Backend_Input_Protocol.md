@@ -1,7 +1,32 @@
 # Task: Consolidate GUI ↔ CLI SPM backend + input protocol
 
-**Status:** investigating — design goals + gap analysis. **Do not mark Done** without USER confirmation.  
+**Status:** investigating — partial unification in progress (2026-07-28). **Do not mark Done** without USER confirmation.
+
 **Related:** [`SPM_CLI_Headless.md`](SPM_CLI_Headless.md) · [`user_guide/SPM_CLI.md`](../../user_guide/SPM_CLI.md) · GUI `spammm/GUI/AFMExtension.py` · backend `spammm/SPM/ModularPipeline.py`
+
+---
+
+## Discrepancy inventory (2026-07-28) — why GUI ≠ CLI
+
+| Issue | Was | Fix / remaining |
+|-------|-----|-----------------|
+| **Silent Morse→FDBM fallback** | GUI combo "Morse" silently ran DFTB FDBM | **Fixed:** fail loud; Morse uses shared `AFM_utils.run_morse_coulomb_afm` |
+| **df without amp** | GUI `stage4` → `compute_df` on raw hmin–hmax | **Fixed:** GUI uses `afm_df_height_stacks` + `compute_df_amp` (same as `stm br`) |
+| **Height defaults** | GUI 2.8–3.6; CLI/BR 3.7–4.7 | **Fixed:** GUI defaults → 3.7–4.7, amp=1.0, Z=4.2 |
+| **CLI `afm` projection/step** | default stock / 0.15 | **Aligned:** prolonged / 0.1 |
+| **CLI `afm` vs ModularPipeline** | `testplot_fdbm_relax._run_from_density` fork | **Remaining:** fold CLI `afm` into ModularPipeline or shared runner |
+| **CLI BR-STM** | was missing | **Exists:** `run_spm.py stm br` → `run_br_stm_afm_panel` (ModularPipeline) |
+| **SPMJobSpec** | no single job dict | **Remaining:** extract `run_spm_job(cfg)` |
+
+**Shared backends today**
+
+| Mode | Shared function | CLI | GUI |
+|------|-----------------|-----|-----|
+| FDBM AFM + BR | `ModularAFMPipeline` (+ amp heights in GUI / `run_br_stm_afm_panel`) | `stm br` ✓; `afm` still forked | AFM / BR-STM buttons |
+| Morse+Coulomb | `AFM_utils.run_morse_coulomb_afm` | `afm-morse` | AFM button when Morse selected |
+| Flat STM diagnostic | `stm_compare` | `stm orbitals/…` | (not product path) |
+
+**No silent fallbacks:** Morse never becomes FDBM; STM/BR-STM with Morse raise `RuntimeError`.
 
 ---
 

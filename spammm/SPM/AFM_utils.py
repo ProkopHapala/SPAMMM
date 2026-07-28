@@ -12,7 +12,10 @@ Key functionality:
   - Density providers: get_density_from_dftb(), get_density_from_pyscf(), get_density_from_cube()
   - CO tip: _co_tip_cache_dir(), _compute_co_tip_subprocess()
   - FDBM helpers: fft_poisson(), compute_pauli_field(), compute_es_conv_field()
-  - STM: compute_stm(), compute_bond_resolved_stm(), compute_stm_basis_variants()
+  - STM/BR-STM: compute_stm(), compute_bond_resolved_stm(), compute_stm_basis_variants(),
+    afm_df_height_stacks(), run_br_stm_afm_panel() (3-stage: pure STM → AFM+|dxy|/PP-dots → BR-STM),
+    overlay_pp_relaxed_xy() / plot_pp_distortion_strip() (ppafm plotDistortions: every-nth PP xy)
+  - Basis tails (talk): run_basis_tails_compare() — central-C ρ(z)+Pauli log (GPAW/pySCF/stock/prolonged)
 
 Role in SPAMMM: AFM orchestration layer. Used by ModularPipeline.py for all
 stages and by AFMExtension.py for result visualization. Depends on AFM.py for
@@ -486,19 +489,25 @@ def afm_panel_clim(arr, *, scale='per_image', pct=99.0, symmetric=False):
     return lo, hi
 
 
+def _afm_strip_symmetric(qty):
+    """Symmetric color scale only for signed force/energy-like quantities."""
+    q = str(qty)
+    return q == 'Fz' or q.startswith('E') or q.startswith('F')
+
+
 def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
                                   scale='per_image', title='', dpi=140, pct=99.0,
                                   colorbar=True, figsize_col=1.55, figsize_row=1.35,
                                   amp=None, apos=None, show_atoms=False, extent=None,
                                   atom_ms=2.0, atom_alpha=0.55, amp_align=False):
-    """Multi-row × multi-height AFM compare strip (df/Fz × methods).
+    """Multi-row × multi-height AFM compare strip (df/Fz/STM/BR-STM × methods).
 
     Args:
-        variants: dict key → {'df': (nx,ny,nz), 'Fz': (nx,ny,nz), ...}
+        variants: dict key → {'df': (nx,ny,nz), 'Fz': (nx,ny,nz), 'stm':..., 'br_stm':..., ...}
         row_specs: list of (qty, key, ylabel, cmap) e.g. ('df','cube','df cube','gray')
         heights: (nz,)  — column labels = df probe heights when amp_align
         amp_align: if True, Fz arrays are already sampled at h−amp (fair morph. match);
-          title notes this. If False, Fz and df share the same labeled h (expect ~amp shift).
+          title notes this. STM/BR-STM stay at labeled df probe h (same imaging window).
         amp: peak oscillation amplitude [Å] (annotation)
     """
     heights = np.asarray(heights, dtype=np.float64)
@@ -517,7 +526,7 @@ def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
     if scale == 'common':
         for qty, keys in qty_keys.items():
             stack = np.concatenate([np.asarray(variants[k][qty], dtype=np.float64).ravel() for k in keys])
-            common_clim[qty] = afm_panel_clim(stack, pct=pct, symmetric=(qty != 'df'))
+            common_clim[qty] = afm_panel_clim(stack, pct=pct, symmetric=_afm_strip_symmetric(qty))
 
     for ih in range(n_h):
         col_clim = {}
@@ -525,7 +534,7 @@ def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
             for qty, keys in qty_keys.items():
                 stack = np.concatenate([
                     np.asarray(variants[k][qty][:, :, ih], dtype=np.float64).ravel() for k in keys])
-                col_clim[qty] = afm_panel_clim(stack, pct=pct, symmetric=(qty != 'df'))
+                col_clim[qty] = afm_panel_clim(stack, pct=pct, symmetric=_afm_strip_symmetric(qty))
 
         for ir, (qty, key, ylab, cmap) in enumerate(row_specs):
             ax = axes[ir, ih]
@@ -573,6 +582,26 @@ def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
     plt.close(fig)
     print(f'REVIEW: {out_path}')
     return out_path
+
+
+def afm_df_height_stacks(h_min, h_max, h_step, amp=1.0, amp_align=True):
+    """SSOT AFM height ladders (skill:`afm-plotting` / CLI afm).
+
+    Returns:
+        h_df:   df / STM / BR-STM display probe heights (column labels)
+        h_Fz:   Fz display heights (= h_df − amp if amp_align else h_df)
+        h_scan: dense PP scan covering [h_df±amp] for compute_df_amp
+    """
+    def _h_stack(h0, h1, dz):
+        n = int(round((float(h1) - float(h0)) / float(dz))) + 1
+        return (float(h0) + np.arange(n, dtype=np.float64) * float(dz)).astype(np.float32)
+    h_df = _h_stack(h_min, h_max, h_step)
+    amp = float(amp)
+    h_Fz = (h_df.astype(np.float64) - amp).astype(np.float32) if amp_align else h_df.copy()
+    h_scan = _h_stack(float(h_df[0]) - amp, float(h_df[-1]) + amp, h_step)
+    if len(h_scan) < 3:
+        raise ValueError(f'afm_df_height_stacks: need denser heights for amp={amp}: n_scan={len(h_scan)}')
+    return h_df, h_Fz, h_scan
 
 
 def plot_afm_df_Fz_tworow(
@@ -3081,6 +3110,83 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
     return df, tip_disp, FEs_relax
 
 
+def run_morse_coulomb_afm(xyz_path, outdir, *,
+                          params_path=None, use_morse=True,
+                          n=(150, 150, 80), margin=5.0, z_top=8.0,
+                          nxy=(100, 100), nz_scan=20, dtip=-0.1,
+                          slice_indices=None, save_png=True):
+    """Classic Morse (or LJ) + point-charge Coulomb AFM — shared CLI/GUI backend.
+
+    No electron density / FDBM. Uses ``AFMulator(use_morse=...)``.
+    Returns dict with Fz, df, heights, paths.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    xyz_path = os.path.abspath(xyz_path)
+    os.makedirs(outdir, exist_ok=True)
+    if params_path is None:
+        _ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+        params_path = os.path.join(_ROOT, 'data', 'ElementTypes.dat')
+    params_path = os.path.abspath(params_path)
+
+    afmulator = afm.AFMulator(use_morse=bool(use_morse))
+    afmulator.load_molecule(xyz_path)
+    afmulator.assign_params(params_path=params_path)
+    afmulator.setup_grid(n=tuple(int(x) for x in n), margin=float(margin), z_top=float(z_top))
+    afmulator.make_forcefield()
+
+    nz_scan = int(nz_scan)
+    dtip = float(dtip)
+    FEs, _pts = afmulator.run_scan(nxy=tuple(int(x) for x in nxy), nz=nz_scan, dtip=dtip)
+    Fz = FEs[:, :, :, 2]
+    df = afm.compute_df(Fz, abs(dtip))
+    mol_z = afmulator.mol_z
+    z0_tip = mol_z + 5.0 + abs(float(afmulator.dpos0[2]))
+    heights = z0_tip + np.arange(nz_scan) * dtip - mol_z
+    pot = 'Morse' if use_morse else 'LJ'
+    mol_tag = os.path.splitext(os.path.basename(xyz_path))[0]
+
+    if slice_indices is None:
+        slice_indices = [max(0, nz_scan // 4), nz_scan // 2, min(nz_scan - 1, 3 * nz_scan // 4)]
+    sel = [i for i in slice_indices if 0 <= int(i) < nz_scan]
+    if not sel:
+        sel = [nz_scan // 2]
+
+    pngs = []
+    if save_png:
+        for kind, data, cmap in (('Fz', Fz, 'bwr'), ('df', df, 'bwr')):
+            fig, axes = plt.subplots(1, len(sel), figsize=(3 * len(sel), 3))
+            if len(sel) == 1:
+                axes = [axes]
+            for ax, iz in zip(axes, sel):
+                arr = data[:, :, int(iz)].T
+                vabs = max(float(np.percentile(np.abs(arr), 99)), 1e-6)
+                im = ax.imshow(arr, origin='lower', cmap=cmap, aspect='equal', vmin=-vabs, vmax=vabs)
+                ax.set_title(f'{kind} h={heights[int(iz)]:.2f}Å', fontsize=8)
+                plt.colorbar(im, ax=ax, shrink=0.8)
+            fig.suptitle(f'AFM {kind} ({pot}+Coulomb) — {mol_tag}', fontsize=10)
+            fig.tight_layout()
+            out_png = os.path.join(outdir, f'afm_{kind}_{mol_tag}.png')
+            fig.savefig(out_png, dpi=140)
+            plt.close(fig)
+            print(f'REVIEW: {out_png}')
+            pngs.append(out_png)
+
+    npz = os.path.join(outdir, f'afm_morse_{mol_tag}.npz')
+    np.savez(npz, Fz=Fz, df=df, heights=heights)
+    summary = os.path.join(outdir, 'SUMMARY.out')
+    with open(summary, 'w') as f:
+        f.write(f'AFM {pot}+Coulomb  xyz={xyz_path}\nREVIEW: {outdir}/\n')
+    print(f'REVIEW: {summary}')
+    return {
+        'Fz': Fz, 'df': df, 'heights': heights, 'pot': pot,
+        'pngs': pngs, 'npz': npz, 'summary': summary,
+        'afmulator': afmulator,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # GPU vs CPU Interpolation Debugging Functions
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3657,6 +3763,86 @@ def plot_tip_displacement(tip_disp, scan_xs, scan_ys, heights, output_dir, prefi
     print(f"  Saved tip displacement plot: {fname}")
 
 
+def overlay_pp_relaxed_xy(ax, tip_disp, scan_xs, scan_ys, iz, *,
+                          stride=4, color='lime', zorder=6, extent=None):
+    """Overlay every-nth relaxed PP (x,y) as true 1-screen-pixel marks.
+
+    Rasterizes into an RGBA overlay (``interpolation='nearest'``) — no circle
+    markers. Call after ``fig.canvas.draw()`` so axes pixel size is known.
+    Absolute positions ``scan + tip_disp``.
+    """
+    from matplotlib.colors import to_rgb
+    s = max(1, int(stride))
+    xs = np.asarray(scan_xs, dtype=np.float64)
+    ys = np.asarray(scan_ys, dtype=np.float64)
+    dx = np.asarray(tip_disp['dx'][:, :, int(iz)], dtype=np.float64)
+    dy = np.asarray(tip_disp['dy'][:, :, int(iz)], dtype=np.float64)
+    XX, YY = np.meshgrid(xs, ys, indexing='ij')
+    x = (XX[::s, ::s] + dx[::s, ::s]).ravel()
+    y = (YY[::s, ::s] + dy[::s, ::s]).ravel()
+    if extent is None:
+        extent = (float(xs[0]), float(xs[-1]), float(ys[0]), float(ys[-1]))
+    x0, x1, y0, y1 = map(float, extent)
+    bbox = ax.get_window_extent()
+    W = max(8, int(round(bbox.width)))
+    H = max(8, int(round(bbox.height)))
+    rgba = np.zeros((H, W, 4), dtype=np.float32)
+    px = np.rint((x - x0) / max(x1 - x0, 1e-30) * (W - 1)).astype(np.int32)
+    py = np.rint((y - y0) / max(y1 - y0, 1e-30) * (H - 1)).astype(np.int32)
+    m = (px >= 0) & (px < W) & (py >= 0) & (py < H)
+    r, g, b = to_rgb(color)
+    rgba[py[m], px[m], 0] = r
+    rgba[py[m], px[m], 1] = g
+    rgba[py[m], px[m], 2] = b
+    rgba[py[m], px[m], 3] = 1.0
+    ax.imshow(rgba, origin='lower', extent=extent, interpolation='nearest',
+              aspect='equal', zorder=zorder, resample=False)
+
+
+def plot_pp_distortion_strip(tip_disp, scan_xs, scan_ys, heights, out_path, *,
+                             bg=None, bg_cmap='magma', stride=4, color='lime',
+                             title='', apos=None, show_atoms=False, dpi=140,
+                             figsize_col=1.55, figsize_row=1.55, colorbar=True):
+    """Height strip: optional BG (df/Fz/|dxy|) + every-nth relaxed PP xy pixels.
+
+    SSOT of the classic ppafm ``plotDistortions`` mode (``by=stride``).
+    """
+    heights = np.asarray(heights, dtype=np.float64)
+    n_h = len(heights)
+    extent = scan_extent(scan_xs, scan_ys)
+    fig, axes = plt.subplots(1, n_h, figsize=(figsize_col * n_h + 1.2, figsize_row + 0.8),
+                             squeeze=False, dpi=dpi)
+    for ih in range(n_h):
+        ax = axes[0, ih]
+        if bg is not None:
+            arr = np.asarray(bg[:, :, ih], dtype=np.float64)
+            vmin, vmax = afm_panel_clim(arr, pct=99.0, symmetric=False)
+            im = ax.imshow(arr.T, origin='lower', cmap=bg_cmap, vmin=vmin, vmax=vmax,
+                           aspect='equal', extent=extent)
+            if colorbar:
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        else:
+            ax.set_xlim(extent[0], extent[1])
+            ax.set_ylim(extent[2], extent[3])
+            ax.set_aspect('equal')
+        if show_atoms and apos is not None:
+            overlay_afm_geometry(ax, apos=apos, show_bonds=False, show_cell=False, show_atoms=True,
+                                 atom_ms=2.0, atom_alpha=0.55)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(f'h={heights[ih]:.2f}Å', fontsize=8)
+    fig.suptitle(title or f'PP relaxed xy every {int(stride)}th pixel ({color})', fontsize=10)
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.canvas.draw()  # needed so overlay knows axes pixel size
+    for ih in range(n_h):
+        overlay_pp_relaxed_xy(axes[0, ih], tip_disp, scan_xs, scan_ys, ih,
+                              stride=stride, color=color, extent=extent)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or '.', exist_ok=True)
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print(f'REVIEW: {out_path}')
+    return out_path
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # STM Computation Functions
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3841,6 +4027,278 @@ def compute_bond_resolved_stm(projector, eigvecs, eigvals, scan_xs, scan_ys, hei
     return stm_grid
 
 
+def run_br_stm_afm_panel(atomPos, enames, outdir, *,
+                         basis='3ob-3-1', step=0.1, margin=4.0, z_extra=6.0,
+                         scan_range=3.0, scan_step=None,
+                         h_min=3.7, h_max=4.7, h_step=0.1, amp=1.0, amp_align=True,
+                         stm_heights=(0.5, 1.5, 2.5),
+                         K_LAT_Nm=0.5, K_RAD=20.0, bond_length=3.0,
+                         mo_relative=(0, 1), field='psi2',
+                         projection='prolonged',
+                         tip_mode='co', pauli_A=None, pauli_beta=None, C6_CO=30.0,
+                         df_cmap='gray', fz_cmap='seismic', stm_cmap='viridis',
+                         scale='per_image', show_atoms=True, force_recompute=False,
+                         pp_stride=4):
+    """Three-stage BR-STM campaign (separate figures; do not mash STM into AFM strip).
+
+    Stage 1 — pure STM (orbital identity), prolonged STO, ``use_exp_basis=False``.
+              One row per requested MO (never auto-sum near-deg partners).
+    Stage 2 — AFM df + Fz(amp-align) + |dxy|; plus ppafm-style every-nth PP xy dots.
+    Stage 3 — flat STM vs BR-STM vs |Δ| at Fz heights (closer → larger PP bend).
+
+    Returns dict with paths ``png_stm``, ``png_afm``, ``png_pp_dots``, ``png_brstm``.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    from spammm.SPM import AFM as afm_mod
+    from spammm.SPM.ModularPipeline import ModularAFMPipeline
+    from spammm.config_utils import get_dftb_basis_path
+    from spammm.quantum.DFTB.DFTBplusParser import (
+        parse_wfc_hsd, convert_wfc_to_species_list_ang, make_slater_tail_species_list,
+    )
+
+    atomPos = np.asarray(atomPos, dtype=np.float64)
+    enames = list(enames)
+    os.makedirs(outdir, exist_ok=True)
+    if scan_step is None:
+        scan_step = float(step)
+    projection = str(projection).lower()
+    if projection not in ('stock', 'prolonged'):
+        raise ValueError(f"projection must be 'stock' or 'prolonged', got {projection!r}")
+
+    h_df, h_Fz, h_scan = afm_df_height_stacks(h_min, h_max, h_step, amp=amp, amp_align=amp_align)
+    h_stm = np.asarray(stm_heights, dtype=np.float32)
+    print(f"[BR-STM] Stage heights: STM_pure={list(h_stm)}  "
+          f"AFM df=[{float(h_df[0]):.2f},{float(h_df[-1]):.2f}]  "
+          f"Fz/BR=[{float(h_Fz[0]):.2f},{float(h_Fz[-1]):.2f}]  scan=[{float(h_scan[0]):.2f},{float(h_scan[-1]):.2f}]")
+
+    pipe = ModularAFMPipeline(
+        xyz_file=None, output_dir=outdir, atomPos=atomPos, enames=enames,
+        basis=basis, slako_prefix=basis, tip_mode=tip_mode,
+        step=float(step), margin=float(margin), z_extra=float(z_extra),
+        scan_range=float(scan_range), scan_step=float(scan_step),
+        height_range=(float(h_scan[0]), float(h_scan[-1]) + 0.5 * float(h_step)),
+        height_step=float(h_step),
+        work_dir=os.path.join(outdir, 'dftb_work'), backend='dftb',
+    )
+    pipe.heights = np.asarray(h_scan, dtype=np.float64)
+    pipe.cache_stage3 = os.path.join(outdir, f'cache_stage3_potentials_{projection}.npz')
+    pipe.cache_stage4 = os.path.join(outdir, f'cache_stage4_relax_{projection}.npz')
+
+    pa = dict(afm_mod.PAULI_FITTED_DEFAULTS.get(basis, afm_mod.PAULI_FITTED_DEFAULTS['3ob-3-1']))
+    if pauli_A is not None:
+        pa['A'] = float(pauli_A)
+    if pauli_beta is not None:
+        pa['beta'] = float(pauli_beta)
+
+    dm, eigvecs, eigvals = pipe.stage1_scf(force_recompute=force_recompute)
+    rho_scf_stock, rho_na, rho_diff_stock = pipe.stage2_project(dm, force_recompute=force_recompute)
+
+    basis_hsd = get_dftb_basis_path(basis)
+    basis_data = parse_wfc_hsd(basis_hsd)
+    basis_ang = convert_wfc_to_species_list_ang(basis_data, resolution_bohr=0.04)
+    prol_ang = make_slater_tail_species_list(basis_ang)
+    sto_ang = prol_ang if projection == 'prolonged' else basis_ang
+
+    # ── AFM dual basis (prolonged Pauli / stock ES) ──────────────────────────
+    if projection == 'prolonged':
+        print("[BR-STM] AFM dual basis: prolonged Pauli ρ / stock Δρ→ES")
+        _set_projector_species_basis(pipe.projector, pipe.atoms_dict, prol_ang, rc_max=6.0)
+        rho_scf_pauli = pipe.projector.project_density_dense(
+            dm.astype(np.float32), pipe.norb_per_atom, pipe.orb_offsets, pipe.atoms_dict, pipe.grid_spec)
+        if hasattr(pipe.projector, 'queue'):
+            pipe.projector.queue.finish()
+    else:
+        rho_scf_pauli = rho_scf_stock
+        _set_projector_species_basis(pipe.projector, pipe.atoms_dict, basis_ang, rc_max=6.0)
+
+    V_ES, E_pauli, E_ES, E_vdw, F_total = pipe.stage3_potentials(
+        rho_scf_pauli, rho_na, rho_diff_stock, force_recompute=force_recompute,
+        pauli_params={'A': pa['A'], 'beta': pa['beta']},
+        vdw_params={'C6_CO': float(C6_CO)},
+    )
+    K_LAT = afm_mod.stiffness_Nm_to_eVA2(float(K_LAT_Nm))
+    s4_force = bool(force_recompute) or (not os.path.exists(pipe.cache_stage4))
+    if (not s4_force) and os.path.exists(pipe.cache_stage4):
+        if int(np.load(pipe.cache_stage4)['FEs_relax'].shape[2]) != int(len(h_scan)):
+            s4_force = True
+    _df_legacy, tip_disp, FEs_relax = pipe.stage4_relax(
+        F_total, force_recompute=s4_force,
+        relax_params={'K_LAT': K_LAT, 'K_RAD': float(K_RAD), 'bond_length': float(bond_length)},
+        ppm_mode=True,
+    )
+    del _df_legacy, V_ES, E_pauli, E_ES, E_vdw
+
+    Fz_full = np.asarray(FEs_relax[:, :, :, 2], dtype=np.float32)
+    dz = float(h_scan[1] - h_scan[0])
+    df_full = afm_mod.compute_df_amp(Fz_full, dz, amp=float(amp))
+    idx_df = [int(np.argmin(np.abs(h_scan - h))) for h in h_df]
+    idx_Fz = [int(np.argmin(np.abs(h_scan - h))) for h in h_Fz]
+    df = df_full[:, :, idx_df]
+    Fz = Fz_full[:, :, idx_Fz]
+    tip_disp_df = {'dx': tip_disp['dx'][:, :, idx_df], 'dy': tip_disp['dy'][:, :, idx_df]}
+    tip_disp_Fz = {'dx': tip_disp['dx'][:, :, idx_Fz], 'dy': tip_disp['dy'][:, :, idx_Fz]}
+    dxy_df = np.hypot(tip_disp_df['dx'], tip_disp_df['dy']).astype(np.float32)
+    dxy_Fz = np.hypot(tip_disp_Fz['dx'], tip_disp_Fz['dy']).astype(np.float32)
+    print(f"[BR-STM] |dxy| max @df-h={float(dxy_df.max()):.3f}Å  @Fz-h={float(dxy_Fz.max()):.3f}Å")
+
+    homo, lumo = dftb_frontier_mo_indices(eigvals, atomTypes=pipe.atoms_dict['type'])
+    mo_list = [int(homo) + int(d) for d in mo_relative]
+    ev = np.asarray(eigvals, dtype=np.float64)
+    for imo in mo_list:
+        E0 = float(ev[imo])
+        partners = [i for i in range(len(ev)) if abs(float(ev[i]) - E0) <= 0.002]
+        if len(partners) > 1:
+            print(f"[BR-STM] WARNING: MO#{imo} near-deg with {partners} "
+                  f"(DFTB may break symmetry). Plotting alone — pass partners via --mo to sum.")
+    print(f"[BR-STM] HOMO={homo} E={float(eigvals[homo])*27.2114:.3f} eV  "
+          f"LUMO={lumo} E={float(eigvals[lumo])*27.2114:.3f} eV  MOs={mo_list}")
+
+    extent = scan_extent(pipe.scan_xs, pipe.scan_ys)
+    amp_f = float(amp)
+
+    def _mo_ylab(imo):
+        if imo == homo:
+            return f'HOMO\n#{imo}'
+        if imo == lumo:
+            return f'LUMO\n#{imo}'
+        if imo < homo:
+            return f'HOMO{imo - homo}\n#{imo}'
+        return f'LUMO+{imo - lumo}\n#{imo}'
+
+    # ═══════════════ Stage 1: pure STM (working prolonged-STO path) ═══════════
+    print("\n[BR-STM] === Stage 1: pure STM (prolonged STO, use_exp_basis=False) ===")
+    _set_projector_species_basis(pipe.projector, pipe.atoms_dict, sto_ang, rc_max=6.0)
+    stm_rows = {}
+    row_specs_stm = []
+    for imo in mo_list:
+        key = f'mo{imo}'
+        stm_1 = compute_stm(
+            pipe.projector, eigvecs, eigvals, pipe.scan_xs, pipe.scan_ys, h_stm,
+            pipe.norb_per_atom, pipe.orb_offsets, pipe.atoms_dict,
+            mo_indices=[imo], field=field, use_exp_basis=False,
+        )
+        stm_rows[key] = {'stm': stm_1}
+        row_specs_stm.append(('stm', key, _mo_ylab(imo), stm_cmap))
+        print(f"  pure STM MO#{imo} @h={list(h_stm)} range=[{stm_1.min():.3e},{stm_1.max():.3e}]")
+    png_stm = os.path.join(outdir, '01_stm_pure.png')
+    plot_afm_variant_height_strip(
+        stm_rows, row_specs_stm, h_stm, png_stm, scale='per_image',
+        title=(f'Stage 1 — pure STM  {basis}/{projection} STO  field={field}  '
+               f'(same path as stm panel; no PP, no exp tails)'),
+        dpi=140, apos=atomPos if show_atoms else None, show_atoms=show_atoms,
+        extent=extent, amp=None, amp_align=False, figsize_row=1.4,
+    )
+
+    # ═══════════════ Stage 2: df + Fz + |dxy| ═════════════════════════════════
+    print("\n[BR-STM] === Stage 2: AFM df / Fz / tip |dxy| ===")
+    variants_afm = {'pipe': {'df': df, 'Fz': Fz, 'dxy': dxy_Fz}}  # |dxy| amp-aligned with Fz
+    fz_ylab = f'Fz\n@h−{amp_f:.1f}Å' if amp_align else 'Fz'
+    dxy_ylab = f'|dxy|\n@h−{amp_f:.1f}Å' if amp_align else '|dxy|'
+    row_specs_afm = [
+        ('df', 'pipe', f'df\n({projection})', df_cmap),
+        ('Fz', 'pipe', fz_ylab, fz_cmap),
+        ('dxy', 'pipe', dxy_ylab, 'magma'),
+    ]
+    png_afm = os.path.join(outdir, '02_afm_df_tipdisp.png')
+    plot_afm_variant_height_strip(
+        variants_afm, row_specs_afm, h_df, png_afm, scale=scale if scale != 'per_image' else 'per_column',
+        title=(f'Stage 2 — AFM  tip={tip_mode} K_LAT={K_LAT_Nm:.2f} N/m L={bond_length:.1f}Å  '
+               f'columns=df h; Fz & |dxy| morph. at h−amp when amp_align'),
+        dpi=140, apos=atomPos if show_atoms else None, show_atoms=show_atoms,
+        extent=extent, amp=amp_f, amp_align=bool(amp_align), figsize_row=1.3,
+    )
+    # also full tip_disp gallery at Fz heights (where bending is large)
+    plot_tip_displacement(tip_disp_Fz, pipe.scan_xs, pipe.scan_ys, h_Fz, outdir,
+                          prefix='02_tip_disp_Fz_heights')
+    # classic ppafm plotDistortions: every-nth relaxed PP xy as tiny red dots
+    png_pp = os.path.join(outdir, '02_pp_xy_dots.png')
+    plot_pp_distortion_strip(
+        tip_disp_Fz, pipe.scan_xs, pipe.scan_ys, h_Fz, png_pp,
+        bg=dxy_Fz, bg_cmap='magma', stride=int(pp_stride), color='lime',
+        title=(f'Stage 2b — relaxed PP xy every {int(pp_stride)}th pixel (lime, 1px) on |dxy|  '
+               f'(ppafm plotDistortions)'),
+        apos=atomPos if show_atoms else None, show_atoms=show_atoms, dpi=140,
+    )
+
+    # ═══════════════ Stage 3: STM vs BR-STM at Fz heights (PP effect) ═════════
+    print("\n[BR-STM] === Stage 3: STM flat vs BR-STM at Fz heights (PP bend) ===")
+    # Prefer LUMO for BR-STM when present: DFTB HOMO is often a broken-symmetry
+    # partner of a near-degenerate pair (see frontier_diag). Orbital identity first.
+    if int(lumo) in mo_list:
+        imo_br = int(lumo)
+    else:
+        imo_br = int(mo_list[0])
+    print(f"[BR-STM] Stage3 BR compare MO#{imo_br} ({'LUMO' if imo_br == lumo else 'from --mo'})")
+    _set_projector_species_basis(pipe.projector, pipe.atoms_dict, sto_ang, rc_max=6.0)
+    stm_flat = compute_stm(
+        pipe.projector, eigvecs, eigvals, pipe.scan_xs, pipe.scan_ys, h_Fz,
+        pipe.norb_per_atom, pipe.orb_offsets, pipe.atoms_dict,
+        mo_indices=[imo_br], field=field, use_exp_basis=True, exp_beta=1.0, exp_r0=3.0,
+    )
+    br_stm = compute_bond_resolved_stm(
+        pipe.projector, eigvecs, eigvals, pipe.scan_xs, pipe.scan_ys, h_Fz,
+        tip_disp_Fz, pipe.norb_per_atom, pipe.orb_offsets, pipe.atoms_dict,
+        mo_indices=[imo_br], field=field, use_exp_basis=True, exp_beta=1.0, exp_r0=3.0,
+    )
+    stm_diff = np.abs(br_stm - stm_flat).astype(np.float32)
+    print(f"  MO#{imo_br}: STM=[{stm_flat.min():.3e},{stm_flat.max():.3e}]  "
+          f"BR=[{br_stm.min():.3e},{br_stm.max():.3e}]  |Δ|max={float(stm_diff.max()):.3e}")
+    variants_br = {'pipe': {'stm': stm_flat, 'br_stm': br_stm, 'diff': stm_diff, 'dxy': dxy_Fz}}
+    row_specs_br = [
+        ('stm', 'pipe', f'STM flat\n{_mo_ylab(imo_br)}', stm_cmap),
+        ('br_stm', 'pipe', f'BR-STM\n{_mo_ylab(imo_br)}', stm_cmap),
+        ('diff', 'pipe', '|BR−STM|', 'magma'),
+        ('dxy', 'pipe', '|dxy|', 'magma'),
+    ]
+    png_br = os.path.join(outdir, '03_brstm_vs_stm.png')
+    plot_afm_variant_height_strip(
+        variants_br, row_specs_br, h_Fz, png_br, scale='per_image',
+        title=(f'Stage 3 — BR-STM vs flat STM @ Fz heights  MO#{imo_br}  '
+               f'|dxy|_max={float(dxy_Fz.max()):.2f}Å  (exp tails for vacuum amp)'),
+        dpi=140, apos=atomPos if show_atoms else None, show_atoms=show_atoms,
+        extent=extent, amp=None, amp_align=False, figsize_row=1.25,
+    )
+
+    npz_path = os.path.join(outdir, 'brstm_stages.npz')
+    np.savez_compressed(
+        npz_path, df=df, Fz=Fz, dxy_df=dxy_df, dxy_Fz=dxy_Fz,
+        stm_flat_Fz=stm_flat, br_stm_Fz=br_stm, stm_diff_Fz=stm_diff,
+        heights_df=h_df, heights_Fz=h_Fz, heights_stm=h_stm, heights_scan=h_scan,
+        scan_xs=pipe.scan_xs, scan_ys=pipe.scan_ys,
+        tip_disp_dx_Fz=tip_disp_Fz['dx'], tip_disp_dy_Fz=tip_disp_Fz['dy'],
+        eigvals=eigvals, mo_list=np.asarray(mo_list, dtype=np.int32),
+        mo_br=np.int32(imo_br), homo=np.int32(homo), lumo=np.int32(lumo),
+        atomPos=atomPos, projection=np.asarray(projection),
+    )
+    summary = os.path.join(outdir, 'SUMMARY.out')
+    with open(summary, 'w') as f:
+        f.write('BR-STM three-stage campaign\n')
+        f.write(f'basis={basis} projection={projection} tip={tip_mode} field={field}\n')
+        f.write(f'HOMO={homo} LUMO={lumo} Stage1 MOs={mo_list} Stage3 MO={imo_br}\n')
+        f.write(f'Stage1 STM heights={list(h_stm)} prolonged STO use_exp=False\n')
+        f.write(f'Stage2 AFM df=[{h_min},{h_max}] Fz amp_align={amp_align} amp={amp}\n')
+        f.write(f'Stage3 BR-STM at Fz heights |dxy|_max={float(dxy_Fz.max()):.3f}Å\n')
+        f.write(f'REVIEW: {png_stm}\nREVIEW: {png_afm}\nREVIEW: {png_pp}\nREVIEW: {png_br}\n')
+        f.write(f'REVIEW: {os.path.join(outdir, "02_tip_disp_Fz_heights.png")}\n')
+        f.write(f'REVIEW: {npz_path}\n')
+    print(f'REVIEW: {png_stm}')
+    print(f'REVIEW: {png_afm}')
+    print(f'REVIEW: {png_pp}')
+    print(f'REVIEW: {png_br}')
+    print(f'REVIEW: {summary}')
+    return {
+        'df': df, 'Fz': Fz, 'dxy_df': dxy_df, 'dxy_Fz': dxy_Fz,
+        'stm_flat': stm_flat, 'br_stm': br_stm, 'stm_diff': stm_diff,
+        'heights': h_df, 'heights_Fz': h_Fz, 'heights_stm': h_stm,
+        'scan_xs': pipe.scan_xs, 'scan_ys': pipe.scan_ys,
+        'mo_list': mo_list, 'mo_br': imo_br, 'homo': homo, 'lumo': lumo,
+        'png_stm': png_stm, 'png_afm': png_afm, 'png_pp_dots': png_pp, 'png_brstm': png_br,
+        'out_png': png_br, 'npz': npz_path, 'summary': summary,
+        'pipe': pipe, 'projection': projection,
+    }
+
+
 def _set_projector_species_basis(projector, atoms_dict, species_list_ang, *, rc_max=None, max_shells=None):
     """Reload/update STO radial table + atom Rcut for orbital projection.
 
@@ -3874,6 +4332,78 @@ def dftb_n_valence_electrons(enames=None, atomTypes=None):
         inv = {1: 'H', 6: 'C', 7: 'N', 8: 'O', 15: 'P', 16: 'S', 35: 'Br', 53: 'I'}
         return int(sum(DFTB_VALENCE_ELEC.get(inv.get(int(z), 'C'), 4) for z in atomTypes))
     raise ValueError('dftb_n_valence_electrons: need enames or atomTypes')
+
+
+def plot_brstm_compare_slice(df_2d, stm_2d, br_2d, tip_disp, scan_xs, scan_ys, iz, *,
+                             apos=None, title='', dpi=120, fig=None,
+                             pp_stride=4, stm_cmap='viridis', df_cmap='gray'):
+    """2×2 BR-STM product panel at one height:
+
+    1. AFM df   2. |dxy| + lime PP xy pixels (one panel)
+    3. STM flat 4. BR-STM (PP-relaxed)
+
+    Shared by GUI and headless stills.
+    """
+    xs = np.asarray(scan_xs, dtype=np.float64)
+    ys = np.asarray(scan_ys, dtype=np.float64)
+    extent = scan_extent(xs, ys)
+    dx = np.asarray(tip_disp['dx'][:, :, int(iz)], dtype=np.float64)
+    dy = np.asarray(tip_disp['dy'][:, :, int(iz)], dtype=np.float64)
+    dxy = np.hypot(dx, dy)
+    if fig is None:
+        fig, axes = plt.subplots(2, 2, figsize=(9.5, 8.5), dpi=dpi)
+    else:
+        fig.clf()
+        axes = np.array(fig.subplots(2, 2))
+
+    # (1) AFM df
+    ax = axes[0, 0]
+    arr = np.asarray(df_2d, dtype=np.float64)
+    vmin, vmax = afm_panel_clim(arr, pct=99.0, symmetric=False)
+    im = ax.imshow(arr.T, origin='lower', cmap=df_cmap, vmin=vmin, vmax=vmax,
+                   aspect='equal', extent=extent)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title('AFM df', fontsize=10)
+    ax.set_xticks([]); ax.set_yticks([])
+    if apos is not None:
+        overlay_afm_geometry(ax, apos=apos, show_bonds=False, show_cell=False, show_atoms=True,
+                             atom_ms=2.0, atom_alpha=0.55)
+
+    # (2) |dxy| + green PP dots (single panel — do not split)
+    ax = axes[0, 1]
+    vmin, vmax = afm_panel_clim(dxy, pct=99.0, symmetric=False)
+    im = ax.imshow(dxy.T, origin='lower', cmap='magma', vmin=vmin, vmax=vmax,
+                   aspect='equal', extent=extent)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title(f'|dxy| + PP xy (lime)  max={float(dxy.max()):.3f}Å', fontsize=10)
+    ax.set_xticks([]); ax.set_yticks([])
+    if apos is not None:
+        overlay_afm_geometry(ax, apos=apos, show_bonds=False, show_cell=False, show_atoms=True,
+                             atom_ms=2.0, atom_alpha=0.55)
+    fig.canvas.draw()
+    tip_iz = {'dx': tip_disp['dx'][:, :, int(iz):int(iz) + 1],
+              'dy': tip_disp['dy'][:, :, int(iz):int(iz) + 1]}
+    overlay_pp_relaxed_xy(ax, tip_iz, xs, ys, 0, stride=int(pp_stride), color='lime', extent=extent)
+
+    # (3) STM flat  (4) BR-STM
+    for ax, arr, ylab in (
+        (axes[1, 0], np.asarray(stm_2d, dtype=np.float64), 'STM (flat, no PP)'),
+        (axes[1, 1], np.asarray(br_2d, dtype=np.float64), 'BR-STM (PP-relaxed)'),
+    ):
+        vmin, vmax = afm_panel_clim(arr, pct=99.0, symmetric=False)
+        im = ax.imshow(arr.T, origin='lower', cmap=stm_cmap, vmin=vmin, vmax=vmax,
+                       aspect='equal', extent=extent)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_title(ylab, fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+        if apos is not None:
+            overlay_afm_geometry(ax, apos=apos, show_bonds=False, show_cell=False, show_atoms=True,
+                                 atom_ms=2.0, atom_alpha=0.55)
+
+    if title:
+        fig.suptitle(title, fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.95] if title else None)
+    return fig
 
 
 def dftb_frontier_mo_indices(eigvals, n_elec=None, enames=None, atomTypes=None):
@@ -6301,3 +6831,331 @@ def fit_pauli_parameters_pyscf(xyz_file, pyscf_basis='sto-3g', pyscf_method='RHF
         'beta_std': np.std([r['beta'] for r in all_results]) if all_results else None,
     }
     return result_dict
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Basis-tail compare — ρ(z) + Pauli log (SSOT for ``run_spm.py basis-tails``)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_BASIS_TAILS_GPAW = '/home/prokop/SIMULATIONS/Fukui_AFM/gpaw_fukui_cluster/jobs/results'
+_BASIS_TAILS_PYSCF = '/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster/jobs/results'
+_BASIS_TAILS_COLORS = {
+    'GPAW PBE': '#d62728',
+    'pySCF PBE/def2-SVP': '#2ca02c',
+    'DFTB 3ob stock': '#1f77b4',
+    'DFTB prolonged': '#9467bd',
+}
+_BASIS_TAILS_MOL = {
+    'pentacene': {'gpaw': 'pentacene_PBE_500eV', 'pyscf': 'pentacene_PBE_def2-SVP'},
+    'PTCDA': {'gpaw': 'PTCDA_PBE_500eV', 'pyscf': 'PTCDA_PBE_def2-SVP'},
+}
+
+
+def _basis_tails_parse_cube(cube_path, bohr_to_ang=0.529177):
+    with open(cube_path) as f:
+        lines = f.readlines()
+    p = lines[2].split()
+    natoms = int(p[0])
+    origin = np.array([float(p[1]), float(p[2]), float(p[3])]) * bohr_to_ang
+    nx, dx = int(lines[3].split()[0]), float(lines[3].split()[1]) * bohr_to_ang
+    ny, dy = int(lines[4].split()[0]), float(lines[4].split()[2]) * bohr_to_ang
+    nz, dz = int(lines[5].split()[0]), float(lines[5].split()[3]) * bohr_to_ang
+    atoms = []
+    for i in range(natoms):
+        p = lines[6 + i].split()
+        atoms.append((int(p[0]), float(p[2]) * bohr_to_ang, float(p[3]) * bohr_to_ang, float(p[4]) * bohr_to_ang))
+    return atoms, origin, np.array([dx, dy, dz]), np.array([nx, ny, nz])
+
+
+def _basis_tails_parse_gpaw_txt(txt_path):
+    import re
+    with open(txt_path) as f:
+        text = f.read()
+    pos_section = re.search(r'Positions:\s*\n(.*?)\n\s*\n', text, re.DOTALL)
+    atoms = []
+    for line in pos_section.group(1).strip().split('\n'):
+        parts = line.split()
+        atoms.append((int(parts[0]), parts[1], float(parts[2]), float(parts[3]), float(parts[4])))
+    cell_lines = re.findall(r'\d+\.\s*axis:\s+yes\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)\s+([\d.]+)', text)
+    cell = np.array([[float(c[0]), float(c[1]), float(c[2])] for c in cell_lines])
+    fine_match = re.search(r'Fine grid:\s*(\d+)\*(\d+)\*(\d+)', text)
+    fine_grid = np.array([int(fine_match.group(i)) for i in range(1, 4)])
+    return atoms, cell, fine_grid
+
+
+def _basis_tails_central_C(atoms):
+    """atoms: (idx, sym, x, y, z) — return index into atoms list + atom tuple."""
+    C = [(i, a) for i, a in enumerate(atoms) if a[1] == 'C']
+    xy = np.array([[a[2], a[3]] for _, a in C])
+    com = xy.mean(0)
+    j = int(np.argmin(np.linalg.norm(xy - com, axis=1)))
+    return C[j][0], C[j][1]
+
+
+def _basis_tails_fit_slope(z, rho, lo=0.5, hi=1.5):
+    r = np.maximum(np.asarray(rho), 1e-30)
+    m = (z >= lo) & (z <= hi) & (r > 1e-30)
+    if m.sum() < 3:
+        return None, None, None
+    a, b = np.polyfit(z[m], np.log(r[m]), 1)
+    return float(a), float(b), (lo, hi)
+
+
+def _basis_tails_six_decade_ylim(curves, floor=1e-20):
+    peaks = []
+    for y in curves:
+        y = np.asarray(y, float)
+        y = y[np.isfinite(y) & (y > floor)]
+        if y.size:
+            peaks.append(float(y.max()))
+    if not peaks:
+        return (1e-6, 1.0)
+    ymax = max(peaks)
+    return (ymax / 1e6, ymax * 1.5)
+
+
+def _basis_tails_pauli_line(rho, origin, step, tip_mode, sigma, A, beta, xy, zs, tip_cache):
+    """Pauli E(z) above xy for one density grid (tip kernel cached by shape/step)."""
+    s = float(np.asarray(step).reshape(-1)[0])
+    key = (rho.shape, s, tip_mode, float(sigma))
+    if key not in tip_cache:
+        tip_tot, _ = get_tip_densities(tip_mode, rho.shape, s, sigma=sigma)
+        tip_cache[key] = tip_tot
+    overlap = afm.compute_pauli_overlap(rho, tip_cache[key], s, tip_rolled=True)
+    E = afm.scale_pauli_field(overlap, s, A, beta, return_grads=False)
+    o = np.asarray(origin, float).ravel()[:3]
+    return sample_field_z_profile(E, o, s, xy, zs)
+
+
+def run_basis_tails_compare(
+    molecules=('pentacene', 'PTCDA'),
+    outdir='debug/presentation_basis_tails',
+    basis='3ob-3-1',
+    tip_mode='gaussian',
+    sigma=0.35,
+    A_pauli=1.0,
+    beta_pauli=1.0,
+    z_max=3.0,
+    dz=0.1,
+    ylim_rho=(1e-5, 1e1),
+    formats=('svg', 'png'),
+    gpaw_dir=None,
+    pyscf_dir=None,
+    dftb_step=0.1,
+    verbosity=1,
+):
+    """Central-carbon ρ(z) + Pauli E(z) on log scale: GPAW / pySCF / DFTB stock / prolonged.
+
+    Talk / presentation SSOT. Writes SVG+PNG under ``outdir``.
+    Pauli uses the same (A,β) for all channels so tails track density (default A=β=1 → raw overlap).
+    """
+    from spammm.config_utils import get_dftb_basis_path
+    from spammm.quantum.DFTB.DFTBplusParser import (
+        parse_wfc_hsd, convert_wfc_to_species_list_ang, make_slater_tail_species_list)
+    from spammm.quantum.DFTB.basis_optimizer import extract_z_profiles
+
+    os.environ.setdefault('SPAMMM_AFM_CPU_FFT', '1')
+    gpaw_dir = gpaw_dir or _BASIS_TAILS_GPAW
+    pyscf_dir = pyscf_dir or _BASIS_TAILS_PYSCF
+    outdir = os.path.abspath(outdir)
+    os.makedirs(outdir, exist_ok=True)
+
+    z_to_sym = {1: 'H', 6: 'C', 7: 'N', 8: 'O'}
+    elem_z = {'H': 1, 'C': 6, 'N': 7, 'O': 8}
+    basis_hsd = get_dftb_basis_path(basis)
+    basis_ang = convert_wfc_to_species_list_ang(parse_wfc_hsd(basis_hsd), resolution_bohr=0.04)
+    prol_basis = make_slater_tail_species_list(basis_ang)
+
+    mols = []
+    for raw in molecules:
+        for part in str(raw).split(','):
+            part = part.strip()
+            if part:
+                mols.append(part)
+    if not mols:
+        raise ValueError('No molecules given')
+
+    tip_cache = {}
+    order = ['GPAW PBE', 'pySCF PBE/def2-SVP', 'DFTB 3ob stock', 'DFTB prolonged']
+    summary_lines = [
+        'Central-C ρ(z) + Pauli log (fit 0.5–1.5 Å)',
+        f'basis={basis} tip={tip_mode} σ={sigma} A={A_pauli} β={beta_pauli}',
+        f'ylim_ρ={ylim_rho}  formats={formats}',
+    ]
+    results = {}
+
+    for label in mols:
+        if label not in _BASIS_TAILS_MOL:
+            raise KeyError(f'Unknown molecule {label!r}; known={list(_BASIS_TAILS_MOL)}')
+        meta = _BASIS_TAILS_MOL[label]
+        if verbosity:
+            print(f'=== basis-tails {label} ===', flush=True)
+
+        gdir = os.path.join(gpaw_dir, meta['gpaw'])
+        atoms, cell, fine_grid = _basis_tails_parse_gpaw_txt(os.path.join(gdir, 'N.txt'))
+        z0 = float(np.mean([a[4] for a in atoms]))
+        dL_gpaw = np.array([cell[i, i] for i in range(3)]) / fine_grid
+        ci, ca = _basis_tails_central_C(atoms)
+        xy = (ca[2], ca[3])
+        if verbosity:
+            print(f'  central C atom {ci} @ ({ca[2]:.3f},{ca[3]:.3f},{ca[4]:.3f})', flush=True)
+
+        channels = []
+        z_vals = np.arange(0.0, z_max + dz / 2, dz)
+        zs_abs = z0 + z_vals
+
+        rho_gpaw = np.load(os.path.join(gdir, 'rho_N.npy'))
+        gpaw_profs, _ = extract_z_profiles(rho_gpaw, atoms, np.zeros(3), dL_gpaw, fine_grid, z0, z_max, dz)
+        E_g = _basis_tails_pauli_line(rho_gpaw, np.zeros(3), dL_gpaw, tip_mode, sigma, A_pauli, beta_pauli, xy, zs_abs, tip_cache)
+        channels.append(('GPAW PBE', gpaw_profs[ci], E_g))
+        del rho_gpaw
+
+        atomPos = np.array([[a[2], a[3], a[4]] for a in atoms], dtype=np.float64)
+        atomTypes = np.array([elem_z[a[1]] for a in atoms], dtype=np.int32)
+        work = os.path.join(outdir, f'{label}_dftb')
+        if verbosity:
+            print('  DFTB stock density...', flush=True)
+        d_stock = get_density_from_dftb_dense(
+            atomPos, atomTypes, basis_hsd, work + '_stock',
+            step=dftb_step, margin=6.0, z_extra=6.0, verbosity=0)
+        if verbosity:
+            print('  DFTB prolonged density...', flush=True)
+        d_prol = get_density_from_dftb_dense(
+            atomPos, atomTypes, basis_hsd, work + '_prol',
+            step=dftb_step, margin=6.0, z_extra=6.0, verbosity=0,
+            projection_basis_ang=prol_basis)
+        stock_profs, _ = extract_z_profiles(
+            d_stock['rho_scf'], atoms, d_stock['origin'], dftb_step, d_stock['ngrid'], z0, z_max, dz)
+        prol_profs, _ = extract_z_profiles(
+            d_prol['rho_scf'], atoms, d_prol['origin'], dftb_step, d_prol['ngrid'], z0, z_max, dz)
+        E_s = _basis_tails_pauli_line(
+            d_stock['rho_scf'], d_stock['origin'], dftb_step, tip_mode, sigma, A_pauli, beta_pauli, xy, zs_abs, tip_cache)
+        E_p = _basis_tails_pauli_line(
+            d_prol['rho_scf'], d_prol['origin'], dftb_step, tip_mode, sigma, A_pauli, beta_pauli, xy, zs_abs, tip_cache)
+        channels.append(('DFTB 3ob stock', stock_profs[ci], E_s))
+        channels.append(('DFTB prolonged', prol_profs[ci], E_p))
+
+        pdir = os.path.join(pyscf_dir, meta['pyscf'])
+        rho_pyscf = np.load(os.path.join(pdir, 'rho_N.npy')) / (0.529177 ** 3)
+        pyscf_atoms, pyscf_origin, dL_pyscf, pyscf_ngrid = _basis_tails_parse_cube(os.path.join(pdir, 'rho_N.cube'))
+        z0_p = float(np.mean([a[3] for a in pyscf_atoms]))
+        pyscf_fmt = [(i, z_to_sym.get(a[0], '?'), a[1], a[2], a[3]) for i, a in enumerate(pyscf_atoms)]
+        pC = [(i, a) for i, a in enumerate(pyscf_fmt) if a[1] == 'C']
+        pxy = np.array([[a[2], a[3]] for _, a in pC])
+        pi = pC[int(np.argmin(np.linalg.norm(pxy - pxy.mean(0), axis=1)))][0]
+        pyscf_profs, _ = extract_z_profiles(rho_pyscf, pyscf_fmt, pyscf_origin, dL_pyscf, pyscf_ngrid, z0_p, z_max, dz)
+        xy_p = (pyscf_fmt[pi][2], pyscf_fmt[pi][3])
+        zs_p = z0_p + z_vals
+        E_y = _basis_tails_pauli_line(
+            rho_pyscf, pyscf_origin, dL_pyscf, tip_mode, sigma, A_pauli, beta_pauli, xy_p, zs_p, tip_cache)
+        channels.append(('pySCF PBE/def2-SVP', pyscf_profs[pi], E_y))
+        del rho_pyscf
+
+        ch_map = {n: (r, e) for n, r, e in channels}
+        channels = [(n, *ch_map[n]) for n in order if n in ch_map]
+
+        np.savez(os.path.join(outdir, f'{label}_central_C_profiles.npz'),
+                 z=z_vals, atom=ci,
+                 **{f'rho_{n.replace(" ", "_")}': r for n, r, _ in channels},
+                 **{f'pauli_{n.replace(" ", "_")}': e for n, _, e in channels})
+
+        ylim_E = _basis_tails_six_decade_ylim([e for _, _, e in channels])
+        slopes = {}
+        fig, axes = plt.subplots(1, 2, figsize=(11.2, 5.0))
+        for ax, kind, ylab, ylim in (
+            (axes[0], 'rho', r'$\rho$ (e/Å$^3$)', ylim_rho),
+            (axes[1], 'pauli', rf'$E_{{\mathrm{{Pauli}}}}$ (eV)  A={A_pauli:g} β={beta_pauli:g}', ylim_E),
+        ):
+            for name, rho, Epauli in channels:
+                y = rho if kind == 'rho' else Epauli
+                color = _BASIS_TAILS_COLORS.get(name, None)
+                ax.plot(z_vals, np.maximum(y, 1e-30), '-', color=color, lw=2.4, label=name)
+                a, b, win = _basis_tails_fit_slope(z_vals, y)
+                if a is not None:
+                    if kind == 'rho':
+                        slopes[name] = a
+                    fz = np.linspace(win[0], win[1], 40)
+                    ax.plot(fz, np.exp(a * fz + b), '--', color=color, lw=1.1, alpha=0.8,
+                            label=f'fit {a:.2f}/Å')
+            ax.set_yscale('log'); ax.set_ylim(*ylim); ax.set_xlim(0, z_max)
+            ax.set_xlabel('z above plane (Å)'); ax.set_ylabel(ylab)
+            ax.set_title('ρ(z)' if kind == 'rho' else 'Pauli E(z) (same tip, all ρ)')
+            ax.legend(fontsize=7.5, loc='upper right', framealpha=0.92)
+            ax.grid(True, which='major', alpha=0.35); ax.grid(True, which='minor', alpha=0.15)
+        fig.suptitle(f'{label}: central C (atom {ci}) — stock dies; prolonged ≈ DFT  (log, 6 decades)', fontsize=12)
+        fig.tight_layout()
+        for ext in formats:
+            path = os.path.join(outdir, f'{label}_central_C_rho_pauli_log.{ext}')
+            fig.savefig(path, dpi=220, bbox_inches='tight')
+            print(f'REVIEW: {path}')
+        plt.close(fig)
+
+        for kind, ylab, ylim, tag in (
+            ('rho', r'$\rho$ (e/Å$^3$)', ylim_rho, 'rho'),
+            ('pauli', rf'$E_{{\mathrm{{Pauli}}}}$ (eV)', ylim_E, 'pauli'),
+        ):
+            fig2, ax = plt.subplots(figsize=(6.4, 5.2))
+            for name, rho, Epauli in channels:
+                y = rho if kind == 'rho' else Epauli
+                color = _BASIS_TAILS_COLORS.get(name, None)
+                ax.plot(z_vals, np.maximum(y, 1e-30), '-', color=color, lw=2.6, label=name)
+                a, b, win = _basis_tails_fit_slope(z_vals, y)
+                if a is not None:
+                    fz = np.linspace(win[0], win[1], 40)
+                    ax.plot(fz, np.exp(a * fz + b), '--', color=color, lw=1.15, alpha=0.8,
+                            label=f'fit {a:.2f}/Å')
+            ax.set_yscale('log'); ax.set_ylim(*ylim); ax.set_xlim(0, z_max)
+            ax.set_xlabel('z above plane (Å)', fontsize=12); ax.set_ylabel(ylab, fontsize=12)
+            ttl = (f'{label}: ρ(z) above central C (atom {ci})\nstock cuts off; prolonged ≈ GPAW/pySCF'
+                   if kind == 'rho' else
+                   f'{label}: Pauli E(z) above central C (atom {ci})\ntip={tip_mode}  A={A_pauli:g} β={beta_pauli:g}  (tracks ρ tails)')
+            ax.set_title(ttl, fontsize=12)
+            ax.legend(fontsize=8.5, loc='upper right'); ax.grid(True, which='both', alpha=0.25)
+            if kind == 'rho':
+                ax.set_yticks([1e1, 1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5])
+            fig2.tight_layout()
+            for ext in formats:
+                path = os.path.join(outdir, f'{label}_central_C_{tag}_z_log.{ext}')
+                fig2.savefig(path, dpi=220, bbox_inches='tight')
+                print(f'REVIEW: {path}')
+            plt.close(fig2)
+
+        summary_lines.append(f'\n{label} central C atom {ci}')
+        for name, a in slopes.items():
+            summary_lines.append(f'  {name}: β_ρ={a:.3f}/Å')
+        results[label] = {'atom': ci, 'slopes_rho': slopes, 'ylim_pauli': ylim_E}
+
+    if len(mols) >= 2:
+        fig, axes = plt.subplots(1, len(mols), figsize=(5.5 * len(mols), 4.8), squeeze=False)
+        for ax, label in zip(axes[0], mols):
+            d = np.load(os.path.join(outdir, f'{label}_central_C_profiles.npz'))
+            z = d['z']; atom = int(d['atom'])
+            for name in order:
+                key = f'rho_{name.replace(" ", "_")}'
+                if key not in d.files:
+                    continue
+                color = _BASIS_TAILS_COLORS.get(name, None)
+                ax.plot(z, np.maximum(d[key], 1e-30), '-', color=color, lw=2.3, label=name)
+                a, b, win = _basis_tails_fit_slope(z, d[key])
+                if a is not None:
+                    fz = np.linspace(win[0], win[1], 40)
+                    ax.plot(fz, np.exp(a * fz + b), '--', color=color, lw=1.0, alpha=0.8,
+                            label=f'fit {a:.2f}/Å')
+            ax.set_yscale('log'); ax.set_ylim(*ylim_rho); ax.set_xlim(0, z_max)
+            ax.set_xlabel('z above plane (Å)'); ax.set_ylabel(r'$\rho$ (e/Å$^3$)')
+            ax.set_title(f'{label} — central C (atom {atom})')
+            ax.legend(fontsize=7, loc='upper right'); ax.grid(True, which='both', alpha=0.25)
+            ax.set_yticks([1e1, 1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5])
+        fig.suptitle(r'Electron density $\rho(z)$ above central carbon (log, 6 decades)', fontsize=13)
+        fig.tight_layout()
+        for ext in formats:
+            path = os.path.join(outdir, f'central_C_rho_z_log_GPAW_pySCF_DFTB.{ext}')
+            fig.savefig(path, dpi=200, bbox_inches='tight')
+            print(f'REVIEW: {path}')
+        plt.close(fig)
+
+    sum_path = os.path.join(outdir, 'SUMMARY.out')
+    with open(sum_path, 'w') as f:
+        f.write('\n'.join(summary_lines) + '\n')
+    print(f'REVIEW: {sum_path}')
+    return {'outdir': outdir, 'molecules': results, 'summary': sum_path}

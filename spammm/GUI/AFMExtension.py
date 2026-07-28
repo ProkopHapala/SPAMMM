@@ -96,6 +96,235 @@ def _update_afm_status(window, msg):
     QtWidgets.QApplication.processEvents()
 
 
+def _afm_height_stack(h0, h1, dz):
+    """Inclusive probe-height ladder [h0, h1] with step dz."""
+    h0, h1, dz = float(h0), float(h1), float(dz)
+    if h1 < h0:
+        h0, h1 = h1, h0
+    n = int(round((h1 - h0) / dz)) + 1
+    return np.round(h0 + np.arange(max(n, 1), dtype=np.float64) * dz, 6)
+
+
+def _sync_pipe_heights_amp(pipe, params):
+    """Align ModularPipeline.heights with CLI/BR amp SSOT (afm_df_height_stacks).
+
+    UI hmin/hmax = df display window; PP scan = [hmin−amp, hmax+amp].
+    Returns (h_df, h_Fz, h_scan, amp, changed).
+    """
+    from spammm.SPM.AFM_utils import afm_df_height_stacks
+    amp = float(params.get('amp', 1.0))
+    h_df, h_Fz, h_scan = afm_df_height_stacks(
+        params['hmin'], params['hmax'], params['hstep'], amp=amp, amp_align=True)
+    new_h = np.asarray(h_scan, dtype=np.float64)
+    changed = (
+        pipe.heights is None
+        or len(pipe.heights) != len(new_h)
+        or not np.allclose(np.asarray(pipe.heights, dtype=np.float64), new_h, atol=1e-6)
+    )
+    pipe.heights = new_h
+    pipe.height_range = (float(h_scan[0]), float(h_scan[-1]))
+    pipe.height_step = float(params['hstep'])
+    return h_df, h_Fz, h_scan, amp, changed
+
+
+def _require_fdbm_backend(window, what='STM'):
+    """Fail loud if Morse/classic selected — no silent FDBM fallback."""
+    params = _get_pipeline_params(window)
+    if params.get('backend') == 'morse':
+        raise RuntimeError(
+            f"{what} requires DFTB FDBM (MOs / density). "
+            "Morse+Coulomb has no orbitals — switch AFM backend to DFTB FDBM.")
+    return params
+
+
+def _run_morse_coulomb_gui(window, *, plot=True):
+    """Classic Morse+Coulomb AFM via shared CLI/GUI backend (no ModularPipeline)."""
+    import tempfile
+    from spammm.atomicUtils import save_xyz
+    from spammm.SPM.AFM_utils import run_morse_coulomb_afm
+
+    atomPos, _, enames = _get_afm_geometry(window)
+    if len(atomPos) == 0:
+        raise ValueError("No atoms in molecule")
+    params = _get_pipeline_params(window)
+    outdir = getattr(window, '_afm_output_dir', None)
+    if outdir is None:
+        outdir = tempfile.mkdtemp(prefix='afm_gui_morse_')
+        window._afm_output_dir = outdir
+    os.makedirs(outdir, exist_ok=True)
+    xyz = os.path.join(outdir, 'sample_morse.xyz')
+    save_xyz(xyz, enames, atomPos, comment='GUI Morse+Coulomb AFM')
+
+    hmin, hmax, hstep = float(params['hmin']), float(params['hmax']), float(params['hstep'])
+    nz_scan = int(round((hmax - hmin) / hstep)) + 1
+    nz_scan = max(nz_scan, 5)
+    _update_afm_status(window, f"Morse+Coulomb AFM (shared run_morse_coulomb_afm) nz={nz_scan}...")
+    res = run_morse_coulomb_afm(
+        xyz, outdir, use_morse=True,
+        margin=float(params['margin']),
+        nz_scan=nz_scan, dtip=-abs(hstep),
+        save_png=True,
+    )
+    Fz = res['Fz']
+    df = res['df']
+    heights = np.asarray(res['heights'], dtype=np.float64)
+    nx, ny, nz = df.shape
+    tip_disp = {
+        'dx': np.zeros((nx, ny, nz), dtype=np.float32),
+        'dy': np.zeros((nx, ny, nz), dtype=np.float32),
+        'dz': np.zeros((nx, ny, nz), dtype=np.float32),
+    }
+    # Prefer molecule-centered extent from geometry
+    pad = float(params.get('scan_range', 3.0))
+    scan_xs = np.linspace(float(atomPos[:, 0].min()) - pad, float(atomPos[:, 0].max()) + pad, nx)
+    scan_ys = np.linspace(float(atomPos[:, 1].min()) - pad, float(atomPos[:, 1].max()) + pad, ny)
+
+    window._afm_pipeline = None  # Morse does not use ModularPipeline
+    window._afm_results = {
+        'df': df, 'tip_disp': tip_disp,
+        'FEs_relax': np.stack([np.zeros_like(Fz), np.zeros_like(Fz), Fz], axis=-1),
+        'Fz': Fz, 'heights': heights, 'scan_xs': scan_xs, 'scan_ys': scan_ys,
+        'backend': 'morse', 'amp': float(params.get('amp', 1.0)),
+    }
+    window._afm_potentials = None
+    window._afm_density = None
+    if plot:
+        if hasattr(window, 'afm_component_combo'):
+            idx = window.afm_component_combo.findText("AFM Image (df)")
+            if idx >= 0:
+                window.afm_component_combo.setCurrentIndex(idx)
+        plot_afm_slice(window)
+    return df, tip_disp, window._afm_results
+
+
+def _ensure_height_covers(window, z_want, margin=1.0):
+    """If z_want is outside computed scan heights, expand range by ``margin`` and recompute.
+
+    Expands hmin/hmax (UI + pipeline) so small z-stepping does not re-trigger every click.
+    Recomputes S4 (df/tip_disp); S5/S6 only if those grids already exist.
+    Returns True if a recompute happened.
+    """
+    res = window._afm_results
+    if res is None or 'heights' not in res:
+        return False
+    if res.get('backend') == 'morse':
+        raise RuntimeError(
+            "Live Z expand is not supported for Morse+Coulomb. "
+            "Widen H min/max in Parameters and re-run AFM.")
+    heights = np.asarray(res['heights'], dtype=np.float64)
+    if heights.size == 0:
+        return False
+    z = float(z_want)
+    h0, h1 = float(heights.min()), float(heights.max())
+    if (h0 - 1e-6) <= z <= (h1 + 1e-6):
+        return False
+
+    hstep = float(window.afm_hstep_spin.value()) if hasattr(window, 'afm_hstep_spin') else 0.1
+    amp = float(window.afm_amp_spin.value()) if hasattr(window, 'afm_amp_spin') else 1.0
+    margin = float(margin)
+    # UI stores df display window; scan already includes ±amp. Expand display so scan covers z±margin.
+    ui_min = float(window.afm_hmin_spin.value()) if hasattr(window, 'afm_hmin_spin') else h0 + amp
+    ui_max = float(window.afm_hmax_spin.value()) if hasattr(window, 'afm_hmax_spin') else h1 - amp
+    new_min = np.floor((min(ui_min, z) - margin) / hstep) * hstep
+    new_max = np.ceil((max(ui_max, z) + margin) / hstep) * hstep
+    new_min = max(1.0, float(new_min))
+    new_max = max(new_min + hstep, float(new_max))
+
+    _update_afm_status(
+        window,
+        f"Z={z:.2f}Å outside [{h0:.2f},{h1:.2f}] — expanding df window to "
+        f"[{new_min:.2f},{new_max:.2f}] (+{margin:.1f}Å margin, amp={amp:.2f}) and recomputing...")
+
+    # Sync Parameter spins without firing mark_scan (we handle recompute here)
+    if hasattr(window, 'afm_hmin_spin'):
+        window.afm_hmin_spin.blockSignals(True)
+        window.afm_hmax_spin.blockSignals(True)
+        window.afm_hmin_spin.setRange(1.0, 12.0)
+        window.afm_hmax_spin.setRange(1.5, 15.0)
+        window.afm_hmin_spin.setValue(new_min)
+        window.afm_hmax_spin.setValue(new_max)
+        window.afm_hmin_spin.blockSignals(False)
+        window.afm_hmax_spin.blockSignals(False)
+
+    pipe = _ensure_pipeline(window)
+    params = _get_pipeline_params(window)
+    if getattr(window, '_afm_pipeline_params', None) is not None:
+        window._afm_pipeline_params['hmin'] = new_min
+        window._afm_pipeline_params['hmax'] = new_max
+        window._afm_pipeline_params['hstep'] = hstep
+    _h_df, _h_Fz, h_scan, amp, _ = _sync_pipe_heights_amp(pipe, params)
+    new_heights = pipe.heights
+
+    had_stm = 'stm_grid' in res
+    had_br = 'br_stm_grid' in res
+    had_afm = ('df' in res) and ('tip_disp' in res)
+
+    # Height change → S4 cache invalid
+    window._afm_dirty.mark('s4')
+    if had_stm or had_br:
+        window._afm_dirty.mark('s5')
+    if had_br:
+        window._afm_dirty.mark('s6')
+    if os.path.exists(pipe.cache_stage4):
+        try:
+            os.remove(pipe.cache_stage4)
+        except OSError:
+            pass
+
+    if had_afm or had_br:
+        if window._afm_potentials is None or 'F_total' not in window._afm_potentials:
+            _run_afm_s1_to_s4(window, plot=False)
+        else:
+            from spammm.SPM import AFM as afm_mod
+            _update_afm_status(window, f"Stage 4: PP relax on amp-aware heights [{float(h_scan[0]):.2f},{float(h_scan[-1]):.2f}]...")
+            _df_legacy, tip_disp, FEs_relax = pipe.stage4_relax(
+                window._afm_potentials['F_total'], force_recompute=True,
+                relax_params={'K_LAT': params['klat'], 'bond_length': params.get('bond_length', 3.0)},
+                ppm_mode=True,
+            )
+            Fz = np.asarray(FEs_relax[:, :, :, 2], dtype=np.float32)
+            dz = float(pipe.heights[1] - pipe.heights[0])
+            df = afm_mod.compute_df_amp(Fz, dz, amp=float(amp))
+            window._afm_dirty.clean('s4')
+            prev = dict(window._afm_results or {})
+            window._afm_results = {
+                'df': df, 'tip_disp': tip_disp, 'FEs_relax': FEs_relax,
+                'heights': pipe.heights, 'scan_xs': pipe.scan_xs, 'scan_ys': pipe.scan_ys,
+                'amp': float(amp), 'backend': 'fdbm',
+            }
+            for k in ('stm_grid', 'br_stm_grid'):
+                if k in prev:
+                    window._afm_results[k] = prev[k]
+    else:
+        # STM-only session: just update height labels stored in results
+        window._afm_results['heights'] = pipe.heights
+        window._afm_results['scan_xs'] = pipe.scan_xs
+        window._afm_results['scan_ys'] = pipe.scan_ys
+
+    if (had_stm or had_br) and window._afm_eigvecs is not None:
+        sp = _get_stm_params_from_ui(window)
+        _update_afm_status(window, "Recomputing STM on expanded heights...")
+        window._afm_results['stm_grid'] = pipe.stage5_stm(
+            window._afm_eigvecs, window._afm_eigvals,
+            lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
+            field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
+        window._afm_dirty.clean('s5')
+        if had_br and 'tip_disp' in window._afm_results:
+            _update_afm_status(window, "Recomputing BR-STM on expanded heights...")
+            window._afm_results['br_stm_grid'] = pipe.stage6_br_stm(
+                window._afm_eigvecs, window._afm_eigvals, window._afm_results['tip_disp'],
+                lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
+                field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
+            window._afm_dirty.clean('s6')
+
+    _update_afm_status(
+        window,
+        f"Height range now df-window [{new_min:.2f},{new_max:.2f}]  scan [{float(new_heights[0]):.2f},{float(new_heights[-1]):.2f}] Å  ({len(new_heights)} slices)")
+    if hasattr(window, '_afm_refresh_dirty_label'):
+        window._afm_refresh_dirty_label()
+    return True
+
+
 def _get_pipeline_params(window):
     """Snapshot current UI parameter values - used for dirty detection.
 
@@ -103,6 +332,19 @@ def _get_pipeline_params(window):
     """
     from spammm.SPM import AFM as afm_mod
     klat_Nm = window.afm_klat_spin.value()
+    projection = 'prolonged'
+    if hasattr(window, 'afm_projection_combo'):
+        projection = str(window.afm_projection_combo.currentText()).lower()
+    backend = 'dftb'
+    if hasattr(window, 'afm_backend_combo'):
+        # UI labels → ModularPipeline backend / force path
+        be = str(window.afm_backend_combo.currentText())
+        if 'pySCF' in be:
+            backend = 'pyscf'
+        elif 'Morse' in be:
+            backend = 'morse'  # classic Morse+Coulomb (not FDBM)
+        else:
+            backend = 'dftb'
     return {
         'basis':      window.afm_basis_combo.currentText(),
         'step':       window.afm_step_spin.value(),
@@ -117,6 +359,10 @@ def _get_pipeline_params(window):
         'c6':         window.afm_vdw_c6_spin.value(),
         'klat_Nm':    klat_Nm,
         'klat':       afm_mod.stiffness_Nm_to_eVA2(klat_Nm),  # eV/Å² for scan_fdbm
+        'projection': projection,
+        'backend':    backend,
+        'bond_length': float(window.afm_bond_length_spin.value()) if hasattr(window, 'afm_bond_length_spin') else 3.0,
+        'amp': float(window.afm_amp_spin.value()) if hasattr(window, 'afm_amp_spin') else 1.0,
     }
 
 
@@ -138,7 +384,7 @@ def _ensure_pipeline(window):
     if not needs_reinit:
         # Reinit if geometry identity changed (atom count, centroid) or key params
         prev = window._afm_pipeline_params
-        reinit_keys = {'basis', 'step', 'margin', 'z_extra', 'scan_range', 'hmin', 'hmax', 'hstep'}
+        reinit_keys = {'basis', 'step', 'margin', 'z_extra', 'scan_range', 'hmin', 'hmax', 'hstep', 'backend'}
         needs_reinit = any(params[k] != prev.get(k) for k in reinit_keys)
         if not needs_reinit:
             # Check geometry — strong hash of all positions + element types
@@ -157,6 +403,12 @@ def _ensure_pipeline(window):
             output_dir = tempfile.mkdtemp(prefix='afm_gui_')
             window._afm_output_dir = output_dir
 
+        be = params['backend']
+        if be == 'morse':
+            raise RuntimeError(
+                "Morse+Coulomb is not an FDBM ModularPipeline backend — no silent fallback to DFTB. "
+                "Use the AFM button with 'Morse+Coulomb' selected (shared AFM_utils.run_morse_coulomb_afm). "
+                "STM / BR-STM require DFTB FDBM.")
         window._afm_pipeline = ModularAFMPipeline(
             xyz_file=None,  # unused when atomPos/enames injected
             output_dir=output_dir,
@@ -165,22 +417,65 @@ def _ensure_pipeline(window):
             scan_range=params['scan_range'], scan_step=0.1,
             height_range=(params['hmin'], params['hmax']), height_step=params['hstep'],
             atomPos=atomPos, enames=enames,
+            backend=be,
+            tip_mode='co',
         )
+        # Separate Stage3/4 caches per projection (stock vs prolonged dual-basis)
+        proj = params.get('projection', 'prolonged')
+        window._afm_pipeline.cache_stage3 = os.path.join(output_dir, f'cache_stage3_potentials_{proj}.npz')
+        window._afm_pipeline.cache_stage4 = os.path.join(output_dir, f'cache_stage4_relax_{proj}.npz')
         window._afm_pipeline_params = params.copy()
         import hashlib
         geom_bytes = atomPos.astype(np.float64).tobytes() + b''.join(e.encode() for e in enames)
         window._afm_pipeline_geom_hash = hashlib.md5(geom_bytes).hexdigest()[:16]
         window._afm_dirty.mark_geometry_changed()  # Full cascade
 
+    # Keep Stage3/4 cache paths in sync if only projection changed
+    proj = params.get('projection', 'prolonged')
+    out = window._afm_pipeline.output_dir
+    want3 = os.path.join(out, f'cache_stage3_potentials_{proj}.npz')
+    want4 = os.path.join(out, f'cache_stage4_relax_{proj}.npz')
+    if window._afm_pipeline.cache_stage3 != want3:
+        window._afm_pipeline.cache_stage3 = want3
+        window._afm_pipeline.cache_stage4 = want4
+        window._afm_dirty.mark('s3')
+
     return window._afm_pipeline
 
 
 def _get_homo_index(window):
-    """Return the HOMO index (0-based) from cached eigvals, or None."""
-    if window._afm_eigvals is not None:
-        homo = int(np.sum(window._afm_eigvals < 0.0)) - 1
-        return max(0, homo)
-    return None
+    """Return valence HOMO/SOMO index (0-based). Never eigvals<0 (wrong for DFTB).
+
+    Closed shell: HOMO = n_elec//2 − 1.
+    Open shell (odd n_elec): SOMO ≈ (n_elec+1)//2 − 1, with a warning — AFM must not crash.
+    """
+    from spammm.SPM.AFM_utils import dftb_frontier_mo_indices, dftb_n_valence_electrons
+    if window._afm_eigvals is None:
+        window._afm_homo_note = None
+        return None
+    pipe = getattr(window, '_afm_pipeline', None)
+    atomTypes = pipe.atoms_dict.get('type') if pipe is not None and getattr(pipe, 'atoms_dict', None) else None
+    enames = list(pipe.enames) if pipe is not None and getattr(pipe, 'enames', None) is not None else None
+    try:
+        homo, _ = dftb_frontier_mo_indices(window._afm_eigvals, atomTypes=atomTypes, enames=enames)
+        window._afm_homo_note = None
+        return int(homo)
+    except ValueError as e:
+        # Open shell / odd n_elec — AFM/STM must still run
+        try:
+            n_elec = dftb_n_valence_electrons(enames=enames, atomTypes=atomTypes)
+        except Exception:
+            n_elec = None
+        if n_elec is not None and n_elec > 0:
+            # SOMO index for odd-electron system (alpha channel fill)
+            homo = int((n_elec + 1) // 2 - 1)
+            homo = max(0, min(homo, len(window._afm_eigvals) - 1))
+            window._afm_homo_note = f"open shell n_e={n_elec} → SOMO#{homo}"
+            print(f"[AFM/STM] WARNING: {window._afm_homo_note} ({e})")
+            return homo
+        window._afm_homo_note = str(e)
+        print(f"[AFM/STM] WARNING: HOMO unavailable: {e}")
+        return None
 
 
 def _update_homo_label(window):
@@ -189,14 +484,19 @@ def _update_homo_label(window):
         return
     homo = _get_homo_index(window)
     if homo is None:
-        window.afm_homo_label.setText("(run SCF first)")
+        note = getattr(window, '_afm_homo_note', None) or "run SCF first"
+        window.afm_homo_label.setText(f"({note})")
         return
     nmo = len(window._afm_eigvals)
     lumo = homo + 1
-    e_homo = window._afm_eigvals[homo]
-    e_lumo = window._afm_eigvals[lumo] if lumo < nmo else float('nan')
-    window.afm_homo_label.setText(f"#{homo}  (E={e_homo:.3f} eV,  LUMO #{lumo} E={e_lumo:.3f} eV)")
-    # Also bump orbital spin max to nmo-1
+    e_homo = float(window._afm_eigvals[homo]) * 27.2114
+    e_lumo = float(window._afm_eigvals[lumo]) * 27.2114 if lumo < nmo else float('nan')
+    note = getattr(window, '_afm_homo_note', None)
+    tag = "SOMO" if note and "open shell" in note else "HOMO"
+    txt = f"#{homo} {tag} (E={e_homo:.2f} eV,  +1 #{lumo} E={e_lumo:.2f} eV)"
+    if note:
+        txt += f"  [{note}]"
+    window.afm_homo_label.setText(txt)
     if hasattr(window, 'afm_orbital_spin'):
         window.afm_orbital_spin.setRange(0, nmo - 1)
         window.afm_orbital_spin.setValue(homo)
@@ -243,47 +543,18 @@ def _ensure_stages_for_component(window, component):
     params = _get_pipeline_params(window)
 
     def _need_s1_to_s4():
-        """Run stages 1-4 if any of them are dirty or results missing."""
-        pipe = _ensure_pipeline(window)
-        if dirty.is_dirty('s1') or window._afm_eigvecs is None:
-            _update_afm_status(window, "Auto: Stage 1 SCF...")
-            dm_dense, eigvecs, eigvals = pipe.stage1_scf(force_recompute=dirty.is_dirty('s1'))
-            dirty.clean('s1')
-            window._afm_eigvecs = eigvecs; window._afm_eigvals = eigvals
-            _update_homo_label(window)
-        else:
-            dm_dense = None  # Will be loaded from cache if s2 needs it
-
-        if dirty.is_dirty('s2') or window._afm_density is None:
-            if dm_dense is None:
-                data = np.load(pipe.cache_stage1, allow_pickle=True)
-                dm_dense = data['dm_dense']
-            _update_afm_status(window, "Auto: Stage 2 grid...")
-            rho_scf, rho_na, rho_diff = pipe.stage2_project(dm_dense, force_recompute=dirty.is_dirty('s2'))
-            dirty.clean('s2')
-            window._afm_density = {'rho_scf': rho_scf, 'rho_na': rho_na, 'rho_diff': rho_diff,
-                                    'origin': pipe.origin, 'ngrid': pipe.ngrid, 'grid_spec': pipe.grid_spec}
-        if dirty.is_dirty('s3') or window._afm_potentials is None:
-            d = window._afm_density
-            _update_afm_status(window, "Auto: Stage 3 potentials...")
-            V_ES, E_pauli, E_ES, E_vdw, F_total = pipe.stage3_potentials(
-                d['rho_scf'], d['rho_na'], d['rho_diff'], force_recompute=dirty.is_dirty('s3'),
-                pauli_params={'A': params['pauli_a'], 'beta': params['pauli_beta']},
-                vdw_params={'C6_CO': params['c6']})
-            dirty.clean('s3')
-            window._afm_potentials = {'V_ES': V_ES, 'E_pauli_field': E_pauli, 'E_ES_field': E_ES,
-                                       'E_vdw': E_vdw, 'F_total': F_total,
-                                       'origin': pipe.origin, 'step': pipe.step, 'grid_spec': pipe.grid_spec}
-        if dirty.is_dirty('s4') or window._afm_results is None or 'df' not in (window._afm_results or {}):
-            _update_afm_status(window, "Auto: Stage 4 relax...")
-            df, tip_disp, FEs_relax = pipe.stage4_relax(
-                window._afm_potentials['F_total'], force_recompute=dirty.is_dirty('s4'),
-                relax_params={'K_LAT': params['klat']}, ppm_mode=True)
-            dirty.clean('s4')
-            window._afm_results = {'df': df, 'tip_disp': tip_disp, 'FEs_relax': FEs_relax,
-                                    'heights': pipe.heights, 'scan_xs': pipe.scan_xs, 'scan_ys': pipe.scan_ys}
-            # Keep UI z-height (default 3.0 Å); do not jump to mid-scan height
-
+        """Run stages 1-4 if any of them are dirty or results missing (amp-aware SSOT)."""
+        need = (
+            dirty.is_dirty('s1') or dirty.is_dirty('s2') or dirty.is_dirty('s3') or dirty.is_dirty('s4')
+            or window._afm_eigvecs is None
+            or window._afm_density is None
+            or window._afm_potentials is None
+            or window._afm_results is None
+            or 'df' not in (window._afm_results or {})
+            or (window._afm_results or {}).get('backend') == 'morse'
+        )
+        if need:
+            _run_afm_s1_to_s4(window, plot=False)
     if component == "AFM Image (df)":
         _need_s1_to_s4()
 
@@ -332,92 +603,264 @@ def _ensure_stages_for_component(window, component):
         window._afm_refresh_dirty_label()
 
 
-def run_afm_full_pipeline(window):
-    """Run complete AFM pipeline (stages 1-4), then STM/BR-STM if enabled.
-    Only recomputes stages that are marked dirty."""
-    try:
-        atomPos, _, enames = _get_afm_geometry(window)
-        if len(atomPos) == 0:
-            raise ValueError("No atoms in molecule")
+def _run_afm_s1_to_s4(window, *, plot=False):
+    """Ensure AFM Stages 1–4 are ready (dirty-aware). No STM/BR-STM.
 
-        pipe = _ensure_pipeline(window)
-        dirty = window._afm_dirty
-        params = _get_pipeline_params(window)
+    Height / df SSOT matches CLI ``afm`` / ``stm br``:
+      UI hmin–hmax = df display window; PP scan = ±amp; df = ``compute_df_amp``.
 
-        _update_afm_status(window, f"Pipeline [{dirty.status_str()}] - running dirty stages...")
+    Returns (df, tip_disp, FEs_relax, pipe).
+    """
+    from spammm.SPM import AFM as afm_mod
 
-        # --- Stage 1: SCF ---
-        _update_afm_status(window, "Stage 1: DFTB+ SCF...")
-        dm_dense, eigvecs, eigvals = pipe.stage1_scf(force_recompute=dirty.is_dirty('s1'))
-        dirty.clean('s1')
-        window._afm_eigvecs = eigvecs
-        window._afm_eigvals = eigvals
-        _update_homo_label(window)
+    atomPos, _, enames = _get_afm_geometry(window)
+    if len(atomPos) == 0:
+        raise ValueError("No atoms in molecule")
 
-        # --- Stage 2: Grid projection ---
-        _update_afm_status(window, "Stage 2: Grid projection...")
-        rho_scf, rho_na, rho_diff = pipe.stage2_project(dm_dense, force_recompute=dirty.is_dirty('s2'))
-        dirty.clean('s2')
-        window._afm_density = {
-            'rho_scf': rho_scf, 'rho_na': rho_na, 'rho_diff': rho_diff,
-            'origin': pipe.origin, 'ngrid': pipe.ngrid, 'grid_spec': pipe.grid_spec,
-        }
+    pipe = _ensure_pipeline(window)
+    dirty = window._afm_dirty
+    params = _get_pipeline_params(window)
 
-        # --- Stage 3: Potentials ---
-        _update_afm_status(window, "Stage 3: FDBM potentials...")
-        V_ES, E_pauli_field, E_ES_field, E_vdw, F_total = pipe.stage3_potentials(
-            rho_scf, rho_na, rho_diff, force_recompute=dirty.is_dirty('s3'),
-            pauli_params={'A': params['pauli_a'], 'beta': params['pauli_beta']},
-            vdw_params={'C6_CO': params['c6']},
-        )
-        dirty.clean('s3')
-        window._afm_potentials = {
-            'V_ES': V_ES, 'E_pauli_field': E_pauli_field, 'E_ES_field': E_ES_field,
-            'E_vdw': E_vdw, 'F_total': F_total,
-            'origin': pipe.origin, 'step': pipe.step, 'grid_spec': pipe.grid_spec,
-        }
+    _h_df, _h_Fz, h_scan, amp, heights_changed = _sync_pipe_heights_amp(pipe, params)
+    if heights_changed:
+        dirty.mark('s4')
+        if os.path.exists(pipe.cache_stage4):
+            try:
+                os.remove(pipe.cache_stage4)
+            except OSError:
+                pass
 
-        # --- Stage 4: Relaxation ---
-        _update_afm_status(window, "Stage 4: PP relaxation...")
-        df, tip_disp, FEs_relax = pipe.stage4_relax(
-            F_total, force_recompute=dirty.is_dirty('s4'),
-            relax_params={'K_LAT': params['klat']}, ppm_mode=True,
-        )
-        dirty.clean('s4')
-        window._afm_results = {
-            'df': df, 'tip_disp': tip_disp, 'FEs_relax': FEs_relax,
-            'heights': pipe.heights, 'scan_xs': pipe.scan_xs, 'scan_ys': pipe.scan_ys,
-        }
+    _update_afm_status(
+        window,
+        f"AFM S1–S4 [{dirty.status_str()}]  df=[{params['hmin']:.2f},{params['hmax']:.2f}]  "
+        f"scan=[{float(h_scan[0]):.2f},{float(h_scan[-1]):.2f}] amp={amp:.2f}...")
 
-        # --- Stage 5/6: STM / BR-STM (always fast, rerun on request) ---
-        stm_enable = hasattr(window, 'afm_stm_enable') and window.afm_stm_enable.isChecked()
-        if stm_enable:
-            sp = _get_stm_params_from_ui(window)
-            _update_afm_status(window, f"Stage 5: STM (field={sp['field']}, lumo_offsets={sp['lumo_offsets']})...")
-            stm_grid = pipe.stage5_stm(eigvecs, eigvals,
-                lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
-                field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
-            window._afm_results['stm_grid'] = stm_grid
-            dirty.clean('s5')
+    _update_afm_status(window, "Stage 1: DFTB+ SCF...")
+    dm_dense, eigvecs, eigvals = pipe.stage1_scf(force_recompute=dirty.is_dirty('s1'))
+    dirty.clean('s1')
+    window._afm_eigvecs = eigvecs
+    window._afm_eigvals = eigvals
+    _update_homo_label(window)
 
-            if sp['bond_resolved']:
-                _update_afm_status(window, "Stage 6: BR-STM...")
-                br_stm_grid = pipe.stage6_br_stm(eigvecs, eigvals, tip_disp,
-                    lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
-                    field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
-                window._afm_results['br_stm_grid'] = br_stm_grid
-                dirty.clean('s6')
+    _update_afm_status(window, "Stage 2: Grid projection...")
+    rho_scf_stock, rho_na, rho_diff = pipe.stage2_project(dm_dense, force_recompute=dirty.is_dirty('s2'))
+    dirty.clean('s2')
+    window._afm_density = {
+        'rho_scf': rho_scf_stock, 'rho_na': rho_na, 'rho_diff': rho_diff,
+        'origin': pipe.origin, 'ngrid': pipe.ngrid, 'grid_spec': pipe.grid_spec,
+    }
 
-        # Keep UI z-height (default 3.0 Å); do not jump to mid-scan height
+    proj = params.get('projection', 'prolonged')
+    if proj == 'prolonged':
+        _update_afm_status(window, "Stage 2b: prolonged Pauli ρ...")
+        rho_scf_pauli = pipe.project_pauli_rho(dm_dense, projection='prolonged',
+                                               rho_scf_stock=rho_scf_stock)
+    else:
+        rho_scf_pauli = rho_scf_stock
+
+    _update_afm_status(window, f"Stage 3: FDBM potentials ({proj})...")
+    V_ES, E_pauli_field, E_ES_field, E_vdw, F_total = pipe.stage3_potentials(
+        rho_scf_pauli, rho_na, rho_diff, force_recompute=dirty.is_dirty('s3'),
+        pauli_params={'A': params['pauli_a'], 'beta': params['pauli_beta']},
+        vdw_params={'C6_CO': params['c6']},
+    )
+    dirty.clean('s3')
+    window._afm_potentials = {
+        'V_ES': V_ES, 'E_pauli_field': E_pauli_field, 'E_ES_field': E_ES_field,
+        'E_vdw': E_vdw, 'F_total': F_total,
+        'origin': pipe.origin, 'step': pipe.step, 'grid_spec': pipe.grid_spec,
+    }
+
+    _update_afm_status(window, "Stage 4: PP relaxation + compute_df_amp...")
+    force_s4 = dirty.is_dirty('s4') or heights_changed
+    if (not force_s4) and os.path.exists(pipe.cache_stage4):
+        cached_nz = int(np.load(pipe.cache_stage4)['FEs_relax'].shape[2])
+        if cached_nz != int(len(pipe.heights)):
+            force_s4 = True
+    _df_legacy, tip_disp, FEs_relax = pipe.stage4_relax(
+        F_total, force_recompute=force_s4,
+        relax_params={'K_LAT': params['klat'], 'bond_length': params.get('bond_length', 3.0)},
+        ppm_mode=True,
+    )
+    del _df_legacy
+    Fz = np.asarray(FEs_relax[:, :, :, 2], dtype=np.float32)
+    dz = float(pipe.heights[1] - pipe.heights[0])
+    df = afm_mod.compute_df_amp(Fz, dz, amp=float(amp))
+    dirty.clean('s4')
+    # Preserve any existing STM grids if present
+    prev = window._afm_results or {}
+    window._afm_results = {
+        'df': df, 'tip_disp': tip_disp, 'FEs_relax': FEs_relax,
+        'heights': pipe.heights, 'scan_xs': pipe.scan_xs, 'scan_ys': pipe.scan_ys,
+        'amp': float(amp), 'backend': 'fdbm',
+    }
+    for k in ('stm_grid', 'br_stm_grid'):
+        if k in prev:
+            window._afm_results[k] = prev[k]
+
+    if plot:
+        if hasattr(window, 'afm_component_combo'):
+            idx = window.afm_component_combo.findText("AFM Image (df)")
+            if idx >= 0:
+                window.afm_component_combo.setCurrentIndex(idx)
         plot_afm_slice(window)
 
-        nz = df.shape[2]
-        msg = f"Done [{dirty.status_str()}]  df=[{df.min():.2f},{df.max():.2f}]Hz  {nz} heights"
-        _update_afm_status(window, msg)
+    return df, tip_disp, FEs_relax, pipe
 
+
+def run_afm_full_pipeline(window):
+    """AFM only. FDBM → ModularPipeline S1–S4; Morse → shared run_morse_coulomb_afm."""
+    try:
+        params = _get_pipeline_params(window)
+        if params.get('backend') == 'morse':
+            df, tip_disp, _res = _run_morse_coulomb_gui(window, plot=True)
+            nz = df.shape[2]
+            _update_afm_status(
+                window,
+                f"Morse+Coulomb AFM done  df=[{df.min():.2f},{df.max():.2f}]Hz  {nz} heights")
+            return
+        df, tip_disp, FEs_relax, pipe = _run_afm_s1_to_s4(window, plot=True)
+        nz = df.shape[2]
+        dxy = float(np.hypot(tip_disp['dx'], tip_disp['dy']).max())
+        amp = float((_get_pipeline_params(window)).get('amp', 1.0))
+        _update_afm_status(
+            window,
+            f"AFM done [{window._afm_dirty.status_str()}]  "
+            f"df=[{df.min():.2f},{df.max():.2f}]Hz amp={amp:.2f}  |dxy|_max={dxy:.3f}Å  {nz} heights")
     except Exception as e:
         _update_afm_status(window, f"FAILED: {e}")
         raise
+
+
+def run_stm(window):
+    """STM only (S5): needs SCF MOs, no PP relaxation. Plots flat STM."""
+    try:
+        _require_fdbm_backend(window, what='STM')
+        pipe = _ensure_pipeline(window)
+        dirty = window._afm_dirty
+        # SCF only — no S2–S4 required for flat STM
+        if dirty.is_dirty('s1') or window._afm_eigvecs is None:
+            _update_afm_status(window, "STM needs SCF — running Stage 1...")
+            dm_dense, eigvecs, eigvals = pipe.stage1_scf(force_recompute=dirty.is_dirty('s1'))
+            dirty.clean('s1')
+            window._afm_eigvecs = eigvecs
+            window._afm_eigvals = eigvals
+            _update_homo_label(window)
+
+        sp = _get_stm_params_from_ui(window)
+        _update_afm_status(window, f"STM (field={sp['field']}, MOs={sp['mo_indices']})...")
+        stm_grid = pipe.stage5_stm(
+            window._afm_eigvecs, window._afm_eigvals,
+            lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
+            field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
+        if window._afm_results is None:
+            window._afm_results = {
+                'heights': pipe.heights, 'scan_xs': pipe.scan_xs, 'scan_ys': pipe.scan_ys,
+            }
+        window._afm_results['stm_grid'] = stm_grid
+        window._afm_results.setdefault('heights', pipe.heights)
+        window._afm_results.setdefault('scan_xs', pipe.scan_xs)
+        window._afm_results.setdefault('scan_ys', pipe.scan_ys)
+        dirty.clean('s5')
+
+        if hasattr(window, 'afm_component_combo'):
+            idx = window.afm_component_combo.findText("STM Signal")
+            if idx >= 0:
+                window.afm_component_combo.setCurrentIndex(idx)
+        plot_afm_slice(window)
+        _update_afm_status(window, f"STM done. [{dirty.status_str()}]")
+    except Exception as e:
+        _update_afm_status(window, f"FAILED: {e}")
+        raise
+
+
+def run_br_stm(window):
+    """BR-STM product: auto AFM S1–S4 if needed, then S5+S6, plot 4-panel."""
+    try:
+        _require_fdbm_backend(window, what='BR-STM')
+        # Auto-run AFM if tip_disp / df missing or dirty
+        need_afm = (
+            window._afm_results is None
+            or (window._afm_results or {}).get('backend') == 'morse'
+            or 'tip_disp' not in (window._afm_results or {})
+            or 'df' not in (window._afm_results or {})
+            or window._afm_dirty.is_dirty('s1')
+            or window._afm_dirty.is_dirty('s2')
+            or window._afm_dirty.is_dirty('s3')
+            or window._afm_dirty.is_dirty('s4')
+        )
+        if need_afm:
+            _update_afm_status(window, "BR-STM needs AFM distortions — running S1–S4 first...")
+            _run_afm_s1_to_s4(window, plot=False)
+
+        pipe = _ensure_pipeline(window)
+        sp = _get_stm_params_from_ui(window)
+        tip_disp = window._afm_results['tip_disp']
+
+        _update_afm_status(window, f"STM flat (MOs={sp['mo_indices']})...")
+        stm_grid = pipe.stage5_stm(
+            window._afm_eigvecs, window._afm_eigvals,
+            lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
+            field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
+        window._afm_results['stm_grid'] = stm_grid
+        window._afm_dirty.clean('s5')
+
+        _update_afm_status(window, "BR-STM (Stage 6)...")
+        br_stm_grid = pipe.stage6_br_stm(
+            window._afm_eigvecs, window._afm_eigvals, tip_disp,
+            lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
+            field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
+        window._afm_results['br_stm_grid'] = br_stm_grid
+        window._afm_dirty.clean('s6')
+
+        if hasattr(window, 'afm_component_combo'):
+            idx = window.afm_component_combo.findText("BR-STM Panel")
+            if idx >= 0:
+                window.afm_component_combo.setCurrentIndex(idx)
+        plot_brstm_panel(window)
+        _update_afm_status(window, f"BR-STM done. [{window._afm_dirty.status_str()}]")
+    except Exception as e:
+        _update_afm_status(window, f"FAILED: {e}")
+        raise
+
+
+def plot_brstm_panel(window):
+    """2×2: AFM df | |dxy|+PP dots | STM flat | BR-STM."""
+    try:
+        import matplotlib
+        matplotlib.use('Qt5Agg')
+        from matplotlib.figure import Figure
+        from spammm.SPM import AFM_utils as au
+
+        if window._afm_results is None or 'df' not in window._afm_results:
+            raise ValueError("No AFM df — run AFM or BR-STM first.")
+        if 'stm_grid' not in window._afm_results or 'br_stm_grid' not in window._afm_results:
+            raise ValueError("No STM/BR-STM grids — run BR-STM button.")
+
+        z_height = float(window.afm_z_height_spin.value())
+        _ensure_height_covers(window, z_height, margin=1.0)
+
+        heights = np.asarray(window._afm_results['heights'], dtype=np.float64)
+        iz = int(np.argmin(np.abs(heights - z_height)))
+        actual_z = float(heights[iz])
+        apos = None
+        if hasattr(window, 'backend') and window.backend.sys is not None:
+            apos = np.asarray(window.backend.sys.apos, dtype=np.float64)
+
+        fig = Figure(figsize=(9.5, 8.5), dpi=110)
+        au.plot_brstm_compare_slice(
+            window._afm_results['df'][:, :, iz],
+            window._afm_results['stm_grid'][:, :, iz],
+            window._afm_results['br_stm_grid'][:, :, iz],
+            window._afm_results['tip_disp'],
+            window._afm_results['scan_xs'], window._afm_results['scan_ys'], iz,
+            apos=apos, title=f'BR-STM  z={actual_z:.2f}Å', dpi=110, fig=fig,
+            pp_stride=4, stm_cmap='viridis',
+        )
+        _show_in_plot_window(window, fig, f"BR-STM Panel z={actual_z:.2f}Å")
+        window.statusBar().showMessage(f"BR-STM panel at z={actual_z:.2f}Å")
+    except Exception as e:
+        raise RuntimeError(f"BR-STM panel FAILED: {e}")
 
 
 def run_afm_stage1(window):
@@ -462,6 +905,7 @@ def run_afm_stage2(window):
         raise
 
 
+
 def run_afm_stage3(window):
     """Run Stage 3 (potentials) only."""
     try:
@@ -496,55 +940,27 @@ def run_afm_stage4(window):
         if window._afm_potentials is None or 'F_total' not in window._afm_potentials:
             raise ValueError("Stage 3 not computed. Run Stage 3 first.")
         params = _get_pipeline_params(window)
-        _update_afm_status(window, "Stage 4: PP relaxation (forced)...")
-        df, tip_disp, FEs_relax = pipe.stage4_relax(
+        from spammm.SPM import AFM as afm_mod
+        _h_df, _h_Fz, h_scan, amp, _ = _sync_pipe_heights_amp(pipe, params)
+        _update_afm_status(window, f"Stage 4: PP relaxation + compute_df_amp (amp={amp:.2f})...")
+        _df_legacy, tip_disp, FEs_relax = pipe.stage4_relax(
             window._afm_potentials['F_total'], force_recompute=True,
-            relax_params={'K_LAT': params['klat']}, ppm_mode=True,
+            relax_params={'K_LAT': params['klat'], 'bond_length': params.get('bond_length', 3.0)}, ppm_mode=True,
         )
+        del _df_legacy
+        Fz = np.asarray(FEs_relax[:, :, :, 2], dtype=np.float32)
+        dz = float(pipe.heights[1] - pipe.heights[0])
+        df = afm_mod.compute_df_amp(Fz, dz, amp=float(amp))
         window._afm_dirty.mark('s4')
         window._afm_dirty.clean('s4')
         window._afm_results = {
             'df': df, 'tip_disp': tip_disp, 'FEs_relax': FEs_relax,
             'heights': pipe.heights, 'scan_xs': pipe.scan_xs, 'scan_ys': pipe.scan_ys,
+            'amp': float(amp), 'backend': 'fdbm',
         }
-        # Keep UI z-height (default 3.0 Å); do not jump to mid-scan height
+        # Keep UI z-height; do not jump to mid-scan height
         plot_afm_slice(window)
         _update_afm_status(window, f"Stage 4 done. [{window._afm_dirty.status_str()}]")
-    except Exception as e:
-        _update_afm_status(window, f"FAILED: {e}")
-        raise
-
-
-def run_stm(window):
-    """Run STM/BR-STM independently (stages 5/6 only - very fast from cache)."""
-    try:
-        pipe = _ensure_pipeline(window)
-        if window._afm_eigvecs is None:
-            raise ValueError("Eigenvectors not available. Run at least Stage 1 first.")
-        if window._afm_results is None or 'tip_disp' not in window._afm_results:
-            raise ValueError("Tip displacements not available. Run Stage 4 first.")
-
-        sp = _get_stm_params_from_ui(window)
-        eigvecs = window._afm_eigvecs
-        eigvals = window._afm_eigvals
-        tip_disp = window._afm_results['tip_disp']
-
-        _update_afm_status(window, f"STM (field={sp['field']}, lumo_offsets={sp['lumo_offsets']})...")
-        stm_grid = pipe.stage5_stm(eigvecs, eigvals,
-            lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
-            field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
-        window._afm_results['stm_grid'] = stm_grid
-        window._afm_dirty.clean('s5')
-
-        if sp['bond_resolved']:
-            _update_afm_status(window, "BR-STM...")
-            br_stm_grid = pipe.stage6_br_stm(eigvecs, eigvals, tip_disp,
-                lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
-                field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
-            window._afm_results['br_stm_grid'] = br_stm_grid
-            window._afm_dirty.clean('s6')
-
-        _update_afm_status(window, f"STM done. [{window._afm_dirty.status_str()}]")
     except Exception as e:
         _update_afm_status(window, f"FAILED: {e}")
         raise
@@ -646,11 +1062,21 @@ def plot_afm_slice(window):
         from matplotlib.figure import Figure
 
         component = window.afm_component_combo.currentText()
+        if component == "BR-STM Panel":
+            plot_brstm_panel(window)
+            return
         z_height = window.afm_z_height_spin.value()
         auto_limits = window.afm_auto_limits.isChecked()
 
         # Auto-run any needed pipeline stages
-        _ensure_stages_for_component(window, component)
+        if component == "|dxy| tip":
+            _ensure_stages_for_component(window, "AFM Image (df)")
+        else:
+            _ensure_stages_for_component(window, component)
+
+        # Expand scan heights if z spinner left the computed window (margin=1Å)
+        if component in ("AFM Image (df)", "|dxy| tip", "STM Signal", "BR-STM Signal"):
+            _ensure_height_covers(window, z_height, margin=1.0)
 
         # Determine data source and get grid info
         if component == "AFM Image (df)":
@@ -671,6 +1097,19 @@ def plot_afm_slice(window):
             data_label = "Frequency Shift (Hz)"
             # Extract slice data
             data = data_3d[:, :, iz]
+
+        elif component == "|dxy| tip":
+            if window._afm_results is None or 'tip_disp' not in window._afm_results:
+                raise ValueError("No tip_disp. Run Stage 4 first.")
+            tip = window._afm_results['tip_disp']
+            heights = window._afm_results.get('heights', [])
+            h_idx = np.argmin(np.abs(np.asarray(heights) - z_height))
+            actual_z = heights[h_idx]
+            iz = h_idx
+            data = np.hypot(tip['dx'][:, :, iz], tip['dy'][:, :, iz])
+            cmap = 'magma'
+            symmetric = False
+            data_label = "|dxy| (Å)"
 
         elif component in ("STM Signal", "BR-STM Signal"):
             grid_key = 'stm_grid' if component == "STM Signal" else 'br_stm_grid'
@@ -905,13 +1344,25 @@ def build_ui(window):
         window.afm_dirty_label.setText(f"Cache: [{window._afm_dirty.status_str()}]")
     window._afm_refresh_dirty_label = _refresh_dirty_label
 
-    # --- Main pipeline button ---
-    full_btn = QtWidgets.QPushButton("Run Full AFM Pipeline (smart)")
-    full_btn.setToolTip("Runs only dirty stages. Change geometry or params to force recompute.")
-    full_btn.clicked.connect(lambda: (run_afm_full_pipeline(window), _refresh_dirty_label()))
-    layout.addWidget(full_btn)
+    # --- Three product buttons: AFM | STM | BR-STM ---
+    main_row = QtWidgets.QHBoxLayout()
+    afm_btn = QtWidgets.QPushButton("AFM")
+    afm_btn.setToolTip("S1–S4 only: FDBM + PP relax → df / tip_disp. No STM/BR-STM.")
+    afm_btn.clicked.connect(lambda: (run_afm_full_pipeline(window), _refresh_dirty_label()))
+    main_row.addWidget(afm_btn)
 
-    # --- Individual stage buttons ---
+    stm_btn = QtWidgets.QPushButton("STM")
+    stm_btn.setToolTip("Flat STM only (needs SCF). No PP relaxation.")
+    stm_btn.clicked.connect(lambda: (run_stm(window), _refresh_dirty_label()))
+    main_row.addWidget(stm_btn)
+
+    br_btn = QtWidgets.QPushButton("BR-STM")
+    br_btn.setToolTip("Product mode: auto-runs AFM S1–S4 if needed, then STM+BR → 4-panel.")
+    br_btn.clicked.connect(lambda: (run_br_stm(window), _refresh_dirty_label()))
+    main_row.addWidget(br_btn)
+    layout.addLayout(main_row)
+
+    # --- Individual stage buttons (advanced) ---
     stage_layout = QtWidgets.QHBoxLayout()
     s1_btn = QtWidgets.QPushButton("S1: SCF")
     s1_btn.setToolTip("DFTB+ SCF - density matrix and eigenvectors")
@@ -934,13 +1385,8 @@ def build_ui(window):
     stage_layout.addWidget(s4_btn)
     layout.addLayout(stage_layout)
 
-    # STM/orbital row
+    # Orbital plot (separate from product buttons)
     stm_row = QtWidgets.QHBoxLayout()
-    stm_run_btn = QtWidgets.QPushButton("Run STM/BR-STM")
-    stm_run_btn.setToolTip("Run stages 5/6 only (fast from cached S1+S4 data)")
-    stm_run_btn.clicked.connect(lambda: (run_stm(window), _refresh_dirty_label()))
-    stm_row.addWidget(stm_run_btn)
-
     orb_btn = QtWidgets.QPushButton("Plot Orbital")
     orb_btn.setToolTip("Plot selected MO with phase (needs S1)")
     orb_btn.clicked.connect(lambda: plot_orbital_map(window))
@@ -965,17 +1411,36 @@ def build_ui(window):
     density_grid = QtWidgets.QGridLayout(density_group)
     density_grid.addWidget(QtWidgets.QLabel("Basis:"), 0, 0)
     window.afm_basis_combo = QtWidgets.QComboBox()
-    window.afm_basis_combo.addItems(["mio-1-1", "3ob-3-1"])
+    window.afm_basis_combo.addItems(["3ob-3-1", "mio-1-1"])
     density_grid.addWidget(window.afm_basis_combo, 0, 1)
-    density_grid.addWidget(QtWidgets.QLabel("Step [Å]:"), 1, 0)
+    density_grid.addWidget(QtWidgets.QLabel("AFM backend:"), 1, 0)
+    window.afm_backend_combo = QtWidgets.QComboBox()
+    window.afm_backend_combo.addItems([
+        "DFTB FDBM (prolonged)",
+        "DFTB FDBM (stock)",
+        "Morse+Coulomb (classic)",
+        "pySCF FDBM",
+    ])
+    window.afm_backend_combo.setToolTip(
+        "DFTB FDBM prolonged = dual-basis Pauli (CLI/GUI SSOT).\n"
+        "Morse+Coulomb = classic PP-AFM via shared AFM_utils.run_morse_coulomb_afm (no FDBM).\n"
+        "STM/BR-STM require DFTB FDBM — Morse fails loud (no silent fallback).\n"
+        "pySCF FDBM = density from pySCF (STM not yet).")
+    density_grid.addWidget(window.afm_backend_combo, 1, 1)
+    density_grid.addWidget(QtWidgets.QLabel("Projection:"), 2, 0)
+    window.afm_projection_combo = QtWidgets.QComboBox()
+    window.afm_projection_combo.addItems(["prolonged", "stock"])
+    window.afm_projection_combo.setToolTip("Pauli ρ basis. ES always uses stock Δρ (dual-basis rule).")
+    density_grid.addWidget(window.afm_projection_combo, 2, 1)
+    density_grid.addWidget(QtWidgets.QLabel("Step [Å]:"), 3, 0)
     window.afm_step_spin = QtWidgets.QDoubleSpinBox()
     window.afm_step_spin.setRange(0.05, 0.5); window.afm_step_spin.setValue(0.1); window.afm_step_spin.setSingleStep(0.05)
     window.afm_step_spin.setToolTip("Density/FF grid spacing. Prefer ≤0.1 Å for ES near the molecule (0.15 Å undersamples ρ_diff → broken hex symmetry).")
-    density_grid.addWidget(window.afm_step_spin, 1, 1)
-    density_grid.addWidget(QtWidgets.QLabel("Margin [Å]:"), 2, 0)
+    density_grid.addWidget(window.afm_step_spin, 3, 1)
+    density_grid.addWidget(QtWidgets.QLabel("Margin [Å]:"), 4, 0)
     window.afm_margin_spin = QtWidgets.QDoubleSpinBox()
     window.afm_margin_spin.setRange(2.0, 10.0); window.afm_margin_spin.setValue(4.0)
-    density_grid.addWidget(window.afm_margin_spin, 2, 1)
+    density_grid.addWidget(window.afm_margin_spin, 4, 1)
     param_layout.addWidget(density_group)
 
     scan_group = QtWidgets.QGroupBox("Scan")
@@ -986,16 +1451,26 @@ def build_ui(window):
     scan_grid.addWidget(window.afm_scan_range_spin, 0, 1)
     scan_grid.addWidget(QtWidgets.QLabel("H min:"), 1, 0)
     window.afm_hmin_spin = QtWidgets.QDoubleSpinBox()
-    window.afm_hmin_spin.setRange(1.5, 5.0); window.afm_hmin_spin.setValue(2.8)
+    window.afm_hmin_spin.setRange(1.0, 12.0); window.afm_hmin_spin.setValue(3.7)
+    window.afm_hmin_spin.setToolTip("df display window bottom [Å] (CLI SSOT 3.7). PP scan extends −amp.")
     scan_grid.addWidget(window.afm_hmin_spin, 1, 1)
     scan_grid.addWidget(QtWidgets.QLabel("H max:"), 2, 0)
     window.afm_hmax_spin = QtWidgets.QDoubleSpinBox()
-    window.afm_hmax_spin.setRange(3.0, 8.0); window.afm_hmax_spin.setValue(3.6)
+    window.afm_hmax_spin.setRange(1.5, 15.0); window.afm_hmax_spin.setValue(4.7)
+    window.afm_hmax_spin.setToolTip("df display window top [Å] (CLI SSOT 4.7). Live Z outside scan auto-expands.")
     scan_grid.addWidget(window.afm_hmax_spin, 2, 1)
     scan_grid.addWidget(QtWidgets.QLabel("H step:"), 3, 0)
     window.afm_hstep_spin = QtWidgets.QDoubleSpinBox()
     window.afm_hstep_spin.setRange(0.05, 0.3); window.afm_hstep_spin.setValue(0.1)
     scan_grid.addWidget(window.afm_hstep_spin, 3, 1)
+    scan_grid.addWidget(QtWidgets.QLabel("Amp [Å]:"), 4, 0)
+    window.afm_amp_spin = QtWidgets.QDoubleSpinBox()
+    window.afm_amp_spin.setRange(0.1, 3.0); window.afm_amp_spin.setValue(1.0)
+    window.afm_amp_spin.setSingleStep(0.1)
+    window.afm_amp_spin.setToolTip(
+        "Oscillation amplitude for compute_df_amp (CLI SSOT = 1.0 Å peak).\n"
+        "PP scan covers [Hmin−amp, Hmax+amp]. df(h) samples Fz around h±amp.")
+    scan_grid.addWidget(window.afm_amp_spin, 4, 1)
     param_layout.addWidget(scan_group)
 
     physics_group = QtWidgets.QGroupBox("Physics")
@@ -1036,6 +1511,11 @@ def build_ui(window):
         window.afm_klat_eva2_label.setText(f"  → {k_ev:.4f} eV/Å²  (internal)")
     _refresh_klat_unit_label()
     window.afm_klat_spin.valueChanged.connect(_refresh_klat_unit_label)
+    physics_grid.addWidget(QtWidgets.QLabel("L bond [Å]:"), 5, 0)
+    window.afm_bond_length_spin = QtWidgets.QDoubleSpinBox()
+    window.afm_bond_length_spin.setRange(1.0, 6.0); window.afm_bond_length_spin.setValue(3.0)
+    window.afm_bond_length_spin.setToolTip("Tip–probe lever length L (CLI SSOT = 3.0 Å)")
+    physics_grid.addWidget(window.afm_bond_length_spin, 5, 1)
     param_layout.addWidget(physics_group)
 
     def on_basis_changed(idx):
@@ -1047,6 +1527,18 @@ def build_ui(window):
         elif basis == '3ob-3-1':
             window.afm_pauli_a_spin.setValue(509.28); window.afm_pauli_beta_spin.setValue(1.0586)
     window.afm_basis_combo.currentIndexChanged.connect(on_basis_changed)
+    # Default basis is 3ob — sync Pauli spins
+    window.afm_pauli_a_spin.setValue(509.28); window.afm_pauli_beta_spin.setValue(1.0586)
+
+    def on_backend_changed(_idx=None):
+        be = window.afm_backend_combo.currentText()
+        if 'stock' in be.lower():
+            window.afm_projection_combo.setCurrentText('stock')
+        elif 'prolonged' in be.lower() or be.startswith('DFTB FDBM'):
+            window.afm_projection_combo.setCurrentText('prolonged')
+        window._afm_dirty.mark_geometry_changed()
+        _refresh_dirty_label()
+    window.afm_backend_combo.currentIndexChanged.connect(on_backend_changed)
 
     def _mark_s2(): window._afm_dirty.mark_density_params_changed(); _refresh_dirty_label()
     def _mark_s3(): window._afm_dirty.mark_physics_params_changed(); _refresh_dirty_label()
@@ -1055,14 +1547,17 @@ def build_ui(window):
 
     window.afm_step_spin.valueChanged.connect(_mark_s2)
     window.afm_margin_spin.valueChanged.connect(_mark_s2)
+    window.afm_projection_combo.currentIndexChanged.connect(_mark_s3)
     window.afm_pauli_a_spin.valueChanged.connect(_mark_s3)
     window.afm_pauli_beta_spin.valueChanged.connect(_mark_s3)
     window.afm_vdw_c6_spin.valueChanged.connect(_mark_s3)
     window.afm_klat_spin.valueChanged.connect(_mark_s4)
+    window.afm_bond_length_spin.valueChanged.connect(_mark_s4)
     window.afm_scan_range_spin.valueChanged.connect(_mark_s4)
     window.afm_hmin_spin.valueChanged.connect(_mark_s4)
     window.afm_hmax_spin.valueChanged.connect(_mark_s4)
     window.afm_hstep_spin.valueChanged.connect(_mark_s4)
+    window.afm_amp_spin.valueChanged.connect(_mark_s4)
 
     param_sec.setContent(param_widget)
     layout.addWidget(param_sec)
@@ -1075,7 +1570,7 @@ def build_ui(window):
 
     window.afm_component_combo = QtWidgets.QComboBox()
     window.afm_component_combo.addItems([
-        "AFM Image (df)", "STM Signal", "BR-STM Signal",
+        "AFM Image (df)", "|dxy| tip", "STM Signal", "BR-STM Signal", "BR-STM Panel",
         "SCF Density", "Neutral Density", "Delta Density",
         "Pauli Energy", "Electrostatic Energy", "vdW Energy",
         "Total Potential", "Total Z-Force",
@@ -1086,7 +1581,7 @@ def build_ui(window):
     z_layout = QtWidgets.QHBoxLayout()
     z_layout.addWidget(QtWidgets.QLabel("Z-height (A):"))
     window.afm_z_height_spin = QtWidgets.QDoubleSpinBox()
-    window.afm_z_height_spin.setRange(-20.0, 20.0); window.afm_z_height_spin.setValue(3.0)
+    window.afm_z_height_spin.setRange(-20.0, 20.0); window.afm_z_height_spin.setValue(4.2)
     window.afm_z_height_spin.setSingleStep(0.1); window.afm_z_height_spin.setDecimals(2)
     z_layout.addWidget(window.afm_z_height_spin)
     window.afm_live_update = QtWidgets.QCheckBox("Live")
@@ -1098,8 +1593,11 @@ def build_ui(window):
         if window.afm_live_update.isChecked():
             has_data = (window._afm_results is not None) or (window._afm_potentials is not None) or (window._afm_density is not None)
             if has_data:
-                try: plot_afm_slice(window)
-                except Exception: pass
+                try:
+                    # plot_afm_slice / BR panel call _ensure_height_covers if needed
+                    plot_afm_slice(window)
+                except Exception as e:
+                    _update_afm_status(window, f"Z-update failed: {e}")
     window.afm_z_height_spin.valueChanged.connect(on_z_height_changed)
 
     lim_layout = QtWidgets.QHBoxLayout()
@@ -1145,9 +1643,15 @@ def build_ui(window):
     row = 0
 
     window.afm_stm_enable = QtWidgets.QCheckBox("Compute STM in full pipeline")
+    window.afm_stm_enable.setChecked(False)
+    window.afm_stm_enable.setToolTip("Deprecated — use STM / BR-STM buttons. AFM button never runs STM.")
+    window.afm_stm_enable.setVisible(False)  # keep widget for _get_stm_params compat; hide
     stm_grid.addWidget(window.afm_stm_enable, row, 0, 1, 2); row += 1
 
     window.afm_stm_bond_resolved = QtWidgets.QCheckBox("Bond-resolved (BR-STM)")
+    window.afm_stm_bond_resolved.setChecked(True)
+    window.afm_stm_bond_resolved.setToolTip("Used by auto-plot paths; BR-STM button always computes BR.")
+    window.afm_stm_bond_resolved.setVisible(False)
     stm_grid.addWidget(window.afm_stm_bond_resolved, row, 0, 1, 2); row += 1
 
     # HOMO reference (read-only info label, updated after Stage 1)
@@ -1158,8 +1662,8 @@ def build_ui(window):
 
     # MO list: space/comma-separated integers
     stm_grid.addWidget(QtWidgets.QLabel("MO list:"), row, 0)
-    window.afm_stm_mo_list = QtWidgets.QLineEdit("-1 0 1")
-    window.afm_stm_mo_list.setToolTip("Space/comma separated. Relative to HOMO if checkbox below is ticked (0=HOMO, +1=LUMO, -1=HOMO-1). Absolute otherwise.")
+    window.afm_stm_mo_list = QtWidgets.QLineEdit("1")
+    window.afm_stm_mo_list.setToolTip("Relative to HOMO if checkbox below (0=HOMO, +1=LUMO). Default LUMO.")
     stm_grid.addWidget(window.afm_stm_mo_list, row, 1); row += 1
 
     window.afm_stm_relative_mo = QtWidgets.QCheckBox("Relative to HOMO")
@@ -1169,7 +1673,7 @@ def build_ui(window):
 
     stm_grid.addWidget(QtWidgets.QLabel("field:"), row, 0)
     window.afm_stm_field_combo = QtWidgets.QComboBox()
-    window.afm_stm_field_combo.addItems(['ldos', 'psi2', 'psi'])
+    window.afm_stm_field_combo.addItems(['psi2', 'ldos', 'psi'])
     stm_grid.addWidget(window.afm_stm_field_combo, row, 1); row += 1
 
     stm_grid.addWidget(QtWidgets.QLabel("exp_beta:"), row, 0)

@@ -40,17 +40,19 @@ input (.xyz/.mol/.mol2 | ASCII | SMILES)
 | `stm orbitals` | Frontier MO **ψ** (signed), DFTB + pySCF | `stm_compare` |
 | `stm current` | MO-resolved STM **I≥0**, tip s/p_z/p_y | `stm_compare` |
 | `stm panel` | HOMO/LUMO vacuum stock/prolonged/pySCF | `stm_compare` |
+| `stm br` | **BR-STM** 4-row: df / Fz(amp-align) / STM / BR-STM | `AFM_utils.run_br_stm_afm_panel` + ModularPipeline |
 
 ```bash
 python run_spm.py --help
 python run_spm.py smiles-afm --example naphthalene --method uff
 python run_spm.py stm orbitals --molecule pentacene --n-near 5
+python run_spm.py stm br --xyz data/xyz/PTCDA.xyz --show-atoms
 python run_spm.py afm --xyz data/xyz/benzene.xyz --projection both
 ```
 
 **AFM height defaults (2026-07-24):** df window `--h-min/--h-max` = **3.7–4.7** Å, `--h-step/--dz` = **0.1**; amp-align shows Fz at **h−amp** (default amp=1 → Fz 2.7–3.7). Plots default `--plots compare,stage`. Geometry: force planar (`z` identical) + PCA long axis ‖ x.
 
-**Not yet in CLI:** ASCII / `.mol`/`.mol2` shared resolver flags, substrate `dock`, BR-STM.
+**Not yet in CLI:** ASCII / `.mol`/`.mol2` shared resolver flags, substrate `dock`.
 
 ---
 
@@ -116,7 +118,7 @@ Also: vibrations already choose UFF/SPFF/DFTB (`VibrationExtension` / `dynamics/
 
 | Gap | Notes | Related |
 |-----|-------|---------|
-| Bond-resolved STM (BR-STM) | GUI has S6 via `ModularPipeline.stage6_br_stm`; **CLI missing** — must share backend | `AFMExtension`, `Consolidate_GUI_CLI_Backend_Input_Protocol.md` |
+| Bond-resolved STM (BR-STM) | CLI: `run_spm.py stm br` → `AFM_utils.run_br_stm_afm_panel` (S1–S6); GUI still separate path — consolidate later | `Consolidate_GUI_CLI_Backend_Input_Protocol.md` |
 | GUI↔CLI shared job spec | Widget/argparse adapters → JSON dict → one runner | `Consolidate_GUI_CLI_Backend_Input_Protocol.md` |
 | FDBM ↔ Kriging compare | Single CLI entry for method panels | `testplot_kriging_vs_fdbm_cube.py` |
 | Pauli \(A,\beta\) fit modes | Contact / residual vs Kriging | `PauliFitting_TestDesign.md`, `Pauli_A_beta_KrigingTransferability.md` |

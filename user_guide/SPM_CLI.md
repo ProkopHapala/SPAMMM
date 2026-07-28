@@ -44,6 +44,7 @@ Awkward FDBM grid sizes: keep **CPU FFT** (`afm` default `--cpu-fft`).
 | `stm orbitals` | Frontier MO **ψ** (signed phase), DFTB + pySCF | **ready** |
 | `stm current` | MO-resolved **STM current** I≥0, s/p_z/p_y tips | **ready** |
 | `stm panel` | HOMO/LUMO vacuum STM (stock vs prolonged vs pySCF) | **ready** |
+| `basis-tails` | Central-C **ρ(z)** + **Pauli E(z)** log (GPAW/pySCF/stock/prolonged) | **ready** |
 
 ### Orbital vs STM (plot convention)
 
@@ -53,6 +54,20 @@ Awkward FDBM grid sizes: keep **CPU FFT** (`afm` default `--cpu-fft`).
 | **STM current** | I ≥ 0, no phase; tip picks φ_t | `stm current` | viridis |
 
 Both `stm orbitals` and `stm current` write **vertical** (E↑) and **horizontal** (E→) spectrum↔map figures by default (`--layout both`).
+
+---
+
+## Basis tails (talk plots)
+
+Central-carbon **ρ(z)** and **Pauli E(z)** on a log axis (6 decades), GPAW / pySCF / DFTB stock / prolonged:
+
+```bash
+python run_spm.py basis-tails --molecule pentacene,PTCDA
+python run_spm.py basis-tails --molecule PTCDA --tip-mode gaussian --sigma 0.35 --A 1 --beta 1
+```
+
+Artifacts: `debug/presentation_basis_tails/*_central_C_{rho,pauli,rho_pauli}_*.{svg,png}`.  
+Pauli uses the **same** (A,β) for every density so the vacuum-tail story tracks ρ (default A=β=1 → raw overlap; default Gaussian σ=0.35 Å so E_Pauli follows ρ tails).
 
 ---
 
@@ -156,6 +171,17 @@ Key flags: `--basis`, `--projection` (`stock`|`prolonged`|`both`), `--tip-mode` 
 
 **Dual basis:** prolonged ρ is **Pauli only**; electrostatics always from stock Δρ.
 
+### Pauli A,β — fit vs evaluate
+
+| | Rule |
+|--|------|
+| **SSOT dict** | `AFM.PAULI_FITTED_DEFAULTS` |
+| **CLI default (3ob-3-1)** | **A = 124.84**, **β = 1.4330** |
+| **Evaluation** (`afm`, `panel-fukui`, gallery) | Same `(A,β)` for every molecule and every ρ row in the strip |
+| **Fitting** | Separate scripts only; may explore mol-specific fits — **never** wire those into eval/panel |
+
+Do not special-case PTCDA (or any molecule) in evaluation. See skill:`afm-plotting` § Pauli A,β.
+
 ### `afm-morse` — classical force field
 
 No SCF / no cube — Morse (or `--lj`) + tip point charges on a 3D grid, then `run_scan` → Fz/df slices.
@@ -176,12 +202,26 @@ python run_spm.py afm-kriging --klat 0.5,1.0,2.0 --outdir debug/spm_afm_kriging
 
 ### `panel-fukui` / `replot-panel`
 
+**Same height SSOT as `afm`** (do not pass coarse `2.5–5.7` / `dz=0.4` unless USER asks):
+
+| | Default |
+|--|---------|
+| df window | **3.7–4.7 Å**, **dz=0.1** |
+| Fz in strip | **amp-aligned** @ **h−amp** (→ 2.7–3.7 with amp=1) |
+| Rows | **DFT cube → prolonged → stock** for df and Fz (**6 rows** when `rho_N.cube` exists) |
+
 ```bash
-python run_spm.py panel-fukui --molecule PTCDA pentacene
-python run_spm.py replot-panel --panel-dir debug/fdbm_fukui_panel --molecule PTCDA
+# full systematic gallery → debug/AFM_CLI_FDBM/<mol>/
+python tests/SPM/run_afm_cli_fdbm_gallery.py
+
+python run_spm.py panel-fukui --molecule PTCDA pentacene --outdir debug/AFM_CLI_FDBM
+python run_spm.py panel-fukui --molecule adenine-uracil azaindol_dimer \
+  --outdir debug/AFM_CLI_FDBM
+# uses CLI height defaults above — do NOT add --h-min 2.5 --h-step 0.4
+python run_spm.py replot-panel --panel-dir debug/AFM_CLI_FDBM --molecule PTCDA
 ```
 
-Cubes: `/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster/<name>_PBE_def2-SVP/rho_N.cube`
+Cubes searched in order: `…/Fukui_AFM/new/<name>_PBE_def2-SVP/`, then `…/pyscf_fukui_cluster/<name>_PBE_def2-SVP/` (`rho_N.cube`).
 
 ---
 
@@ -224,6 +264,32 @@ python run_spm.py stm current --molecule pentacene --stm-z-above 3.0 --layout ho
 ```
 
 Outputs: `debug/stm_orbital_compare/<mol>/frontier_stm_diag/tip_{s,pz,py}/spectrum_stm_{vertical,horizontal}_z3.0_*.png`
+
+### `stm br` — three-stage BR-STM campaign
+
+Separate figures (do **not** mash STM into the AFM strip):
+
+1. **Pure STM** (orbital identity, prolonged STO) — heights `--stm-heights` (default 0.5,1.5,2.5)
+2. **AFM** df + Fz(amp-align) + |dxy|; plus **PP xy red dots** every `--pp-stride` pixels
+3. **BR-STM vs flat STM** at Fz heights (where PP bend is large)
+
+```bash
+python run_spm.py stm br --xyz data/xyz/PTCDA.xyz --show-atoms --mo 1
+python run_spm.py stm br --xyz data/xyz/benzene.xyz --mo 0 --outdir debug/spm_brstm/benzene
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--h-min` / `--h-max` / `--h-step` | **3.7 / 4.7 / 0.1** | AFM df window (same SSOT as `afm`) |
+| `--amp` | **1.0** | df amplitude; Fz & |dxy| at **h−amp** unless `--no-amp-align` |
+| `--stm-heights` | `0.5,1.5,2.5` | Stage1 pure-STM heights |
+| `--mo` | `0 1` | offsets vs HOMO for Stage1 (`0`=HOMO, `1`=LUMO) |
+| `--pp-stride` | `4` | every Nth pixel for PP xy red-dot overlay |
+| `--K-LAT` | `0.5` | PP spring [N/m] |
+| `--bond-length` | `3.0` | tip–probe lever L [Å] |
+| `--field` | `psi2` | `ldos` / `psi2` / `psi` |
+
+Outputs under `debug/spm_brstm/<mol>/`: `01_stm_pure.png`, `02_afm_df_tipdisp.png`, `02_pp_xy_dots.png`, `03_brstm_vs_stm.png`, `SUMMARY.out`.
 
 ### `stm panel` — HOMO/LUMO vacuum compare
 
@@ -269,13 +335,12 @@ See `doc/AGENTS/skills/afm-plotting/SKILL.md`.
 3. Fukui panel + per-image replot
 4. Morse/LJ + Coulomb AFM (`afm-morse`)
 5. Kriging GridFF AFM (`afm-kriging`)
-6. STM orbitals + STM current + vacuum panel
+6. STM orbitals + STM current + vacuum panel + **BR-STM** (`stm br`)
 
 **Still open** (see `doc/Tasks/SPM_CLI_Headless.md`):
 
 | Priority | Item | Notes |
 |----------|------|-------|
-| Near | Bond-resolved STM (**BR-STM**) | GUI ModularPipeline S6; CLI missing |
 | Near | **GUI↔CLI input protocol** | JSON `SPMJobSpec` + `run_spm_job` |
 | Near | FDBM ↔ Kriging compare | Wrap `testplot_kriging_vs_fdbm_cube` |
 | Near | Cube FDBM ES / NA multipoles | Prefer cube `ρ_NA`; see Fukui notes §1b |

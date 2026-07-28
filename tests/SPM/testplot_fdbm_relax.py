@@ -190,7 +190,9 @@ def _run_one(xyz, basis, step, margin, tip_mode, outdir, args):
         'atomPos': atomPos, 'origin': origin, 'step': step,
     }
 
-# Pauli A,β fitted vs site-correct pySCF GPU Ez (CO tip, PTCDA, z∈[1.7,2.5] Å) — 2026-07-20
+# FITTING ONLY (PTCDA Ez calibration 2026-07-20) — used by run_ptcda_stock_vs_sa.
+# NEVER import into panel-fukui / AFM_CLI_FDBM / default evaluation (transferable
+# defaults live in AFM.PAULI_FITTED_DEFAULTS).
 PTCDA_PAULI_FIT = {
     'stock': {'A': 12.817, 'beta': 0.6514, 'label': 'stock 3ob'},
     'sa':    {'A': 11.762, 'beta': 0.8519, 'label': 'SA-prolonged'},
@@ -462,19 +464,36 @@ def run_ptcda_stock_vs_sa(args):
 
 
 # Fukui pySCF PBE/def2-SVP panel — cube FDBM vs DFTB stock vs prolonged
-# USER 2026-07-24: geometries enforced flat (z=0); cubes refreshed under FUKUI_CUBE_ROOT
-FUKUI_CUBE_ROOT = '/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster'
+# USER 2026-07-24: geometries enforced flat (z=0); cubes under FUKUI_CUBE_ROOTS
+# USER 2026-07-27: new H-bonded dimers under …/Fukui_AFM/new (xyz always; cubes when present)
+FUKUI_CUBE_ROOTS = [
+    '/home/prokop/SIMULATIONS/Fukui_AFM/new',
+    '/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster',
+]
+FUKUI_CUBE_ROOT = FUKUI_CUBE_ROOTS[0]  # preferred / error-message default
+_NEW = '/home/prokop/SIMULATIONS/Fukui_AFM/new'
 FUKUI_PANEL = [
-    ('azaindol_dimer', 'data/xyz/azaindol_dimer.xyz'),
-    ('azaindol_isodimer', 'data/xyz/azaindol_isodimer.xyz'),
+    ('adenine-uracil', f'{_NEW}/adenine-uracil_PBE_def2-SVP/adenine-uracil_opt.xyz'),
+    ('adenine-uracil-iso', f'{_NEW}/adenine-uracil-iso_PBE_def2-SVP/adenine-uracil-iso_opt.xyz'),
+    ('azaindol_dimer', f'{_NEW}/azaindol_dimer_PBE_def2-SVP/azaindol_dimer_opt.xyz'),
+    ('azaindol_isodimer', f'{_NEW}/azaindol_isodimer_PBE_def2-SVP/azaindol_isodimer_opt.xyz'),
     ('benzoicacid_dimer', 'data/xyz/benzoicacid_dimer.xyz'),
     ('benzoicamid_dimer', 'data/xyz/benzoicamid_dimer.xyz'),
     ('pentacene', 'data/xyz/pentacene.xyz'),
     ('PTCDA', 'data/xyz/PTCDA.xyz'),
-    # folder tag = <name>_PBE_def2-SVP; xyz short name for phtalo
     ('phtalo_1-dftb-relax', 'data/xyz/phtalo_1.xyz'),
     ('phtalo_2-dftb-relax', 'data/xyz/phtalo_2.xyz'),
 ]
+
+
+def _fukui_cube_dir(mol):
+    """First root that has rho_N.cube for ``<mol>_PBE_def2-SVP``, else preferred path."""
+    tag = f'{mol}_PBE_def2-SVP'
+    for root in FUKUI_CUBE_ROOTS:
+        d = os.path.join(root, tag)
+        if os.path.isfile(os.path.join(d, 'rho_N.cube')):
+            return d
+    return os.path.join(FUKUI_CUBE_ROOTS[0], tag)
 
 
 def _fft_friendly_grid_spec(atomPos, step, margin, z_extra):
@@ -502,7 +521,7 @@ def run_fukui_one(mol, xyz_rel, args):
 
     os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
     _ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    cube_dir = os.path.join(FUKUI_CUBE_ROOT, f'{mol}_PBE_def2-SVP')
+    cube_dir = _fukui_cube_dir(mol)
     xyz = xyz_rel if os.path.isabs(xyz_rel) else os.path.join(_ROOT, xyz_rel)
     outdir = os.path.join(args.outdir, mol)
     os.makedirs(outdir, exist_ok=True)
@@ -527,32 +546,43 @@ def run_fukui_one(mol, xyz_rel, args):
     # All-electron SSOT (pyridine): clamp→compact NA + GridsOCL project — NOT Gaussian NA
     # and NOT scipy resample_field_to_grid (breaks ∫Δρ / dipole).
     rho_cube = os.path.join(cube_dir, 'rho_N.cube')
-    if not os.path.isfile(rho_cube):
-        raise FileNotFoundError(rho_cube)
-    d_cube = afm_utils.get_density_from_cube(rho_cube, use_esp_cube=False, verbosity=0)
-    atomPos = np.asarray(d_cube['atomPos'], dtype=np.float64)
-    atomZ = np.asarray(d_cube['atomZ'], dtype=np.float64)
-    atomTypes = np.array([int(round(z)) for z in atomZ], dtype=np.int32)
-    # Prefer cube frame; fall back to xyz if atom count mismatch
-    if len(atomPos) != len(atomPos_xyz):
-        print(f'  WARNING: cube natom={len(atomPos)} != xyz {len(atomPos_xyz)}; using cube')
+    has_cube = os.path.isfile(rho_cube)
+    if has_cube:
+        d_cube = afm_utils.get_density_from_cube(rho_cube, use_esp_cube=False, verbosity=0)
+        atomPos = np.asarray(d_cube['atomPos'], dtype=np.float64)
+        atomZ = np.asarray(d_cube['atomZ'], dtype=np.float64)
+        atomTypes = np.array([int(round(z)) for z in atomZ], dtype=np.int32)
+        if len(atomPos) != len(atomPos_xyz):
+            print(f'  WARNING: cube natom={len(atomPos)} != xyz {len(atomPos_xyz)}; using cube')
+    else:
+        print(f'  WARNING: no rho_N.cube under {cube_dir} — DFTB stock+prolonged only (no DFT cube row)')
+        lines.append(f'WARNING: missing {rho_cube} — skipped DFT cube variant')
+        atomPos = atomPos_xyz
+        atomTypes = atomTypes_xyz
+        atomZ = atomTypes.astype(np.float64)
+        d_cube = None
+
     grid_spec, origin, ngrid, step = _fft_friendly_grid_spec(
         atomPos, args.step, args.margin, z_extra=6.0)
     nx, ny, nz = [int(x) for x in ngrid]
     lines.append(f'grid={nx}x{ny}x{nz} step={step} origin={origin}')
-    lines.append('cube ES: clamp→element-invariant compact_NA + cube-node GridsOCL.project (no dipole strip)')
 
-    cube_prep = afm_utils.allelectron_cube_to_fdbm_grid(
-        d_cube['rho_scf'], d_cube['origin'], d_cube['step'], atomPos, atomZ,
-        origin, step, ngrid, rc_na=0.6, R_sphere=0.6, verbosity=0)
-    rho_cube_g = cube_prep['rho_scf']
-    rho_diff_g = cube_prep['rho_diff']
-    dV = step ** 3
-    V_ES_cube = afm.fft_poisson_cpu(rho_diff_g, step)
-    lines.append(
-        f'cube q_scf={float(rho_cube_g.sum()*dV):.2f} q_diff={cube_prep["q_diff"]:.3e} '
-        f'p_diff={cube_prep["p_diff"]}  (native ∫Δρ={cube_prep["clamp"]["Q_diff"]:.3e})')
-
+    rho_cube_g = V_ES_cube = None
+    if has_cube:
+        lines.append('cube ES: clamp→element-invariant compact_NA + cube-node GridsOCL.project (no dipole strip)')
+        cube_prep = afm_utils.allelectron_cube_to_fdbm_grid(
+            d_cube['rho_scf'], d_cube['origin'], d_cube['step'], atomPos, atomZ,
+            origin, step, ngrid, rc_na=0.6, R_sphere=0.6, verbosity=0)
+        rho_cube_g = cube_prep['rho_scf']
+        rho_diff_g = cube_prep['rho_diff']
+        dV = step ** 3
+        V_ES_cube = afm.fft_poisson_cpu(rho_diff_g, step)
+        lines.append(
+            f'cube q_scf={float(rho_cube_g.sum()*dV):.2f} q_diff={cube_prep["q_diff"]:.3e} '
+            f'p_diff={cube_prep["p_diff"]}  (native ∫Δρ={cube_prep["clamp"]["Q_diff"]:.3e})')
+    else:
+        dV = step ** 3
+        lines.append('cube ES: SKIPPED (no rho_N.cube)')
     # ── DFTB stock on same grid ──
     basis_hsd = get_dftb_basis_path('3ob-3-1')
     args.basis = '3ob-3-1'
@@ -586,63 +616,81 @@ def run_fukui_one(mol, xyz_rel, args):
              origin=origin, ngrid=ngrid, step=step, atom_pos=atomPos)
     lines.append(f'prolonged q_scf={float(rho_prol.sum()*dV):.2f} (NOT charge-normalized; Pauli only)')
 
-    pa_cube = afm.PAULI_FITTED_DEFAULTS.get('pyscf_6-31g*', {'A': 40.0, 'beta': 1.15})
-    pa_3ob = afm.PAULI_FITTED_DEFAULTS.get('3ob-3-1', {'A': 124.84, 'beta': 1.433})
-    # PTCDA has site-refitted A,β — use those when available
-    if mol == 'PTCDA':
-        pa_stock = PTCDA_PAULI_FIT['stock']
-        pa_prol = PTCDA_PAULI_FIT['sa']
-    else:
-        pa_stock = pa_3ob
-        pa_prol = pa_3ob  # default prolonged; SA-refit later per molecule
+    # EVALUATION SSOT: one transferable (A,β) for all molecules and all ρ rows.
+    # Do NOT use PTCDA_PAULI_FIT / per-mol fits here — those are for fitting scripts only
+    # (run_ptcda_stock_vs_sa). See doc/AGENTS/skills/afm-plotting/SKILL.md § Pauli A,β.
+    basis_key = getattr(args, 'basis', None) or '3ob-3-1'
+    pa = dict(afm.PAULI_FITTED_DEFAULTS.get(basis_key, afm.PAULI_FITTED_DEFAULTS['3ob-3-1']))
+    A, beta = float(pa['A']), float(pa['beta'])
+    lines.append(f'Pauli EVAL defaults ({basis_key}): A={A:.3f} β={beta:.4f}  '
+                 f'(same for cube|stock|prolonged; no per-molecule override)')
 
     variants = {}
-    specs = [
-        ('cube', rho_cube_g, V_ES_cube, pa_cube['A'], pa_cube['beta']),
-        ('stock', rho_stock, V_ES, pa_stock['A'], pa_stock['beta']),
-        ('prolonged', rho_prol, V_ES, pa_prol['A'], pa_prol['beta']),
+    specs = []
+    if has_cube:
+        specs.append(('cube', rho_cube_g, V_ES_cube, A, beta))
+    specs += [
+        ('stock', rho_stock, V_ES, A, beta),
+        ('prolonged', rho_prol, V_ES, A, beta),
     ]
-    for key, rho, Ves, A, beta in specs:
+    for key, rho, Ves, A_i, beta_i in specs:
         r = _run_from_density(key, rho, Ves, atomPos, atomTypes, origin, step, ngrid,
-                              A, beta, 'co', outdir, args)
+                              A_i, beta_i, 'co', outdir, args)
         variants[key] = r
-        lines.append(f'[{key}] A={A:.3f} β={beta:.4f}  df=[{r["df"].min():.3e},{r["df"].max():.3e}]')
+        lines.append(f'[{key}] A={A_i:.3f} β={beta_i:.4f}  df=[{r["df"].min():.3e},{r["df"].max():.3e}]')
 
     heights = variants['stock']['heights']
-    # Row order: DFT cube → prolonged (DFT-like tails) → stock (short-range) — similar images adjacent
-    row_specs = [
-        ('df', 'cube', f'df  DFT cube\nA={pa_cube["A"]:.1f} β={pa_cube["beta"]:.2f}', args.df_cmap),
-        ('df', 'prolonged', f'df  prolonged\nA={pa_prol["A"]:.1f} β={pa_prol["beta"]:.2f}', args.df_cmap),
-        ('df', 'stock', f'df  stock 3ob\nA={pa_stock["A"]:.1f} β={pa_stock["beta"]:.2f}', args.df_cmap),
-        ('Fz', 'cube', 'Fz  DFT cube', args.cmap),
+    # Row order: DFT cube → prolonged (DFT-like tails) → stock (short-range)
+    row_specs = []
+    if has_cube:
+        row_specs += [
+            ('df', 'cube', f'df  DFT cube\nA={A:.1f} β={beta:.2f}', args.df_cmap),
+        ]
+    row_specs += [
+        ('df', 'prolonged', f'df  prolonged\nA={A:.1f} β={beta:.2f}', args.df_cmap),
+        ('df', 'stock', f'df  stock 3ob\nA={A:.1f} β={beta:.2f}', args.df_cmap),
+    ]
+    if has_cube:
+        row_specs.append(('Fz', 'cube', 'Fz  DFT cube', args.cmap))
+    row_specs += [
         ('Fz', 'prolonged', 'Fz  prolonged', args.cmap),
         ('Fz', 'stock', 'Fz  stock 3ob', args.cmap),
     ]
-    title = (f'{mol} FDBM CO tip | DFT cube → prolonged → stock 3ob\n'
-             f'DUAL BASIS: prolonged ρ → Pauli only; ES = stock Δρ  |  PBE/def2-SVP cubes')
-    # Keep common/per-column strip (variants comparable) + experimental per-image contrast
-    cmp = os.path.join(outdir, 'compare_cube_stock_prolonged.png')
+    title = (f'{mol} FDBM CO tip | '
+             + ('DFT cube → ' if has_cube else '(no cube) ')
+             + f'prolonged → stock 3ob\n'
+             f'DUAL BASIS: prolonged ρ → Pauli only; ES = stock Δρ'
+             + ('  |  PBE/def2-SVP cubes' if has_cube else '  |  DFTB-only (rho_N.cube missing)'))
+    amp = float(getattr(args, 'amp', 1.0) or 1.0)
+    amp_align = not bool(getattr(args, 'no_amp_align', False))
+    cmp_name = 'compare_cube_stock_prolonged.png' if has_cube else 'compare_stock_prolonged.png'
+    cmp = os.path.join(outdir, cmp_name)
     afm_utils.plot_afm_variant_height_strip(
         variants, row_specs, heights, cmp, scale='per_column', title=title,
-        dpi=140, amp=getattr(args, 'amp', None))
+        dpi=140, amp=amp, amp_align=amp_align)
     lines.append(f'REVIEW: {cmp}')
     per_dir = os.path.join(outdir, 'per_image')
     os.makedirs(per_dir, exist_ok=True)
-    cmp_pi = os.path.join(per_dir, 'compare_cube_stock_prolonged.png')
+    cmp_pi = os.path.join(per_dir, cmp_name)
     afm_utils.plot_afm_variant_height_strip(
         variants, row_specs, heights, cmp_pi, scale='per_image', title=title,
-        dpi=140, amp=getattr(args, 'amp', None))
+        dpi=140, amp=amp, amp_align=amp_align)
     lines.append(f'REVIEW: {cmp_pi}')
-
-    np.savez(os.path.join(outdir, 'scan_cube_stock_prolonged.npz'),
-             heights=heights,
-             df_cube=variants['cube']['df'], Fz_cube=variants['cube']['Fz'],
-             df_stock=variants['stock']['df'], Fz_stock=variants['stock']['Fz'],
-             df_prolonged=variants['prolonged']['df'], Fz_prolonged=variants['prolonged']['Fz'],
-             A_cube=pa_cube['A'], beta_cube=pa_cube['beta'],
-             A_stock=pa_stock['A'], beta_stock=pa_stock['beta'],
-             A_prolonged=pa_prol['A'], beta_prolonged=pa_prol['beta'])
-
+    lines.append(f'height SSOT: df=[{float(heights[0]):.2f},{float(heights[-1]):.2f}] dz={args.h_step} '
+                 f'amp={amp} amp_align={amp_align}  (Fz@h−amp when align)')
+    save_kw = dict(
+        heights=heights,
+        df_stock=variants['stock']['df'], Fz_stock=variants['stock']['Fz'],
+        df_prolonged=variants['prolonged']['df'], Fz_prolonged=variants['prolonged']['Fz'],
+        A_stock=A, beta_stock=beta,
+        A_prolonged=A, beta_prolonged=beta,
+        has_cube=has_cube, cube_dir=cube_dir, xyz=xyz,
+    )
+    if has_cube:
+        save_kw.update(
+            df_cube=variants['cube']['df'], Fz_cube=variants['cube']['Fz'],
+            A_cube=A, beta_cube=beta)
+    np.savez(os.path.join(outdir, 'scan_cube_stock_prolonged.npz'), **save_kw)
     summary = os.path.join(outdir, 'SUMMARY.out')
     lines += ['', f'REVIEW: {summary}', f'heights={list(map(float, heights))}']
     open(summary, 'w').write('\n'.join(lines) + '\n')
@@ -712,7 +760,8 @@ def run_fukui_es_diag_one(mol, xyz_rel, args):
 
     os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
     _ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    cube_dir = os.path.join(FUKUI_CUBE_ROOT, f'{mol}_PBE_def2-SVP')
+    # Prefer cube frame for ES diag too
+    cube_dir = _fukui_cube_dir(mol)
     outdir = os.path.join(args.outdir, mol, 'es_diag')
     os.makedirs(outdir, exist_ok=True)
     z_above = tuple(getattr(args, 'z_above', None) or (1.0, 5.0))
@@ -885,7 +934,9 @@ def run_fukui_panel(args):
     for mol, xyz in mols:
         run_fukui_one(mol, xyz, args)
         panel_lines.append(f'REVIEW: {os.path.join(args.outdir, mol, "compare_cube_stock_prolonged.png")}')
+        panel_lines.append(f'REVIEW: {os.path.join(args.outdir, mol, "compare_stock_prolonged.png")}')
         panel_lines.append(f'REVIEW: {os.path.join(args.outdir, mol, "per_image", "compare_cube_stock_prolonged.png")}')
+        panel_lines.append(f'REVIEW: {os.path.join(args.outdir, mol, "SUMMARY.out")}')
     panel_sum = os.path.join(args.outdir, 'SUMMARY.out')
     open(panel_sum, 'w').write('\n'.join(panel_lines) + '\n')
     print(f'\nREVIEW: {panel_sum}')
