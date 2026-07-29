@@ -65,7 +65,7 @@ Topology (AtomicGraph SSOT) → Type Assignment → Force Fields → Surface Int
 | `ModularPipeline.py` | ✅ Active **SSOT** | `bench_fdbm.py`, `testplot_cli_vs_modular_parity.py` | S1–S6 + FAST_S3; GUI + `stm br`; CLI `afm` still on deprecated `_run_from_density` until cutover |
 | `KrigingGridFF.py` | ✅ Active | kriging testplots | Mithun DFT → GridFF; CLI: `run_spm.py afm-kriging` |
 | `stm_compare.py` | ✅ Active | `testplot_stm_basis_compare.py` | SSOT for `run_spm.py stm {orbitals,current,panel}` |
-| STM kernels (`LCAO_STM.cl`, `LCAO_grid.cl`) | ⚠️ Kernels + `compute_stm` | No dedicated STM L0 | Campaign: `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md` |
+| STM kernels (`LCAO_grid` / `LCAO_STM_FGR` / `LCAO_STM`) | ⚠️ FGR Level-B wired (`stm fgr`); Dyson later | No dedicated STM L0 | Report: `STM_FGR_Transfer_H_ES_2026-07-29.md`; campaign: `STM_ExtendedBasis_OrbitalCompare.md` |
 
 **Headless CLI (2026-07-24):** repo-root [`run_spm.py`](../../run_spm.py) + user docs [`user_guide/SPM_CLI.md`](../../user_guide/SPM_CLI.md). Task / gaps: [`doc/Tasks/SPM_CLI_Headless.md`](../Tasks/SPM_CLI_Headless.md).
 
@@ -162,7 +162,7 @@ Plus: 42 topology editing tests, 5 folded rigid tests, 2 contact surface tests, 
 |------|-----|----------|
 | FDBM hex/rot60 image QA | Coarse `step=0.15` symmetry; see AFMTesting lessons | Medium |
 | ModularPipeline S1-S6 | Bench exists (`bench_fdbm.py`); more L0 E2E asserts welcome | Medium |
-| STM simulation | CLI `stm *` wired; L0 thin; basis campaign open | **High** — `STM_ExtendedBasis_OrbitalCompare.md`, `SPM_CLI_Headless.md` |
+| STM simulation | CLI `stm *` + `stm fgr`; L0 thin; basis + FGR review open | **High** — `STM_ExtendedBasis_OrbitalCompare.md`, `STM_FGR_Transfer_H_ES_2026-07-29.md`, `SPM_CLI_Headless.md` |
 | Headless SPM CLI gaps | BR-STM, substrate relax, light-STM, charge-rings | **High** — `SPM_CLI_Headless.md` |
 | Pauli \(A,\beta\) site maps | Global fits only; H≠N/C in pyridine | **High** — `Pauli_A_beta_KrigingTransferability.md` |
 | Fukui FDBM molecule panel | Ran cube/stock/prolonged; cube ES open; USER review | **High** — `ProlongedRadialBasis_DFTB.md`, `Fukui_FDBM_panel_notes_2026-07-23.md` |

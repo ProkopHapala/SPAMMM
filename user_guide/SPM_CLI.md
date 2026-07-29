@@ -44,6 +44,7 @@ Awkward FDBM grid sizes: keep **CPU FFT** (`afm` default `--cpu-fft`).
 | `stm orbitals` | Frontier MO **ψ** (signed phase), DFTB + pySCF | **ready** |
 | `stm current` | MO-resolved **STM current** I≥0, s/p_z/p_y tips | **ready** |
 | `stm panel` | HOMO/LUMO vacuum STM (stock vs prolonged vs pySCF) | **ready** |
+| `stm fgr` | FGR \(H-ES\) vs legacy overlap_exp (Level-B long-tail) | **review** |
 | `basis-tails` | Central-C **ρ(z)** + **Pauli E(z)** log (GPAW/pySCF/stock/prolonged) | **ready** |
 
 ### Orbital vs STM (plot convention)
@@ -103,7 +104,7 @@ python run_spm.py opt --smiles 'c1ccccc1' --method dftb --basis 3ob-3-1
 | `--no-planar` | off | Keep 3D after opt (default: flatten to xy) |
 | `--no-orient` | off | Skip PCA long→x |
 
-After opt (when planar): all atoms share one z (`make_planar_xy` then `z = mean`), then PCA. Planarity is **forced** — AFM “buckling” contrast is not from atom z.
+After opt (when planar): `make_planar_xy` then PCA, then **all atom z = 0**. Same default on `afm` for SMILES/xyz (skip with `--no-planar`; cube path keeps cube atom z). Planarity is **forced** — AFM “buckling” contrast is chemical/electronic, not from atom z.
 
 Outputs: `{name}_opt.xyz`, `SUMMARY.out` under `--outdir`.
 
@@ -313,6 +314,24 @@ python run_spm.py stm panel --molecule pentacene --heights 2.5,3.0,3.5 --bases m
 
 Known molecules: `pentacene`, `PTCDA`, `benzene`, `pyridine` (or any `--xyz`).
 
+### `stm fgr` — FGR \(H-ES\) vs overlap
+
+Compares legacy `mo_overlap_points_exp_sk` to long-tail Level-B tables: \(I_S\), \(I_H\), \(I_\tau=|c^\dagger(H-ES)c|^2\).
+
+```bash
+python run_spm.py stm fgr --molecule pentacene,PTCDA --stm-tips s,pz --stm-z-above 3.0
+```
+
+Outputs under `debug/stm_fgr_compare/<mol>/`. Report: `doc/Reports/STM_FGR_Transfer_H_ES_2026-07-29.md`.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--stm-z-above` | `3.0` | Height above molecular plane [Å] |
+| `--stm-tips` | `s,pz` | Point-tip orbitals |
+| `--eh-K` | `1.75` | Extended-Hückel \(K\) |
+| `--tip-elem` | `C` | Phantom tip element for SK types |
+| `--rcut` | `10.0` | Atom-pair cutoff [Å] |
+
 ---
 
 ## Plotting SSOT
@@ -329,6 +348,7 @@ See `doc/AGENTS/skills/afm-plotting/SKILL.md`.
 
 - Task tracker — `doc/Tasks/SPM_CLI_Headless.md`
 - STM basis compare — `doc/Reports/STM_ExtendedBasis_OrbitalCompare.md` · `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md`
+- STM FGR \(H-ES\) — `doc/Reports/STM_FGR_Transfer_H_ES_2026-07-29.md` · `doc/TopicalAudit/STM_FGR_Transfer.md`
 - Prolonged basis — `doc/Tasks/ProlongedRadialBasis_DFTB.md`
 - Kriging import — `doc/Tasks/Import_KrigingGridFF.md`
 - Fukui panel / df↔Fz amp — `doc/Reports/Fukui_FDBM_panel_notes_2026-07-23.md`

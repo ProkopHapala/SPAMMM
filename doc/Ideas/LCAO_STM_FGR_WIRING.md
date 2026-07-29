@@ -1,5 +1,10 @@
 # Wiring `LCAO_STM_FGR.cl`
 
+**Status (2026-07-29):** Level **B** host path is coded (`run_spm.py stm fgr`).  
+**Report:** [`../Reports/STM_FGR_Transfer_H_ES_2026-07-29.md`](../Reports/STM_FGR_Transfer_H_ES_2026-07-29.md)  
+**Audit:** [`../TopicalAudit/STM_FGR_Transfer.md`](../TopicalAudit/STM_FGR_Transfer.md)  
+**Derivation chat:** [`STM_perturbation_H.chat.md`](STM_perturbation_H.chat.md)
+
 ## Recommended execution path
 
 1. Pack one tip MO and one sample MO atom-major as `[px, py, pz, s]`.
@@ -103,16 +108,21 @@ STOs using fixed neutral-atom effective potentials. Do this offline once per
 ordered element/type pair. This is the direct analogue of DFTB0 table
 generation, but with your tunnelling orbitals.
 
-### Level B: very fast prototype
+### Level B: very fast prototype — **implemented**
 
 Generate the STO overlap tables exactly, then use a frozen extended-Hueckel
 closure
 
 `H_gamma(R) = K_gamma * 0.5*(epsilon_A,l + epsilon_B,l') * S_gamma(R)`.
 
+Code: `DFTBplusParser.build_longtail_eh_sk_tables` + cylindrical
+`sto_two_center_sk_channels`. Onsite \(\varepsilon\) from homoatomic SKF line 2.
+Default `K=1.75` (`--eh-K`).
+
 The `K_gamma` factors may be fitted per channel or pair. This is internally
 consistent enough for an initial BR-STM contrast test, but it makes H and S
-share the same radial shape.
+share the same radial shape — so on C/H systems \(I_S\) and \(I_\tau\) often
+look identical up to a global scale.
 
 ### Level C: direct empirical transfer tables
 

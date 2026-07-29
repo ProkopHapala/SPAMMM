@@ -59,6 +59,8 @@ def _add_common_afm_args(p: argparse.ArgumentParser) -> None:
     g.add_argument('--esp-cube', default=None,                    help='Optional ESP cube')
     g.add_argument('--no-orient', action='store_true', dest='no_orient',
                    help='Skip PCA long-axis→x orientation (default: orient)')
+    g.add_argument('--no-planar', action='store_true', dest='no_planar',
+                   help='Keep 3D sample geometry (default: force all atom z=0 for AFM)')
 
     b = p.add_argument_group('DFTB basis / projection')
     b.add_argument('--basis',      default='3ob-3-1',    choices=['3ob-3-1', 'mio-1-1'])
@@ -178,10 +180,20 @@ def cmd_afm(args: argparse.Namespace) -> int:
         atomPos = np.asarray(d_cube['atomPos'], dtype=np.float64)
         atomTypes = np.array([int(round(z)) for z in d_cube['atomZ']], dtype=np.int32)
 
+    # Default: perfectly flat sample (z=0). Skip when density comes from a cube
+    # (atoms must stay aligned with the cube) or when --no-planar is set.
+    do_planar = (d_cube is None) and (not getattr(args, 'no_planar', False))
+    if do_planar:
+        from spammm.forcefields.FFController import make_planar_xy
+        atomPos[:] = make_planar_xy(atomPos)
+        print(f'planarize → z=0  zspan={atomPos[:,2].ptp():.3e}Å')
     if not getattr(args, 'no_orient', False):
         from spammm.forcefields.FFController import orient_long_axis_x
         orient_long_axis_x(atomPos)
-        print(f'orientPCA long→x  span_xy=({atomPos[:,0].ptp():.3f},{atomPos[:,1].ptp():.3f})')
+        if do_planar:
+            atomPos[:, 2] = 0.0
+        print(f'orientPCA long→x  span_xy=({atomPos[:,0].ptp():.3f},{atomPos[:,1].ptp():.3f})'
+              f'  zspan={atomPos[:,2].ptp():.3e}Å')
 
     z_vac = float(args.z_extra) if args.z_extra is not None else 6.0
     grid_spec, origin, ngrid, step = afm_utils.make_fdbm_grid_com_zsym(
@@ -513,6 +525,17 @@ def cmd_stm_panel(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stm_fgr(args: argparse.Namespace) -> int:
+    """Overlap_exp vs long-tail FGR I_S / I_H / I_τ (Level-B EH tables)."""
+    from spammm.SPM import stm_compare as stm
+    if args.outdir is None or args.outdir == stm.DEFAULT_OUT:
+        args.outdir = os.path.join(_ROOT, 'debug', 'stm_fgr_compare')
+    _prepare_stm_outdir(args)
+    for mol_name, pos, names, types, info in stm.resolve_molecules(args.molecule, xyz=args.xyz):
+        stm.run_fgr_transfer_compare(mol_name, pos, names, types, info, args)
+    return 0
+
+
 def cmd_stm_br(args: argparse.Namespace) -> int:
     """Three-stage BR-STM: (1) pure STM, (2) df+|dxy|, (3) STM vs BR-STM."""
     import numpy as np
@@ -697,6 +720,11 @@ def build_parser() -> argparse.ArgumentParser:
     stm.add_stm_common_args(p_stmp)
     stm.add_panel_args(p_stmp)
     p_stmp.set_defaults(func=cmd_stm_panel)
+
+    p_fgr = stm_sub.add_parser('fgr', help='FGR H−ES vs overlap_exp (pentacene/PTCDA Level-B)')
+    stm.add_stm_common_args(p_fgr)
+    stm.add_fgr_args(p_fgr)
+    p_fgr.set_defaults(func=cmd_stm_fgr)
 
     p_br = stm_sub.add_parser('br', help='3-stage BR-STM: pure STM → df+|dxy| → STM vs BR-STM')
     p_br.add_argument('--xyz', default='data/xyz/PTCDA.xyz')

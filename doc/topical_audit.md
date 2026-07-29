@@ -258,12 +258,14 @@ L0: `tests/SPM/test_afm_contact_surface.py`. L2: `tests/testplot_contact_surface
 
 ### 4b. STM Simulation
 - LCAO orbital projection, spectral function / BR-STM; vacuum tails need prolonged basis
-- **Kernels:** `kernels/LCAO_STM.cl`, `kernels/LCAO_grid.cl`
-- **Python:** `AFM_utils.compute_stm`, `compute_bond_resolved_stm`; `Grid_dftb` orbital projectors; ModularPipeline S6
+- **Kernels:** `kernels/LCAO_grid.cl` (overlap_exp + projectors), `kernels/LCAO_STM_FGR.cl` (FGR \(H-ES\)), `kernels/LCAO_STM.cl` (Dyson/GF later)
+- **Python:** `AFM_utils.compute_stm`, `compute_bond_resolved_stm`, `project_mo_stm_fgr_slice`; `Grid_dftb` orbital projectors + FGR host; ModularPipeline S6; `stm_compare.run_fgr_transfer_compare`
+- **CLI:** `run_spm.py stm {orbitals,current,panel,br,fgr}`
 - **Task (campaign):** [Tasks/STM_ExtendedBasis_OrbitalCompare.md](Tasks/STM_ExtendedBasis_OrbitalCompare.md) — mio vs 3ob vs prolonged vs pySCF HOMO/LUMO cubes (pentacene, PTCDA)
+- **FGR transfer (\(M=H-ES\)):** [TopicalAudit/STM_FGR_Transfer.md](TopicalAudit/STM_FGR_Transfer.md) · report [Reports/STM_FGR_Transfer_H_ES_2026-07-29.md](Reports/STM_FGR_Transfer_H_ES_2026-07-29.md) · wiring [Ideas/LCAO_STM_FGR_WIRING.md](Ideas/LCAO_STM_FGR_WIRING.md) · artifacts `debug/stm_fgr_compare/`
 - **Related:** prolonged WFC [Tasks/ProlongedRadialBasis_DFTB.md](Tasks/ProlongedRadialBasis_DFTB.md); Dyson later [Tasks/DysonOrbitals_DFTB_STM.md](Tasks/DysonOrbitals_DFTB_STM.md)
 - **Audit Document:** [afm_stm_simulation.md](afm_stm_simulation.md) (STM sections)
-- **Caveats:** no dedicated L0 STM pytest yet; GUI STM/Orbitals widgets often empty
+- **Caveats:** no dedicated L0 STM FGR pytest yet; GUI STM/Orbitals widgets often empty; Level B EH makes \(H\propto S\) (Level A unfinished)
 
 ### 4c. Kriging GridFF ↔ FDBM Pauli
 - DFT z-scan → Wendland Kriging/RBF GridFF; compare to FDBM Pauli/ES/vdW; site Pauli fits

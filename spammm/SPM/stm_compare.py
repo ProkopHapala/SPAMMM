@@ -544,3 +544,148 @@ def add_panel_args(p: argparse.ArgumentParser) -> None:
     p.add_argument('--heights', default='2.5,3.0,3.5', help='Comma probe heights [Å]')
     p.add_argument('--field', default='psi2', choices=('psi', 'psi2', 'ldos'),
                    help='psi=orbital phase; psi2/ldos=STM intensity')
+
+
+def run_fgr_transfer_compare(mol_name, pos, names, types, info, args):
+    """Compare legacy exp-overlap STM vs long-tail FGR I_S / I_H / I_τ (Level B EH).
+
+    Columns: overlap_exp | I_S=|c†Sc|² | I_H=|c†Hc|² | I_τ=|c†(H−ES)c|²
+    Rows: HOMO/LUMO × tip (s, pz by default).
+    Artifacts: debug/stm_fgr_compare/<mol>/
+    """
+    out_dir = os.path.join(args.outdir, mol_name)
+    os.makedirs(out_dir, exist_ok=True)
+    z_mol = float(np.mean(pos[:, 2]))
+    z_plane = z_mol + float(args.stm_z_above)
+    scan_xs, scan_ys = make_scan_grid(pos, args.scan_step, args.margin)
+    tips = [t.strip().lower() for t in str(args.stm_tips).split(',') if t.strip()]
+    for t in tips:
+        if t not in afm_utils.STM_TIP_ORBITALS:
+            raise ValueError(f'Unknown stm tip {t!r}; use s,pz,py')
+    basis_key = _basis_key(args.bases)
+    basis_hsd = WFC_HSD_PATHS[basis_key]
+    work = os.path.join(out_dir, f'dftb_work_{basis_key}')
+    K = float(getattr(args, 'eh_K', 1.75))
+    tip_elem = str(getattr(args, 'tip_elem', 'C'))
+    rcut = float(getattr(args, 'rcut', 10.0))
+
+    lines = [
+        f'FGR transfer compare: {mol_name}',
+        f'z = z_mol({z_mol:.3f}) + {args.stm_z_above} = {z_plane:.3f} Å',
+        f'scan={len(scan_xs)}x{len(scan_ys)} step={args.scan_step}  tips={tips}',
+        f'DFTB={basis_key}  Level-B EH K={K}  tip_elem={tip_elem}  rcut={rcut}',
+        'Methods: overlap_exp (legacy) | I_S | I_H | I_τ=H−E·S (recommended)',
+        '',
+    ]
+
+    t0 = time.perf_counter()
+    d = afm_utils.get_density_from_dftb_dense(
+        pos, types, basis_hsd, work, step=0.5, margin=0.5, z_extra=0.5,
+        verbosity=0, project_density=False)
+    t_scf = time.perf_counter() - t0
+    eigvecs, eigvals = d['eigvecs'], np.asarray(d['eigvals'], dtype=np.float64)
+    n_elec = afm_utils.dftb_n_valence_electrons(enames=names)
+    homo, lumo = afm_utils.dftb_frontier_mo_indices(eigvals, n_elec=n_elec)
+    E_eV = eigvals * HAU2EV
+    projector = d['projector']
+    atoms_dict = d['atoms_dict']
+    basis_ang = d['basis_ang']
+    species_per_atom = list(range(len(names)))
+    afm_utils._set_projector_species_basis(projector, atoms_dict, basis_ang, rc_max=max(8.0, rcut))
+    lines.append(
+        f'[DFTB] HOMO#{homo} E={E_eV[homo]:.3f} eV  LUMO#{lumo} E={E_eV[lumo]:.3f} eV  '
+        f'SCF={t_scf:.3f}s')
+
+    zeta = load_zeta_override(info)
+    t0 = time.perf_counter()
+    tables, tip_type0, name_to_smp, prol, _sto = afm_utils._stm_fgr_prepare_tables(
+        projector, work, basis_ang, tip_elem=tip_elem, zeta_override=zeta, K=K,
+        rcut_table=rcut, sample_elems=sorted(set(names)))
+    t_tab = time.perf_counter() - t0
+    lines.append(
+        f'[tables] pairs={tables["n_pair"]} n_r={tables["n_r"]} '
+        f'r0={tables["r_grid0"]} dr={tables["dr"]}  wall={t_tab:.2f}s  '
+        f'smp_types={tables["smp_names"]}')
+
+    mo_labs = [('HOMO', homo), ('LUMO', lumo)]
+    methods = [
+        ('overlap_exp', None),
+        ('I_S', 'S'),
+        ('I_H', 'H'),
+        ('I_tau', 'tau'),
+    ]
+    row_labels = []
+    # maps_by_col[method_idx][row_label] = (nx,ny)
+    maps_by_col = [{}, {}, {}, {}]
+    for tip in tips:
+        for lab, imo in mo_labs:
+            row = f'{lab} tip={tip}'
+            row_labels.append(row)
+            E_tun = float(eigvals[imo])  # sample partition
+            for ic, (mtitle, mode) in enumerate(methods):
+                t1 = time.perf_counter()
+                if mode is None:
+                    arr = afm_utils.project_mo_stm_sk_slice(
+                        projector, eigvecs[imo], atoms_dict, basis_ang, names,
+                        species_per_atom, scan_xs, scan_ys, z_plane,
+                        tip_orbital=tip, rcut=min(8.0, rcut), intensity=True)
+                else:
+                    arr = afm_utils.project_mo_stm_fgr_slice(
+                        projector, eigvecs[imo], atoms_dict, basis_ang, names,
+                        species_per_atom, scan_xs, scan_ys, z_plane,
+                        tables, tip_type0, name_to_smp, E_tun,
+                        tip_orbital=tip, tip_elem=tip_elem, mode=mode,
+                        rcut=rcut, intensity=True)
+                dt = time.perf_counter() - t1
+                maps_by_col[ic][row] = arr
+                lines.append(
+                    f'  [{mtitle:11s}] {row:16s}  max={float(arr.max()):.3e}  '
+                    f'mean={float(arr.mean()):.3e}  {dt*1e3:.1f} ms')
+
+    col_titles = [m[0] for m in methods]
+    png = os.path.join(out_dir, f'fgr_compare_z{args.stm_z_above:.1f}_{mol_name}.png')
+    afm_utils.plot_stm_fgr_method_panel(
+        maps_by_col, scan_xs, scan_ys, z_plane, row_labels, col_titles, png,
+        atom_pos=pos,
+        title=(f'{mol_name}  FGR vs overlap  z={z_plane:.2f}Å  DFTB {basis_key}  '
+               f'EH K={K}  E_tunnel=ε_sample'))
+    lines.append(f'REVIEW: {png}')
+
+    # Per-row contrast metric: centre vs perimeter (rough halo diagnostic)
+    nx, ny = len(scan_xs), len(scan_ys)
+    cx0, cx1 = nx // 4, 3 * nx // 4
+    cy0, cy1 = ny // 4, 3 * ny // 4
+    lines.append('')
+    lines.append('Contrast = mean(centre)/mean(border)  (>1 ⇒ brighter molecular core)')
+    for row in row_labels:
+        parts = []
+        for ic, (mtitle, _) in enumerate(methods):
+            a = maps_by_col[ic][row]
+            core = float(a[cx0:cx1, cy0:cy1].mean())
+            border = float(a.mean()) - 0.5 * core  # crude
+            # better: frame mean
+            frame = np.concatenate([a[:nx // 8].ravel(), a[-nx // 8:].ravel(),
+                                    a[:, :ny // 8].ravel(), a[:, -ny // 8:].ravel()])
+            fr = float(frame.mean()) + 1e-30
+            parts.append(f'{mtitle}={core/fr:.2f}')
+        lines.append(f'  {row}: ' + '  '.join(parts))
+
+    np.savez(os.path.join(out_dir, f'fgr_compare_z{args.stm_z_above:.1f}.npz'),
+             scan_xs=scan_xs, scan_ys=scan_ys, z_plane=z_plane,
+             homo=homo, lumo=lumo, E_homo=float(eigvals[homo]), E_lumo=float(eigvals[lumo]),
+             **{f'{mtitle}_{row.replace(" ", "_")}': maps_by_col[ic][row]
+                for ic, (mtitle, _) in enumerate(methods) for row in row_labels})
+    summary = os.path.join(out_dir, 'SUMMARY.out')
+    open(summary, 'w').write('\n'.join(lines) + '\n')
+    lines.append(f'REVIEW: {summary}')
+    print('\n'.join(lines))
+    return {'homo': homo, 'lumo': lumo, 'png': png, 'summary': summary}
+
+
+def add_fgr_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument('--stm-z-above', type=float, default=3.0, help='STM height above molecular plane [Å]')
+    p.add_argument('--stm-tips', default='s,pz', help='Tip orbitals: s,pz,py')
+    p.add_argument('--tip-elem', default='C', help='Phantom tip atom element for SK tables')
+    p.add_argument('--eh-K', type=float, default=1.75, dest='eh_K', help='Extended-Hückel K')
+    p.add_argument('--rcut', type=float, default=10.0, help='Atom-pair cutoff [Å]')
+

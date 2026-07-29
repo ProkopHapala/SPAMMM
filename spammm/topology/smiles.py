@@ -387,6 +387,7 @@ def _embed_2d(n: int, bonds, enames, n_iters=80, seed=0) -> np.ndarray:
     out = np.zeros((n, 3), dtype=np.float64)
     out[:, :2] = xy
     out -= out.mean(axis=0, keepdims=True)
+    out[:, 2] = 0.0
     return out
 
 
@@ -509,9 +510,15 @@ def parse_smiles(s: str, add_h: bool = True, embed: str = '2d', engine: str = 'a
 
 
 def smiles_to_system(s: str, **kwargs) -> AtomicSystem:
-    """Parse SMILES → AtomicSystem (flat arrays for FF / DFTB / SPM)."""
+    """Parse SMILES → AtomicSystem (flat arrays for FF / DFTB / SPM).
+
+    Default 2D embed is perfectly planar (all atom z = 0).
+    """
     graph = parse_smiles(s, **kwargs)
     _atom_list, enames, apos, atypes, bonds, _bond_list, _rings = graph.to_arrays()
+    apos = np.asarray(apos, dtype=np.float64).copy()
+    if kwargs.get('embed', '2d') in ('2d', True, None):
+        apos[:, 2] = 0.0
     sys = AtomicSystem(apos=apos, atypes=atypes, enames=list(enames), bonds=bonds, bPreinit=True)
     sys.graph = graph
     return sys

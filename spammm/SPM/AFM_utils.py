@@ -5077,6 +5077,109 @@ def project_mo_stm_sk_slice(projector, mo_coeff, atoms_dict, basis_ang, enames, 
     return out.reshape(nx, ny)
 
 
+def _stm_fgr_prepare_tables(projector, work_dir, basis_ang, tip_elem='C',
+                            zeta_override=None, K=1.75, rcut_table=10.0,
+                            r_grid0=0.5, dr=0.1, sample_elems=None):
+    """Build prolonged Level-B H/S tables + tip/sample type maps for FGR STM.
+
+    Returns (tables_dict, tip_type0, name_to_smp, prol_ang, sto_params).
+    tip is a single phantom atom of element tip_elem (type index 0 in tip table).
+    sample_elems: element names in the molecule (filters full HSD species list).
+    """
+    from spammm.quantum.DFTB.DFTBplusParser import (
+        make_slater_tail_species_list, prolonged_sto_params,
+        build_longtail_eh_sk_tables, read_skf_onsite_sp,
+    )
+    prol_all = make_slater_tail_species_list(basis_ang, zeta_override=zeta_override)
+    if sample_elems is None:
+        smp_names = [sp['name'] for sp in prol_all]
+    else:
+        want = set(sample_elems)
+        smp_names = [sp['name'] for sp in prol_all if sp['name'] in want]
+        if not smp_names:
+            raise ValueError(f'no sample species matched {sample_elems!r} in basis')
+    prol = [sp for sp in prol_all if sp['name'] in set(smp_names) | {tip_elem}]
+    names_have = {sp['name'] for sp in prol}
+    if tip_elem not in names_have:
+        tip_sp = next((sp for sp in prol_all if sp['name'] == tip_elem), None)
+        if tip_sp is None:
+            raise ValueError(f'tip_elem={tip_elem!r} not in basis species')
+        prol = list(prol) + [tip_sp]
+    sto = prolonged_sto_params(prol)
+    if tip_elem not in sto:
+        raise ValueError(f"tip_elem={tip_elem!r} not in prolonged species {list(sto)}")
+    tip_names = [tip_elem]
+    onsite = {}
+    for el in set(smp_names + tip_names):
+        skf = os.path.join(work_dir, f'{el}-{el}.skf')
+        if not os.path.isfile(skf):
+            raise FileNotFoundError(f'need homoatomic SKF for onsite: {skf}')
+        onsite[el] = read_skf_onsite_sp(skf)
+    n_r = int(np.ceil((rcut_table - r_grid0) / dr)) + 2
+    tables = build_longtail_eh_sk_tables(
+        tip_names, smp_names, sto, onsite,
+        r_grid0=r_grid0, dr=dr, n_r=n_r, K=K)
+    name_to_smp = {n: i for i, n in enumerate(smp_names)}
+    return tables, 0, name_to_smp, prol, sto
+
+
+def project_mo_stm_fgr_slice(projector, mo_coeff, atoms_dict, basis_ang, enames, species_per_atom,
+                             scan_xs, scan_ys, z_A, tables, tip_type0, name_to_smp,
+                             E_tunnel_Ha, *, tip_orbital='s', tip_elem='C',
+                             mode='tau', rcut=10.0, intensity=True):
+    """FGR STM current with long-tail SK tables: mode in {'tau','S','H'}.
+
+    mode='tau' → |c†(H−E S)c|²; 'S' → |c† S c|²; 'H' → |c† H c|².
+    Point tip φ_t ∈ {s,pz,py}; E_tunnel_Ha must share energy zero with H (DFTB Ha).
+    """
+    from spammm.quantum.DFTB.DFTBplusParser import evec_to_kernel_coeffs
+    tip_orbital = str(tip_orbital).lower()
+    if tip_orbital not in STM_TIP_ORBITALS:
+        raise ValueError(f"tip_orbital must be one of {tuple(STM_TIP_ORBITALS)}, got {tip_orbital!r}")
+    if mode not in ('tau', 'S', 'H'):
+        raise ValueError(f"mode must be tau|S|H, got {mode!r}")
+    natoms = len(enames)
+    coeffs_smp = evec_to_kernel_coeffs(
+        np.asarray(mo_coeff, dtype=np.float64).ravel(), natoms,
+        species_per_atom, list(enames), basis_ang)
+    coeffs_tip = np.tile(STM_TIP_ORBITALS[tip_orbital], (1, 1))
+    XX, YY = np.meshgrid(scan_xs, scan_ys, indexing='ij')
+    tip_centers = np.stack(
+        [XX.ravel(), YY.ravel(), np.full(XX.size, float(z_A))], axis=1).astype(np.float32)
+    tip_pos_rel = np.zeros((1, 3), dtype=np.float32)
+    smp_pos = np.asarray(atoms_dict['pos'][:natoms], dtype=np.float32)
+    tip_atom_type = np.array([int(tip_type0)], dtype=np.int32)
+    smp_atom_type = np.array([name_to_smp[enames[i]] for i in range(natoms)], dtype=np.int32)
+
+    H4, Hpi = tables['H4'], tables['Hpp_pi']
+    S4, Spi = tables['S4'], tables['Spp_pi']
+    if mode == 'S':
+        tau4, taupi = S4, Spi
+    elif mode == 'H':
+        tau4, taupi = H4, Hpi
+    else:
+        tau4, taupi = projector.build_stm_transfer_sk_tables_gpu(
+            H4, Hpi, S4, Spi, float(E_tunnel_Ha))
+
+    t, I, _np = projector.stm_fgr_sk_tau_scan_real(
+        tip_centers, tip_pos_rel, smp_pos,
+        tip_atom_type, smp_atom_type,
+        tables['pair_map'], tables['n_sample_types'],
+        coeffs_tip, coeffs_smp,
+        tau4, taupi, tables['n_r'], tables['r_grid0'], tables['inv_dr'],
+        rcut=float(rcut))
+    nx, ny = len(scan_xs), len(scan_ys)
+    return (I if intensity else t).reshape(nx, ny)
+
+
+def plot_stm_fgr_method_panel(maps_by_col, scan_xs, scan_ys, height, row_labels,
+                              col_titles, out_path, *, atom_pos=None, title=None):
+    """Rows = MOs / tips; columns = transfer methods (overlap_exp, I_S, I_H, I_τ)."""
+    return plot_stm_basis_compare_panel(
+        maps_by_col, scan_xs, scan_ys, height, row_labels, col_titles, out_path,
+        field='psi2', atom_pos=atom_pos, title=title, share_row_scale=False)
+
+
 def plot_eigspectrum_compare(E_dftb_eV, homo_d, E_pyscf_eV, homo_p, out_path, *,
                              n_near=5, title=None, mark_indices_d=None, mark_indices_p=None):
     """Side-by-side eigenvalue ladders. Energy grows **up** (unoccupied above occupied).

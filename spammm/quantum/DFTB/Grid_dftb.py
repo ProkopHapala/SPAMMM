@@ -13,8 +13,8 @@ Key functionality:
   - setup_gridprojector_from_dftb() — convenience constructor from DFTB data
 
 Role in SPAMMM: DFTB density projection engine. Used by ModularPipeline.py Stage 2
-(density projection) and AFM_utils.py (STM/LDOS computation). The LCAO_grid.cl + LCAO_STM.cl
-kernel handles the GPU projection of STO basis functions.
+(density projection) and AFM_utils.py (STM/LDOS computation). Kernels loaded together:
+LCAO_grid.cl + LCAO_STM.cl + LCAO_STM_FGR.cl (FGR \(M=H-ES\); see doc/TopicalAudit/STM_FGR_Transfer.md).
 
 Major Functionality:
 -------------------
@@ -36,7 +36,8 @@ Major Functionality:
    - realloc_dense_projection_buffers(): Reallocate dense projection buffers
 
 3. STM Imaging
-   - mo_overlap_points_exp_sk(): MO overlap scan with exponential SK hopping
+   - mo_overlap_points_exp_sk(): MO overlap scan with exponential SK hopping (legacy H'≈1)
+   - stm_fgr_sk_tau_scan_real(): FGR M=c†(H−ES)c with tabulated long-tail SK τ (LCAO_STM_FGR.cl)
    - stm_dyson_wg_scan(): Dyson Green's function STM scan
    - stm_gf_dyson_2mol_mo_scan(): Two-molecule GF-Dyson STM
    - mo_overlap_points_exp_sk_2mol(): Two-molecule MO overlap (explicit kernel)
@@ -219,6 +220,7 @@ class GridProjector(OpenCLBase):
         cl_paths = [
             os.path.join(kernel_dir, 'LCAO_grid.cl'),
             os.path.join(kernel_dir, 'LCAO_STM.cl'),
+            os.path.join(kernel_dir, 'LCAO_STM_FGR.cl'),
         ]
         # We might want to pass some constants to the kernel during build
         build_opts = []
@@ -935,6 +937,163 @@ class GridProjector(OpenCLBase):
         self.fromGPU_(self.mosk_out_I_buff, out_I)
         self.queue.finish()
         return out_t, out_I
+
+    def stm_fgr_sk_tau_scan_real(
+            self,
+            tip_centers,
+            tip_pos_rel,
+            smp_pos,
+            tip_atom_type,
+            smp_atom_type,
+            pair_map,
+            n_sample_types,
+            coeffs_tip,
+            coeffs_smp,
+            tau4_table,
+            tau_pp_pi_table,
+            n_r,
+            r_grid0,
+            inv_dr,
+            rcut=10.0,
+            amplitude_scale=1.0,
+            bTryAllocate=True,
+        ):
+        """First-order FGR STM: M = c_T† τ_TS c_S with τ = H − E S (real MOs).
+
+        Host must prebuild τ via build_stm_transfer_sk_tables (or CPU H−E*S).
+        Orbital order [px,py,pz,s] per atom — same as mo_overlap_points_exp_sk.
+        See kernels/LCAO_STM_FGR.cl and doc/Ideas/LCAO_STM_FGR_WIRING.md.
+
+        Returns:
+            M: (npts,) signed amplitude
+            I: (npts,) M²
+            npair: (npts,) atom pairs used per pixel
+        """
+        tip_centers = np.asarray(tip_centers, dtype=np.float32)
+        tip_pos_rel = np.asarray(tip_pos_rel, dtype=np.float32)
+        smp_pos = np.asarray(smp_pos, dtype=np.float32)
+        tip_atom_type = np.asarray(tip_atom_type, dtype=np.int32).ravel()
+        smp_atom_type = np.asarray(smp_atom_type, dtype=np.int32).ravel()
+        pair_map = np.asarray(pair_map, dtype=np.int32).ravel()
+        coeffs_tip = np.asarray(coeffs_tip, dtype=np.float32)
+        coeffs_smp = np.asarray(coeffs_smp, dtype=np.float32)
+        tau4_table = np.asarray(tau4_table, dtype=np.float32).reshape(-1, 4)
+        tau_pp_pi_table = np.asarray(tau_pp_pi_table, dtype=np.float32).ravel()
+
+        npts = len(tip_centers)
+        ntip = len(tip_pos_rel)
+        nsmp = len(smp_pos)
+        if coeffs_tip.shape != (ntip, 4):
+            raise ValueError(f"stm_fgr_sk_tau_scan_real: coeffs_tip must be (ntip,4), got {coeffs_tip.shape}")
+        if coeffs_smp.shape != (nsmp, 4):
+            raise ValueError(f"stm_fgr_sk_tau_scan_real: coeffs_smp must be (nsmp,4), got {coeffs_smp.shape}")
+        if tip_atom_type.shape[0] != ntip or smp_atom_type.shape[0] != nsmp:
+            raise ValueError("stm_fgr_sk_tau_scan_real: atom_type length mismatch")
+        if pair_map.shape[0] != int(n_sample_types) * (int(tip_atom_type.max()) + 1) and pair_map.size < int(n_sample_types):
+            pass  # pair_map size validated loosely; host builds tip×sample rectangular map
+        if tau4_table.shape[0] != tau_pp_pi_table.shape[0]:
+            raise ValueError("stm_fgr_sk_tau_scan_real: tau4 / tau_pp_pi length mismatch")
+
+        tip_centers4 = np.c_[tip_centers, np.zeros((npts, 1), dtype=np.float32)].astype(np.float32)
+        tip_pos_rel4 = np.c_[tip_pos_rel, np.zeros((ntip, 1), dtype=np.float32)].astype(np.float32)
+        smp_pos4 = np.c_[smp_pos, np.zeros((nsmp, 1), dtype=np.float32)].astype(np.float32)
+        c_tip = coeffs_tip.astype(np.float32).ravel()
+        c_smp = coeffs_smp.astype(np.float32).ravel()
+
+        sz_f, sz_i = 4, 4
+        n_tau = len(tau_pp_pi_table)
+        if bTryAllocate:
+            buffs = {
+                "fgr_tip_centers": sz_f * 4 * npts,
+                "fgr_tip_pos_rel": sz_f * 4 * ntip,
+                "fgr_smp_pos":     sz_f * 4 * nsmp,
+                "fgr_tip_type":    sz_i * ntip,
+                "fgr_smp_type":    sz_i * nsmp,
+                "fgr_pair_map":    sz_i * pair_map.size,
+                "fgr_c_tip":       sz_f * c_tip.size,
+                "fgr_c_smp":       sz_f * c_smp.size,
+                "fgr_tau4":        sz_f * 4 * n_tau,
+                "fgr_taupi":       sz_f * n_tau,
+                "fgr_out":         sz_f * 4 * npts,
+            }
+            self.try_make_buffers(buffs, suffix="_buff")
+
+        self.toGPU_(self.fgr_tip_centers_buff, tip_centers4)
+        self.toGPU_(self.fgr_tip_pos_rel_buff, tip_pos_rel4)
+        self.toGPU_(self.fgr_smp_pos_buff, smp_pos4)
+        self.toGPU_(self.fgr_tip_type_buff, tip_atom_type)
+        self.toGPU_(self.fgr_smp_type_buff, smp_atom_type)
+        self.toGPU_(self.fgr_pair_map_buff, pair_map)
+        self.toGPU_(self.fgr_c_tip_buff, c_tip)
+        self.toGPU_(self.fgr_c_smp_buff, c_smp)
+        self.toGPU_(self.fgr_tau4_buff, tau4_table)
+        self.toGPU_(self.fgr_taupi_buff, tau_pp_pi_table)
+
+        self.prg.stm_fgr_sk_tau_scan_real(
+            self.queue, (int(npts),), None,
+            np.int32(npts),
+            self.fgr_tip_centers_buff,
+            self.fgr_tip_pos_rel_buff,
+            self.fgr_smp_pos_buff,
+            self.fgr_tip_type_buff,
+            self.fgr_smp_type_buff,
+            np.int32(n_sample_types),
+            self.fgr_pair_map_buff,
+            self.fgr_c_tip_buff,
+            self.fgr_c_smp_buff,
+            np.int32(ntip),
+            np.int32(nsmp),
+            self.fgr_tau4_buff,
+            self.fgr_taupi_buff,
+            np.int32(n_r),
+            np.float32(r_grid0),
+            np.float32(inv_dr),
+            np.float32(rcut),
+            np.float32(amplitude_scale),
+            self.fgr_out_buff,
+        )
+        self.queue.finish()
+        out = np.empty((npts, 4), dtype=np.float32)
+        self.fromGPU_(self.fgr_out_buff, out)
+        self.queue.finish()
+        return out[:, 0].copy(), out[:, 1].copy(), out[:, 2].copy()
+
+    def build_stm_transfer_sk_tables_gpu(self, H4, Hpp_pi, S4, Spp_pi, E_tunnel, bTryAllocate=True):
+        """τ = H − E S on GPU (same energy zero as H and E_tunnel)."""
+        H4 = np.asarray(H4, dtype=np.float32).reshape(-1, 4)
+        S4 = np.asarray(S4, dtype=np.float32).reshape(-1, 4)
+        Hpp_pi = np.asarray(Hpp_pi, dtype=np.float32).ravel()
+        Spp_pi = np.asarray(Spp_pi, dtype=np.float32).ravel()
+        n = len(Hpp_pi)
+        if S4.shape[0] != n or H4.shape[0] != n or Spp_pi.shape[0] != n:
+            raise ValueError("build_stm_transfer_sk_tables_gpu: table length mismatch")
+        sz_f = 4
+        if bTryAllocate:
+            buffs = {
+                "fgrb_H4": sz_f * 4 * n, "fgrb_Hpi": sz_f * n,
+                "fgrb_S4": sz_f * 4 * n, "fgrb_Spi": sz_f * n,
+                "fgrb_tau4": sz_f * 4 * n, "fgrb_taupi": sz_f * n,
+            }
+            self.try_make_buffers(buffs, suffix="_buff")
+        self.toGPU_(self.fgrb_H4_buff, H4)
+        self.toGPU_(self.fgrb_Hpi_buff, Hpp_pi)
+        self.toGPU_(self.fgrb_S4_buff, S4)
+        self.toGPU_(self.fgrb_Spi_buff, Spp_pi)
+        self.prg.build_stm_transfer_sk_tables(
+            self.queue, (int(n),), None,
+            np.int32(n),
+            self.fgrb_H4_buff, self.fgrb_Hpi_buff,
+            self.fgrb_S4_buff, self.fgrb_Spi_buff,
+            np.float32(E_tunnel),
+            self.fgrb_tau4_buff, self.fgrb_taupi_buff,
+        )
+        self.queue.finish()
+        tau4 = np.empty((n, 4), dtype=np.float32)
+        taupi = np.empty(n, dtype=np.float32)
+        self.fromGPU_(self.fgrb_tau4_buff, tau4)
+        self.fromGPU_(self.fgrb_taupi_buff, taupi)
+        self.queue.finish()
+        return tau4, taupi
 
 
 

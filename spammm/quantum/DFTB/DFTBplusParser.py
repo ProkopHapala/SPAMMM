@@ -1329,3 +1329,210 @@ def test_single_sto_component(species_list_ang, species_name, orbital_idx, pow_i
     print(f"  RMS diff = {np.sqrt(np.mean((values - expected)**2)):.2e}")
     
     return r_ang, values, expected
+
+
+# =============================================================================
+# Long-tail tunnelling SK tables (Level B: exact STO S + extended-Hückel H)
+# =============================================================================
+# Used by kernels/LCAO_STM_FGR.cl.  See doc/Ideas/LCAO_STM_FGR_WIRING.md.
+# Tables are for the *prolonged* Slater tails, not mio/3ob short orbitals.
+# Orbital packing in the scan kernel remains [px,py,pz,s].
+
+def read_skf_onsite_sp(skf_path):
+    """Read Es, Ep (Hartree) from a homoatomic DFTB SKF file.
+
+    SKF line 2 (spd layout used by 3ob/mio): Ed Ep Es SPE Ud Up Us fd fp fs.
+    Returns (Es, Ep).  Ep may be None if the species has no p shell.
+    """
+    with open(skf_path, 'r') as f:
+        f.readline()  # grid header
+        line2 = f.readline().replace(',', ' ')
+    toks = [float(x) for x in line2.split()]
+    if len(toks) < 3:
+        raise ValueError(f'read_skf_onsite_sp: need ≥3 floats on SKF line 2, got {toks!r} in {skf_path}')
+    # Ed, Ep, Es, ...
+    Ep, Es = float(toks[1]), float(toks[2])
+    return Es, Ep
+
+
+def prolonged_sto_params(species_list_ang):
+    """Extract per-element (N, zeta) for s and p from a prolonged species list.
+
+    Returns dict name -> {'s': (N, zeta) or None, 'p': (N, zeta) or None}.
+    """
+    out = {}
+    for sp in species_list_ang:
+        entry = {'s': None, 'p': None}
+        for orb in sp['orbitals']:
+            l = int(orb['l'])
+            N = float(np.asarray(orb['coefficients']).ravel()[0])
+            z = float(np.asarray(orb['exponents']).ravel()[0])
+            if l == 0:
+                entry['s'] = (N, z)
+            elif l == 1:
+                entry['p'] = (N, z)
+        out[sp['name']] = entry
+    return out
+
+
+def sto_two_center_sk_channels(R, tip_s, tip_p, smp_s, smp_p, n_rho=48, n_z=96, pad=8.0):
+    """Numerically integrate five directed SK overlap channels for prolonged STOs.
+
+    Tip atom at z=0, sample at z=R (Å).  Axis u = +z = (R_sample-R_tip)/R.
+    Radial STOs: R_l(r) = N r^l exp(-ζ r); full AO = R_l Y_lm.
+
+    Channels (same packing as LCAO_STM_FGR.cl):
+      Sss, Ssp=<s_T|p_S,u>, Sps=<p_T,u|s_S>, Spp_sigma, Spp_pi.
+
+    tip_s / smp_s: (N, zeta) or None; tip_p / smp_p likewise.
+    Missing shells → those channels are 0.
+    """
+    R = float(R)
+    if R < 1e-8:
+        # Same-centre limit not used by the scan (rcut skips r~0); return 0.
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    zmax = R + pad
+    zmin = -pad
+    rhomax = pad
+    zs = np.linspace(zmin, zmax, n_z, dtype=np.float64)
+    rhos = np.linspace(0.0, rhomax, n_rho, dtype=np.float64)
+    ZZ, RR = np.meshgrid(zs, rhos, indexing='ij')  # (nz, nrho)
+    dV = (zs[1] - zs[0]) * (rhos[1] - rhos[0])  # φ integrated below
+
+    rA = np.sqrt(RR * RR + ZZ * ZZ) + 1e-30
+    zB = ZZ - R
+    rB = np.sqrt(RR * RR + zB * zB) + 1e-30
+
+    inv_sqrt4pi = 1.0 / np.sqrt(4.0 * np.pi)
+    c_p = np.sqrt(3.0 / (4.0 * np.pi))  # |Y_1m| cartesian prefactor
+
+    def radial(N_zeta, r, l):
+        if N_zeta is None:
+            return None
+        N, z = N_zeta
+        return float(N) * (r ** l) * np.exp(-float(z) * r)
+
+    RA_s = radial(tip_s, rA, 0)
+    RA_p = radial(tip_p, rA, 1)
+    RB_s = radial(smp_s, rB, 0)
+    RB_p = radial(smp_p, rB, 1)
+
+    # ψ_s = R_0 * Y00;  ψ_pz = R_1 * Y10 = R_1 * c_p * (z/r)
+    # → ψ_pz = N_p * c_p * z * exp(-ζ r)   (r in R_1 cancels 1/r in Y)
+    def psi_s(R0):
+        return None if R0 is None else R0 * inv_sqrt4pi
+
+    def psi_pz(N_zeta, r, zc):
+        if N_zeta is None:
+            return None
+        N, z = N_zeta
+        return float(N) * c_p * zc * np.exp(-float(z) * r)
+
+    def psi_px_amp(N_zeta, r):
+        """Amplitude such that ψ_px = amp * (ρ cosφ); returns amp(ρ,z)."""
+        if N_zeta is None:
+            return None
+        N, z = N_zeta
+        return float(N) * c_p * np.exp(-float(z) * r)
+
+    A_s = psi_s(RA_s)
+    B_s = psi_s(RB_s)
+    A_pz = psi_pz(tip_p, rA, ZZ)
+    B_pz = psi_pz(smp_p, rB, zB)
+    A_px = psi_px_amp(tip_p, rA)
+    B_px = psi_px_amp(smp_p, rB)
+
+    def integ_axisym(prod):
+        # ∫ prod ρ dρ dz dφ with φ-independent prod → 2π ∫ prod ρ dρ dz
+        return float(2.0 * np.pi * np.sum(prod * RR) * dV)
+
+    Sss = integ_axisym(A_s * B_s) if (A_s is not None and B_s is not None) else 0.0
+    Ssp = integ_axisym(A_s * B_pz) if (A_s is not None and B_pz is not None) else 0.0
+    Sps = integ_axisym(A_pz * B_s) if (A_pz is not None and B_s is not None) else 0.0
+    Spp_s = integ_axisym(A_pz * B_pz) if (A_pz is not None and B_pz is not None) else 0.0
+    # px·px: ∫ ampA ampB ρ² cos²φ · ρ dρ dz dφ = π ∫ ampA ampB ρ³ dρ dz
+    if A_px is not None and B_px is not None:
+        Spp_pi = float(np.pi * np.sum(A_px * B_px * (RR ** 3)) * dV)
+    else:
+        Spp_pi = 0.0
+    return Sss, Ssp, Sps, Spp_s, Spp_pi
+
+
+def build_longtail_eh_sk_tables(
+        tip_names, smp_names, sto_params, onsite_Ha,
+        r_grid0=0.5, dr=0.1, n_r=100, K=1.75, K_pp_pi=None,
+        n_rho=40, n_z=80, pad=8.0):
+    """Build Level-B long-tail H/S SK tables for ordered tip×sample element pairs.
+
+    H_γ(R) = K_γ * 0.5*(ε_{A,l}+ε_{B,l'}) * S_γ(R)   (extended Hückel / Wolfsberg–Helmholtz)
+    S_γ(R) from numerical prolonged-STO two-centre integrals.
+
+    Args:
+        tip_names, smp_names: lists of element names (compact type order)
+        sto_params: from prolonged_sto_params()
+        onsite_Ha: {elem: (Es, Ep_or_None)} in Hartree
+        K, K_pp_pi: EH prefactors (K_pp_pi defaults to K)
+
+    Returns dict with float32 arrays ready for LCAO_STM_FGR.cl:
+      H4, Hpp_pi, S4, Spp_pi  shape [n_pair, n_r] / [n_pair*n_r] flattened as pair-major
+      pair_map (n_tip, n_smp) int32, r_grid0, dr, n_r, tip_names, smp_names
+    """
+    if K_pp_pi is None:
+        K_pp_pi = K
+    n_tip, n_smp = len(tip_names), len(smp_names)
+    n_pair = n_tip * n_smp
+    r = r_grid0 + dr * np.arange(n_r, dtype=np.float64)
+
+    H4 = np.zeros((n_pair, n_r, 4), dtype=np.float64)
+    Hpi = np.zeros((n_pair, n_r), dtype=np.float64)
+    S4 = np.zeros((n_pair, n_r, 4), dtype=np.float64)
+    Spi = np.zeros((n_pair, n_r), dtype=np.float64)
+    pair_map = -np.ones((n_tip, n_smp), dtype=np.int32)
+
+    def eps(elem, l):
+        Es, Ep = onsite_Ha[elem]
+        if l == 0:
+            return float(Es)
+        if Ep is None:
+            raise ValueError(f'build_longtail_eh_sk_tables: no Ep for {elem}')
+        return float(Ep)
+
+    ip = 0
+    for it, ta in enumerate(tip_names):
+        for js, sb in enumerate(smp_names):
+            pair_map[it, js] = ip
+            pa, pb = sto_params[ta], sto_params[sb]
+            for ir, Rij in enumerate(r):
+                Sss, Ssp, Sps, Spp_s, Spp_pi = sto_two_center_sk_channels(
+                    Rij, pa['s'], pa['p'], pb['s'], pb['p'],
+                    n_rho=n_rho, n_z=n_z, pad=pad)
+                S4[ip, ir] = (Sss, Ssp, Sps, Spp_s)
+                Spi[ip, ir] = Spp_pi
+                # EH: channel-dependent average onsite
+                e_ss = 0.5 * (eps(ta, 0) + eps(sb, 0))
+                e_sp = 0.5 * (eps(ta, 0) + eps(sb, 1 if pb['p'] else 0))
+                e_ps = 0.5 * (eps(ta, 1 if pa['p'] else 0) + eps(sb, 0))
+                e_pp = 0.5 * (eps(ta, 1 if pa['p'] else 0) + eps(sb, 1 if pb['p'] else 0))
+                H4[ip, ir] = (K * e_ss * Sss, K * e_sp * Ssp, K * e_ps * Sps, K * e_pp * Spp_s)
+                Hpi[ip, ir] = K_pp_pi * e_pp * Spp_pi
+            ip += 1
+
+    return {
+        'H4': H4.reshape(-1, 4).astype(np.float32),
+        'Hpp_pi': Hpi.ravel().astype(np.float32),
+        'S4': S4.reshape(-1, 4).astype(np.float32),
+        'Spp_pi': Spi.ravel().astype(np.float32),
+        'pair_map': pair_map.ravel().astype(np.int32),
+        'n_tip_types': n_tip,
+        'n_sample_types': n_smp,
+        'n_pair': n_pair,
+        'n_r': n_r,
+        'r_grid0': float(r_grid0),
+        'dr': float(dr),
+        'inv_dr': float(1.0 / dr),
+        'tip_names': list(tip_names),
+        'smp_names': list(smp_names),
+        'K': float(K),
+        'K_pp_pi': float(K_pp_pi),
+    }

@@ -459,10 +459,10 @@ class FFController:
 
 
 def make_planar_xy(apos):
-    """Project atoms onto best-fit plane and rotate into the xy plane (z≈const)."""
+    """Project atoms onto best-fit plane, rotate into xy, force all z=0."""
     apos = np.asarray(apos, dtype=np.float64).copy()
     if len(apos) < 3:
-        apos[:, 2] = apos[:, 2].mean() if len(apos) else 0.0
+        apos[:, 2] = 0.0
         return apos
     c = apos.mean(axis=0)
     p = apos - c
@@ -483,7 +483,7 @@ def make_planar_xy(apos):
         vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]], dtype=np.float64)
         R = np.eye(3) + vx + vx @ vx * ((1.0 - cdot) / (s * s))
     out = (p @ R.T) + c
-    out[:, 2] = out[:, 2].mean()
+    out[:, 2] = 0.0
     return out
 
 
@@ -533,9 +533,9 @@ def optimize_vacuum(sys, method='uff', nsteps=1000, fmax_tol=0.05, planar=True,
         sys.apos[:] = make_planar_xy(sys.apos)
     if orient_pca:
         orient_long_axis_x(sys.apos)
-        # keep planar after PCA (numerical noise)
+        # keep perfectly flat after PCA (numerical noise)
         if planar:
-            sys.apos[:, 2] = sys.apos[:, 2].mean()
+            sys.apos[:, 2] = 0.0
     zspan = float(sys.apos[:, 2].max() - sys.apos[:, 2].min())
     info['zspan_before'] = zspan_before
     info['zspan'] = zspan

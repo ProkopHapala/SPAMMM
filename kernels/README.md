@@ -20,8 +20,9 @@ OpenCL source for SPAMMM GPU compute. Python harnesses concatenate `.cl` snippet
 | `assembly.cl` | Multi-molecule rigid transforms + clash | `forcefields/Assembly.py` |
 | `AFM.cl` | Probe relaxation + AFM image generation | `SPM/AFM.py` |
 | `grids.cl` | Density project/downsample (dipole-preserving), Gaussian NA, axpy | `utils/GridsOCL.py` |
-| `LCAO_grid.cl` | LCAO density/orbital grid projection | `quantum/DFTB/Grid_dftb.py` |
-| `LCAO_STM.cl` | STM / Dyson equation | `quantum/DFTB/Grid_dftb.py` |
+| `LCAO_grid.cl` | LCAO density/orbital grid projection + legacy `mo_overlap_points_exp_sk` | `quantum/DFTB/Grid_dftb.py` |
+| `LCAO_STM_FGR.cl` | First-order FGR STM \(M=c^\dagger(H-ES)c\) with tabulated long-tail SK τ | `quantum/DFTB/Grid_dftb.py` |
+| `LCAO_STM.cl` | STM / Dyson equation (GF-dressed; not FGR product path) | `quantum/DFTB/Grid_dftb.py` |
 | `lingebra.cl` | Batched small-matrix Jacobi eigh | `utils/Lingebra_ocl.py` |
 
 ## Composition rules
@@ -41,7 +42,7 @@ Concatenation order matters. Typical stacks:
 | GridFF only | `common` + `Forces` + `gridFF` |
 | Contact surface | `common` + `Forces` + `contact_surface` |
 | Grids (density project) | `grids.cl` (standalone) |
-| LCAO / STM | `LCAO_grid` + `LCAO_STM` |
+| LCAO / STM | `LCAO_grid` + `LCAO_STM` + `LCAO_STM_FGR` |
 | Assembly | `assembly` (standalone) |
 | Lingebra | `lingebra` (standalone) |
 
@@ -346,9 +347,27 @@ Helpers: `evaluate_radial` (B-spline), `eval_angular_dense` (Y_lm l=0,1,2), `eva
 
 ---
 
+## LCAO_STM_FGR.cl
+
+First-order Fermi-golden-rule STM only: \(M = c_T^\dagger(H_{TS}-E S_{TS})c_S\). **No** Dyson, GF, SCC, or diagonalization. Radial tables are **custom long-tail** STOs (not mio/3ob). Concatenated after `LCAO_grid` + `LCAO_STM` in `Grid_dftb`.
+
+| Kernel | Role |
+|--------|------|
+| `build_stm_transfer_sk_tables` | \(\tau = H - E S\) once per energy |
+| `stm_fgr_sk_tau_scan_real` | **Production** real-MO scan → `(M, M², npair, 0)` |
+| `stm_fgr_sk_tau_scan` | Complex coeffs (Bloch / SOC) |
+| `stm_fgr_sk_hs_scan` | Debug: interpolate H and S separately |
+
+**Docs:** `doc/Ideas/LCAO_STM_FGR_WIRING.md`, report `doc/Reports/STM_FGR_Transfer_H_ES_2026-07-29.md`, audit `doc/TopicalAudit/STM_FGR_Transfer.md`.  
+**CLI:** `run_spm.py stm fgr`.
+
+**Caveats:** Host must remap DFTB orbital order to `[px,py,pz,s]`. Level-B EH tables make \(H\propto S\) (Level A unfinished). Energy zero of \(H\) and \(E_\mathrm{tunnel}\) must match.
+
+---
+
 ## LCAO_STM.cl
 
-STM tunneling current via Dyson equation: G = (I − G₀·V_TS)⁻¹·G₀, where G₀ = diag(G_T, G_S) and V_TS is the tip-sample hopping (Slater-Koster with exponential radial decay). Requires `LCAO_grid.cl` types.
+STM tunneling current via Dyson equation: G = (I − G₀·V_TS)⁻¹·G₀, where G₀ = diag(G_T, G_S) and V_TS is the tip-sample hopping (Slater-Koster with exponential radial decay). Requires `LCAO_grid.cl` types. **Do not use as the first-order Bardeen/FGR validation path** — see `LCAO_STM_FGR.cl`.
 
 Three approaches (increasing physical accuracy, decreasing GPU cost):
 

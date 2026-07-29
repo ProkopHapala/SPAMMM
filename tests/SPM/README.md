@@ -30,6 +30,14 @@ See `doc/TEST_DESIGN.md` for L0/L1/L2 review levels.
 | `testplot_stm_basis_compare.py` | visual | STM HOMO/LUMO: mio/3ob stock vs prolonged vs pySCF → `debug/stm_orbital_compare/` |
 | `test_stm_basis_compare.py` | pytest | L0: prolonged ≠ stock at vacuum height (benzene, `@gpu @slow`) |
 
+**FGR transfer (\(H-ES\)) compare** (not a testplot file — CLI SSOT):
+
+```bash
+python run_spm.py stm fgr --molecule pentacene,PTCDA
+```
+
+→ `debug/stm_fgr_compare/`; report `doc/Reports/STM_FGR_Transfer_H_ES_2026-07-29.md`; audit `doc/TopicalAudit/STM_FGR_Transfer.md`.
+
 **Open task scripts:** Pauli site maps → `doc/Tasks/Pauli_A_beta_KrigingTransferability.md`; contact-surface finish → `doc/Tasks/Fast_2p5D_AFM_ContactSurface.md`.
 
 **Fukui DFT densities (FDBM refs):** `/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster/{pentacene,PTCDA,azaindol_dimer,azaindol_isodimer,benzoicacid_dimer,benzoicamid_dimer}_PBE_def2-SVP/` — cube vs DFTB stock vs prolonged; see `doc/Tasks/ProlongedRadialBasis_DFTB.md`.

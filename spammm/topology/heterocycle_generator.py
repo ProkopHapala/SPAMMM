@@ -436,12 +436,15 @@ def build_atomic_system(system, dx=DX, dy=DY, dimer_offset=DIMER_OFFSET):
 # ---------------------------------------------------------------------------
 def plot_system(atoms, title=None, fname='heterocycle.svg',
                 figsize=(8, 8), dpi=150, show=False, sz=50., bond_orders=None,
-                n_pi=None):
+                n_pi=None, ascii_art=None):
     """Plot the AtomicSystem using plotSystem from plotUtils and save as SVG.
 
     If bond_orders is provided, it must be a 1-D array of total bond orders
     (one per bond in atoms.bonds).  Double bonds are drawn thicker and
     aromatic bonds are drawn green.
+
+    If ascii_art is provided, the verbatim ASCII source is drawn as a monospace
+    inset (top-right).
     """
     fig, ax = plt.subplots(figsize=figsize)
     _plot_utils.plotSystem(atoms, axes=(0, 1), bBonds=True, bLabels=True, sz=sz)
@@ -481,6 +484,14 @@ def plot_system(atoms, title=None, fname='heterocycle.svg',
         ax.set_title(title)
     ax.text(0.02, 0.98, f"N = {atoms.natoms}", transform=ax.transAxes,
             fontsize=12, verticalalignment='top', color='black')
+    if ascii_art is not None:
+        # Keep leading indentation; only strip outer blank lines for a tight inset.
+        art = str(ascii_art).strip('\n')
+        ax.text(0.98, 0.98, art, transform=ax.transAxes, fontsize=8,
+                fontfamily='monospace', ha='right', va='top', color='#222222',
+                linespacing=1.05, zorder=10,
+                bbox=dict(boxstyle='round,pad=0.35', facecolor='white',
+                          edgecolor='#888888', alpha=0.92))
     ax.set_aspect('equal')
     ax.axis('off')
     fig.tight_layout()

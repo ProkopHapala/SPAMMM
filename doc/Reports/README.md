@@ -11,6 +11,7 @@ Validated and review-ready scientific results, with exact methods, artifacts, re
 - **Kriging_DFT_vs_DFTB_FDBM_pyridine.md** — Pyridine+CO: Kriging DFT GridFF vs FDBM from cubes and DFTB; Δρ recipes vs basis tails; dual-basis Slater rules; plotting SSOT; session history (investigating).
 - **Kriging_FDBM_PauliFit_pyridine_2026-07-21.md** — Day log: contact vs residual Pauli \(A,\beta\) fits; N+C vs N+C+H; tip×sample matrix; open cube-ES caveats.
 - **STM_ExtendedBasis_OrbitalCompare.md** — STM HOMO/LUMO: mio/3ob stock vs prolonged vs pySCF (awaiting USER review).
+- **STM_FGR_Transfer_H_ES_2026-07-29.md** — FGR \(M=H-ES\) vs legacy `overlap_exp`; Level-B long-tail tables; pentacene/PTCDA panels (`debug/stm_fgr_compare/`; awaiting USER review).
 
 - **Cube_ES_DeltaRho_NA_dipole.md** — **SSOT** for cube Δρ/NA dipole asymmetry (full investigation).
 - **Cube_ES_DeltaRho_NA_Codex_handoff_2026-07-24.md** — Short handoff: element-invariant clamp + node project; awaiting USER visual.

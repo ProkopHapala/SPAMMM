@@ -842,12 +842,12 @@ def main():
             title = (title + '\n' if title else '') + f"ERROR: {err}"
         if args.kekule_single:
             bo_total = 1.0 + bo_snap
-            plot_system(atoms, title=title, fname=args.out, show=args.plot != 0, sz=args.size, n_pi=n_pi, bond_orders=bo_total)
+            plot_system(atoms, title=title, fname=args.out, show=args.plot != 0, sz=args.size, n_pi=n_pi, bond_orders=bo_total, ascii_art=art)
         else:
             plot_kekule_phases(atoms, k, bo_raw=bo_raw, bo_snap=bo_snap, title=title, fname=args.out, show=args.plot != 0, sz=args.size)
     else:
         n_pi = make_n_pi(atoms)
-        plot_system(atoms, title=args.title, fname=args.out, show=args.plot != 0,sz=args.size, n_pi=n_pi)
+        plot_system(atoms, title=args.title, fname=args.out, show=args.plot != 0, sz=args.size, n_pi=n_pi, ascii_art=art)
 
     bt = mol_bond_types(atoms, bo_snap=bo_snap if args.kekule else None,  allow_aromatic=(args.aromatic != 0), kekule=args.kekule)
     mol_fname = export_mol(atoms, mol_opt=args.mol, out_path=args.out,title=args.example, bond_types=bt)
