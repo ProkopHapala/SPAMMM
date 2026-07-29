@@ -184,6 +184,7 @@
 
 ### ✅ Working
 - **SPAMMM_GUI / AtomScene** — VisPy + PyQt5 molecular editor; **ortho 2D/3D view mode** (`Enter` / `b2Dview`); Ring/atom/bond pick in 3D; hex 2D-only. See `doc/Tasks/GUI_Editor_3D_ViewMode.md`, `doc/GUI_CHEATSHEET.md`
+- **Draw demo scripts (SVG + GIF)** — shared `azaindol_draw_sequence` drives offline SVG and live GUI PNG→GIF (`azaindol_draw_offline` / `azaindol_draw_demo`); VisPy hover foreshadow + full-window GL composite capture. See `doc/Topics/GUI_DrawDemo_Scripts.md`
 - **AFMExtension** — AFM panel with S1-S6 pipeline UI
 - **VispyUtils AtomScene** — reusable ortho scene: picking, drag, camera presets, depth test in 3D
 

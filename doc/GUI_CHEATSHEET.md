@@ -161,3 +161,18 @@ No Shift/Ctrl needed for add/remove — δ and φ are separate toggles.
 - Ring size spinbox is only visible in Ring mode.
 - Debug View toggle shows pin nodes (cyan) and atom→pin lines.
 - Bond Colors toggle visualizes bond orders by color.
+
+## Demo scripts (SVG / GIF)
+
+Reproduce the Ring→Atom→Select workflow as presentation artifacts (hover foreshadow before each click):
+
+```bash
+# Offline SVG frames (no Qt)
+PYTHONPATH=. python spammm/GUI/gui_scripts/azaindol_draw_offline.py
+
+# Live GUI → PNG frames + animated GIF
+./run_gui.sh --script spammm/GUI/gui_scripts/azaindol_draw_demo.py
+./run_gui.sh --script spammm/GUI/gui_scripts/azaindol_draw_demo.py -- --zoom-out 2 --gif-ms 550
+```
+
+Outputs: `debug/azaindol_draw_offline/*.svg`, `debug/azaindol_draw_demo/azaindol_draw_demo.gif`. Details: [Topics/GUI_DrawDemo_Scripts.md](Topics/GUI_DrawDemo_Scripts.md).

@@ -1,4 +1,20 @@
-"""Helpers for programmatic GUI scripts — same state as user widget actions."""
+"""gui_script_utils.py — drive SPAMMM_GUI like a user; capture demo PNG/GIF frames.
+
+Motivation: control scripts must click the same widgets / set the same toggles a
+human would, so scripted setups stay valid when the UI layout changes. Capture
+helpers exist so draw demos can prove real VisPy chrome (hover foreshadow, δ/φ
+handles) in presentation GIFs — not only headless SVG.
+
+Design notes:
+- Widget helpers (``set_edit_mode``, ``set_atom_combo``, …) always ``process_events``.
+- **apply_demo_overlays** mirrors ``EditModeHandlers`` mouse-move visuals; never
+  ``set_data`` empty on ``ring_preview_line`` (VisPy Line + offscreen render can segfault).
+- **capture_window_png** composites ``canvas.render()`` into the Qt grab — grab alone
+  often blanks OpenGL (offscreen / Wayland).
+- **frames_to_gif** — Pillow pack of ordered PNGs.
+
+Doc: ``doc/Topics/GUI_DrawDemo_Scripts.md``.
+"""
 import os
 
 from PyQt5 import QtWidgets, QtCore
@@ -75,3 +91,215 @@ def set_edit_mode(window, mode):
 def extension_panel(window, key, open=True):
     """Backward-compatible alias for expand_extension_panel."""
     return expand_extension_panel(window, key, open=open)
+
+
+def set_auto_h_cap(window, on):
+    """Mirror the Auto H toggle button."""
+    on = bool(on)
+    if window.auto_h_cap_btn.isChecked() != on:
+        window.auto_h_cap_btn.setChecked(on)
+        window.toggle_auto_h_cap()
+    else:
+        window.backend.auto_h_cap = on
+    process_events(window)
+
+
+def set_ring_size(window, n):
+    """Set Ring-mode n-gon size spinbox (same as user / numpad ±)."""
+    set_spin_value(window.ring_size_spinbox, int(n))
+
+
+def set_atom_combo(window, element):
+    """Set element combo (Atom-mode click applies this type)."""
+    set_combo_text(window.atom_combo, str(element))
+    window.cur_atom_type = str(element)
+    process_events(window)
+
+
+def apply_demo_overlays(window, *, cursor_xy=None, hover_hex=None, bond_highlight=None,
+                        ring_preview=None, hover_atom_id=None, clear=True):
+    """Drive VisPy hover/cursor chrome the same way EditModeHandlers do on mouse move.
+
+    Used by GUI demo scripts so GIF frames show foreshadow rings, bond hover, etc.
+
+    NOTE: never ``set_data`` empty arrays on ``ring_preview_line`` — VisPy Line can
+    segfault on the next ``canvas.render()`` offscreen after empty→refill.
+    """
+    import numpy as np
+    from spammm.topology.HexGrid import snap_to_grid
+
+    if clear:
+        # Hide only — do not empty ring_preview_line buffers
+        if hasattr(window, 'hover_markers'):
+            window.hover_markers.visible = False
+        window.scene.ring_preview_line.visible = False
+        window.scene.hover_bond_line.visible = False
+        try:
+            window.scene.hover_atom_marker.visible = False
+        except Exception:
+            pass
+        if hasattr(window, 'cursor_markers') and cursor_xy is None:
+            window.cursor_markers.visible = False
+
+    # Mouse cursor (same Markers as on_mouse_move)
+    if cursor_xy is not None and hasattr(window, 'cursor_markers'):
+        p = np.array([[float(cursor_xy[0]), float(cursor_xy[1]), 0.0]], dtype=np.float32)
+        window.cursor_markers.set_data(pos=p, symbol='cross', edge_width=2,
+                                       edge_color='red', face_color='transparent', size=14)
+        window.cursor_markers.visible = True
+
+    # Hex tile hover — orange node discs (RingMode)
+    if hover_hex is not None:
+        q, r = hover_hex
+        ring_nodes = window.backend.grid.ring_nodes(q, r)
+        hover_pos = [[snap_to_grid(n)[0], snap_to_grid(n)[1], -0.08] for n in ring_nodes]
+        if hover_pos:
+            window.hover_markers.set_data(pos=np.array(hover_pos, dtype=np.float32), symbol='disc',
+                                         edge_width=2, edge_color='orange', face_color='transparent', size=12)
+            window.hover_markers.visible = True
+        nodes = np.asarray(ring_nodes, dtype=np.float32)
+        if nodes.ndim == 2 and nodes.shape[1] == 2:
+            nodes = np.column_stack([nodes, np.zeros(len(nodes), dtype=np.float32)])
+        closed = np.vstack([nodes, nodes[:1]]).astype(np.float32)
+        window.scene.ring_preview_line.set_data(pos=closed, color=(0.2, 0.8, 0.8, 0.6))
+        window.scene.ring_preview_line.visible = True
+
+    # Bond hover (lime line) — set_data only when we have endpoints
+    if bond_highlight is not None:
+        ids = list(bond_highlight)
+        a = window.backend.graph.atoms.get(ids[0])
+        b = window.backend.graph.atoms.get(ids[1])
+        if a is not None and b is not None and a.alive and b.alive:
+            window.scene.hover_bond_line.set_data(pos=np.array([a.pos, b.pos], dtype=np.float32))
+            window.scene.hover_bond_line.visible = True
+
+    # Cyan adjacent-ring foreshadow (overrides hex outline if both set)
+    if ring_preview is not None:
+        rp = np.asarray(ring_preview, dtype=np.float64)
+        if rp.ndim != 2:
+            raise ValueError(f'ring_preview shape {rp.shape}')
+        if rp.shape[1] == 2:
+            rp3 = np.column_stack([rp, np.zeros(len(rp))])
+        else:
+            rp3 = rp[:, :3]
+        closed = np.vstack([rp3, rp3[:1]]).astype(np.float32)
+        window.scene.ring_preview_line.set_data(pos=closed, color=(0.2, 0.8, 0.8, 0.6))
+        window.scene.ring_preview_line.visible = True
+
+    # Atom hover marker (same args as EditModeHandlers._hover_atom)
+    if hover_atom_id is not None:
+        atom = window.backend.graph.atoms.get(hover_atom_id)
+        if atom is not None and atom.alive:
+            window.scene.hover_atom_marker.set_data(
+                pos=np.array([atom.pos], dtype=np.float32),
+                symbol='disc', edge_width=3, edge_color='yellow', face_color='transparent', size=20)
+            window.scene.hover_atom_marker.visible = True
+
+    process_events(window)
+
+
+def capture_canvas_png(window, path, size=None, fit=True, zoom_out=2.0):
+    """Rasterize the VisPy editor canvas to PNG (viewport only).
+
+    zoom_out: extra factor on fit_to_atoms margin (2 ≈ show selection box comfortably).
+    """
+    from vispy.io import write_png
+    process_events(window)
+    if fit and hasattr(window.scene, 'fit_to_atoms'):
+        window.scene.fit_to_atoms(margin=1.8 * float(zoom_out))
+    window.scene.canvas.update()
+    process_events(window)
+    kwargs = {}
+    if size is not None:
+        kwargs['size'] = tuple(size)
+    img = window.scene.canvas.render(alpha=False, **kwargs)
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
+    write_png(path, img)
+    return path
+
+
+def capture_window_png(window, path, include_frame=True, fit=True, zoom_out=2.0):
+    """Screenshot of the Qt window including side panels / status bar.
+
+    Composites VisPy ``canvas.render()`` into the Qt grab at the native canvas
+    widget rect — ``QWidget.grab()`` / ``grabWindow`` often miss OpenGL content
+    (offscreen / Wayland). Titlebar included via ``grabWindow(winId)`` when possible.
+    """
+    from PyQt5 import QtGui
+    import numpy as np
+    from PIL import Image
+
+    process_events(window)
+    if fit and hasattr(window, 'scene') and hasattr(window.scene, 'fit_to_atoms'):
+        window.scene.fit_to_atoms(margin=1.8 * float(zoom_out))
+        window.scene.canvas.update()
+        process_events(window)
+
+    used_frame = False
+    pix = None
+    if include_frame:
+        try:
+            screen = window.screen() or QtWidgets.QApplication.primaryScreen()
+            if screen is not None and window.winId():
+                pix = screen.grabWindow(int(window.winId()))
+                used_frame = pix is not None and not pix.isNull()
+        except Exception:
+            pix = None
+            used_frame = False
+    if pix is None or pix.isNull():
+        pix = window.grab()
+        used_frame = False
+
+    try:
+        canvas = window.scene.canvas
+        native = getattr(canvas, 'native', None)
+        gl = canvas.render(alpha=False)
+        if native is not None and gl is not None and getattr(gl, 'size', 0):
+            top_left = native.mapTo(window, native.rect().topLeft())
+            ox, oy = int(top_left.x()), int(top_left.y())
+            if used_frame:
+                try:
+                    geo = window.frameGeometry()
+                    cgeo = window.geometry()
+                    ox += int(cgeo.x() - geo.x())
+                    oy += int(cgeo.y() - geo.y())
+                except Exception:
+                    pass
+            gl_img = np.asarray(gl)
+            if gl_img.ndim == 3 and gl_img.shape[2] >= 3:
+                if gl_img.dtype != np.uint8:
+                    gl_img = (np.clip(gl_img, 0, 1) * 255).astype(np.uint8) if float(gl_img.max()) <= 1.0 else gl_img.astype(np.uint8)
+                h, w = gl_img.shape[:2]
+                nw, nh = max(1, int(native.width())), max(1, int(native.height()))
+                pil_gl = Image.fromarray(gl_img[:, :, :3])
+                if (w, h) != (nw, nh):
+                    pil_gl = pil_gl.resize((nw, nh), Image.BILINEAR)
+                    w, h = nw, nh
+                qimg = pix.toImage().convertToFormat(QtGui.QImage.Format_RGBA8888)
+                ptr = qimg.bits(); ptr.setsize(qimg.byteCount())
+                arr = np.frombuffer(ptr, np.uint8).reshape(qimg.height(), qimg.width(), 4).copy()
+                base = Image.fromarray(arr[:, :, :3])
+                if ox < base.width and oy < base.height and ox + w > 0 and oy + h > 0:
+                    base.paste(pil_gl, (ox, oy))
+                    os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
+                    base.save(path)
+                    return path
+    except Exception as e:
+        print(f'[capture_window_png] VisPy composite skipped: {e}')
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
+    pix.save(path)
+    return path
+
+
+def frames_to_gif(frame_paths, out_gif, duration_ms=700):
+    """Pack ordered PNG frames into an animated GIF (Pillow)."""
+    from PIL import Image
+    imgs = [Image.open(p).convert('RGB') for p in frame_paths]
+    if not imgs:
+        raise ValueError('frames_to_gif: empty frame list')
+    os.makedirs(os.path.dirname(os.path.abspath(out_gif)) or '.', exist_ok=True)
+    imgs[0].save(out_gif, save_all=True, append_images=imgs[1:], duration=int(duration_ms), loop=0)
+    for im in imgs:
+        im.close()
+    return out_gif

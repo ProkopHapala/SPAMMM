@@ -36,8 +36,12 @@ debug/<script_stem>/          # matches pytest module name without .py
 | `fdbm_fukui_panel_flat/<mol>/es_diag/dipole_origin_bisect.png` | `run_spm.py es-diag` | Cube ES smoking gun. See `doc/Caveats.md` |
 | `helicene_afm_pipeline/rank*/compare_contact_vs_gridff_*.png` | `run_assembly_afm.py --compare-dir` | Contact-sep vs Morse+Coulomb GridFF |
 | `testplot_contact_surface/` | `tests/testplot_contact_surface.py` | PTCDA + toys contact-surface parity |
+| `azaindol_draw_demo/` | `./run_gui.sh --script spammm/GUI/gui_scripts/azaindol_draw_demo.py` | Live GUI PNG frames + `azaindol_draw_demo.gif` |
+| `azaindol_draw_offline/` | `PYTHONPATH=. python spammm/GUI/gui_scripts/azaindol_draw_offline.py` | Headless SVG (+PNG) draw frames |
 
 Do **not** treat deletion of these workflows as cleanup. Old runs live under `debug/OLD/`.
+
+Presentation draw demos: see `doc/Topics/GUI_DrawDemo_Scripts.md`.
 
 
 ## Presentation gallery

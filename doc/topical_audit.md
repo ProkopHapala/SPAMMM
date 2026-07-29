@@ -100,6 +100,7 @@ This **is** a supplement to:
   - **Corner ring** (`add_corner_ring`): n-gon sharing 2 existing bonds at an inner corner atom (angle < 180°); uses circumcircle through B-A-C, vector-math only (dot/cross products, no atan2); outer corners (>180°) fall through to edge/hex method; mouse direction selects which neighbor pair
   - **Hex-grid ring** (`add_ring`): snap to hex grid center, creates hexagonal ring on grid
   - Priority in RingMode: bond → corner atom → hex center
+- **Draw demos:** shared sequence → SVG / GIF — [Topics/GUI_DrawDemo_Scripts.md](Topics/GUI_DrawDemo_Scripts.md)
 - **Grid transforms:** transpose, flip X, flip Y — apply to both grid and atom geometry (`transform_atoms`)
 - **Tests:** `tests/topology/test_editing_ops.py`, `tests/test_export_import.py`
 
@@ -109,6 +110,15 @@ This **is** a supplement to:
 - **Audit Document:** [molecular_topology_editors.md](molecular_topology_editors.md)
 - **Feature audit:** [gui_audit.md](gui_audit.md)
 - **Developer notes:** [Takeways.md](Takeways.md) (matplotlib blit, GUI vs test geometry)
+
+### 1i. GUI Draw Demo Scripts (SVG + GIF)
+- Shared editor step sequence (hex → fused pent → N → H → copy/paste → δ/φ dimer) for presentation and systematic GUI debugging
+- **SSOT sequence:** `spammm/GUI/azaindol_draw_sequence.py` (`run_azaindol_draw`, `render_editor_svg`)
+- **Helpers:** `spammm/GUI/gui_script_utils.py` (`apply_demo_overlays`, `capture_window_png` GL composite, `frames_to_gif`)
+- **GUI scripts:** `azaindol_draw_demo.py` (live window PNG → GIF), `azaindol_draw_offline.py` (headless SVG)
+- **Audit document:** [Topics/GUI_DrawDemo_Scripts.md](Topics/GUI_DrawDemo_Scripts.md)
+- **Artifacts:** `debug/azaindol_draw_demo/` (PNG+GIF), `debug/azaindol_draw_offline/` (SVG+PNG)
+- **Caveats:** never empty `ring_preview_line` then refill (VisPy segfault); window grab must composite `canvas.render()` into Qt pixmap
 
 ## 2. Force Fields
 

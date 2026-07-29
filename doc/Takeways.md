@@ -12,6 +12,7 @@ patterns worth reusing. Not a design spec — see topical docs (`doc/Topics/`) a
 
 **Related topical docs:**
 - [ReactionCoordinateScan.md](Topics/ReactionCoordinateScan.md)
+- [GUI_DrawDemo_Scripts.md](Topics/GUI_DrawDemo_Scripts.md) — SVG + GIF draw demos, capture pitfalls
 - [AFM Contact Surface (static)](Topics/AFM/ContactSurface_Static.md)
 
 **Blit helper:** `spammm/GUI/mpl_blit.py`
@@ -156,6 +157,17 @@ from the **same** RC slider as the 3D view.
 - **Full run**: DFTB + save cache; use for first run or after geometry/scan logic changes.
 - **Offline mirror:** `spammm/GUI/gui_scripts/rc_scan_offline.py` (no Qt), same
   `build_ascii_hbond_system` path.
+
+### Dual-path draw demos (SVG + GIF)
+
+Shared ops in `spammm/GUI/azaindol_draw_sequence.py`; only `snapshot()` differs.
+
+| Runner | Entry | Artifacts |
+|--------|-------|-----------|
+| Offline SVG | `PYTHONPATH=. python spammm/GUI/gui_scripts/azaindol_draw_offline.py` | `debug/azaindol_draw_offline/*.svg` |
+| GUI GIF | `./run_gui.sh --script spammm/GUI/gui_scripts/azaindol_draw_demo.py` | `debug/azaindol_draw_demo/*.png` + `.gif` |
+
+**Pitfalls:** (1) `capture_window_png` must paste VisPy `canvas.render()` into the Qt grab — grab alone often blanks GL. (2) Never `set_data([])` on `ring_preview_line` then refill — offscreen render can segfault; hide-only. (3) Pick bonds/atoms by geometry, not hardcoded `_id` (global counter). Full write-up: [Topics/GUI_DrawDemo_Scripts.md](Topics/GUI_DrawDemo_Scripts.md).
 
 ---
 

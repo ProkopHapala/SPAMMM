@@ -72,6 +72,33 @@ python run_spm.py stm current --molecule pentacene --stm-tips s,pz,py
 - **Users:** [`user_guide/README.md`](user_guide/README.md) · [`user_guide/SPM_CLI.md`](user_guide/SPM_CLI.md) · [`demos/PairFF_manual.md`](demos/PairFF_manual.md) (rigid-body PairFF)
 - **Developers / layout:** [`MANIFEST.md`](MANIFEST.md) · [`doc/`](doc/) · [`doc/TopicalAudit/PairFF_RigidBody.md`](doc/TopicalAudit/PairFF_RigidBody.md) · [`doc/ToDo/ToDo.agents.md`](doc/ToDo/ToDo.agents.md)
 
-## License
+## Required QM Forks
 
-See the repository for licensing information.
+The FDBM desnity inpur rely on forks of DFTB and pySCF packages:
+
+- **DFTB+:** [`ProkopHapala/dftbplus`](https://github.com/ProkopHapala/dftbplus)
+- **pySCF:** [`ProkopHapala/pyscf`](https://github.com/ProkopHapala/pyscf)
+
+Clone both repositories, then follow their own README/install documentation for the actual build and dependencies:
+
+```bash
+mkdir -p ~/git
+git clone https://github.com/ProkopHapala/dftbplus.git ~/git/dftbplus
+git clone https://github.com/ProkopHapala/pyscf.git ~/git/pyscf
+```
+
+For DFTB+, build the executable and shared libraries (`libdftbcore.so`; use `-DBUILD_SHARED_LIBS=ON`) as described in its [`README.rst`](https://github.com/ProkopHapala/dftbplus/blob/main/README.rst) and [`INSTALL.rst`](https://github.com/ProkopHapala/dftbplus/blob/main/INSTALL.rst). For pySCF, follow the fork's [installation instructions](https://github.com/ProkopHapala/pyscf#installation).
+
+Configure the checkout and data paths in your shell (for example in `~/.bashrc`):
+
+```bash
+export SPAMMM_PYSCF_ROOT="$HOME/git/pyscf"
+export PYTHONPATH="$SPAMMM_PYSCF_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+export DFTB_ROOT="$HOME/git/dftbplus"
+export DFTB_EXE="$DFTB_ROOT/_build/app/dftb+/dftb+"
+export DFTB_SK_PATH="/path/to/slakos"  # parent containing mio-1-1/, 3ob-3-1/, ...
+export DFTB_BASIS_PATH="/path/to/SPAMMM/spammm/quantum/DFTB/data"  # optional; bundled WFC basis files
+```
+
+`DFTBcore` automatically searches for the fork's shared library at `~/git/dftbplus/_build/app/dftbcore/libdftbcore.so` (or `~/opt/dftbplus/lib/libdftbcore.so`). If your CMake build puts the executable or library elsewhere, adjust `DFTB_EXE` and either install/symlink the library into one of those locations or pass its path explicitly as `DFTBcore(libpath=...)`.

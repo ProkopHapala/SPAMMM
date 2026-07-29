@@ -102,7 +102,9 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `mpl_blit.py` — reusable matplotlib blit helper for Qt embedded plots (see `doc/Takeways.md`)
 - `rc_scan_gui_script.py` — programmatic RC review setup for `--script` launcher
 - `gui_script_runner.py` — runs control scripts after `window.show()`
-- `gui_scripts/` — `rc_scan_review.py`, `rc_scan_offline.py` (GUI / headless entry points)
+- `gui_script_utils.py` — script helpers; demo overlays; `capture_window_png` / `frames_to_gif`
+- `azaindol_draw_sequence.py` — shared hex→azaindol→dimer draw sequence (SVG + GUI hosts)
+- `gui_scripts/` — `rc_scan_*`, `azaindol_draw_demo.py` / `azaindol_draw_offline.py`, `folded_rigid_setup.py`
 - `plotutils.py` — Qt 2D plot window wrapper; re-exports `spammm.plotUtils` ESP helpers
 - `CollapsibleSection.py` — UI collapsible section widget
 - `shaders/` — GLSL shaders

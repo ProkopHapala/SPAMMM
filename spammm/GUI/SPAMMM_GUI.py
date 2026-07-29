@@ -1061,7 +1061,47 @@ class SPAMMMWindow(BaseGUI):
         if packed is None:
             debug_print(2, "No atoms to paste")
             return
-        self._insert_packed(packed, status_fmt="Pasted {n} atoms — sticky δ-move on; LMB click to drop")
+        return self._insert_packed(packed, status_fmt="Pasted {n} atoms — sticky δ-move on; LMB click to drop")
+
+    def translate_selected(self, dx, dy, dz=0.0):
+        """Translate currently selected atoms (same end-state as sticky δ-move)."""
+        ids = list(self.scene.get_selected_ids())
+        if not ids:
+            return
+        self._push_undo()
+        for aid in ids:
+            a = self.backend.graph.atoms.get(aid)
+            if a is None or not a.alive:
+                continue
+            a.pos[0] += float(dx); a.pos[1] += float(dy); a.pos[2] += float(dz)
+        self.backend._sync_sys()
+        self.refresh_view()
+        self.scene.set_selected_ids(ids)
+        debug_print(2, f"translate_selected n={len(ids)} d=({dx},{dy},{dz})")
+
+    def rotate_selected(self, deg, axis='z'):
+        """Rotate selected atoms about selection COM in XY (sticky φ end-state)."""
+        ids = list(self.scene.get_selected_ids())
+        if not ids:
+            return
+        atoms = [self.backend.graph.atoms[aid] for aid in ids if aid in self.backend.graph.atoms and self.backend.graph.atoms[aid].alive]
+        if not atoms:
+            return
+        self._push_undo()
+        com = np.mean([a.pos for a in atoms], axis=0)
+        ang = np.deg2rad(float(deg))
+        c, s = np.cos(ang), np.sin(ang)
+        for a in atoms:
+            d = a.pos - com
+            if axis == 'z':
+                a.pos[0] = com[0] + c * d[0] - s * d[1]
+                a.pos[1] = com[1] + s * d[0] + c * d[1]
+            else:
+                raise ValueError(f"rotate_selected: unsupported axis {axis!r}")
+        self.backend._sync_sys()
+        self.refresh_view()
+        self.scene.set_selected_ids(ids)
+        debug_print(2, f"rotate_selected n={len(ids)} deg={deg}")
 
     def _insert_packed(self, packed, status_fmt=None):
         """Append PackedMolecule into current graph (like paste). Returns new atom ids."""

@@ -280,7 +280,7 @@ The repo has a well-organized documentation hierarchy:
 - [doc/ToDo/ToDo.agents.md](cci:7://file:///home/prokop/git/SPAMMM/doc/ToDo/ToDo.agents.md:0:0-0:0) — agent task index (Done/Soon/Later)
 - [doc/AGENTS/skills/](cci:9://file:///home/prokop/git/SPAMMM/doc/AGENTS/skills:0:0-0:0) — 15 skill files for agent guidance
 - [doc/AGENTS/protocols/](cci:9://file:///home/prokop/git/SPAMMM/doc/AGENTS/protocols:0:0-0:0) — domain + general protocols
-- [doc/Topics/](cci:9://file:///home/prokop/git/SPAMMM/doc/Topics:0:0-0:0) — per-topic deep dives (AFM, Vibrations, RC Scan, RigidBody, PairFF)
+- [doc/Topics/](cci:9://file:///home/prokop/git/SPAMMM/doc/Topics:0:0-0:0) — per-topic deep dives (AFM, Vibrations, RC Scan, GUI Draw Demo, RigidBody, PairFF)
 - [doc/TopicalAudit/PairFF_RigidBody.md](../TopicalAudit/PairFF_RigidBody.md) — PairFF inventory
 - [demos/PairFF_manual.md](../../demos/PairFF_manual.md) — PairFF user manual
 - [tests/TEST_RESULTS.md](cci:7://file:///home/prokop/git/SPAMMM/tests/TEST_RESULTS.md:0:0-0:0) — 1109-line detailed test report with human-reviewed sections

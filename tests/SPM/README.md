@@ -11,6 +11,7 @@ See `doc/TEST_DESIGN.md` for L0/L1/L2 review levels.
 | `test_afm_morse.py` | pytest | Morse/LJ + Coulomb AFM: force field grid, scans, frequency shift |
 | `test_afm_fdbm.py` | pytest | FDBM pipeline: DFTB SCF, density projection, relaxed scan |
 | `testplot_density_projection.py` | visual | DFTB+ density projection, 2D slices + `.cub` |
+| `testplot_lcao_tile_partition.py` | visual | LCAO 8³ block tiling vs atom Rcut (denmap pairs) → `debug/lcao_tile_partition/` |
 | `testplot_fdbm_potentials.py` | visual | FDBM potential plots (Pauli, ES, dispersion) |
 | `testplot_fdbm_relax.py` | visual | FDBM + PP relaxation; **legacy** `_run_from_density` (deprecated for product CLI — see parity script) |
 | `testplot_cli_vs_modular_parity.py` | visual | **LEGACY CLI Stage3–4 vs Modular FAST_S3** parity + timing → `debug/cli_vs_modular_parity/` |

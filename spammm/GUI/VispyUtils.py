@@ -682,6 +682,27 @@ class AtomScene(QtCore.QObject):
         cam.scale_factor = 1.0
         self.canvas.update()
 
+    def fit_to_atoms(self, margin=1.8):
+        """Center + zoom ortho camera so all atoms are in view (demo/screenshot helper)."""
+        cam = self.view.camera
+        if cam is None:
+            return
+        pos = self._pos
+        if pos is None or len(pos) == 0:
+            return
+        ctr = pos.mean(axis=0)
+        span = float(np.ptp(pos[:, :2], axis=0).max())
+        if span < 1e-6:
+            span = 5.0
+        cam.fov = 0
+        cam.azimuth = 0
+        cam.elevation = 90
+        cam.center = (float(ctr[0]), float(ctr[1]), float(ctr[2]))
+        # fov=0: scale_factor ≈ visible half-extent (same convention as render_surface_png)
+        # Floor keeps early frames (single hex + foreshadow) from looking axis-gizmo zoomed
+        cam.scale_factor = max(float(span * 0.5 * margin), 5.0)
+        self.canvas.update()
+
     def set_pick_mode(self, mode):
         mode = str(mode).lower()
         if mode not in ('2d', '3d'):

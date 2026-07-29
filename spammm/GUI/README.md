@@ -43,5 +43,7 @@ Run via `./run_gui.sh --script spammm/GUI/gui_scripts/NAME.py [-- extra args]`:
 - **folded_rigid_setup.py** — Folded-rigid molecule-on-surface manipulation: load molecule, fit/load potential, run/drag
 - **rc_scan_review.py** — 2Quinolone symmetric pm-NEB relaxed review; `--preview` loads cached npz
 - **rc_scan_offline.py** — Same DFTB path without Qt (`PYTHONPATH=. python3 …`)
+- **azaindol_draw_demo.py** — Live Ring/Atom/Select draw → full-window PNG frames → GIF (`--zoom-out`, `--canvas-only`)
+- **azaindol_draw_offline.py** — Same sequence headless → one SVG per step (`PYTHONPATH=. python …`)
 
-Topical doc: `doc/Topics/ReactionCoordinateScan.md`
+Shared sequence: `azaindol_draw_sequence.py`. Topical docs: `doc/Topics/ReactionCoordinateScan.md`, `doc/Topics/GUI_DrawDemo_Scripts.md`. Folder index: `gui_scripts/README.md`.
