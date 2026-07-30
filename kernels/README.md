@@ -16,7 +16,7 @@ OpenCL source for SPAMMM GPU compute. Python harnesses concatenate `.cl` snippet
 | `gridFF.cl` | 3D B-spline grid build, Poisson, sampling | SPFF, GridFF, rigid |
 | `surface.cl` | Ewald2D, folded basis, brute Morse, isosurface | SPFF, SurfaceEwald |
 | `contact_surface.cl` | Quasi-2D contact surface (separable + PIC) | `surfaces/ContactSurface.py` |
-| `rigid.cl` | 6-DOF rigid body (GridFF + folded + PairFF allmol±FAF) | `forcefields/RigidBodyDynamics.py` |
+| `rigid.cl` | 6-DOF rigid body plus PairFF+FAF replica energy evaluation | `forcefields/RigidBodyDynamics.py` |
 | `assembly.cl` | Multi-molecule rigid transforms + clash | `forcefields/Assembly.py` |
 | `AFM.cl` | Probe relaxation + AFM image generation | `SPM/AFM.py` |
 | `grids.cl` | Density project/downsample (dipole-preserving), Gaussian NA, axpy | `utils/GridsOCL.py` |
@@ -272,6 +272,7 @@ AFMulator adds `AFM.cl` for full scan stack.
 | `folded_FT_perturb` | Same after ±eps along one of 6 DOFs (FD Hessian column) |
 | `rigid_solve6_lm` | `(A+λI)x=b` — GE + partial pivoting; return 0 if singular |
 | `rigid_update_FIRE` | Bitzek-style velocity zeroing + dt/damp adapt |
+| `rigid_body_pairff_energy_replica_kernel` | Pure replica×active PairFF+FAF/Kz/anchor energy channels; 64-thread NVIDIA tile path |
 
 **Caveat:** Gyroscopic term ω×(I·ω) must use body-frame inertia. Folded setup scales both `I` and `I⁻¹` with the requested effective mass; changing translation alone is inconsistent. FIRE when `md_params.w < 0`. Python: `run_folded(..., fire=True)`, `run_folded_newton` / `run_folded_newton_replicas`; host FD Newton is `relax_newton_host` (debug only).
 

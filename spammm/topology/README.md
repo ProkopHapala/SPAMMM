@@ -1,6 +1,6 @@
 # topology/
 
-Editable molecular topology and structure generation. **`AtomicGraph` is the SSOT** — rendering, force-field export (`AtomicSystem`), `PackedMolecule`, and GUI editing all derive from it.
+Editable molecular topology and structure generation. **`AtomicGraph` is the SSOT** for atoms — rendering, force-field export (`AtomicSystem`), `PackedMolecule`, and GUI editing all derive from it. **Rigid-molecule poses** (`pos`+`qrot`) are a separate planned SSOT (`RigidEnsemble`) — see `doc/TopicalAudit/RigidBody.md`, `doc/Tasks/RigidMoleculePose_SSOT.md` (not implemented yet).
 
 See also: `kernels/README.md` (GPU force fields consume topology via `AtomicSystem` / packed arrays).
 

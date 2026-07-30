@@ -30,7 +30,7 @@ duplicate physics       →     one OpenCLBase path, NVIDIA-first
 | 2 | PPAFM Kriging → GridFF | `doc/Tasks/Import_KrigingGridFF.md` | **P1** |
 | 7 | STM mio/3ob/prolonged + pySCF cubes | `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md` | **P1** |
 | — | Site Pauli \(A,\beta\) + transferability | `doc/Tasks/Pauli_A_beta_KrigingTransferability.md` | **P1** |
-| 3 | PME charge rings + MC / Hubbard / MQCA | `doc/Tasks/Import_ChargeRings_PME.md` | **P1** |
+| 3 | PME charge rings + MC / Hubbard / MQCA | `doc/Tasks/Import_ChargeRings_PME.md` (A+D+F Done); pose glue `RigidMoleculePose_SSOT.md` | **P1** |
 | 8 | Kekulé π → exponential RI density | `doc/Tasks/Kekule_ExponentialDensityFit.md` | **P2** |
 | 9 | Fast 2.5D contact-surface AFM | `doc/Tasks/Fast_2p5D_AFM_ContactSurface.md` | **P1** (parity bisect; was P2) |
 | — | Frenkel / TEPL | `doc/Ideas/FrenkelRigidFF.chat.md` (ideas only) | **P2** |

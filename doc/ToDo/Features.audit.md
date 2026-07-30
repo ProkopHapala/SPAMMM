@@ -83,7 +83,7 @@ Topology (AtomicGraph SSOT) → Type Assignment → Force Fields → Surface Int
 | Shared GUI↔CLI job-spec protocol | ✗ ToDo (`Consolidate_GUI_CLI_Backend_Input_Protocol.md`) |
 | Inputs: ASCII / `.mol`/`.mol2` shared flags | ✗ ToDo — SMILES done; ASCII builder exists (`SPM_CLI_Headless.md` §A/D) |
 | Substrate `dock` (GridFF / FAF) | ✗ **Future** — harder; see `SPM_CLI_Headless.md` §E + folded-basis task |
-| light-STM; charge-rings | ✗ ToDo |
+| light-STM; charge-rings CLI | light-STM ✗; PME A+D+F ✓ (solver+scans+GUI); CLI imaging Later; pose SSOT design [`RigidMoleculePose_SSOT.md`](../Tasks/RigidMoleculePose_SSOT.md) |
 
 
 **FDBM perf (T01, 2026-07-19) — measured on RTX 3090:** benzene warm ~**0.18 s** (was ~1.65 s); flat_1 S2 NA **5.87→0.03 s**; S3 cache **~10→0.4 s**; flat_1 warm S3+S4 ~**1.4 s**. Spec: `doc/Tasks/PerfBenchmark_FDBM.md`.
@@ -282,6 +282,8 @@ The repo has a well-organized documentation hierarchy:
 - [doc/AGENTS/protocols/](cci:9://file:///home/prokop/git/SPAMMM/doc/AGENTS/protocols:0:0-0:0) — domain + general protocols
 - [doc/Topics/](cci:9://file:///home/prokop/git/SPAMMM/doc/Topics:0:0-0:0) — per-topic deep dives (AFM, Vibrations, RC Scan, GUI Draw Demo, RigidBody, PairFF)
 - [doc/TopicalAudit/PairFF_RigidBody.md](../TopicalAudit/PairFF_RigidBody.md) — PairFF inventory
+- [doc/TopicalAudit/RigidBody.md](../TopicalAudit/RigidBody.md) — cross-module pose (`pos`+`qrot`); SSOT gap
+- [doc/Tasks/RigidMoleculePose_SSOT.md](../Tasks/RigidMoleculePose_SSOT.md) — design for host pose authority
 - [demos/PairFF_manual.md](../../demos/PairFF_manual.md) — PairFF user manual
 - [tests/TEST_RESULTS.md](cci:7://file:///home/prokop/git/SPAMMM/tests/TEST_RESULTS.md:0:0-0:0) — 1109-line detailed test report with human-reviewed sections
 - Per-module [README.md](cci:7://file:///home/prokop/git/SPAMMM/README.md:0:0-0:0) files in key directories
@@ -301,7 +303,7 @@ The repo has a well-organized documentation hierarchy:
 - Morse/LJ AFM imaging (9 tests, pentacene/PTCDA images); CLI `afm-morse`
 - **Headless SPM CLI** (`run_spm.py`): FDBM / Morse / Kriging AFM + STM orbitals/current/panel — docs `user_guide/SPM_CLI.md` (science sign-off pending; gaps in `SPM_CLI_Headless.md`)
 - Folded basis rigid body relaxation + manipulation (5 tests, ref data)
-- **PairFF rigid-body docking** — unified/env OpenCL kernels, Vispy demo (FIRE default, multi-body click-to-select, mixed XYZs); manual `demos/PairFF_manual.md`; main-GUI wire still open
+- **PairFF rigid-body docking** — unified/env OpenCL kernels, Vispy demo (FIRE default, multi-body click-to-select, mixed XYZs); manual `demos/PairFF_manual.md`; main-GUI wire still open; **no shared host pose SSOT** yet (`RigidBody.md` / `RigidMoleculePose_SSOT.md`)
 - Contact surface AFM (2 tests, separable + PIC)
 - DFTB+ SCF + GPU density projection
 - FDBM Pauli parameter fitting (global log-log, 3 basis sets)

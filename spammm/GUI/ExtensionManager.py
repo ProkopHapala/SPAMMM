@@ -159,6 +159,11 @@ EXTENSION_REGISTRY = {
         dependencies=['pyopencl'], req_paths=[],
         build_ui='build_ui',
     ),
+    'charge_rings': dict(
+        module='spammm.GUI.ChargeRingsExtension', class_name=None,
+        dependencies=['pyopencl'], req_paths=[],
+        build_ui='build_ui',
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -182,6 +187,7 @@ DEFAULT_CONFIG = {
     'reaction_coord': dict(enabled=True),
     'vibrations': dict(enabled=True),
     'folded_rigid': dict(enabled=True),
+    'charge_rings': dict(enabled=True),
 }
 
 # ---------------------------------------------------------------------------

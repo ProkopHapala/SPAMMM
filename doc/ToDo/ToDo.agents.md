@@ -59,7 +59,8 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
   - CO guinea-pig for ES Δρ + tip prolonged Pauli (notes in task file)
 - [ ] **Site-resolved Pauli \(A,\beta\) + transferability** — fit \(A\) (and β) at atoms/bonds/rings vs Kriging; optionally Kriging-interpolate parameter maps; spread across site types & molecules (`doc/Tasks/Pauli_A_beta_KrigingTransferability.md`)
 - [ ] **STM orbital compare (mio / 3ob / prolonged + pySCF cubes)** — pentacene + PTCDA HOMO/LUMO panels (`doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md`); CLI: `run_spm.py stm *`; depends on prolonged WFC
-- [ ] **Charge rings PME + Hubbard/MQCA** — OpenCL into SPAMMM; later CLI imaging (`doc/Tasks/Import_ChargeRings_PME.md`)
+- [x] **Charge rings PME (slices A+D+F)** — `PauliSolverCL` + `pauli_scan` + Ruslan/fig3 + `ChargeRingsExtension`; Hubbard/MQCA/MC-fit Later (`doc/Tasks/Import_ChargeRings_PME.md`, `doc/TopicalAudit/ChargeRings_PME.md`)
+- [ ] **Rigid-molecule pose SSOT** (`pos`+`qrot`) — design only; glue ChargeRings ↔ PairFF ↔ Assembly ↔ FoldedRigid (`doc/Tasks/RigidMoleculePose_SSOT.md`, inventory `doc/TopicalAudit/RigidBody.md`) — do not code until USER prioritizes
 - [ ] **Light-STM** — optically driven / excited-state STM channels (CLI ToDo; no module yet)
 
 **P2 — secondary if time**
@@ -248,7 +249,8 @@ SSOT priorities: `doc/ARCHITECTURE_ROADMAP.md` §TOC. Strategy: `doc/Tasks/RepoC
 | Kriging → GridFF (P1) | `doc/Tasks/Import_KrigingGridFF.md` |
 | Pauli \(A,\beta\) transferability (P1) | `doc/Tasks/Pauli_A_beta_KrigingTransferability.md` |
 | STM mio/3ob/prolonged + DFT cubes (P1) | `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md` |
-| Charge rings / PME / MQCA (P1) | `doc/Tasks/Import_ChargeRings_PME.md` |
+| Charge rings / PME / MQCA (P1) | `doc/Tasks/Import_ChargeRings_PME.md`, `doc/TopicalAudit/ChargeRings_PME.md` |
+| Rigid pose SSOT (P1 glue) | `doc/Tasks/RigidMoleculePose_SSOT.md`, `doc/TopicalAudit/RigidBody.md` |
 | Kekulé exponential RI density (P2) | `doc/Tasks/Kekule_ExponentialDensityFit.md` |
 | Fast 2.5D contact surface (P2) | `doc/Tasks/Fast_2p5D_AFM_ContactSurface.md` |
 | Frenkel / TEPL (P2) | `doc/Ideas/FrenkelRigidFF.chat.md` |

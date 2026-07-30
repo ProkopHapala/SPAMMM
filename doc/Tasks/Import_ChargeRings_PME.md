@@ -1,10 +1,12 @@
 # Task: Import charge rings — Pauli Master Equation + MC / Hubbard / MQCA
 
-**Status:** investigating  
+**Status:** Done (slices A+D+F) — Hubbard/MQCA/MC-fit remain Later; pose SSOT follow-on in [`RigidMoleculePose_SSOT.md`](RigidMoleculePose_SSOT.md)  
 **Priority:** P1 (nc-AFM — `doc/ARCHITECTURE_ROADMAP.md` §TOC)  
 
 **Human ToDo:** item 3  
-**Parent:** `doc/Tasks/RepoConsolidation.md`
+**Parent:** `doc/Tasks/RepoConsolidation.md`  
+**Topical audit:** `doc/TopicalAudit/ChargeRings_PME.md`  
+**Pose glue (sites = molecules):** `doc/TopicalAudit/RigidBody.md` · `doc/Tasks/RigidMoleculePose_SSOT.md`
 
 ## Objective
 
@@ -54,25 +56,36 @@ PME steady state P  →  I, dI/dV maps (xy, xV)
 
 ## Work plan (parallelizable slices)
 
-| Slice | Owner focus | Exit criterion |
-|-------|-------------|----------------|
-| A | `PME.cl` + `PauliSolverCL` + 4-site x-scan L0 | parity vs FireCore `test_pme_parity_*` |
-| B | `hubbard.cl` MC + dense PME | max\|dI\| ~ 1e-12 vs A on 2/4-site |
-| C | MQCA + top8 | ground-state / logic-map smoke |
-| D | `pauli_scan` xy/xV API + testplot | NTCDA dimer map PNG |
-| E | MC fit skeleton | optional; needs exp data policy |
-| F | GUI extension | after A+D |
+| Slice | Owner focus | Exit criterion | Status |
+|-------|-------------|----------------|--------|
+| A | `PME.cl` + `PauliSolverCL` + 4-site x-scan L0 | parity vs FireCore `test_pme_parity_*` | **Done** (USER 2026-07-30) |
+| B | `hubbard.cl` MC + dense PME | max\|dI\| ~ 1e-12 vs A on 2/4-site | Later |
+| C | MQCA + top8 | ground-state / logic-map smoke | Later |
+| D | `pauli_scan` xy/xV API + testplot | NTCDA dimer + fig3 trimer NDR | **Done** (USER 2026-07-30) |
+| E | MC fit skeleton | optional; needs exp data policy | Later |
+| F | GUI extension | after A+D | **Done** (ChargeRingsExtension) |
 
 ## Acceptance
 
-- [ ] Solvers live under SPAMMM tree; run on NVIDIA
-- [ ] Documented parity numbers in test stdout / `.out`
-- [ ] One NTCDA (or Ruslan) xy or xV plot for USER review
-- [ ] No silent PoCL fallback in benches
-- [ ] USER confirms before Done
+- [x] Solvers live under SPAMMM tree; run on NVIDIA — `kernels/PME.cl` + `PauliSolverCL` + `pauli_scan`
+- [x] Documented parity numbers in test stdout / `.out` — square mirror; Ruslan/fig3 plots
+- [x] One NTCDA (or Ruslan) xy or xV plot for USER review — + fig3 trimer NDR
+- [x] No silent PoCL fallback in benches — NVIDIA assert in tests
+- [x] USER confirms before Done — confirmed 2026-07-30 (docs + mark done)
+
+**Delivered:**
+- `spammm/quantum/PauliSolverCL.py`, `pauli_scan.py`, `kernels/PME.cl`
+- Fixtures `data/charge_rings/` (Ruslan_*, square_tetramer, fig3_trimer.json)
+- L0 `tests/quantum/test_pme_pauli.py`; L2 `testplot_charge_rings_{ruslan,trimer}.py`
+- Audit `doc/TopicalAudit/ChargeRings_PME.md`
 
 ## Caveats from exports
 
-- Temperature units GUI→solver bug in ppafm (`temperature.md`) — fix at port time.
-- Hubbard PME: known historical bugs (pivoting, dE sign) already fixed in FireCore — port fixed kernels only.
+- Temperature units GUI→solver bug in ppafm (`temperature.md`) — SPAMMM uses Kelvin→eV via `make_configured_solver` convention.
+- Hubbard PME: known historical bugs (pivoting, dE sign) already fixed in FireCore — port fixed kernels only (slice B).
 - Full exp dataset / QmeQ integration = Later.
+- **Two regimes:** Ruslan dimer (Qzz=10) vs fig3/symmetric trimer (Qzz=0 monopole → strong NDR).
+
+## Follow-on (not in A–F)
+
+- [ ] **Rigid sites = molecules** — ChargeRings `spos`/`rots` from shared pose SSOT (`pos`+`qrot`), same bodies as PairFF/Assembly/FoldedRigid. Inventory: [`doc/TopicalAudit/RigidBody.md`](../TopicalAudit/RigidBody.md). Design: [`RigidMoleculePose_SSOT.md`](RigidMoleculePose_SSOT.md). Do not implement until USER prioritizes.

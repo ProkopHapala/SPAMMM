@@ -28,7 +28,7 @@ Executive summary from recent git (high level): FDBM PP-AFM sped up (fused Poiss
 | **P1** | Kriging / RBF z-scan → GridFF | **In SPAMMM** — `KrigingGridFF` + pyridine campaign; cube-FDBM ES vs Kriging still open | DFT z-scan → GridFF → PP; Pauli fit vs FDBM | Task `doc/Tasks/Import_KrigingGridFF.md`; reports `doc/Reports/Kriging_*.md`; topic `doc/Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md` |
 | **P1** | Site-resolved Pauli \(A,\beta\) + transferability | **New task** — pyridine shows N/C/H want different \(A\) | Map \(A\) (β) at sites; optional Kriging of params; cross-molecule stats | `doc/Tasks/Pauli_A_beta_KrigingTransferability.md` |
 | **P1** | STM mio / 3ob / prolonged + pySCF MO cubes | Kernels + `compute_stm` exist; no systematic panel | Pentacene + PTCDA HOMO/LUMO gallery | `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md` |
-| **P1** | PME / charge rings / Hubbard–MQCA | Export docs + FireCore/ppafm OpenCL; **not consolidated in SPAMMM** | Bring OpenCL solvers into SPAMMM for a showable xy/xV slice | Task `doc/Tasks/Import_ChargeRings_PME.md`; `/home/prokop/git/ppafm/docs/export/charge_rings.export.md`; `/home/prokop/git/FireCore/doc/Topics/ManyBody/MQCA_Hubbard_Ising.export.md` |
+| **P1** | PME / charge rings / Hubbard–MQCA | **PME A+D+F Done** — solver + scans + GUI; Hubbard/MQCA/MC-fit Later; **pose SSOT** follow-on (sites = rigid molecules) | Showable xy/xV; later Hubbard/MQCA; shared `pos`+`qrot` | Tasks `Import_ChargeRings_PME.md`, `RigidMoleculePose_SSOT.md`; audits `ChargeRings_PME.md`, `RigidBody.md` |
 | **P2** | Kekulé → exponential RI density | Kekulé orders + Slater tools exist; no RI pipeline | Cheap π ρ vs DFT/DFTB; optional FDBM Pauli | `doc/Tasks/Kekule_ExponentialDensityFit.md` |
 | **P2** | Frenkel Hamiltonian (TEPL / tip molecule + surface aggregate) | **Ideas only** — no `spammm/` module yet | Post-conference unless surplus time | Design chat `doc/Ideas/FrenkelRigidFF.chat.md`; would sit on rigid/FoldedRigid geometry + GPU dense eigen (~(N+1)m) |
 | **P2** | Quasi-2D / 2.5D contact-surface AFM | **Prototype** — separable + PIC GPU; elastic Phase 2 design-only | Harden parity; decide hybrid (iii); speed demo | Task `doc/Tasks/Fast_2p5D_AFM_ContactSurface.md`; `kernels/contact_surface.cl`; `ContactSurface.py`; `ContactSurface_Static.md` |
@@ -560,7 +560,7 @@ Library stored as JSON or Python dict, loadable at runtime. Initial groups:
 | Kriging → GridFF (P1) | §TOC | — | Soon | `doc/Tasks/Import_KrigingGridFF.md`, reports `Kriging_*.md` |
 | Pauli \(A,\beta\) maps (P1) | §TOC | — | Soon | `doc/Tasks/Pauli_A_beta_KrigingTransferability.md` |
 | STM basis compare (P1) | §TOC | — | Soon | `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md` |
-| PME / charge rings (P1) | §TOC | — | Soon | `doc/Tasks/Import_ChargeRings_PME.md` |
+| PME / charge rings (P1) | §TOC | A+D+F Done; Hubbard Later | Soon | `Import_ChargeRings_PME.md`; pose SSOT `RigidMoleculePose_SSOT.md` / `TopicalAudit/RigidBody.md` |
 | Kekulé RI density (P2) | §TOC | — | Soon | `doc/Tasks/Kekule_ExponentialDensityFit.md` |
 | Frenkel / TEPL (P2) | §TOC | — | Later | `doc/Ideas/FrenkelRigidFF.chat.md` only |
 | Contact surface 2.5D (P2) | §TOC | — | Soon | `doc/Tasks/Fast_2p5D_AFM_ContactSurface.md`, `ContactSurface_*.md` |

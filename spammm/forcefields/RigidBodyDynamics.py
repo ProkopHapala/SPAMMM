@@ -1784,10 +1784,36 @@ void rigid_body_pairff_unified_allmol_faf_kernel(
         self.krnl_pairff_allmol = None
         self.pairff_allmol_faf_args = None
         self.krnl_pairff_allmol_faf = None
+        self.krnl_pairff_energy_replica = None
+        self.n_energy_replica = 0
+        self._energy_active_mols = None
         self.pairff_mode = PAIRFF_MODE_LEGACY
         self.env_mode = False
         self.allmol_mode = False  # shared all-molecule buffers; active_mol index only
         self.faf_mode = False  # when True, run_pairff uses fused PairFF+FAF kernels
+        self.kernelheaders["rigid_body_pairff_energy_replica_kernel"] = """__kernel
+void rigid_body_pairff_energy_replica_kernel(
+    __global const int*     mols,
+    __global const float4*  poss,
+    __global const float4*  qrots,
+    __global const float4*  apos_body,
+    __global const float4*  dyn_REQ,
+    __global const int*     dyn_type,
+    __global const int*     active_mols,
+    const int               nactive,
+    const int               nmol,
+    const int               n_replica,
+    const float4            pairff_params,
+    const float             beta,
+    const float             z_target,
+    __global const float*   folded_coeffs,
+    __global const float4*  folded_kxyz,
+    __global const int*     folded_atom_type,
+    const int4              folded_meta,
+    const float4            folded_lvec2d,
+    __global const float4*  anchors,
+    __global float4*        E_out
+)"""
         self.n_env_mols = 0
         self.n_env_sites = 0
         self.env_mols_host = None
@@ -2398,6 +2424,228 @@ void rigid_body_pairff_unified_allmol_faf_kernel(
                 types = types[m]
             out.append({'world': world, 'enames': list(enames), 'types': np.asarray(types), 'pos': self._mb_pos[j].copy(), 'quat': self._mb_quat[j].copy()})
         return out
+
+    # ------------------------------------------------------------------
+    # Replica energy kernel (MC / GA harness) — Kernel 14
+    # ------------------------------------------------------------------
+    RIGID_ENERGY_WG = 64
+
+    def ensure_energy_replica_buffers(self, n_replica, nactive=None):
+        """Allocate pose/E_out/active_mols buffers for energy_replica kernel."""
+        if not self.allmol_mode:
+            raise RuntimeError("energy_replica requires from_molecules() / allmol_mode")
+        n_replica = int(n_replica)
+        nmol = int(self.n_bodies)
+        if nactive is None:
+            nactive = nmol
+        nactive = int(nactive)
+        mf = cl.mem_flags
+        f4 = 4 * np.float32().itemsize
+        self.check_buf('poss_replicas', n_replica * nmol * f4, mf.READ_ONLY)
+        self.check_buf('qrots_replicas', n_replica * nmol * f4, mf.READ_ONLY)
+        self.check_buf('active_mols', max(nactive, 1) * np.int32().itemsize, mf.READ_ONLY)
+        self.check_buf('E_out', n_replica * nactive * f4, mf.WRITE_ONLY)
+        self.n_energy_replica = n_replica
+        if self.krnl_pairff_energy_replica is None:
+            self.krnl_pairff_energy_replica = cl.Kernel(self.prg, "rigid_body_pairff_energy_replica_kernel")
+        # FAF-off defaults so energy kernel always has scalar params
+        if 'folded_meta' not in self.kernel_params:
+            self.kernel_params['folded_meta'] = np.array([0, 1, 0, 0], dtype=np.int32)
+        if 'folded_lvec2d' not in self.kernel_params:
+            self.kernel_params['folded_lvec2d'] = np.array([1.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        return self
+
+    def set_active_mols(self, active_mols):
+        """Upload active molecule index list for the next energy_replica launch."""
+        active = np.asarray(active_mols, dtype=np.int32).ravel().copy()
+        if active.size < 1:
+            raise ValueError("active_mols must be non-empty")
+        if np.any(active < 0) or np.any(active >= self.n_bodies):
+            raise ValueError(f"active_mols out of range [0,{self.n_bodies})")
+        self._energy_active_mols = active
+        return active
+
+    def upload_replica_poses(self, poss, qrots):
+        """Upload replica poses: poss/qrots shaped (n_replica, nmol, 4) or (n_replica*nmol, 4)."""
+        nmol = int(self.n_bodies)
+        poss = np.asarray(poss, dtype=np.float32)
+        qrots = np.asarray(qrots, dtype=np.float32)
+        if poss.ndim == 3:
+            n_replica = poss.shape[0]
+            if poss.shape != (n_replica, nmol, 4) or qrots.shape != (n_replica, nmol, 4):
+                raise ValueError(f"pose shapes {poss.shape}/{qrots.shape} != ({n_replica},{nmol},4)")
+            poss = poss.reshape(n_replica * nmol, 4)
+            qrots = qrots.reshape(n_replica * nmol, 4)
+        elif poss.ndim == 2:
+            if poss.shape[1] != 4 or poss.shape[0] % nmol != 0:
+                raise ValueError(f"flat poss shape {poss.shape} not divisible by nmol={nmol}")
+            n_replica = poss.shape[0] // nmol
+            if qrots.shape != poss.shape:
+                raise ValueError(f"qrots shape {qrots.shape} != poss {poss.shape}")
+        else:
+            raise ValueError(f"poss ndim={poss.ndim}, expected 2 or 3")
+        self.ensure_energy_replica_buffers(n_replica, nactive=(len(self._energy_active_mols) if self._energy_active_mols is not None else nmol))
+        self.toGPU('poss_replicas', np.ascontiguousarray(poss))
+        self.toGPU('qrots_replicas', np.ascontiguousarray(qrots))
+        return n_replica
+
+    @staticmethod
+    def energy_changed(E_chan):
+        """Reduce float4 channels → E_changed per replica (design §4.3)."""
+        E = np.asarray(E_chan, dtype=np.float64)
+        if E.ndim == 2:
+            return float(0.5 * E[:, 0].sum() + E[:, 1].sum() + E[:, 2].sum())
+        if E.ndim != 3 or E.shape[-1] < 3:
+            raise ValueError(f"E_chan shape {E.shape}, expected (R,nactive,4) or (nactive,4)")
+        return 0.5 * E[..., 0].sum(axis=-1) + E[..., 1].sum(axis=-1) + E[..., 2].sum(axis=-1)
+
+    def eval_energy_replicas(self, poss=None, qrots=None, active_mols=None, bTryAllocate=True):
+        """Launch energy_replica kernel; return E_chan (n_replica, nactive, 4).
+
+        poss/qrots: optional upload; else reuse last replica buffers.
+        active_mols: optional int list; else last set_active_mols / all molecules.
+        """
+        nmol = int(self.n_bodies)
+        if active_mols is not None:
+            active = self.set_active_mols(active_mols)
+        elif self._energy_active_mols is not None:
+            active = self._energy_active_mols
+        else:
+            active = self.set_active_mols(np.arange(nmol, dtype=np.int32))
+        nactive = int(active.shape[0])
+        if poss is not None or qrots is not None:
+            if poss is None or qrots is None:
+                raise ValueError("pass both poss and qrots, or neither")
+            n_replica = self.upload_replica_poses(poss, qrots)
+        else:
+            n_replica = int(self.n_energy_replica)
+            if n_replica < 1:
+                raise RuntimeError("call upload_replica_poses(...) before eval_energy_replicas()")
+        if bTryAllocate:
+            self.ensure_energy_replica_buffers(n_replica, nactive=nactive)
+        self.toGPU('active_mols', np.ascontiguousarray(active))
+        # Ensure FAF-off scalars if never attached
+        if 'folded_meta' not in self.kernel_params:
+            self.kernel_params['folded_meta'] = np.array([0, 1, 0, 0], dtype=np.int32)
+        if 'folded_lvec2d' not in self.kernel_params:
+            self.kernel_params['folded_lvec2d'] = np.array([1.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        self.kernel_params['nactive'] = np.int32(nactive)
+        self.kernel_params['nmol'] = np.int32(nmol)
+        self.kernel_params['n_replica'] = np.int32(n_replica)
+        if self.krnl_pairff_energy_replica is None:
+            self.krnl_pairff_energy_replica = cl.Kernel(self.prg, "rigid_body_pairff_energy_replica_kernel")
+        args = self.generate_kernel_args(
+            "rigid_body_pairff_energy_replica_kernel",
+            overrides={
+                'poss': self.buffer_dict['poss_replicas'],
+                'qrots': self.buffer_dict['qrots_replicas'],
+            },
+        )
+        wg = int(self.RIGID_ENERGY_WG)
+        # Exact 2D grid — no padding (kernel early-return would deadlock on barriers)
+        global_size = (nactive * wg, n_replica)
+        local_size = (wg, 1)
+        self.krnl_pairff_energy_replica(self.queue, global_size, local_size, *args)
+        self.queue.finish()
+        E = np.empty((n_replica * nactive, 4), dtype=np.float32)
+        self.fromGPU('E_out', E)
+        return E.reshape(n_replica, nactive, 4)
+
+    @staticmethod
+    def packing_energy(pos, k_pack=0.0, center=(0.0, 0.0)):
+        """Harmonic pull of CoMs toward ``center`` in the xy plane: ½ k Σ|r−c|²."""
+        if k_pack <= 0.0:
+            return 0.0
+        pos = np.asarray(pos, dtype=np.float64)
+        c = np.asarray(center, dtype=np.float64)[:2]
+        d = pos[:, :2] - c[None, :]
+        return float(0.5 * k_pack * np.sum(d * d))
+
+    def eval_energy_system(self, pos, quat, k_pack=0.0, pack_center=(0.0, 0.0)):
+        """Evaluate E_tot for one pose set (nmol bodies). pos (nmol,3), quat (nmol,4)."""
+        nmol = int(self.n_bodies)
+        pos = np.asarray(pos, dtype=np.float32).reshape(nmol, 3)
+        quat = np.asarray(quat, dtype=np.float32).reshape(nmol, 4)
+        poss = np.zeros((1, nmol, 4), dtype=np.float32)
+        poss[0, :, :3] = pos
+        qrots = quat.reshape(1, nmol, 4).copy()
+        E = self.eval_energy_replicas(poss, qrots, active_mols=np.arange(nmol, dtype=np.int32))
+        return float(self.energy_changed(E)[0]) + self.packing_energy(pos, k_pack, pack_center)
+
+    def greedy_energy_step(self, pos, quat, moved, n_trial=128, dxy=0.4, dphi=0.25, seed=None,
+                           rmin_com=0.0, rmin_atom=0.0, k_pack=0.0, pack_center=(0.0, 0.0)):
+        """Greedy best-of-batch planar move of molecules in ``moved``.
+
+        Score = PairFF channel energy of the active set + optional packing well.
+        Reject trials with CoM–CoM < rmin_com or any real-atom pair < rmin_atom.
+        Returns (pos', quat', E_before, E_best, accepted, E_batch).
+        """
+        rng = np.random.default_rng(seed)
+        nmol = int(self.n_bodies)
+        pos = np.asarray(pos, dtype=np.float32).reshape(nmol, 3).copy()
+        quat = np.asarray(quat, dtype=np.float32).reshape(nmol, 4).copy()
+        moved = np.asarray(moved, dtype=np.int32).ravel()
+        n_trial = int(n_trial)
+        poss = np.zeros((n_trial, nmol, 4), dtype=np.float32)
+        qrots = np.tile(quat[None, :, :], (n_trial, 1, 1))
+        for r in range(n_trial):
+            poss[r, :, :3] = pos
+            for i in moved:
+                if r == 0:
+                    continue
+                poss[r, i, 0] += float(rng.normal(0.0, dxy))
+                poss[r, i, 1] += float(rng.normal(0.0, dxy))
+                dphi_i = float(rng.normal(0.0, dphi))
+                half = 0.5 * dphi_i
+                dq = np.array([0.0, 0.0, np.sin(half), np.cos(half)], dtype=np.float32)
+                qrots[r, i] = self._quat_normalize(self._quat_mul(quat[i], dq))
+        E_chan = self.eval_energy_replicas(poss, qrots, active_mols=moved)
+        E = self.energy_changed(E_chan)
+        if k_pack > 0.0:
+            for r in range(n_trial):
+                E[r] = float(E[r]) + self.packing_energy(poss[r, :, :3], k_pack, pack_center)
+        need_clash = (rmin_com > 0.0) or (rmin_atom > 0.0)
+        if need_clash:
+            real_rel = []
+            if self._mb_packs is not None and rmin_atom > 0.0:
+                for pack in self._mb_packs:
+                    m = pack['types'] == 0
+                    real_rel.append(np.asarray(pack['rel'][m, :3], dtype=np.float32))
+            for r in range(1, n_trial):  # keep replica 0
+                pxy = poss[r, :, :2]
+                if rmin_com > 0.0:
+                    clash = False
+                    for i in range(nmol):
+                        for j in range(i + 1, nmol):
+                            if float(np.linalg.norm(pxy[i] - pxy[j])) < rmin_com:
+                                clash = True
+                                break
+                        if clash:
+                            break
+                    if clash:
+                        E[r] = np.inf
+                        continue
+                if rmin_atom > 0.0 and real_rel:
+                    worlds = [_body_sites_world(real_rel[j], poss[r, j, :3], qrots[r, j]) for j in range(nmol)]
+                    clash = False
+                    for i in range(nmol):
+                        for j in range(i + 1, nmol):
+                            d = worlds[i][:, None, :] - worlds[j][None, :, :]
+                            if float(np.min(np.einsum('ijk,ijk->ij', d, d))) < rmin_atom * rmin_atom:
+                                clash = True
+                                break
+                        if clash:
+                            break
+                    if clash:
+                        E[r] = np.inf
+        E0 = float(E[0])
+        ibest = int(np.argmin(E))
+        Ebest = float(E[ibest])
+        accepted = np.isfinite(Ebest) and Ebest < E0 - 1e-8
+        if accepted:
+            pos = poss[ibest, :, :3].copy()
+            quat = qrots[ibest].copy()
+        return pos, quat, E0, Ebest, accepted, E
 
     def tip_pull_scan(self, pin_local_idx, path, k_spring=20.0, n_relax=100, dt=0.02,
                       fire=True, record_every=1):

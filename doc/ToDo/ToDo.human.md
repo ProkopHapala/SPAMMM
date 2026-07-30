@@ -2,7 +2,9 @@
 1) stable cassette rots for coarse grid ptcda (https://graphics.cs.utah.edu/research/projects/stable-cosserat-rods/) → `doc/Tasks/Import_CosseratRods_PTCDA.md`
 2) implement PPAFM Kriging interactions (`/home/prokop/git/ppafm/docs/export/interpolation.export.md`) → `doc/Tasks/Import_KrigingGridFF.md`
    - follow-on: site-resolved Pauli \(A,\beta\) maps + transferability → `doc/Tasks/Pauli_A_beta_KrigingTransferability.md`
-3) Monte Carlo + Pauli master equations / charge rings (`/home/prokop/git/ppafm/docs/export/charge_rings.export.md`, `/home/prokop/git/FireCore/doc/Topics/ManyBody/MQCA_Hubbard_Ising.export.md`) → `doc/Tasks/Import_ChargeRings_PME.md`
+3) ~~Monte Carlo + Pauli master equations / charge rings~~ **Done (PME A+D+F)** — Hubbard/MQCA/MC-fit Later (`doc/Tasks/Import_ChargeRings_PME.md`, audit `doc/TopicalAudit/ChargeRings_PME.md`)
+   - follow-on (design): sites = rigid molecules via shared pose SSOT — `doc/Tasks/RigidMoleculePose_SSOT.md`, inventory `doc/TopicalAudit/RigidBody.md`
+   - was: `/home/prokop/git/ppafm/docs/export/charge_rings.export.md`, `/home/prokop/git/FireCore/doc/Topics/ManyBody/MQCA_Hubbard_Ising.export.md`
 4) prolonged radial basis with DFTB+ (both STM and AFM) — tests live under `tests/SPM/testplot_3ob_basis_tails.py` etc. → `doc/Tasks/ProlongedRadialBasis_DFTB.md`
    - FDBM refs: `/home/prokop/SIMULATIONS/Fukui_AFM/pyscf_fukui_cluster/{pentacene,PTCDA,azaindol_dimer,azaindol_isodimer,benzoicacid_dimer,benzoicamid_dimer}_PBE_def2-SVP/` (`rho_N`/`esp_N`) vs DFTB stock + extended
 5) Dyson orbital with DFTB+? (`doc/Dyson_orbitals_STM.chat.md`) → `doc/Tasks/DysonOrbitals_DFTB_STM.md`

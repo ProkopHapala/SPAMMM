@@ -2,8 +2,8 @@
 
 **Status:** investigating — design notes only (no implementation yet)  
 **Priority:** P1 after multi-body kernel demo (`PairFF_MultiBody_Kernel.md`)  
-**Depends on:** `demos/demo_pairff.py`, `spammm/GUI/RigidBodyVispy.py`, `RigidBodyPairFF` (unified kernel)  
-**Related:** `FoldedRigidExtension.py`, `FFExtension.py`, `doc/GUI_FF_Relaxation.md`, `doc/Tasks/RigidBodyDynamicsWithFoldedBasisSubstrate.md`
+**Depends on:** `demos/demo_pairff.py`, `spammm/GUI/RigidBodyVispy.py`, `RigidBodyPairFF` (unified kernel); **shared rigid pose SSOT** ([`RigidMoleculePose_SSOT.md`](RigidMoleculePose_SSOT.md), inventory [`TopicalAudit/RigidBody.md`](../TopicalAudit/RigidBody.md)) — do **not** invent a parallel pose store when wiring PairFF into the main GUI  
+**Related:** `FoldedRigidExtension.py`, `ChargeRingsExtension.py`, `FFExtension.py`, `doc/GUI_FF_Relaxation.md`, `doc/Tasks/RigidBodyDynamicsWithFoldedBasisSubstrate.md`
 
 ---
 
@@ -116,28 +116,25 @@ Thin wrapper: register `pairff` in `ExtensionManager`, embed or dock `RigidBodyV
 ## Data flow (target)
 
 ```
-AtomicGraph (SSOT) ──► per-molecule rigid bodies (poses, quats, REQ, epairs)
-                              │
-                              ▼
-                    RigidBodyPairFF (multi-body)
+RigidEnsemble (pose SSOT: pos, qrot)  ◄── write authority for rigid sessions
+        │
+        ├─► AtomicGraph atoms_world (display; derived) ──► AtomScene
+        ├─► RigidBodyPairFF GPU poss/qrots (mirror)
+        └─► (optional) ChargeRings PME spos + R(q)
                               │
               ┌───────────────┴───────────────┐
               ▼                               ▼
      active body: integrate            fixed bodies: env only
-              │                               │
-              └───────────────┬───────────────┘
-                              ▼
-                    AtomScene markers (world apos)
-                              │
-                              ▼
-              backend._sync_sys() on relax stop (active body only?)
 ```
+
+Until [`RigidMoleculePose_SSOT.md`](RigidMoleculePose_SSOT.md) exists in code, do **not** treat GPU/`_mb_*` as a second GUI authority — stage poses through one host array path shared with FoldedRigid / ChargeRings.
 
 **Open design questions for USER:**
 
-1. After relax, update **only active molecule** in `AtomicGraph`, or all bodies?
-2. Substrate: keep folded NaCl overlay + PairFF adsorbates, or PairFF-only (no lattice fit)?
-3. Embed PairFF map in main scene vs keep side potential map from `RigidBodyVispy`?
+1. Sync policy: pose-primary vs graph-primary ([`RigidMoleculePose_SSOT.md`](RigidMoleculePose_SSOT.md) decision gate)?
+2. After relax, update **only active molecule** in `AtomicGraph`, or all bodies?
+3. Substrate: keep folded NaCl overlay + PairFF adsorbates, or PairFF-only (no lattice fit)?
+4. Embed PairFF map in main scene vs keep side potential map from `RigidBodyVispy`?
 
 ---
 

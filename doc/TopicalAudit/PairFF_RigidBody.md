@@ -24,6 +24,7 @@ timestamp: 2026-07-28
 | OpenCL | `kernels/Forces.cl` (`compact_exp_pair_EF`) | active | Shared radial primitive |
 | OpenCL | `kernels/rigid.cl` 7–9 | active | Legacy, unified 1+1, unified env (legacy multi) |
 | OpenCL | `kernels/rigid.cl` 10–13 | active | Unified±FAF; **allmol** ± FAF (preferred multi) |
+| OpenCL | `kernels/rigid.cl` 14 | experimental | Replica×active energy channels for MC/GA; RTX 3090 compile/resource checked, numerical/runtime parity pending |
 | Python | `RigidBodyDynamics.py` → `RigidBodyPairFF` | active | `from_molecules`, `set_active_body`, `attach_pairff_faf`, `tip_pull_scan`, `world_sites_all_bodies` |
 | Python | `spammm/surfaces/FoldedRigid.py` | active | Fit/load; `eval_folded_potential_grid`; probe type pick |
 | Python | `spammm/surfaces/surface_plots.py` | experimental | Tip-pull movie helpers; **display scale not yet Vispy SSOT** |
@@ -46,11 +47,13 @@ timestamp: 2026-07-28
 
 ## Open Issues
 
+- Replica-energy kernel 14 has no harness yet; PairFF/FAF channel parity and NVIDIA throughput remain unverified.
 - **[Tomorrow]** Tip-pull / `surface_plots` map display must **reuse** Vispy compose + `potential_to_rgba` — no softclip reinvent ([`PairFF_MapDisplay_SSOT.md`](../Tasks/PairFF_MapDisplay_SSOT.md)).
 - XYZ PTCDA/PTCDI ship with `Q=0` → Coulomb/Hbond silent until QEq (physical sign: negate `solve_from_elements`; GUI QEq does not flip — SSOT TBD).
 - Per-atom QEq in FAF fit → too many types (`FOLDED_TYPES_MAX=8`); use element-mean `q_override`.
 - No `data/xyz/NTCDA.xyz`; demo uses PTCDA as stand-in.
 - Main `SPAMMM_GUI` integration still design-only.
+- Shared rigid-molecule pose SSOT (`pos`+`qrot`) across PairFF / Assembly / FoldedRigid / PME — see [`RigidBody.md`](RigidBody.md) and [`Tasks/RigidMoleculePose_SSOT.md`](../Tasks/RigidMoleculePose_SSOT.md).
 - Strategy C (flat site chunks) not implemented; allmol/M first.
 - Formal pytest L0 for PairFF multi-body / FAF compose / tip_pull still thin.
 - Mixed-species `--mols` + FAF requires fit `atom_type_ids` length match per pack.

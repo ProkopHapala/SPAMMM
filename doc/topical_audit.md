@@ -141,10 +141,10 @@ This **is** a supplement to:
 - **Key files:** `spammm/forcefields/RigidBodyDynamics.py` (`RigidBodyPairFF`), `spammm/GUI/RigidBodyVispy.py`, `spammm/surfaces/FoldedRigid.py`, `demos/demo_pairff.py`
 - **Kernels:** `kernels/rigid.cl` (7–13; prefer allmol ± FAF), `kernels/Forces.cl` (`compact_exp_pair_EF`)
 - **User manual:** [demos/PairFF_manual.md](../demos/PairFF_manual.md)
-- **Topical audit:** [TopicalAudit/PairFF_RigidBody.md](TopicalAudit/PairFF_RigidBody.md)
+- **Topical audit:** [TopicalAudit/PairFF_RigidBody.md](TopicalAudit/PairFF_RigidBody.md) (force model); [TopicalAudit/RigidBody.md](TopicalAudit/RigidBody.md) (pose SSOT across modules)
 - **Design report:** [Topics/ForceFields/PairFF.md](Topics/ForceFields/PairFF.md)
-- **Tasks:** [Tasks/PairFF_MultiBody_Kernel.md](Tasks/PairFF_MultiBody_Kernel.md) (Done), [Tasks/PairFF_FAF_Substrate.md](Tasks/PairFF_FAF_Substrate.md) (Done)
-- **Caveats:** multi-body/FAF need unified mode + NVIDIA; ≤128 sites/molecule; map omits Coulomb; main GUI not wired yet
+- **Tasks:** [Tasks/PairFF_MultiBody_Kernel.md](Tasks/PairFF_MultiBody_Kernel.md) (Done), [Tasks/PairFF_FAF_Substrate.md](Tasks/PairFF_FAF_Substrate.md) (Done), [Tasks/RigidMoleculePose_SSOT.md](Tasks/RigidMoleculePose_SSOT.md) (design)
+- **Caveats:** multi-body/FAF need unified mode + NVIDIA; ≤128 sites/molecule; map omits Coulomb; main GUI not wired yet; **no shared host pose SSOT** yet (GPU/`_mb_*`/Assembly/PME forked)
 
 ### 2c. Charge Equilibration
 - QEq charge transfer method
@@ -196,7 +196,7 @@ Interactive rigid-body dynamics of a small molecule on a periodic substrate usin
 | `data/fits/h2o_nacl.npz` | data | Cached H2O/NaCl folded basis fit (`nu=4, nv=4`) |
 
 **Key design points:**
-- `AtomicGraph` is the SSOT for atom positions; `RigidBodyDynamics` is the SSOT for the physics state.
+- `AtomicGraph` is the SSOT for atom positions; `RigidBodyDynamics` is currently the physics-state mirror (GPU `poss`/`qrots`). Planned shared host pose SSOT (`pos`+`qrot` per molecule): [TopicalAudit/RigidBody.md](TopicalAudit/RigidBody.md), [Tasks/RigidMoleculePose_SSOT.md](Tasks/RigidMoleculePose_SSOT.md).
 - `_update_graph` rebuilds the backend graph if the atom count diverges between `backend` and `rbd`.
 - `FRManipMode` uses `AtomScene._pick_id_from_mouse` for screen-space atom picking and ray-projection for anchor targets.
 - Default dynamics: `k=2.0`, `dt=0.02`, `n_iter=250`, adaptive `Run` timer `max(20, 0.1·n_iter)` ms.
@@ -275,6 +275,19 @@ L0: `tests/SPM/test_afm_contact_surface.py`. L2: `tests/testplot_contact_surface
 - **Caveats (global):** [Caveats.md](Caveats.md) — aniso cubes; AE core alias → **element-invariant** clamp NA; node vs center project; sample vs project
 - **ES dipole report (SSOT):** [Reports/Cube_ES_DeltaRho_NA_dipole.md](Reports/Cube_ES_DeltaRho_NA_dipole.md) · handoff [Cube_ES_DeltaRho_NA_Codex_handoff_2026-07-24.md](Reports/Cube_ES_DeltaRho_NA_Codex_handoff_2026-07-24.md) (implemented; USER visual pending)
 - **Topic:** [Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md](Topics/AFM/KrigingGridFF_DFT_vs_FDBM.md)
+
+### 4d. Charge rings (Pauli Master Equation)
+- Many-body site occupations → STM \(I\), \(dI/dV\) (xy rings, xV diamonds, NDR)
+- **Kernel:** `kernels/PME.cl` (4 sites / 16 states)
+- **Python:** `spammm/quantum/PauliSolverCL.py`, `pauli_scan.py`
+- **Data:** `data/charge_rings/` (Ruslan_*, fig3_trimer.json)
+- **Demos:** `tests/quantum/testplot_charge_rings_{ruslan,trimer}.py` → `debug/testplot_charge_rings_*/`
+- **L0:** `tests/quantum/test_pme_trimer.py` — symmetric trimer mirror + NDR
+- **GUI:** `spammm/GUI/ChargeRingsExtension.py` — JSON I/O, Calc XY/xV/1D, cut line, state probs
+- **Topical audit:** [TopicalAudit/ChargeRings_PME.md](TopicalAudit/ChargeRings_PME.md)
+- **Task:** [Tasks/Import_ChargeRings_PME.md](Tasks/Import_ChargeRings_PME.md) — A+D+F Done; Hubbard/MQCA/MC-fit Later
+- **Pose follow-on:** sites = rigid molecules — [TopicalAudit/RigidBody.md](TopicalAudit/RigidBody.md), [Tasks/RigidMoleculePose_SSOT.md](Tasks/RigidMoleculePose_SSOT.md) (design only)
+- **Caveats:** pad n&lt;4 with spectators + Wij; tip μ from Vtips; Ruslan Qzz=10 vs fig3 Qzz=0 (NDR); sites still abstract (circle/JSON) until pose SSOT
 
 ## 5. QM Integration (DFTB+)
 

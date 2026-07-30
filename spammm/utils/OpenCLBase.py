@@ -615,20 +615,17 @@ class OpenCLBase:
 
         try:
             for aname, typ in args_names:
-                if typ == 0:
+                if aname in overrides:
+                    args.append(overrides[aname])
+                elif typ == 0:
                     # Some kernels may have scalar args mis-classified as buffers by header parsing.
                     # Prefer buffers when present; otherwise fall back to kernel_params.
                     if aname in self.buffer_dict:
                         args.append(self.buffer_dict[aname])
-                    elif aname in overrides:
-                        args.append(overrides[aname])
                     else:
                         args.append(self.kernel_params[aname])
                 else:
-                    if aname in overrides:
-                        args.append(overrides[aname])
-                    else:
-                        args.append(self.kernel_params[aname])
+                    args.append(self.kernel_params[aname])
         except KeyError as e:
             print ( "kernel_header ", kernel_header )
             print(f"OpenCLBase::generate_kernel_args() KeyError: {e}")

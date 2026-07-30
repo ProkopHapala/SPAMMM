@@ -3804,3 +3804,229 @@ void rigid_body_pairff_unified_allmol_faf_kernel(
         poss [a] = pos; qrots[a] = qrot; vposs[a] = vpos; vrots[a] = vrot;
     }
 }
+
+// ==================================================================
+//  Kernel 14: rigid_body_pairff_energy_replica_kernel
+// ==================================================================
+//  Pure PairFF + FAF/Kz/anchor energy evaluator for MC/GA populations.
+//
+//  2D launch:
+//    global = (nactive*RIGID_ENERGY_WG, n_replica)
+//    local  = (RIGID_ENERGY_WG, 1)
+//    group  = (active slot, replica)
+//
+//  E_out = (PairFF vs active, PairFF vs frozen, one-body, reserved).
+//  The host obtains the changed-set energy as 0.5*sum(E.x)+sum(E.y+E.z).
+//
+//  NVIDIA design:
+//    - 64 threads = two warps; one private site/thread avoids register spills.
+//    - One 64-site scratch tile is reused by PairFF and 32-basis FAF tiles.
+//    - Local footprint is ~2.9 KiB/WG, allowing 16 resident WGs in 48 KiB.
+//    - Larger molecules are streamed in chunks instead of being truncated.
+
+#ifndef RIGID_ENERGY_WG
+#define RIGID_ENERGY_WG 64
+#endif
+#ifndef RIGID_ENERGY_SITES_PER_THREAD
+#define RIGID_ENERGY_SITES_PER_THREAD 1
+#endif
+#ifndef RIGID_ENERGY_SITE_TILE
+#define RIGID_ENERGY_SITE_TILE 64
+#endif
+#define RIGID_ENERGY_FAF_TILE ((RIGID_ENERGY_SITE_TILE*4)/FOLDED_TYPES_MAX_RIGID)
+
+__kernel __attribute__((reqd_work_group_size(RIGID_ENERGY_WG, 1, 1)))
+void rigid_body_pairff_energy_replica_kernel(
+    __global const int*     restrict mols,
+    __global const float4*  restrict poss,
+    __global const float4*  restrict qrots,
+    __global const float4*  restrict apos_body,
+    __global const float4*  restrict dyn_REQ,
+    __global const int*     restrict dyn_type,
+    __global const int*     restrict active_mols,
+    const int                        nactive,
+    const int                        nmol,
+    const int                        n_replica,
+    const float4                     pairff_params,
+    const float                      beta,
+    const float                      z_target,
+    __global const float*   restrict folded_coeffs,
+    __global const float4*  restrict folded_kxyz,
+    __global const int*     restrict folded_atom_type,
+    const int4                       folded_meta,
+    const float4                     folded_lvec2d,
+    __global const float4*  restrict anchors,
+    __global float4*        restrict E_out
+) {
+    const int lid    = get_local_id(0);
+    const int islot  = get_group_id(0);
+    const int irepl  = get_group_id(1);
+    if (islot >= nactive || irepl >= n_replica) return;
+
+    const int ia     = active_mols[islot];
+    const int ia0    = mols[ia];
+    const int na     = mols[ia+1] - ia0;
+    const int ipose0 = irepl * nmol;
+    const int nbasis = folded_meta.x;
+    const int ntypes = folded_meta.y;
+    const float k_z  = pairff_params.w;
+    const float inv_beta_n = 8.0f / fmax(beta, 1e-6f);
+
+    __local float4  Lsite[RIGID_ENERGY_SITE_TILE];       // PairFF: xyz,g; FAF: basis params
+    __local float   Lparam[RIGID_ENERGY_SITE_TILE*4];    // PairFF: REQ;   FAF: type-major coeff tile
+    __local float   Lsum[3*RIGID_ENERGY_WG];
+    __local cl_Mat3 LR;
+    __local float4  Lpos;
+    __local int     Lj0, Lnj, Lpartner_active;
+
+    float4 invLvec2d = (float4)(0.0f);
+    if (nbasis > 0) {
+        const float ax = folded_lvec2d.x, bx = folded_lvec2d.y, ay = folded_lvec2d.z, by = folded_lvec2d.w;
+        const float invdet = 1.0f / (ax*by - bx*ay);
+        invLvec2d = (float4)(by*invdet, -bx*invdet, -ay*invdet, ax*invdet);
+    }
+
+    float E_active = 0.0f;
+    float E_frozen = 0.0f;
+    float E_one    = 0.0f;
+
+    for (int abase = 0; abase < na; abase += RIGID_ENERGY_WG*RIGID_ENERGY_SITES_PER_THREAD) {
+        if (lid == 0) {
+            const float4 q = normalize(qrots[ipose0 + ia]);
+            Lpos = poss[ipose0 + ia];
+            LR.a = (float4)(quat_to_a(q), 0.0f);
+            LR.b = (float4)(quat_to_b(q), 0.0f);
+            LR.c = (float4)(quat_to_c(q), 0.0f);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        float4 own_pos[RIGID_ENERGY_SITES_PER_THREAD];
+        float4 own_REQ[RIGID_ENERGY_SITES_PER_THREAD];
+        int    own_type[RIGID_ENERGY_SITES_PER_THREAD];
+        int nown = 0;
+        for (int i = 0; i < RIGID_ENERGY_SITES_PER_THREAD; i++) {
+            const int atom_idx = abase + lid + i*RIGID_ENERGY_WG;
+            if (atom_idx >= na) break;
+            const int isite = ia0 + atom_idx;
+            const float3 pw = Lpos.xyz + rotate_vec_by_matrix(apos_body[isite].xyz, &LR);
+            own_pos[nown]  = (float4)(pw, (dyn_type[isite] == 0) ? 1.0f : 0.0f);
+            own_REQ[nown]  = dyn_REQ[isite];
+            own_type[nown] = (nbasis > 0) ? folded_atom_type[isite] : -1;
+            nown++;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // PairFF partner tiles. Classification is once per partner, not per site pair.
+        for (int j = 0; j < nmol; j++) {
+            if (j == ia) continue;
+            if (lid == 0) {
+                Lj0 = mols[j];
+                Lnj = mols[j+1] - Lj0;
+                const float4 q = normalize(qrots[ipose0 + j]);
+                Lpos = poss[ipose0 + j];
+                LR.a = (float4)(quat_to_a(q), 0.0f);
+                LR.b = (float4)(quat_to_b(q), 0.0f);
+                LR.c = (float4)(quat_to_c(q), 0.0f);
+                int is_active = (nactive == nmol);
+                if (nactive == 1) {
+                    is_active = 0;
+                } else if (nactive != nmol) {
+                    for (int k = 0; k < nactive; k++) {
+                        if (active_mols[k] == j) { is_active = 1; break; }
+                    }
+                }
+                Lpartner_active = is_active;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            float Ej = 0.0f;
+            for (int jbase = 0; jbase < Lnj; jbase += RIGID_ENERGY_SITE_TILE) {
+                const int nt = min(RIGID_ENERGY_SITE_TILE, Lnj - jbase);
+                for (int t = lid; t < nt; t += RIGID_ENERGY_WG) {
+                    const int jsite = Lj0 + jbase + t;
+                    const float3 pw = Lpos.xyz + rotate_vec_by_matrix(apos_body[jsite].xyz, &LR);
+                    Lsite[t] = (float4)(pw, (dyn_type[jsite] == 0) ? 1.0f : 0.0f);
+                    vstore4(dyn_REQ[jsite], t, Lparam);
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+
+                for (int i = 0; i < nown; i++) {
+                    const float3 pi = own_pos[i].xyz;
+                    const float4 REQ_i = own_REQ[i];
+                    const float gi = own_pos[i].w;
+                    for (int t = 0; t < nt; t++) {
+                        const float3 dp = pi - Lsite[t].xyz;
+                        const float r2 = dot(dp, dp);
+                        const float4 REQ_j = vload4(t, Lparam);
+                        const float gj = Lsite[t].w;
+                        const float gij = gi * gj;
+                        const float R0 = gij * (REQ_i.x + REQ_j.x);
+                        const float w  = REQ_i.w + REQ_j.w;
+                        const float rho_c = R0 + inv_beta_n;
+                        const float rc2 = rho_c * (rho_c + 2.0f*w);
+                        const float attr = -fmin(0.0f, REQ_i.z * REQ_j.z);
+                        const float both_dummy = 1.0f - fmin(gi + gj, 1.0f);
+                        const float E0 = mix(attr, REQ_i.y * REQ_j.y, gij) * (1.0f - both_dummy);
+                        if (E0 != 0.0f && r2 <= rc2) Ej += compact_exp_pair_EF(dp, R0, E0, gij, w, beta).x;
+                        if (gij > 0.5f) Ej += COULOMB_CONST * REQ_i.z * REQ_j.z * sqrt(1.0f / (r2 + R2SAFE));
+                    }
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+            }
+            if (Lpartner_active) E_active += Ej; else E_frozen += Ej;
+        }
+
+        // Reuse the PairFF scratch for small FAF basis/coeff tiles.
+        if (nbasis > 0) {
+            for (int ibase = 0; ibase < nbasis; ibase += RIGID_ENERGY_FAF_TILE) {
+                const int nbt = min(RIGID_ENERGY_FAF_TILE, nbasis - ibase);
+                for (int ib = lid; ib < nbt; ib += RIGID_ENERGY_WG) Lsite[ib] = folded_kxyz[ibase + ib];
+                for (int it = 0; it < ntypes; it++) {
+                    for (int ib = lid; ib < nbt; ib += RIGID_ENERGY_WG) Lparam[it*nbt + ib] = folded_coeffs[it*nbasis + ibase + ib];
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+
+                for (int i = 0; i < nown; i++) {
+                    const int ityp = own_type[i];
+                    if (ityp >= 0 && ityp < ntypes) {
+                        const float3 p = own_pos[i].xyz;
+                        float u = invLvec2d.x*p.x + invLvec2d.y*p.y;
+                        float v = invLvec2d.z*p.x + invLvec2d.w*p.y;
+                        u -= floor(u);
+                        v -= floor(v);
+                        const int ioff = ityp * nbt;
+                        for (int ib = 0; ib < nbt; ib++) E_one += Lparam[ioff + ib] * folded_eval_basis_rigid(u, v, p.z, Lsite[ib]);
+                    }
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+            }
+        }
+
+        // Preserve allmol semantics: FAF only on real sites; Kz/anchors on all sites.
+        for (int i = 0; i < nown; i++) {
+            const int isite = ia0 + abase + lid + i*RIGID_ENERGY_WG;
+            const float3 p = own_pos[i].xyz;
+            const float4 anchor = anchors[isite];
+            if (anchor.w > 0.0f) {
+                const float3 d = p - anchor.xyz;
+                E_one += 0.5f * anchor.w * dot(d, d);
+            }
+            const float dz = p.z - z_target;
+            E_one += 0.5f * k_z * dz * dz;
+        }
+    }
+
+    Lsum[lid]                     = E_active;
+    Lsum[RIGID_ENERGY_WG + lid]   = E_frozen;
+    Lsum[2*RIGID_ENERGY_WG + lid] = E_one;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = RIGID_ENERGY_WG >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            Lsum[lid]                     += Lsum[lid + stride];
+            Lsum[RIGID_ENERGY_WG + lid]   += Lsum[RIGID_ENERGY_WG + lid + stride];
+            Lsum[2*RIGID_ENERGY_WG + lid] += Lsum[2*RIGID_ENERGY_WG + lid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) E_out[irepl*nactive + islot] = (float4)(Lsum[0], Lsum[RIGID_ENERGY_WG], Lsum[2*RIGID_ENERGY_WG], 0.0f);
+}

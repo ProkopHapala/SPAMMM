@@ -5,4 +5,6 @@ Provides **DFTB_utils.py** for DFTB+ subprocess/C-API integration and
 contains the ctypes wrapper (**DFTBcore**), basis parser (**DFTBplusParser**),
 GPU density projection (**Grid_dftb**), and basis optimizer (**basis_optimizer**).
 Densities feed into the FDBM AFM method in the SPM package.
+
+**PauliSolverCL.py** — OpenCL Pauli Master Equation (``kernels/PME.cl``, 4 sites).
 """
