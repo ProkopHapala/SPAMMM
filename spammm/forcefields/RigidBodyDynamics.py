@@ -2228,12 +2228,27 @@ void rigid_body_pairff_energy_replica_kernel(
         return out
 
     def _folded_types_all_sites(self, fit_result):
-        """Build folded_atom_type length == total_atoms (dummies -1) from fit atom_type_ids."""
+        """Build folded_atom_type length == total_atoms (dummies -1) from fit atom_type_ids.
+
+        Supports both single-species (atom_type_ids length = n_real of one pack, reused
+        for every pack) and multi-species (atom_type_ids length = total real atoms across
+        all packs, sliced per pack by cumulative real-atom count).
+        """
         at_fit = np.asarray(fit_result['atom_type_ids'], dtype=np.int32).ravel()
         if self.allmol_mode and self._mb_packs is not None:
+            n_real_per = [int((p['types'] == 0).sum()) for p in self._mb_packs]
+            total_real = sum(n_real_per)
             parts = []
-            for pack in self._mb_packs:
-                parts.append(self.folded_types_for_pairff_sites(pack['types'], at_fit))
+            if at_fit.shape[0] == n_real_per[0] and at_fit.shape[0] != total_real:
+                # Single-species: reuse same type IDs for every pack
+                for pack in self._mb_packs:
+                    parts.append(self.folded_types_for_pairff_sites(pack['types'], at_fit))
+            else:
+                # Multi-species: slice per pack
+                offset = 0
+                for pack, nr in zip(self._mb_packs, n_real_per):
+                    parts.append(self.folded_types_for_pairff_sites(pack['types'], at_fit[offset:offset + nr]))
+                    offset += nr
             out = np.concatenate(parts).astype(np.int32)
         else:
             out = self.folded_types_for_pairff_sites(self.dyn_type_host, at_fit)

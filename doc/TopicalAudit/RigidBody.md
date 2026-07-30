@@ -28,7 +28,7 @@ SPAMMM treats adsorbed molecules as **6-DOF rigid bodies** (CoM translation + qu
 
 `AtomicGraph` remains SSOT for atomic topology/positions. Rigid sessions need a dual SSOT for **molecule pose**. Without it, GUI “connect PME ↔ PairFF ↔ Assembly” will keep forking geometry.
 
-Proposed name (TBD): `RigidEnsemble` / `MoleculePoseGraph` — see SSOT task. **Do not implement until USER prioritizes** and picks sync policy (pose-primary vs graph-primary).
+Proposed name (TBD): `RigidEnsemble` / `MoleculePoseGraph` — see SSOT task. **Design locked USER 2026-07-30:** `RigidEnsemble` in `spammm/forcefields/`, poses-only (templates stay in modules), rigid-optional shared numpy rep (NOT global SSOT — AtomicGraph/GUI independent), one-way ensemble→AtomicGraph on demand, reverse deferred. Modules depend on ensemble; ensemble never reaches back. GPU buffers stay per-algorithm, untouched.
 
 ## Implementations
 

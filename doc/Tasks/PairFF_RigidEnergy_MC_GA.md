@@ -1,14 +1,14 @@
 ---
 type: Task
 title: PairFF rigid energy kernel — MC / GA / population harness
-status: implementation
+status: K1+P1+H1+F implemented; H2 (SA) and H3 (GA) pending
 tags: [PairFF, rigid-body, OpenCL, MonteCarlo, GeneticAlgorithm, FAF, performance]
 timestamp: 2026-07-30
 ---
 
 # PairFF rigid energy kernel — algorithm-agnostic replica evaluator
 
-**Status:** K1 kernel implemented and NVIDIA compile/resource checked; numerical parity and runtime performance remain unverified. Harness intentionally deferred.  
+**Status:** K1 kernel + P1 host API + H1 greedy harness + F real FAF fits implemented and verified on NVIDIA RTX 3090 across 4 molecules (PTCDA, formic acid, terephthalic acid, NTCDI). Numerical parity confirmed (err < 1e-7). H2 (simulated annealing) and H3 (GA population) remain pending — greedy MC stalls in deep minima (21–75/1000 accepted), motivating SA.  
 **Goal:** One GPU kernel that evaluates **PairFF + FAF (+ optional Kz/anchors) energy** for rigid molecular assemblies across many **replicas**, for an arbitrary **active molecule set**. Host harness chooses greedy / Metropolis / SA / genetic algorithm — **kernel never knows the optimizer**.
 
 **Related:** [`PairFF_MultiBody_Kernel.md`](PairFF_MultiBody_Kernel.md), [`PairFF_FAF_Substrate.md`](PairFF_FAF_Substrate.md), [`TopicalAudit/PairFF_RigidBody.md`](../TopicalAudit/PairFF_RigidBody.md), [`TopicalAudit/RigidBody.md`](../TopicalAudit/RigidBody.md) (pose inventory), [`RigidMoleculePose_SSOT.md`](RigidMoleculePose_SSOT.md) (host pose authority for replicas when implemented), `kernels/rigid.cl` (allmol FAF MD kernels 12–13; replica energy kernel 14), `spammm/forcefields/RigidBodyDynamics.py` (`RigidBodyPairFF`).
@@ -487,17 +487,17 @@ Reference: reuse compact-exp CPU path from HBondFF / existing PairFF map helpers
 
 ## 11. Implementation phases
 
-| Phase | Deliverable |
-|-------|-------------|
-| **D** (this doc) | Design locked |
-| **K1** | Energy kernel + channel reduce; FAF optional via `nbasis` |
-| **P1** | `eval_energy_replicas` + `energy_changed` on `RigidBodyPairFF` |
-| **H1** | Greedy planar harness, `nactive=1`, no FAF |
-| **H2** | Metropolis/SA one-liner; multi-`nactive` moves |
-| **H3** | Population / GA fitness path (`nactive=nmol`) |
-| **F** | Real FAF fit (NTCDI/PTCDA@NaCl) |
+| Phase | Deliverable | Status |
+|-------|-------------|--------|
+| **D** (this doc) | Design locked | ✅ done |
+| **K1** | Energy kernel + channel reduce; FAF optional via `nbasis` | ✅ done — `kernels/rigid.cl` kernel 14, WG=64, 2912 B LM, 64 regs, 0 spills |
+| **P1** | `eval_energy_replicas` + `energy_changed` on `RigidBodyPairFF` | ✅ done — `RigidBodyDynamics.py` L2428–2648 |
+| **H1** | Greedy planar harness, `nactive=1`, no FAF | ✅ done — `greedy_energy_step` + `tests/testplot_pairff_energy_mc.py` |
+| **H2** | Metropolis/SA one-liner; multi-`nactive` moves | ⏳ pending — greedy MC stalls (21–75/1000 acc); SA is next |
+| **H3** | Population / GA fitness path (`nactive=nmol`) | ⏳ pending |
+| **F** | Real FAF fit (NTCDI/PTCDA@NaCl) | ✅ done — 4 molecules, remapped fits, FAF+PairFF verified |
 
-Do **not** implement until USER confirms this design.
+Do **not** implement H2/H3 until USER confirms priorities.
 
 ---
 
@@ -518,6 +518,60 @@ Do **not** implement until USER confirms this design.
 2. **Active flags:** rebuild `mol_is_active[nmol]` on host each launch vs kernel scans `active_mols`?
 3. **Kz in planar tests:** keep channel with `k_z=0`, or omit Kz from kernel until needed? (Recommendation: keep, `k_z=0`.)
 4. **NTCDI input:** mol2 loader now vs temporary XYZ export?
+
+---
+
+## 13. Results (H1+F, 2026-07-30)
+
+**Driver:** `tests/testplot_pairff_energy_mc.py` → `debug/testplot_pairff_energy_mc/<mol>/`
+
+**Single-species runs (1000 steps, 256 trials):**
+
+| Molecule | nmol | E_initial [eV] | E_final [eV] | ΔE [eV] | Accepted | Parity err |
+|----------|------|----------------|-------------|---------|----------|------------|
+| PTCDA | 4 | 6.89 | 2.90 | -3.98 | 21/1000 | 9.9e-08 |
+| Formic acid | 6 | 6.70 | -0.23 | -6.93 | 75/1000 | 5.8e-08 |
+| Terephthalic acid | 4 | 3.44 | 0.31 | -3.13 | 40/1000 | 7.8e-08 |
+| NTCDI | 4 | 4.95 | 0.58 | -4.37 | 29/1000 | 7.5e-09 |
+| TBTAP | 4 | 9.42 | 1.95 | -7.48 | 18/1000 | 2.2e-07 |
+| Azaindol | 4 | 3.37 | 0.77 | -2.61 | 38/1000 | 4.5e-08 |
+| Uracil | 4 | 1.93 | -0.40 | -2.33 | 36/1000 | 1.1e-07 |
+| Adenine | 4 | 2.30 | 0.44 | -1.87 | 32/1000 | 2.1e-08 |
+
+**Multi-species runs (1000 steps, 256 trials):**
+
+| Molecules | nmol/species | E_initial [eV] | E_final [eV] | ΔE [eV] | Accepted | Parity err |
+|-----------|-------------|----------------|-------------|---------|----------|------------|
+| adenine + uracil | 3 | 10.17 | 1.68 | -8.49 | 54/1000 | 8.9e-08 |
+
+**Usage:**
+```bash
+# Single molecule
+python3 tests/testplot_pairff_energy_mc.py --mol PTCDA --steps 1000
+# Multi-species (comma-separated)
+python3 tests/testplot_pairff_energy_mc.py --mol adenine,uracil --nmol 3 --spacing 10
+```
+
+**Artifacts per run** (`debug/testplot_pairff_energy_mc/<mol>/` or `.../<mol1+mol2>/`):
+- `summary.out` — energies, charges, inter-mol distances, final positions
+- `energy_history.png` — E vs MC step
+- `assembly_before_after.png` — FAF substrate + bonds + charge-colored atoms (before/after)
+- `trajectory.gif` — animated MC trajectory (FAF + bonds + charges, fixed axes)
+- `before.xyz`, `after.xyz`, `traj.xyz` — structures
+
+**FAF fits used (remapped by REQ similarity):**
+- PTCDA → `ptcda_nacl.npz` (C, O, H); Formic acid → `hcooh_nacl.npz` (H, C, O, H)
+- NTCDI, TBTAP, azaindol, uracil, adenine → `ptcdi_nacl.npz` (C, N, O, H — broadest coverage)
+- Terephthalic acid → `ptcda_nacl.npz` (C, O, H)
+- Multi-species → `ptcdi_nacl.npz` (default — covers all elements)
+
+**Multi-species support:**
+- `--mol adenine,uracil` creates `nmol` copies of each species (total = nmol × n_species)
+- `_folded_types_all_sites` in `RigidBodyDynamics.py` slices FAF atom_type_ids per pack
+- `assembly_real_atoms` accepts per-pack bonds list for correct skeleton rendering
+- Molecules interleave on the grid for better mixing
+
+**Key observation:** greedy MC stalls in deep minima (18–75/1000 accepted). Bigger steps (dxy=1.5 Å, dphi=0.8 rad) help but don't solve it. Simulated annealing (H2) is the proper fix — the kernel already supports it; only harness acceptance logic needs `P=exp(-ΔE/T)` with a cooling schedule.
 
 ---
 

@@ -42,6 +42,7 @@ pytest tests/topology/test_editing_ops.py --develop -s  # new feature debug
 | `testplot_tensor_parity.py` | GPU tensor kernel parity plots |
 | `testplot_folded_surface_scan.py` | Folded basis fitting plots |
 | `testplot_assembly.py` | Hexagonal SAM assembly search, clash/strain maps, XYZ export |
+| `testplot_pairff_energy_mc.py` | PairFF+FAF rigid-body greedy MC assembly (8 mols, multi-species, charge colors, GIF trajectory) |
 | `testplot_contact_surface.py` | GPU contact surface vs brute Morse (separable + PIC) |
 | `SPM/test_afm_*.py` | AFM pytest (Morse + FDBM; FAST_S3 parity) |
 | `SPM/bench_fdbm.py` | Headless FDBM timing (`SPAMMM_AFM_BENCH`); see `doc/Tasks/PerfBenchmark_FDBM.md` |

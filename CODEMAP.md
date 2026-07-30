@@ -156,6 +156,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `testplot_tensor_parity.py` — GPU vs CPU tensor kernel parity (visual demo)
 - `testplot_folded_surface_scan.py` — folded basis fitting + plots (visual demo)
 - `testplot_assembly.py` — hexagonal SAM assembly search + clash/strain diagnostics (visual demo; Class 2)
+- `testplot_pairff_energy_mc.py` — PairFF+FAF rigid-body greedy MC assembly (8 mols, multi-species `--mol adenine,uracil`, charge colors, GIF trajectory); `debug/testplot_pairff_energy_mc/<mol>/`
 - `testplot_contact_surface.py` — contact-surface fit + parity (separable + PIC + PP relaxed); `debug/testplot_contact_surface/`
 - `test_export_import.py` — MOL/MOL2/XYZ round-trip
 - `test_clipboard_undo.py` — clipboard/undo operations
