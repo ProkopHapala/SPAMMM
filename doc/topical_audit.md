@@ -194,10 +194,12 @@ Interactive rigid-body dynamics of a small molecule on a periodic substrate usin
 | `kernels/rigid.cl` | active | `rigid_body_folded_kernel` folded basis force/torque + anchor springs |
 | `spammm/GUI/SPAMMM_GUI.py` | active | Mouse dispatch (`on_mouse_press/move/release`), `refresh_view` no-bonds fix, extension integration |
 | `spammm/GUI/EditModeHandlers.py` | active | `on_move` ray-origin/direction, `on_release` hook base class |
+| `spammm/GUI/RigidAssemblyExtension.py` | active | Unified rigid-body GUI: Drag + MC/GA + PME in one panel; single `RigidEnsemble` + `RigidBodyPairFF`; reuses `greedy_energy_step` / `update_anchors` / `pauli_scan.scan_xy`. L0: `tests/GUI/test_rigid_assembly_extension.py` |
+| `spammm/forcefields/molecule_loaders.py` | active | Shared rigid-body molecule loaders (XYZ/mol2 + QEq + bonds); reused by `testplot_pairff_energy_mc.py` + `RigidAssemblyExtension` |
 | `data/fits/h2o_nacl.npz` | data | Cached H2O/NaCl folded basis fit (`nu=4, nv=4`) |
 
 **Key design points:**
-- `AtomicGraph` is the SSOT for atom positions; `RigidBodyDynamics` is currently the physics-state mirror (GPU `poss`/`qrots`). Planned shared host pose SSOT (`pos`+`qrot` per molecule): [TopicalAudit/RigidBody.md](TopicalAudit/RigidBody.md), [Tasks/RigidMoleculePose_SSOT.md](Tasks/RigidMoleculePose_SSOT.md).
+- `AtomicGraph` is the SSOT for atom positions; `RigidBodyDynamics` GPU `poss`/`qrots` remain per-algorithm working storage. **Shared rigid-pose rep now exists:** `spammm/forcefields/RigidEnsemble.py` — optional, numpy-only, poses-only (`pos`+`qrot` per molecule, stable ids). Rigid modules import it and read `get_poses()`; one-way `ensemble → AtomicGraph` on demand. See [TopicalAudit/RigidBody.md](TopicalAudit/RigidBody.md), [Tasks/RigidMoleculePose_SSOT.md](Tasks/RigidMoleculePose_SSOT.md).
 - `_update_graph` rebuilds the backend graph if the atom count diverges between `backend` and `rbd`.
 - `FRManipMode` uses `AtomScene._pick_id_from_mouse` for screen-space atom picking and ray-projection for anchor targets.
 - Default dynamics: `k=2.0`, `dt=0.02`, `n_iter=250`, adaptive `Run` timer `max(20, 0.1·n_iter)` ms.

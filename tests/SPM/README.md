@@ -29,6 +29,7 @@ See `doc/TEST_DESIGN.md` for L0/L1/L2 review levels.
 | `testplot_kriging_vs_fdbm_cube.py` | visual | Kriging DFT vs FDBM; Pauli fit modes |
 | `testplot_stm_basis_compare.py` | visual | STM HOMO/LUMO: mio/3ob stock vs prolonged vs pySCF → `debug/stm_orbital_compare/` |
 | `test_stm_basis_compare.py` | pytest | L0: prolonged ≠ stock at vacuum height (benzene, `@gpu @slow`) |
+| `test_stm_fgr_compare.py` | pytest | L0: FGR I_τ vs overlap_exp (benzene, `@gpu @slow`) + table Sps≈−Ssp smoke |
 
 **FGR transfer (\(H-ES\)) compare** (not a testplot file — CLI SSOT):
 

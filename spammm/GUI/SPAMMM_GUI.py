@@ -427,7 +427,7 @@ class SPAMMMWindow(BaseGUI):
         self._ext_view_modes = {}   # label -> callback
         self._extension_sections = {}  # extension key / panel title -> CollapsibleSection
 
-        EXTENSION_TITLES = {'ff': 'Force Field', 'afm': 'AFM', 'dftb': 'DFTB', 'firecore': 'FireCore', 'qeq': 'QEq Charges', 'kekule': 'Kekule Solver', 'ascii': 'ASCII Builder', 'fragments': 'Fragments', 'reaction_coord': 'Reaction coordinate', 'vibrations': 'Vibrations', 'folded_rigid': 'Folded Rigid', 'charge_rings': 'Charge Rings (PME)'}
+        EXTENSION_TITLES = {'ff': 'Force Field', 'afm': 'AFM', 'dftb': 'DFTB', 'firecore': 'FireCore', 'qeq': 'QEq Charges', 'kekule': 'Kekule Solver', 'ascii': 'ASCII Builder', 'fragments': 'Fragments', 'reaction_coord': 'Reaction coordinate', 'vibrations': 'Vibrations', 'folded_rigid': 'Folded Rigid', 'charge_rings': 'Charge Rings (PME)', 'rigid_assembly': 'Rigid Assembly'}
         for name in self.extensions.enabled_extensions():
             ui = self.extensions.build_ui(name, self)
             title = EXTENSION_TITLES.get(name, name.capitalize())

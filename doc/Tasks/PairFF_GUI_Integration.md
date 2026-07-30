@@ -1,6 +1,6 @@
 # Task: PairFF integration into SPAMMM GUI
 
-**Status:** investigating — design notes only (no implementation yet)  
+**Status:** implemented (core) — `RigidAssemblyExtension` provides Drag + MC/GA + PME in one panel; USER L2 review pending  
 **Priority:** P1 after multi-body kernel demo (`PairFF_MultiBody_Kernel.md`)  
 **Depends on:** `demos/demo_pairff.py`, `spammm/GUI/RigidBodyVispy.py`, `RigidBodyPairFF` (unified kernel); **shared rigid pose SSOT** ([`RigidMoleculePose_SSOT.md`](RigidMoleculePose_SSOT.md), inventory [`TopicalAudit/RigidBody.md`](../TopicalAudit/RigidBody.md)) — do **not** invent a parallel pose store when wiring PairFF into the main GUI  
 **Related:** `FoldedRigidExtension.py`, `ChargeRingsExtension.py`, `FFExtension.py`, `doc/GUI_FF_Relaxation.md`, `doc/Tasks/RigidBodyDynamicsWithFoldedBasisSubstrate.md`
@@ -86,8 +86,8 @@ Thin wrapper: register `pairff` in `ExtensionManager`, embed or dock `RigidBodyV
 
 ## Recommended path
 
-1. **Short term (demo):** ~~Extend `demos/demo_pairff.py` for multi-body + pick-one-active~~ — **done** (`PairFF_MultiBody_Kernel.md`): allmol shared buffers, `--bodies` / `--mols`, LMB selects active (index only). ~~FAF substrate + map compose~~ — **done** (`PairFF_FAF_Substrate.md`): `--faf`. Still **not** wired into main `SPAMMM_GUI`.
-2. **GUI phase:** **Option A** — add PairFF section to `FoldedRigidExtension` *or* rename panel to `SurfaceRigidExtension` if scope grows; keep `folded_rigid` registry key for backward compatibility.
+1. **Short term (demo):** ~~Extend `demos/demo_pairff.py` for multi-body + pick-one-active~~ — **done** (`PairFF_MultiBody_Kernel.md`): allmol shared buffers, `--bodies` / `--mols`, LMB selects active (index only). ~~FAF substrate + map compose~~ — **done** (`PairFF_FAF_Substrate.md`): `--faf`.
+2. **GUI phase:** **Option A (variant: new `RigidAssemblyExtension`)** — implemented 2026-07-30. New extension `spammm/GUI/RigidAssemblyExtension.py` (registry key `rigid_assembly`, title "Rigid Assembly") provides one panel with three modes (Drag / MC-GA / PME), all sharing a single `RigidEnsemble` pose SSOT + single `RigidBodyPairFF` GPU backend. Reuses `greedy_energy_step`, `update_anchors`, `pauli_scan.scan_xy` — no new physics. L0 tests: `tests/GUI/test_rigid_assembly_extension.py` (5 pass). USER L2 review pending.
 3. **Do not** merge PairFF into `FFExtension` without explicit USER decision.
 
 ---
@@ -140,11 +140,12 @@ Until [`RigidMoleculePose_SSOT.md`](RigidMoleculePose_SSOT.md) exists in code, d
 
 ## Acceptance (do not mark Done without USER confirmation)
 
-- [ ] USER picks Option A vs B
-- [ ] One molecule pickable as “active”; others fixed; visible in main GUI
-- [ ] Unified kernel default; legacy available for A/B
-- [ ] Geometry sync documented (which atoms update in graph)
-- [ ] `gui_scripts/pairff_setup.py` or extended `folded_rigid_setup.py` reproduces demo in GUI
+- [x] USER picks Option A vs B → **Option A variant: new `RigidAssemblyExtension`** (USER-approved 2026-07-30)
+- [x] One molecule pickable as "active"; others fixed; visible in main GUI — `RigidBodyPairFF.set_active_body` + main `AtomScene` (no second VisPy window)
+- [x] Unified kernel default; legacy available for A/B — `RigidBodyPairFF.from_molecules` uses unified kernel
+- [x] Geometry sync documented (which atoms update in graph) — one-way `ensemble → AtomicGraph` via `_update_graph` after each accepted MC step / drag release
+- [x] `gui_scripts/pairff_setup.py` or extended `folded_rigid_setup.py` reproduces demo in GUI — `prepare_rigid_assembly(window, mol, nmol, ...)` GUI-script entry point implemented
+- [ ] **USER L2 review** of the extension in a live GUI session (build, MC run, drag, PME scan)
 
 ## Out of scope (this task)
 

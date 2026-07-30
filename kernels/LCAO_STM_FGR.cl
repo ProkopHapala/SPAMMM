@@ -28,6 +28,18 @@
 #define LCAO_STM_FGR_CL
 
 // ----------------------------------------------------------------------------
+// Smooth cutoff taper: cosine taper from (rcut-taper_w) to rcut.
+// Returns 1.0 inside, 0.0 outside, smooth cosine in between.
+// Eliminates ring artifacts from hard truncation of SK tables.
+// ----------------------------------------------------------------------------
+inline float stm_cutoff_taper(const float r, const float rcut, const float taper_w) {
+    if (r >= rcut) return 0.0f;
+    if (taper_w <= 0.0f || r <= rcut - taper_w) return 1.0f;
+    const float s = (rcut - r) / taper_w;  // 1 at inner edge, 0 at rcut
+    return 0.5f * (1.0f + cos(3.14159265358979f * (1.0f - s)));
+}
+
+// ----------------------------------------------------------------------------
 // Complex helpers: float2 = (real, imaginary)
 // ----------------------------------------------------------------------------
 inline float2 stm_cadd(const float2 a, const float2 b) {
@@ -301,6 +313,7 @@ __kernel void stm_fgr_sk_tau_scan_real(
     const float r_grid0,
     const float inv_dr,
     const float rcut,
+    const float taper_w,
     const float amplitude_scale,
     __global float4* out_M_M2
 ) {
@@ -357,7 +370,8 @@ __kernel void stm_fgr_sk_tau_scan_real(
             if (ws == 0.0f) continue;
 
             const float3 u = d * (1.0f/r);
-            M += stm_contract_sp_pair_real(
+            const float taper = stm_cutoff_taper(r, rcut, taper_w);
+            M += taper * stm_contract_sp_pair_real(
                 u, tau4, tau_pi,
                 ct_px, ct_py, ct_pz, ct_s,
                 cs_px, cs_py, cs_pz, cs_s
@@ -445,6 +459,7 @@ __kernel void stm_fgr_sk_tau_scan(
     const float r_grid0,
     const float inv_dr,
     const float rcut,
+    const float taper_w,
     const float amplitude_scale,
     __global float4* out_M_M2
 ) {
@@ -507,11 +522,12 @@ __kernel void stm_fgr_sk_tau_scan(
             if (ws == 0.0f) continue;
 
             const float3 u = d * (1.0f/r);
-            M = stm_cadd(M, stm_contract_sp_pair(
+            const float taper = stm_cutoff_taper(r, rcut, taper_w);
+            M = stm_cadd(M, stm_cscale(stm_contract_sp_pair(
                 u, tau4, tau_pi,
                 ct_px, ct_py, ct_pz, ct_s,
                 cs_px, cs_py, cs_pz, cs_s
-            ));
+            ), taper));
             npair_used++;
         }
     }
@@ -553,6 +569,7 @@ __kernel void stm_fgr_sk_hs_scan(
     const float r_grid0,
     const float inv_dr,
     const float rcut,
+    const float taper_w,
     const float E_tunnel,
     const float amplitude_scale,
     __global float4* out_M_M2
@@ -619,11 +636,12 @@ __kernel void stm_fgr_sk_hs_scan(
             if (ws == 0.0f) continue;
 
             const float3 u = d * (1.0f/r);
-            M = stm_cadd(M, stm_contract_sp_pair(
+            const float taper = stm_cutoff_taper(r, rcut, taper_w);
+            M = stm_cadd(M, stm_cscale(stm_contract_sp_pair(
                 u, tau4, tau_pi,
                 ct_px, ct_py, ct_pz, ct_s,
                 cs_px, cs_py, cs_pz, cs_s
-            ));
+            ), taper));
             npair_used++;
         }
     }

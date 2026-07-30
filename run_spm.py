@@ -536,6 +536,34 @@ def cmd_stm_fgr(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stm_br_fgr(args: argparse.Namespace) -> int:
+    """BR-STM compare: overlap vs FGR (I_S/I_H/I_τ) with PP-AFM tip displacement."""
+    import numpy as np
+    from spammm.SPM import stm_compare as stm
+    from spammm import atomicUtils as au
+    if args.outdir is None:
+        args.outdir = os.path.join(_ROOT, 'debug', 'stm_br_fgr_compare')
+    os.makedirs(args.outdir, exist_ok=True)
+    for mol_name in args.molecule:
+        xyz = _abs_path(f'data/xyz/{mol_name}.xyz')
+        if not os.path.isfile(xyz):
+            print(f'  skip {mol_name}: {xyz} not found')
+            continue
+        pos, _, names, _, _ = au.load_xyz(xyz)
+        atomPos = np.asarray(pos, dtype=np.float64)
+        # Planarize + center (same as stm br)
+        from spammm.AtomicSystem import AtomicSystem
+        mol = AtomicSystem(fname=xyz)
+        if hasattr(mol, 'orientPCA'):
+            mol.orientPCA()
+            atomPos = np.asarray(mol.apos, dtype=np.float64)
+            names = list(mol.enames)
+        atomPos = atomPos.copy()
+        atomPos[:, 2] = float(atomPos[:, 2].mean())
+        stm.run_br_stm_fgr_compare(mol_name, atomPos, names, args)
+    return 0
+
+
 def cmd_stm_br(args: argparse.Namespace) -> int:
     """Three-stage BR-STM: (1) pure STM, (2) df+|dxy|, (3) STM vs BR-STM."""
     import numpy as np
@@ -579,6 +607,9 @@ def cmd_stm_br(args: argparse.Namespace) -> int:
         df_cmap=args.df_cmap, fz_cmap=args.cmap, stm_cmap=args.stm_cmap,
         scale=args.scale, show_atoms=bool(args.show_atoms),
         force_recompute=bool(args.force), pp_stride=int(args.pp_stride),
+        stm_mode=args.stm_mode, tip_orbital=args.tip_orbital, tip_elem=args.tip_elem,
+        eh_K=args.eh_K, rcut=args.rcut, taper_w=args.taper_w,
+        degen_thresh_eV=args.degen_thresh,
     )
     print(f'REVIEW: {os.path.abspath(outdir)}/')
     print(f'REVIEW: {res["png_stm"]}')
@@ -726,6 +757,32 @@ def build_parser() -> argparse.ArgumentParser:
     stm.add_fgr_args(p_fgr)
     p_fgr.set_defaults(func=cmd_stm_fgr)
 
+    p_brfgr = stm_sub.add_parser('br-fgr',
+        help='BR-STM FGR compare: overlap vs I_S/I_H/I_τ with PP-AFM tip displacement')
+    p_brfgr.add_argument('--molecule', nargs='*', default=['pentacene', 'PTCDA'])
+    p_brfgr.add_argument('--outdir', default=None, help='Default: debug/stm_br_fgr_compare')
+    p_brfgr.add_argument('--bases', default='3ob-3-1', choices=['3ob-3-1', 'mio-1-1'])
+    # FGR args
+    stm.add_fgr_args(p_brfgr)
+    # PP-AFM args (shared with stm br) — uses same h_Fz stack as stm br
+    p_brfgr.add_argument('--step', type=float, default=0.1)
+    p_brfgr.add_argument('--margin', type=float, default=4.0)
+    p_brfgr.add_argument('--z-extra', type=float, default=6.0, dest='z_extra')
+    p_brfgr.add_argument('--scan-range', type=float, default=3.0, dest='scan_range')
+    p_brfgr.add_argument('--scan-step', type=float, default=0.1, dest='scan_step')
+    p_brfgr.add_argument('--h-min', type=float, default=3.7, dest='h_min')
+    p_brfgr.add_argument('--h-max', type=float, default=4.7, dest='h_max')
+    p_brfgr.add_argument('--h-step', type=float, default=0.1, dest='h_step')
+    p_brfgr.add_argument('--amp', type=float, default=1.0)
+    p_brfgr.add_argument('--no-amp-align', action='store_true', dest='no_amp_align')
+    p_brfgr.add_argument('--K-LAT', type=float, default=0.5, dest='K_LAT')
+    p_brfgr.add_argument('--K-RAD', type=float, default=20.0, dest='K_RAD')
+    p_brfgr.add_argument('--bond-length', type=float, default=3.0, dest='bond_length')
+    p_brfgr.add_argument('--tip-mode', default='co', choices=['co', 'gaussian'], dest='tip_mode')
+    p_brfgr.add_argument('--projection', default='prolonged', choices=['stock', 'prolonged'])
+    p_brfgr.add_argument('--force', action='store_true')
+    p_brfgr.set_defaults(func=cmd_stm_br_fgr)
+
     p_br = stm_sub.add_parser('br', help='3-stage BR-STM: pure STM → df+|dxy| → STM vs BR-STM')
     p_br.add_argument('--xyz', default='data/xyz/PTCDA.xyz')
     p_br.add_argument('--outdir', default=None, help='Default: debug/spm_brstm/<mol>')
@@ -761,6 +818,21 @@ def build_parser() -> argparse.ArgumentParser:
                       help='Every Nth pixel for PP xy red-dot overlay (ppafm plotDistortions)')
     p_br.add_argument('--no-orient', action='store_true', dest='no_orient')
     p_br.add_argument('--force', action='store_true')
+    # FGR transfer STM mode (Stage 3): 'overlap' (legacy) or 'fgr' (H−E·S kernel)
+    p_br.add_argument('--stm-mode', default='overlap', choices=['overlap', 'fgr'], dest='stm_mode',
+                      help="Stage 3 STM kernel: 'overlap' (legacy exp) or 'fgr' (H−E·S transfer)")
+    p_br.add_argument('--tip-orbital', default='s', choices=['s', 'pz', 'py'], dest='tip_orbital',
+                      help='FGR tip orbital (only used when --stm-mode=fgr)')
+    p_br.add_argument('--tip-elem', default='C', dest='tip_elem',
+                      help='FGR phantom tip atom element (only used when --stm-mode=fgr)')
+    p_br.add_argument('--eh-K', type=float, default=1.75, dest='eh_K',
+                      help='Extended-Hückel K for FGR tables (only used when --stm-mode=fgr)')
+    p_br.add_argument('--rcut', type=float, default=15.0,
+                      help='Atom-pair cutoff [Å] (FGR mode)')
+    p_br.add_argument('--taper-w', type=float, default=2.0, dest='taper_w',
+                      help='Cosine taper width at rcut [Å] (FGR mode)')
+    p_br.add_argument('--degen-thresh', type=float, default=0.005, dest='degen_thresh',
+                      help='Degeneracy threshold [eV] for Stage 3 MO cluster sum (0=off)')
     p_br.set_defaults(func=cmd_stm_br)
 
     p_bt = sub.add_parser(

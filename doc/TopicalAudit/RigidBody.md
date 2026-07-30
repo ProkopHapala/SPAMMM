@@ -53,7 +53,7 @@ Proposed name (TBD): `RigidEnsemble` / `MoleculePoseGraph` — see SSOT task. **
 | Dynamics | `spammm/dynamics/Vibrations.py` | **active** | N/A | removes 6 rigid DOF | Orthogonal (mode projection) |
 | Tip QM | `spammm/quantum/DFTB/Grid_dftb.py` | **active** | tip scan `tip_quat` | default `[0,0,0,1]` | Tip frame only |
 | Cosserat / Frenkel | docs only | unfinished | — | would need poses | `Tasks/Import_CosseratRods_PTCDA.md`, `Ideas/FrenkelRigidFF.chat.md` |
-| **Pose SSOT** | *(none)* | **unfinished** | proposed `pos`+`qrot` per body | quat xyzw | [`RigidMoleculePose_SSOT.md`](../Tasks/RigidMoleculePose_SSOT.md) |
+| **Pose SSOT** | `spammm/forcefields/RigidEnsemble.py` | **implemented (core)** | `pos`+`qrot` per body, stable ids | quat xyzw | [`RigidMoleculePose_SSOT.md`](../Tasks/RigidMoleculePose_SSOT.md); L0 tests `tests/forcefields/test_rigid_ensemble.py` |
 
 ### Related topical audits (do not merge)
 
@@ -145,7 +145,7 @@ Documented dual language today (`doc/topical_audit.md` §3b): *“AtomicGraph SS
 
 ## Open issues
 
-- [ ] **No `RigidEnsemble` module** — GPU/demo arrays treated as truth ([`RigidMoleculePose_SSOT.md`](../Tasks/RigidMoleculePose_SSOT.md))
+- [x] **`RigidEnsemble` module implemented** — `spammm/forcefields/RigidEnsemble.py` (poses only, numpy, stable ids); L0 tests pass; `testplot_pairff_energy_mc.py` rerouted with bit-exact parity vs reference. Remaining consumers (ChargeRings, Assembly, FoldedRigid, PairFF `_mb_*`) to be rerouted incrementally.
 - [ ] Sync policy undecided: **pose-primary** (recommended for multi-mol / PME / PairFF) vs **graph-primary** (draw→promote)
 - [ ] ChargeRings historically φ-only; must bridge via full `R(q)` (PME already supports it)
 - [ ] CoM definition: mass CoM (RBD) vs geometric center vs charge centroid — pick per template

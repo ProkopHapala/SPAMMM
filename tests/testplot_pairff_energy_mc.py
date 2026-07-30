@@ -54,171 +54,17 @@ from spammm import elements
 from spammm.AtomicSystem import AtomicSystem
 from spammm.forcefields.QEq import solve_from_elements
 from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF, _body_sites_world
+from spammm.forcefields.RigidEnsemble import RigidEnsemble
+from spammm.forcefields.molecule_loaders import (
+    MOL_PATHS, FAF_FITS, FAF_FIT_DEFAULT, LOADERS,
+    load_ntcdi, load_ptcda, load_formic_acid, load_terephthalic_acid,
+    load_uracil, load_adenine, load_azaindol, load_tbtap,
+    remap_fit_for_molecule, bonds_from_geom,
+)
 from spammm.plotUtils import plotAtoms, plotBonds
 from spammm.surfaces.FoldedRigid import load_fit, eval_folded_potential_grid, Z_SURF_TOP
-from spammm.topology.FFparams import (
-    read_atom_types, read_element_types, make_REQs_from_enames, load_xyz_with_REQs, _DATA_PATH,
-)
 
 OUT_ROOT = os.path.join(REPO, 'debug', 'testplot_pairff_energy_mc')
-NTCDI = os.path.join(REPO, 'data', 'mol', 'NTCDI.mol2')
-PTCDA = os.path.join(REPO, 'data', 'xyz', 'PTCDA.xyz')
-HCOOH = os.path.join(REPO, 'data', 'xyz', 'HCOOH.xyz')
-TEREPHTHALIC = os.path.join(REPO, 'data', 'xyz', 'terephthalic_acid.xyz')
-TBTAP = os.path.join(REPO, 'data', 'mol', 'TBTAP.mol2')
-AZAINDOL = os.path.join(REPO, 'data', 'xyz', 'azaindol.xyz')
-URACIL = os.path.join(REPO, 'data', 'xyz', 'uracil.xyz')
-ADENINE = os.path.join(REPO, 'data', 'xyz', 'adenine.xyz')
-FAF_FITS = {
-    'formic_acid':       os.path.join(REPO, 'data', 'fits', 'hcooh_nacl.npz'),
-    'PTCDA':             os.path.join(REPO, 'data', 'fits', 'ptcda_nacl.npz'),
-    'NTCDI':             os.path.join(REPO, 'data', 'fits', 'ptcdi_nacl.npz'),  # C,N,O,H — same elements
-    'terephthalic_acid': os.path.join(REPO, 'data', 'fits', 'ptcda_nacl.npz'),  # C,O,H — same elements
-    'TBTAP':             os.path.join(REPO, 'data', 'fits', 'ptcdi_nacl.npz'),  # C,N,O,H — Br maps to closest
-    'azaindol':          os.path.join(REPO, 'data', 'fits', 'ptcdi_nacl.npz'),  # C,N,H — same elements
-    'uracil':            os.path.join(REPO, 'data', 'fits', 'ptcdi_nacl.npz'),  # C,N,O,H — same elements
-    'adenine':           os.path.join(REPO, 'data', 'fits', 'ptcdi_nacl.npz'),  # C,N,H — same elements
-}
-# Default fit for multi-species runs (must cover all elements)
-FAF_FIT_DEFAULT = os.path.join(REPO, 'data', 'fits', 'ptcdi_nacl.npz')  # C,N,O,H — broadest coverage
-
-
-def _atom_types_dict():
-    etypes = read_element_types(os.path.join(_DATA_PATH, 'ElementTypes.dat'))
-    return etypes, read_atom_types(os.path.join(_DATA_PATH, 'AtomTypes.dat'), etypes)
-
-
-def remap_fit_for_molecule(fit, mol_REQs):
-    """Remap a FAF fit's atom types for a different molecule by (R,E,Q) similarity.
-
-    The fit's coeffs/basis_params/lvec2d are reused; only atom_type_ids is rebuilt
-    so each real atom picks the closest type in the fit's unique_REQs.
-    """
-    unique = np.asarray(fit['unique_REQs'], dtype=np.float64)
-    reqs = np.asarray(mol_REQs, dtype=np.float64)[:, :4]
-    scale = np.array([1.0, 20.0, 3.0, 0.0])  # R~1, E~0.05→1, Q~0.3→1, w ignored
-    atids = np.zeros(len(reqs), dtype=np.int32)
-    for i, r in enumerate(reqs):
-        d = np.sqrt(((unique[:, :3] - r[:3]) * scale[:3])**2).sum(axis=1)
-        atids[i] = int(np.argmin(d))
-    fit2 = dict(fit)
-    fit2['atom_type_ids'] = atids
-    return fit2
-
-
-def load_ntcdi():
-    etypes, atom_types = _atom_types_dict()
-    mol = AtomicSystem(fname=NTCDI)
-    apos = np.asarray(mol.apos, dtype=np.float32)
-    enames = [str(e) for e in mol.enames]
-    qs = np.asarray(mol.qs, dtype=np.float32) if mol.qs is not None else np.zeros(len(enames), np.float32)
-    REQs = make_REQs_from_enames(enames, qs, atom_types)
-    apos[:, :2] -= apos[:, :2].mean(axis=0)
-    apos[:, 2] = 0.0
-    bonds = _bonds_from_geom(apos, enames)
-    return apos, enames, REQs, bonds
-
-
-def load_ptcda(qeq=True):
-    """PTCDA with optional QEq charges (needed for O↔H quadrupole / windmill)."""
-    etypes, atom_types = _atom_types_dict()
-    apos, REQs, enames, Zs, lvec = load_xyz_with_REQs(PTCDA, atom_types=atom_types)
-    apos = np.asarray(apos, dtype=np.float32)
-    enames = [str(e) for e in enames]
-    apos[:, :2] -= apos[:, :2].mean(axis=0)
-    apos[:, 2] = 0.0
-    if qeq:
-        # Physical partial charges = negate electron-occupancy QEq (PairFF audit SSOT)
-        q = -solve_from_elements(apos, enames, etypes, Q_target=0.0)
-        REQs = make_REQs_from_enames(enames, q.astype(np.float32), atom_types)
-        print(f'  QEq: sum={q.sum():.4f}  O=[{q[[i for i,e in enumerate(enames) if e=="O"]].min():.3f},'
-              f'{q[[i for i,e in enumerate(enames) if e=="O"]].max():.3f}]  '
-              f'H=[{q[[i for i,e in enumerate(enames) if e=="H"]].min():.3f},'
-              f'{q[[i for i,e in enumerate(enames) if e=="H"]].max():.3f}]')
-    bonds = _bonds_from_geom(apos, enames)
-    return apos, enames, REQs, bonds
-
-
-def load_formic_acid(qeq=True):
-    """Formic acid (HCOOH) with optional QEq charges."""
-    etypes, atom_types = _atom_types_dict()
-    apos, REQs, enames, Zs, lvec = load_xyz_with_REQs(HCOOH, atom_types=atom_types)
-    apos = np.asarray(apos, dtype=np.float32)
-    enames = [str(e) for e in enames]
-    apos[:, :2] -= apos[:, :2].mean(axis=0)
-    apos[:, 2] = 0.0
-    if qeq:
-        q = -solve_from_elements(apos, enames, etypes, Q_target=0.0)
-        REQs = make_REQs_from_enames(enames, q.astype(np.float32), atom_types)
-        print(f'  QEq: sum={q.sum():.4f}  Q per atom: {np.round(q,3)}')
-    bonds = _bonds_from_geom(apos, enames)
-    return apos, enames, REQs, bonds
-
-
-def load_terephthalic_acid(qeq=True):
-    """Terephthalic acid (C8H6O4) with optional QEq charges."""
-    etypes, atom_types = _atom_types_dict()
-    apos, REQs, enames, Zs, lvec = load_xyz_with_REQs(TEREPHTHALIC, atom_types=atom_types)
-    apos = np.asarray(apos, dtype=np.float32)
-    enames = [str(e) for e in enames]
-    apos[:, :2] -= apos[:, :2].mean(axis=0)
-    apos[:, 2] = 0.0
-    if qeq:
-        q = -solve_from_elements(apos, enames, etypes, Q_target=0.0)
-        REQs = make_REQs_from_enames(enames, q.astype(np.float32), atom_types)
-        print(f'  QEq: sum={q.sum():.4f}  O=[{q[[i for i,e in enumerate(enames) if e=="O"]].min():.3f},'
-              f'{q[[i for i,e in enumerate(enames) if e=="O"]].max():.3f}]')
-    bonds = _bonds_from_geom(apos, enames)
-    return apos, enames, REQs, bonds
-
-
-def _load_xyz_generic(path, qeq=True, name=''):
-    """Generic XYZ loader with QEq charges, centering, and planarization."""
-    etypes, atom_types = _atom_types_dict()
-    apos, REQs, enames, Zs, lvec = load_xyz_with_REQs(path, atom_types=atom_types)
-    apos = np.asarray(apos, dtype=np.float32)
-    enames = [str(e) for e in enames]
-    apos[:, :2] -= apos[:, :2].mean(axis=0)
-    apos[:, 2] = 0.0
-    if qeq:
-        q = -solve_from_elements(apos, enames, etypes, Q_target=0.0)
-        REQs = make_REQs_from_enames(enames, q.astype(np.float32), atom_types)
-        print(f'  {name} QEq: sum={q.sum():.4f}  Q range=[{q.min():.3f},{q.max():.3f}]')
-    bonds = _bonds_from_geom(apos, enames)
-    return apos, enames, REQs, bonds
-
-
-def _load_mol2_generic(path, qeq=True, name=''):
-    """Generic mol2 loader via AtomicSystem with QEq charges."""
-    etypes, atom_types = _atom_types_dict()
-    mol = AtomicSystem(fname=path)
-    apos = np.asarray(mol.apos, dtype=np.float32)
-    enames = [str(e) for e in mol.enames]
-    apos[:, :2] -= apos[:, :2].mean(axis=0)
-    apos[:, 2] = 0.0
-    if qeq:
-        q = -solve_from_elements(apos, enames, etypes, Q_target=0.0)
-    else:
-        q = np.asarray(mol.qs, dtype=np.float32) if mol.qs is not None else np.zeros(len(enames), np.float32)
-    REQs = make_REQs_from_enames(enames, q.astype(np.float32), atom_types)
-    print(f'  {name} QEq: sum={q.sum():.4f}  Q range=[{q.min():.3f},{q.max():.3f}]  atoms={len(enames)}  elems={sorted(set(enames))}')
-    bonds = _bonds_from_geom(apos, enames)
-    return apos, enames, REQs, bonds
-
-
-def load_uracil(qeq=True):     return _load_xyz_generic(URACIL, qeq=qeq, name='uracil')
-def load_adenine(qeq=True):    return _load_xyz_generic(ADENINE, qeq=qeq, name='adenine')
-def load_azaindol(qeq=True):   return _load_xyz_generic(AZAINDOL, qeq=qeq, name='azaindol')
-def load_tbtap(qeq=True):      return _load_mol2_generic(TBTAP, qeq=qeq, name='TBTAP')
-
-
-def _bonds_from_geom(apos, enames):
-    atypes = [elements.ELEMENT_DICT[e][0] if e in elements.ELEMENT_DICT else 6 for e in enames]
-    mol = AtomicSystem(apos=np.asarray(apos, dtype=np.float32).copy(), atypes=atypes, enames=list(enames))
-    mol.neighs(bBond=True)
-    if mol.bonds is None or len(mol.bonds) == 0:
-        return np.zeros((0, 2), dtype=np.int32)
-    return np.asarray(mol.bonds, dtype=np.int32)
 
 
 def grid_pos(n, spacing, z=0.0):
@@ -497,7 +343,15 @@ def main():
         phi0 = (i * 0.5 * np.pi) + float(rng.uniform(-0.35, 0.35))
         quat[i] = np.array([0, 0, np.sin(0.5 * phi0), np.cos(0.5 * phi0)], dtype=np.float32)
 
+    # Build shared rigid-pose ensemble (RigidEnsemble SSOT for rigid modules).
+    # The MC loop reads/writes poses through the ensemble; RigidBodyPairFF and plotting
+    # read from it. tid = species name (cycles through mol_names per pack).
+    tids = [mol_names[i % len(mol_names)] for i in range(n_total)]
+    ensemble = RigidEnsemble.from_poses(tids, pos, quat)
+    print(f'  ensemble: {ensemble.summary()}')
+
     print(f'Building PairFF ({mol_label}, {n_total} mols, k_pack={args.k_pack}, FAF={"on" if fit else "off"})...')
+    pos, quat = ensemble.get_poses()  # read from ensemble (copies) for GPU upload
     rbd = RigidBodyPairFF.from_molecules(
         molecules, pos, quats=quat, active_body=0,
         He=-0.1, rc=3.0, w=0.7, k_z=0.0, z_target=z_mol, Hs=1.0, beta=1.7,
@@ -519,13 +373,14 @@ def main():
         charges_per_mol.append(pack['REQ_ext'][m, 2].copy())
     charges_all = np.concatenate(charges_per_mol)
 
-    pos0, quat0 = pos.copy(), quat.copy()
-    E = rbd.eval_energy_system(pos, quat, k_pack=args.k_pack)
+    pos0, quat0 = ensemble.get_poses()  # snapshot initial poses from ensemble
+    E = rbd.eval_energy_system(pos0, quat0, k_pack=args.k_pack)
     hist = [E]
     n_acc = 0
     print(f'E_initial = {E:.6f} eV  (PairFF{"+FAF" if fit else ""}+pack)')
 
     frames = [('initial', pos0.copy(), quat0.copy(), hist[0])]
+    pos, quat = ensemble.get_poses()  # working copies read from ensemble
     for step in range(args.steps):
         moved = [step % n_total]
         pos, quat, E0, Ebest, acc, Ebatch = rbd.greedy_energy_step(
@@ -535,6 +390,7 @@ def main():
         )
         if acc:
             n_acc += 1
+            ensemble.set_poses(pos, quat)  # write accepted poses back to ensemble
         E = rbd.eval_energy_system(pos, quat, k_pack=args.k_pack)
         hist.append(E)
         if acc or step % 50 == 0:

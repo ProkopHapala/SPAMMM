@@ -164,6 +164,11 @@ EXTENSION_REGISTRY = {
         dependencies=['pyopencl'], req_paths=[],
         build_ui='build_ui',
     ),
+    'rigid_assembly': dict(
+        module='spammm.GUI.RigidAssemblyExtension', class_name=None,
+        dependencies=['pyopencl'], req_paths=[],
+        build_ui='build_ui',
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -188,6 +193,7 @@ DEFAULT_CONFIG = {
     'vibrations': dict(enabled=True),
     'folded_rigid': dict(enabled=True),
     'charge_rings': dict(enabled=True),
+    'rigid_assembly': dict(enabled=True),
 }
 
 # ---------------------------------------------------------------------------

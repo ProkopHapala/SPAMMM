@@ -4610,6 +4610,110 @@ def compute_bond_resolved_stm(projector, eigvecs, eigvals, scan_xs, scan_ys, hei
     return stm_grid
 
 
+def compute_bond_resolved_stm_fgr(projector, eigvecs, eigvals, scan_xs, scan_ys, heights,
+                                  tip_disp, atoms_dict, basis_ang, enames, species_per_atom,
+                                  tables, tip_type0, name_to_smp,
+                                  mo_indices, *, tip_orbital='s', tip_elem='C',
+                                  mode='tau', rcut=15.0, taper_w=2.0,
+                                  degen_thresh_eV=0.0, degen_partner_count=0):
+    """Bond-resolved STM with the FGR transfer kernel (H−E·S) at displaced tip positions.
+
+    Like ``compute_bond_resolved_stm`` but uses ``stm_fgr_sk_tau_scan_real`` instead of
+    the legacy ``project_orbital_dense_points_exp``. The AFM relaxation displaces the tip
+    laterally (dx, dy); the FGR kernel evaluates M = c_t†(H−ES)c_s at the displaced
+    tip centers, so the bond-resolved contrast reflects the physically correct tunneling
+    matrix element distorted by CO bending.
+
+    Args:
+        tip_disp: dict with 'dx' and 'dy' arrays (nx_s, ny_s, nz_s)
+        tables, tip_type0, name_to_smp: prebuilt by ``_stm_fgr_prepare_tables``
+        mo_indices: list of MO indices to sum (caller handles degeneracy clustering)
+        degen_thresh_eV, degen_partner_count: only used for the log line
+
+    Returns:
+        stm_grid: (nx_s, ny_s, nz_s) FGR STM intensity at displaced positions
+    """
+    mo_list = [int(i) for i in mo_indices]
+    nmo = int(eigvecs.shape[0])
+    bad = [int(i) for i in mo_list if (int(i) < 0 or int(i) >= nmo)]
+    if len(bad) > 0:
+        raise ValueError(f"BR-STM(FGR): MO indices out of range {bad}; valid=[0,{nmo-1}]")
+    print(f"  [BR-STM(FGR)] MOs={mo_list}  mode={mode}  rcut={rcut}  taper_w={taper_w}")
+    if degen_partner_count > 0:
+        print(f"  [BR-STM(FGR)] summing I over {len(mo_list)} MOs (degen thresh={degen_thresh_eV} eV)")
+    print(f"  [BR-STM(FGR)] Applying tip displacement from AFM relaxation")
+
+    nx_s, ny_s, nz_s = len(scan_xs), len(scan_ys), len(heights)
+    XX, YY = np.meshgrid(scan_xs, scan_ys, indexing='ij')
+    stm_grid = np.zeros((nx_s, ny_s, nz_s), dtype=np.float32)
+
+    for iz, h in enumerate(heights):
+        X_disp = XX + tip_disp['dx'][:, :, iz]
+        Y_disp = YY + tip_disp['dy'][:, :, iz]
+        for imo in mo_list:
+            arr = project_mo_stm_fgr_points(
+                projector, eigvecs[imo], atoms_dict, basis_ang, enames, species_per_atom,
+                X_disp, Y_disp, float(h), tables, tip_type0, name_to_smp,
+                E_tunnel_Ha=float(eigvals[imo]), tip_orbital=tip_orbital, tip_elem=tip_elem,
+                mode=mode, rcut=rcut, taper_w=taper_w, intensity=True)
+            stm_grid[:, :, iz] += arr
+        if iz == 0:
+            print(f"  [BR-STM(FGR)] z={h:.3f} Å  I range=[{stm_grid[:,:,iz].min():.3e},"
+                  f"{stm_grid[:,:,iz].max():.3e}]")
+
+    print(f"  [BR-STM(FGR)] STM grid shape: {stm_grid.shape}, range: "
+          f"[{stm_grid.min():.4e}, {stm_grid.max():.4e}]")
+    return stm_grid
+
+
+def project_mo_stm_fgr_points(projector, mo_coeff, atoms_dict, basis_ang, enames, species_per_atom,
+                              X_disp, Y_disp, z_A, tables, tip_type0, name_to_smp,
+                              E_tunnel_Ha, *, tip_orbital='s', tip_elem='C',
+                              mode='tau', rcut=15.0, taper_w=2.0, intensity=True):
+    """FGR STM current at arbitrary (non-grid) tip positions — used by BR-STM.
+
+    ``X_disp``, ``Y_disp`` are 2D arrays (nx, ny) of tip xy coordinates (already
+    displaced by AFM relaxation). The z coordinate is the scalar ``z_A``.
+    """
+    from spammm.quantum.DFTB.DFTBplusParser import evec_to_kernel_coeffs
+    tip_orbital = str(tip_orbital).lower()
+    if tip_orbital not in STM_TIP_ORBITALS:
+        raise ValueError(f"tip_orbital must be one of {tuple(STM_TIP_ORBITALS)}, got {tip_orbital!r}")
+    if mode not in ('tau', 'S', 'H'):
+        raise ValueError(f"mode must be tau|S|H, got {mode!r}")
+    natoms = len(enames)
+    coeffs_smp = evec_to_kernel_coeffs(
+        np.asarray(mo_coeff, dtype=np.float64).ravel(), natoms,
+        species_per_atom, list(enames), basis_ang)
+    coeffs_tip = np.tile(STM_TIP_ORBITALS[tip_orbital], (1, 1))
+    nx, ny = X_disp.shape
+    tip_centers = np.stack(
+        [X_disp.ravel(), Y_disp.ravel(), np.full(X_disp.size, float(z_A))], axis=1).astype(np.float32)
+    tip_pos_rel = np.zeros((1, 3), dtype=np.float32)
+    smp_pos = np.asarray(atoms_dict['pos'][:natoms], dtype=np.float32)
+    tip_atom_type = np.array([int(tip_type0)], dtype=np.int32)
+    smp_atom_type = np.array([name_to_smp[enames[i]] for i in range(natoms)], dtype=np.int32)
+
+    H4, Hpi = tables['H4'], tables['Hpp_pi']
+    S4, Spi = tables['S4'], tables['Spp_pi']
+    if mode == 'S':
+        tau4, taupi = S4, Spi
+    elif mode == 'H':
+        tau4, taupi = H4, Hpi
+    else:
+        tau4, taupi = projector.build_stm_transfer_sk_tables_gpu(
+            H4, Hpi, S4, Spi, float(E_tunnel_Ha))
+
+    t, I, _np = projector.stm_fgr_sk_tau_scan_real(
+        tip_centers, tip_pos_rel, smp_pos,
+        tip_atom_type, smp_atom_type,
+        tables['pair_map'], tables['n_sample_types'],
+        coeffs_tip, coeffs_smp,
+        tau4, taupi, tables['n_r'], tables['r_grid0'], tables['inv_dr'],
+        rcut=float(rcut), taper_w=float(taper_w))
+    return (I if intensity else t).reshape(nx, ny)
+
+
 def run_br_stm_afm_panel(atomPos, enames, outdir, *,
                          basis='3ob-3-1', step=0.1, margin=4.0, z_extra=6.0,
                          scan_range=3.0, scan_step=None,
@@ -4621,13 +4725,17 @@ def run_br_stm_afm_panel(atomPos, enames, outdir, *,
                          tip_mode='co', pauli_A=None, pauli_beta=None, C6_CO=30.0,
                          df_cmap='gray', fz_cmap='seismic', stm_cmap='viridis',
                          scale='per_image', show_atoms=True, force_recompute=False,
-                         pp_stride=4):
+                         pp_stride=4,
+                         stm_mode='overlap', tip_orbital='s', tip_elem='C',
+                         eh_K=1.75, rcut=15.0, taper_w=2.0, degen_thresh_eV=0.005):
     """Three-stage BR-STM campaign (separate figures; do not mash STM into AFM strip).
 
     Stage 1 — pure STM (orbital identity), prolonged STO, ``use_exp_basis=False``.
               One row per requested MO (never auto-sum near-deg partners).
     Stage 2 — AFM df + Fz(amp-align) + |dxy|; plus ppafm-style every-nth PP xy dots.
     Stage 3 — flat STM vs BR-STM vs |Δ| at Fz heights (closer → larger PP bend).
+              When ``stm_mode='fgr'``, uses the FGR transfer kernel (H−E·S) instead
+              of the legacy overlap-exp kernel, and sums I over degenerate MO clusters.
 
     Returns dict with paths ``png_stm``, ``png_afm``, ``png_pp_dots``, ``png_brstm``.
     """
@@ -4814,32 +4922,84 @@ def run_br_stm_afm_panel(atomPos, enames, outdir, *,
     else:
         imo_br = int(mo_list[0])
     print(f"[BR-STM] Stage3 BR compare MO#{imo_br} ({'LUMO' if imo_br == lumo else 'from --mo'})")
-    _set_projector_species_basis(pipe.projector, pipe.atoms_dict, sto_ang, rc_max=6.0)
-    stm_flat = compute_stm(
-        pipe.projector, eigvecs, eigvals, pipe.scan_xs, pipe.scan_ys, h_Fz,
-        pipe.norb_per_atom, pipe.orb_offsets, pipe.atoms_dict,
-        mo_indices=[imo_br], field=field, use_exp_basis=True, exp_beta=1.0, exp_r0=3.0,
-    )
-    br_stm = compute_bond_resolved_stm(
-        pipe.projector, eigvecs, eigvals, pipe.scan_xs, pipe.scan_ys, h_Fz,
-        tip_disp_Fz, pipe.norb_per_atom, pipe.orb_offsets, pipe.atoms_dict,
-        mo_indices=[imo_br], field=field, use_exp_basis=True, exp_beta=1.0, exp_r0=3.0,
-    )
+
+    # Degenerate cluster for imo_br (sum I over near-degenerate manifold)
+    ev = np.asarray(eigvals, dtype=np.float64)
+    degen_thresh = float(degen_thresh_eV)
+    if degen_thresh > 0:
+        E0 = float(ev[imo_br])
+        br_cluster = [i for i in range(len(ev)) if abs(float(ev[i]) - E0) <= degen_thresh]
+    else:
+        br_cluster = [int(imo_br)]
+    if len(br_cluster) > 1:
+        print(f"[BR-STM] degen cluster for MO#{imo_br}: {br_cluster} "
+              f"(thresh={degen_thresh} eV) → summing I over cluster")
+
+    if stm_mode == 'fgr':
+        # Build FGR tables once (prolonged STO long-tail SK)
+        from spammm.quantum.DFTB.DFTBplusParser import (
+            make_slater_tail_species_list, prolonged_sto_params,
+        )
+        print(f"[BR-STM] Stage3 STM mode=fgr  K={eh_K}  tip_elem={tip_elem}  "
+              f"rcut={rcut}  taper_w={taper_w}  tip_orbital={tip_orbital}")
+        sample_elems = sorted(set(enames))
+        tables, tip_type0_fgr, name_to_smp, _prol, _sto = _stm_fgr_prepare_tables(
+            pipe.projector, os.path.join(outdir, 'dftb_work'), basis_ang,
+            tip_elem=tip_elem, K=float(eh_K), rcut_table=float(rcut),
+            sample_elems=sample_elems)
+        # atoms_dict from setup_gridprojector_from_dftb lacks species_per_atom/names;
+        # rebuild from enames (each atom is its own species index, species_names=enames).
+        species_per_atom = list(range(len(enames)))
+        # Flat STM (no displacement) via FGR
+        stm_flat = np.zeros((len(pipe.scan_xs), len(pipe.scan_ys), len(h_Fz)), dtype=np.float32)
+        XX0, YY0 = np.meshgrid(pipe.scan_xs, pipe.scan_ys, indexing='ij')
+        for iz, h in enumerate(h_Fz):
+            for imo in br_cluster:
+                arr = project_mo_stm_fgr_points(
+                    pipe.projector, eigvecs[imo], pipe.atoms_dict, basis_ang, enames,
+                    species_per_atom, XX0, YY0, float(h), tables, tip_type0_fgr, name_to_smp,
+                    E_tunnel_Ha=float(ev[imo]), tip_orbital=tip_orbital, tip_elem=tip_elem,
+                    mode='tau', rcut=float(rcut), taper_w=float(taper_w), intensity=True)
+                stm_flat[:, :, iz] += arr
+        # BR-STM (displaced tip) via FGR
+        br_stm = compute_bond_resolved_stm_fgr(
+            pipe.projector, eigvecs, eigvals, pipe.scan_xs, pipe.scan_ys, h_Fz,
+            tip_disp_Fz, pipe.atoms_dict, basis_ang, enames, species_per_atom,
+            tables, tip_type0_fgr, name_to_smp, mo_indices=br_cluster,
+            tip_orbital=tip_orbital, tip_elem=tip_elem, mode='tau',
+            rcut=float(rcut), taper_w=float(taper_w),
+            degen_thresh_eV=degen_thresh, degen_partner_count=len(br_cluster) - 1)
+        stage3_title_extra = f'FGR H−ES  K={eh_K}  tip={tip_orbital}/{tip_elem}'
+    else:
+        _set_projector_species_basis(pipe.projector, pipe.atoms_dict, sto_ang, rc_max=6.0)
+        stm_flat = compute_stm(
+            pipe.projector, eigvecs, eigvals, pipe.scan_xs, pipe.scan_ys, h_Fz,
+            pipe.norb_per_atom, pipe.orb_offsets, pipe.atoms_dict,
+            mo_indices=[imo_br], field=field, use_exp_basis=True, exp_beta=1.0, exp_r0=3.0,
+        )
+        br_stm = compute_bond_resolved_stm(
+            pipe.projector, eigvecs, eigvals, pipe.scan_xs, pipe.scan_ys, h_Fz,
+            tip_disp_Fz, pipe.norb_per_atom, pipe.orb_offsets, pipe.atoms_dict,
+            mo_indices=[imo_br], field=field, use_exp_basis=True, exp_beta=1.0, exp_r0=3.0,
+        )
+        stage3_title_extra = 'exp tails for vacuum amp'
     stm_diff = np.abs(br_stm - stm_flat).astype(np.float32)
     print(f"  MO#{imo_br}: STM=[{stm_flat.min():.3e},{stm_flat.max():.3e}]  "
           f"BR=[{br_stm.min():.3e},{br_stm.max():.3e}]  |Δ|max={float(stm_diff.max()):.3e}")
-    variants_br = {'pipe': {'stm': stm_flat, 'br_stm': br_stm, 'diff': stm_diff, 'dxy': dxy_Fz}}
+    variants_br = {'pipe': {'stm': stm_flat, 'br_stm': br_stm, 'dxy': dxy_Fz}}
+    br_label = f'BR-STM\n{_mo_ylab(imo_br)}'
+    if len(br_cluster) > 1:
+        br_label = f'BR-STM×{len(br_cluster)}\n{_mo_ylab(imo_br)}'
     row_specs_br = [
         ('stm', 'pipe', f'STM flat\n{_mo_ylab(imo_br)}', stm_cmap),
-        ('br_stm', 'pipe', f'BR-STM\n{_mo_ylab(imo_br)}', stm_cmap),
-        ('diff', 'pipe', '|BR−STM|', 'magma'),
+        ('br_stm', 'pipe', br_label, stm_cmap),
         ('dxy', 'pipe', '|dxy|', 'magma'),
     ]
     png_br = os.path.join(outdir, '03_brstm_vs_stm.png')
     plot_afm_variant_height_strip(
         variants_br, row_specs_br, h_Fz, png_br, scale='per_image',
         title=(f'Stage 3 — BR-STM vs flat STM @ Fz heights  MO#{imo_br}  '
-               f'|dxy|_max={float(dxy_Fz.max()):.2f}Å  (exp tails for vacuum amp)'),
+               f'|dxy|_max={float(dxy_Fz.max()):.2f}Å  ({stage3_title_extra})'),
         dpi=140, apos=atomPos if show_atoms else None, show_atoms=show_atoms,
         extent=extent, amp=None, amp_align=False, figsize_row=1.25,
     )
@@ -4853,7 +5013,12 @@ def run_br_stm_afm_panel(atomPos, enames, outdir, *,
         tip_disp_dx_Fz=tip_disp_Fz['dx'], tip_disp_dy_Fz=tip_disp_Fz['dy'],
         eigvals=eigvals, mo_list=np.asarray(mo_list, dtype=np.int32),
         mo_br=np.int32(imo_br), homo=np.int32(homo), lumo=np.int32(lumo),
+        br_cluster=np.asarray(br_cluster, dtype=np.int32),
         atomPos=atomPos, projection=np.asarray(projection),
+        stm_mode=np.asarray(stm_mode), tip_orbital=np.asarray(tip_orbital),
+        tip_elem=np.asarray(tip_elem), eh_K=np.float32(eh_K),
+        rcut=np.float32(rcut), taper_w=np.float32(taper_w),
+        degen_thresh_eV=np.float32(degen_thresh_eV),
     )
     summary = os.path.join(outdir, 'SUMMARY.out')
     with open(summary, 'w') as f:
@@ -5126,11 +5291,12 @@ def _stm_fgr_prepare_tables(projector, work_dir, basis_ang, tip_elem='C',
 def project_mo_stm_fgr_slice(projector, mo_coeff, atoms_dict, basis_ang, enames, species_per_atom,
                              scan_xs, scan_ys, z_A, tables, tip_type0, name_to_smp,
                              E_tunnel_Ha, *, tip_orbital='s', tip_elem='C',
-                             mode='tau', rcut=10.0, intensity=True):
+                             mode='tau', rcut=10.0, taper_w=2.0, intensity=True):
     """FGR STM current with long-tail SK tables: mode in {'tau','S','H'}.
 
     mode='tau' → |c†(H−E S)c|²; 'S' → |c† S c|²; 'H' → |c† H c|².
     Point tip φ_t ∈ {s,pz,py}; E_tunnel_Ha must share energy zero with H (DFTB Ha).
+    taper_w: cosine taper width [Å] at rcut (eliminates hard-cutoff ring artifacts).
     """
     from spammm.quantum.DFTB.DFTBplusParser import evec_to_kernel_coeffs
     tip_orbital = str(tip_orbital).lower()
@@ -5167,7 +5333,7 @@ def project_mo_stm_fgr_slice(projector, mo_coeff, atoms_dict, basis_ang, enames,
         tables['pair_map'], tables['n_sample_types'],
         coeffs_tip, coeffs_smp,
         tau4, taupi, tables['n_r'], tables['r_grid0'], tables['inv_dr'],
-        rcut=float(rcut))
+        rcut=float(rcut), taper_w=float(taper_w))
     nx, ny = len(scan_xs), len(scan_ys)
     return (I if intensity else t).reshape(nx, ny)
 

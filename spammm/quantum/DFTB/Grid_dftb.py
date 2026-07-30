@@ -955,6 +955,7 @@ class GridProjector(OpenCLBase):
             r_grid0,
             inv_dr,
             rcut=10.0,
+            taper_w=2.0,
             amplitude_scale=1.0,
             bTryAllocate=True,
         ):
@@ -1049,6 +1050,7 @@ class GridProjector(OpenCLBase):
             np.float32(r_grid0),
             np.float32(inv_dr),
             np.float32(rcut),
+            np.float32(taper_w),
             np.float32(amplitude_scale),
             self.fgr_out_buff,
         )

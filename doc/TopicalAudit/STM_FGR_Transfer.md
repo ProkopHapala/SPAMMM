@@ -34,7 +34,7 @@ Weak-coupling STM between known tip and sample MOs evaluates \(M = c_t^\dagger(H
 | Level B \(I_S\) vs \(I_\tau\) (C/H only) | nearly identical shape (EH \(H\propto S\)) | expected; not a bug |
 | Level B vs Level A \(H^0\) | **not implemented** | — |
 | Bardeen-plane FFT vs SK τ | **not implemented** | — |
-| L0 pytest | **missing** | — |
+| L0 pytest | **active** (`tests/SPM/test_stm_fgr_compare.py`) | table Sps≈−Ssp smoke + benzene scan I_τ≠overlap_exp + NVIDIA marker |
 
 ## Design notes
 
@@ -47,8 +47,11 @@ Weak-coupling STM between known tip and sample MOs evaluates \(M = c_t^\dagger(H
 ## Open Issues
 
 - Level A numerical \(H^0\) (kinetic + frozen \(v_A^0+v_B^0\)).
-- USER confirmation of pentacene/PTCDA panels before product promotion.
-- PTCDA HOMO localization / broken-symmetry DFTB caveat (shared with other STM reports).
+- USER confirmation of pentacene/PTCDA height-ladder panels (z=3,4,5,6 Å) before product promotion.
+- PTCDA HOMO degeneracy (1.8 meV split) → fixed by summing I over degenerate cluster; same fix needed in all STM paths (`Tasks/STM_FGR_CLI_GUI_Integration.md`).
+- BR-STM with FGR kernel — **implemented** (2026-07-30): `compute_bond_resolved_stm_fgr` + `run_br_stm_afm_panel(stm_mode='fgr')` + CLI `run_spm.py stm br --stm-mode fgr`. See `Tasks/STM_FGR_BondResolved.md`.
+- Cutoff/taper fix (2026-07-30): `rcut` 10→15 Å + cosine taper `taper_w=2.0` Å in `LCAO_STM_FGR.cl` (`stm_cutoff_taper`). Eliminates hard-cutoff ring artifacts.
+- FGR into CLI/GUI as first-class mode — see `Tasks/STM_FGR_CLI_GUI_Integration.md`.
 - Optional Bardeen surface reference; WKB barrier factor later.
 - Keep Dyson/`LCAO_STM.cl` off the first-order FGR validation path until FGR is accepted.
 

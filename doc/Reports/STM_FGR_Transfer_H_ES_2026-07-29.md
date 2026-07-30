@@ -130,8 +130,32 @@ Useful knobs: `--eh-K` (default 1.75), `--tip-elem C`, `--rcut 10`.
 1. **Long-tail \(S\) vs `overlap_exp`** already changes lateral weight a lot (pentacene HOMO \(s\): core/frame ~20 → ~190). Replacing the artificial \(\exp(-\beta(r-r_0))\) SK radial is the first-order fix for vacuum halos.
 2. **Level B limitation:** \(H_\gamma\propto S_\gamma\) → for C/H-dominated tip–sample pairs, \(I_S\), \(I_H\), \(I_\tau\) share essentially the **same shape** (identical contrast ratios on pentacene). Channel-dependent \((K\bar\varepsilon-E)\) only reshapes when onsite mix matters (O in PTCDA).
 3. **PTCDA LUMO:** FGR long-tail maps concentrate intensity on the molecular body vs `overlap_exp` (desired direction for the original “halo too bright” complaint).
-4. **PTCDA HOMO:** \(I_\tau\) core/frame **drops below 1** while `overlap_exp` stays core-bright — heteroatom weighting + possible DFTB HOMO localization (broken symmetry). Needs visual judgment; do **not** call “fixed”.
+4. **PTCDA HOMO asymmetry — root cause found (2026-07-30):** HOMO#69 (E=−6.4310 eV) and HOMO-1 #68 (E=−6.4328 eV) are split by only **1.8 meV** — a near-degenerate pair. DFTB's eigensolver returns an arbitrary rotation within this 2D subspace, breaking the molecular inversion symmetry (PTCDA has D₂h with inversion, not independent x/y mirrors). Single-MO maps have inversion asymmetry ~1.60; **summing I over the degenerate pair restores symmetry** (asymmetry → 0.04, comparable to LUMO's 0.02 baseline). LUMO#70 is 1598 meV above LUMO+1 → well isolated → symmetric. Fix implemented: `--degen-thresh 0.005` (eV) in `run_fgr_transfer_compare` sums I over the degenerate cluster. This is the physically correct STM current at finite bias/T (all degenerate states contribute). The same fix is needed in all STM paths — see `Tasks/STM_FGR_CLI_GUI_Integration.md`.
 5. Absolute intensities differ by orders of magnitude across columns (expected: different operators / units); panels use **per-image** clim.
+
+### Height ladder (2026-07-30, z = 3, 4, 5, 6 Å, degen fix applied)
+
+Contrast = mean(centre)/mean(border)  (>1 ⇒ brighter molecular core)
+
+**Pentacene** (no degeneracy, HOMO#50/LUMO#51 well separated):
+
+| z Å | HOMO s overlap | I_τ | LUMO s overlap | I_τ | HOMO pz overlap | I_τ | LUMO pz overlap | I_τ |
+|-----|----------------|-----|----------------|-----|-----------------|-----|-----------------|-----|
+| 3 | 19.7 | 188 | 9.9 | 60.9 | 190 | 205 | 68.6 | 65.5 |
+| 4 | 5.6 | 82.6 | 3.4 | 30.3 | 33.2 | 86.6 | 16.3 | 31.5 |
+| 5 | 2.0 | 39.5 | 1.8 | 16.5 | 7.8 | 40.7 | 4.6 | 16.8 |
+| 6 | 0.7 | 20.3 | 0.9 | 9.5 | 2.4 | 20.7 | 1.7 | 9.6 |
+
+**PTCDA** (HOMO×2 degenerate cluster [68,69], LUMO#70 isolated):
+
+| z Å | HOMO×2 s overlap | I_τ | LUMO s overlap | I_τ | HOMO×2 pz overlap | I_τ | LUMO pz overlap | I_τ |
+|-----|------------------|-----|----------------|-----|-------------------|-----|-----------------|-----|
+| 3 | 8.3 | 0.83 | 4.1 | 71.7 | 6.8 | 0.59 | 26.5 | 23.8 |
+| 4 | 7.1 | 1.16 | 2.5 | 45.6 | 6.8 | 0.52 | 7.4 | 18.3 |
+| 5 | 6.0 | 1.70 | 2.2 | 24.7 | 6.1 | 0.50 | 3.0 | 13.6 |
+| 6 | 6.1 | 2.56 | 2.5 | 13.3 | 5.9 | 0.52 | 2.3 | 9.7 |
+
+Observations: (a) At all heights, `overlap_exp` decays much slower than FGR (overlap_exp contrast drops below 1 at z=6 for pentacene, while I_τ stays >9 — FGR concentrates on the molecular core). (b) PTCDA LUMO I_τ contrast decreases with height but stays >1 (core-bright) at all heights. (c) PTCDA HOMO×2 I_τ stays <1 at all heights (heteroatom weighting suppresses core). Artifacts: `debug/stm_fgr_compare/{pentacene,PTCDA}/fgr_compare_z{3,4,5,6}.0_*.png`.
 
 ### Timing (order of magnitude, this machine)
 
@@ -141,11 +165,16 @@ DFTB SCF ~0.15–0.2 s; table build ~0.07–0.08 s (few element pairs × ~100 \(
 
 ## Open issues / next steps
 
-- [ ] **USER L2 review** of both PNGs (morphology vs experiment / known BR-STM).
+- [ ] **USER L2 review** of height-ladder PNGs (z=3,4,5,6 Å, degen fix applied) — morphology vs experiment / known BR-STM.
+- [x] **Height ladder** z=3,4,5,6 Å run for pentacene + PTCDA (2026-07-30). See height-ladder table above.
+- [x] **PTCDA HOMO asymmetry** root-caused (near-degenerate pair 1.8 meV) and fixed (sum I over cluster). See interpretation §4 above.
 - [ ] **Level A** frozen \(H^0\) (kinetic + \(v_A^0+v_B^0\)) so \(H\) and \(S\) differ radially — expected to unlock true \(H-ES\) cancellation beyond EH.
-- [ ] Height ladder (2.5–4.0 Å); tip \(\beta,r_0\) parity check vs prolonged \(\zeta\).
+- [x] **BR-STM with FGR** — wired FGR transfer into `compute_bond_resolved_stm` (new `compute_bond_resolved_stm_fgr`) and `run_br_stm_afm_panel` Stage 3 via `stm_mode='fgr'`. CLI: `run_spm.py stm br --stm-mode fgr`. Parity verified (far height |Δ|/flat=0.18, close height=0.94). See `Tasks/STM_FGR_BondResolved.md`.
+- [x] **BR-STM FGR compare gallery** — `run_spm.py stm br-fgr` produces 4-column panels (BR-overlap | BR-I_S | BR-I_H | BR-I_τ) with PP-AFM tip displacement at Fz heights. Artifacts: `debug/stm_br_fgr_compare/{PTCDA,pentacene}/`.
+- [x] **Cutoff/taper fix** (2026-07-30): `rcut` default 10→15 Å + cosine taper `taper_w=2.0` Å in all 3 FGR scan kernels (`stm_cutoff_taper` in `LCAO_STM_FGR.cl`). Eliminates hard-cutoff ring artifacts visible at z=5,6 Å.
+- [ ] **FGR into CLI/GUI** — promote from compare gallery to first-class STM mode. See `Tasks/STM_FGR_CLI_GUI_Integration.md`.
 - [ ] Optional Bardeen-plane FFT reference for selected geometries.
-- [ ] L0 pytest (finite maps, \(S_{ps}\approx -S_{sp}\) smoke, NVIDIA marker).
+- [x] **L0 pytest** (`tests/SPM/test_stm_fgr_compare.py`): table Sps≈−Ssp smoke + benzene scan I_τ≠overlap_exp + NVIDIA device marker.
 - [ ] Do **not** promote Level B into BR-STM product path until USER OK.
 
 ---

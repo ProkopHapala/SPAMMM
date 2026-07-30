@@ -29,7 +29,8 @@ PyQt5 GUI for molecular editing and AFM simulation. Main window combines VisPy 3
 - **KekuleExtension.py** — Kekulé π-bond-order solver panel
 - **FoldedRigidExtension.py** — Folded-basis rigid-body manipulation panel (load molecule, fit/load substrate potential, drag atoms)
 - **ChargeRingsExtension.py** — PME charge-ring STM: JSON params, Calc XY/xV/1D, cut-line overlay, many-body state probs (`doc/TopicalAudit/ChargeRings_PME.md`); sites still abstract until pose SSOT (`RigidMoleculePose_SSOT.md`)
-- **RigidBodyVispy.py** — Standalone Vispy+Qt viewer for **PairFF** (FIRE, click-to-select active, map = PairFF[+FAF]); used by `demos/demo_pairff.py` — not yet a main-GUI extension (`PairFF_GUI_Integration.md`); depends on shared pose store before dual-panel wiring
+- **RigidAssemblyExtension.py** — Unified rigid-body panel: **Drag** (anchor-spring pull, reuses `FRManipMode` pattern + `update_anchors`), **MC/GA** (greedy best-of-batch, reuses `RigidBodyPairFF.greedy_energy_step`), **PME** (sites = ensemble CoM + R(q), reuses `pauli_scan.scan_xy`). Single `RigidEnsemble` pose SSOT + single `RigidBodyPairFF` GPU backend. No new physics, no second VisPy window. L0 tests: `tests/GUI/test_rigid_assembly_extension.py`.
+- **RigidBodyVispy.py** — Standalone Vispy+Qt viewer for **PairFF** (FIRE, click-to-select active, map = PairFF[+FAF]); used by `demos/demo_pairff.py` — superseded for main-GUI use by `RigidAssemblyExtension` (`PairFF_GUI_Integration.md`)
 - **AsciiArtExtension.py** — ASCII art → molecule; must match `build_ascii_hbond_system` pipeline for DFTB scans
 - **ReactionCoordinateExtension.py** — H-bond RC scan: import graph, DFTB methods, slider, bond viz, ESP animation
 - **rc_esp_view.py** — Blitted ESP heatmap synced to RC slider (uses `mpl_blit.py`)
