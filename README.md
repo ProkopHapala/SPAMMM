@@ -97,8 +97,34 @@ export PYTHONPATH="$SPAMMM_PYSCF_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 export DFTB_ROOT="$HOME/git/dftbplus"
 export DFTB_EXE="$DFTB_ROOT/_build/app/dftb+/dftb+"
-export DFTB_SK_PATH="/path/to/slakos"  # parent containing mio-1-1/, 3ob-3-1/, ...
+export DFTB_SK_PATH="/path/to/slakos"  # PARENT dir containing mio/, library/, etc. — NOT library/ itself
 export DFTB_BASIS_PATH="/path/to/SPAMMM/spammm/quantum/DFTB/data"  # optional; bundled WFC basis files
 ```
 
 `DFTBcore` automatically searches for the fork's shared library at `~/git/dftbplus/_build/app/dftbcore/libdftbcore.so` (or `~/opt/dftbplus/lib/libdftbcore.so`). If your CMake build puts the executable or library elsewhere, adjust `DFTB_EXE` and either install/symlink the library into one of those locations or pass its path explicitly as `DFTBcore(libpath=...)`.
+
+### DFTB+ Slater-Koster (SK) parameter sets — critical setup
+
+SPAMMM uses **two** SK sets: `3ob-3-1` for the sample molecule and `mio-1-1` for the CO tip (hardcoded in `compute_co_tip.py`). Both must be present and discoverable. **This is the #1 issue when cloning to a new machine.**
+
+**Download** from https://dftb.org/parameters/download.html:
+- `3ob-3-1` — main set (C, H, N, O, P, S, Br, I, and metals)
+- `mio-1-1` — tip set (C, H, N, O, P, S)
+
+**Directory layout** varies by how you download/extract:
+```
+slakos/
+├── 3ob-3-1/              ← direct child (some installs)
+├── library/3ob-3-1/      ← nested (other installs)
+├── mio/mio-1-1/          ← always nested under mio/
+```
+
+`DFTB_SK_PATH` must point to the **parent** (`slakos/`), not a subdirectory. The code searches `slakos/{basis}/`, `slakos/mio/{basis}/`, `slakos/library/{basis}/`, and even the parent of `DFTB_SK_PATH` as fallback.
+
+**Verify after setup:**
+```bash
+python3 -c "from spammm.quantum.DFTB_utils import SK_PATHS; print(SK_PATHS)"
+# Must show BOTH 'mio-1-1' and '3ob-3-1' with valid paths
+```
+
+If auto-discovery fails, create `firecore_config.json` (gitignored) with explicit paths — see `doc/Caveats.md` §7 for template and full troubleshooting.

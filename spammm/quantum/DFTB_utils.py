@@ -7,8 +7,12 @@ or the C-API. Handles input generation, output parsing, and SK parameter managem
 Key functionality:
   - run_dftb_subprocess() — run DFTB+ as external process, parse output
   - parse_dftb_output() — extract energy, forces, charges from output
-  - SK_PATHS — dictionary of Slater-Koster parameter directories
+  - SK_PATHS — dictionary of Slater-Koster parameter directories (two sets: 3ob-3-1 for sample, mio-1-1 for CO tip)
   - make_dftb_input() — generate dftb_in.hsd from atomic geometry
+
+SK path resolution: _get_sk_paths() uses get_dftb_sk_path() from config_utils.py,
+which searches firecore_config.json → DFTB_SK_PATH env var with subdir patterns
+(mio/, library/) → parent dir fallback. See doc/Caveats.md §7 for full guide.
 
 Role in SPAMMM: DFTB+ integration. Used by ModularPipeline.py (SCF backend)
 and any module that needs DFTB+ single-point calculations. Bridges SPAMMM's
@@ -38,7 +42,20 @@ def _check_sk_path():
         raise RuntimeError("DFTB_SK_PATH not set. Set in firecore_config.json or via: export DFTB_SK_PATH=/path/to/library/ (e.g. ~/SIMULATIONS/dftbplus/slakos/). Download: wget https://github.com/dftbparams/3ob/releases/download/v3.1.0/3ob-3-1.tar.xz && tar xf 3ob-3-1.tar.xz. See https://dftb.org/parameters/download.html")
     if not os.path.isdir(sk_lib_path): raise RuntimeError(f"SK library not found: {sk_lib_path}")
     sk_lib_path = sk_lib_path.rstrip('/') + '/'
-    available_sets = [d for d in os.listdir(sk_lib_path) if os.path.isdir(os.path.join(sk_lib_path, d)) and any(f.endswith('.skf') for f in os.listdir(os.path.join(sk_lib_path, d)))]
+    # Search direct children AND one level of subdirs (mio/, library/) for SK sets
+    available_sets = []
+    for d in os.listdir(sk_lib_path):
+        full = os.path.join(sk_lib_path, d)
+        if not os.path.isdir(full):
+            continue
+        if any(f.endswith('.skf') for f in os.listdir(full)):
+            available_sets.append(d)
+        else:
+            # Search one level deeper (e.g. mio/mio-1-1, library/3ob-3-1)
+            for sub in os.listdir(full):
+                sub_full = os.path.join(full, sub)
+                if os.path.isdir(sub_full) and any(f.endswith('.skf') for f in os.listdir(sub_full)):
+                    available_sets.append(sub)
     if not available_sets:             raise RuntimeError(f"No .skf files in {sk_lib_path}. Contents: {os.listdir(sk_lib_path)}")
     return sk_lib_path, available_sets
 
@@ -471,14 +488,12 @@ def _get_sk_paths():
         for basis_name, basis_info in config['dftb']['basis_sets'].items():
             if 'sk_path' in basis_info:
                 sk_paths[basis_name] = basis_info['sk_path']
-    # Fallback: construct from dftb_sk_path + known basis names
-    if not sk_paths:
-        sk_lib_path = get_path('dftb_sk_path') or os.environ.get('DFTB_SK_PATH')
-        if sk_lib_path and os.path.isdir(sk_lib_path):
-            for basis_name in ['mio-1-1', '3ob-3-1']:
-                candidate = os.path.join(sk_lib_path, basis_name)
-                if os.path.isdir(candidate):
-                    sk_paths[basis_name] = candidate
+    # Fallback: use get_dftb_sk_path() which searches subdirs (mio/, library/, etc.)
+    for basis_name in ['mio-1-1', '3ob-3-1']:
+        if basis_name not in sk_paths:
+            p = get_dftb_sk_path(basis_name)
+            if p and os.path.isdir(p):
+                sk_paths[basis_name] = p
     if not sk_paths:
         raise RuntimeError("SK paths not configured. Set them in firecore_config.json under dftb.basis_sets or use DFTB_SK_PATH environment variable.")
     return sk_paths

@@ -224,6 +224,9 @@ debug/**
 # GUI output (screenshots, saved plots)
 output/
 
+# Machine-specific config (absolute paths to SK files, Fdata, etc.)
+firecore_config.json
+
 # Binary density files (large, regenerable — keep in debug/)
 tests/ref_data/densities/
 tests/ref_data/bak/

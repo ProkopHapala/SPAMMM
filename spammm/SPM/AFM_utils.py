@@ -1707,7 +1707,8 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
 
     # Prepare DFTBcore input (minimal, no Analysis/Options blocks like DFTB+ needs)
     from spammm.quantum.DFTB_utils import SK_PATHS as _SK_PATHS
-    sk_dir = _SK_PATHS.get(basis_name, os.path.join(os.environ.get('DFTB_SK_PATH', ''), basis_name))
+    from spammm.config_utils import get_dftb_sk_path as _get_dftb_sk_path
+    sk_dir = _SK_PATHS.get(basis_name) or _get_dftb_sk_path(basis_name) or os.path.join(os.environ.get('DFTB_SK_PATH', ''), basis_name)
     xyz_path = os.path.join(work_dir, 'geom.xyz')
     hsd_path = os.path.join(work_dir, 'dftb_in.hsd')
 

@@ -2,7 +2,8 @@
 
 Quantum chemistry integration: DFTB+ scans, Hessians for vibrations, electron densities for FDBM AFM.
 
-- **DFTB_utils.py** — DFTB+ I/O, `run_dftb_sp` / `run_dftb_relax`, Mulliken parse, Hessian, `clean_dftb_workdir`, failure diagnostics
+- **DFTB_utils.py** — DFTB+ I/O, `run_dftb_sp` / `run_dftb_relax`, Mulliken parse, Hessian, `clean_dftb_workdir`, failure diagnostics. **SK path resolution SSOT**: `SK_PATHS` dict, `_get_sk_paths()`, `_check_sk_path()` — see `doc/Caveats.md` §7
+- **config_utils.py** — `get_dftb_sk_path()` smart search (config → env var + subdir patterns → parent fallback), `firecore_config.json` loader
 - **coordinate_scan.py** — Reaction-coordinate engine: control grids, pm-NEB (endpoint relax + all-atom interp), Mulliken charges per frame → `ScanDataset`
 - **esp_grid.py** — Precompute Coulomb ESP stacks `[nframes, ny, nx]` from charges (KE/r, same as QEq)
 - **hbond_scan.py** — Legacy ASCII rigid proton-transfer scan (0.1 Å axis steps); kept for existing tests

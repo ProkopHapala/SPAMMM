@@ -107,7 +107,85 @@ Quasi-2D contact-sep is meant to **approximate** Morse(+Coulomb), not invent sha
 
 ---
 
-## 7. Related but secondary
+## 7. DFTB+ Slater-Koster (SK) path configuration — the #1 clone-to-new-machine bug
+
+**Symptom:** Main molecule SCF works (e.g. `3ob-3-1`), but CO tip computation crashes with `SK file ... not found` for `O-O.skf` in `mio-1-1`. Or: everything worked on machine A, broken after `git clone` on machine B.
+
+**Root cause:** DFTB+ needs two SK parameter sets — `3ob-3-1` for the sample molecule and `mio-1-1` for the CO tip (`compute_co_tip.py:157`, hardcoded). These sets live in different subdirectory layouts depending on how they were downloaded:
+
+```
+~/SIMULATIONS/dftbplus/slakos/
+├── 3ob-3-1/              ← direct child (some installs)
+├── library/
+│   └── 3ob-3-1/          ← nested under library/ (other installs)
+├── mio/
+│   └── mio-1-1/          ← nested under mio/ (always, from dftb.org)
+└── ...
+```
+
+`DFTB_SK_PATH` must point to the **parent** (`.../slakos/`), not a subdirectory like `.../slakos/library/`. If it points to `library/`, only `3ob-3-1` is found; `mio-1-1` (under `mio/`) is invisible.
+
+**Resolution priority** (highest → lowest):
+1. **`firecore_config.json`** (repo root, gitignored) — explicit `sk_path` per basis set; machine-specific
+2. **`DFTB_SK_PATH` env var** — parent dir; code searches `sk_path/{basis}`, `sk_path/mio/{basis}`, `sk_path/library/{basis}`, and also the **parent** of `sk_path` (handles wrong `library/` setting)
+3. **Bundled WFC files** — `spammm/quantum/DFTB/data/wfc.{basis}.hsd` (always in repo, no SK files)
+
+**Setup checklist for a new machine:**
+1. Download SK sets: `3ob-3-1` (has O, Br, P, S…) and `mio-1-1` (has O, N, C, H…)
+   - From https://dftb.org/parameters/download.html
+   - `mio-1-1` typically extracts as `mio/mio-1-1/` (nested)
+   - `3ob-3-1` may extract as `3ob-3-1/` or `library/3ob-3-1/` depending on source
+2. Set `DFTB_SK_PATH` to the **parent** containing both:
+   ```bash
+   export DFTB_SK_PATH="$HOME/SIMULATIONS/dftbplus/slakos/"
+   ```
+3. **Verify** both sets resolve:
+   ```bash
+   python3 -c "from spammm.quantum.DFTB_utils import SK_PATHS; print(SK_PATHS)"
+   # Should show both mio-1-1 and 3ob-3-1 with real paths
+   ```
+4. If paths still don't resolve, create `firecore_config.json` (see template below)
+5. **Verify O-O.skf exists** in the `mio-1-1` set (CO tip needs it)
+
+**`firecore_config.json` template** (repo root, gitignored):
+```json
+{
+  "paths": {
+    "dftb_sk_path": "/home/USER/SIMULATIONS/dftbplus/slakos/"
+  },
+  "dftb": {
+    "basis_sets": {
+      "mio-1-1": {
+        "sk_path": "/home/USER/SIMULATIONS/dftbplus/slakos/mio/mio-1-1/",
+        "wfc_path": "@REPO_ROOT/spammm/quantum/DFTB/data/wfc.mio-1-1.hsd"
+      },
+      "3ob-3-1": {
+        "sk_path": "/home/USER/SIMULATIONS/dftbplus/slakos/library/3ob-3-1/",
+        "wfc_path": "@REPO_ROOT/spammm/quantum/DFTB/data/wfc.3ob-3-1.hsd"
+      }
+    }
+  }
+}
+```
+
+`@REPO_ROOT` is resolved to the repo directory at load time.
+
+**Code entry points:**
+
+| Function | File | Role |
+|----------|------|------|
+| `get_dftb_sk_path()` | `spammm/config_utils.py` | Smart search: config → env var + subdir patterns → parent dir fallback |
+| `_get_sk_paths()` | `spammm/quantum/DFTB_utils.py` | Builds `SK_PATHS` dict at import time; uses `get_dftb_sk_path()` |
+| `_check_sk_path()` | `spammm/quantum/DFTB_utils.py` | Validates `DFTB_SK_PATH` at import; searches 2 levels deep |
+| `get_density_from_dftb_dense()` | `spammm/SPM/AFM_utils.py` | SK fallback for sample molecule SCF |
+| `_stage1_scf_dftb()` | `spammm/SPM/ModularPipeline.py` | SK fallback for pipeline Stage 1 |
+| `compute_co_tip.py:157` | `spammm/SPM/` | **Hardcoded** `basis_name='mio-1-1'` for CO tip |
+
+**Why `mio-1-1` for the tip?** The CO tip (C+O, 10 electrons) is a small diatomic — `mio-1-1` is the standard set for organic molecules with C, H, N, O. `3ob-3-1` would also work (has O), but `mio-1-1` is the conventional choice for tip density.
+
+---
+
+## 8. Related but secondary
 
 - Tip innocent when tip XY mirror ~1e−7 and peak at (0,0,0) after roll.
 - z-box asymmetry (extra vacuum on +z only) can bias vertical fields.

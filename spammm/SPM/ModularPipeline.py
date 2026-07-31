@@ -31,7 +31,7 @@ from spammm.globals import debug_print
 from spammm.SPM.AFM import AFMBench, afm_bench_enabled, afm_bench_no_io, afm_use_cpu_fft, afm_use_fast_s3, afm_diag_download
 from spammm.SPM import AFM as afm
 from spammm.SPM import AFM_utils as afm_utils
-from spammm.config_utils import get_config, get_path, get_dftb_basis_path
+from spammm.config_utils import get_config, get_path, get_dftb_basis_path, get_dftb_sk_path
 
 
 def _bench():
@@ -268,7 +268,7 @@ class ModularAFMPipeline:
             _ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
             basis_hsd_path = os.path.join(_ROOT, 'spammm', 'quantum', 'DFTB', 'data', f'wfc.{basis_name}.hsd')
 
-        sk_dir = _SK_PATHS.get(basis_name, os.path.join(os.environ.get('DFTB_SK_PATH', ''), basis_name))
+        sk_dir = _SK_PATHS.get(basis_name) or get_dftb_sk_path(basis_name) or os.path.join(os.environ.get('DFTB_SK_PATH', ''), basis_name)
 
         # Set up DFTBcore directory and input
         xyz_path = os.path.join(self.work_dir, 'geom.xyz')

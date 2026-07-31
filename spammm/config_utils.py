@@ -6,9 +6,15 @@ Provides centralized path resolution for DFTB basis sets, SK parameter directori
 and other external dependencies.
 
 Key functionality:
-  - get_config() — load firecore_config.json
+  - get_config() — load firecore_config.json (gitignored, machine-specific)
   - get_path() — resolve paths by key (dftb_sk_path, dftb_basis_path, etc.)
   - get_dftb_basis_path(), get_dftb_sk_path() — DFTB-specific helpers
+
+SK path resolution (get_dftb_sk_path):
+  1. firecore_config.json dftb.basis_sets.{name}.sk_path (explicit)
+  2. DFTB_SK_PATH env var with subdir search: {sk_path}/{basis}, {sk_path}/mio/{basis}, {sk_path}/library/{basis}
+  3. Parent of DFTB_SK_PATH with same subdir patterns (handles DFTB_SK_PATH pointing to library/ instead of slakos/)
+  See doc/Caveats.md §7 for full troubleshooting guide.
 
 Role in SPAMMM: Central configuration. Used by ModularPipeline.py (DFTB backend),
 DFTBcore.py (SK paths), and any module that needs external resource locations.
@@ -174,11 +180,19 @@ def get_dftb_sk_path(basis_name, config_path=None):
     # Fall back to constructing from dftb_sk_path
     sk_path = get_path('dftb_sk_path', config_path)
     if sk_path:
-        # Try common subdirectories
+        sk_path = sk_path.rstrip('/')
+        # Try common subdirectories under sk_path
         for subdir in [basis_name, f'mio/{basis_name}', f'library/{basis_name}']:
             candidate = Path(sk_path) / subdir
             if candidate.exists():
                 return str(candidate)
+        # Also try parent directory (handles DFTB_SK_PATH pointing to a subdir like library/)
+        parent = str(Path(sk_path).parent)
+        if parent != sk_path:
+            for subdir in [basis_name, f'mio/{basis_name}', f'library/{basis_name}']:
+                candidate = Path(parent) / subdir
+                if candidate.exists():
+                    return str(candidate)
         # Return the base sk_path and let caller handle subdirectory
         return sk_path
     
