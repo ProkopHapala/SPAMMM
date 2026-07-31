@@ -116,30 +116,36 @@ Physical PPM: probe (CO O-apex) hangs **L** below tip apex (metal / C).
 3. `scan_fdbm(probe_heights=…)` already places tip apex at probe+L internally. Do **not** add L a second time.
 4. K_LAT: human/GUI = **N/m**; internal = **eV/Å²** (`stiffness_Nm_to_eVA2`). Hapala 0.5 N/m ≈ 0.031 eV/Å².
 
-### Oscillation amplitude vs Fz / df
+### Oscillation amplitude vs Fz / df — z-reference convention
 
 `compute_df_amp(Fz, dz, amp)` uses **peak** amplitude `amp` (half of peak-to-peak).
 
+**z-reference = h_Fz = probe atom (O) center position above molecule plane (z=0).**
+See `doc/figures/z_reference_geometry.svg`. Contact at h_Fz = R_O + R_C = 1.66 + 1.90 = 3.56 A.
+
 ```
-df(z) averages ∂Fz/∂z over [z − amp, z + amp]  (Giessibl semi-circle weight)
-closest approach ≈ probe_z − amp
+h_Fz = O center position (unrelaxed) = physical z (Fz, dXY, BR-STM evaluated here)
+h_df = h_Fz + amp = oscillation center (df extracted here)
+df(z) averages dFz/dz over [z - amp, z + amp]  (Giessibl semi-circle weight)
+closest approach during df oscillation = h_df - amp = h_Fz
 ```
 
 | Default | Value |
 |---------|-------|
-| `amp` | **1.0 Å** (peak) |
+| `amp` | **1.0 A** (peak) |
 
-**USER (Fukui panel / PTCDA, 2026-07-23):** bond / chemical contrast evolves in **df** near **h≈4.3–5.3** (sharpening ~4.5) but in **Fz** near **h≈2.9–3.9** (sharpening ≲3.0) — apparent shift **~1.4 Å**. With `amp=1.0` that is **expected to leading order** (df at \(h\) “sees” Fz down to ~\(h-\mathrm{amp}\)). Do **not** treat same-column Fz and df as the same tip–sample distance. See `doc/Reports/Fukui_FDBM_panel_notes_2026-07-23.md`.
+**Convention (2026-07-31, USER-confirmed):** All plot column labels = **h_Fz** (physical z).
+- Fz, dXY, BR-STM: directly at h_Fz (no shift)
+- df: extracted at h_df = h_Fz + amp, labeled as `df (amp=1.0)` — contrast dominated by closest approach at h_Fz
+- df and Fz at the same column show **consistent** contrast features (df is a convolved/smoothed Fz)
 
-**Other reasons the shift can exceed ~amp:** coarse height stack for `compute_df_amp` (prefer dz≈0.1); comparing only **relaxed** Fz to df (pyridine SSOT: also show **Fz_unrelax**); per-image color scale exaggerating high-z df features.
+**Do NOT** label columns by h_df (oscillation center) — this was the old convention and caused
+confusion (df sharpening at h_df~4.0 vs Fz at h_Fz~3.0 in the same column looked inconsistent).
 
-**Pitfalls (already hit this session):**
+**Pitfalls:**
+- Computing df on a **short coarse** height stack (`mode='nearest'`) makes high-z columns inherit contact from low-z edges -> df looks "way too close".
+- **Fix:** dense PP scan with `dz~0.1` over `[h_Fz_min, h_Fz_max + 2*amp]`, then extract df at h_df = h_Fz + amp.
 
-- Computing df on a **short coarse** height stack (`mode='nearest'`) makes high-z columns inherit contact from low-z edges → df looks “way too close”.
-- **Fix:** dense PP scan with `dz≈0.1` over `[probe_min−amp, probe_max+amp]`, then extract df at display probe heights.
-- Expect df contrast to look ~`amp` closer than Fz in the same column — physical, not a lever bug.
-- For fair Fz↔df visual match, use smaller `amp` (e.g. 0.5), label columns by **closest approach** \(h-\mathrm{amp}\), or show Fz at \(h-\mathrm{amp}\) next to df at \(h\).
-- Experimental chemical window for **df** often **~4.3–5.3 Å** (Δz=0.1); matching **Fz** morphology lives ~**amp** lower.
 ### Recommended z ladders (pyridine / AFM)
 
 | Use | Tip_z | Probe_z (= tip−L, L=3) |

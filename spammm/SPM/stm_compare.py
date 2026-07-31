@@ -281,7 +281,7 @@ def run_frontier_stm_current(mol_name, pos, names, types, args):
     tips = [t.strip().lower() for t in args.stm_tips.split(',') if t.strip()]
     for t in tips:
         if t not in afm_utils.STM_TIP_ORBITALS:
-            raise ValueError(f'Unknown stm tip {t!r}; use s,pz,py')
+            raise ValueError(f'Unknown stm tip {t!r}; use s,pz,px,py')
     basis_key = _basis_key(args.bases)
     basis_hsd = WFC_HSD_PATHS[basis_key]
     root_dir = os.path.join(args.outdir, mol_name, 'frontier_stm_diag')
@@ -563,7 +563,7 @@ def run_fgr_transfer_compare(mol_name, pos, names, types, info, args):
     tips = [t.strip().lower() for t in str(args.stm_tips).split(',') if t.strip()]
     for t in tips:
         if t not in afm_utils.STM_TIP_ORBITALS:
-            raise ValueError(f'Unknown stm tip {t!r}; use s,pz,py')
+            raise ValueError(f'Unknown stm tip {t!r}; use s,pz,px,py')
     basis_key = _basis_key(args.bases)
     basis_hsd = WFC_HSD_PATHS[basis_key]
     work = os.path.join(out_dir, f'dftb_work_{basis_key}')
@@ -745,7 +745,7 @@ def run_br_stm_fgr_compare(mol_name, atomPos, enames, args):
     tips = [t.strip().lower() for t in str(args.stm_tips).split(',') if t.strip()]
     for t in tips:
         if t not in afm_utils.STM_TIP_ORBITALS:
-            raise ValueError(f'Unknown stm tip {t!r}; use s,pz,py')
+            raise ValueError(f'Unknown stm tip {t!r}; use s,pz,px,py')
     basis_key = _basis_key(args.bases)
     K = float(getattr(args, 'eh_K', 1.75))
     tip_elem = str(getattr(args, 'tip_elem', 'C'))
@@ -832,11 +832,21 @@ def run_br_stm_fgr_compare(mol_name, atomPos, enames, args):
         ppm_mode=True)
     del _df_legacy, V_ES, E_pauli, E_ES, E_vdw
 
-    # Extract tip displacement at Fz heights (same as stm br Stage 3)
+    # Extract AFM df (at h_df) and Fz/dxy (at h_Fz = h_df − amp).
+    # amp_align: df at probe height h "sees" Fz over [h−amp, h+amp] (Giessibl).
+    # So df sharpening at h_df≈4.0 corresponds to Fz sharpening at h_Fz≈3.0.
+    # Column labels = h_df (probe height); Fz/BR-STM shown at h_Fz = h_df − amp.
+    Fz_full = np.asarray(FEs_relax[:, :, :, 2], dtype=np.float32)
+    dz = float(h_scan[1] - h_scan[0])
+    df_full = afm_mod.compute_df_amp(Fz_full, dz, amp=float(amp))
+    idx_df = [int(np.argmin(np.abs(h_scan - h))) for h in h_df]
     idx_Fz = [int(np.argmin(np.abs(h_scan - h))) for h in h_Fz]
+    df_disp = df_full[:, :, idx_df]    # df at probe heights (h_df)
+    Fz_disp = Fz_full[:, :, idx_Fz]    # Fz at tip heights (h_Fz = h_df − amp)
     tip_disp_Fz = {'dx': tip_disp['dx'][:, :, idx_Fz], 'dy': tip_disp['dy'][:, :, idx_Fz]}
     dxy_Fz = np.hypot(tip_disp_Fz['dx'], tip_disp_Fz['dy']).astype(np.float32)
     scan_xs, scan_ys = pipe.scan_xs, pipe.scan_ys
+    print(f'[BR-FGR] h_df={list(h_df)}  h_Fz={list(h_Fz)} (amp={amp})')
     print(f'[BR-FGR] |dxy| at Fz heights: {[float(dxy_Fz[:,:,i].max()) for i in range(len(h_Fz))]} Å')
 
     # ── FGR tables ────────────────────────────────────────────────────────────
@@ -867,7 +877,15 @@ def run_br_stm_fgr_compare(mol_name, atomPos, enames, args):
         print(f'[degen] HOMO cluster {homo_cluster} E={[f"{E_eV[i]:.4f}" for i in homo_cluster]} eV')
     if len(lumo_cluster) > 1:
         print(f'[degen] LUMO cluster {lumo_cluster} E={[f"{E_eV[i]:.4f}" for i in lumo_cluster]} eV')
-    mo_groups = [('HOMO', homo_cluster), ('LUMO', lumo_cluster)]
+
+    # MO groups: default HOMO/LUMO, or user-specified --mo-list (sum of selected MOs)
+    mo_list_arg = str(getattr(args, 'mo_list', '')).strip()
+    if mo_list_arg:
+        # User-specified MO list: sum all into one group
+        user_mos = sorted(set(int(x) for x in mo_list_arg.split(',') if x.strip()))
+        mo_groups = [(f'MO[{user_mos[0]}..{user_mos[-1]}]' if len(user_mos) > 1 else f'MO#{user_mos[0]}', user_mos)]
+    else:
+        mo_groups = [('HOMO', homo_cluster), ('LUMO', lumo_cluster)]
     # Only 2 methods: BR-overlap (displaced) and BR-I_τ (FGR, displaced)
     methods = [('BR-overlap', None), ('BR-I_tau', 'tau')]
 
@@ -917,38 +935,52 @@ def run_br_stm_fgr_compare(mol_name, atomPos, enames, args):
                     f'mean={float(arr_3d.mean()):.3e}  {dt*1e3:.1f} ms'
                     + (f'  ({len(cluster)} MOs)' if len(cluster) > 1 else ''))
 
-    # ── Plot: single panel with Fz heights as columns ┐
-    # Use plot_afm_variant_height_strip (same as 03_brstm_vs_stm.png)
-    # Build variants: one per method, each with rows keyed by row_label
+    # ── Plot: one PNG per (method × MO group) ────────────────────────────────
+    # z-reference = h_Fz (probe atom O center, unrelaxed, above molecule plane z=0).
+    # See doc/figures/z_reference_geometry.svg. Fz/dXY/BR-STM at h_Fz.
+    # df extracted at h_df = h_Fz + amp; contrast dominated by closest approach at h_Fz.
     extent = afm_utils.scan_extent(scan_xs, scan_ys)
-    variants = {}
+    pp_stride = int(getattr(args, 'pp_stride', 4))
+    png_paths = []
+    # Group row_labels by MO group label prefix
+    mo_group_labels = [lab for lab, _ in mo_groups]
     for ic, (mtitle, _) in enumerate(methods):
-        variants[mtitle] = {row: maps_by_col[ic][row] for row in row_labels}
-    # row_specs: (key, variant_key, y_label, cmap)
-    row_specs = []
-    for row in row_labels:
-        row_specs.append((row, 'BR-overlap', row, 'viridis'))
-        row_specs.append((row, 'BR-I_tau', row, 'viridis'))
-    # Actually plot_afm_variant_height_strip expects (field, variant_key, label, cmap)
-    # where field is the key into the variant dict. We need a different layout:
-    # 2 columns (methods) × N rows (MO×tip). Use the same function as 03_brstm_vs_stm.
-    # Build a combined variant dict: each method is a variant, each row is a field.
-    # But the function plots (field, variant) → so we need field=row_label, variant=method.
-    # Rebuild: variants_by_method[method][row] = arr_3d
-    # row_specs: for each row, two entries (one per method column)
-    row_specs_flat = []
-    for row in row_labels:
-        row_specs_flat.append((row, 'BR-overlap', row, 'viridis'))
-        row_specs_flat.append((row, 'BR-I_tau', row, 'viridis'))
-    png = os.path.join(out_dir, f'br_fgr_compare_{mol_name}.png')
-    afm_utils.plot_afm_variant_height_strip(
-        variants, row_specs_flat, h_Fz, png, scale='per_image',
-        title=(f'{mol_name}  BR-STM: overlap vs FGR I_τ  @ Fz heights  '
-               f'|dxy|_max={float(dxy_Fz.max()):.2f}Å  DFTB {basis_key}  EH K={K}  tip={tip_mode}'),
-        dpi=140, apos=atomPos, show_atoms=True,
-        extent=extent, amp=None, amp_align=False, figsize_row=1.4,
+        for glabel, _ in mo_groups:
+            # Rows for this MO group only: match by row label prefix
+            group_rows = [r for r in row_labels if any(r.startswith(gl) for gl in [glabel])]
+            if not group_rows:
+                continue
+            variants = {
+                'afm': {'df': df_disp, 'Fz': Fz_disp, 'dxy': dxy_Fz},
+                mtitle: {row: maps_by_col[ic][row] for row in group_rows},
+            }
+            row_specs = [
+                ('df', 'afm', f'df\namp={amp:.1f}', 'gray'),
+                ('Fz', 'afm', 'Fz', 'seismic'),
+                ('dxy', 'afm', '|dxy|', 'magma'),
+            ] + [(row, mtitle, row, 'viridis') for row in group_rows]
+            png = os.path.join(out_dir, f'br_{mtitle}_{glabel}_{mol_name}.png')
+            afm_utils.plot_afm_variant_height_strip(
+                variants, row_specs, h_Fz, png, scale='per_image',
+                title=(f'{mol_name}  {mtitle}  {glabel}  z = h_Fz (O center)  '
+                       f'df: Giessibl amp={amp:.1f}  '
+                       f'|dxy|_max={float(dxy_Fz.max()):.2f}Å  DFTB {basis_key}  '
+                       f'EH K={K}  tip={tip_mode}'),
+                dpi=140, apos=atomPos, show_atoms=True,
+                extent=extent, amp=None, amp_align=False, figsize_row=1.4,
+            )
+            png_paths.append(png)
+            lines.append(f'REVIEW: {png}')
+    # PP dots PNG (shared, one per molecule)
+    png_dots = os.path.join(out_dir, f'pp_dots_{mol_name}.png')
+    afm_utils.plot_pp_distortion_strip(
+        tip_disp_Fz, scan_xs, scan_ys, h_Fz, png_dots,
+        bg=dxy_Fz, bg_cmap='magma', stride=pp_stride, color='lime',
+        title=f'{mol_name}  PP xy dots  z = h_Fz  |dxy|_max={float(dxy_Fz.max()):.2f}Å',
+        apos=atomPos, show_atoms=True, dpi=140, colorbar=False,
     )
-    lines.append(f'REVIEW: {png}')
+    png_paths.append(png_dots)
+    lines.append(f'REVIEW: {png_dots}')
 
     # Save npz
     np.savez(os.path.join(out_dir, 'br_fgr_compare.npz'),
@@ -963,7 +995,7 @@ def run_br_stm_fgr_compare(mol_name, atomPos, enames, args):
     open(summary, 'w').write('\n'.join(lines) + '\n')
     lines.append(f'REVIEW: {summary}')
     print('\n'.join(lines))
-    return {'homo': homo, 'lumo': lumo, 'png': png, 'summary': summary}
+    return {'homo': homo, 'lumo': lumo, 'pngs': png_paths, 'summary': summary}
 
 
 def add_fgr_args(p: argparse.ArgumentParser) -> None:

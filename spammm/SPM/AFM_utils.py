@@ -599,7 +599,7 @@ def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
             if ext is not None and rot90_long:
                 ext = (ext[2], ext[3], ext[0], ext[1])
             im = ax.imshow(view, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax, aspect='equal',
-                           extent=ext, interpolation='nearest')
+                           extent=ext, interpolation='bilinear')
             ax.set_box_aspect(disp_h / max(disp_w, 1))  # no letterbox gaps
             ax.set_xticks([]); ax.set_yticks([])
             for _sp in ax.spines.values():
@@ -644,10 +644,13 @@ def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
 def afm_df_height_stacks(h_min, h_max, h_step, amp=1.0, amp_align=True):
     """SSOT AFM height ladders (skill:`afm-plotting` / CLI afm).
 
+    z-reference = h_Fz = probe atom (O) center position above molecule plane (z=0).
+    See doc/figures/z_reference_geometry.svg. Contact at h_Fz = R_O + R_C ≈ 3.56 Å.
+
     Returns:
-        h_df:   df / STM / BR-STM display probe heights (column labels)
-        h_Fz:   Fz display heights (= h_df − amp if amp_align else h_df)
-        h_scan: dense PP scan covering [h_df±amp] for compute_df_amp
+        h_df:   oscillation center heights = h_Fz + amp (df is extracted here)
+        h_Fz:   probe atom (O) center heights = physical z (Fz/dXY/BR-STM here)
+        h_scan: dense PP scan covering [h_df−amp, h_df+amp] for compute_df_amp
     """
     def _h_stack(h0, h1, dz):
         n = int(round((float(h1) - float(h0)) / float(dz))) + 1
@@ -3568,44 +3571,43 @@ def run_fukui_one(mol, xyz_rel, outdir_root, *,
         variants[key] = r
         lines.append(f'[{key}] A={A:.3f} β={beta:.4f}  df=[{r["df"].min():.3e},{r["df"].max():.3e}]')
 
-    heights = variants['stock']['heights']
+    heights = variants['stock']['heights']           # h_df (oscillation center)
+    heights_Fz = variants['stock']['heights_Fz']     # h_Fz (O center, physical z)
     row_specs = []
     if has_cube:
-        row_specs.append(('df', 'cube', f'df  DFT cube\nA={A:.1f} β={beta:.2f}', df_cmap))
+        row_specs.append(('df', 'cube', f'df  DFT cube\nA={A:.1f} β={beta:.2f}\namp={amp:.1f}', df_cmap))
     row_specs += [
-        ('df', 'prolonged', f'df  prolonged\nA={A:.1f} β={beta:.2f}', df_cmap),
-        ('df', 'stock', f'df  stock 3ob\nA={A:.1f} β={beta:.2f}', df_cmap),
+        ('df', 'prolonged', f'df  prolonged\nA={A:.1f} β={beta:.2f}\namp={amp:.1f}', df_cmap),
+        ('df', 'stock', f'df  stock 3ob\nA={A:.1f} β={beta:.2f}\namp={amp:.1f}', df_cmap),
     ]
     if has_cube:
-        fz_c = f'Fz  DFT cube\n@h−{amp:.1f}Å' if amp_align else 'Fz  DFT cube'
-        row_specs.append(('Fz', 'cube', fz_c, cmap))
+        row_specs.append(('Fz', 'cube', 'Fz  DFT cube', cmap))
     for k, lab in (('prolonged', 'prolonged'), ('stock', 'stock 3ob')):
-        fz_lab = f'Fz  {lab}\n@h−{amp:.1f}Å' if amp_align else f'Fz  {lab}'
-        row_specs.append(('Fz', k, fz_lab, cmap))
+        row_specs.append(('Fz', k, f'Fz  {lab}', cmap))
 
     title = (f'{mol} FDBM {tip_mode} tip | '
              + ('DFT cube → ' if has_cube else '(no cube) ')
              + f'prolonged → stock 3ob\n'
-             f'DUAL BASIS: prolonged ρ → Pauli only; ES = stock Δρ'
+             f'DUAL BASIS: prolonged ρ → Pauli only; ES = stock Δρ  |  z = h_Fz (O center)'
              + ('  |  PBE/def2-SVP cubes' if has_cube else '  |  DFTB-only'))
     cmp_name = 'compare_cube_stock_prolonged.png' if has_cube else 'compare_stock_prolonged.png'
     cmp = os.path.join(outdir, cmp_name)
     plot_afm_variant_height_strip(
-        variants, row_specs, heights, cmp, scale='per_image', title=title,
-        dpi=140, amp=amp, amp_align=amp_align, long_axis_vertical=True, tight=True)
+        variants, row_specs, heights_Fz, cmp, scale='per_image', title=title,
+        dpi=140, amp=None, amp_align=False, long_axis_vertical=True, tight=True)
     lines.append(f'REVIEW: {cmp}')
     per_dir = os.path.join(outdir, 'per_column_Fz')
     os.makedirs(per_dir, exist_ok=True)
     cmp_pi = os.path.join(per_dir, cmp_name)
     plot_afm_variant_height_strip(
-        variants, row_specs, heights, cmp_pi, scale='per_column', title=title + ' [Fz per_column]',
-        dpi=140, amp=amp, amp_align=amp_align, long_axis_vertical=True, tight=True)
+        variants, row_specs, heights_Fz, cmp_pi, scale='per_column', title=title + ' [Fz per_column]',
+        dpi=140, amp=None, amp_align=False, long_axis_vertical=True, tight=True)
     lines.append(f'REVIEW: {cmp_pi}')
     lines.append(f'height SSOT: df=[{float(heights[0]):.2f},{float(heights[-1]):.2f}] dz={h_step} '
                  f'amp={amp} amp_align={amp_align}')
 
     save_kw = dict(
-        heights=heights,
+        heights=heights, heights_Fz=heights_Fz, amp=float(amp),
         df_stock=variants['stock']['df'], Fz_stock=variants['stock']['Fz'],
         df_prolonged=variants['prolonged']['df'], Fz_prolonged=variants['prolonged']['Fz'],
         A_stock=A, beta_stock=beta, A_prolonged=A, beta_prolonged=beta,
@@ -3657,6 +3659,7 @@ def replot_fukui_per_image(panel_dir, molecules=None, cmap='seismic', df_cmap='g
             continue
         d = np.load(npz)
         heights = d['heights']
+        heights_Fz = d['heights_Fz'] if 'heights_Fz' in d else heights - float(d['amp']) if 'amp' in d else heights
         variants = {
             'cube': {'df': d['df_cube'], 'Fz': d['Fz_cube']},
             'stock': {'df': d['df_stock'], 'Fz': d['Fz_stock']},
@@ -3665,27 +3668,28 @@ def replot_fukui_per_image(panel_dir, molecules=None, cmap='seismic', df_cmap='g
         A_c, b_c = float(d['A_cube']), float(d['beta_cube'])
         A_s, b_s = float(d['A_stock']), float(d['beta_stock'])
         A_p, b_p = float(d['A_prolonged']), float(d['beta_prolonged'])
+        amp_val = float(d['amp']) if 'amp' in d else 1.0
         row_specs = [
-            ('df', 'cube', f'df  DFT cube\nA={A_c:.1f} β={b_c:.2f}', df_cmap),
-            ('df', 'prolonged', f'df  prolonged\nA={A_p:.1f} β={b_p:.2f}', df_cmap),
-            ('df', 'stock', f'df  stock 3ob\nA={A_s:.1f} β={b_s:.2f}', df_cmap),
+            ('df', 'cube', f'df  DFT cube\nA={A_c:.1f} β={b_c:.2f}\namp={amp_val:.1f}', df_cmap),
+            ('df', 'prolonged', f'df  prolonged\nA={A_p:.1f} β={b_p:.2f}\namp={amp_val:.1f}', df_cmap),
+            ('df', 'stock', f'df  stock 3ob\nA={A_s:.1f} β={b_s:.2f}\namp={amp_val:.1f}', df_cmap),
             ('Fz', 'cube', 'Fz  DFT cube', cmap),
             ('Fz', 'prolonged', 'Fz  prolonged', cmap),
             ('Fz', 'stock', 'Fz  stock 3ob', cmap),
         ]
-        title = f'{mol} FDBM CO tip | DFT cube → prolonged → stock'
+        title = f'{mol} FDBM CO tip | DFT cube → prolonged → stock  |  z = h_Fz (O center)'
         out_main = os.path.join(panel_dir, mol, 'compare_cube_stock_prolonged.png')
         plot_afm_variant_height_strip(
-            variants, row_specs, heights, out_main, scale='per_image', title=title, dpi=140,
-            long_axis_vertical=True, tight=True, amp=1.0, amp_align=True)
+            variants, row_specs, heights_Fz, out_main, scale='per_image', title=title, dpi=140,
+            long_axis_vertical=True, tight=True, amp=None, amp_align=False)
         lines.append(f'REVIEW: {out_main}')
         per_dir = os.path.join(panel_dir, mol, 'per_column_Fz')
         os.makedirs(per_dir, exist_ok=True)
         out_col = os.path.join(per_dir, 'compare_cube_stock_prolonged.png')
         plot_afm_variant_height_strip(
-            variants, row_specs, heights, out_col, scale='per_column',
+            variants, row_specs, heights_Fz, out_col, scale='per_column',
             title=f'{title} [Fz per_column]', dpi=140,
-            long_axis_vertical=True, tight=True, amp=1.0, amp_align=True)
+            long_axis_vertical=True, tight=True, amp=None, amp_align=False)
         lines.append(f'REVIEW: {out_col}')
     sum_path = os.path.join(panel_dir, 'SUMMARY_replot.out')
     open(sum_path, 'w').write('\n'.join(lines) + '\n')
@@ -4883,21 +4887,22 @@ def run_br_stm_afm_panel(atomPos, enames, outdir, *,
 
     # ═══════════════ Stage 2: df + Fz + |dxy| ═════════════════════════════════
     print("\n[BR-STM] === Stage 2: AFM df / Fz / tip |dxy| ===")
-    variants_afm = {'pipe': {'df': df, 'Fz': Fz, 'dxy': dxy_Fz}}  # |dxy| amp-aligned with Fz
-    fz_ylab = f'Fz\n@h−{amp_f:.1f}Å' if amp_align else 'Fz'
-    dxy_ylab = f'|dxy|\n@h−{amp_f:.1f}Å' if amp_align else '|dxy|'
+    # z-reference = h_Fz (probe atom O center, unrelaxed). See doc/figures/z_reference_geometry.svg
+    # df extracted at h_df = h_Fz + amp; contrast dominated by closest approach at h_Fz.
+    variants_afm = {'pipe': {'df': df, 'Fz': Fz, 'dxy': dxy_Fz}}
     row_specs_afm = [
-        ('df', 'pipe', f'df\n({projection})', df_cmap),
-        ('Fz', 'pipe', fz_ylab, fz_cmap),
-        ('dxy', 'pipe', dxy_ylab, 'magma'),
+        ('df', 'pipe', f'df\n({projection})\namp={amp_f:.1f}', df_cmap),
+        ('Fz', 'pipe', 'Fz', fz_cmap),
+        ('dxy', 'pipe', '|dxy|', 'magma'),
     ]
     png_afm = os.path.join(outdir, '02_afm_df_tipdisp.png')
     plot_afm_variant_height_strip(
-        variants_afm, row_specs_afm, h_df, png_afm,         scale=scale if scale in ('per_image', 'per_column', 'common') else 'per_image',
+        variants_afm, row_specs_afm, h_Fz, png_afm,
+        scale=scale if scale in ('per_image', 'per_column', 'common') else 'per_image',
         title=(f'Stage 2 — AFM  tip={tip_mode} K_LAT={K_LAT_Nm:.2f} N/m L={bond_length:.1f}Å  '
-               f'columns=df h; Fz & |dxy| morph. at h−amp when amp_align'),
+               f'z = h_Fz (O center); df: Giessibl amp={amp_f:.1f} (closest approach = h_Fz)'),
         dpi=140, apos=atomPos if show_atoms else None, show_atoms=show_atoms,
-        extent=extent, amp=amp_f, amp_align=bool(amp_align), figsize_row=1.3,
+        extent=extent, amp=None, amp_align=False, figsize_row=1.3,
         long_axis_vertical=True, tight=True,
     )
     # also full tip_disp gallery at Fz heights (where bending is large)
@@ -5206,6 +5211,7 @@ def project_mo_xy_slice(projector, coeffs, norb_per_atom, orb_offsets, atoms_dic
 STM_TIP_ORBITALS = {
     's':  np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
     'pz': np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32),
+    'px': np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
     'py': np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
 }
 

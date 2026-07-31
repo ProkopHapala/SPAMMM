@@ -780,6 +780,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_brfgr.add_argument('--bond-length', type=float, default=3.0, dest='bond_length')
     p_brfgr.add_argument('--tip-mode', default='co', choices=['co', 'gaussian'], dest='tip_mode')
     p_brfgr.add_argument('--projection', default='prolonged', choices=['stock', 'prolonged'])
+    p_brfgr.add_argument('--pp-stride', type=int, default=4, dest='pp_stride',
+                         help='PP xy dots: plot every Nth pixel')
+    p_brfgr.add_argument('--mo-list', default='', dest='mo_list',
+                         help='Comma-separated MO indices to sum (e.g. "68,69"). Default: HOMO+LUMO separately')
     p_brfgr.add_argument('--force', action='store_true')
     p_brfgr.set_defaults(func=cmd_stm_br_fgr)
 
@@ -821,7 +825,7 @@ def build_parser() -> argparse.ArgumentParser:
     # FGR transfer STM mode (Stage 3): 'overlap' (legacy) or 'fgr' (H−E·S kernel)
     p_br.add_argument('--stm-mode', default='overlap', choices=['overlap', 'fgr'], dest='stm_mode',
                       help="Stage 3 STM kernel: 'overlap' (legacy exp) or 'fgr' (H−E·S transfer)")
-    p_br.add_argument('--tip-orbital', default='s', choices=['s', 'pz', 'py'], dest='tip_orbital',
+    p_br.add_argument('--tip-orbital', default='s', choices=['s', 'pz', 'px', 'py'], dest='tip_orbital',
                       help='FGR tip orbital (only used when --stm-mode=fgr)')
     p_br.add_argument('--tip-elem', default='C', dest='tip_elem',
                       help='FGR phantom tip atom element (only used when --stm-mode=fgr)')
