@@ -4,9 +4,9 @@
 Uses the same editor tools as a user: Ring/Atom/Select modes, Auto H, element combo,
 backend ring ops, Ctrl-C/V, translate_selected / rotate_selected.
 
-  ./run_gui.sh --script spammm/GUI/gui_scripts/azaindol_draw_demo.py
-  ./run_gui.sh --script spammm/GUI/gui_scripts/azaindol_draw_demo.py -- --gif-ms 500
-  ./run_gui.sh --script spammm/GUI/gui_scripts/azaindol_draw_demo.py -- --canvas-only
+  ./run_gui.sh --script demos/gui_scripts/azaindol_draw_demo.py
+  ./run_gui.sh --script demos/gui_scripts/azaindol_draw_demo.py -- --gif-ms 500
+  ./run_gui.sh --script demos/gui_scripts/azaindol_draw_demo.py -- --canvas-only
 """
 import argparse
 import os
@@ -158,5 +158,5 @@ def run(window, argv=None):
 
 
 if __name__ == '__main__':
-    print('Use: ./run_gui.sh --script spammm/GUI/gui_scripts/azaindol_draw_demo.py', file=sys.stderr)
+    print('Use: ./run_gui.sh --script demos/gui_scripts/azaindol_draw_demo.py', file=sys.stderr)
     raise SystemExit(1)

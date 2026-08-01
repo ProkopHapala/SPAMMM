@@ -39,8 +39,8 @@ Motivation: systematic GUI debugging, reproducible presentation of how rings/N-s
 | Shared sequence SSOT | `spammm/GUI/azaindol_draw_sequence.py` | **active** | `run_azaindol_draw`, `render_editor_svg`, geometry helpers |
 | GUI helpers | `spammm/GUI/gui_script_utils.py` | **active** | `apply_demo_overlays`, `capture_canvas_png`, `capture_window_png`, `frames_to_gif` |
 | Script runner | `spammm/GUI/gui_script_runner.py` | **active** | loads `run(window, argv)` after `show()` |
-| Offline entry | `spammm/GUI/gui_scripts/azaindol_draw_offline.py` | **active** | no Qt |
-| GUI entry | `spammm/GUI/gui_scripts/azaindol_draw_demo.py` | **active** | widget-parity + GIF |
+| Offline entry | `demos/gui_scripts/azaindol_draw_offline.py` | **active** | no Qt |
+| GUI entry | `demos/gui_scripts/azaindol_draw_demo.py` | **active** | widget-parity + GIF |
 | Editor backend | `spammm/topology/MoleculeEditorBackend.py` | **active** | ops both hosts call |
 | VisPy scene | `spammm/GUI/VispyUtils.py` | **active** | `fit_to_atoms`, selection δ/φ, `ring_preview_line` |
 | Mode handlers | `spammm/GUI/EditModeHandlers.py` | **active** | Ring foreshadow / hover semantics mirrored by overlays |
@@ -50,7 +50,7 @@ Motivation: systematic GUI debugging, reproducible presentation of how rings/N-s
 ### Offline SVG sequence
 
 ```bash
-PYTHONPATH=. python spammm/GUI/gui_scripts/azaindol_draw_offline.py
+PYTHONPATH=. python demos/gui_scripts/azaindol_draw_offline.py
 # optional: --relax  (DFTB after H caps)  --out DIR  --save-xyz PATH
 ```
 
@@ -59,9 +59,9 @@ Artifacts: `debug/azaindol_draw_offline/{00_empty,…,09_done}.svg` (+ `.png` si
 ### GUI demo → GIF
 
 ```bash
-./run_gui.sh --script spammm/GUI/gui_scripts/azaindol_draw_demo.py
-./run_gui.sh --script spammm/GUI/gui_scripts/azaindol_draw_demo.py -- --zoom-out 2 --gif-ms 550
-./run_gui.sh --script spammm/GUI/gui_scripts/azaindol_draw_demo.py -- --canvas-only   # VisPy only
+./run_gui.sh --script demos/gui_scripts/azaindol_draw_demo.py
+./run_gui.sh --script demos/gui_scripts/azaindol_draw_demo.py -- --zoom-out 2 --gif-ms 550
+./run_gui.sh --script demos/gui_scripts/azaindol_draw_demo.py -- --canvas-only   # VisPy only
 ```
 
 Artifacts: `debug/azaindol_draw_demo/*.png`, `azaindol_draw_demo.gif`, `azaindol_dimer_drawn.xyz`.
@@ -74,7 +74,7 @@ from PyQt5 import QtWidgets
 from spammm.GUI.SPAMMM_GUI import SPAMMMWindow
 from spammm.GUI.gui_script_runner import run_gui_script
 app = QtWidgets.QApplication([]); w = SPAMMMWindow(); w.resize(1280,900); w.show()
-run_gui_script(w, 'spammm/GUI/gui_scripts/azaindol_draw_demo.py', ['--gif-ms','500'])
+run_gui_script(w, 'demos/gui_scripts/azaindol_draw_demo.py', ['--gif-ms','500'])
 "
 ```
 
@@ -122,7 +122,7 @@ Dimer pose: 180° about selection COM + COM shift from reference `azaindol_dimer
 - Index: [topical_audit.md §1f–1g](../topical_audit.md)
 - Cheatsheet (modes / δφ): [GUI_CHEATSHEET.md](../GUI_CHEATSHEET.md)
 - Script launcher notes: [Takeways.md](../Takeways.md)
-- Folder indexes: [spammm/GUI/README.md](../../spammm/GUI/README.md), [gui_scripts/README.md](../../spammm/GUI/gui_scripts/README.md)
+- Folder indexes: [spammm/GUI/README.md](../../spammm/GUI/README.md), [gui_scripts/README.md](../../demos/gui_scripts/README.md)
 - Sibling pattern: [ReactionCoordinateScan.md](ReactionCoordinateScan.md)
 - Editor ring ops: [ARCHITECTURE_ROADMAP.md](../ARCHITECTURE_ROADMAP.md) (N-gon placement)
 - FireCore analogue (not ported): `ScriptRunner.js` whitelist commands — SPAMMM uses Python hosts instead

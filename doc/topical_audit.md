@@ -85,7 +85,7 @@ This **is** a supplement to:
 - Multi-H-bond control grids, `ScanDataset` trajectories, DFTB relax at endpoints, Mulliken charges, ESP animation
 - **Key files:** `spammm/quantum/coordinate_scan.py`, `spammm/topology/scan_dataset.py`, `spammm/topology/hbond_utils.py`, `spammm/quantum/esp_grid.py`, `spammm/GUI/ReactionCoordinateExtension.py`, `spammm/GUI/rc_esp_view.py`, `spammm/GUI/mpl_blit.py`
 - **DFTB:** `run_dftb_relax`, `run_dftb_sp(return_charges=True)`, `parse_mulliken_charges`, `clean_dftb_workdir`
-- **GUI scripts:** `spammm/GUI/gui_scripts/rc_scan_review.py`, `rc_scan_offline.py`; launcher `./run_gui.sh --script …`
+- **GUI scripts:** `demos/gui_scripts/rc_scan_review.py`, `rc_scan_offline.py`; launcher `./run_gui.sh --script …`
 - **Audit document:** [Topics/ReactionCoordinateScan.md](Topics/ReactionCoordinateScan.md)
 - **Tests:** `tests/topology/test_scan_dataset.py`, `tests/GUI/test_rc_scan_gui_script.py`
 - **Artifacts:** `debug/rc_scan/`, `debug/testplot_rc_scan_gui/*.npz`, `debug/rc_scan_offline/`
@@ -186,7 +186,7 @@ Interactive rigid-body dynamics of a small molecule on a periodic substrate usin
 |----------|--------|-------|
 | `spammm/surfaces/FoldedRigid.py` | active | `setup_rigid_folded`, `relax_folded`, `fit_folded_for_molecule`, `RigidBodyDynamics` setup |
 | `spammm/GUI/FoldedRigidExtension.py` | active | Extension panel, edit modes (`fr_pin`, `fr_com`, `fr_manip`), continuous timer, drag atom picking |
-| `spammm/GUI/gui_scripts/folded_rigid_setup.py` | active | One-command setup script (`--run`, `--manip`, `--fit`, `--mol`) |
+| `demos/gui_scripts/folded_rigid_setup.py` | active | One-command setup script (`--run`, `--manip`, `--fit`, `--mol`) |
 | `spammm/forcefields/SPFF_cl.py` | active | `fit_folded_surface_basis` with `coulomb_solver='ewald2d'` |
 | `spammm/forcefields/RigidBodyDynamics.py` | active | OpenCL rigid-body state, `run_folded`, `update_anchors` |
 | `tests/testplot_ptcda_nacl_replicas.py` | experimental | 256×256 pinned-PTCDA imaging; staged damped Newton, FIRE comparison, constraint-reaction maps |
@@ -209,9 +209,9 @@ Interactive rigid-body dynamics of a small molecule on a periodic substrate usin
 
 **GUI scripts:**
 ```bash
-./run_gui.sh --script spammm/GUI/gui_scripts/folded_rigid_setup.py -- --mol data/xyz/H2O.xyz --fit data/fits/h2o_nacl.npz --run
-./run_gui.sh --script spammm/GUI/gui_scripts/folded_rigid_setup.py -- --mol data/xyz/H2O.xyz --fit data/fits/h2o_nacl.npz --manip
-./run_gui.sh --script spammm/GUI/gui_scripts/ptcda_interactive_drag.py
+./run_gui.sh --script demos/gui_scripts/folded_rigid_setup.py -- --mol data/xyz/H2O.xyz --fit data/fits/h2o_nacl.npz --run
+./run_gui.sh --script demos/gui_scripts/folded_rigid_setup.py -- --mol data/xyz/H2O.xyz --fit data/fits/h2o_nacl.npz --manip
+./run_gui.sh --script demos/gui_scripts/ptcda_interactive_drag.py
 ```
 
 **Tests:** `tests/surfaces/test_folded_relax.py` (smoke), manual `Run`/`drag` L2 review.
@@ -310,10 +310,11 @@ L0: `tests/SPM/test_afm_contact_surface.py`. L2: `tests/testplot_contact_surface
 - **Extensions:** `KekuleExtension.py`, `AFMExtension.py`, `FFExtension.py`, `QEqExtension.py`, `VibrationExtension.py`, `RigidAssemblyExtension.py`, `FoldedRigidExtension.py`
 - **Substrate visualization (FAF potential map):** `VispyUtils.update_faf_map_overlay` — shared function reusing `RigidBodyVispy.potential_to_rgba` (display SSOT, vmax=|Emin|) + `FoldedRigid.eval_folded_potential_grid`. Used by `FoldedRigidExtension`, `RigidAssemblyExtension`, and `ptcda_drag_demo.py`. Same visualization as `demos/demo_pairff.py`.
 - **Anchor visualization (drag spring):** `RigidAssemblyExtension._update_anchor_visuals` — red line (atom→target) + red cross marker (at target). Wired into `RAManipMode.on_press/on_move/on_release` for interactive + script dragging.
-- **GUI scripting:** `gui_script_runner.py` + `gui_script_utils.py` (GSU). Scripts call the same functions as GUI buttons. See [GUI_Scripting_DemoRunner.md](Tasks/GUI_Scripting_DemoRunner.md).
+- **GUI scripting:** `gui_script_runner.py` + `gui_script_utils.py` (GSU). Scripts call the same functions as GUI buttons. Scripts centralized in `demos/gui_scripts/` (auto-discovered by Scripts → Bundled menu). See [GUI_Scripting_DemoRunner.md](Tasks/GUI_Scripting_DemoRunner.md), [GUI_Scripts_Consolidation_2026-08-01.md](Reports/GUI_Scripts_Consolidation_2026-08-01.md).
+- **Animation export:** `frames_to_gif` (PIL) + `frames_to_video` (ffmpeg H.264 `-tune animation`, 11x smaller than GIF). Supports MP4/WebM/AV1.
 - **Design docs:** [GUI.desing.md](GUI.desing.md), [GUI_FF_Relaxation.md](GUI_FF_Relaxation.md), [GUI_topology_edit.desing.md](GUI_topology_edit.desing.md)
 - **Audit Document:** [molecular_topology_editors.md](molecular_topology_editors.md), [gui_audit.md](gui_audit.md)
-- **Reports:** [PTCDA_DragDemo_StickSlip_2026-08-01.md](Reports/PTCDA_DragDemo_StickSlip_2026-08-01.md) — drag demo with FAF substrate, anchor lines, trajectory visualization
+- **Reports:** [PTCDA_DragDemo_StickSlip_2026-08-01.md](Reports/PTCDA_DragDemo_StickSlip_2026-08-01.md) — drag demo with FAF substrate, anchor lines, trajectory visualization; [GUI_Scripts_Consolidation_2026-08-01.md](Reports/GUI_Scripts_Consolidation_2026-08-01.md) — scripts centralized to `demos/gui_scripts/` + MP4 export
 
 ---
 

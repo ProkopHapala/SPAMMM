@@ -2,13 +2,13 @@
 """GUI control script: symmetric dual-H RC scan with DFTB-relaxed isomers.
 
   # Full relaxed path (DFTB opt both isomers, interpolate all atoms — bond lengths change):
-  ./run_gui.sh --script spammm/GUI/gui_scripts/rc_scan_review.py
+  ./run_gui.sh --script demos/gui_scripts/rc_scan_review.py
 
   # Fast replay from cached relaxed npz (after one full run above):
-  ./run_gui.sh --script spammm/GUI/gui_scripts/rc_scan_review.py -- --preview
+  ./run_gui.sh --script demos/gui_scripts/rc_scan_review.py -- --preview
 
   # Force rigid H-only morph (no cache, no C-C changes):
-  ./run_gui.sh --script spammm/GUI/gui_scripts/rc_scan_review.py -- --preview --no-cache
+  ./run_gui.sh --script demos/gui_scripts/rc_scan_review.py -- --preview --no-cache
 """
 import argparse
 
@@ -50,5 +50,5 @@ def run(window, argv=None):
 
 
 if __name__ == '__main__':
-    print("Use: ./run_gui.sh --script spammm/GUI/gui_scripts/rc_scan_review.py", file=__import__('sys').stderr)
+    print("Use: ./run_gui.sh --script demos/gui_scripts/rc_scan_review.py", file=__import__('sys').stderr)
     raise SystemExit(1)

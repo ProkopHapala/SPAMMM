@@ -1,10 +1,10 @@
 ---
 type: Task
 title: GUI scripting & demo runner — conference demo of full SPAMMM workflow (build → greedy assembly → AFM/BR-STM/PME)
-status: design proposed — awaiting USER approval before implementation
+status: delivered — scripts centralized to demos/gui_scripts/, both conference demos work (2026-08-01)
 tags: [gui, scripting, demo, conference, pacing, menu, automation, presentation]
 timestamp: 2026-08-01
-related: [GUI_DrawDemo_Scripts.md, GUI_TightLayout.md, Consolidate_GUI_CLI_Backend_Input_Protocol.md]
+related: [GUI_DrawDemo_Scripts.md, GUI_TightLayout.md, Consolidate_GUI_CLI_Backend_Input_Protocol.md, GUI_Scripts_Consolidation_2026-08-01.md]
 skills: [code-reuse, doc-read-navigate]
 ---
 
@@ -50,7 +50,7 @@ propose an efficient, general, elegant (simple), and unlimited solution.
 Args after `--` are forwarded to the script. **Terminal-arg execution already works:**
 
 ```
-./run_gui.sh --script spammm/GUI/gui_scripts/NAME.py -- --opt val
+./run_gui.sh --script demos/gui_scripts/NAME.py -- --opt val
 ```
 
 ### 2.2 Widget-helper library (DONE, ~305 lines)
@@ -73,7 +73,7 @@ Args after `--` are forwarded to the script. **Terminal-arg execution already wo
 
 ### 2.3 Existing scripts (5, all use the `run(window, argv)` contract)
 
-`spammm/GUI/gui_scripts/`:
+`demos/gui_scripts/`:
 
 - `azaindol_draw_demo.py` — **closest precedent**: full draw workflow → PNG frames →
   GIF via a `GuiHost` that wraps `window`.
@@ -332,10 +332,10 @@ CLI options belong before `--`; arguments after `--` remain untouched script arg
 
 ```bash
 # Fast defaults
-./run_gui.sh --script spammm/GUI/gui_scripts/conference_demo.py -- --n-step 200
+./run_gui.sh --script demos/gui_scripts/conference_demo.py -- --n-step 200
 
 # Paced, five MC steps per visual frame, explicit barriers enabled
-./run_gui.sh --script spammm/GUI/gui_scripts/conference_demo.py \
+./run_gui.sh --script demos/gui_scripts/conference_demo.py \
   --script-delay-ms 300 --script-points-per-frame 5 --script-barriers \
   -- --n-step 200
 ```
@@ -520,7 +520,7 @@ settings. `F8` is currently conflict-free and should be registered through
 `ShortcutRegistry` under group `Script Runner`, invoking the same Continue method as the
 panel and menu. Do not add a second shortcut dispatch path.
 
-Bundled discovery scans `spammm/GUI/gui_scripts/` on refresh:
+Bundled discovery scans `demos/gui_scripts/` on refresh:
 
 - sorted `*.py`, excluding `_*.py`, `__pycache__`, and `*_offline.py`,
 - display name = humanized filename stem,
@@ -715,6 +715,6 @@ Use existing GUI test infrastructure; no GPU/DFTB is needed for runner tests.
 
 - Topical SSOT: `doc/Topics/GUI_DrawDemo_Scripts.md` (azaindol draw demo architecture)
 - Script launcher notes: `doc/Topics/Takeways.md`
-- `spammm/GUI/gui_scripts/README.md` — adding-a-script guide
+- `demos/gui_scripts/README.md` — adding-a-script guide
 - `spammm/GUI/FFExtension.py:414` — `QTimer` interactive-relaxation precedent
 - `spammm/GUI/azaindol_draw_sequence.py` — shared sequence SSOT (offline + GUI hosts)

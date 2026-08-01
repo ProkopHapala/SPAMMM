@@ -146,7 +146,7 @@ After `_on_build` creates new geometry, the existing `_afm_pipeline` (if any) is
 
 | File | Key Functions | Role |
 |------|--------------|------|
-| `spammm/GUI/gui_scripts/conference_demo.py` | `run(window, argv, ctx)` | The demo script — orchestrates build → MC → AFM → BR-STM → PME |
+| `demos/gui_scripts/conference_demo.py` | `run(window, argv, ctx)` | The demo script — orchestrates build → MC → AFM → BR-STM → PME |
 | `spammm/GUI/RigidAssemblyExtension.py` | `_on_build` (189), `_sync_display` (167), `_assembly_world_atoms` (88), `_update_graph` (153) | Builds rigid assembly, syncs to AtomicGraph → backend.sys |
 | `spammm/GUI/AFMExtension.py` | `_get_afm_geometry` (83), `_ensure_pipeline` (370), `run_afm_stage1` (894), `run_afm_stage2` (914), `run_afm_stage3` (937), `run_afm_stage4` (964), `run_br_stm`, `plot_afm_slice` (1110), `AFMDirtyFlags` (32), `init_afm` (1385) | AFM pipeline orchestration, reads geometry from backend.sys |
 | `spammm/SPM/ModularPipeline.py` | `ModularAFMPipeline.__init__` (69), `_init_geometry_and_grids` (185), `stage2_project` (415), `stage4_relax` (702) | AFM compute pipeline — grid setup, density, relaxation |

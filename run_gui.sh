@@ -11,8 +11,8 @@
 #   ./run_gui.sh --help             # Show all CLI options
 #
 # GUI control script (auto-setup for review):
-#   ./run_gui.sh --script spammm/GUI/gui_scripts/rc_scan_review.py
-#   ./run_gui.sh --script spammm/GUI/gui_scripts/rc_scan_review.py -- --dftb --dx 0.1
+#   ./run_gui.sh --script demos/gui_scripts/rc_scan_review.py
+#   ./run_gui.sh --script demos/gui_scripts/rc_scan_review.py -- --dftb --dx 0.1
 #
 # All saved images (screenshots, plots) default to <repo>/output/
 

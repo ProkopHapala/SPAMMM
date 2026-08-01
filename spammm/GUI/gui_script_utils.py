@@ -1,4 +1,4 @@
-"""gui_script_utils.py — drive SPAMMM_GUI like a user; capture demo PNG/GIF frames.
+"""gui_script_utils.py — drive SPAMMM_GUI like a user; capture demo PNG/GIF/MP4 frames.
 
 Motivation: control scripts must click the same widgets / set the same toggles a
 human would, so scripted setups stay valid when the UI layout changes. Capture
@@ -11,9 +11,12 @@ Design notes:
   ``set_data`` empty on ``ring_preview_line`` (VisPy Line + offscreen render can segfault).
 - **capture_window_png** composites ``canvas.render()`` into the Qt grab — grab alone
   often blanks OpenGL (offscreen / Wayland).
-- **frames_to_gif** — Pillow pack of ordered PNGs.
+- **frames_to_gif** — Pillow pack of ordered PNGs (256-color, large files).
+- **frames_to_video** — ffmpeg H.264 with ``-tune animation`` (best for mostly-static
+  screen content; ~11x smaller than GIF). Pads to even dimensions (H.264 requirement).
+  Also supports VP9 (WebM) and AV1 via ``codec=`` parameter.
 
-Doc: ``doc/Topics/GUI_DrawDemo_Scripts.md``.
+Doc: ``doc/Topics/GUI_DrawDemo_Scripts.md``, ``doc/Reports/GUI_Scripts_Consolidation_2026-08-01.md``.
 """
 import os
 
@@ -303,3 +306,72 @@ def frames_to_gif(frame_paths, out_gif, duration_ms=700):
     for im in imgs:
         im.close()
     return out_gif
+
+
+def frames_to_video(frame_paths, out_video, fps=10, codec='libx264', crf=23, extra_args=None):
+    """Encode ordered PNG frames into a video (MP4/WebM) via ffmpeg.
+
+    Defaults: H.264 with ``-tune animation`` (best for mostly-static screen content
+    with small moving parts — flat colors compress well). CRF 23 = x264 default
+    (good quality, reasonable size). ``-pix_fmt yuv420p`` for universal playback.
+
+    Args:
+        frame_paths: list of PNG file paths (ordered, zero-padded names expected).
+        out_video: output path (``.mp4`` → H.264, ``.webm`` → VP9).
+        fps: frames per second.
+        codec: ffmpeg video codec (``libx264``, ``libvpx-vp9``, ``libaom-av1``).
+        crf: quality (lower=better; 18=visually lossless, 23=default, 28=small).
+        extra_args: list of additional ffmpeg args appended before output.
+
+    Returns the output path. Raises if ffmpeg fails or is not found.
+    """
+    import subprocess
+    if not frame_paths:
+        raise ValueError('frames_to_video: empty frame list')
+    os.makedirs(os.path.dirname(os.path.abspath(out_video)) or '.', exist_ok=True)
+    # Use image2 demuxer with sequential frame pattern (frames must be zero-padded)
+    # Detect pattern from first frame path
+    first = frame_paths[0]
+    n = len(frame_paths)
+    # Build a printf-style pattern: replace the zero-padded number with %0Nd
+    import re
+    m = re.search(r'^(.*?)(\d+)(\.\w+)$', first)
+    if m and len(m.group(2)) >= 2:
+        prefix = m.group(1)
+        pad = len(m.group(2))
+        ext = m.group(3)
+        pattern = f'{prefix}%0{pad}d{ext}'
+    else:
+        # Fallback: write a concat list (no duration — rely on fps)
+        import tempfile
+        fd, list_path = tempfile.mkstemp(suffix='.txt', dir=os.path.dirname(os.path.abspath(out_video)) or '.')
+        with os.fdopen(fd, 'w') as f:
+            for p in frame_paths:
+                f.write(f"file '{os.path.abspath(p)}'\n")
+        cmd_input = ['-f', 'concat', '-safe', '0', '-i', list_path]
+        pattern = None
+    if pattern is not None:
+        cmd_input = ['-framerate', str(fps), '-i', pattern]
+    cmd = ['ffmpeg', '-y'] + cmd_input
+    # Pad to even dimensions (H.264/VP9 require even width/height)
+    cmd += ['-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2']
+    if codec == 'libx264':
+        cmd += ['-c:v', 'libx264', '-tune', 'animation', '-crf', str(crf),
+                '-pix_fmt', 'yuv420p', '-movflags', '+faststart']
+    elif codec == 'libvpx-vp9':
+        cmd += ['-c:v', 'libvpx-vp9', '-crf', str(crf), '-b:v', '0', '-pix_fmt', 'yuv420p']
+    else:
+        cmd += ['-c:v', codec, '-crf', str(crf)]
+    if extra_args:
+        cmd += list(extra_args)
+    cmd.append(out_video)
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise RuntimeError('ffmpeg not found — install it to use frames_to_video')
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f'ffmpeg failed (code {e.returncode}):\n{e.stderr}')
+    finally:
+        if pattern is None:
+            os.unlink(list_path)
+    return out_video

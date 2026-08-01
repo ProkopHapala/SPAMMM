@@ -2,9 +2,9 @@
 """GUI control script: load molecule, fold-rigid setup, optionally run.
 
 Usage:
-    ./run_gui.sh --script spammm/GUI/gui_scripts/folded_rigid_setup.py -- --mol data/xyz/H2O.xyz --fit data/fits/h2o_nacl.npz --run
-    ./run_gui.sh --script spammm/GUI/gui_scripts/folded_rigid_setup.py -- --mol data/xyz/H2O.xyz --fit data/fits/h2o_nacl.npz --manip
-    ./run_gui.sh --script spammm/GUI/gui_scripts/folded_rigid_setup.py -- --mol data/xyz/H2O.xyz --fit-fit
+    ./run_gui.sh --script demos/gui_scripts/folded_rigid_setup.py -- --mol data/xyz/H2O.xyz --fit data/fits/h2o_nacl.npz --run
+    ./run_gui.sh --script demos/gui_scripts/folded_rigid_setup.py -- --mol data/xyz/H2O.xyz --fit data/fits/h2o_nacl.npz --manip
+    ./run_gui.sh --script demos/gui_scripts/folded_rigid_setup.py -- --mol data/xyz/H2O.xyz --fit-fit
 """
 import argparse
 
@@ -58,5 +58,5 @@ def run(window, argv=None):
 
 
 if __name__ == '__main__':
-    print("Use: ./run_gui.sh --script spammm/GUI/gui_scripts/folded_rigid_setup.py", file=sys.stderr)
+    print("Use: ./run_gui.sh --script demos/gui_scripts/folded_rigid_setup.py", file=sys.stderr)
     raise SystemExit(1)

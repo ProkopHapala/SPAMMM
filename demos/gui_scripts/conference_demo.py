@@ -5,10 +5,10 @@ Paced generator script (yields ctx.frame / ctx.barrier). Run fast from CLI or sl
 with visible frames from the Script Runner panel / Scripts menu.
 
   # Fast (defaults)
-  ./run_gui.sh --script spammm/GUI/gui_scripts/conference_demo.py
+  ./run_gui.sh --script demos/gui_scripts/conference_demo.py
 
   # Paced, 5 MC steps per frame, 300 ms delay, honor barriers
-  ./run_gui.sh --script spammm/GUI/gui_scripts/conference_demo.py \
+  ./run_gui.sh --script demos/gui_scripts/conference_demo.py \
     --script-delay-ms 300 --script-points-per-frame 5 --script-barriers
 
 Doc: doc/Tasks/GUI_Scripting_DemoRunner.md
@@ -126,5 +126,5 @@ def run(window, argv=None, ctx=None):
 
 if __name__ == '__main__':
     import sys
-    print('Use: ./run_gui.sh --script spammm/GUI/gui_scripts/conference_demo.py', file=sys.stderr)
+    print('Use: ./run_gui.sh --script demos/gui_scripts/conference_demo.py', file=sys.stderr)
     raise SystemExit(1)

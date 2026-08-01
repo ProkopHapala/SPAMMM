@@ -150,12 +150,12 @@ from the **same** RC slider as the 3D view.
 
 ## GUI control scripts (`./run_gui.sh --script …`)
 
-**Pattern:** `spammm/GUI/gui_scripts/*.py` with `run(window, argv)` — setup after
+**Pattern:** `demos/gui_scripts/*.py` with `run(window, argv)` — setup after
 `window.show()`, argv after `--` (leading `--` stripped in `SPAMMM_GUI.py`).
 
 - **`--preview`**: load cached npz from `debug/testplot_rc_scan_gui/` if present.
 - **Full run**: DFTB + save cache; use for first run or after geometry/scan logic changes.
-- **Offline mirror:** `spammm/GUI/gui_scripts/rc_scan_offline.py` (no Qt), same
+- **Offline mirror:** `demos/gui_scripts/rc_scan_offline.py` (no Qt), same
   `build_ascii_hbond_system` path.
 
 ### Dual-path draw demos (SVG + GIF)
@@ -164,8 +164,8 @@ Shared ops in `spammm/GUI/azaindol_draw_sequence.py`; only `snapshot()` differs.
 
 | Runner | Entry | Artifacts |
 |--------|-------|-----------|
-| Offline SVG | `PYTHONPATH=. python spammm/GUI/gui_scripts/azaindol_draw_offline.py` | `debug/azaindol_draw_offline/*.svg` |
-| GUI GIF | `./run_gui.sh --script spammm/GUI/gui_scripts/azaindol_draw_demo.py` | `debug/azaindol_draw_demo/*.png` + `.gif` |
+| Offline SVG | `PYTHONPATH=. python demos/gui_scripts/azaindol_draw_offline.py` | `debug/azaindol_draw_offline/*.svg` |
+| GUI GIF | `./run_gui.sh --script demos/gui_scripts/azaindol_draw_demo.py` | `debug/azaindol_draw_demo/*.png` + `.gif` |
 
 **Pitfalls:** (1) `capture_window_png` must paste VisPy `canvas.render()` into the Qt grab — grab alone often blanks GL. (2) Never `set_data([])` on `ring_preview_line` then refill — offscreen render can segfault; hide-only. (3) Pick bonds/atoms by geometry, not hardcoded `_id` (global counter). Full write-up: [Topics/GUI_DrawDemo_Scripts.md](Topics/GUI_DrawDemo_Scripts.md).
 
@@ -380,6 +380,32 @@ every frame — the viewport recenters on the molecule as it drifts.
 **Fix:** `capture_canvas_png(..., fit=False)`. One `fit_to_atoms` at the start, then lock.
 
 **Takeaway:** For any multi-frame capture where the molecule moves, use `fit=False`.
+
+---
+
+## MP4 video export — 11x smaller than GIF for screen content
+
+**Symptom:** GIFs of GUI demos are huge (1.5 MB for 11 frames at 682×709).
+
+**Root cause:** GIF is 256-color palette-indexed — no inter-frame compression, no flat-color
+exploitation. Screen-capture-like content (mostly static, small moving parts) is the worst
+case for GIF but the best case for modern video codecs.
+
+**Fix / pattern:**
+- `GSU.frames_to_video(frame_paths, out_mp4, fps=10)` — ffmpeg H.264 with `-tune animation`
+- `-tune animation` is specifically designed for flat colors + small motion (anime, screen capture)
+- `-crf 23` (default quality), `-pix_fmt yuv420p` (universal), `-movflags +faststart` (streaming)
+- Pads to even dimensions (H.264 requirement — VisPy canvas can be odd-sized, e.g. 682×709)
+- Result: 130 KB MP4 vs 1.5 MB GIF → **11x smaller**
+
+**When to use which:**
+- GIF: GitHub README (READMEs don't render `<video>` tags)
+- MP4: GitHub PR comments, Slack, Discord, presentations (inline autoplay, 10x smaller)
+- WebM: web embeds you control (25-40% smaller than H.264, but Safari spotty)
+
+**Takeaway:** Default to `--format both` (GIF + MP4). Use MP4 for presentations/PRs, GIF for READMEs.
+
+**Reference:** `doc/Reports/GUI_Scripts_Consolidation_2026-08-01.md`
 
 ---
 

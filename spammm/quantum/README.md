@@ -24,9 +24,9 @@ Quantum chemistry integration: DFTB+ scans, Hessians for vibrations, electron de
 **SSOT:** `coordinate_scan.py` + `topology/scan_dataset.py`. Topical doc: `doc/Topics/ReactionCoordinateScan.md`.
 
 ```bash
-PYTHONPATH=. python3 spammm/GUI/gui_scripts/rc_scan_offline.py
+PYTHONPATH=. python3 demos/gui_scripts/rc_scan_offline.py
 pytest tests/topology/test_scan_dataset.py::test_pm_neb_relaxed_dftb -s
-./run_gui.sh --script spammm/GUI/gui_scripts/rc_scan_review.py
+./run_gui.sh --script demos/gui_scripts/rc_scan_review.py
 ```
 
 **Requires:** `DFTB_EXE`, `DFTB_SK_PATH`.

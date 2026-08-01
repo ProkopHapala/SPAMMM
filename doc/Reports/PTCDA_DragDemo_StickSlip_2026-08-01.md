@@ -18,8 +18,8 @@ skills: [code-reuse, doc-read-navigate, centralized-plotting]
 
 **Status:** delivered — USER confirmed the final GIF shows real stick-slip with substrate, anchor line, and growing trajectories.  
 **Artifacts:** `debug/ptcda_drag_demo/ptcda_drag_demo.gif`, `frame_first.png`, `frame_last.png`  
-**Script:** `spammm/GUI/gui_scripts/ptcda_drag_demo.py`  
-**Run:** `./run_gui.sh --script spammm/GUI/gui_scripts/ptcda_drag_demo.py`
+**Script:** `demos/gui_scripts/ptcda_drag_demo.py`  
+**Run:** `./run_gui.sh --script demos/gui_scripts/ptcda_drag_demo.py`
 
 ---
 
@@ -158,7 +158,7 @@ Called after `_on_build` when FAF is enabled. Loads the FAF fit, computes the as
 
 `_update_substrate_overlay` and `_update_potential_overlay` now call the shared `VispyUtils` functions instead of inline VisPy code. Removed duplicated `_SUB_COLORS` dict.
 
-### 4.5 Demo script (`spammm/GUI/gui_scripts/ptcda_drag_demo.py`)
+### 4.5 Demo script (`demos/gui_scripts/ptcda_drag_demo.py`)
 
 Complete rewrite. Uses the GUI code path:
 - `GSU.click_button(window.ra_build_btn)` — build via GUI
@@ -203,7 +203,7 @@ The user explicitly said "use the surface visualization from `demo_pairff.py`" m
 
 | File | Role |
 |------|------|
-| `spammm/GUI/gui_scripts/ptcda_drag_demo.py` | Demo script: GUI build → drag → GIF |
+| `demos/gui_scripts/ptcda_drag_demo.py` | Demo script: GUI build → drag → GIF |
 | `spammm/GUI/VispyUtils.py` | Shared `update_faf_map_overlay` (FAF potential heatmap) |
 | `spammm/GUI/RigidAssemblyExtension.py` | `_update_anchor_visuals`, `_update_ra_substrate_overlay` |
 | `spammm/GUI/FoldedRigidExtension.py` | Refactored to use shared VispyUtils functions |

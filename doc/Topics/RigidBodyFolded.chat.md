@@ -414,7 +414,7 @@ All fixes implemented and verified. Here's a summary of what was done:
 
 3. **[from_xyz_and_grid](cci:1://file:///home/prokophapala/git/SPAMMM/spammm/forcefields/RigidBodyDynamics.py:672:4-758:18) passes `I_body`**: Computes `I_relax = I * (mass_rot/mtot)` (the proper inverse of `Iinv_relax = Iinv * (mtot/mass_rot)`) and uploads it, so GridFF kernel can compute gyroscopic term
 
-4. **[run()](cci:1://file:///home/prokophapala/git/SPAMMM/spammm/GUI/gui_scripts/folded_rigid_setup.py:32:0-56:24) accepts `lin_damp`/`ang_damp`**: Generic kernel runner now passes damping through `md_params` instead of kernel using hardcoded `0.90f`
+4. **[run()](cci:1://file:///home/prokophapala/git/SPAMMM/demos/gui_scripts/folded_rigid_setup.py:32:0-56:24) accepts `lin_damp`/`ang_damp`**: Generic kernel runner now passes damping through `md_params` instead of kernel using hardcoded `0.90f`
 
 5. **`md_params` in default `kernel_params`**: Added so [generate_kernel_args](cci:1://file:///home/prokophapala/git/SPAMMM/spammm/utils/OpenCLBase.py:585:4-640:19) can discover it for the generic kernel
 

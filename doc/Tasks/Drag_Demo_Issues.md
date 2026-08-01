@@ -6,6 +6,7 @@ tags: [drag, stick-slip, FAF, PTCDI, NaCl, GUI-script, visualization]
 timestamp: 2026-08-01
 related:
   - doc/Reports/PTCDA_DragDemo_StickSlip_2026-08-01.md
+  - doc/Reports/GUI_Scripts_Consolidation_2026-08-01.md
   - doc/Tasks/GUI_Scripting_DemoRunner.md
 ---
 
@@ -106,7 +107,7 @@ All molecules have FAF enabled (K_Z=5.0), so they all feel the surface. But with
 | File | Role |
 |------|------|
 | `tests/run_drag_demo.py` | Standalone offline drag demo (produces drag_demo.gif) |
-| `spammm/GUI/gui_scripts/ptcda_interactive_drag.py` | GUI script for interactive drag setup |
+| `demos/gui_scripts/ptcda_interactive_drag.py` | GUI script for interactive drag setup |
 | `spammm/GUI/RigidAssemblyExtension.py` | `_make_ramdrag_mode` (line ~447) — interactive drag handler |
 | `spammm/forcefields/RigidBodyDynamics.py` | `run_multimol_md`, `attach_pairff_faf`, `reset_dynamics_state` |
 | `spammm/surfaces/FoldedRigid.py` | `Z_SURF_TOP = -3.25`, `load_fit`, FAF substrate potential |

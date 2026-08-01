@@ -2,7 +2,7 @@
 """Prepare four charged PTCDA molecules on NaCl for interactive stick-slip dragging.
 
 Run:
-  ./run_gui.sh --script spammm/GUI/gui_scripts/ptcda_interactive_drag.py
+  ./run_gui.sh --script demos/gui_scripts/ptcda_interactive_drag.py
 
 Pick an oxygen atom and drag it toward the center. The spring acts on that atom,
 while the concurrent rigid-body kernel moves all four molecules under intermolecular
@@ -58,5 +58,5 @@ def run(window, argv=None, ctx=None):
 
 if __name__ == '__main__':
     import sys
-    print('Use: ./run_gui.sh --script spammm/GUI/gui_scripts/ptcda_interactive_drag.py', file=sys.stderr)
+    print('Use: ./run_gui.sh --script demos/gui_scripts/ptcda_interactive_drag.py', file=sys.stderr)
     raise SystemExit(1)

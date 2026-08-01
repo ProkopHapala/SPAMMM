@@ -50,7 +50,7 @@ real GUI setup: GTX 1650, 4×PTCDA, FAF=True, max |Q|=0.368 e
 Run the interactive review:
 
 ```bash
-./run_gui.sh --script spammm/GUI/gui_scripts/ptcda_interactive_drag.py
+./run_gui.sh --script demos/gui_scripts/ptcda_interactive_drag.py
 ```
 
 Pick an O atom and pull it toward the center. Whether the motion shows the

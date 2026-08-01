@@ -29,8 +29,8 @@ ASCII-only rigid scans remain in `hbond_scan.py` (0.1 Å axis steps) — use `co
 | `spammm/GUI/rc_esp_view.py` | **active** | Blitted ESP animation synced to RC slider |
 | `spammm/GUI/mpl_blit.py` | **active** | Reusable Qt matplotlib blit helper |
 | `spammm/GUI/rc_scan_gui_script.py` | **active** | Programmatic setup for review scripts |
-| `spammm/GUI/gui_scripts/rc_scan_review.py` | **active** | `./run_gui.sh --script …` entry |
-| `spammm/GUI/gui_scripts/rc_scan_offline.py` | **active** | Same geometry path as tests, no Qt |
+| `demos/gui_scripts/rc_scan_review.py` | **active** | `./run_gui.sh --script …` entry |
+| `demos/gui_scripts/rc_scan_offline.py` | **active** | Same geometry path as tests, no Qt |
 | `tests/topology/test_scan_dataset.py` | **active** | L0 + slow `test_pm_neb_relaxed_dftb` |
 | `tests/GUI/test_rc_scan_gui_script.py` | **active** | Offscreen GUI script smoke |
 
@@ -68,10 +68,10 @@ AtomicGraph / build_ascii_hbond_system  →  import_from_graph (GUI)
 
 ```bash
 # Full DFTB relaxed path + cache + ESP animation
-./run_gui.sh --script spammm/GUI/gui_scripts/rc_scan_review.py
+./run_gui.sh --script demos/gui_scripts/rc_scan_review.py
 
 # Replay cached npz (after one full run)
-./run_gui.sh --script spammm/GUI/gui_scripts/rc_scan_review.py -- --preview
+./run_gui.sh --script demos/gui_scripts/rc_scan_review.py -- --preview
 ```
 
 Cache: `debug/testplot_rc_scan_gui/{name}_sym_pm_neb_relaxed.npz`
@@ -79,7 +79,7 @@ Cache: `debug/testplot_rc_scan_gui/{name}_sym_pm_neb_relaxed.npz`
 ### Offline (no Qt)
 
 ```bash
-PYTHONPATH=. python3 spammm/GUI/gui_scripts/rc_scan_offline.py
+PYTHONPATH=. python3 demos/gui_scripts/rc_scan_offline.py
 pytest tests/topology/test_scan_dataset.py::test_pm_neb_relaxed_dftb -s
 ```
 

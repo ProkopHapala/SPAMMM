@@ -11,6 +11,9 @@ Two script contracts, both loaded after ``window.show()``:
   repaint/control boundary. This is the cooperative model: arbitrary Python/Qt/OpenCL
   work runs between yields; the runner never preem a kernel or a Qt call.
 
+Scripts live in ``demos/gui_scripts/`` (centralized). ``bundled_scripts()`` auto-discovers
+them for the Scripts → Bundled menu and the Script Runner panel. No manual registration.
+
 Design (see ``doc/Tasks/GUI_Scripting_DemoRunner.md``):
 - ``ScriptOptions`` is the SSOT for presentation pacing (delay, points-per-frame,
   barriers). Defaults are fast mode.
@@ -334,9 +337,12 @@ def bundled_scripts(gui_scripts_dir=None):
     """Return list of (display_name, abs_path) for bundled GUI scripts, sorted.
 
     Excludes ``_*.py`` and ``*_offline.py``. Does not import any module.
+    Scripts live in ``demos/gui_scripts/`` (centralized demo scripts directory).
     """
     if gui_scripts_dir is None:
-        gui_scripts_dir = os.path.join(os.path.dirname(__file__), 'gui_scripts')
+        # demos/gui_scripts/ relative to repo root (two levels up from spammm/GUI/)
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        gui_scripts_dir = os.path.join(repo_root, 'demos', 'gui_scripts')
     if not os.path.isdir(gui_scripts_dir):
         return []
     out = []

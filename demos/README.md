@@ -26,4 +26,13 @@ Fit cache (created on first `--faf` if missing): `data/fits/hcooh_nacl.npz`. PTC
 
 **Map display SSOT:** Vispy `potential_to_rgba` (scale to attractive `|Emin|`). Offline tip-pull movies must reuse it — task [`doc/Tasks/PairFF_MapDisplay_SSOT.md`](../doc/Tasks/PairFF_MapDisplay_SSOT.md); session report [`doc/Reports/PairFF_TipPull_PTCDI_QEq_2026-07-28.md`](../doc/Reports/PairFF_TipPull_PTCDI_QEq_2026-07-28.md).
 
+## GUI scripts (`gui_scripts/`)
+
+Centralized GUI control scripts — launched by the GUI after startup, auto-discovered by the **Scripts → Bundled** menu. See [`gui_scripts/README.md`](gui_scripts/README.md) for the full index.
+
+```bash
+./run_gui.sh --script demos/gui_scripts/ptcda_drag_demo.py
+./run_gui.sh --script demos/gui_scripts/conference_demo.py --script-delay-ms 300
+```
+
 Developer notes: [`doc/Tasks/PairFF_MultiBody_Kernel.md`](../doc/Tasks/PairFF_MultiBody_Kernel.md) · [`doc/Tasks/PairFF_FAF_Substrate.md`](../doc/Tasks/PairFF_FAF_Substrate.md) · audit [`doc/TopicalAudit/PairFF_RigidBody.md`](../doc/TopicalAudit/PairFF_RigidBody.md).

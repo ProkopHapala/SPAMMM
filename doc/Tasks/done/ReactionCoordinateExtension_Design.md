@@ -410,8 +410,8 @@ Follow `doc/TEST_DESIGN.md`; artifacts under `debug/test_reaction_coord/`.
 | `spammm/GUI/rc_esp_view.py` | **Done** — blitted ESP animation synced to slider |
 | `spammm/GUI/mpl_blit.py` | **Done** — reusable Qt matplotlib blit helper |
 | `spammm/GUI/rc_scan_gui_script.py` | **Done** — programmatic review setup |
-| `spammm/GUI/gui_scripts/rc_scan_review.py` | **Done** — `./run_gui.sh --script …` |
-| `spammm/GUI/gui_scripts/rc_scan_offline.py` | **Done** — headless DFTB path |
+| `demos/gui_scripts/rc_scan_review.py` | **Done** — `./run_gui.sh --script …` |
+| `demos/gui_scripts/rc_scan_offline.py` | **Done** — headless DFTB path |
 | `spammm/quantum/esp_grid.py` | **Done** — ESP stack precompute |
 | `spammm/quantum/DFTB_utils.py` | **Done** — Mulliken parse, relax diagnostics, `return_charges` |
 | `spammm/topology/hbond_utils.py` | **Done** |
@@ -477,8 +477,8 @@ For repeatable interactive review without manual clicking:
 4. Bond-length visualization on; slider at mid-frame
 
 ```bash
-./run_gui.sh --script spammm/GUI/gui_scripts/rc_scan_review.py
-./run_gui.sh --script spammm/GUI/gui_scripts/rc_scan_review.py -- --dftb --dx 0.1
+./run_gui.sh --script demos/gui_scripts/rc_scan_review.py
+./run_gui.sh --script demos/gui_scripts/rc_scan_review.py -- --dftb --dx 0.1
 ```
 
 Script module must define `run(window, argv=None)`. Runner: `spammm/GUI/gui_script_runner.py`.

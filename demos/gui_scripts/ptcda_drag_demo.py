@@ -12,10 +12,10 @@ Frames are captured from the VisPy canvas (GSU.capture_canvas_png), which now
 shows the NaCl substrate overlay (shared VispyUtils.update_substrate_overlay).
 
 Run:
-  ./run_gui.sh --script spammm/GUI/gui_scripts/ptcda_drag_demo.py
+  ./run_gui.sh --script demos/gui_scripts/ptcda_drag_demo.py
 
   # Bigger drag, more relaxation:
-  ./run_gui.sh --script spammm/GUI/gui_scripts/ptcda_drag_demo.py --drag-x 20 --n-relax 300
+  ./run_gui.sh --script demos/gui_scripts/ptcda_drag_demo.py --drag-x 20 --n-relax 300
 """
 import argparse
 import os
@@ -38,6 +38,7 @@ def run(window, argv=None, ctx=None):
     p.add_argument('--anchor-atom', type=int, default=29, help='local index of anchored O atom (29=top-right corner carbonyl O)')
     p.add_argument('--opposite-atom', type=int, default=27, help='local index of opposite corner O atom (27=bottom-left corner carbonyl O)')
     p.add_argument('--out', type=str, default=None, help='output dir (default: debug/ptcda_drag_demo)')
+    p.add_argument('--format', type=str, default='both', choices=['gif', 'mp4', 'both'], help='output format (default: both)')
     args = p.parse_args(argv or [])
 
     from spammm.GUI import RigidAssemblyExtension as RA
@@ -184,19 +185,27 @@ def run(window, argv=None, ctx=None):
     elapsed = time.perf_counter() - t0
     print(f'[ptcda_drag_demo] Drag done in {elapsed:.1f}s ({n_steps} steps)', flush=True)
 
-    # === Phase 5: Save GIF ===
-    gif_path = os.path.join(outdir, 'ptcda_drag_demo.gif')
-    pil_frames[0].save(gif_path, save_all=True, append_images=pil_frames[1:],
-                       duration=150, loop=0, optimize=True)
-    print(f'REVIEW: {gif_path}', flush=True)
+    # === Phase 5: Save GIF and/or MP4 ===
+    frame_paths = [os.path.join(outdir, f'_frame_{i:04d}.png') for i in range(len(pil_frames))]
+    if args.format in ('gif', 'both'):
+        gif_path = os.path.join(outdir, 'ptcda_drag_demo.gif')
+        pil_frames[0].save(gif_path, save_all=True, append_images=pil_frames[1:],
+                           duration=150, loop=0, optimize=True)
+        print(f'REVIEW: {gif_path}', flush=True)
+    if args.format in ('mp4', 'both'):
+        try:
+            mp4_path = os.path.join(outdir, 'ptcda_drag_demo.mp4')
+            GSU.frames_to_video(frame_paths, mp4_path, fps=10)
+            print(f'REVIEW: {mp4_path}', flush=True)
+        except Exception as e:
+            print(f'[ptcda_drag_demo] MP4 export skipped: {e}', flush=True)
     # Save first and last frame
     pil_frames[0].save(os.path.join(outdir, 'frame_first.png'))
     pil_frames[-1].save(os.path.join(outdir, 'frame_last.png'))
     print(f'REVIEW: {os.path.join(outdir, "frame_first.png")}', flush=True)
     print(f'REVIEW: {os.path.join(outdir, "frame_last.png")}', flush=True)
     # Clean up temp frames
-    for i in range(len(pil_frames)):
-        p = os.path.join(outdir, f'_frame_{i:04d}.png')
+    for p in frame_paths:
         if os.path.exists(p):
             os.remove(p)
 
@@ -219,5 +228,5 @@ def run(window, argv=None, ctx=None):
 
 if __name__ == '__main__':
     import sys
-    print('Use: ./run_gui.sh --script spammm/GUI/gui_scripts/ptcda_drag_demo.py', file=sys.stderr)
+    print('Use: ./run_gui.sh --script demos/gui_scripts/ptcda_drag_demo.py', file=sys.stderr)
     raise SystemExit(1)

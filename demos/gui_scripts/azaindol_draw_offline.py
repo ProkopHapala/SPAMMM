@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Headless azaindol draw demo → one SVG per step (same ops as GUI script).
 
-  PYTHONPATH=. python spammm/GUI/gui_scripts/azaindol_draw_offline.py
-  PYTHONPATH=. python spammm/GUI/gui_scripts/azaindol_draw_offline.py --relax
+  PYTHONPATH=. python demos/gui_scripts/azaindol_draw_offline.py
+  PYTHONPATH=. python demos/gui_scripts/azaindol_draw_offline.py --relax
 """
 import argparse
 import os

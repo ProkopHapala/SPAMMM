@@ -38,12 +38,16 @@ PyQt5 GUI for molecular editing and AFM simulation. Main window combines VisPy 3
 - **ChargeRingsExtension.py** — PME charge-ring STM panel (JSON I/O, xy/xV/1D, state probs)
 - **FragmentExtension.py**, **DFTBExtension.py** — fragment browser / DFTB panel
 
-## Control scripts (`gui_scripts/`)
+## Control scripts (`demos/gui_scripts/`)
 
-Run via `./run_gui.sh --script spammm/GUI/gui_scripts/NAME.py [-- extra args]`:
+Scripts live in `demos/gui_scripts/` (centralized). Run via
+`./run_gui.sh --script demos/gui_scripts/NAME.py [-- extra args]`
+or select from the **Scripts → Bundled** menu (auto-discovered).
+See [`demos/gui_scripts/README.md`](../../demos/gui_scripts/README.md) for full index.
 
 - **folded_rigid_setup.py** — Folded-rigid molecule-on-surface manipulation: load molecule, fit/load potential, run/drag
 - **conference_demo.py** — 4×PTCDA windmill candidate → untouched default 3ob DFTB+ AFM → LUMO BR-STM
+- **ptcda_drag_demo.py** — Automatic 2×PTCDA stick-slip drag on NaCl → GIF + MP4 (`--format both`)
 - **ptcda_interactive_drag.py** — 4×QEq-PTCDA/NaCl setup for all-mobile O-anchor stick-slip review
 - **rc_scan_review.py** — 2Quinolone symmetric pm-NEB relaxed review; `--preview` loads cached npz
 - **rc_scan_offline.py** — Same DFTB path without Qt (`PYTHONPATH=. python3 …`)

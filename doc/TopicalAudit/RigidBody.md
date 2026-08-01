@@ -164,7 +164,7 @@ Documented dual language today (`doc/topical_audit.md` §3b): *“AtomicGraph SS
 
 **Core:** `spammm/forcefields/RigidBodyDynamics.py`, `kernels/rigid.cl`, `spammm/surfaces/FoldedRigid.py`, `spammm/forcefields/RigidBodyAFM.py`, `spammm/forcefields/Assembly.py`, `spammm/forcefields/SPFF_cl.py`
 
-**GUI:** `spammm/GUI/FoldedRigidExtension.py`, `spammm/GUI/RigidBodyVispy.py`, `spammm/GUI/ChargeRingsExtension.py`, `spammm/GUI/gui_scripts/folded_rigid_setup.py`
+**GUI:** `spammm/GUI/FoldedRigidExtension.py`, `spammm/GUI/RigidBodyVispy.py`, `spammm/GUI/ChargeRingsExtension.py`, `demos/gui_scripts/folded_rigid_setup.py`
 
 **PME:** `spammm/quantum/pauli_scan.py`, `spammm/quantum/PauliSolverCL.py`, `kernels/PME.cl`
 

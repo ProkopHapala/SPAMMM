@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Offline reaction-coordinate scan (no GUI). Same geometry path as tests/GUI script.
 
-  python spammm/GUI/gui_scripts/rc_scan_offline.py
-  python spammm/GUI/gui_scripts/rc_scan_offline.py --name 2Quinolone --dx 0.2
+  python demos/gui_scripts/rc_scan_offline.py
+  python demos/gui_scripts/rc_scan_offline.py --name 2Quinolone --dx 0.2
 """
 import argparse
 import os

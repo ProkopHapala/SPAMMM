@@ -182,11 +182,11 @@ Reproduce the Ring→Atom→Select workflow as presentation artifacts (hover for
 
 ```bash
 # Offline SVG frames (no Qt)
-PYTHONPATH=. python spammm/GUI/gui_scripts/azaindol_draw_offline.py
+PYTHONPATH=. python demos/gui_scripts/azaindol_draw_offline.py
 
 # Live GUI → PNG frames + animated GIF
-./run_gui.sh --script spammm/GUI/gui_scripts/azaindol_draw_demo.py
-./run_gui.sh --script spammm/GUI/gui_scripts/azaindol_draw_demo.py -- --zoom-out 2 --gif-ms 550
+./run_gui.sh --script demos/gui_scripts/azaindol_draw_demo.py
+./run_gui.sh --script demos/gui_scripts/azaindol_draw_demo.py -- --zoom-out 2 --gif-ms 550
 ```
 
 Outputs: `debug/azaindol_draw_offline/*.svg`, `debug/azaindol_draw_demo/azaindol_draw_demo.gif`. Details: [Topics/GUI_DrawDemo_Scripts.md](Topics/GUI_DrawDemo_Scripts.md).
