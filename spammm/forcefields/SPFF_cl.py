@@ -512,10 +512,12 @@ class SPFF_cl(OpenCLBase):
             else:
                 warn_skip("getSurfFlat", missing)
         self.kernel_args_getSurfMorse = None
+        self.krnl_getSurfMorse = None
         if "getSurfMorse" in self.kernelheaders:
             ok, missing = can_bind_kernel("getSurfMorse")
             if ok:
                 self.kernel_args_getSurfMorse = self.generate_kernel_args("getSurfMorse")
+                self.krnl_getSurfMorse = cl.Kernel(self.prg, "getSurfMorse")
             else:
                 warn_skip("getSurfMorse", missing)
         self.kernel_args_getSurfFolded = None
@@ -968,7 +970,9 @@ class SPFF_cl(OpenCLBase):
             lx -= 1
         sz = (int(self.natoms), nSystems)
         loc = (int(lx), 1)
-        self.prg.getSurfMorse(self.queue, sz, loc, *self.kernel_args_getSurfMorse)
+        if self.krnl_getSurfMorse is None:
+            self.krnl_getSurfMorse = cl.Kernel(self.prg, "getSurfMorse")
+        self.krnl_getSurfMorse(self.queue, sz, loc, *self.kernel_args_getSurfMorse)
         self.queue.finish()
 
     def run_getSurfFolded(self, nSystems=None):
@@ -1305,6 +1309,7 @@ class SPFF_cl(OpenCLBase):
         want_coulomb = ('coulomb' in comp_keys)
         ew = None
         z_top = None
+        phi_ewald = None
         if want_coulomb and coulomb_solver == 'ewald2d':
             from ..surfaces.SurfaceEwald import SurfaceEwaldCL
             if surf_xyz is None:
@@ -1322,20 +1327,28 @@ class SPFF_cl(OpenCLBase):
             b_vec = np.array(self.surface_lvec[1, :2], dtype=np.float32)
             ew = SurfaceEwaldCL(platform='nvidia')
             ew.prepare_system(ion_data, a_vec, b_vec, n_harm=int(ewald_n_harm))
-            print(f"[folded] coulomb_solver=ewald2d z_top={z_top:.6f} ewald_n_harm={int(ewald_n_harm)}")
+            X = xyz[:, 0].reshape(-1, 1)
+            Y = xyz[:, 1].reshape(-1, 1)
+            Z = (xyz[:, 2] - z_top).reshape(-1, 1)
+            phi_ewald = np.asarray(ew.eval_full(X, Y, Z).reshape(-1), dtype=np.float64)
+            print(f"[folded] coulomb_solver=ewald2d z_top={z_top:.6f} ewald_n_harm={int(ewald_n_harm)}", flush=True)
         z_mask = np.ones(len(uvz), dtype=bool) if fit_mask is None else np.asarray(fit_mask, dtype=bool).reshape(-1)
         if len(z_mask) != len(uvz):
             raise ValueError(f'fit_folded_surface_basis(): fit_mask length {len(z_mask)} != nsamples {len(uvz)}')
+        md1 = self.__class__(nloc=self.nloc, debug_build_options='-DDBG_UFF=0')
+        md1.init_rigid_molecule_batch(np.zeros((1,3), dtype=np.float32), uniq_REQs[0:1], nSystems=min(max(len(transforms), 1), 8192))
+        md1.set_surface(surf_xyz, nPBC=nPBC, pos0=(0.0,0.0,0.0), alpha_morse=alpha_morse, r_damp=r_damp, bMacro=bMacro, type_map=type_map)
+        if substrate_R_override:
+            for ia, e in enumerate(md1.surface_enames):
+                if e in substrate_R_override:
+                    md1.surface_REQs[ia, 0] = float(substrate_R_override[e])
+            md1.toGPU('REQ_s', md1.surface_REQs)
+        morse_comps = [ck for ck in comp_keys if ck != 'coulomb'] if (want_coulomb and coulomb_solver == 'ewald2d') else comp_keys
         for it in range(ntypes):
-            md1 = self.__class__(nloc=self.nloc, debug_build_options='-DDBG_UFF=0')
-            md1.init_rigid_molecule_batch(np.zeros((1,3), dtype=np.float32), uniq_REQs[it:it+1], nSystems=min(max(len(transforms), 1), 8192))
-            md1.set_surface(surf_xyz, nPBC=nPBC, pos0=(0.0,0.0,0.0), alpha_morse=alpha_morse, r_damp=r_damp, bMacro=bMacro, type_map=type_map)
-            if substrate_R_override:
-                for ia, e in enumerate(md1.surface_enames):
-                    if e in substrate_R_override:
-                        md1.surface_REQs[ia, 0] = float(substrate_R_override[e])
-                md1.toGPU('REQ_s', md1.surface_REQs)
-            morse_comps = [ck for ck in comp_keys if ck != 'coulomb'] if (want_coulomb and coulomb_solver == 'ewald2d') else comp_keys
+            print(f"[folded] fitting probe type {it+1}/{ntypes}", flush=True)
+            md1.rigid_REQs0[0] = uniq_REQs[it]
+            reqs_all = np.broadcast_to(md1.rigid_REQs0[None, :, :], (md1.nSystems, 1, 4)).copy()
+            md1.toGPU('REQs', reqs_all)
             out = md1.eval_rigid_getSurfMorse_components(transforms.reshape(-1,12), chunk_size=md1.nSystems, components=morse_comps)
             for ck in comp_keys:
                 if ck == 'coulomb' and want_coulomb and coulomb_solver == 'ewald2d':
@@ -1344,11 +1357,9 @@ class SPFF_cl(OpenCLBase):
                     if z_top is None:
                         raise ValueError('fit_folded_surface_basis(): internal error z_top is None for coulomb_solver=ewald2d')
                     q_probe = float(uniq_REQs[it, 2])
-                    X = xyz[:, 0].reshape(-1, 1)
-                    Y = xyz[:, 1].reshape(-1, 1)
-                    Z = (xyz[:, 2] - z_top).reshape(-1, 1)
-                    phi = ew.eval_full(X, Y, Z)
-                    y = np.asarray(phi.reshape(-1) * q_probe, dtype=np.float64)
+                    if phi_ewald is None:
+                        raise ValueError('fit_folded_surface_basis(): internal error phi_ewald is None')
+                    y = phi_ewald * q_probe
                 elif ck == 'coulomb' and want_coulomb and coulomb_solver == 'none':
                     y = np.zeros(len(transforms), dtype=np.float64)
                 else:

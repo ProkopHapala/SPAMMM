@@ -36,7 +36,7 @@ def test_constants_exist():
     assert MARGIN == 0
     assert SPACING == 1
     assert ROW_SPACING == 1
-    assert SPIN_MAX_WIDTH == 55
+    assert SPIN_MAX_WIDTH == 70
 
 
 # ── apply_tight ───────────────────────────────────────────────────────────────
@@ -141,7 +141,7 @@ def test_tight_spin_int_mode():
 
 def test_tight_combo_natural_width():
     cb = tight_combo(items=["a", "b"])
-    assert cb.sizePolicy().horizontalPolicy() == QtWidgets.QSizePolicy.Maximum
+    assert cb.sizePolicy().horizontalPolicy() == QtWidgets.QSizePolicy.Preferred
     assert cb.count() == 2
 
 def test_make_flow_returns_flowlayout():

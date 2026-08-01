@@ -26,8 +26,21 @@ H is the damped Coulomb matrix (SPD when hardness > 0):
 import numpy as np
 from scipy.linalg import cho_factor, cho_solve
 
+from spammm.topology.FFparams import read_element_types, read_atom_types, make_REQs_from_enames, _DATA_PATH
+
 # Coulomb constant in eV*Angstrom/e^2
 KE = 14.3996448915
+
+# Cached (element_types, atom_types) — reading .dat files is expensive
+_ETA_CACHE = None
+
+def get_atom_types():
+    """Load and cache (element_types, atom_types) from FFparams data files."""
+    global _ETA_CACHE
+    if _ETA_CACHE is None:
+        etypes = read_element_types(_DATA_PATH + '/ElementTypes.dat')
+        _ETA_CACHE = (etypes, read_atom_types(_DATA_PATH + '/AtomTypes.dat', etypes))
+    return _ETA_CACHE
 
 
 def build_coulomb_matrix(pos, hardness, damping='linear'):
@@ -125,3 +138,26 @@ def solve_from_elements(pos, enames, element_types, Q_target=0.0, method='choles
     chi = np.array([element_types[name].Eaff for name in enames], dtype=np.float64)
     hardness = np.array([element_types[name].Ehard for name in enames], dtype=np.float64)
     return solve(pos, chi, hardness, Q_target=Q_target, method=method)
+
+
+def compute_qeq_reqs(apos, enames, Q_target=0.0, name=''):
+    """Compute QEq charges and build REQs (R, sqrt(E), Q, H) for a molecule.
+
+    Single shared QEq→REQs path. Loads element_types + atom_types internally
+    (cached). Without QEq charges, Coulomb is zero (no Na/Cl checkerboard).
+
+    Args:
+        apos: (N,3) atom positions
+        enames: list of N element name strings
+        Q_target: total charge constraint (default 0 = neutral)
+        name: optional name for the QEq log line
+
+    Returns: REQs float32 (N,4) with QEq charges in column 2
+    """
+    etypes, atom_types = get_atom_types()
+    apos = np.asarray(apos, dtype=np.float32)
+    q = -solve_from_elements(apos, enames, etypes, Q_target=Q_target)
+    REQs = make_REQs_from_enames(enames, q.astype(np.float32), atom_types)
+    if name:
+        print(f'  {name} QEq: sum={q.sum():.4f}  Q range=[{q.min():.3f},{q.max():.3f}]')
+    return REQs

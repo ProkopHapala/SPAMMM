@@ -23,6 +23,18 @@ Consolidation strategy: `doc/Tasks/RepoConsolidation.md` (eat FireCore/ppafm int
 - [x] 3D view (ortho editor mode: `Enter` / `b2Dview`; Ring/atom/bond work; hex 2D-only) — `doc/Tasks/GUI_Editor_3D_ViewMode.md`
 - [ ] Molecuar Browser
 - [ ] add menu to load example moleucles form assiart of SMILES
+- [ ] Consolidate Extensions - .e.g. AFM and STM are overlaping, we should make one SPM extension integrtting the two and reusing code used by SPM_CLI
+- [ ] make sub-categories of extensions, one should be experimental (with wibrations etc.)
+- [ ] remove FireCore extions
+- [ ] reorganize extension (Build, Relax, on Surface, SPM)
+
+- most are really tight I like that, but some like "STM orbitals" and "Parameters" sub panel in "AFM" extension still seem to have some mmarings between lines
+
+
+
+
+
+
 
 
 ## GUI Laptop

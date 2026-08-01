@@ -58,6 +58,7 @@ from PyQt5 import QtCore, QtWidgets
 from PyQt5.QtGui import QFont
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtWidgets import QHBoxLayout
+from spammm.GUI.LayoutPolicy import TIGHT_STYLESHEET
 
 import json
 import re
@@ -105,6 +106,10 @@ class BaseGUI(QtWidgets.QMainWindow):
         app = QtWidgets.QApplication.instance()
         if app:
             app.setFont(QFont("Sans", 8))
+        # Global tight stylesheet — reduces intrinsic widget padding so widgets
+        # are only as wide as their content. This is the primary layout-tightening
+        # mechanism; per-widget size policies handle the rest.
+        self.setStyleSheet(TIGHT_STYLESHEET)
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
         self.setWindowTitle(title)
         self.main_widget = QtWidgets.QWidget(self)
@@ -139,10 +144,11 @@ class BaseGUI(QtWidgets.QMainWindow):
     def comboBox(self, items=None, callback=None, layout=None, pass_index=False):
         """Create QComboBox with optional items, callback, and auto-add to layout.
 
-        Natural width (Maximum size policy) — only as wide as its items.
+        Preferred size policy — shows full content, fills available space.
         """
         cb = QtWidgets.QComboBox()
-        cb.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+        cb.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        cb.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
         if items is not None:    cb.addItems(items)
         if callback is not None:
             if pass_index:
@@ -155,7 +161,7 @@ class BaseGUI(QtWidgets.QMainWindow):
     def spinBox(self, value=0.0, step=0.1, max_width=None, vmin=-1e9, vmax=1e9, decimals=4, enabled=True, callback=None, layout=None, label=None, int_mode=False):
         """Create QSpinBox (int_mode=True) or QDoubleSpinBox (default) with auto-add to layout.
 
-        Maximum size policy — only as wide as needed (capped by SPIN_MAX_WIDTH).
+        Preferred size policy — shows full value, fills available space up to cap.
         """
         from spammm.GUI.LayoutPolicy import SPIN_MAX_WIDTH
         if max_width is None: max_width = SPIN_MAX_WIDTH
@@ -165,7 +171,7 @@ class BaseGUI(QtWidgets.QMainWindow):
         spin.setRange(vmin, vmax)
         spin.setValue(value)
         spin.setMaximumWidth(max_width)
-        spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+        spin.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
         spin.setEnabled(enabled)
         if callback is not None: spin.valueChanged.connect(callback)
         elif hasattr(self, 'on_param_changed'): spin.valueChanged.connect(self.on_param_changed)

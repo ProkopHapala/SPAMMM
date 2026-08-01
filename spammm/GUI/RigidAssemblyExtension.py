@@ -37,7 +37,7 @@ Reuse map (no duplication):
                `RigidBodyDynamics.update_anchors` / `run_pairff` / `set_active_body`
   - PME:       `pauli_scan.scan_xy` / `scan_xV` / `scan_1d` / `embed_sites_pme4` +
                `PauliSolverCL`; `RigidEnsemble.get_poses()` → `spos` + `R(q)`
-  - Loaders:   `spammm.forcefields.molecule_loaders` (shared with testplot) +
+  - Loaders:   `spammm.forcefields.RigidBodyDynamics.load_molecule` (general loader) +
                `graph_to_rigid_fragments` (AtomicGraph → connected components → rigid bodies)
   - Display:   main `AtomScene` (no second VisPy window); graph rebuild via
                `AtomicGraph` constructor + `backend.graph = new_graph`
@@ -57,8 +57,23 @@ from .EditModeHandlers import EditModeHandler
 from .CollapsibleSection import CollapsibleSection
 
 from spammm.forcefields.RigidEnsemble import RigidEnsemble
-from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF, _body_sites_world, _quat_to_matrix_np
-from spammm.forcefields.molecule_loaders import LOADERS, FAF_FITS, FAF_FIT_DEFAULT, remap_fit_for_molecule, graph_to_rigid_fragments
+from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF, _body_sites_world, _quat_to_matrix_np, load_molecule, graph_to_rigid_fragments
+from spammm.surfaces.FoldedRigid import remap_fit_for_molecule
+
+# Molecule paths for dropdown (data, not logic)
+_MOL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'data', 'mol')
+_XYZ_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'data', 'xyz')
+MOL_PATHS = {
+    'NTCDI':             os.path.join(_MOL_DIR, 'NTCDI.mol2'),
+    'TBTAP':             os.path.join(_MOL_DIR, 'TBTAP.mol2'),
+    'PTCDA':             os.path.join(_XYZ_DIR, 'PTCDA.xyz'),
+    'formic_acid':       os.path.join(_XYZ_DIR, 'HCOOH.xyz'),
+    'terephthalic_acid': os.path.join(_XYZ_DIR, 'terephthalic_acid.xyz'),
+    'azaindol':          os.path.join(_XYZ_DIR, 'azaindol.xyz'),
+    'uracil':            os.path.join(_XYZ_DIR, 'uracil.xyz'),
+    'adenine':           os.path.join(_XYZ_DIR, 'adenine.xyz'),
+}
+_NO_QEQ = {'NTCDI'}  # NTCDI.mol2 has good file charges
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
@@ -216,11 +231,11 @@ def _on_build(window):
             mol_name = window.ra_mol_combo.currentText()
             nmol = int(window.ra_nmol_spin.value())
             spacing = float(window.ra_spacing_spin.value())
-            if mol_name not in LOADERS:
+            if mol_name not in MOL_PATHS:
                 _status(window, f'Unknown molecule: {mol_name}')
                 return
             _status(window, f'Loading {mol_name}...')
-            apos, enames, REQs, bonds = LOADERS[mol_name](qeq=not window.ra_no_qeq_chk.isChecked())
+            apos, enames, REQs, bonds = load_molecule(MOL_PATHS[mol_name], qeq=(mol_name not in _NO_QEQ) and (not window.ra_no_qeq_chk.isChecked()), name=mol_name)
             molecules = [(apos, enames, REQs)] * nmol
             # Grid positions (same pattern as testplot grid_pos)
             nx = int(np.ceil(np.sqrt(nmol)))
@@ -251,18 +266,14 @@ def _on_build(window):
         # Optional FAF substrate (only for file source — fragments have no fit)
         if source != 'From editor' and not window.ra_no_faf_chk.isChecked():
             mol_name = window.ra_mol_combo.currentText()
-            fit_path = FAF_FITS.get(mol_name, FAF_FIT_DEFAULT)
-            if os.path.isfile(fit_path):
-                from spammm.surfaces.FoldedRigid import load_fit
-                fit = load_fit(fit_path)
-                fit = remap_fit_for_molecule(fit, REQs)
-                # Tile atom_type_ids for nmol copies (all same species)
-                at_ids = np.tile(fit['atom_type_ids'], nmol).astype(np.int32)
-                fit['atom_type_ids'] = at_ids
-                window.ra_rbd.attach_pairff_faf(fit, z_init=float(window.ra_z_init_spin.value()), k_z=0.0, enable=True)
-                window.ra_fit = fit
-            else:
-                window.ra_fit = None
+            from spammm.surfaces.FoldedRigid import load_or_fit_faf
+            fit = load_or_fit_faf((apos, enames, REQs), mol_name=mol_name)
+            fit = remap_fit_for_molecule(fit, REQs)
+            # Tile atom_type_ids for nmol copies (all same species)
+            at_ids = np.tile(fit['atom_type_ids'], nmol).astype(np.int32)
+            fit['atom_type_ids'] = at_ids
+            window.ra_rbd.attach_pairff_faf(fit, z_init=float(window.ra_z_init_spin.value()), k_z=0.0, enable=True)
+            window.ra_fit = fit
         else:
             window.ra_fit = None
         # Cache per-pack bonds for display
@@ -582,7 +593,7 @@ def build_ui(window):
     row0 = QtWidgets.QHBoxLayout()
     row0.addWidget(QtWidgets.QLabel('Mol:'))
     window.ra_mol_combo = QtWidgets.QComboBox()
-    window.ra_mol_combo.addItems(sorted(LOADERS.keys()))
+    window.ra_mol_combo.addItems(sorted(MOL_PATHS.keys()))
     row0.addWidget(window.ra_mol_combo)
     window.ra_nmol_spin = QtWidgets.QSpinBox(); window.ra_nmol_spin.setRange(1, 64); window.ra_nmol_spin.setValue(4); window.ra_nmol_spin.setMaximumWidth(50)
     row0.addWidget(QtWidgets.QLabel('nmol:')); row0.addWidget(window.ra_nmol_spin)

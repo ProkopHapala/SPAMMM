@@ -294,30 +294,27 @@ def _on_fit(window):
         alpha = float(window.fr_alpha_spin.value())
         z_min = float(window.fr_zmin_spin.value())
         z_max = float(window.fr_zmax_spin.value())
+        # Cache path keyed on geometry+substrate+params (custom substrate support)
         key = _fit_cache_key(sys, sub_file, nu, nv, alpha, z_min, z_max)
         cache_path = os.path.join(_fit_cache_dir(), f"{key}.npz")
-        if os.path.isfile(cache_path):
-            window.fr_fit_result = FoldedRigid.load_fit(cache_path)
-            _populate_potential_type_combo(window, window.fr_fit_result)
-            _on_setup(window)
-            _status(window, f"Loaded cached fit: {window.fr_fit_result['coeffs'].shape}")
-            return
-        mol_file = _export_molecule_to_temp(window)
-        _status(window, "Fitting folded basis...")
-        fit = FoldedRigid.fit_folded_for_molecule(
-            mol_file,
-            substrate_file=sub_file,
-            z_range_rel=(z_min, z_max),
-            nu=nu, nv=nv,
-            nPBC=(4, 4, 0),
-            alpha_morse=alpha,
+        # Build molecule tuple with QEq charges — sys.qs are valence electron
+        # counts, NOT QEq charges. Without QEq, Coulomb is zero (no checkerboard).
+        from spammm.forcefields.QEq import compute_qeq_reqs
+        apos = np.asarray(sys.apos, dtype=np.float32)
+        enames = list(sys.enames)
+        REQs = compute_qeq_reqs(apos, enames, name='editor_mol')
+        _status(window, f"Fitting folded basis (QEq Q=[{REQs[:, 2].min():.3f},{REQs[:, 2].max():.3f}])...")
+        fit = FoldedRigid.load_or_fit_faf(
+            (apos, enames, REQs), mol_name='editor_mol',
+            substrate_file=sub_file, z_range_rel=(z_min, z_max),
+            fit_path=cache_path,
+            nu=nu, nv=nv, nPBC=(4, 4, 0), alpha_morse=alpha,
             custom_alphas=FoldedRigid.COMBINED_ALPHAS,
         )
         window.fr_fit_result = fit
-        FoldedRigid.save_fit(fit, cache_path)
         _populate_potential_type_combo(window, fit)
         _on_setup(window)
-        _status(window, f"Fit complete: {fit['coeffs'].shape} (cached)")
+        _status(window, f"Fit complete: {fit['coeffs'].shape}")
     except Exception as e:
         _status(window, f"Fit failed: {e}")
         traceback.print_exc()

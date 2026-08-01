@@ -17,6 +17,9 @@ Key functionality:
 
 Role in SPAMMM: Rigid engine for AFM manipulation (`RigidBodyAFM.py`) and
 interactive PairFF docking (`demos/demo_pairff.py`). Kernels in `rigid.cl`.
+
+TODO: This module mixes GPU dynamics core with rigid-body utils (e.g.
+graph_to_rigid_fragments). Split into core + utils later.
 """
 
 import os
@@ -25,8 +28,10 @@ import numpy as np
 import pyopencl as cl
 
 from ..utils.OpenCLBase import OpenCLBase
-from ..topology.FFparams import load_xyz_with_REQs
+from ..topology.FFparams import load_xyz_with_REQs, make_REQs_from_enames
 from ..AtomicSystem import AtomicSystem
+from .. import elements
+from .QEq import solve_from_elements, get_atom_types
 
 
 DEFAULT_WORKGROUP_SIZE = 32
@@ -208,6 +213,108 @@ def _quat_to_matrix_np(q):
         ], axis=2).astype(np.float32)
     else:
         raise ValueError(f"Quaternion must have shape (4,) or (N,4), got {q.shape}")
+
+
+def _bonds_from_geom(apos, enames):
+    """Infer intramolecular bonds from geometry via AtomicSystem.neighs(bBond=True)."""
+    atypes = [elements.ELEMENT_DICT[e][0] if e in elements.ELEMENT_DICT else 6 for e in enames]
+    mol = AtomicSystem(apos=np.asarray(apos, dtype=np.float32).copy(), atypes=atypes, enames=list(enames))
+    mol.neighs(bBond=True)
+    if mol.bonds is None or len(mol.bonds) == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    return np.asarray(mol.bonds, dtype=np.int32)
+
+
+def load_molecule(path, qeq=True, planarize=True, name=''):
+    """Load any molecule (.xyz, .mol2, .mol) for rigid-body simulation.
+
+    General loader — uses AtomicSystem (handles all formats) + QEq charges.
+    Returns (apos, enames, REQs, bonds) ready for RigidBodyPairFF.from_molecules.
+
+    Args:
+        path: file path (.xyz, .mol2, .mol — AtomicSystem auto-detects)
+        qeq: if True, compute QEq charges; if False, use file charges (mol2) or 0
+        planarize: if True, XY-center and z-planarize to 0
+        name: optional name for QEq log line
+    """
+    from .QEq import compute_qeq_reqs
+    mol = AtomicSystem(fname=path)
+    apos = np.asarray(mol.apos, dtype=np.float32)
+    enames = [str(e) for e in mol.enames]
+    if planarize:
+        apos = apos.copy()
+        apos[:, :2] -= apos[:, :2].mean(axis=0)
+        apos[:, 2] = 0.0
+    if qeq:
+        REQs = compute_qeq_reqs(apos, enames, name=name)
+    else:
+        q = np.asarray(mol.qs, dtype=np.float32) if mol.qs is not None else np.zeros(len(enames), np.float32)
+        _, atom_types = get_atom_types()
+        REQs = make_REQs_from_enames(enames, q, atom_types)
+    bonds = _bonds_from_geom(apos, enames)
+    return apos, enames, REQs, bonds
+
+
+def graph_to_rigid_fragments(graph, qeq=True, planarize=True):
+    """Split an AtomicGraph into independent rigid-body fragments (connected components).
+
+    For each connected component (fragment not linked by any bond):
+      - extract (apos, enames)
+      - compute mass-weighted CoM (body center) using atomic masses from `elements`
+      - build body-frame relative positions: apos - CoM
+      - build REQs via `make_REQs_from_enames` with charges from QEq (if qeq=True) or
+        from `atom.charge` (if already set on the graph) or 0
+      - build bonds array from the graph's bonds within the fragment
+
+    Returns (fragments, coms):
+      fragments: list of (apos_rel (n,3) f32, enames list[str], REQs (n,4) f32, bonds (m,2) i32)
+                 apos_rel is body-frame (CoM-centered); z planarized to 0 if planarize=True
+      coms: (n_frags, 3) f32 — mass-weighted center of mass per fragment (body positions)
+    """
+    components = graph.find_connected_components()
+    if not components:
+        return [], np.zeros((0, 3), dtype=np.float32)
+
+    # Collect full-system arrays for QEq (run once on the whole graph)
+    all_atoms = [a for comp in components for a in comp]
+    all_apos = np.array([a.pos for a in all_atoms], dtype=np.float32)
+    all_enames = [str(a.ename) for a in all_atoms]
+    if planarize:
+        all_apos = all_apos.copy()
+        all_apos[:, 2] = 0.0
+
+    # Charges: run QEq on the whole system once, then split per fragment
+    if qeq:
+        etypes, atom_types = get_atom_types()
+        q_all = -solve_from_elements(all_apos, all_enames, etypes, Q_target=0.0)
+        print(f'  graph_to_rigid_fragments: QEq sum={q_all.sum():.4f}  Q range=[{q_all.min():.3f},{q_all.max():.3f}]')
+    else:
+        q_all = np.array([float(a.charge) for a in all_atoms], dtype=np.float32)
+        etypes, atom_types = get_atom_types()
+
+    # Map atom → index in all_atoms for charge lookup
+    atom_to_idx = {a._id: i for i, a in enumerate(all_atoms)}
+
+    fragments = []
+    coms = np.zeros((len(components), 3), dtype=np.float32)
+
+    for fi, comp in enumerate(components):
+        n = len(comp)
+        apos = np.array([a.pos for a in comp], dtype=np.float32)
+        enames = [str(a.ename) for a in comp]
+        masses = np.array([elements.ELEMENT_DICT[e][10] if e in elements.ELEMENT_DICT else 12.0 for e in enames], dtype=np.float32)
+        mtot = masses.sum()
+        com = apos.mean(axis=0) if mtot <= 0 else (apos * masses[:, None]).sum(axis=0) / mtot
+        coms[fi] = com.astype(np.float32)
+        apos_rel = (apos - com).astype(np.float32)
+        if planarize:
+            apos_rel[:, 2] = 0.0
+        q_frag = np.array([q_all[atom_to_idx[a._id]] for a in comp], dtype=np.float32)
+        REQs = make_REQs_from_enames(enames, q_frag, atom_types)
+        bonds = _bonds_from_geom(apos_rel, enames)
+        fragments.append((apos_rel, enames, REQs, bonds))
+
+    return fragments, coms
 
 
 class RigidBodyDynamics(OpenCLBase):
@@ -450,7 +557,7 @@ void rigid_body_folded_newton_replicas_kernel(
         FOLDED_TYPES_MAX = 8
         self.create_buffer('folded_coeffs',  FOLDED_TYPES_MAX * FOLDED_BASIS_MAX * 4 * float_size, mf.READ_ONLY)
         self.create_buffer('folded_kxyz',    FOLDED_BASIS_MAX * 4 * float_size, mf.READ_ONLY)
-        self.create_buffer('folded_atom_type', self.total_atoms * int_size, mf.READ_ONLY)
+        self.create_buffer('folded_atom_type', self.total_atoms * 4 * float_size, mf.READ_ONLY)
 
         self.kernel_params = {
             'natoms': np.int32(self.total_atoms),
@@ -512,7 +619,7 @@ void rigid_body_folded_newton_replicas_kernel(
         FOLDED_TYPES_MAX = 8
         self.create_buffer('folded_coeffs',  FOLDED_TYPES_MAX * FOLDED_BASIS_MAX * 4 * float_size, mf.READ_ONLY)
         self.create_buffer('folded_kxyz',    FOLDED_BASIS_MAX * 4 * float_size, mf.READ_ONLY)
-        self.create_buffer('folded_atom_type', self.total_atoms * int_size, mf.READ_ONLY)
+        self.create_buffer('folded_atom_type', self.total_atoms * 4 * float_size, mf.READ_ONLY)
         self.create_buffer('dyn_REQ',  self.total_atoms * 4 * float_size, mf.READ_ONLY)
         self.create_buffer('dyn_type', self.total_atoms * int_size, mf.READ_ONLY)
 
@@ -788,17 +895,23 @@ void rigid_body_folded_newton_replicas_kernel(
         """Initialize folded basis surface interaction for rigid body dynamics.
 
         Args:
-            folded_coeffs: (ntypes, nbasis) float32 — fitted coefficients per atom type
+            folded_coeffs: typed (ntypes,nbasis), or factorized (nbasis,4) float32
             folded_kxyz:   (nbasis, 4) float32 — basis params (ku, kv, alpha, z0) per basis function
-            folded_atom_type: (natoms,) int32 — type index per atom in the rigid body
+            folded_atom_type: typed (natoms,) int32 IDs, or factorized (natoms,4) runtime PLQH
             folded_lvec2d: (4,) float32 — 2D lattice vectors as (ax, bx, ay, by)
-            folded_meta: (4,) int32 — (nbasis, ntypes, 0, 0). If None, inferred from shapes.
+            folded_meta: (nbasis,ntypes,0,0); ntypes=-1 selects factorized PLQH
         """
         coeffs = np.asarray(folded_coeffs, dtype=np.float32)
         kxyz   = np.asarray(folded_kxyz,   dtype=np.float32)
-        atype  = np.asarray(folded_atom_type, dtype=np.int32)
         lvec2d = np.asarray(folded_lvec2d, dtype=np.float32)
-        ntypes, nbasis = coeffs.shape
+        factorized = folded_meta is not None and int(np.asarray(folded_meta).reshape(4)[1]) < 0
+        if factorized:
+            coeffs4 = coeffs.reshape(-1, 4)
+            nbasis, ntypes = len(coeffs4), 1
+            atype = np.asarray(folded_atom_type, dtype=np.float32).reshape(-1, 4)
+        else:
+            ntypes, nbasis = coeffs.shape
+            atype = np.asarray(folded_atom_type, dtype=np.int32).reshape(-1)
         if kxyz.shape[0] < nbasis:
             raise ValueError(f"folded_kxyz has {kxyz.shape[0]} basis params but coeffs expects {nbasis}")
         if atype.shape[0] != self.total_atoms:
@@ -815,8 +928,11 @@ void rigid_body_folded_newton_replicas_kernel(
         if ntypes > FOLDED_TYPES_MAX:
             raise ValueError(f"ntypes={ntypes} exceeds FOLDED_TYPES_MAX={FOLDED_TYPES_MAX}")
         coeff_pad = np.zeros(FOLDED_TYPES_MAX * FOLDED_BASIS_MAX * 4, dtype=np.float32)
-        coeff_flat = np.asarray(coeffs, dtype=np.float32).reshape(ntypes, -1)[:, :nbasis]
-        coeff_pad[:ntypes * nbasis] = coeff_flat.flatten()
+        if factorized:
+            coeff_pad[:nbasis*4] = coeffs4[:nbasis].reshape(-1)
+        else:
+            coeff_flat = np.asarray(coeffs, dtype=np.float32).reshape(ntypes, -1)[:, :nbasis]
+            coeff_pad[:ntypes * nbasis] = coeff_flat.flatten()
         kxyz_pad = np.zeros((FOLDED_BASIS_MAX, 4), dtype=np.float32)
         kxyz_pad[:nbasis, :] = kxyz[:nbasis]
         self.toGPU('folded_coeffs',    coeff_pad)
@@ -846,6 +962,8 @@ void rigid_body_folded_newton_replicas_kernel(
         """
         if self.newton_args is None:
             raise RuntimeError("Newton kernel not initialized; call init_folded(...) first")
+        if int(self.kernel_params['folded_meta'][1]) < 0:
+            raise NotImplementedError("factorized_plqh is implemented for folded MD/FIRE, replicas, PairFF and MC energy kernels; GPU Newton remains typed-only")
         f2tol = float(min(f_tol * f_tol, t_tol * t_tol))
         self.kernel_params['newton_params'] = np.array([eps_t, eps_r, trust0, lambda0], dtype=np.float32)
         self.kernel_params['f2tol'] = np.float32(f2tol)
@@ -870,6 +988,8 @@ void rigid_body_folded_newton_replicas_kernel(
         """Centered-FD GPU Newton for many replicas; lambda0 is the persistent LM floor."""
         if self.newton_replicas_args is None:
             raise RuntimeError("Newton replicas kernel not initialized; call init_replicas(...) first")
+        if int(self.kernel_params['folded_meta'][1]) < 0:
+            raise NotImplementedError("factorized_plqh is implemented for folded MD/FIRE replicas; GPU Newton replicas remain typed-only")
         f2tol = float(min(f_tol * f_tol, t_tol * t_tol))
         self.kernel_params['newton_params'] = np.array([eps_t, eps_r, trust0, lambda0], dtype=np.float32)
         self.kernel_params['f2tol'] = np.float32(f2tol)
@@ -891,19 +1011,25 @@ void rigid_body_folded_newton_replicas_kernel(
 
         Args:
             n_replicas: number of rigid body replicas
-            folded_coeffs: (ntypes, nbasis) float32
+            folded_coeffs: typed (ntypes,nbasis), or factorized (nbasis,4) float32
             folded_kxyz: (nbasis, 4) float32
-            folded_atom_type: (natoms,) int32 — type index per atom (shared)
+            folded_atom_type: typed int IDs, or factorized runtime PLQH (shared)
             folded_lvec2d: (4,) float32 — (ax, bx, ay, by)
-            folded_meta: (4,) int32 — (nbasis, ntypes, na, n_replicas). If None, inferred.
+            folded_meta: (nbasis,ntypes,na,n_replicas); ntypes=-1 selects factorized
         """
         if self.n_bodies == 0:
             raise RuntimeError("Call realloc() before init_replicas()")
         coeffs = np.asarray(folded_coeffs, dtype=np.float32)
         kxyz   = np.asarray(folded_kxyz,   dtype=np.float32)
-        atype  = np.asarray(folded_atom_type, dtype=np.int32)
         lvec2d = np.asarray(folded_lvec2d, dtype=np.float32)
-        ntypes, nbasis = coeffs.shape
+        factorized = folded_meta is not None and int(np.asarray(folded_meta).reshape(4)[1]) < 0
+        if factorized:
+            coeffs4 = coeffs.reshape(-1, 4)
+            nbasis, ntypes = len(coeffs4), 1
+            atype = np.asarray(folded_atom_type, dtype=np.float32).reshape(-1, 4)
+        else:
+            ntypes, nbasis = coeffs.shape
+            atype = np.asarray(folded_atom_type, dtype=np.int32).reshape(-1)
         na = atype.shape[0]
         if kxyz.shape[0] < nbasis:
             raise ValueError(f"folded_kxyz has {kxyz.shape[0]} basis params but coeffs expects {nbasis}")
@@ -918,8 +1044,11 @@ void rigid_body_folded_newton_replicas_kernel(
         if ntypes > FOLDED_TYPES_MAX:
             raise ValueError(f"ntypes={ntypes} exceeds FOLDED_TYPES_MAX={FOLDED_TYPES_MAX}")
         coeff_pad = np.zeros(FOLDED_TYPES_MAX * FOLDED_BASIS_MAX * 4, dtype=np.float32)
-        coeff_flat = np.asarray(coeffs, dtype=np.float32).reshape(ntypes, -1)[:, :nbasis]
-        coeff_pad[:ntypes * nbasis] = coeff_flat.flatten()
+        if factorized:
+            coeff_pad[:nbasis*4] = coeffs4[:nbasis].reshape(-1)
+        else:
+            coeff_flat = np.asarray(coeffs, dtype=np.float32).reshape(ntypes, -1)[:, :nbasis]
+            coeff_pad[:ntypes * nbasis] = coeff_flat.flatten()
         kxyz_pad = np.zeros((FOLDED_BASIS_MAX, 4), dtype=np.float32)
         kxyz_pad[:nbasis, :] = kxyz[:nbasis]
         self.toGPU('folded_coeffs',    coeff_pad)
@@ -2258,15 +2387,36 @@ void rigid_body_pairff_energy_replica_kernel(
             raise ValueError(f"folded types length {out.shape[0]} != total_atoms {self.total_atoms}")
         return out
 
+    def _folded_plqh_all_sites(self, alpha_morse):
+        """Build runtime FAF PLQH for real sites; dummy PairFF sites get zero."""
+        def one(types, req_base):
+            types = np.asarray(types, dtype=np.int32)
+            out = np.zeros((len(types), 4), dtype=np.float32)
+            real = types == 0
+            req_base = np.asarray(req_base, dtype=np.float32).reshape(-1, 4)
+            if int(real.sum()) != len(req_base):
+                raise ValueError(f"_folded_plqh_all_sites(): {int(real.sum())} real sites != {len(req_base)} REQ rows")
+            out[real] = _reqs_to_plq(req_base, alpha=float(alpha_morse))
+            return out
+        if self.allmol_mode and self._mb_packs is not None:
+            out = np.vstack([one(p['types'], p['REQ_base']) for p in self._mb_packs])
+        elif self._dyn_REQ_base is not None:
+            out = one(self.dyn_type_host, self._dyn_REQ_base)
+        else:
+            raise ValueError("_folded_plqh_all_sites(): molecule base REQ parameters are unavailable")
+        if out.shape != (self.total_atoms, 4):
+            raise ValueError(f"_folded_plqh_all_sites(): got {out.shape}, expected ({self.total_atoms},4)")
+        return out
+
     def attach_pairff_faf(self, fit_result, z_init=3.5, k_z=0.0, enable=True):
         """Bind FAF substrate to this PairFF instance (dynamics + Vispy map).
 
         Raises all body CoMs to Z_SURF_TOP + z_init, sets k_z (default 0),
         init_folded with dummy sites skipped, stores ``faf_fit`` for map compose.
-        Fit ``atom_type_ids`` must match real-atom count of each molecule pack
-        (identical copies OK).
+        Typed fit ``atom_type_ids`` must match real-atom count. Factorized fits
+        derive PLQH from each pack's runtime REQ and skip dummy sites.
         """
-        from spammm.surfaces.FoldedRigid import Z_SURF_TOP
+        from spammm.surfaces.FoldedRigid import FAF_MODE_FACTOR, Z_SURF_TOP, faf_fit_mode
         fit_result = dict(fit_result)
         z = float(Z_SURF_TOP + z_init)
         out = self.download_outputs()
@@ -2284,11 +2434,17 @@ void rigid_body_pairff_energy_replica_kernel(
             epair_dist=ph.get('epair_dist', 1.4), sigma_dist=ph.get('sigma_dist', 1.0),
             mode=self.pairff_mode, beta=ph.get('beta', 1.7),
         )
-        atype = self._folded_types_all_sites(fit_result)
-        coeffs = np.asarray(fit_result['coeffs'], dtype=np.float32)
+        mode = faf_fit_mode(fit_result)
+        if mode == FAF_MODE_FACTOR:
+            atype = self._folded_plqh_all_sites(float(fit_result.get('alpha_morse', 1.8)))
+            coeffs = np.asarray(fit_result['coeffs4'], dtype=np.float32)
+            ntypes, nbasis = -1, int(coeffs.reshape(-1, 4).shape[0])
+        else:
+            atype = self._folded_types_all_sites(fit_result)
+            coeffs = np.asarray(fit_result['coeffs'], dtype=np.float32)
+            ntypes, nbasis = coeffs.shape
         kxyz = np.asarray(fit_result['basis_params'], dtype=np.float32)
         lvec2d = np.asarray(fit_result['folded_lvec2d'], dtype=np.float32)
-        ntypes, nbasis = coeffs.shape
         self.init_folded(coeffs, kxyz, atype, lvec2d,
                          folded_meta=np.array([nbasis, ntypes, 0, 0], dtype=np.int32))
         self.faf_fit = fit_result

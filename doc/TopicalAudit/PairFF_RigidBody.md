@@ -26,7 +26,7 @@ timestamp: 2026-07-28
 | OpenCL | `kernels/rigid.cl` 10–13 | active | Unified±FAF; **allmol** ± FAF (preferred multi) |
 | OpenCL | `kernels/rigid.cl` 14 | active | Replica×active energy channels plus fused real-atom/CoM clash flags for MC/GA; GTX 1650 PairFF/FAF parity and runtime tested |
 | Python | `RigidBodyDynamics.py` → `RigidBodyPairFF` | active | `from_molecules`, `set_active_body`, `attach_pairff_faf`, batched `greedy_energy_step`, `tip_pull_scan`, `world_sites_all_bodies` |
-| Python | `spammm/surfaces/FoldedRigid.py` | active | Fit/load; `eval_folded_potential_grid`; probe type pick |
+| Python | `spammm/surfaces/FoldedRigid.py` | experimental | Versioned typed-combined and substrate-only factorized-PLQH fit/load/eval; physical review pending |
 | Python | `spammm/surfaces/surface_plots.py` | experimental | Tip-pull movie helpers; **display scale not yet Vispy SSOT** |
 | Python/GUI | `spammm/GUI/RigidBodyVispy.py` | active | FIRE default ON; click→active; map PairFF[+FAF]; **`potential_to_rgba` = display SSOT** |
 | Demo | `demos/demo_pairff.py` | active | `--bodies`, `--mols`, `--faf`, `--faf-fit`, `--z-init` |
@@ -51,7 +51,7 @@ timestamp: 2026-07-28
 
 - **[Tomorrow]** Tip-pull / `surface_plots` map display must **reuse** Vispy compose + `potential_to_rgba` — no softclip reinvent ([`PairFF_MapDisplay_SSOT.md`](../Tasks/PairFF_MapDisplay_SSOT.md)).
 - XYZ PTCDA/PTCDI ship with `Q=0` → Coulomb/Hbond silent until QEq (physical sign: negate `solve_from_elements`; GUI QEq does not flip — SSOT TBD).
-- Per-atom QEq in FAF fit → too many types (`FOLDED_TYPES_MAX=8`); use element-mean `q_override`.
+- FAF now has two experimental paths: constrained charge-discretized typed fits and reusable factorized PLQH fits with exact runtime Q scaling. Backend parity is measured; adsorption-physics review is still pending ([architecture task](../Tasks/FAF_Fit_Architecture.md)).
 - No `data/xyz/NTCDA.xyz`; demo uses PTCDA as stand-in.
 - Main `SPAMMM_GUI` integration still design-only.
 - Shared rigid-molecule pose SSOT (`pos`+`qrot`) across PairFF / Assembly / FoldedRigid / PME — see [`RigidBody.md`](RigidBody.md) and [`Tasks/RigidMoleculePose_SSOT.md`](../Tasks/RigidMoleculePose_SSOT.md).

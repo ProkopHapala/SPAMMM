@@ -460,7 +460,7 @@ def _faf_probe_type(fit, probe_type='auto'):
 
     'auto'  → most-negative-Q row in fit['unique_REQs'] (shows the Na/Cl Coulomb
               checkerboard; a neutral probe like C only sees uniform Pauli repulsion).
-    int     → explicit type index.
+    int     → explicit type index (typed mode) or atom index (factorized mode).
     None    → skip FAF (caller decides).
     """
     if probe_type is None or fit is None:
@@ -519,17 +519,26 @@ def plot_assembly_on_substrate(ax, mol_apos, mol_enames, mol_bonds=None,
     plt.sca(ax)
     # 1) FAF substrate heatmap (charged probe → Na/Cl checkerboard visible)
     if draw_faf and fit is not None and z_eval is not None:
+        from spammm.surfaces.FoldedRigid import faf_fit_mode, FAF_MODE_FACTOR
+        mode = faf_fit_mode(fit)
         ityp = _faf_probe_type(fit, probe_type)
         if ityp is not None:
             xs = np.linspace(xmin, xmax, ngrid)
             ys = np.linspace(ymin, ymax, ngrid)
-            V = eval_folded_potential_grid(fit, ityp, xs, ys, z_eval)
+            if mode == FAF_MODE_FACTOR:
+                # Factorized: show the substrate Coulomb potential (coulomb_phi).
+                # This is molecule-independent (no Q scaling) and always non-zero,
+                # so the Na/Cl checkerboard is visible regardless of molecule charges.
+                V = eval_folded_potential_grid(fit, 0, xs, ys, z_eval, component='coulomb_phi')
+                qlab = 'phi_sub'
+            else:
+                V = eval_folded_potential_grid(fit, ityp, xs, ys, z_eval)
+                ureq = np.asarray(fit.get('unique_REQs', []), dtype=np.float64)
+                qlab = f'Q={ureq[ityp, 2]:+.2f}' if len(ureq) else f'type {ityp}'
             vmax = max(abs(np.nanmin(V)), abs(np.nanmax(V)), 1e-9)
             im = ax.imshow(V, extent=(xmin, xmax, ymin, ymax), origin='lower',
                            cmap='RdBu_r', vmin=-vmax, vmax=vmax,
                            aspect='equal', interpolation='bilinear', alpha=0.7)
-            ureq = np.asarray(fit.get('unique_REQs', []), dtype=np.float64)
-            qlab = f'Q={ureq[ityp, 2]:+.2f}' if len(ureq) else f'type {ityp}'
             plt.colorbar(im, ax=ax, fraction=0.04, pad=0.02, label=f'V_FAF({qlab}) [eV]')
 
     # 2) Substrate ions (Na=goldenrod, Cl=green) — the checkerboard the user sees

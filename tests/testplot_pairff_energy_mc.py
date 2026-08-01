@@ -58,18 +58,11 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from spammm.AtomicSystem import AtomicSystem
-from spammm.forcefields.QEq import solve_from_elements
-from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF, _body_sites_world
+from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF, _body_sites_world, load_molecule
 from spammm.forcefields.RigidEnsemble import RigidEnsemble
-from spammm.forcefields.molecule_loaders import (
-    MOL_PATHS, FAF_FITS, FAF_FIT_DEFAULT, LOADERS,
-    load_ntcdi, load_ptcda, load_formic_acid, load_terephthalic_acid,
-    load_uracil, load_adenine, load_azaindol, load_tbtap,
-    remap_fit_for_molecule, bonds_from_geom,
-)
 from spammm.surfaces.FoldedRigid import (
-    load_fit, save_fit, fit_folded_for_molecule,
     Z_SURF_TOP, NACL_SUBSTRATE, load_substrate, replicate_substrate,
+    remap_fit_for_molecule,
 )
 from spammm.surfaces.surface_plots import plot_assembly_on_substrate
 
@@ -237,6 +230,9 @@ def main():
     ap.add_argument('--k-pack', type=float, default=0.03, help='centripetal packing spring [eV/Å²]')
     ap.add_argument('--no-qeq', action='store_true', help='keep XYZ charges (usually 0)')
     ap.add_argument('--no-faf', action='store_true', help='disable FAF substrate (vacuum)')
+    ap.add_argument('--faf-mode', type=str, default='auto', choices=['auto', 'typed', 'factorized'],
+                    help='FAF fit mode: typed (per-type combined, with charge discretization), '
+                         'factorized (per-atom PLQH mixing, substrate-only Coulomb), or auto (pick by availability)')
     ap.add_argument('--z-init', type=float, default=3.0, help='initial height above NaCl surface [Å]')
     # Output control
     ap.add_argument('--no-plot', action='store_true', help='skip all plotting (pure performance benchmark)')
@@ -251,29 +247,35 @@ def main():
     mol_names = [m.strip() for m in args.mol.split(',')]
     is_multi = len(mol_names) > 1
     mol_label = '+'.join(mol_names) if is_multi else mol_names[0]
-    OUT = os.path.join(OUT_ROOT, mol_label.replace(',', '_'))
+    faf_tag = 'nofaf' if args.no_faf else args.faf_mode
+    OUT = os.path.join(OUT_ROOT, f'{mol_label.replace(",", "_")}_{faf_tag}')
     os.makedirs(OUT, exist_ok=True)
-    print(f'=== MC assembly START  mol={mol_label}  nmol={args.nmol}  steps={args.steps}  ntrial={args.ntrial}  FAF={"off" if args.no_faf else "on"}  → {OUT}', flush=True)
+    print(f'=== MC assembly START  mol={mol_label}  nmol={args.nmol}  steps={args.steps}  ntrial={args.ntrial}  FAF={faf_tag}  → {OUT}', flush=True)
 
-    LOADERS = {
-        'NTCDI':             lambda: load_ntcdi(),
-        'PTCDA':             lambda: load_ptcda(qeq=not args.no_qeq),
-        'formic_acid':       lambda: load_formic_acid(qeq=not args.no_qeq),
-        'terephthalic_acid': lambda: load_terephthalic_acid(qeq=not args.no_qeq),
-        'TBTAP':             lambda: load_tbtap(qeq=not args.no_qeq),
-        'azaindol':          lambda: load_azaindol(qeq=not args.no_qeq),
-        'uracil':            lambda: load_uracil(qeq=not args.no_qeq),
-        'adenine':           lambda: load_adenine(qeq=not args.no_qeq),
+    # Molecule paths + QEq defaults (NTCDI uses mol2 file charges, not QEq)
+    _MOL_DIR = os.path.join(REPO, 'data', 'mol')
+    _XYZ_DIR = os.path.join(REPO, 'data', 'xyz')
+    MOL_PATHS = {
+        'NTCDI':             os.path.join(_MOL_DIR, 'NTCDI.mol2'),
+        'TBTAP':             os.path.join(_MOL_DIR, 'TBTAP.mol2'),
+        'PTCDA':             os.path.join(_XYZ_DIR, 'PTCDA.xyz'),
+        'formic_acid':       os.path.join(_XYZ_DIR, 'HCOOH.xyz'),
+        'terephthalic_acid': os.path.join(_XYZ_DIR, 'terephthalic_acid.xyz'),
+        'azaindol':          os.path.join(_XYZ_DIR, 'azaindol.xyz'),
+        'uracil':            os.path.join(_XYZ_DIR, 'uracil.xyz'),
+        'adenine':           os.path.join(_XYZ_DIR, 'adenine.xyz'),
     }
+    # NTCDI.mol2 has good file charges; others use QEq
+    _NO_QEQ = {'NTCDI'}
     for mn in mol_names:
-        if mn not in LOADERS:
-            raise ValueError(f'unknown molecule {mn!r}; available: {list(LOADERS.keys())}')
+        if mn not in MOL_PATHS:
+            raise ValueError(f'unknown molecule {mn!r}; available: {list(MOL_PATHS.keys())}')
 
     # Load each species
     species = []
     for mn in mol_names:
         print(f'Loading {mn}...')
-        species.append(LOADERS[mn]())
+        species.append(load_molecule(MOL_PATHS[mn], qeq=(mn not in _NO_QEQ) and (not args.no_qeq), name=mn))
 
     # Build molecules list: nmol copies of each species, interleaved on the grid
     n_total = args.nmol * len(species)
@@ -290,49 +292,44 @@ def main():
     fit = None
     z_mol = 0.0
     if not args.no_faf:
-        # For multi-species: use the default fit (ptcdi has C,N,O,H — broadest)
-        # For single-species: use the species-specific fit if available
-        if is_multi:
-            fit_path = FAF_FIT_DEFAULT
-        elif mol_names[0] in FAF_FITS:
-            fit_path = FAF_FITS[mol_names[0]]
+        from spammm.surfaces.FoldedRigid import load_or_fit_faf, faf_fit_mode, FAF_MODE_TYPED, FAF_MODE_FACTOR
+        # Resolve requested mode: 'auto' → prefer factorized (substrate-only, exact Coulomb)
+        faf_mode_req = args.faf_mode
+        if faf_mode_req == 'auto':
+            faf_mode_req = 'factorized'
+        faf_mode_key = FAF_MODE_TYPED if faf_mode_req == 'typed' else FAF_MODE_FACTOR
+        # Single shared entry point: load_or_fit_faf handles QEq + cache + fit.
+        # No duplication, no silent fallback.
+        fit_apos, fit_enames, fit_REQs, _ = species[0]
+        charge_disc = 'element_sign' if faf_mode_key == FAF_MODE_TYPED else None
+        fit = load_or_fit_faf((fit_apos, fit_enames, fit_REQs), mol_name=mol_names[0],
+                              fit_mode=faf_mode_key, charge_discretization=charge_disc)
+        mode = faf_fit_mode(fit)
+        if mode == FAF_MODE_TYPED:
+            # Remap each species and concatenate atom_type_ids
+            at_ids_parts = []
+            for sp_idx, (apos, enames, REQs, _) in enumerate(species):
+                sp_fit = remap_fit_for_molecule(fit, REQs)
+                at_ids_parts.append(sp_fit['atom_type_ids'])
+                print(f'  FAF remap {mol_names[sp_idx]}: {sp_fit["atom_type_ids"]}')
+            tiled_parts = []
+            for sp_idx in range(len(species)):
+                n_real = len(at_ids_parts[sp_idx])
+                for _ in range(args.nmol):
+                    tiled_parts.append(at_ids_parts[sp_idx])
+            fit['atom_type_ids'] = np.concatenate(tiled_parts).astype(np.int32)
+            ntypes = fit['coeffs'].shape[0]
+            nbasis = fit['coeffs'].shape[1]
         else:
-            fit_path = FAF_FIT_DEFAULT
-        # Auto-fit + cache if the fit file is missing (same pattern as
-        # demo_pairff._load_or_fit_faf / testplot_ptcda_nacl_replicas._ensure_fit).
-        if not os.path.isfile(fit_path):
-            # Auto-fit: use the species XYZ if available, else PTCDA.xyz (broad C,N,O,H).
-            # .mol2 files (e.g. NTCDI, TBTAP) can't be fit directly — fit_folded_for_molecule
-            # needs XYZ; the ptcdi/ptcda fit covers C,N,O,H and remap handles the rest.
-            mol_xyz = MOL_PATHS.get(mol_names[0] if not is_multi else 'PTCDA', MOL_PATHS['PTCDA'])
-            if not mol_xyz.endswith('.xyz'):
-                mol_xyz = MOL_PATHS['PTCDA']
-            print(f'FAF fit missing: {fit_path}  → fitting {mol_xyz} on NaCl (first run, ~10-60s)...', flush=True)
-            os.makedirs(os.path.dirname(fit_path) or '.', exist_ok=True)
-            t0 = time.perf_counter()
-            new_fit = fit_folded_for_molecule(mol_xyz, substrate_file=NACL_SUBSTRATE, z_range_rel=(1.5, 8.0))
-            save_fit(new_fit, fit_path)
-            print(f'  fit done in {time.perf_counter()-t0:.1f}s  ntypes={new_fit["coeffs"].shape[0]}  → {fit_path}')
-        fit = load_fit(fit_path)
-        # Remap each species and concatenate atom_type_ids
-        at_ids_parts = []
-        for sp_idx, (apos, enames, REQs, _) in enumerate(species):
-            sp_fit = remap_fit_for_molecule(fit, REQs)
-            n_real = int((np.asarray(REQs)[:, 3] >= 0).sum())  # all REQs are real atoms
-            at_ids_parts.append(sp_fit['atom_type_ids'])
-            print(f'  FAF remap {mol_names[sp_idx]}: {sp_fit["atom_type_ids"]}')
-        fit['atom_type_ids'] = np.concatenate(at_ids_parts).astype(np.int32)
-        # For multi-species, tile the per-species IDs nmol times
-        # _folded_types_all_sites slices per pack, so we need total = nmol * n_real_per_species
-        tiled_parts = []
-        for sp_idx in range(len(species)):
-            n_real = len(at_ids_parts[sp_idx])
-            for _ in range(args.nmol):
-                tiled_parts.append(at_ids_parts[sp_idx])
-        fit['atom_type_ids'] = np.concatenate(tiled_parts).astype(np.int32)
+            # Factorized: atom_type_ids are zeros (all atoms use the single substrate fit);
+            # runtime PLQH is derived per-atom from REQs in attach_pairff_faf.
+            n_real_total = sum(len(sp[2]) for sp in species) * args.nmol
+            fit['atom_type_ids'] = np.zeros(n_real_total, dtype=np.int32)
+            ntypes = 1
+            nbasis = fit['coeffs4'].shape[0]
         z_mol = Z_SURF_TOP + args.z_init
-        print(f'FAF: loaded {fit_path}  ntypes={fit["coeffs"].shape[0]}  '
-              f'nbasis={fit["coeffs"].shape[1]}  z_mol={z_mol:.2f} Å  '
+        print(f'FAF: mode={mode}  ntypes={ntypes}  '
+              f'nbasis={nbasis}  z_mol={z_mol:.2f} Å  '
               f'total_atom_type_ids={fit["atom_type_ids"].shape[0]}')
 
     # Substrate ions (Na/Cl) for visualization — load + replicate to the grid extent.

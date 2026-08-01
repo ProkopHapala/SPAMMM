@@ -185,7 +185,7 @@ def test_graph_to_rigid_fragments():
     """graph_to_rigid_fragments splits a graph into connected components with CoM + rel positions."""
     from spammm import elements
     from spammm.topology.AtomicGraph import AtomicGraph
-    from spammm.forcefields.molecule_loaders import graph_to_rigid_fragments
+    from spammm.forcefields.RigidBodyDynamics import graph_to_rigid_fragments
 
     g = AtomicGraph()
     # Fragment 1: H2O (O at 0, H at ±1)

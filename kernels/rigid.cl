@@ -851,6 +851,13 @@ inline float3 folded_eval_grad_rigid(float u, float v, float z, float4 prm, floa
     return (float3)( dEdu*dudx + dEdv*dvdx, dEdu*dudy + dEdv*dvdy, dEdz );
 }
 
+// folded_meta.y > 0: legacy typed scalar coefficients.
+// folded_meta.y < 0: one substrate-only float4 coefficient per basis and
+// runtime atom PLQH stored in the folded_atom_type buffer.
+inline float folded_coeff_rigid(__local const float* coeffs, int ib, int nbasis, int ityp, float4 plqh, int factorized){
+    return factorized ? dot(vload4(ib, coeffs), plqh) : coeffs[ityp*nbasis + ib];
+}
+
 // ==================================================================
 //  Kernel: rigid_body_folded_kernel  — MD / FIRE, one body per workgroup
 // ==================================================================
@@ -909,7 +916,8 @@ void rigid_body_folded_kernel(
     const int ia0 = mols[gid];
     const int na  = mols[gid+1]-ia0;
     const int nbasis = folded_meta.x;
-    const int ntypes = folded_meta.y;
+    const int factorized = (folded_meta.y < 0);
+    const int ntypes = factorized ? 1 : folded_meta.y;
     const float damp0_lin = md_params.x, damp0_ang = md_params.y;
     const float dtmin = dt * 0.1f, dtmax = dt * 10.0f;
     const int use_fire = (md_params.w < 0.0f);
@@ -935,7 +943,8 @@ void rigid_body_folded_kernel(
     for (int j = lid; j < nbasis; j += lsize) {
         LBASIS[j] = folded_kxyz[j];
     }
-    for (int j = lid; j < nbasis * ntypes; j += lsize) {
+    const int ncoeff = factorized ? nbasis*4 : nbasis*ntypes;
+    for (int j = lid; j < ncoeff; j += lsize) {
         LCOEFFS[j] = folded_coeffs[j];
     }
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -977,11 +986,11 @@ void rigid_body_folded_kernel(
             // Evaluate folded basis potential and gradient for this atom's type
             float E = 0.0f;
             float3 f = (float3)(0.0f, 0.0f, 0.0f);
-            const int ityp = folded_atom_type[atom_idx];
-            if (ityp >= 0 && ityp < ntypes) {
-                int ioff = ityp * nbasis;
+            const int ityp = factorized ? 0 : folded_atom_type[atom_idx];
+            const float4 plqh = factorized ? ((__global const float4*)folded_atom_type)[atom_idx] : (float4)(0.0f);
+            if (factorized || (ityp >= 0 && ityp < ntypes)) {
                 for (int ib = 0; ib < nbasis; ib++) {
-                    float c = LCOEFFS[ioff + ib];
+                    float c = folded_coeff_rigid(LCOEFFS, ib, nbasis, ityp, plqh, factorized);
                     float4 prm = LBASIS[ib];
                     float  b = folded_eval_basis_rigid(u, v, p_world.z, prm);
                     float3 g = folded_eval_grad_rigid (u, v, p_world.z, prm, invLvec2d);
@@ -1110,13 +1119,15 @@ __kernel void rigid_body_folded_replicas_kernel(
     const int lid = get_local_id(0);
     const int lsize = get_local_size(0);
     const int nbasis = folded_meta.x;
-    const int ntypes = folded_meta.y;
+    const int factorized = (folded_meta.y < 0);
+    const int ntypes = factorized ? 1 : folded_meta.y;
     const int na     = folded_meta.z;
     const int n_rep  = folded_meta.w;
 
     // ---- Local memory: shared molecule data (loaded once) ----
     __local float4 s_apos_body[MAX_ATOMS_PER_BODY];
     __local int    s_atom_type[MAX_ATOMS_PER_BODY];
+    __local float4 s_atom_plqh[MAX_ATOMS_PER_BODY];
     __local cl_Mat3 s_Iinv;
     __local cl_Mat3 s_Ibody;
     __local float4 LBASIS[FOLDED_BASIS_MAX_RIGID];
@@ -1124,9 +1135,13 @@ __kernel void rigid_body_folded_replicas_kernel(
 
     // ---- Cooperative load of shared data ----
     for (int i = lid; i < na;     i += lsize) s_apos_body[i]  = apos_body[i];
-    for (int i = lid; i < na;     i += lsize) s_atom_type[i]  = folded_atom_type[i];
+    for (int i = lid; i < na;     i += lsize) {
+        if (factorized) s_atom_plqh[i] = ((__global const float4*)folded_atom_type)[i];
+        else            s_atom_type[i] = folded_atom_type[i];
+    }
     for (int j = lid; j < nbasis; j += lsize) LBASIS[j]       = folded_kxyz[j];
-    for (int j = lid; j < nbasis * ntypes; j += lsize) LCOEFFS[j] = folded_coeffs[j];
+    const int ncoeff = factorized ? nbasis*4 : nbasis*ntypes;
+    for (int j = lid; j < ncoeff; j += lsize) LCOEFFS[j] = folded_coeffs[j];
     if (lid == 0) {
         s_Iinv.a  = I_body_inv[0].a;  s_Iinv.b  = I_body_inv[0].b;  s_Iinv.c  = I_body_inv[0].c;
         s_Ibody.a = I_body[0].a;      s_Ibody.b = I_body[0].b;      s_Ibody.c = I_body[0].c;
@@ -1188,11 +1203,11 @@ __kernel void rigid_body_folded_replicas_kernel(
             v = v - floor(v);
 
             float3 f = (float3)(0.0f);
-            int ityp = s_atom_type[ia];
-            if (ityp >= 0 && ityp < ntypes) {
-                int ioff = ityp * nbasis;
+            int ityp = factorized ? 0 : s_atom_type[ia];
+            float4 plqh = factorized ? s_atom_plqh[ia] : (float4)(0.0f);
+            if (factorized || (ityp >= 0 && ityp < ntypes)) {
                 for (int ib = 0; ib < nbasis; ib++) {
-                    float c = LCOEFFS[ioff + ib];
+                    float c = folded_coeff_rigid(LCOEFFS, ib, nbasis, ityp, plqh, factorized);
                     float4 prm = LBASIS[ib];
                     float3 g = folded_eval_grad_rigid(u, v, p_world.z, prm, invLvec2d);
                     f -= c * g;
@@ -1264,11 +1279,11 @@ __kernel void rigid_body_folded_replicas_kernel(
 
         float E = 0.0f;
         float3 f = (float3)(0.0f);
-        int ityp = s_atom_type[ia];
-        if (ityp >= 0 && ityp < ntypes) {
-            int ioff = ityp * nbasis;
+        int ityp = factorized ? 0 : s_atom_type[ia];
+        float4 plqh = factorized ? s_atom_plqh[ia] : (float4)(0.0f);
+        if (factorized || (ityp >= 0 && ityp < ntypes)) {
             for (int ib = 0; ib < nbasis; ib++) {
-                float c = LCOEFFS[ioff + ib];
+                float c = folded_coeff_rigid(LCOEFFS, ib, nbasis, ityp, plqh, factorized);
                 float4 prm = LBASIS[ib];
                 float  b = folded_eval_basis_rigid(u, v, p_world.z, prm);
                 float3 g = folded_eval_grad_rigid (u, v, p_world.z, prm, invLvec2d);
@@ -2838,7 +2853,8 @@ void rigid_body_pairff_unified_faf_kernel(
     float damp_lin = resume_fire ? fstate.z : md_params.x, damp_ang = resume_fire ? fstate.w : md_params.y;
     const float inv_beta_n = 8.0f / fmax(beta, 1e-6f);
     const int nbasis = folded_meta.x;
-    const int ntypes = folded_meta.y;
+    const int factorized = (folded_meta.y < 0);
+    const int ntypes = factorized ? 1 : folded_meta.y;
 
     if (lid == 0) {
         pos      = poss[gid];
@@ -2859,7 +2875,8 @@ void rigid_body_pairff_unified_faf_kernel(
         Lstatic_g[j]   = (static_type[j] == 0) ? 1.0f : 0.0f;
     }
     for (int j = lid; j < nbasis; j += lsize) LBASIS[j] = folded_kxyz[j];
-    for (int j = lid; j < nbasis * ntypes; j += lsize) LCOEFFS[j] = folded_coeffs[j];
+    const int ncoeff = factorized ? nbasis*4 : nbasis*ntypes;
+    for (int j = lid; j < ncoeff; j += lsize) LCOEFFS[j] = folded_coeffs[j];
     barrier(CLK_LOCAL_MEM_FENCE);
 
     float ax = folded_lvec2d.x, bx = folded_lvec2d.y, ay = folded_lvec2d.z, by = folded_lvec2d.w;
@@ -2914,15 +2931,15 @@ void rigid_body_pairff_unified_faf_kernel(
                 }
             }
 
-            const int ityp = folded_atom_type[ia];
-            if (ityp >= 0 && ityp < ntypes) {
+            const int ityp = factorized ? 0 : folded_atom_type[ia];
+            const float4 plqh = factorized ? ((__global const float4*)folded_atom_type)[ia] : (float4)(0.0f);
+            if ((factorized && dyn_type[ia] == 0) || (!factorized && ityp >= 0 && ityp < ntypes)) {
                 float u = invLvec2d.x*p_world.x + invLvec2d.y*p_world.y;
                 float v = invLvec2d.z*p_world.x + invLvec2d.w*p_world.y;
                 u = u - floor(u);
                 v = v - floor(v);
-                int ioff = ityp * nbasis;
                 for (int ib = 0; ib < nbasis; ib++) {
-                    float c = LCOEFFS[ioff + ib];
+                    float c = folded_coeff_rigid(LCOEFFS, ib, nbasis, ityp, plqh, factorized);
                     float4 prm = LBASIS[ib];
                     float  b = folded_eval_basis_rigid(u, v, p_world.z, prm);
                     float3 g = folded_eval_grad_rigid (u, v, p_world.z, prm, invLvec2d);
@@ -3074,7 +3091,8 @@ void rigid_body_pairff_unified_env_faf_kernel(
     float damp_lin = resume_fire ? fstate.z : md_params.x, damp_ang = resume_fire ? fstate.w : md_params.y;
     const float inv_beta_n = 8.0f / fmax(beta, 1e-6f);
     const int nbasis = folded_meta.x;
-    const int ntypes = folded_meta.y;
+    const int factorized = (folded_meta.y < 0);
+    const int ntypes = factorized ? 1 : folded_meta.y;
 
     if (lid == 0) {
         pos      = poss[gid];
@@ -3090,7 +3108,8 @@ void rigid_body_pairff_unified_env_faf_kernel(
         Ibody.c     = I_body[gid].c;
     }
     for (int j = lid; j < nbasis; j += lsize) LBASIS[j] = folded_kxyz[j];
-    for (int j = lid; j < nbasis * ntypes; j += lsize) LCOEFFS[j] = folded_coeffs[j];
+    const int ncoeff = factorized ? nbasis*4 : nbasis*ntypes;
+    for (int j = lid; j < ncoeff; j += lsize) LCOEFFS[j] = folded_coeffs[j];
     barrier(CLK_LOCAL_MEM_FENCE);
 
     float ax = folded_lvec2d.x, bx = folded_lvec2d.y, ay = folded_lvec2d.z, by = folded_lvec2d.w;
@@ -3189,15 +3208,15 @@ void rigid_body_pairff_unified_env_faf_kernel(
             const float3 r_world = r_store[i];
             const int ia = ia_store[i];
 
-            const int ityp = folded_atom_type[ia];
-            if (ityp >= 0 && ityp < ntypes) {
+            const int ityp = factorized ? 0 : folded_atom_type[ia];
+            const float4 plqh = factorized ? ((__global const float4*)folded_atom_type)[ia] : (float4)(0.0f);
+            if ((factorized && dyn_type[ia] == 0) || (!factorized && ityp >= 0 && ityp < ntypes)) {
                 float u = invLvec2d.x*p_world.x + invLvec2d.y*p_world.y;
                 float v = invLvec2d.z*p_world.x + invLvec2d.w*p_world.y;
                 u = u - floor(u);
                 v = v - floor(v);
-                int ioff = ityp * nbasis;
                 for (int ib = 0; ib < nbasis; ib++) {
-                    float c = LCOEFFS[ioff + ib];
+                    float c = folded_coeff_rigid(LCOEFFS, ib, nbasis, ityp, plqh, factorized);
                     float4 prm = LBASIS[ib];
                     float  b = folded_eval_basis_rigid(u, v, p_world.z, prm);
                     float3 g = folded_eval_grad_rigid (u, v, p_world.z, prm, invLvec2d);
@@ -3609,7 +3628,8 @@ void rigid_body_pairff_unified_allmol_faf_kernel(
     float damp_lin = resume_fire ? fstate.z : md_params.x, damp_ang = resume_fire ? fstate.w : md_params.y;
     const float inv_beta_n = 8.0f / fmax(beta, 1e-6f);
     const int nbasis = folded_meta.x;
-    const int ntypes = folded_meta.y;
+    const int factorized = (folded_meta.y < 0);
+    const int ntypes = factorized ? 1 : folded_meta.y;
 
     if (lid == 0) {
         pos      = poss[a];
@@ -3625,7 +3645,8 @@ void rigid_body_pairff_unified_allmol_faf_kernel(
         Ibody.c     = I_body[a].c;
     }
     for (int ib = lid; ib < nbasis; ib += lsize) LBASIS[ib] = folded_kxyz[ib];
-    for (int ib = lid; ib < nbasis * ntypes; ib += lsize) LCOEFFS[ib] = folded_coeffs[ib];
+    const int ncoeff = factorized ? nbasis*4 : nbasis*ntypes;
+    for (int ib = lid; ib < ncoeff; ib += lsize) LCOEFFS[ib] = folded_coeffs[ib];
     barrier(CLK_LOCAL_MEM_FENCE);
 
     float ax = folded_lvec2d.x, bx = folded_lvec2d.y, ay = folded_lvec2d.z, by = folded_lvec2d.w;
@@ -3728,14 +3749,14 @@ void rigid_body_pairff_unified_allmol_faf_kernel(
             const float3 p_world = p_store[i];
             const float3 r_world = r_store[i];
             const int ia = ia_store[i];
-            const int ityp = folded_atom_type[ia];
-            if (ityp >= 0 && ityp < ntypes) {
+            const int ityp = factorized ? 0 : folded_atom_type[ia];
+            const float4 plqh = factorized ? ((__global const float4*)folded_atom_type)[ia] : (float4)(0.0f);
+            if ((factorized && dyn_type[ia] == 0) || (!factorized && ityp >= 0 && ityp < ntypes)) {
                 float u = invLvec2d.x*p_world.x + invLvec2d.y*p_world.y;
                 float v = invLvec2d.z*p_world.x + invLvec2d.w*p_world.y;
                 u = u - floor(u); v = v - floor(v);
-                int ioff = ityp * nbasis;
                 for (int ib = 0; ib < nbasis; ib++) {
-                    float c = LCOEFFS[ioff + ib];
+                    float c = folded_coeff_rigid(LCOEFFS, ib, nbasis, ityp, plqh, factorized);
                     float4 prm = LBASIS[ib];
                     E += c * folded_eval_basis_rigid(u, v, p_world.z, prm);
                     f -= c * folded_eval_grad_rigid(u, v, p_world.z, prm, invLvec2d);
@@ -3871,7 +3892,8 @@ void rigid_body_pairff_energy_replica_kernel(
     const int na     = mols[ia+1] - ia0;
     const int ipose0 = irepl * nmol;
     const int nbasis = folded_meta.x;
-    const int ntypes = folded_meta.y;
+    const int factorized = (folded_meta.y < 0);
+    const int ntypes = factorized ? 1 : folded_meta.y;
     const float k_z  = pairff_params.w;
     const float inv_beta_n = 8.0f / fmax(beta, 1e-6f);
 
@@ -3906,6 +3928,7 @@ void rigid_body_pairff_energy_replica_kernel(
 
         float4 own_pos[RIGID_ENERGY_SITES_PER_THREAD];
         float4 own_REQ[RIGID_ENERGY_SITES_PER_THREAD];
+        float4 own_faf[RIGID_ENERGY_SITES_PER_THREAD];
         int    own_type[RIGID_ENERGY_SITES_PER_THREAD];
         int nown = 0;
         for (int i = 0; i < RIGID_ENERGY_SITES_PER_THREAD; i++) {
@@ -3915,7 +3938,8 @@ void rigid_body_pairff_energy_replica_kernel(
             const float3 pw = Lpos.xyz + rotate_vec_by_matrix(apos_body[isite].xyz, &LR);
             own_pos[nown]  = (float4)(pw, (dyn_type[isite] == 0) ? 1.0f : 0.0f);
             own_REQ[nown]  = dyn_REQ[isite];
-            own_type[nown] = (nbasis > 0) ? folded_atom_type[isite] : -1;
+            own_type[nown] = (nbasis > 0 && !factorized) ? folded_atom_type[isite] : -1;
+            own_faf[nown]  = (nbasis > 0 && factorized) ? ((__global const float4*)folded_atom_type)[isite] : (float4)(0.0f);
             nown++;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -3988,21 +4012,29 @@ void rigid_body_pairff_energy_replica_kernel(
             for (int ibase = 0; ibase < nbasis; ibase += RIGID_ENERGY_FAF_TILE) {
                 const int nbt = min(RIGID_ENERGY_FAF_TILE, nbasis - ibase);
                 for (int ib = lid; ib < nbt; ib += RIGID_ENERGY_WG) Lsite[ib] = folded_kxyz[ibase + ib];
-                for (int it = 0; it < ntypes; it++) {
-                    for (int ib = lid; ib < nbt; ib += RIGID_ENERGY_WG) Lparam[it*nbt + ib] = folded_coeffs[it*nbasis + ibase + ib];
+                if (factorized) {
+                    for (int ic = lid; ic < nbt*4; ic += RIGID_ENERGY_WG) Lparam[ic] = folded_coeffs[ibase*4 + ic];
+                } else {
+                    for (int it = 0; it < ntypes; it++) {
+                        for (int ib = lid; ib < nbt; ib += RIGID_ENERGY_WG) Lparam[it*nbt + ib] = folded_coeffs[it*nbasis + ibase + ib];
+                    }
                 }
                 barrier(CLK_LOCAL_MEM_FENCE);
 
                 for (int i = 0; i < nown; i++) {
-                    const int ityp = own_type[i];
-                    if (ityp >= 0 && ityp < ntypes) {
+                    const int ityp = factorized ? 0 : own_type[i];
+                    if ((factorized && own_pos[i].w > 0.5f) || (!factorized && ityp >= 0 && ityp < ntypes)) {
                         const float3 p = own_pos[i].xyz;
                         float u = invLvec2d.x*p.x + invLvec2d.y*p.y;
                         float v = invLvec2d.z*p.x + invLvec2d.w*p.y;
                         u -= floor(u);
                         v -= floor(v);
-                        const int ioff = ityp * nbt;
-                        for (int ib = 0; ib < nbt; ib++) E_one += Lparam[ioff + ib] * folded_eval_basis_rigid(u, v, p.z, Lsite[ib]);
+                        if (factorized) {
+                            for (int ib = 0; ib < nbt; ib++) E_one += dot(vload4(ib, Lparam), own_faf[i]) * folded_eval_basis_rigid(u, v, p.z, Lsite[ib]);
+                        } else {
+                            const int ioff = ityp * nbt;
+                            for (int ib = 0; ib < nbt; ib++) E_one += Lparam[ioff + ib] * folded_eval_basis_rigid(u, v, p.z, Lsite[ib]);
+                        }
                     }
                 }
                 barrier(CLK_LOCAL_MEM_FENCE);

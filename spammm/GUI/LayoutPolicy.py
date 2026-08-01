@@ -34,10 +34,10 @@ MARGIN = 0          # eliminate margins — tightest possible
 SPACING = 1         # minimal spacing between widgets
 ROW_SPACING = 1     # between rows in vertical layouts
 
-# No max width caps — widgets should be natural size (size policy = Maximum)
-# Buttons/labels/combos shrink to fit their text content.
-# Spinboxes keep a small cap since they have excessive default width.
-SPIN_MAX_WIDTH = 55
+# Spinboxes: wide enough to show values (5-6 digits + arrows), but capped
+# so they don't take excessive space. With Preferred policy they fill
+# available space up to this cap.
+SPIN_MAX_WIDTH = 70
 
 # Backward-compat aliases (deprecated — use setSizePolicy(Maximum, Fixed) instead)
 BUTTON_MAX_WIDTH = 9999  # effectively no cap — size policy controls width
@@ -194,9 +194,118 @@ def tight_spin(value=0.0, step=0.1, max_width=SPIN_MAX_WIDTH,
 
 
 def tight_combo(items=None, parent=None):
-    """Create a QComboBox at natural width (no expansion)."""
+    """Create a QComboBox that shows full content (Preferred policy)."""
     cb = QtWidgets.QComboBox(parent)
-    cb.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+    cb.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+    cb.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
     if items:
         cb.addItems(items)
     return cb
+
+
+# ---------------------------------------------------------------------------
+# TIGHT_STYLESHEET — global Qt stylesheet that shrinks intrinsic widget sizes
+# ---------------------------------------------------------------------------
+# This is the PRIMARY layout-tightening mechanism. Qt's default widget padding
+# (6px for buttons, 4px for spinboxes, etc.) makes widgets far wider than their
+# text content. This stylesheet eliminates that padding globally, so widgets
+# are only as wide as their actual text + minimal chrome.
+#
+# Combined with Maximum size policy (via enforce_tight), widgets become
+# truly minimal-width: text content + 1-2px padding.
+TIGHT_STYLESHEET = """
+QPushButton {
+    padding: 1px 4px;
+    min-width: 0;
+}
+QSpinBox, QDoubleSpinBox {
+    padding: 0px 2px;
+    min-width: 0;
+}
+QComboBox {
+    padding: 0px 4px;
+    min-width: 0;
+}
+QComboBox QAbstractItemView {
+    padding: 0px;
+}
+QLabel {
+    padding: 0px;
+    margin: 0px;
+}
+QCheckBox {
+    padding: 0px;
+    spacing: 2px;
+}
+QGroupBox {
+    padding: 0px;
+    margin: 0px;
+    border: 1px solid #888;
+}
+QGroupBox::title {
+    padding: 0px 2px;
+}
+QToolButton {
+    padding: 0px 2px;
+    min-width: 0;
+}
+QSlider {
+    padding: 0px;
+    margin: 0px;
+}
+QScrollBar:vertical {
+    width: 8px;
+}
+QScrollBar:horizontal {
+    height: 8px;
+}
+QScrollArea {
+    border: none;
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# enforce_tight — recursive sweep that forces Maximum size policy on all widgets
+# ---------------------------------------------------------------------------
+def enforce_tight(widget):
+    """Set appropriate size policy on ALL widgets in the tree.
+
+    ROBUST enforcement — runs AFTER the entire UI is built, catches everything.
+
+    Policy per widget type:
+      - Buttons, Labels, Checkboxes: Maximum (natural width, no expansion)
+      - Combos, Spinboxes: Preferred (show full content, fill available space)
+        — these must be READABLE, not squeezed to 1-2 chars
+
+    Uses findChildren() which returns ALL descendants recursively.
+
+    Call this after initUI() in SPAMMM_GUI and after each build_ui() in
+    ExtensionManager.
+    """
+    Max = QtWidgets.QSizePolicy.Maximum
+    Fixed = QtWidgets.QSizePolicy.Fixed
+    Pref = QtWidgets.QSizePolicy.Preferred
+
+    # Buttons, labels, checkboxes → Maximum (natural width, don't expand)
+    for w in widget.findChildren(QtWidgets.QPushButton):
+        w.setSizePolicy(Max, Fixed)
+    for w in widget.findChildren(QtWidgets.QToolButton):
+        w.setSizePolicy(Max, Fixed)
+    for w in widget.findChildren(QtWidgets.QLabel):
+        w.setSizePolicy(Max, Fixed)
+    for w in widget.findChildren(QtWidgets.QCheckBox):
+        w.setSizePolicy(Max, Fixed)
+
+    # Combos, spinboxes, lineedits → Preferred (show content, fill space)
+    # These must be READABLE — don't squeeze them to minimum width.
+    for w in widget.findChildren(QtWidgets.QComboBox):
+        w.setSizePolicy(Pref, Fixed)
+        # Size to contents, not to minimum — so the full text is visible
+        w.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+    for w in widget.findChildren(QtWidgets.QSpinBox):
+        w.setSizePolicy(Pref, Fixed)
+    for w in widget.findChildren(QtWidgets.QDoubleSpinBox):
+        w.setSizePolicy(Pref, Fixed)
+    for w in widget.findChildren(QtWidgets.QLineEdit):
+        w.setSizePolicy(Pref, Fixed)

@@ -158,7 +158,7 @@ class SPAMMMWindow(BaseGUI):
         # Create side panel content (inside a scroll area)
         from spammm.GUI.LayoutPolicy import PANEL_TARGET_WIDTH, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH
         side_content = QtWidgets.QWidget()
-        side_content.setMaximumWidth(PANEL_MAX_WIDTH)
+        side_content.setFixedWidth(PANEL_TARGET_WIDTH)
         side_layout = QtWidgets.QVBoxLayout(side_content)
         apply_tight(side_layout, margins=0, spacing=ROW_SPACING)
         
@@ -242,6 +242,11 @@ class SPAMMMWindow(BaseGUI):
         self.error_statusbar = True  # Update status bar
         self.apply_view_mode()
         self._register_shortcuts()
+
+        # Enforce tight layout on the entire side panel — recursive sweep
+        # that sets Maximum size policy on all widgets so they don't expand.
+        from spammm.GUI.LayoutPolicy import enforce_tight
+        enforce_tight(side_content)
 
     def _register_shortcuts(self):
         """Register this window's keyboard shortcuts in the centralized ShortcutRegistry.
@@ -670,6 +675,7 @@ class SPAMMMWindow(BaseGUI):
         two_ribbon_group.setCheckable(True)
         two_ribbon_group.setChecked(False)
         two_ribbon_group.toggled.connect(lambda checked: two_ribbon_group.setVisible(checked))
+        two_ribbon_group.setVisible(False)  # hide initially — toggled signal doesn't fire on setChecked
         two_ribbon_layout = QtWidgets.QVBoxLayout()
         two_ribbon_layout.setContentsMargins(0, 0, 0, 0)
         two_ribbon_layout.setSpacing(2)

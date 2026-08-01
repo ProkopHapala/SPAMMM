@@ -1409,6 +1409,7 @@ def build_ui(window):
 
     density_group = QtWidgets.QGroupBox("Density / Grid")
     density_grid = QtWidgets.QGridLayout(density_group)
+    apply_tight(density_grid)
     density_grid.addWidget(QtWidgets.QLabel("Basis:"), 0, 0)
     window.afm_basis_combo = QtWidgets.QComboBox()
     window.afm_basis_combo.addItems(["3ob-3-1", "mio-1-1"])
@@ -1445,6 +1446,7 @@ def build_ui(window):
 
     scan_group = QtWidgets.QGroupBox("Scan")
     scan_grid = QtWidgets.QGridLayout(scan_group)
+    apply_tight(scan_grid)
     scan_grid.addWidget(QtWidgets.QLabel("Range:"), 0, 0)
     window.afm_scan_range_spin = QtWidgets.QDoubleSpinBox()
     window.afm_scan_range_spin.setRange(1.0, 10.0); window.afm_scan_range_spin.setValue(2.0)
@@ -1476,6 +1478,7 @@ def build_ui(window):
 
     physics_group = QtWidgets.QGroupBox("Physics")
     physics_grid = QtWidgets.QGridLayout(physics_group)
+    apply_tight(physics_grid)
     physics_grid.addWidget(QtWidgets.QLabel("Pauli A [eV]:"), 0, 0)
     window.afm_pauli_a_spin = QtWidgets.QDoubleSpinBox()
     from spammm.SPM import AFM as _afm_pauli
@@ -1646,6 +1649,7 @@ def build_ui(window):
     stm_sec = CollapsibleSection("STM / Orbitals", collapsed=True, parent=panel)
     stm_widget = QtWidgets.QWidget()
     stm_grid = QtWidgets.QGridLayout(stm_widget)
+    apply_tight(stm_grid)
     row = 0
 
     window.afm_stm_enable = QtWidgets.QCheckBox("Compute STM in full pipeline")

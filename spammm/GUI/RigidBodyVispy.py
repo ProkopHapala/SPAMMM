@@ -866,9 +866,17 @@ class RigidBodyVispy:
         # Compose FAF substrate at the same z (diagnostic: E_PairFF + E_FAF)
         fit = getattr(rbd, 'faf_fit', None)
         if fit is not None and getattr(rbd, 'faf_mode', False):
-            from spammm.surfaces.FoldedRigid import eval_folded_potential_grid, faf_type_idx_for_probe
-            ityp = faf_type_idx_for_probe(fit, probe_R0, probe_E0, probe_q)
-            Efaf = eval_folded_potential_grid(fit, ityp, xs, ys, z_height)
+            from spammm.surfaces.FoldedRigid import eval_folded_potential_grid, faf_type_idx_for_probe, faf_fit_mode, FAF_MODE_FACTOR
+            mode = faf_fit_mode(fit)
+            if mode == FAF_MODE_FACTOR:
+                # Factorized: pass probe REQH explicitly so the map uses the
+                # GUI probe's Q (not fit['reqs'][0] which is the first fit atom).
+                probe_REQH = np.array([float(probe_R0), float(np.sqrt(max(float(probe_E0), 0.0))),
+                                       float(probe_q), 0.0], dtype=np.float32)
+                Efaf = eval_folded_potential_grid(fit, 0, xs, ys, z_height, atom_REQH=probe_REQH)
+            else:
+                ityp = faf_type_idx_for_probe(fit, probe_R0, probe_E0, probe_q)
+                Efaf = eval_folded_potential_grid(fit, ityp, xs, ys, z_height)
             Emap = Emap + Efaf
 
         rgba = potential_to_rgba(Emap)

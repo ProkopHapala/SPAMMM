@@ -6,8 +6,14 @@ without evaluating FAF or running any simulation — just the discretization mat
 
 Run:  pytest tests/test_faftype_discretize.py -s
 """
+import os
 import numpy as np
 import pytest
+from spammm.forcefields.RigidBodyDynamics import load_molecule
+
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PTCDA = os.path.join(_REPO, 'data', 'xyz', 'PTCDA.xyz')
+_HCOOH = os.path.join(_REPO, 'data', 'xyz', 'HCOOH.xyz')
 
 
 def discretize_charges(apos, enames, q_per_atom, type_scheme='element'):
@@ -103,6 +109,11 @@ def discretize_charges(apos, enames, q_per_atom, type_scheme='element'):
     }
 
 
+# Keep the original prototype above as historical context; all checks below
+# exercise the shared production implementation.
+from spammm.surfaces.FoldedRigid import discretize_charges
+
+
 def _print_moments(label, result):
     mo, md = result['moments_orig'], result['moments_disc']
     print(f'\n=== {label} ===')
@@ -128,15 +139,14 @@ def test_discretize_ptcda(type_scheme):
     """PTCDA: 38 atoms, 3 element types (C/O/H) or 4-5 element+sign types.
     Discretized charges should preserve neutrality (exact) and approximate dipole+quadrupole.
     """
-    from spammm.forcefields.molecule_loaders import load_ptcda
-    apos, enames, REQs, _ = load_ptcda(qeq=True)
+    apos, enames, REQs, _ = load_molecule(_PTCDA, qeq=True, name='PTCDA')
     q = REQs[:, 2].copy()
 
     result = discretize_charges(apos, enames, q, type_scheme=type_scheme)
     d_err, q_err = _print_moments(f'PTCDA ({type_scheme})', result)
 
     # Neutrality: exact (hard constraint)
-    assert abs(result['moments_disc']['M0']) < 1e-6, 'neutrality violated'
+    assert abs(result['moments_disc']['M0'] - result['moments_orig']['M0']) < 1e-12, 'total charge constraint violated'
 
     # Dipole: should be well preserved (PTCDA is centrosymmetric, dipole ≈ 0)
     assert d_err < 0.5, f'dipole error too large: {d_err}'
@@ -160,25 +170,65 @@ def test_discretize_formic_acid():
     """formic_acid: 5 atoms (C, O×2, H×2). Small molecule, 3 element types.
     Should preserve moments well with 3 types for 5 atoms.
     """
-    from spammm.forcefields.molecule_loaders import load_formic_acid
-    apos, enames, REQs, _ = load_formic_acid(qeq=True)
+    apos, enames, REQs, _ = load_molecule(_HCOOH, qeq=True, name='formic_acid')
     q = REQs[:, 2].copy()
 
     result = discretize_charges(apos, enames, q, type_scheme='element')
     d_err, q_err = _print_moments('formic_acid (element)', result)
 
-    assert abs(result['moments_disc']['M0']) < 1e-6
+    assert abs(result['moments_disc']['M0'] - result['moments_orig']['M0']) < 1e-12
     assert d_err < 1.0, f'dipole error too large: {d_err}'
     assert np.any(np.abs(result['Q_type']) > 0.01)
 
 
+def test_discretize_translation_and_permutation_invariant():
+    """Type charges must not depend on atom ordering or coordinate origin."""
+    apos = np.array([[0.0, 0.0, 0.0], [1.2, 0.1, 0.0], [-0.3, 1.1, 0.2], [0.4, -0.7, 0.9], [1.3, 1.4, -0.2]])
+    enames = np.array(['C', 'O', 'C', 'H', 'O'])
+    q = np.array([0.21, -0.31, -0.08, 0.13, 0.05])
+    r0 = discretize_charges(apos, enames, q, type_scheme='element_sign')
+    shift = np.array([1000.0, -2000.0, 17.0])
+    p = np.array([3, 0, 4, 1, 2])
+    r1 = discretize_charges(apos[p] + shift, enames[p], q[p], type_scheme='element_sign')
+    m0 = dict(zip(r0['type_names'], r0['Q_type']))
+    m1 = dict(zip(r1['type_names'], r1['Q_type']))
+    assert m0.keys() == m1.keys()
+    assert np.allclose([m0[k] for k in sorted(m0)], [m1[k] for k in sorted(m1)], atol=1e-11, rtol=1e-11)
+    assert r0['diagnostics']['constraint_error'] < 1e-13
+
+
+def test_factorized_cpu_eval_and_storage(tmp_path):
+    """A factorized fit must apply exact runtime Q/PL mixing and round-trip."""
+    from spammm.forcefields.RigidBodyDynamics import _reqs_to_plq
+    from spammm.surfaces.FoldedRigid import FAF_MODE_FACTOR, eval_folded_potential, load_fit, save_fit
+    reqs = np.array([[1.2, 0.4, -0.3, 0.0], [1.2, 0.4, 0.7, 0.0]], dtype=np.float32)
+    fit = {
+        'format_version': 2, 'fit_mode': FAF_MODE_FACTOR,
+        'coeffs4': np.array([[2.0, 3.0, 5.0, 0.0]], dtype=np.float32),
+        'basis_params': np.array([[0.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+        'atom_type_ids': np.zeros(2, dtype=np.int32), 'folded_lvec2d': np.array([2.0, 0.0, 0.0, 2.0], dtype=np.float32),
+        'unique_REQs': np.array([[0.0, 1.0, 1.0, 0.0]], dtype=np.float32), 'z_range': (0.0, 8.0),
+        'enames': ['C', 'C'], 'reqs': reqs, 'apos_mol': np.zeros((2, 3), dtype=np.float32), 'alpha_morse': 1.8,
+    }
+    fit['atom_plqh'] = _reqs_to_plq(reqs, alpha=1.8)
+    xyz = np.array([[0.3, 0.4, 2.0]], dtype=np.float64)
+    assert eval_folded_potential(fit, 0, xyz, component='coulomb_phi')[0] == pytest.approx(5.0)
+    e0 = eval_folded_potential(fit, 0, xyz, component='coulomb')[0]
+    e1 = eval_folded_potential(fit, 1, xyz, component='coulomb')[0]
+    assert e0 == pytest.approx(-1.5)
+    assert e1 == pytest.approx(3.5)
+    path = tmp_path/'factorized.npz'
+    save_fit(fit, path)
+    loaded = load_fit(path)
+    assert loaded['fit_mode'] == FAF_MODE_FACTOR
+    assert np.array_equal(loaded['coeffs4'], fit['coeffs4'])
+
+
 if __name__ == '__main__':
     # Run standalone (no pytest) for quick visual check
-    from spammm.forcefields.molecule_loaders import load_ptcda, load_formic_acid
-
     print('=' * 60)
     print('PTCDA — 3 element types (C, O, H)')
-    apos, enames, REQs, _ = load_ptcda(qeq=True)
+    apos, enames, REQs, _ = load_molecule(_PTCDA, qeq=True, name='PTCDA')
     r = discretize_charges(apos, enames, REQs[:, 2], 'element')
     _print_moments('PTCDA (element)', r)
 
@@ -189,6 +239,6 @@ if __name__ == '__main__':
 
     print('\n' + '=' * 60)
     print('formic_acid — 3 element types')
-    apos, enames, REQs, _ = load_formic_acid(qeq=True)
+    apos, enames, REQs, _ = load_molecule(_HCOOH, qeq=True, name='formic_acid')
     r = discretize_charges(apos, enames, REQs[:, 2], 'element')
     _print_moments('formic_acid (element)', r)

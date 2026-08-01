@@ -321,7 +321,14 @@ class ExtensionManager:
             builder = getattr(mod, builder_name, None)
             if builder is None:
                 return UIComponents()
-            return builder(window)
+            ui = builder(window)
+            # Enforce tight layout on the extension panel — recursive sweep
+            from spammm.GUI.LayoutPolicy import enforce_tight
+            if hasattr(ui, 'panel'):
+                enforce_tight(ui.panel)
+            elif hasattr(ui, 'widget'):
+                enforce_tight(ui.widget)
+            return ui
         except Exception as e:
             print(f"ExtensionManager: build_ui({name}) failed: {e}")
             # Return UIComponents with error panel so user can see/copy error
@@ -333,5 +340,7 @@ class ExtensionManager:
             error_text.setMaximumHeight(200)
             error_layout.addWidget(QtWidgets.QLabel(f"Extension '{name}' Error:"))
             error_layout.addWidget(error_text)
+            from spammm.GUI.LayoutPolicy import enforce_tight
+            enforce_tight(error_panel)
             return UIComponents(panel=error_panel)
 

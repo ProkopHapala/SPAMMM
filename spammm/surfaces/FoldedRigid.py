@@ -30,7 +30,7 @@ import os
 import numpy as np
 
 from spammm.forcefields.SPFF_cl import SPFF_cl as MolecularDynamics
-from spammm.forcefields.RigidBodyDynamics import RigidBodyDynamics, _guess_mass, _quat_to_matrix_np, compute_mass_properties
+from spammm.forcefields.RigidBodyDynamics import RigidBodyDynamics, _guess_mass, _quat_to_matrix_np, _reqs_to_plq, compute_mass_properties
 from spammm.topology.FFparams import load_xyz_with_REQs
 from spammm.AtomicSystem import AtomicSystem
 
@@ -46,11 +46,91 @@ LATTICE_A = 4.0
 MORSE_ALPHAS = np.array([1.0, 1.8, 2.7, 3.6, 5.0], dtype=np.float32)
 COULOMB_ALPHAS = np.array([0.0, 0.3, 0.6, 1.0, 1.5], dtype=np.float32)
 COMBINED_ALPHAS = np.array([0.3, 0.6, 1.0, 1.8, 2.7, 3.6, 5.0], dtype=np.float32)
+FAF_FORMAT_VERSION = 2
+FAF_MODE_TYPED = 'typed_combined'
+FAF_MODE_FACTOR = 'factorized_plqh'
 
 
 # =============================================================================
 # Geometry & math utilities
 # =============================================================================
+
+def _charge_moments(apos, q, origin):
+    r = np.asarray(apos, dtype=np.float64) - np.asarray(origin, dtype=np.float64)[None, :]
+    q = np.asarray(q, dtype=np.float64)
+    M2 = np.einsum('i,ij,ik->jk', q, r, r)
+    Q = 3.0*M2 - np.eye(3)*np.trace(M2)
+    return {'M0': float(q.sum()), 'M1': np.einsum('i,ij->j', q, r), 'M2': M2, 'Q': Q}
+
+
+def discretize_charges(apos, enames, q_per_atom, type_scheme='element_sign', sign_threshold=1e-3, origin=None, dipole_weight=1.0, quadrupole_weight=1.0, regularization=1e-8):
+    """Replace per-atom charges by per-type charges with exact total charge.
+
+    Dipole and traceless-quadrupole errors are minimized in coordinates centred
+    at ``origin`` and scaled by molecular RMS radius, so Å and Å² rows have
+    comparable conditioning. The equality constraint is solved through the
+    null space, not by a large penalty.
+    """
+    apos = np.asarray(apos, dtype=np.float64)
+    q = np.asarray(q_per_atom, dtype=np.float64).reshape(-1)
+    enames = np.asarray(enames, dtype=str).reshape(-1)
+    if apos.ndim != 2 or apos.shape[1] != 3 or len(apos) != len(q) or len(enames) != len(q):
+        raise ValueError(f"discretize_charges(): expected apos(N,3), enames(N), q(N); got {apos.shape}, {enames.shape}, {q.shape}")
+    if len(q) == 0 or not np.all(np.isfinite(apos)) or not np.all(np.isfinite(q)):
+        raise ValueError("discretize_charges(): inputs must be non-empty and finite")
+    if origin is None:
+        origin = apos.mean(axis=0)
+    origin = np.asarray(origin, dtype=np.float64).reshape(3)
+    r = apos - origin[None, :]
+    rscale = float(np.sqrt(np.mean(np.einsum('ij,ij->i', r, r))))
+    if not np.isfinite(rscale) or rscale < 1e-12:
+        rscale = 1.0
+    x = r/rscale
+    if type_scheme == 'element':
+        labels = enames.tolist()
+    elif type_scheme == 'element_sign':
+        s = np.where(q > float(sign_threshold), '+', np.where(q < -float(sign_threshold), '-', '0'))
+        labels = [f'{e}{si}' for e, si in zip(enames, s)]
+    else:
+        raise ValueError(f"discretize_charges(): unknown type_scheme '{type_scheme}', expected 'element' or 'element_sign'")
+    type_names, type_ids = np.unique(np.asarray(labels, dtype=str), return_inverse=True)
+    type_ids = type_ids.astype(np.int32)
+    K = len(type_names)
+    G = np.equal(type_ids[:, None], np.arange(K)[None, :]).astype(np.float64)
+    q_mean = (G.T @ q)/G.sum(axis=0)
+    n_t = G.sum(axis=0)
+    C = n_t[None, :]
+    d = np.array([q.sum()], dtype=np.float64)
+    dip_atom = x
+    r2 = np.einsum('ij,ij->i', x, x)
+    quad_atom = np.stack([3*x[:, 0]*x[:, 0]-r2, 3*x[:, 0]*x[:, 1], 3*x[:, 0]*x[:, 2], 3*x[:, 1]*x[:, 1]-r2, 3*x[:, 1]*x[:, 2]], axis=1)
+    A = np.vstack([float(dipole_weight)*(dip_atom.T @ G), float(quadrupole_weight)*(quad_atom.T @ G)])
+    b = np.concatenate([float(dipole_weight)*(dip_atom.T @ q), float(quadrupole_weight)*(quad_atom.T @ q)])
+    U, sC, Vt = np.linalg.svd(C, full_matrices=True)
+    rank_C = int(np.sum(sC > np.finfo(np.float64).eps*max(C.shape)*sC[0]))
+    x0 = C.T @ np.linalg.solve(C @ C.T, d)
+    Z = Vt[rank_C:].T
+    if Z.shape[1]:
+        AZ = A @ Z
+        rhs = b - A @ x0
+        lam = max(0.0, float(regularization))
+        if lam > 0.0:
+            AZ = np.vstack([AZ, np.sqrt(lam)*Z])
+            rhs = np.concatenate([rhs, np.sqrt(lam)*(q_mean-x0)])
+        y, _, rank_soft, s_soft = np.linalg.lstsq(AZ, rhs, rcond=None)
+        Q_type = x0 + Z @ y
+    else:
+        rank_soft, s_soft = 0, np.zeros(0, dtype=np.float64)
+        Q_type = x0
+    Q_type += C.T @ np.linalg.solve(C @ C.T, d-C @ Q_type)
+    q_disc = Q_type[type_ids]
+    mo = _charge_moments(apos, q, origin)
+    md = _charge_moments(apos, q_disc, origin)
+    return {
+        'type_ids': type_ids, 'type_names': type_names.tolist(), 'Q_type': Q_type, 'q_disc': q_disc,
+        'moments_orig': mo, 'moments_disc': md, 'origin': origin, 'length_scale': rscale,
+        'diagnostics': {'constraint_error': float(abs(q_disc.sum()-q.sum())), 'soft_rank': int(rank_soft), 'soft_singular_values': np.asarray(s_soft), 'charge_rms_error': float(np.sqrt(np.mean((q_disc-q)**2)))},
+    }
 
 def random_quaternion(max_angle=np.pi):
     """Generate a random rotation quaternion for rotation up to max_angle radians."""
@@ -156,29 +236,58 @@ def load_substrate(substrate_file=NACL_SUBSTRATE):
 # Folded basis workflow
 # =============================================================================
 
-def fit_folded_for_molecule(mol_file, substrate_file=NACL_SUBSTRATE, z_range_rel=(1.5, 8.0), nu=4, nv=4, nPBC=(4, 4, 0), alpha_morse=1.8, custom_alphas=None, substrate_R_override=None, q_override=None):
+def fit_folded_for_molecule(mol, substrate_file=NACL_SUBSTRATE, z_range_rel=(1.5, 8.0), nu=4, nv=4, nPBC=(4, 4, 0), alpha_morse=1.8, custom_alphas=None, substrate_R_override=None, q_override=None, fit_mode=FAF_MODE_TYPED, charge_discretization=None, nxy=32, nz_samp=60, ewald_n_harm=6):
     """Fit folded basis coefficients for a molecule on a substrate.
 
     Morse (pauli+london) and Coulomb are fitted independently via
     fit_folded_surface_basis with coulomb_solver='ewald2d'.
     Returns dict with total_coeffs, basis_params, atom_type_ids, basis_lvec2d.
 
+    mol: either a file path (str) loaded via load_xyz_with_REQs, or a tuple
+        (apos, enames, REQs) of pre-loaded molecule data. Using a tuple avoids
+        the XYZ-only restriction — mol2 or any other format can be fitted.
     substrate_R_override: optional dict element->RvdW (Å), e.g. {'Na': 1.45}
-    q_override: optional dict element->charge, e.g. {'O': -0.4} (overrides xyz/REQ Q)
+    q_override: optional dict element->charge or one charge per atom
+    fit_mode: ``typed_combined`` (fastest, molecule-specific) or
+        ``factorized_plqh`` (one molecule-independent substrate float4 fit)
+    charge_discretization: optional ``element`` or ``element_sign`` for typed mode
     """
-    apos_mol, reqs, enames, _, _ = load_xyz_with_REQs(mol_file)
-    reqs = np.asarray(reqs, dtype=np.float32).copy()
-    if q_override:
-        for i, e in enumerate(enames):
-            if e in q_override:
-                reqs[i, 2] = float(q_override[e])
+    if isinstance(mol, (tuple, list)) and len(mol) >= 3:
+        apos_mol, enames, reqs = mol[0], mol[1], mol[2]
+        apos_mol = np.asarray(apos_mol, dtype=np.float32)
+        reqs = np.asarray(reqs, dtype=np.float32).copy()
+    else:
+        apos_mol, reqs, enames, _, _ = load_xyz_with_REQs(mol)
+        reqs = np.asarray(reqs, dtype=np.float32).copy()
+    if q_override is not None:
+        if isinstance(q_override, dict):
+            for i, e in enumerate(enames):
+                if e in q_override:
+                    reqs[i, 2] = float(q_override[e])
+        else:
+            q_arr = np.asarray(q_override, dtype=np.float32).reshape(-1)
+            if len(q_arr) != len(reqs):
+                raise ValueError(f"fit_folded_for_molecule(): q_override length {len(q_arr)} != natoms {len(reqs)}")
+            reqs[:, 2] = q_arr
+    mode = str(fit_mode).lower()
+    aliases = {'typed': FAF_MODE_TYPED, 'combined': FAF_MODE_TYPED, 'factorized': FAF_MODE_FACTOR, 'plqh': FAF_MODE_FACTOR}
+    mode = aliases.get(mode, mode)
+    if mode not in (FAF_MODE_TYPED, FAF_MODE_FACTOR):
+        raise ValueError(f"fit_folded_for_molecule(): unknown fit_mode '{fit_mode}', expected '{FAF_MODE_TYPED}' or '{FAF_MODE_FACTOR}'")
+    charge_fit = None
+    if charge_discretization is not None:
+        if mode != FAF_MODE_TYPED:
+            raise ValueError("fit_folded_for_molecule(): charge_discretization only applies to typed_combined mode")
+        charge_fit = discretize_charges(apos_mol, enames, reqs[:, 2], type_scheme=charge_discretization)
+        reqs[:, 2] = charge_fit['q_disc'].astype(np.float32)
     z_range_abs = (Z_SURF_TOP + z_range_rel[0], Z_SURF_TOP + z_range_rel[1])
     if custom_alphas is None:
         custom_alphas = COMBINED_ALPHAS
     nz = len(custom_alphas)
 
+    reqs_fit = reqs if mode == FAF_MODE_TYPED else np.array([[0.0, 1.0, 1.0, 0.0]], dtype=np.float32)
     md = MolecularDynamics(nloc=32, debug_build_options='-DDBG_UFF=0')
-    md.init_rigid_molecule_batch(np.zeros((len(enames), 3), dtype=np.float32), reqs, nSystems=8192)
+    md.init_rigid_molecule_batch(np.zeros((len(reqs_fit), 3), dtype=np.float32), reqs_fit, nSystems=8192)
     md.set_surface(substrate_file, nPBC=nPBC, alpha_morse=alpha_morse, bMacro=True)
     if substrate_R_override:
         for ia, e in enumerate(md.surface_enames):
@@ -190,60 +299,214 @@ def fit_folded_for_molecule(mol_file, substrate_file=NACL_SUBSTRATE, z_range_rel
         surf_xyz=substrate_file, components=('pauli', 'london', 'coulomb'),
         coulomb_solver='ewald2d', z_range=z_range_abs,
         nu=nu, nv=nv, nz=nz, custom_alphas=custom_alphas,
-        nPBC=nPBC, alpha_morse=alpha_morse, nxy=32, nz_samp=60, ewald_n_harm=6,
+        nPBC=nPBC, alpha_morse=alpha_morse, nxy=int(nxy), nz_samp=int(nz_samp), ewald_n_harm=int(ewald_n_harm),
         substrate_R_override=substrate_R_override,
     )
 
     coeff_sets = params['coeff_sets']
-    total_coeffs = coeff_sets['pauli'] + coeff_sets['london'] + coeff_sets['coulomb']
-
     lvec2d = params['basis_lvec2d']
     a = np.array(lvec2d[0, :3], dtype=np.float32)
     b = np.array(lvec2d[1, :3], dtype=np.float32)
     folded_lvec2d = np.array([a[0], b[0], a[1], b[1]], dtype=np.float32)
 
-    return {
-        'coeffs': total_coeffs.astype(np.float32),
+    out = {
+        'format_version': FAF_FORMAT_VERSION,
+        'fit_mode': mode,
         'basis_params': params['basis_params'].astype(np.float32),
-        'atom_type_ids': params['atom_type_ids'].astype(np.int32),
         'folded_lvec2d': folded_lvec2d,
-        'unique_REQs': params['unique_REQs'],
         'z_range': params['z_range'],
         'enames': enames,
         'reqs': reqs,
         'apos_mol': apos_mol,
+        'alpha_morse': float(alpha_morse),
         'substrate_R_override': dict(substrate_R_override) if substrate_R_override else {},
     }
+    if mode == FAF_MODE_TYPED:
+        out['coeffs'] = (coeff_sets['pauli'] + coeff_sets['london'] + coeff_sets['coulomb']).astype(np.float32)
+        out['coeff_sets'] = {k: np.asarray(v, dtype=np.float32) for k, v in coeff_sets.items()}
+        out['atom_type_ids'] = params['atom_type_ids'].astype(np.int32)
+        out['unique_REQs'] = params['unique_REQs']
+        if charge_fit is not None:
+            out['charge_discretization'] = charge_fit
+    else:
+        nbasis = len(params['basis_params'])
+        coeffs4 = np.zeros((nbasis, 4), dtype=np.float32)
+        coeffs4[:, 0] = coeff_sets['pauli'][0, :nbasis]
+        coeffs4[:, 1] = coeff_sets['london'][0, :nbasis]
+        coeffs4[:, 2] = coeff_sets['coulomb'][0, :nbasis]
+        out['coeffs4'] = coeffs4
+        out['atom_plqh'] = _reqs_to_plq(reqs, alpha=float(alpha_morse))
+        out['atom_type_ids'] = np.zeros(len(reqs), dtype=np.int32)
+        out['unique_REQs'] = np.array([[0.0, 1.0, 1.0, 0.0]], dtype=np.float32)
+    return out
 
 
 def save_fit(fit, fname):
     """Save a fit result dict to a small .npz file."""
-    np.savez(fname,
-        coeffs=fit['coeffs'],
-        basis_params=fit['basis_params'],
-        atom_type_ids=fit['atom_type_ids'],
-        folded_lvec2d=fit['folded_lvec2d'],
-        unique_REQs=fit['unique_REQs'],
-        z_range=np.array(fit['z_range'], dtype=np.float32),
-        enames_str=','.join(fit['enames']),
-        reqs=fit['reqs'],
-        apos_mol=fit['apos_mol'],
-    )
+    mode = faf_fit_mode(fit)
+    payload = {
+        'format_version': np.int32(fit.get('format_version', FAF_FORMAT_VERSION)),
+        'fit_mode_str': np.array(mode),
+        'basis_params': fit['basis_params'], 'atom_type_ids': fit['atom_type_ids'],
+        'folded_lvec2d': fit['folded_lvec2d'], 'unique_REQs': fit['unique_REQs'],
+        'z_range': np.array(fit['z_range'], dtype=np.float32), 'enames_str': np.array(','.join(fit['enames'])),
+        'reqs': fit['reqs'], 'apos_mol': fit['apos_mol'], 'alpha_morse': np.float32(fit.get('alpha_morse', 1.8)),
+    }
+    if mode == FAF_MODE_FACTOR:
+        payload['coeffs4'] = fit['coeffs4']
+        payload['atom_plqh'] = fit.get('atom_plqh', _reqs_to_plq(fit['reqs'], alpha=float(payload['alpha_morse'])))
+    else:
+        payload['coeffs'] = fit['coeffs']
+    np.savez(fname, **payload)
 
 
 def load_fit(fname):
     """Load a fit result dict from .npz file written by save_fit."""
     d = np.load(fname, allow_pickle=False)
+    mode = str(d['fit_mode_str'].item()) if 'fit_mode_str' in d.files else FAF_MODE_TYPED
+    out = {
+        'format_version': int(d['format_version']) if 'format_version' in d.files else 1,
+        'fit_mode': mode, 'basis_params': d['basis_params'], 'atom_type_ids': d['atom_type_ids'],
+        'folded_lvec2d': d['folded_lvec2d'], 'unique_REQs': d['unique_REQs'], 'z_range': tuple(d['z_range']),
+        'enames': list(str(d['enames_str'].item()).split(',')), 'reqs': d['reqs'], 'apos_mol': d['apos_mol'],
+        'alpha_morse': float(d['alpha_morse']) if 'alpha_morse' in d.files else 1.8,
+    }
+    if mode == FAF_MODE_FACTOR:
+        if 'coeffs4' not in d.files:
+            raise ValueError(f"load_fit(): factorized fit '{fname}' is missing coeffs4")
+        out['coeffs4'] = d['coeffs4']
+        out['atom_plqh'] = d['atom_plqh'] if 'atom_plqh' in d.files else _reqs_to_plq(out['reqs'], alpha=out['alpha_morse'])
+    else:
+        out['coeffs'] = d['coeffs']
+        coeff_sets = {}
+        for key in ('pauli', 'london', 'coulomb', 'h_bond', 'total'):
+            if f'coeff_{key}' in d.files:
+                coeff_sets[key] = d[f'coeff_{key}']
+        if coeff_sets:
+            out['coeff_sets'] = coeff_sets
+    return out
+
+
+def remap_fit_for_molecule(fit, mol_REQs):
+    """Remap a FAF fit's atom types for a different molecule by (R,E,Q) similarity.
+
+    The fit's coeffs/basis_params/lvec2d are reused; only atom_type_ids is rebuilt
+    so each real atom picks the closest type in the fit's unique_REQs.
+    """
+    unique = np.asarray(fit['unique_REQs'], dtype=np.float64)
+    reqs = np.asarray(mol_REQs, dtype=np.float64)[:, :4]
+    scale = np.array([1.0, 20.0, 3.0, 0.0])  # R~1, E~0.05→1, Q~0.3→1, w ignored
+    atids = np.zeros(len(reqs), dtype=np.int32)
+    for i, r in enumerate(reqs):
+        d = np.sqrt(((unique[:, :3] - r[:3]) * scale[:3])**2).sum(axis=1)
+        atids[i] = int(np.argmin(d))
+    fit2 = dict(fit)
+    fit2['atom_type_ids'] = atids
+    return fit2
+
+
+# =============================================================================
+# Shared load-or-fit entry point — single code path for all callers
+# (GUI extensions, demo_pairff, testplot scripts). No duplication, no fallback.
+# =============================================================================
+
+_FIT_DIR = os.path.join(_proj_root, 'data', 'fits')
+
+
+def load_or_fit_faf(mol, mol_name='mol', fit_mode=FAF_MODE_FACTOR, substrate_file=NACL_SUBSTRATE,
+                    z_range_rel=(1.5, 8.0), charge_discretization=None, force_refit=False,
+                    fit_path=None, **fit_kwargs):
+    """Load cached FAF fit or fit molecule on substrate. SINGLE shared entry point.
+
+    Accepts the molecule in any form and normalizes it to (apos, enames, REQs)
+    with QEq charges. Without QEq, Coulomb is zero (no Na/Cl checkerboard).
+
+    Args:
+        mol: one of:
+            - str: path to XYZ file (loaded with QEq via load_xyz_generic)
+            - tuple (apos, enames, REQs): pre-loaded with QEq charges in REQs[:, 2]
+            - tuple (apos, enames, REQs, bonds): same, bonds ignored
+        mol_name: name for cache filename and log messages (e.g. 'PTCDA')
+        fit_mode: FAF_MODE_FACTOR (default) or FAF_MODE_TYPED
+        substrate_file: path to substrate XYZ
+        z_range_rel: (z_min, z_max) relative to Z_SURF_TOP
+        charge_discretization: 'element' or 'element_sign' for typed mode
+        force_refit: if True, re-fit even if cache exists
+        fit_path: explicit cache path (overrides default). Use when substrate or
+            fit params differ from defaults (e.g. FoldedRigidExtension custom substrate)
+        **fit_kwargs: passed to fit_folded_for_molecule (nu, nv, alpha_morse, etc.)
+
+    Returns: fit dict (from load_fit or fit_folded_for_molecule)
+    """
+    # 1. Normalize mol to (apos, enames, REQs) with QEq charges
+    if isinstance(mol, str):
+        from spammm.AtomicSystem import AtomicSystem
+        from spammm.forcefields.QEq import compute_qeq_reqs
+        sys = AtomicSystem(fname=mol)
+        apos = np.asarray(sys.apos, dtype=np.float32)
+        enames = [str(e) for e in sys.enames]
+        apos[:, :2] -= apos[:, :2].mean(axis=0)
+        apos[:, 2] = 0.0
+        REQs = compute_qeq_reqs(apos, enames, name=f'fit({mol_name})')
+    elif isinstance(mol, (tuple, list)) and len(mol) >= 3:
+        apos, enames, REQs = mol[0], mol[1], mol[2]
+        apos = np.asarray(apos, dtype=np.float32)
+        REQs = np.asarray(REQs, dtype=np.float32)
+    else:
+        raise ValueError(f"load_or_fit_faf(): mol must be str path or (apos, enames, REQs) tuple, got {type(mol)}")
+
+    # 2. Cache path: default is per-molecule-per-mode; caller can override
+    if fit_path is None:
+        mode_tag = 'factorized' if fit_mode == FAF_MODE_FACTOR else 'typed'
+        fit_path = os.path.join(_FIT_DIR, f'{mol_name.lower()}_nacl_{mode_tag}.npz')
+
+    # 3. Load cached or fit
+    if not force_refit and os.path.isfile(fit_path):
+        return load_fit(fit_path)
+
+    os.makedirs(os.path.dirname(fit_path) or '.', exist_ok=True)
+    fit = fit_folded_for_molecule((apos, enames, REQs), substrate_file=substrate_file,
+                                  z_range_rel=z_range_rel, fit_mode=fit_mode,
+                                  charge_discretization=charge_discretization, **fit_kwargs)
+    save_fit(fit, fit_path)
+    return fit
+
+
+def faf_fit_mode(fit_result):
+    """Return the explicit FAF storage/evaluation mode, including legacy fits."""
+    mode = str(fit_result.get('fit_mode', FAF_MODE_FACTOR if 'coeffs4' in fit_result else FAF_MODE_TYPED))
+    if mode not in (FAF_MODE_TYPED, FAF_MODE_FACTOR):
+        raise ValueError(f"faf_fit_mode(): unsupported fit mode '{mode}'")
+    if mode == FAF_MODE_FACTOR and 'coeffs4' not in fit_result:
+        raise ValueError("faf_fit_mode(): factorized_plqh fit is missing coeffs4")
+    if mode == FAF_MODE_TYPED and 'coeffs' not in fit_result:
+        raise ValueError("faf_fit_mode(): typed_combined fit is missing coeffs")
+    return mode
+
+
+def materialize_factorized_coeffs(fit_result, reqs):
+    """Combine substrate float4 coefficients with atom REQH on the host."""
+    if faf_fit_mode(fit_result) != FAF_MODE_FACTOR:
+        raise ValueError("materialize_factorized_coeffs(): expected factorized_plqh fit")
+    plqh = _reqs_to_plq(np.asarray(reqs, dtype=np.float32).reshape(-1, 4), alpha=float(fit_result.get('alpha_morse', 1.8)))
+    return (plqh @ np.asarray(fit_result['coeffs4'], dtype=np.float32).reshape(-1, 4).T).astype(np.float32)
+
+
+def compare_faf_fit_modes(mol_file, charge_discretization='element_sign', **fit_kwargs):
+    """Fit both architectures and compare equivalent discretized-type rows."""
+    import time
+    q_override = fit_kwargs.pop('q_override', None)
+    t0 = time.perf_counter()
+    typed = fit_folded_for_molecule(mol_file, q_override=q_override, fit_mode=FAF_MODE_TYPED, charge_discretization=charge_discretization, **fit_kwargs)
+    t1 = time.perf_counter()
+    factor = fit_folded_for_molecule(mol_file, q_override=q_override, fit_mode=FAF_MODE_FACTOR, **fit_kwargs)
+    t2 = time.perf_counter()
+    materialized = materialize_factorized_coeffs(factor, typed['unique_REQs'])
+    delta = np.asarray(typed['coeffs'], dtype=np.float64) - np.asarray(materialized, dtype=np.float64)
     return {
-        'coeffs': d['coeffs'],
-        'basis_params': d['basis_params'],
-        'atom_type_ids': d['atom_type_ids'],
-        'folded_lvec2d': d['folded_lvec2d'],
-        'unique_REQs': d['unique_REQs'],
-        'z_range': tuple(d['z_range']),
-        'enames': list(str(d['enames_str'].item()).split(',')),
-        'reqs': d['reqs'],
-        'apos_mol': d['apos_mol'],
+        'typed': typed, 'factorized': factor,
+        'timing_s': {'typed': t1-t0, 'factorized': t2-t1, 'speedup_fit': (t1-t0)/max(t2-t1, 1e-30)},
+        'coefficient_parity': {'rms': float(np.sqrt(np.mean(delta*delta))), 'max_abs': float(np.max(np.abs(delta))), 'reference_rms': float(np.sqrt(np.mean(np.asarray(typed['coeffs'], dtype=np.float64)**2)))},
     }
 
 
@@ -305,12 +568,13 @@ def setup_rigid_folded(mol_file, fit_result, z_init=3.0, xy_init=(0.0, 0.0), qua
         inertia=np.repeat(I_relax[None, :, :], n_bodies, axis=0),
     )
 
-    coeffs = fit_result['coeffs']
+    mode = faf_fit_mode(fit_result)
+    coeffs = fit_result['coeffs'] if mode == FAF_MODE_TYPED else fit_result['coeffs4']
     kxyz = fit_result['basis_params']
-    atype = fit_result['atom_type_ids']
+    atype = fit_result['atom_type_ids'] if mode == FAF_MODE_TYPED else _reqs_to_plq(reqs, alpha=float(fit_result.get('alpha_morse', 1.8)))
     lvec2d = fit_result['folded_lvec2d']
-    ntypes, nbasis = coeffs.shape
-    folded_meta = np.array([nbasis, ntypes, 0, 0], dtype=np.int32)
+    nbasis = int(coeffs.shape[-2] if mode == FAF_MODE_FACTOR else coeffs.shape[1])
+    folded_meta = np.array([nbasis, -1 if mode == FAF_MODE_FACTOR else coeffs.shape[0], 0, 0], dtype=np.int32)
     rbd.init_folded(coeffs, kxyz, atype, lvec2d, folded_meta=folded_meta)
     return rbd
 
@@ -400,12 +664,13 @@ def setup_rigid_folded_replicas(fit_result, xs, ys, z_init=3.0, quats=None, mass
         pos4, quat4, zero4, zero4, mass_trans, Iinv_relax, rel.astype(np.float32),
         anchors=anchors, inertia=I_relax,
     )
-    coeffs = fit_result['coeffs']
+    mode = faf_fit_mode(fit_result)
+    coeffs = fit_result['coeffs'] if mode == FAF_MODE_TYPED else fit_result['coeffs4']
     kxyz = fit_result['basis_params']
-    atype = fit_result['atom_type_ids']
+    atype = fit_result['atom_type_ids'] if mode == FAF_MODE_TYPED else _reqs_to_plq(reqs, alpha=float(fit_result.get('alpha_morse', 1.8)))
     lvec2d = fit_result['folded_lvec2d']
-    ntypes, nbasis = coeffs.shape
-    folded_meta = np.array([nbasis, ntypes, na, n_rep], dtype=np.int32)
+    nbasis = int(coeffs.shape[-2] if mode == FAF_MODE_FACTOR else coeffs.shape[1])
+    folded_meta = np.array([nbasis, -1 if mode == FAF_MODE_FACTOR else coeffs.shape[0], na, n_rep], dtype=np.int32)
     rbd.init_replicas(n_rep, coeffs, kxyz, atype, lvec2d, folded_meta=folded_meta)
     rbd._scan_nx = nx
     rbd._scan_ny = ny
@@ -611,17 +876,20 @@ def plot_relax_diag(recs, title="Relaxation Diagnostics", save_path=None):
 # Folded potential evaluation (for debugging / visualization)
 # =============================================================================
 
-def eval_folded_potential(fit_result, atom_type_idx, xyz):
-    """Evaluate folded basis potential for a single atom type at arbitrary positions.
+def eval_folded_potential(fit_result, atom_type_idx, xyz, atom_REQH=None, component='total'):
+    """Evaluate a typed row or factorized atom/component at arbitrary positions.
 
     Args:
         fit_result: dict from fit_folded_for_molecule / load_fit
-        atom_type_idx: index into coeffs rows (0 = first unique REQ type)
+        atom_type_idx: typed coefficient-row index; factorized molecule-atom
+            index when atom_REQH is not passed
         xyz: (N, 3) array of world coordinates
+        atom_REQH: explicit factorized probe (R,sqrt(E),Q,H)
+        component: total, pauli, london, coulomb, h_bond, or coulomb_phi
 
     Returns: (N,) array of potential energy values
     """
-    coeffs = np.asarray(fit_result['coeffs'], dtype=np.float64)
+    mode = faf_fit_mode(fit_result)
     kxyz = np.asarray(fit_result['basis_params'], dtype=np.float64)
     lvec2d = np.asarray(fit_result['folded_lvec2d'], dtype=np.float64)
     ax, bx, ay, by = lvec2d
@@ -641,7 +909,36 @@ def eval_folded_potential(fit_result, atom_type_idx, xyz):
     by_ = np.cos(2.0 * np.pi * kv * v[:, None])
     bz_ = np.exp(-az * np.maximum(0.0, z[:, None] - z0))
     basis = bx_ * by_ * bz_
-    c = coeffs[atom_type_idx, :basis.shape[1]]
+    if mode == FAF_MODE_TYPED:
+        if component != 'total':
+            coeff_sets = fit_result.get('coeff_sets', {})
+            if component not in coeff_sets:
+                raise ValueError(f"eval_folded_potential(): typed fit has no component '{component}'")
+            coeffs = np.asarray(coeff_sets[component], dtype=np.float64)
+        else:
+            coeffs = np.asarray(fit_result['coeffs'], dtype=np.float64)
+        c = coeffs[int(atom_type_idx), :basis.shape[1]]
+    else:
+        coeffs4 = np.asarray(fit_result['coeffs4'], dtype=np.float64).reshape(-1, 4)[:basis.shape[1]]
+        if component == 'coulomb_phi':
+            mix = np.array([0.0, 0.0, 1.0, 0.0])
+        else:
+            if atom_REQH is None:
+                reqs = np.asarray(fit_result['reqs'], dtype=np.float32)
+                ia = int(atom_type_idx)
+                if ia < 0 or ia >= len(reqs):
+                    raise ValueError(f"eval_folded_potential(): factorized atom index {ia} outside [0,{len(reqs)})")
+                atom_REQH = reqs[ia]
+            req = np.asarray(atom_REQH, dtype=np.float32).reshape(1, 4)
+            mix = _reqs_to_plq(req, alpha=float(fit_result.get('alpha_morse', 1.8)))[0].astype(np.float64)
+            component_index = {'pauli': 0, 'london': 1, 'coulomb': 2, 'h_bond': 3}
+            if component != 'total':
+                if component not in component_index:
+                    raise ValueError(f"eval_folded_potential(): unknown factorized component '{component}'")
+                mask = np.zeros(4, dtype=np.float64)
+                mask[component_index[component]] = 1.0
+                mix *= mask
+        c = coeffs4 @ mix
     return (basis * c[None, :]).sum(axis=1)
 
 
@@ -673,7 +970,7 @@ def eval_folded_potential_slice(fit_result, atom_type_idx, plane='xy', fixed_val
     return a, b, E
 
 
-def eval_folded_potential_grid(fit_result, atom_type_idx, xs, ys, z):
+def eval_folded_potential_grid(fit_result, atom_type_idx, xs, ys, z, component='total', atom_REQH=None):
     """FAF energy on an arbitrary XY grid (same layout as Vispy PairFF maps).
 
     xs, ys: 1D axes; returns E with shape (len(ys), len(xs)) via meshgrid(xs, ys).
@@ -682,7 +979,7 @@ def eval_folded_potential_grid(fit_result, atom_type_idx, xs, ys, z):
     ys = np.asarray(ys, dtype=np.float64)
     X, Y = np.meshgrid(xs, ys)
     xyz = np.stack([X.ravel(), Y.ravel(), np.full(X.size, float(z))], axis=1)
-    return eval_folded_potential(fit_result, int(atom_type_idx), xyz).reshape(X.shape)
+    return eval_folded_potential(fit_result, int(atom_type_idx), xyz, atom_REQH=atom_REQH, component=component).reshape(X.shape)
 
 
 def faf_type_idx_for_probe(fit_result, probe_R0, probe_E0, probe_q):

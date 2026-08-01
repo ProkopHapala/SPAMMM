@@ -19,10 +19,30 @@ from tests.helpers.folded_rigid import (
     save_reference, compare_to_reference,
     NACL_SUBSTRATE, Z_SURF_TOP, LATTICE_A,
 )
-from spammm.surfaces.FoldedRigid import setup_rigid_folded_replicas
+from spammm.surfaces.FoldedRigid import FAF_MODE_FACTOR, eval_folded_potential, setup_rigid_folded_replicas
 
 DATA_XYZ = os.path.join(_proj_root, 'data', 'xyz')
 DEBUG_DIR = os.path.join(_proj_root, 'debug', 'test_folded_relax')
+
+
+@pytest.mark.gpu
+def test_factorized_folded_cpu_gpu_parity():
+    """Synthetic factorized float4 fit must match the CPU PLQ reference."""
+    apos = np.array([[0,0,0], [1,0,0], [0,1,0], [0,0,1]], dtype=np.float32)
+    reqs = np.array([[1.2,.4,-.3,0], [1.4,.5,.2,0], [1.1,.3,.1,0], [1.3,.45,0,0]], dtype=np.float32)
+    fit = {
+        'format_version': 2, 'fit_mode': FAF_MODE_FACTOR,
+        'coeffs4': np.array([[2,3,5,0], [-1,.5,2,0], [.2,-.4,1,0]], dtype=np.float32),
+        'basis_params': np.array([[0,0,.3,-3.25], [1,0,.5,-3.25], [0,1,.7,-3.25]], dtype=np.float32),
+        'atom_type_ids': np.zeros(4, dtype=np.int32), 'folded_lvec2d': np.array([4,0,0,4], dtype=np.float32),
+        'unique_REQs': np.array([[0,1,1,0]], dtype=np.float32), 'z_range': (-2,5),
+        'enames': ['C','O','H','N'], 'reqs': reqs, 'apos_mol': apos, 'alpha_morse': 1.8,
+    }
+    rbd = setup_rigid_folded(None, fit, z_init=4.0, xy_init=(0.37, 0.61))
+    _, _, _, E_gpu, out = rbd.eval_force_torque()
+    xyz_world = out['atom_positions'][0, :, :3]
+    E_cpu = sum(float(eval_folded_potential(fit, ia, xyz_world[ia:ia+1])[0]) for ia in range(4))
+    assert E_gpu == pytest.approx(E_cpu, abs=2e-5)
 
 
 @pytest.mark.gpu

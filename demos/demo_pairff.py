@@ -101,17 +101,10 @@ def _build_multibody(molecules, labels, active, spacing, args):
 
 
 def _load_or_fit_faf(mol_xyz, fit_path=None):
-    """Load cached FAF fit or fit HCOOH@NaCl and save under data/fits/."""
-    from spammm.surfaces.FoldedRigid import fit_folded_for_molecule, load_fit, save_fit
-    path = fit_path or DEFAULT_HCOOH_FIT
-    if os.path.isfile(path):
-        print(f"Loading FAF fit: {path}")
-        return load_fit(path)
-    print(f"Fitting FAF for {mol_xyz} → {path} (first run; may take a minute)...")
-    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-    fit = fit_folded_for_molecule(mol_xyz)
-    save_fit(fit, path)
-    print(f"Saved FAF fit: {path}")
+    """Load cached FAF fit or fit molecule@NaCl. Delegates to shared load_or_fit_faf."""
+    from spammm.surfaces.FoldedRigid import load_or_fit_faf
+    mol_name = os.path.splitext(os.path.basename(mol_xyz))[0]
+    return load_or_fit_faf(mol_xyz, mol_name=mol_name, fit_path=fit_path)
     return fit
 
 

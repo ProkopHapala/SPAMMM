@@ -1,6 +1,6 @@
 # Task: GUI Tight Layout — Maximally Efficient Widget Packing
 
-**Status:** Spec — problem analysis + design goals (2026-08-01)
+**Status:** Phase 1-3 implemented — global stylesheet + enforce_tight sweep + fixed panel width. Awaiting USER confirmation.
 **Priority:** P2 (GUI UX — sidebar still too wide despite LayoutPolicy)
 **Related:** `spammm/GUI/LayoutPolicy.py`, `spammm/GUI/BaseGUI.py`, `spammm/GUI/SPAMMM_GUI.py`, all `*Extension.py`, `AGENTS.md` §GUI layout
 
@@ -105,3 +105,70 @@ The current approach (manually adding `setSizePolicy` to each widget) is fragile
 | `spammm/GUI/SPAMMM_GUI.py` | Call `enforce()` after `initUI()`, fix panel width |
 | `spammm/GUI/ExtensionManager.py` | Call `enforce()` after each `build_ui()` |
 | All `*Extension.py` | Remove `addStretch()` where appropriate, use `FlowLayout` for wrapping rows |
+
+---
+
+## 6. What was implemented (2026-08-01)
+
+### 6.1 Global tight stylesheet (`TIGHT_STYLESHEET` in LayoutPolicy.py)
+
+The single most impactful change. Qt's default widget padding (6px for buttons, 4px for spinboxes) makes widgets far wider than their text. The stylesheet eliminates this globally:
+
+```css
+QPushButton { padding: 0px 3px; min-width: 0; max-width: 120px; }
+QSpinBox, QDoubleSpinBox { padding: 0px 1px; min-width: 0; }
+QComboBox { padding: 0px 2px; min-width: 0; }
+QLabel { padding: 0px; margin: 0px; }
+QCheckBox { padding: 0px; spacing: 2px; }
+```
+
+Applied in `BaseGUI.__init__` via `self.setStyleSheet(TIGHT_STYLESHEET)`.
+
+### 6.2 `enforce_tight(widget)` — robust recursive sweep
+
+The previous approach (manually adding `setSizePolicy(Maximum, Fixed)` to each widget in extensions) was fragile — any new widget or extension would miss it. The new `enforce_tight` runs AFTER the entire UI is built and uses `findChildren()` to set Maximum policy on ALL widgets of each type:
+
+```python
+def enforce_tight(widget):
+    Max = QtWidgets.QSizePolicy.Maximum
+    Fixed = QtWidgets.QSizePolicy.Fixed
+    for w in widget.findChildren(QtWidgets.QPushButton): w.setSizePolicy(Max, Fixed)
+    for w in widget.findChildren(QtWidgets.QLabel): w.setSizePolicy(Max, Fixed)
+    for w in widget.findChildren(QtWidgets.QComboBox): w.setSizePolicy(Max, Fixed); ...
+    for w in widget.findChildren(QtWidgets.QSpinBox): w.setSizePolicy(Max, Fixed)
+    for w in widget.findChildren(QtWidgets.QDoubleSpinBox): w.setSizePolicy(Max, Fixed)
+    for w in widget.findChildren(QtWidgets.QCheckBox): w.setSizePolicy(Max, Fixed)
+    for w in widget.findChildren(QtWidgets.QLineEdit): w.setSizePolicy(Max, Fixed)
+```
+
+Called at two points:
+- After each `build_ui()` in `ExtensionManager` — catches all extension widgets
+- After `initUI()` in `SPAMMM_GUI` (on `side_content`) — catches all main GUI section widgets
+
+### 6.3 Fixed panel width
+
+`side_content.setFixedWidth(PANEL_TARGET_WIDTH)` instead of `setMaximumWidth(PANEL_MAX_WIDTH)`. The panel is now exactly 320px, not expandable to 450px.
+
+### 6.4 Measured results
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Content widget width | up to 450px | **320px** (fixed) |
+| Labels with Maximum policy | 0/161 | **161/161** |
+| Buttons with Maximum policy | 0/84 | **84/84** |
+| Combos with Maximum policy | 0/18 | **18/18** |
+| Spinboxes with Maximum policy | 0/114 | **114/114** |
+| Button "Auto H" sizeHint | 80px | **46px** |
+| Button "Snap" sizeHint | 80px | **36px** |
+| Button "Auto Bonds" sizeHint | 80px | **71px** |
+| All 56 GUI tests | pass | **pass** |
+
+### 6.5 Remaining work (Phase 4 — FlowLayout for wrapping rows)
+
+The `enforce_tight` sweep + stylesheet + fixed width ensure widgets don't expand. But rows still use `QHBoxLayout` which lays out widgets left-to-right in a single row. If the row content exceeds 320px, the widgets are squeezed (not wrapped).
+
+The next step is to replace `QHBoxLayout` button rows with `FlowLayout` so widgets wrap to the next line when they exceed the panel width — like text line-breaking. This is the "line-broken if they overpass the limits" behavior the user requested.
+
+Files to update:
+- `SPAMMM_GUI.py` — `create_editors_section`, `create_grid_section`, `create_ribbon_section`, `create_accessibility_section`
+- All `*Extension.py` — button rows that currently use `QHBoxLayout`
