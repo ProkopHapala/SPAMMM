@@ -16,7 +16,7 @@ OpenCL source for SPAMMM GPU compute. Python harnesses concatenate `.cl` snippet
 | `gridFF.cl` | 3D B-spline grid build, Poisson, sampling | SPFF, GridFF, rigid |
 | `surface.cl` | Ewald2D, folded basis, brute Morse, isosurface | SPFF, SurfaceEwald |
 | `contact_surface.cl` | Quasi-2D contact surface (separable + PIC) | `surfaces/ContactSurface.py` |
-| `rigid.cl` | 6-DOF rigid body plus PairFF+FAF replica energy evaluation | `forcefields/RigidBodyDynamics.py` |
+| `rigid.cl` | 6-DOF rigid body, PairFF+FAF replica energy, and ping-pong concurrent multi-molecule MD | `forcefields/RigidBodyDynamics.py` |
 | `assembly.cl` | Multi-molecule rigid transforms + clash | `forcefields/Assembly.py` |
 | `AFM.cl` | Probe relaxation + AFM image generation | `SPM/AFM.py` |
 | `grids.cl` | Density project/downsample (dipole-preserving), Gaussian NA, axpy | `utils/GridsOCL.py` |

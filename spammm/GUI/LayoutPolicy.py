@@ -56,30 +56,85 @@ def apply_tight(layout, margins=MARGIN, spacing=SPACING):
     return layout
 
 
-class GridPlacer:
-    """Excel-like grid layout: panel width divided into N equal cells.
+class AutoGridPlacer:
+    """Excel-like grid layout with AUTOMATIC span calculation.
 
-    Each widget occupies 1+ cells. Widgets that need more space span multiple
-    cells (like merging Excel cells). Auto-wraps to next row when full.
+    Panel width divided into `cols` EQUAL cells. Each widget's span is
+    auto-calculated from its sizeHint() — no manual span parameter needed.
 
-    Label+input pairs are treated as ONE component (label cell + input cells).
+    Label+input pairs are treated as ONE component (measured together).
+
+    Auto-wraps to next row when remaining cells can't fit the widget.
+    All cells are equal width (enforced via column stretch), so alignment
+    is perfect and predictable.
 
     Usage:
-        g = GridPlacer(cols=6)
-        g.add(button, span=1)           # small button = 1 cell
-        g.add(button, span=2)           # medium button = 2 cells
-        g.add_pair("Pick R:", spin, input_span=2)  # label=1 + input=2 = 3 cells
-        g.newrow()                      # force new row
+        g = AutoGridPlacer(cols=4)
+        g.add(button)                    # span auto from sizeHint
+        g.add_pair("dt:", spinbox)       # label+input measured together
+        g.newrow()                       # optional forced break
         layout.addLayout(g.layout())
     """
-    def __init__(self, cols=6):
+    def __init__(self, cols=4, cell_width=80):
         self._grid = QtWidgets.QGridLayout()
         apply_tight(self._grid)
         self._cols = cols
+        self._cell_w = cell_width  # reference width for span calculation
         self._row = 0
         self._col = 0
+        # Equal columns via stretch only (NO minimum width — prevents overflow
+        # in scroll areas / narrow panels). Stretch=1 makes all columns equal.
+        for i in range(cols):
+            self._grid.setColumnStretch(i, 1)
+
+    def _text_width(self, widget, text):
+        """Measure text pixel width using widget's fontMetrics."""
+        fm = widget.fontMetrics()
+        if hasattr(fm, 'horizontalAdvance'):
+            return fm.horizontalAdvance(text)
+        return fm.width(text)  # PyQt5 fallback
+
+    def _auto_span(self, widget):
+        """Calculate span from ACTUAL text width via fontMetrics.
+
+        Uses widget's text (buttons, labels) or longest item (combos).
+        Padding is minimal — just enough for borders/decorations.
+        """
+        cw = self._cell_w
+        # Buttons: text width + 10px padding (5px each side)
+        if isinstance(widget, (QtWidgets.QPushButton, QtWidgets.QToolButton)):
+            text = widget.text()
+            total = self._text_width(widget, text) + 10
+            return max(1, (total + cw - 1) // cw)
+        # Checkboxes: text width + 20px (checkbox square + spacing)
+        if isinstance(widget, QtWidgets.QCheckBox):
+            text = widget.text()
+            total = self._text_width(widget, text) + 20
+            return max(1, (total + cw - 1) // cw)
+        # Labels: text width + 2px (minimal)
+        if isinstance(widget, QtWidgets.QLabel):
+            text = widget.text()
+            total = self._text_width(widget, text) + 2
+            return max(1, (total + cw - 1) // cw)
+        # Spinboxes: 1 cell (they have maximumWidth set)
+        if isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
+            return 1
+        # LineEdits: 2 cells (need space for typing)
+        if isinstance(widget, QtWidgets.QLineEdit):
+            return 2
+        # Combos: longest item text + 24px (dropdown arrow + padding)
+        if isinstance(widget, QtWidgets.QComboBox):
+            n = widget.count()
+            if n == 0:
+                return 1
+            longest = max((widget.itemText(i) for i in range(n)), key=len)
+            total = self._text_width(widget, longest) + 24
+            return max(1, (total + cw - 1) // cw)
+        # Fallback: 1 cell
+        return 1
 
     def _place(self, span):
+        """Auto-wrap if needed, return (row, col, span)."""
         if self._col + span > self._cols and self._col > 0:
             self._row += 1
             self._col = 0
@@ -87,26 +142,38 @@ class GridPlacer:
         self._col += span
         return self._row, start, span
 
-    def add(self, widget, span=1):
-        """Add a widget occupying `span` cells."""
+    def add(self, widget, span=None):
+        """Add a widget. Span auto-calculated from sizeHint if not given."""
+        if span is None:
+            span = self._auto_span(widget)
         r, c, s = self._place(span)
         self._grid.addWidget(widget, r, c, 1, s)
         return self
 
-    def add_pair(self, label_text, widget, label_span=1, input_span=2):
-        """Add a label + input as one logical unit (label_span + input_span cells)."""
+    def add_pair(self, label_text, widget, label_span=None, input_span=None):
+        """Add label + input as one unit. Spans auto-calculated if not given."""
+        lbl = QtWidgets.QLabel(label_text)
+        if label_span is None:
+            label_span = self._auto_span(lbl)
+        if input_span is None:
+            input_span = self._auto_span(widget)
         total = label_span + input_span
+        # If total exceeds cols, give label 1 cell, input gets the rest
+        if total > self._cols:
+            label_span = 1
+            input_span = self._cols - 1
+            total = self._cols
+        # Auto-wrap
         if self._col + total > self._cols and self._col > 0:
             self._row += 1
             self._col = 0
-        lbl = QtWidgets.QLabel(label_text)
         self._grid.addWidget(lbl, self._row, self._col, 1, label_span)
         self._grid.addWidget(widget, self._row, self._col + label_span, 1, input_span)
         self._col += total
         return self
 
     def newrow(self):
-        """Force next row."""
+        """Force next row (optional — auto-wrap handles most cases)."""
         self._row += 1
         self._col = 0
         return self
@@ -114,6 +181,34 @@ class GridPlacer:
     def layout(self):
         """Return the underlying QGridLayout."""
         return self._grid
+
+
+# Backward-compatible alias
+GridPlacer = AutoGridPlacer
+
+
+_GROUPBOX_STYLE = """
+QGroupBox {
+    border: 1px solid #888;
+    border-radius: 3px;
+    margin-top: 14px;
+    padding-top: 2px;
+    font-weight: bold;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 4px;
+    padding: 0 3px;
+}
+"""
+
+
+def tight_groupbox(title):
+    """Create a QGroupBox with tight margins but room for the title label."""
+    gb = QtWidgets.QGroupBox(title)
+    gb.setStyleSheet(_GROUPBOX_STYLE)
+    return gb
 
 
 def make_vbox(parent=None, tight=True):

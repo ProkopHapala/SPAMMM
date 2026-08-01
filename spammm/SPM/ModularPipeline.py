@@ -120,6 +120,10 @@ class ModularAFMPipeline:
         self.orb_offsets = None
         self._afmulator = None  # reused across S3 dispersion/gradient + S4 relax
         self._fdbm_grid_ready = False  # True after fast-S3 device setup_fdbm_grid_from_img
+        # FGR STM (Stage 5/6) caches — built lazily, reused across S5/S6 calls
+        self._fgr_basis_ang = None       # prolonged basis_ang for FGR tables
+        self._fgr_tables = None          # (tables, tip_type0, name_to_smp, species_per_atom)
+        self._fgr_tables_key = None      # (tip_elem, eh_K, rcut) for cache invalidation
 
         # pySCF structures (only used for backend='pyscf')
         self._pyscf_data = None  # Cache for mol, mf, dm from pySCF
@@ -134,6 +138,49 @@ class ModularAFMPipeline:
             self._afmulator = afm.AFMulator(use_morse=False, nloc=32)
             _bench().end('AFMulator_ctor')
         return self._afmulator
+
+    # --- FGR STM (H−E·S transfer kernel) helpers for Stage 5/6 ---
+    def _get_fgr_basis_ang(self):
+        """Prolonged basis_ang (Slater-tail) for FGR SK tables — built once, cached."""
+        if self._fgr_basis_ang is None:
+            from spammm.config_utils import get_dftb_basis_path
+            from spammm.quantum.DFTB.DFTBplusParser import (
+                parse_wfc_hsd, convert_wfc_to_species_list_ang)
+            basis_hsd = get_dftb_basis_path(self.basis if hasattr(self, 'basis') else self.slako_prefix)
+            if basis_hsd is None:
+                basis_name = self.slako_prefix.rstrip('/').split('/')[-1] or '3ob-3-1'
+                basis_hsd = get_dftb_basis_path(basis_name)
+            basis_data = parse_wfc_hsd(basis_hsd)
+            self._fgr_basis_ang = convert_wfc_to_species_list_ang(basis_data, resolution_bohr=0.04)
+        return self._fgr_basis_ang
+
+    def _build_fgr_tables(self, tip_elem='C', eh_K=1.75, rcut=15.0):
+        """Build prolonged Level-B H/S FGR tables (cached per tip_elem/K/rcut)."""
+        key = (str(tip_elem), float(eh_K), float(rcut))
+        if self._fgr_tables_key != key:
+            basis_ang = self._get_fgr_basis_ang()
+            sample_elems = sorted(set(self.enames))
+            tables, tip_type0, name_to_smp, _prol, _sto = afm_utils._stm_fgr_prepare_tables(
+                self.projector, self.work_dir, basis_ang,
+                tip_elem=tip_elem, K=float(eh_K), rcut_table=float(rcut),
+                sample_elems=sample_elems)
+            species_per_atom = list(range(len(self.enames)))
+            self._fgr_tables = (tables, tip_type0, name_to_smp, species_per_atom)
+            self._fgr_tables_key = key
+        return self._fgr_tables
+
+    @staticmethod
+    def _expand_degen_cluster(eigvals, mo_list, thresh_eV):
+        """Expand each MO in mo_list to its near-degenerate cluster (|E−E0| ≤ thresh)."""
+        mo_list = [int(i) for i in mo_list]
+        if thresh_eV <= 0:
+            return mo_list
+        ev = np.asarray(eigvals, dtype=np.float64)
+        expanded = set(mo_list)
+        for m in list(mo_list):
+            E0 = float(ev[m])
+            expanded.update(i for i in range(len(ev)) if abs(float(ev[i]) - E0) <= float(thresh_eV))
+        return sorted(expanded)
 
     def _init_geometry_and_grids(self):
         """Load molecular structure and define grid parameters."""
@@ -704,8 +751,15 @@ Hamiltonian = DFTB {{
         return df, tip_disp, FEs_relax
 
     def stage5_stm(self, eigvecs, eigvals, lumo_offsets=[1, 2, 3], mo_indices=None,
-                  field='ldos', use_exp_basis=True, exp_beta=1.0, exp_r0=3.0):
-        """Stage 5: Standard STM projection on height slices."""
+                  field='ldos', use_exp_basis=True, exp_beta=1.0, exp_r0=3.0,
+                  stm_mode='fgr', tip_orbital='s', tip_elem='C', eh_K=1.75,
+                  rcut=15.0, taper_w=2.0, degen_thresh_eV=0.005):
+        """Stage 5: Standard STM projection on height slices.
+
+        ``stm_mode``: 'fgr' (default, H−E·S transfer kernel) or 'overlap' (legacy
+        exp-decay). FGR mode ignores ``field``/``exp_beta``/``exp_r0`` (always returns
+        intensity I=|c_t†(H−ES)c_s|²) and sums I over near-degenerate MO clusters.
+        """
         if self.backend == 'pyscf':
             raise NotImplementedError(
                 "STM imaging (Stage 5) is not yet supported with pySCF backend. "
@@ -714,6 +768,17 @@ Hamiltonian = DFTB {{
                 "or implement Phase 2 (GTO GPU projection) for pySCF STM support."
             )
         print(f"\n[ModularPipeline] Running Stage 5 (Standard STM)...")
+        if stm_mode == 'fgr':
+            if mo_indices is None:
+                raise ValueError("Stage 5 FGR requires explicit mo_indices (resolve HOMO in caller).")
+            basis_ang = self._get_fgr_basis_ang()
+            tables, tip_type0, name_to_smp, species_per_atom = self._build_fgr_tables(tip_elem, eh_K, rcut)
+            return afm_utils.compute_stm_fgr(
+                self.projector, eigvecs, eigvals, self.scan_xs, self.scan_ys, self.heights,
+                self.atoms_dict, basis_ang, self.enames, species_per_atom,
+                tables, tip_type0, name_to_smp, mo_indices=mo_indices,
+                tip_orbital=tip_orbital, tip_elem=tip_elem, mode='tau',
+                rcut=float(rcut), taper_w=float(taper_w), degen_thresh_eV=float(degen_thresh_eV))
         return afm_utils.compute_stm(
             self.projector, eigvecs, eigvals, self.scan_xs, self.scan_ys, self.heights,
             self.norb_per_atom, self.orb_offsets, self.atoms_dict,
@@ -722,8 +787,15 @@ Hamiltonian = DFTB {{
         )
 
     def stage6_br_stm(self, eigvecs, eigvals, tip_disp, lumo_offsets=[1, 2, 3],
-                      mo_indices=None, field='ldos', use_exp_basis=True, exp_beta=1.0, exp_r0=3.0):
-        """Stage 6: Bond-Resolved STM (STM at AFM-relaxed tip positions)."""
+                      mo_indices=None, field='ldos', use_exp_basis=True, exp_beta=1.0, exp_r0=3.0,
+                      stm_mode='fgr', tip_orbital='s', tip_elem='C', eh_K=1.75,
+                      rcut=15.0, taper_w=2.0, degen_thresh_eV=0.005):
+        """Stage 6: Bond-Resolved STM (STM at AFM-relaxed tip positions).
+
+        ``stm_mode``: 'fgr' (default, H−E·S transfer kernel at displaced tip) or
+        'overlap' (legacy exp-decay). FGR mode ignores ``field``/``exp_beta``/``exp_r0``
+        and sums I over near-degenerate MO clusters.
+        """
         if self.backend == 'pyscf':
             raise NotImplementedError(
                 "Bond-Resolved STM (Stage 6) is not yet supported with pySCF backend. "
@@ -732,6 +804,19 @@ Hamiltonian = DFTB {{
                 "or implement Phase 2 (GTO GPU projection) for pySCF STM support."
             )
         print(f"\n[ModularPipeline] Running Stage 6 (Bond-Resolved STM)...")
+        if stm_mode == 'fgr':
+            if mo_indices is None:
+                raise ValueError("Stage 6 FGR requires explicit mo_indices (resolve HOMO in caller).")
+            basis_ang = self._get_fgr_basis_ang()
+            tables, tip_type0, name_to_smp, species_per_atom = self._build_fgr_tables(tip_elem, eh_K, rcut)
+            br_cluster = self._expand_degen_cluster(eigvals, mo_indices, degen_thresh_eV)
+            return afm_utils.compute_bond_resolved_stm_fgr(
+                self.projector, eigvecs, eigvals, self.scan_xs, self.scan_ys, self.heights,
+                tip_disp, self.atoms_dict, basis_ang, self.enames, species_per_atom,
+                tables, tip_type0, name_to_smp, mo_indices=br_cluster,
+                tip_orbital=tip_orbital, tip_elem=tip_elem, mode='tau',
+                rcut=float(rcut), taper_w=float(taper_w),
+                degen_thresh_eV=float(degen_thresh_eV), degen_partner_count=len(br_cluster) - 1)
         return afm_utils.compute_bond_resolved_stm(
             self.projector, eigvecs, eigvals, self.scan_xs, self.scan_ys, self.heights,
             tip_disp, self.norb_per_atom, self.orb_offsets, self.atoms_dict,

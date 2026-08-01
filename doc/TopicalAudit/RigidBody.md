@@ -71,6 +71,7 @@ Proposed name (TBD): `RigidEnsemble` / `MoleculePoseGraph` — see SSOT task. **
 | `rigid_body_*_gridff_*` | GridFF forces → same integration |
 | `rigid_body_folded_*` / Newton / replicas | Folded basis; pose MD / optimizer |
 | PairFF unified allmol (± FAF) | Multi-mol layout; `active_mol` index; all poses stay on GPU |
+| PairFF concurrent 15–17 | Ping-pong multi-WG K=1 reference; experimental persistent and simultaneous single-WG all-mobile MD |
 | `rigid_body_pairff_energy_replica_kernel` | **Read-only** replica `poss`/`qrots` → energies (MC/GA consumer pattern) |
 
 Helpers: `quat_mult`, `make_qrot` / `make_qrot_taylor`, `qrot_omega*`, `quat_to_a/b/c`.

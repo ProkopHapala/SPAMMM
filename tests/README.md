@@ -32,7 +32,7 @@ pytest tests/topology/test_editing_ops.py --develop -s  # new feature debug
 |--------|---------|
 | `conftest.py` | Fixtures, `--develop`/`--review`/`--visual` flags |
 | `test_topology.py` | Bond/angle/hybridization/type assignment |
-| `test_forcefield.py` | UFF/SPFF optimization, NVE |
+| `test_forcefield.py` | UFF/SPFF optimization and NVE; PairFF replica clash and concurrent-launch parity |
 | `test_relax_serial.py` | SPFF serial vs batch parity (L0) |
 | `test_relax_flat1.py` | flat_1 PAH vacuum/substrate timing (`--develop`) |
 | `test_relax_ptcda_faf.py` | PTCDA+FAF: SPFF/UFF fused + **LFF** topology/sweep (`--develop`) |

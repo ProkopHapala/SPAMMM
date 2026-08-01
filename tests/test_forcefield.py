@@ -173,6 +173,36 @@ def test_pairff_replica_clash_channel_matches_cpu():
 
 
 @pytest.mark.gpu
+def test_pairff_multimol_launch_parity():
+    """Concurrent launch variants must match ping-pong K=1 body state."""
+    from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF
+    from spammm.forcefields.RigidBodyUtils import load_molecule
+    _HCOOH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'xyz', 'HCOOH.xyz')
+    apos, enames, REQs, _ = load_molecule(_HCOOH, qeq=False, name='formic_acid')
+    pos = np.array([[0.0, 0.0, 0.0], [5.0, 0.25, 0.0]], dtype=np.float32)
+    quat = np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (2, 1))
+    zero = np.zeros((2, 4), dtype=np.float32)
+    rbd = RigidBodyPairFF.from_molecules([(apos, enames, REQs)] * 2, pos, quats=quat)
+    pos4 = np.zeros((2, 4), dtype=np.float32); pos4[:, :3] = pos; pos4[:, 3] = 1.0
+    def reset():
+        rbd.toGPU('poss', pos4); rbd.toGPU('qrots', quat); rbd.toGPU('vposs', zero); rbd.toGPU('vrots', zero); rbd.toGPU('fire_state', zero); rbd.queue.finish()
+    def state():
+        return rbd.download_selected(('pos', 'quats', 'lin_mom', 'ang_mom', 'body_force', 'body_torque'))
+    reset(); rbd.run_multimol_md(3, dt=0.01, lin_damp=1.0, ang_damp=1.0); ref = state()
+    reset(); rbd.run_multimol_md(3, dt=0.01, lin_damp=1.0, ang_damp=1.0, eventless=True); raw = state()
+    reset(); rbd.run_multimol_single_wg(3, dt=0.01, lin_damp=1.0, ang_damp=1.0); one_wg = state()
+    reset(); rbd.run_multimol_persistent(3, dt=0.01, lin_damp=1.0, ang_damp=1.0); persistent = state()
+    for name in ref:
+        np.testing.assert_allclose(raw[name], ref[name], rtol=0.0, atol=0.0, err_msg=f"eventless {name}")
+        np.testing.assert_allclose(one_wg[name], ref[name], rtol=2e-6, atol=2e-6, err_msg=f"single-WG {name}")
+        np.testing.assert_allclose(persistent[name], ref[name], rtol=2e-6, atol=2e-6, err_msg=f"persistent {name}")
+    reset(); rbd.run_multimol_md(1, dt=0.01, lin_damp=1.0, ang_damp=1.0); ref1 = state()
+    reset(); rbd.run_multimol_md(1, dt=0.01, lin_damp=1.0, ang_damp=1.0, predict_partners=True); pred1 = state()
+    for name in ref1:
+        np.testing.assert_allclose(pred1[name], ref1[name], rtol=0.0, atol=0.0, err_msg=f"K=1 predictor {name}")
+
+
+@pytest.mark.gpu
 def test_uff_force_newton3(xyz):
     """Net force on isolated molecule should be ~0 (Newton's 3rd law)."""
     from spammm.forcefields.UFF_cl import UFF_cl

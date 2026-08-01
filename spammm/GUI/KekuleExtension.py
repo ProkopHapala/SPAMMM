@@ -12,7 +12,7 @@ from PyQt5 import QtWidgets, QtCore
 import numpy as np
 
 from .ExtensionManager import UIComponents
-from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, GridPlacer
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, AutoGridPlacer
 from spammm.topology.KekulePure import run_kekule_solver, localize_kekule, make_n_pi
 
 
@@ -26,60 +26,60 @@ def build_ui(window):
     apply_tight(layout)
 
     # --- Row 4: Kekule solver parameters ---
-    g4 = GridPlacer(cols=6)
+    g4 = AutoGridPlacer(cols=4)
     window.kek_kval_spin = QtWidgets.QDoubleSpinBox()
     window.kek_kval_spin.setRange(0.1, 1000.0)
     window.kek_kval_spin.setValue(50.0)
     window.kek_kval_spin.setMaximumWidth(SPIN_MAX_WIDTH)
-    g4.add_pair("Kval:", window.kek_kval_spin, label_span=1, input_span=2)
+    g4.add_pair("Kval:", window.kek_kval_spin)
     window.kek_kloc_spin = QtWidgets.QDoubleSpinBox()
     window.kek_kloc_spin.setRange(0.0, 100.0)
     window.kek_kloc_spin.setValue(5.0)
     window.kek_kloc_spin.setMaximumWidth(SPIN_MAX_WIDTH)
-    g4.add_pair("Kloc:", window.kek_kloc_spin, label_span=1, input_span=2)
+    g4.add_pair("Kloc:", window.kek_kloc_spin)
     window.kek_karo_spin = QtWidgets.QDoubleSpinBox()
     window.kek_karo_spin.setRange(0.0, 10.0)
     window.kek_karo_spin.setSingleStep(0.1)
     window.kek_karo_spin.setValue(0.5)
     window.kek_karo_spin.setMaximumWidth(SPIN_MAX_WIDTH)
-    g4.add_pair("Karo:", window.kek_karo_spin, label_span=1, input_span=2)
+    g4.add_pair("Karo:", window.kek_karo_spin)
     layout.addLayout(g4.layout())
 
     # --- Row 5: Aromatic + Solve ---
-    g5 = GridPlacer(cols=6)
+    g5 = AutoGridPlacer(cols=4)
     window.kek_aromatic_chk = QtWidgets.QCheckBox("Aromatic")
     window.kek_aromatic_chk.setChecked(True)
-    g5.add(window.kek_aromatic_chk, span=2)
+    g5.add(window.kek_aromatic_chk)
     window.kek_solve_btn = QtWidgets.QPushButton("Solve")
     window.kek_solve_btn.clicked.connect(lambda: _on_solve(window))
-    g5.add(window.kek_solve_btn, span=2)
+    g5.add(window.kek_solve_btn)
     window.kek_solve_current_btn = QtWidgets.QPushButton("Solve Current")
     window.kek_solve_current_btn.clicked.connect(lambda: _on_solve_current(window))
-    g5.add(window.kek_solve_current_btn, span=2)
+    g5.add(window.kek_solve_current_btn)
     layout.addLayout(g5.layout())
 
     # --- Row 5b: Localize (phase 2) + sym_break noise + seed ---
-    g5b = GridPlacer(cols=6)
+    g5b = AutoGridPlacer(cols=4)
     window.kek_localize_btn = QtWidgets.QPushButton("Localize")
     window.kek_localize_btn.setToolTip("Run localization (phase 2): snap delocalized bond orders to integer (0/1) or aromatic (0.5)")
     window.kek_localize_btn.clicked.connect(lambda: _on_localize(window))
-    g5b.add(window.kek_localize_btn, span=1)
+    g5b.add(window.kek_localize_btn)
     window.kek_symbreak_spin = QtWidgets.QDoubleSpinBox()
     window.kek_symbreak_spin.setRange(0.0, 1.0)
     window.kek_symbreak_spin.setSingleStep(0.01)
     window.kek_symbreak_spin.setValue(0.2)
     window.kek_symbreak_spin.setMaximumWidth(55)
     window.kek_symbreak_spin.setToolTip("Symmetry-breaking noise amplitude added to bond orders before localization")
-    g5b.add_pair("Noise:", window.kek_symbreak_spin, label_span=1, input_span=1)
+    g5b.add_pair("Noise:", window.kek_symbreak_spin)
     window.kek_seed_spin = QtWidgets.QSpinBox()
     window.kek_seed_spin.setRange(0, 999999)
     window.kek_seed_spin.setValue(42)
     window.kek_seed_spin.setMaximumWidth(SPIN_MAX_WIDTH)
-    g5b.add_pair("Seed:", window.kek_seed_spin, label_span=1, input_span=1)
+    g5b.add_pair("Seed:", window.kek_seed_spin)
     window.kek_newseed_btn = QtWidgets.QPushButton("New")
     window.kek_newseed_btn.setToolTip("Generate a random seed")
     window.kek_newseed_btn.clicked.connect(lambda: window.kek_seed_spin.setValue(np.random.randint(1, 999999)))
-    g5b.add(window.kek_newseed_btn, span=1)
+    g5b.add(window.kek_newseed_btn)
     layout.addLayout(g5b.layout())
 
     # --- Status ---

@@ -22,7 +22,7 @@ import numpy as np
 from PyQt5 import QtWidgets, QtCore
 from spammm.GUI.CollapsibleSection import CollapsibleSection
 from spammm.GUI.ExtensionManager import UIComponents
-from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, AutoGridPlacer, tight_groupbox
 
 
 # ============================================================
@@ -533,7 +533,23 @@ def _get_stm_params_from_ui(window):
         'exp_beta':     float(window.afm_stm_exp_beta.value()),
         'exp_r0':       float(window.afm_stm_exp_r0.value()),
         'bond_resolved': bool(window.afm_stm_bond_resolved.isChecked()),
+        # STM kernel mode + FGR params (Stage 5/6). Default 'fgr' (H−E·S transfer).
+        'stm_mode':     ('fgr' if (hasattr(window, 'afm_stm_mode_combo') and window.afm_stm_mode_combo.currentIndex() == 0) else 'overlap'),
+        'tip_orbital':  str(window.afm_stm_tip_orbital.currentText()) if hasattr(window, 'afm_stm_tip_orbital') else 's',
+        'tip_elem':     str(window.afm_stm_tip_elem.text()).strip() or 'C' if hasattr(window, 'afm_stm_tip_elem') else 'C',
+        'eh_K':         float(window.afm_stm_eh_K.value()) if hasattr(window, 'afm_stm_eh_K') else 1.75,
+        'rcut':         float(window.afm_stm_rcut.value()) if hasattr(window, 'afm_stm_rcut') else 15.0,
+        'taper_w':      float(window.afm_stm_taper_w.value()) if hasattr(window, 'afm_stm_taper_w') else 2.0,
+        'degen_eV':     float(window.afm_stm_degen.value()) if hasattr(window, 'afm_stm_degen') else 0.005,
     }
+
+
+def _fgr_stage_kwargs(sp):
+    """FGR/STM-mode kwargs shared by all stage5_stm/stage6_br_stm calls (DRY)."""
+    return dict(
+        stm_mode=sp['stm_mode'], tip_orbital=sp['tip_orbital'], tip_elem=sp['tip_elem'],
+        eh_K=sp['eh_K'], rcut=sp['rcut'], taper_w=sp['taper_w'], degen_thresh_eV=sp['degen_eV'],
+    )
 
 
 def _ensure_stages_for_component(window, component):
@@ -569,14 +585,16 @@ def _ensure_stages_for_component(window, component):
             _update_afm_status(window, f"Auto: Stage 5 STM (MOs={sp['mo_indices']})...")
             stm_grid = pipe.stage5_stm(window._afm_eigvecs, window._afm_eigvals,
                 lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
-                field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
+                field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'],
+                **_fgr_stage_kwargs(sp))
             window._afm_results['stm_grid'] = stm_grid
             dirty.clean('s5')
         if need_br and (dirty.is_dirty('s6') or 'br_stm_grid' not in (window._afm_results or {})):
             _update_afm_status(window, "Auto: Stage 6 BR-STM...")
             br_stm_grid = pipe.stage6_br_stm(window._afm_eigvecs, window._afm_eigvals, window._afm_results['tip_disp'],
                 lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
-                field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
+                field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'],
+                **_fgr_stage_kwargs(sp))
             window._afm_results['br_stm_grid'] = br_stm_grid
             dirty.clean('s6')
         if hasattr(window, '_afm_refresh_dirty_label'):
@@ -749,11 +767,12 @@ def run_stm(window):
             _update_homo_label(window)
 
         sp = _get_stm_params_from_ui(window)
-        _update_afm_status(window, f"STM (field={sp['field']}, MOs={sp['mo_indices']})...")
+        _update_afm_status(window, f"STM ({sp['stm_mode']}, MOs={sp['mo_indices']})...")
         stm_grid = pipe.stage5_stm(
             window._afm_eigvecs, window._afm_eigvals,
             lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
-            field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
+            field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'],
+            **_fgr_stage_kwargs(sp))
         if window._afm_results is None:
             window._afm_results = {
                 'heights': pipe.heights, 'scan_xs': pipe.scan_xs, 'scan_ys': pipe.scan_ys,
@@ -798,11 +817,12 @@ def run_br_stm(window):
         sp = _get_stm_params_from_ui(window)
         tip_disp = window._afm_results['tip_disp']
 
-        _update_afm_status(window, f"STM flat (MOs={sp['mo_indices']})...")
+        _update_afm_status(window, f"STM flat ({sp['stm_mode']}, MOs={sp['mo_indices']})...")
         stm_grid = pipe.stage5_stm(
             window._afm_eigvecs, window._afm_eigvals,
             lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
-            field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
+            field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'],
+            **_fgr_stage_kwargs(sp))
         window._afm_results['stm_grid'] = stm_grid
         window._afm_dirty.clean('s5')
 
@@ -810,7 +830,8 @@ def run_br_stm(window):
         br_stm_grid = pipe.stage6_br_stm(
             window._afm_eigvecs, window._afm_eigvals, tip_disp,
             lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
-            field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
+            field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'],
+            **_fgr_stage_kwargs(sp))
         window._afm_results['br_stm_grid'] = br_stm_grid
         window._afm_dirty.clean('s6')
 
@@ -840,26 +861,32 @@ def plot_brstm_panel(window):
 
         z_height = float(window.afm_z_height_spin.value())
         _ensure_height_covers(window, z_height, margin=1.0)
+        # df is at oscillation center h_df = h_Fz + amp; ensure h_df is covered too.
+        _amp_br = float(window.afm_amp_spin.value()) if hasattr(window, 'afm_amp_spin') else 1.0
+        _ensure_height_covers(window, z_height + _amp_br, margin=1.0)
 
         heights = np.asarray(window._afm_results['heights'], dtype=np.float64)
-        iz = int(np.argmin(np.abs(heights - z_height)))
-        actual_z = float(heights[iz])
+        # amp-aware z-slicing (skill:afm-plotting): z_height = h_Fz (physical z, label).
+        # df at oscillation center iz_df (h_df = h_Fz + amp); dxy/STM/BR-STM at iz_Fz (h_Fz).
+        # Using one iz for all shifts df by amp vs the others — CLI fixed this (idx_df/idx_Fz).
+        iz_Fz, iz_df, amp, h_Fz, h_df = _amp_z_indices(window, heights, z_height)
+        actual_z = h_Fz
         apos = None
         if hasattr(window, 'backend') and window.backend.sys is not None:
             apos = np.asarray(window.backend.sys.apos, dtype=np.float64)
 
         fig = Figure(figsize=(9.5, 8.5), dpi=110)
         au.plot_brstm_compare_slice(
-            window._afm_results['df'][:, :, iz],
-            window._afm_results['stm_grid'][:, :, iz],
-            window._afm_results['br_stm_grid'][:, :, iz],
+            window._afm_results['df'][:, :, iz_df],
+            window._afm_results['stm_grid'][:, :, iz_Fz],
+            window._afm_results['br_stm_grid'][:, :, iz_Fz],
             window._afm_results['tip_disp'],
-            window._afm_results['scan_xs'], window._afm_results['scan_ys'], iz,
-            apos=apos, title=f'BR-STM  z={actual_z:.2f}Å', dpi=110, fig=fig,
-            pp_stride=4, stm_cmap='viridis',
+            window._afm_results['scan_xs'], window._afm_results['scan_ys'], iz_Fz,
+            apos=apos, title=f'BR-STM  z={actual_z:.2f}Å (df@h_df={h_df:.2f}, amp={amp:.2f})',
+            dpi=110, fig=fig, pp_stride=4, stm_cmap='viridis',
         )
         _show_in_plot_window(window, fig, f"BR-STM Panel z={actual_z:.2f}Å")
-        window.statusBar().showMessage(f"BR-STM panel at z={actual_z:.2f}Å")
+        window.statusBar().showMessage(f"BR-STM panel at z={actual_z:.2f}Å (df@{h_df:.2f})")
     except Exception as e:
         raise RuntimeError(f"BR-STM panel FAILED: {e}")
 
@@ -1038,6 +1065,26 @@ def _get_z_slice(grid_spec, step, z_height):
     return iz, actual_z
 
 
+def _amp_z_indices(window, heights, z_height):
+    """amp-aware z-slice indices for the df-vs-Fz/STM/dxy convention (skill:afm-plotting).
+
+    ``z_height`` = h_Fz (physical z = plot column label). ``heights`` = pipe.heights =
+    h_scan (dense PP scan). df is the frequency shift at the oscillation center
+    h_df = h_Fz + amp, so it must be indexed at iz_df; Fz/|dxy|/STM/BR-STM are at
+    physical z h_Fz, indexed at iz_Fz. Using one iz for both shifts df by amp relative
+    to the others — this is the bug the CLI fixed (idx_df vs idx_Fz in run_br_stm_afm_panel).
+
+    Returns (iz_Fz, iz_df, amp, h_Fz, h_df).
+    """
+    amp = float(window.afm_amp_spin.value()) if hasattr(window, 'afm_amp_spin') else 1.0
+    h = np.asarray(heights, dtype=np.float64)
+    h_Fz = float(z_height)
+    h_df = h_Fz + amp
+    iz_Fz = int(np.argmin(np.abs(h - h_Fz)))
+    iz_df = int(np.argmin(np.abs(h - h_df)))
+    return iz_Fz, iz_df, amp, h_Fz, h_df
+
+
 def _show_in_plot_window(window, fig, title="AFM Plot"):
     """Show a matplotlib Figure in a reusable Qt dialog window."""
     from .plotutils import show_in_plot_window as _show
@@ -1075,9 +1122,13 @@ def plot_afm_slice(window):
         else:
             _ensure_stages_for_component(window, component)
 
-        # Expand scan heights if z spinner left the computed window (margin=1Å)
+        # Expand scan heights if z spinner left the computed window (margin=1Å).
+        # df is at oscillation center h_df = h_Fz + amp, so ensure h_df is covered too.
         if component in ("AFM Image (df)", "|dxy| tip", "STM Signal", "BR-STM Signal"):
+            _amp = float(window.afm_amp_spin.value()) if hasattr(window, 'afm_amp_spin') else 1.0
             _ensure_height_covers(window, z_height, margin=1.0)
+            if component == "AFM Image (df)":
+                _ensure_height_covers(window, z_height + _amp, margin=1.0)
 
         # Determine data source and get grid info
         if component == "AFM Image (df)":
@@ -1088,14 +1139,16 @@ def plot_afm_slice(window):
             heights = window._afm_results.get('heights', [])
             if len(heights) == 0:
                 raise ValueError("No heights in AFM results")
-            # Find closest height index
-            h_idx = np.argmin(np.abs(heights - z_height))
-            actual_z = heights[h_idx]
-            iz = h_idx
+            # df = frequency shift at oscillation center h_df = h_Fz + amp (skill:afm-plotting).
+            # z_height = h_Fz (physical z, label); df must be indexed at iz_df, NOT iz_Fz,
+            # otherwise df is shifted by amp vs Fz/STM/dxy (CLI fixed this via idx_df/idx_Fz).
+            iz_Fz, iz_df, amp, h_Fz, h_df = _amp_z_indices(window, heights, z_height)
+            iz = iz_df
+            actual_z = h_Fz  # label = h_Fz (closest approach); df extracted at h_df
             step = heights[1] - heights[0] if len(heights) > 1 else 0.1
             cmap = 'afmhot'
             symmetric = False
-            data_label = "Frequency Shift (Hz)"
+            data_label = f"Frequency Shift (Hz)  df@h_df={h_df:.2f}Å (closest={h_Fz:.2f}, amp={amp:.2f})"
             # Extract slice data
             data = data_3d[:, :, iz]
 
@@ -1345,53 +1398,48 @@ def build_ui(window):
     window._afm_refresh_dirty_label = _refresh_dirty_label
 
     # --- Three product buttons: AFM | STM | BR-STM ---
-    main_row = QtWidgets.QHBoxLayout()
+    g_prod = AutoGridPlacer(cols=4)
     afm_btn = QtWidgets.QPushButton("AFM")
     afm_btn.setToolTip("S1–S4 only: FDBM + PP relax → df / tip_disp. No STM/BR-STM.")
     afm_btn.clicked.connect(lambda: (run_afm_full_pipeline(window), _refresh_dirty_label()))
-    main_row.addWidget(afm_btn)
-
+    g_prod.add(afm_btn)
     stm_btn = QtWidgets.QPushButton("STM")
     stm_btn.setToolTip("Flat STM only (needs SCF). No PP relaxation.")
     stm_btn.clicked.connect(lambda: (run_stm(window), _refresh_dirty_label()))
-    main_row.addWidget(stm_btn)
-
+    g_prod.add(stm_btn)
     br_btn = QtWidgets.QPushButton("BR-STM")
     br_btn.setToolTip("Product mode: auto-runs AFM S1–S4 if needed, then STM+BR → 4-panel.")
     br_btn.clicked.connect(lambda: (run_br_stm(window), _refresh_dirty_label()))
-    main_row.addWidget(br_btn)
-    layout.addLayout(main_row)
+    g_prod.add(br_btn)
+    layout.addLayout(g_prod.layout())
 
     # --- Individual stage buttons (advanced) ---
-    stage_layout = QtWidgets.QHBoxLayout()
+    g_stage = AutoGridPlacer(cols=4)
     s1_btn = QtWidgets.QPushButton("S1: SCF")
     s1_btn.setToolTip("DFTB+ SCF - density matrix and eigenvectors")
     s1_btn.clicked.connect(lambda: (run_afm_stage1(window), _refresh_dirty_label()))
-    stage_layout.addWidget(s1_btn)
-
+    g_stage.add(s1_btn)
     s2_btn = QtWidgets.QPushButton("S2: Grid")
     s2_btn.setToolTip("Project density onto real-space grid")
     s2_btn.clicked.connect(lambda: (run_afm_stage2(window), _refresh_dirty_label()))
-    stage_layout.addWidget(s2_btn)
-
+    g_stage.add(s2_btn)
     s3_btn = QtWidgets.QPushButton("S3: Pots")
     s3_btn.setToolTip("Compute Pauli/ES/vdW FDBM potentials")
     s3_btn.clicked.connect(lambda: (run_afm_stage3(window), _refresh_dirty_label()))
-    stage_layout.addWidget(s3_btn)
-
+    g_stage.add(s3_btn)
     s4_btn = QtWidgets.QPushButton("S4: Relax")
     s4_btn.setToolTip("Probe-particle relaxation -> AFM df + tip_disp")
     s4_btn.clicked.connect(lambda: (run_afm_stage4(window), _refresh_dirty_label()))
-    stage_layout.addWidget(s4_btn)
-    layout.addLayout(stage_layout)
+    g_stage.add(s4_btn)
+    layout.addLayout(g_stage.layout())
 
     # Orbital plot (separate from product buttons)
-    stm_row = QtWidgets.QHBoxLayout()
+    g_orb = AutoGridPlacer(cols=4)
     orb_btn = QtWidgets.QPushButton("Plot Orbital")
     orb_btn.setToolTip("Plot selected MO with phase (needs S1)")
     orb_btn.clicked.connect(lambda: plot_orbital_map(window))
-    stm_row.addWidget(orb_btn)
-    layout.addLayout(stm_row)
+    g_orb.add(orb_btn)
+    layout.addLayout(g_orb.layout())
 
     # --- Status display ---
     window.afm_status_label = QtWidgets.QPlainTextEdit()
@@ -1407,14 +1455,11 @@ def build_ui(window):
     param_layout.setSpacing(SPACING)
     param_layout.setContentsMargins(0, 0, 0, 0)
 
-    density_group = QtWidgets.QGroupBox("Density / Grid")
-    density_grid = QtWidgets.QGridLayout(density_group)
-    apply_tight(density_grid)
-    density_grid.addWidget(QtWidgets.QLabel("Basis:"), 0, 0)
+    density_group = tight_groupbox("Density / Grid")
+    g_dens = AutoGridPlacer(cols=4)
     window.afm_basis_combo = QtWidgets.QComboBox()
     window.afm_basis_combo.addItems(["3ob-3-1", "mio-1-1"])
-    density_grid.addWidget(window.afm_basis_combo, 0, 1)
-    density_grid.addWidget(QtWidgets.QLabel("AFM backend:"), 1, 0)
+    g_dens.add_pair("Basis:", window.afm_basis_combo)
     window.afm_backend_combo = QtWidgets.QComboBox()
     window.afm_backend_combo.addItems([
         "DFTB FDBM (prolonged)",
@@ -1427,76 +1472,64 @@ def build_ui(window):
         "Morse+Coulomb = classic PP-AFM via shared AFM_utils.run_morse_coulomb_afm (no FDBM).\n"
         "STM/BR-STM require DFTB FDBM — Morse fails loud (no silent fallback).\n"
         "pySCF FDBM = density from pySCF (STM not yet).")
-    density_grid.addWidget(window.afm_backend_combo, 1, 1)
-    density_grid.addWidget(QtWidgets.QLabel("Projection:"), 2, 0)
+    g_dens.add_pair("AFM backend:", window.afm_backend_combo)
     window.afm_projection_combo = QtWidgets.QComboBox()
     window.afm_projection_combo.addItems(["prolonged", "stock"])
     window.afm_projection_combo.setToolTip("Pauli ρ basis. ES always uses stock Δρ (dual-basis rule).")
-    density_grid.addWidget(window.afm_projection_combo, 2, 1)
-    density_grid.addWidget(QtWidgets.QLabel("Step [Å]:"), 3, 0)
+    g_dens.add_pair("Projection:", window.afm_projection_combo)
     window.afm_step_spin = QtWidgets.QDoubleSpinBox()
     window.afm_step_spin.setRange(0.05, 0.5); window.afm_step_spin.setValue(0.1); window.afm_step_spin.setSingleStep(0.05)
     window.afm_step_spin.setToolTip("Density/FF grid spacing. Prefer ≤0.1 Å for ES near the molecule (0.15 Å undersamples ρ_diff → broken hex symmetry).")
-    density_grid.addWidget(window.afm_step_spin, 3, 1)
-    density_grid.addWidget(QtWidgets.QLabel("Margin [Å]:"), 4, 0)
+    g_dens.add_pair("Step [Å]:", window.afm_step_spin)
     window.afm_margin_spin = QtWidgets.QDoubleSpinBox()
     window.afm_margin_spin.setRange(2.0, 10.0); window.afm_margin_spin.setValue(4.0)
-    density_grid.addWidget(window.afm_margin_spin, 4, 1)
+    g_dens.add_pair("Margin [Å]:", window.afm_margin_spin)
+    density_group.setLayout(g_dens.layout())
     param_layout.addWidget(density_group)
 
-    scan_group = QtWidgets.QGroupBox("Scan")
-    scan_grid = QtWidgets.QGridLayout(scan_group)
-    apply_tight(scan_grid)
-    scan_grid.addWidget(QtWidgets.QLabel("Range:"), 0, 0)
+    scan_group = tight_groupbox("Scan")
+    g_scan = AutoGridPlacer(cols=4)
     window.afm_scan_range_spin = QtWidgets.QDoubleSpinBox()
     window.afm_scan_range_spin.setRange(1.0, 10.0); window.afm_scan_range_spin.setValue(2.0)
     window.afm_scan_range_spin.setToolTip("Lateral pad beyond molecule bbox [Å] (CLI --scan-margin SSOT = 2.0).")
-    scan_grid.addWidget(window.afm_scan_range_spin, 0, 1)
-    scan_grid.addWidget(QtWidgets.QLabel("H min:"), 1, 0)
+    g_scan.add_pair("Range:", window.afm_scan_range_spin)
     window.afm_hmin_spin = QtWidgets.QDoubleSpinBox()
     window.afm_hmin_spin.setRange(1.0, 12.0); window.afm_hmin_spin.setValue(3.7)
     window.afm_hmin_spin.setToolTip("df display window bottom [Å] (CLI SSOT 3.7). PP scan extends −amp.")
-    scan_grid.addWidget(window.afm_hmin_spin, 1, 1)
-    scan_grid.addWidget(QtWidgets.QLabel("H max:"), 2, 0)
+    g_scan.add_pair("H min:", window.afm_hmin_spin)
     window.afm_hmax_spin = QtWidgets.QDoubleSpinBox()
     window.afm_hmax_spin.setRange(1.5, 15.0); window.afm_hmax_spin.setValue(4.7)
     window.afm_hmax_spin.setToolTip("df display window top [Å] (CLI SSOT 4.7). Live Z outside scan auto-expands.")
-    scan_grid.addWidget(window.afm_hmax_spin, 2, 1)
-    scan_grid.addWidget(QtWidgets.QLabel("H step:"), 3, 0)
+    g_scan.add_pair("H max:", window.afm_hmax_spin)
     window.afm_hstep_spin = QtWidgets.QDoubleSpinBox()
     window.afm_hstep_spin.setRange(0.05, 0.3); window.afm_hstep_spin.setValue(0.1)
-    scan_grid.addWidget(window.afm_hstep_spin, 3, 1)
-    scan_grid.addWidget(QtWidgets.QLabel("Amp [Å]:"), 4, 0)
+    g_scan.add_pair("H step:", window.afm_hstep_spin)
     window.afm_amp_spin = QtWidgets.QDoubleSpinBox()
     window.afm_amp_spin.setRange(0.1, 3.0); window.afm_amp_spin.setValue(1.0)
     window.afm_amp_spin.setSingleStep(0.1)
     window.afm_amp_spin.setToolTip(
         "Oscillation amplitude for compute_df_amp (CLI SSOT = 1.0 Å peak).\n"
         "PP scan covers [Hmin−amp, Hmax+amp]. df(h) samples Fz around h±amp.")
-    scan_grid.addWidget(window.afm_amp_spin, 4, 1)
+    g_scan.add_pair("Amp [Å]:", window.afm_amp_spin)
+    scan_group.setLayout(g_scan.layout())
     param_layout.addWidget(scan_group)
 
-    physics_group = QtWidgets.QGroupBox("Physics")
-    physics_grid = QtWidgets.QGridLayout(physics_group)
-    apply_tight(physics_grid)
-    physics_grid.addWidget(QtWidgets.QLabel("Pauli A [eV]:"), 0, 0)
+    physics_group = tight_groupbox("Physics")
+    g_phys = AutoGridPlacer(cols=4)
     window.afm_pauli_a_spin = QtWidgets.QDoubleSpinBox()
     from spammm.SPM import AFM as _afm_pauli
     _pa3 = _afm_pauli.PAULI_FITTED_DEFAULTS['3ob-3-1']
     _pam = _afm_pauli.PAULI_FITTED_DEFAULTS['mio-1-1']
     window.afm_pauli_a_spin.setRange(0.1, 2000.0); window.afm_pauli_a_spin.setValue(_pa3['A']); window.afm_pauli_a_spin.setDecimals(2)
     window.afm_pauli_a_spin.setToolTip("Pauli A — SSOT AFM.PAULI_FITTED_DEFAULTS (3ob: 124.84). Old 509.28 was obsolete.")
-    physics_grid.addWidget(window.afm_pauli_a_spin, 0, 1)
-    physics_grid.addWidget(QtWidgets.QLabel("Beta [-]:"), 1, 0)
+    g_phys.add_pair("Pauli A [eV]:", window.afm_pauli_a_spin)
     window.afm_pauli_beta_spin = QtWidgets.QDoubleSpinBox()
     window.afm_pauli_beta_spin.setRange(0.5, 3.0); window.afm_pauli_beta_spin.setValue(_pa3['beta']); window.afm_pauli_beta_spin.setDecimals(4)
     window.afm_pauli_beta_spin.setToolTip("Pauli β — SSOT (3ob: 1.4330). Old 1.0586 was obsolete single-atom fit.")
-    physics_grid.addWidget(window.afm_pauli_beta_spin, 1, 1)
-    physics_grid.addWidget(QtWidgets.QLabel("C6 [eV·Å⁶]:"), 2, 0)
+    g_phys.add_pair("Beta [-]:", window.afm_pauli_beta_spin)
     window.afm_vdw_c6_spin = QtWidgets.QDoubleSpinBox()
     window.afm_vdw_c6_spin.setRange(10.0, 100.0); window.afm_vdw_c6_spin.setValue(30.0)
-    physics_grid.addWidget(window.afm_vdw_c6_spin, 2, 1)
-    physics_grid.addWidget(QtWidgets.QLabel("K_LAT [N/m]:"), 3, 0)
+    g_phys.add_pair("C6 [eV·Å⁶]:", window.afm_vdw_c6_spin)
     window.afm_klat_spin = QtWidgets.QDoubleSpinBox()
     # Literature / Hapala: ~0.5 N/m. Internally converted to eV/Å² (÷16.02).
     # Bug (Jul 2026): spin used to be unlabeled eV/Å² defaulting to 0.5 → 8 N/m (rigid tip).
@@ -1508,10 +1541,16 @@ def build_ui(window):
         "Lateral PP spring in N/m (classic Hapala ≈0.5 N/m).\n"
         "Converted to eV/Å² for GPU: k[eV/Å²] = k[N/m] / 16.02.\n"
         "Old bug: entering 0.5 as eV/Å² ≈ 8 N/m → |dxy|≪0.1Å blunt/rigid contrast.")
-    physics_grid.addWidget(window.afm_klat_spin, 3, 1)
+    g_phys.add_pair("K_LAT [N/m]:", window.afm_klat_spin)
     window.afm_klat_eva2_label = QtWidgets.QLabel("")
     window.afm_klat_eva2_label.setStyleSheet("color: #666; font-size: 10px;")
-    physics_grid.addWidget(window.afm_klat_eva2_label, 4, 0, 1, 2)
+    g_phys.add(window.afm_klat_eva2_label)
+    window.afm_bond_length_spin = QtWidgets.QDoubleSpinBox()
+    window.afm_bond_length_spin.setRange(1.0, 6.0); window.afm_bond_length_spin.setValue(3.0)
+    window.afm_bond_length_spin.setToolTip("Tip–probe lever length L (CLI SSOT = 3.0 Å)")
+    g_phys.add_pair("L bond [Å]:", window.afm_bond_length_spin)
+    physics_group.setLayout(g_phys.layout())
+    param_layout.addWidget(physics_group)
 
     def _refresh_klat_unit_label():
         from spammm.SPM import AFM as afm_mod
@@ -1520,12 +1559,6 @@ def build_ui(window):
         window.afm_klat_eva2_label.setText(f"  → {k_ev:.4f} eV/Å²  (internal)")
     _refresh_klat_unit_label()
     window.afm_klat_spin.valueChanged.connect(_refresh_klat_unit_label)
-    physics_grid.addWidget(QtWidgets.QLabel("L bond [Å]:"), 5, 0)
-    window.afm_bond_length_spin = QtWidgets.QDoubleSpinBox()
-    window.afm_bond_length_spin.setRange(1.0, 6.0); window.afm_bond_length_spin.setValue(3.0)
-    window.afm_bond_length_spin.setToolTip("Tip–probe lever length L (CLI SSOT = 3.0 Å)")
-    physics_grid.addWidget(window.afm_bond_length_spin, 5, 1)
-    param_layout.addWidget(physics_group)
 
     def on_basis_changed(idx):
         basis = window.afm_basis_combo.currentText()
@@ -1584,19 +1617,18 @@ def build_ui(window):
         "Pauli Energy", "Electrostatic Energy", "vdW Energy",
         "Total Potential", "Total Z-Force",
     ])
-    viz_layout.addWidget(QtWidgets.QLabel("Component:"))
-    viz_layout.addWidget(window.afm_component_combo)
 
-    z_layout = QtWidgets.QHBoxLayout()
-    z_layout.addWidget(QtWidgets.QLabel("Z-height (A):"))
+    g_viz = AutoGridPlacer(cols=4)
+    g_viz.add_pair("Component:", window.afm_component_combo)
+    g_viz.add_pair("Component:", window.afm_component_combo)
     window.afm_z_height_spin = QtWidgets.QDoubleSpinBox()
-    window.afm_z_height_spin.setRange(-20.0, 20.0); window.afm_z_height_spin.setValue(4.2)
+    window.afm_z_height_spin.setRange(-20.0, 20.0); window.afm_z_height_spin.setValue(3.0)
     window.afm_z_height_spin.setSingleStep(0.1); window.afm_z_height_spin.setDecimals(2)
-    z_layout.addWidget(window.afm_z_height_spin)
+    g_viz.add_pair("Z-height (A):", window.afm_z_height_spin)
     window.afm_live_update = QtWidgets.QCheckBox("Live")
     window.afm_live_update.setChecked(True)
-    z_layout.addWidget(window.afm_live_update)
-    viz_layout.addLayout(z_layout)
+    g_viz.add(window.afm_live_update)
+    viz_layout.addLayout(g_viz.layout())
 
     def on_z_height_changed():
         if window.afm_live_update.isChecked():
@@ -1609,19 +1641,19 @@ def build_ui(window):
                     _update_afm_status(window, f"Z-update failed: {e}")
     window.afm_z_height_spin.valueChanged.connect(on_z_height_changed)
 
-    lim_layout = QtWidgets.QHBoxLayout()
+    g_lim = AutoGridPlacer(cols=4)
     window.afm_auto_limits = QtWidgets.QCheckBox("Auto limits")
     window.afm_auto_limits.setChecked(True)
-    lim_layout.addWidget(window.afm_auto_limits)
+    g_lim.add(window.afm_auto_limits)
     window.afm_vmin_spin = QtWidgets.QDoubleSpinBox()
     window.afm_vmin_spin.setRange(-1000, 1000); window.afm_vmin_spin.setValue(-1.0)
     window.afm_vmin_spin.setEnabled(False); window.afm_vmin_spin.setDecimals(3)
-    lim_layout.addWidget(QtWidgets.QLabel("vmin:")); lim_layout.addWidget(window.afm_vmin_spin)
+    g_lim.add_pair("vmin:", window.afm_vmin_spin)
     window.afm_vmax_spin = QtWidgets.QDoubleSpinBox()
     window.afm_vmax_spin.setRange(-1000, 1000); window.afm_vmax_spin.setValue(1.0)
     window.afm_vmax_spin.setEnabled(False); window.afm_vmax_spin.setDecimals(3)
-    lim_layout.addWidget(QtWidgets.QLabel("vmax:")); lim_layout.addWidget(window.afm_vmax_spin)
-    viz_layout.addLayout(lim_layout)
+    g_lim.add_pair("vmax:", window.afm_vmax_spin)
+    viz_layout.addLayout(g_lim.layout())
     window.afm_auto_limits.stateChanged.connect(lambda s: (window.afm_vmin_spin.setEnabled(not s), window.afm_vmax_spin.setEnabled(not s)))
 
     window.afm_show_atoms = QtWidgets.QCheckBox("Overlay atom positions")
@@ -1636,81 +1668,121 @@ def build_ui(window):
             except Exception: pass
     window.afm_show_atoms.stateChanged.connect(on_show_atoms_changed)
 
+    g_vizbtn = AutoGridPlacer(cols=4)
     plot_btn = QtWidgets.QPushButton("Plot Slice")
     plot_btn.clicked.connect(lambda: plot_afm_slice(window))
-    viz_layout.addWidget(plot_btn)
+    g_vizbtn.add(plot_btn)
     diag_btn = QtWidgets.QPushButton("Diagnostic Panel")
     diag_btn.clicked.connect(lambda: plot_afm_diagnostic_panel(window))
-    viz_layout.addWidget(diag_btn)
+    g_vizbtn.add(diag_btn)
+    viz_layout.addLayout(g_vizbtn.layout())
     viz_sec.setContent(viz_widget)
     layout.addWidget(viz_sec)
 
     # --- STM / Orbital section ---
     stm_sec = CollapsibleSection("STM / Orbitals", collapsed=True, parent=panel)
     stm_widget = QtWidgets.QWidget()
-    stm_grid = QtWidgets.QGridLayout(stm_widget)
-    apply_tight(stm_grid)
-    row = 0
+    g_stm = AutoGridPlacer(cols=4)
 
     window.afm_stm_enable = QtWidgets.QCheckBox("Compute STM in full pipeline")
     window.afm_stm_enable.setChecked(False)
     window.afm_stm_enable.setToolTip("Deprecated — use STM / BR-STM buttons. AFM button never runs STM.")
     window.afm_stm_enable.setVisible(False)  # keep widget for _get_stm_params compat; hide
-    stm_grid.addWidget(window.afm_stm_enable, row, 0, 1, 2); row += 1
+    g_stm.add(window.afm_stm_enable)
 
     window.afm_stm_bond_resolved = QtWidgets.QCheckBox("Bond-resolved (BR-STM)")
     window.afm_stm_bond_resolved.setChecked(True)
     window.afm_stm_bond_resolved.setToolTip("Used by auto-plot paths; BR-STM button always computes BR.")
     window.afm_stm_bond_resolved.setVisible(False)
-    stm_grid.addWidget(window.afm_stm_bond_resolved, row, 0, 1, 2); row += 1
+    g_stm.add(window.afm_stm_bond_resolved)
+
+    # STM kernel mode: FGR (H−E·S transfer, default) vs overlap (legacy exp-decay)
+    window.afm_stm_mode_combo = QtWidgets.QComboBox()
+    window.afm_stm_mode_combo.addItems(['FGR (H−ES)', 'Overlap (legacy)'])
+    window.afm_stm_mode_combo.setCurrentIndex(0)  # FGR default
+    window.afm_stm_mode_combo.setToolTip(
+        "STM kernel. 'FGR (H−ES)' = transfer M=c_t†(H−ES)c_s (long-tail SK, recommended); "
+        "'Overlap (legacy)' = exp-decay |ψ|². FGR ignores field/exp_beta/exp_r0 and sums I "
+        "over near-degenerate MO clusters (degen_thresh).")
+    g_stm.add_pair("STM mode:", window.afm_stm_mode_combo)
+
+    # FGR parameters (used only when STM mode = FGR)
+    window.afm_stm_tip_orbital = QtWidgets.QComboBox()
+    window.afm_stm_tip_orbital.addItems(['s', 'pz', 'px', 'py'])
+    window.afm_stm_tip_orbital.setToolTip("FGR tip orbital φ_t (only FGR mode).")
+    g_stm.add_pair("tip_orb:", window.afm_stm_tip_orbital)
+
+    window.afm_stm_tip_elem = QtWidgets.QLineEdit("C")
+    window.afm_stm_tip_elem.setToolTip("FGR phantom tip atom element (only FGR mode).")
+    g_stm.add_pair("tip_elem:", window.afm_stm_tip_elem)
+
+    window.afm_stm_eh_K = QtWidgets.QDoubleSpinBox()
+    window.afm_stm_eh_K.setRange(0.1, 10.0); window.afm_stm_eh_K.setValue(1.75); window.afm_stm_eh_K.setDecimals(3)
+    window.afm_stm_eh_K.setToolTip("Extended-Hückel K for FGR SK tables (only FGR mode).")
+    g_stm.add_pair("eh_K:", window.afm_stm_eh_K)
+
+    window.afm_stm_rcut = QtWidgets.QDoubleSpinBox()
+    window.afm_stm_rcut.setRange(1.0, 40.0); window.afm_stm_rcut.setValue(15.0); window.afm_stm_rcut.setDecimals(2)
+    window.afm_stm_rcut.setToolTip("Atom-pair cutoff [Å] for FGR kernel (only FGR mode).")
+    g_stm.add_pair("rcut:", window.afm_stm_rcut)
+
+    window.afm_stm_taper_w = QtWidgets.QDoubleSpinBox()
+    window.afm_stm_taper_w.setRange(0.0, 10.0); window.afm_stm_taper_w.setValue(2.0); window.afm_stm_taper_w.setDecimals(2)
+    window.afm_stm_taper_w.setToolTip("Cosine taper width at rcut [Å] (only FGR mode).")
+    g_stm.add_pair("taper_w:", window.afm_stm_taper_w)
+
+    window.afm_stm_degen = QtWidgets.QDoubleSpinBox()
+    window.afm_stm_degen.setDecimals(4); window.afm_stm_degen.setRange(0.0, 0.1); window.afm_stm_degen.setValue(0.005)
+    window.afm_stm_degen.setToolTip("Degeneracy threshold [eV]: sum I over |E−E0|≤thresh cluster (0=off).")
+    g_stm.add_pair("degen_eV:", window.afm_stm_degen)
 
     # HOMO reference (read-only info label, updated after Stage 1)
-    stm_grid.addWidget(QtWidgets.QLabel("HOMO iMO:"), row, 0)
     window.afm_homo_label = QtWidgets.QLabel("(run SCF first)")
     window.afm_homo_label.setStyleSheet("font-weight: bold; color: #006600;")
-    stm_grid.addWidget(window.afm_homo_label, row, 1); row += 1
+    g_stm.add_pair("HOMO iMO:", window.afm_homo_label)
 
     # MO list: space/comma-separated integers
-    stm_grid.addWidget(QtWidgets.QLabel("MO list:"), row, 0)
     window.afm_stm_mo_list = QtWidgets.QLineEdit("1")
     window.afm_stm_mo_list.setToolTip("Relative to HOMO if checkbox below (0=HOMO, +1=LUMO). Default LUMO.")
-    stm_grid.addWidget(window.afm_stm_mo_list, row, 1); row += 1
+    g_stm.add_pair("MO list:", window.afm_stm_mo_list)
 
     window.afm_stm_relative_mo = QtWidgets.QCheckBox("Relative to HOMO")
     window.afm_stm_relative_mo.setChecked(True)
     window.afm_stm_relative_mo.setToolTip("If checked, MO list is relative to HOMO index. 0=HOMO, +1=LUMO, -1=HOMO-1 etc.")
-    stm_grid.addWidget(window.afm_stm_relative_mo, row, 0, 1, 2); row += 1
+    g_stm.add(window.afm_stm_relative_mo)
 
-    stm_grid.addWidget(QtWidgets.QLabel("field:"), row, 0)
     window.afm_stm_field_combo = QtWidgets.QComboBox()
     window.afm_stm_field_combo.addItems(['psi2', 'ldos', 'psi'])
-    stm_grid.addWidget(window.afm_stm_field_combo, row, 1); row += 1
+    g_stm.add_pair("field:", window.afm_stm_field_combo)
 
-    stm_grid.addWidget(QtWidgets.QLabel("exp_beta:"), row, 0)
     window.afm_stm_exp_beta = QtWidgets.QDoubleSpinBox()
     window.afm_stm_exp_beta.setRange(0.1, 10.0); window.afm_stm_exp_beta.setValue(1.0); window.afm_stm_exp_beta.setDecimals(3)
-    stm_grid.addWidget(window.afm_stm_exp_beta, row, 1); row += 1
+    g_stm.add_pair("exp_beta:", window.afm_stm_exp_beta)
 
-    stm_grid.addWidget(QtWidgets.QLabel("exp_r0:"), row, 0)
     window.afm_stm_exp_r0 = QtWidgets.QDoubleSpinBox()
     window.afm_stm_exp_r0.setRange(0.0, 10.0); window.afm_stm_exp_r0.setValue(3.0); window.afm_stm_exp_r0.setDecimals(3)
-    stm_grid.addWidget(window.afm_stm_exp_r0, row, 1); row += 1
+    g_stm.add_pair("exp_r0:", window.afm_stm_exp_r0)
 
     # Orbital map (single MO with phase)
-    stm_grid.addWidget(QtWidgets.QLabel("── Orbital Map ──"), row, 0, 1, 2); row += 1
-    stm_grid.addWidget(QtWidgets.QLabel("iMO (abs):"), row, 0)
+    g_stm.add(QtWidgets.QLabel("── Orbital Map ──"))
     window.afm_orbital_spin = QtWidgets.QSpinBox()
     window.afm_orbital_spin.setRange(0, 999); window.afm_orbital_spin.setValue(0)
     window.afm_orbital_spin.setToolTip("Absolute MO index (0=lowest). HOMO shown above.")
-    stm_grid.addWidget(window.afm_orbital_spin, row, 1); row += 1
+    g_stm.add_pair("iMO (abs):", window.afm_orbital_spin)
+
+    stm_widget.setLayout(g_stm.layout())
 
     # Mark STM dirty when relevant params change
-    for w in [window.afm_stm_exp_beta, window.afm_stm_exp_r0]:
+    for w in [window.afm_stm_exp_beta, window.afm_stm_exp_r0,
+              window.afm_stm_eh_K, window.afm_stm_rcut, window.afm_stm_taper_w, window.afm_stm_degen]:
         w.valueChanged.connect(_mark_s56)
     window.afm_stm_mo_list.textChanged.connect(_mark_s56)
     window.afm_stm_relative_mo.stateChanged.connect(_mark_s56)
     window.afm_stm_field_combo.currentIndexChanged.connect(_mark_s56)
     window.afm_stm_bond_resolved.stateChanged.connect(_mark_s56)
+    window.afm_stm_mode_combo.currentIndexChanged.connect(_mark_s56)
+    window.afm_stm_tip_orbital.currentIndexChanged.connect(_mark_s56)
+    window.afm_stm_tip_elem.textChanged.connect(_mark_s56)
 
     stm_sec.setContent(stm_widget)
     layout.addWidget(stm_sec)

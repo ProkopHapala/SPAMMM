@@ -24,6 +24,7 @@ from spammm.GUI.LayoutPolicy import (
     BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH,
     apply_tight, make_vbox, make_hbox, make_flow,
     FlowLayout, tight_button, tight_spin, tight_combo,
+    AutoGridPlacer, tight_groupbox,
 )
 
 
@@ -147,3 +148,121 @@ def test_tight_combo_natural_width():
 def test_make_flow_returns_flowlayout():
     flow = make_flow()
     assert isinstance(flow, FlowLayout)
+
+
+# ── AutoGridPlacer ────────────────────────────────────────────────────────────
+
+def test_autogrid_creates_grid_layout():
+    g = AutoGridPlacer(cols=4)
+    assert isinstance(g.layout(), QtWidgets.QGridLayout)
+
+def test_autogrid_equal_column_widths():
+    """All columns have equal stretch (no minimum width — prevents overflow)."""
+    g = AutoGridPlacer(cols=4, cell_width=80)
+    lay = g.layout()
+    for i in range(4):
+        assert lay.columnMinimumWidth(i) == 0  # no forced minimum
+        assert lay.columnStretch(i) == 1       # equal stretch
+
+def test_autogrid_add_widget_auto_span():
+    """add() without span — short buttons get 1 cell."""
+    g = AutoGridPlacer(cols=4, cell_width=80)
+    btn = QtWidgets.QPushButton("OK")
+    g.add(btn)
+    lay = g.layout()
+    item = lay.itemAtPosition(0, 0)
+    assert item is not None
+    assert item.widget() is btn
+
+def test_autogrid_short_button_1_cell():
+    """Short button text (≤~10 chars) fits in 1 cell."""
+    g = AutoGridPlacer(cols=4, cell_width=80)
+    btn = QtWidgets.QPushButton("Snap")
+    g.add(btn)
+    lay = g.layout()
+    assert lay.itemAtPosition(0, 1) is None  # 1 cell
+
+def test_autogrid_long_button_2_cells():
+    """Long button text (>~70 chars) gets 2 cells."""
+    g = AutoGridPlacer(cols=4, cell_width=80)
+    btn = QtWidgets.QPushButton("Diagnostic Panel")
+    g.add(btn)
+    lay = g.layout()
+    assert lay.itemAtPosition(0, 1) is not None  # 2 cells
+
+def test_autogrid_spinbox_span_is_1():
+    """Spinboxes always get 1 cell."""
+    g = AutoGridPlacer(cols=4, cell_width=80)
+    sp = QtWidgets.QDoubleSpinBox()
+    g.add(sp)
+    lay = g.layout()
+    assert lay.itemAtPosition(0, 1) is None
+
+def test_autogrid_combo_span_by_content():
+    """Combos with short items get 1 cell; long items get 2+."""
+    g = AutoGridPlacer(cols=4, cell_width=80)
+    short_combo = QtWidgets.QComboBox()
+    short_combo.addItems(["C", "N"])
+    g.add(short_combo)
+    lay = g.layout()
+    assert lay.itemAtPosition(0, 1) is None  # 1 cell
+
+    g2 = AutoGridPlacer(cols=4, cell_width=80)
+    long_combo = QtWidgets.QComboBox()
+    long_combo.addItems(["DFTB FDBM (prolonged)", "DFTB FDBM (stock)", "Morse+Coulomb (classic)"])
+    g2.add(long_combo)
+    lay2 = g2.layout()
+    assert lay2.itemAtPosition(0, 1) is not None  # 2+ cells
+
+def test_autogrid_lineedit_span_is_2():
+    """LineEdits get 2 cells (need space for typing)."""
+    g = AutoGridPlacer(cols=4, cell_width=80)
+    le = QtWidgets.QLineEdit()
+    g.add(le)
+    lay = g.layout()
+    assert lay.itemAtPosition(0, 1) is not None  # spans into cell 1
+    assert lay.itemAtPosition(0, 2) is None      # doesn't reach cell 2
+
+def test_autogrid_no_minimum_width():
+    """No column minimum width — prevents overflow in scroll areas."""
+    g = AutoGridPlacer(cols=4, cell_width=80)
+    lay = g.layout()
+    for i in range(4):
+        assert lay.columnMinimumWidth(i) == 0  # no forced minimum
+        assert lay.columnStretch(i) == 1       # equal stretch
+
+def test_autogrid_add_pair_label_and_input():
+    """add_pair places label + widget in adjacent cells."""
+    g = AutoGridPlacer(cols=4, cell_width=80)
+    spin = QtWidgets.QDoubleSpinBox()
+    g.add_pair("dt:", spin)
+    lay = g.layout()
+    # Label at (0,0), spin at (0, label_span)
+    assert lay.itemAtPosition(0, 0) is not None
+    assert isinstance(lay.itemAtPosition(0, 0).widget(), QtWidgets.QLabel)
+
+def test_autogrid_auto_wrap():
+    """When row is full, next widget wraps to next row."""
+    g = AutoGridPlacer(cols=4, cell_width=80)
+    # Add 4 buttons (each 1 cell) → fills row 0
+    for i in range(4):
+        g.add(QtWidgets.QPushButton(f"B{i}"))
+    # 5th button should wrap to row 1
+    g.add(QtWidgets.QPushButton("B4"))
+    lay = g.layout()
+    assert lay.itemAtPosition(1, 0) is not None
+    assert lay.itemAtPosition(1, 0).widget().text() == "B4"
+
+def test_autogrid_newrow_forces_break():
+    g = AutoGridPlacer(cols=4, cell_width=80)
+    g.add(QtWidgets.QPushButton("A"))
+    g.newrow()
+    g.add(QtWidgets.QPushButton("B"))
+    lay = g.layout()
+    assert lay.itemAtPosition(0, 0).widget().text() == "A"
+    assert lay.itemAtPosition(1, 0).widget().text() == "B"
+
+def test_autogrid_backward_compat_alias():
+    """GridPlacer is an alias for AutoGridPlacer."""
+    from spammm.GUI.LayoutPolicy import GridPlacer
+    assert GridPlacer is AutoGridPlacer

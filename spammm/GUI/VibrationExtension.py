@@ -14,7 +14,7 @@ import os
 from PyQt5 import QtCore, QtWidgets
 
 from .ExtensionManager import UIComponents
-from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, GridPlacer
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, AutoGridPlacer
 from .plotutils import show_in_plot_window
 from spammm.AtomicSystem import AtomicSystem
 from spammm.dynamics.Vibrations import run_vibrations, FREQ_UNIT_LABELS, format_freq, format_E_zpe
@@ -57,22 +57,22 @@ def build_ui(window):
     layout = QtWidgets.QVBoxLayout(panel)
     apply_tight(layout)
 
-    g1 = GridPlacer(cols=6)
+    g1 = AutoGridPlacer(cols=4)
     window.vib_backend_combo = QtWidgets.QComboBox()
     window.vib_backend_combo.addItems(['UFF', 'SPFF', 'DFTB'])
     window.vib_backend_combo.setCurrentText('UFF')
     window.vib_backend_combo.setToolTip('UFF: GPU force field. SPFF: pi-aware FF. DFTB: native Hessian via DFTB+.')
     window.vib_backend_combo.setMaximumWidth(72)
-    g1.add_pair("Backend:", window.vib_backend_combo, label_span=1, input_span=1)
+    g1.add_pair("Backend:", window.vib_backend_combo)
     window.vib_unit_combo = QtWidgets.QComboBox()
     for label, key in _UNIT_ITEMS:
         window.vib_unit_combo.addItem(label, key)
     window.vib_unit_combo.setMaximumWidth(80)
     window.vib_unit_combo.currentIndexChanged.connect(lambda _: _on_unit_changed(window))
-    g1.add_pair("Units:", window.vib_unit_combo, label_span=1, input_span=1)
+    g1.add_pair("Units:", window.vib_unit_combo)
     window.vib_compute_btn = QtWidgets.QPushButton("Compute Modes")
     window.vib_compute_btn.clicked.connect(lambda: _on_compute(window))
-    g1.add(window.vib_compute_btn, span=2)
+    g1.add(window.vib_compute_btn)
     layout.addLayout(g1.layout())
 
     window.vib_status_label = QtWidgets.QLabel("Status: Ready — click a row to plot")

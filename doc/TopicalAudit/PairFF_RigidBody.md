@@ -25,6 +25,9 @@ timestamp: 2026-07-28
 | OpenCL | `kernels/rigid.cl` 7–9 | active | Legacy, unified 1+1, unified env (legacy multi) |
 | OpenCL | `kernels/rigid.cl` 10–13 | active | Unified±FAF; **allmol** ± FAF (preferred multi) |
 | OpenCL | `kernels/rigid.cl` 14 | active | Replica×active energy channels plus fused real-atom/CoM clash flags for MC/GA; GTX 1650 PairFF/FAF parity and runtime tested |
+| OpenCL | `kernels/rigid.cl` 15 | experimental | All-mobile synchronous MD with ping-pong body state; optional constant-velocity partner prediction for approximate K-step chunks |
+| OpenCL | `kernels/rigid.cl` 16 | experimental | Ping-pong persistent kernel + software global barrier; GTX 1650 residency-specific |
+| OpenCL | `kernels/rigid.cl` 17 | experimental | Simultaneous-Jacobi single-workgroup all-mobile MD; exact but one-CU limited |
 | Python | `RigidBodyDynamics.py` → `RigidBodyPairFF` | active | `from_molecules`, `set_active_body`, `attach_pairff_faf`, batched `greedy_energy_step`, `tip_pull_scan`, `world_sites_all_bodies` |
 | Python | `spammm/surfaces/FoldedRigid.py` | experimental | Versioned typed-combined and substrate-only factorized-PLQH fit/load/eval; physical review pending |
 | Python | `spammm/surfaces/surface_plots.py` | experimental | Tip-pull movie helpers; **display scale not yet Vispy SSOT** |
@@ -45,6 +48,7 @@ timestamp: 2026-07-28
 - Pure `run_folded` path remains a **different** interaction model (substrate-only).
 - Tip-pull PTCDI+QEq: energy/registry oscillations seen; **map GIFs unverified vs Vispy** (softclip path).
 - Kernel 14 PairFF and PairFF+FAF channel parity on GTX 1650: `|err|=3.912e-08`; fused clash flags match CPU real-atom/CoM distances in `test_pairff_replica_clash_channel_matches_cpu`.
+- Kernels 15–17 body-state parity on GTX 1650: eventless enqueue bit-identical; persistent/single-WG `atol=rtol=2e-6` vs ping-pong K=1 in `test_pairff_multimol_launch_parity`. Awaiting USER review.
 - PTCDA 4-molecule/512-trial greedy step: 79–89 ms → 0.66 ms sustained after GPU clash fusion and vectorized proposal/packing ([task report](../Tasks/PairFF_MC_PythonBottleneck.md)); awaiting USER confirmation.
 
 ## Open Issues
@@ -57,4 +61,6 @@ timestamp: 2026-07-28
 - Shared rigid-molecule pose SSOT (`pos`+`qrot`) across PairFF / Assembly / FoldedRigid / PME — see [`RigidBody.md`](RigidBody.md) and [`Tasks/RigidMoleculePose_SSOT.md`](../Tasks/RigidMoleculePose_SSOT.md).
 - Strategy C (flat site chunks) not implemented; allmol/M first.
 - Formal pytest L0 for PairFF multi-body / FAF compose / tip_pull still thin.
+- All-mobile kernels 15–17 currently reject FAF; fused concurrent FAF remains unimplemented.
+- Persistent kernel residency/global-memory semantics are not portable OpenCL guarantees despite measured GTX 1650 parity through 8 molecules.
 - Mixed-species `--mols` + FAF requires fit `atom_type_ids` length match per pack.

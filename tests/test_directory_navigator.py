@@ -14,7 +14,8 @@ def test_read_dir():
 	"""Test reading the data/xyz directory."""
 	nav = DirectoryNavigator('data/xyz')
 	assert len(nav.file_names) > 0, "No files found in data/xyz"
-	assert all(f.endswith('.xyz') for f in nav.file_names), "All files should be .xyz"
+	# DirectoryNavigator accepts .xyz, .mol, .mol2 (not just .xyz)
+	assert all(f.endswith(('.xyz', '.mol', '.mol2')) for f in nav.file_names), f"All files should be .xyz/.mol/.mol2, got {nav.file_names}"
 	assert '..' in nav.sub_dirs, "Parent dir should be in sub_dirs"
 	print(f"  OK: found {len(nav.file_names)} files, {len(nav.sub_dirs)} dirs in data/xyz")
 

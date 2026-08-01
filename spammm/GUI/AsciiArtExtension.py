@@ -3,7 +3,7 @@ from PyQt5 import QtWidgets, QtCore
 import numpy as np
 
 from .ExtensionManager import UIComponents
-from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, GridPlacer
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, AutoGridPlacer
 from spammm.topology.ascii_art_heterocycle import parse_ascii_art, ASCII_EXAMPLES, resolve_hbond_pairs, _build_target_valence, jacobi_relax_bond_lengths
 from spammm.topology.KekulePure import make_n_pi
 
@@ -13,14 +13,14 @@ def build_ui(window):
     layout = QtWidgets.QVBoxLayout(panel)
     apply_tight(layout)
 
-    g1 = GridPlacer(cols=6)
+    g1 = AutoGridPlacer(cols=4)
     window.kek_example_combo = QtWidgets.QComboBox()
     window.kek_example_combo.addItems(sorted(ASCII_EXAMPLES.keys()))
     window.kek_example_combo.setMaximumWidth(150)
-    g1.add_pair("Example:", window.kek_example_combo, label_span=1, input_span=3)
+    g1.add_pair("Example:", window.kek_example_combo)
     window.kek_load_example_btn = QtWidgets.QPushButton("Load")
     window.kek_load_example_btn.clicked.connect(lambda: load_ascii_example(window))
-    g1.add(window.kek_load_example_btn, span=2)
+    g1.add(window.kek_load_example_btn)
     layout.addLayout(g1.layout())
 
     window.kek_ascii_edit = QtWidgets.QPlainTextEdit()
@@ -28,19 +28,19 @@ def build_ui(window):
     window.kek_ascii_edit.setPlaceholderText("Enter ASCII art here or load an example...")
     layout.addWidget(window.kek_ascii_edit)
 
-    g3 = GridPlacer(cols=6)
+    g3 = AutoGridPlacer(cols=4)
     window.kek_generate_btn = QtWidgets.QPushButton("Generate")
     window.kek_generate_btn.clicked.connect(lambda: generate_ascii_molecule(window))
-    g3.add(window.kek_generate_btn, span=2)
+    g3.add(window.kek_generate_btn)
     window.kek_hydrogens_chk = QtWidgets.QCheckBox("Add H")
     window.kek_hydrogens_chk.setChecked(True)
-    g3.add(window.kek_hydrogens_chk, span=1)
+    g3.add(window.kek_hydrogens_chk)
     window.kek_relax_spin = QtWidgets.QSpinBox()
     window.kek_relax_spin.setRange(0, 100)
     window.kek_relax_spin.setValue(0)
     window.kek_relax_spin.setMaximumWidth(50)
     window.kek_relax_spin.setToolTip("Jacobi bond-length relaxation steps (0=off)")
-    g3.add_pair("Relax:", window.kek_relax_spin, label_span=1, input_span=2)
+    g3.add_pair("Relax:", window.kek_relax_spin)
     layout.addLayout(g3.layout())
 
     window.ascii_status_label = QtWidgets.QLabel("Status: Ready")

@@ -4085,6 +4085,11 @@ void rigid_body_pairff_energy_replica_kernel(
 //  For N steps, enqueue this kernel N times (Strategy A) or use
 //  the persistent variant below (Strategy C).
 //
+//  Input and output body state MUST be distinct. This ping-pong layout prevents
+//  a fast workgroup from overwriting a pose while another workgroup still reads
+//  the old timestep. predict_partners is an optional constant-velocity/angular-
+//  velocity extrapolation for approximate multi-step chunks; K=1 is exact.
+//
 //  Physics identical to rigid_body_pairff_unified_allmol_kernel,
 //  but a = get_group_id(0) (every molecule is active) instead of
 //  a = active_mol (only one active).
@@ -4092,10 +4097,14 @@ void rigid_body_pairff_energy_replica_kernel(
 __kernel
 void rigid_body_pairff_multimol_kernel(
     __global const int*      mols,
-    __global       float4*   poss,
-    __global       float4*   qrots,
-    __global       float4*   vposs,
-    __global       float4*   vrots,
+    __global const float4*   poss_in,
+    __global const float4*   qrots_in,
+    __global const float4*   vposs_in,
+    __global const float4*   vrots_in,
+    __global       float4*   poss_out,
+    __global       float4*   qrots_out,
+    __global       float4*   vposs_out,
+    __global       float4*   vrots_out,
     __global       float4*   fire_state,
     __global const cl_Mat3*  I_body_inv,
     __global const cl_Mat3*  I_body,
@@ -4113,7 +4122,8 @@ void rigid_body_pairff_multimol_kernel(
     const float              z_target,
     const float              dt,
     const float4             md_params,
-    const int                niter
+    const int                niter,
+    const int                predict_partners
 ) {
     const int gid   = get_group_id(0);
     const int lid   = get_local_id(0);
@@ -4149,10 +4159,10 @@ void rigid_body_pairff_multimol_kernel(
     const float inv_beta_n = 8.0f / fmax(beta, 1e-6f);
 
     if (lid == 0) {
-        pos      = poss[a];
-        qrot     = resume_fire ? qrots[a] : normalize(qrots[a]);
-        vpos     = vposs[a];
-        vrot     = vrots[a];
+        pos      = poss_in[a];
+        qrot     = resume_fire ? qrots_in[a] : normalize(qrots_in[a]);
+        vpos     = vposs_in[a];
+        vrot     = vrots_in[a];
         inv_mass = (pos.w > 1e-8f) ? (1.0f / pos.w) : 1.0f;
         Iinv_body.a = I_body_inv[a].a;
         Iinv_body.b = I_body_inv[a].b;
@@ -4199,8 +4209,13 @@ void rigid_body_pairff_multimol_kernel(
             const int n_tile = mols[j+1] - j0;
             if (lid == 0) {
                 Ln_tile = n_tile;
-                posj  = poss[j];
-                qrotj = qrots[j];
+                posj  = poss_in[j];
+                qrotj = qrots_in[j];
+                if (predict_partners && step > 0) {
+                    const float tau = dt * (float)step;
+                    posj.xyz += vposs_in[j].xyz * tau;
+                    qrotj = normalize(quat_mult(qrotj, make_qrot_taylor(vrots_in[j].xyz * tau)));
+                }
             }
             barrier(CLK_LOCAL_MEM_FENCE);
             if      (lid == 0) Rj.a = (float4){ quat_to_a(qrotj), 0.f };
@@ -4326,10 +4341,10 @@ void rigid_body_pairff_multimol_kernel(
     }
     if (lid == 0) {
         if (use_fire) fire_state[a] = (float4)(dt_lin, dt_ang, damp_lin, damp_ang);
-        poss [a] = pos;
-        qrots[a] = qrot;
-        vposs[a] = vpos;
-        vrots[a] = vrot;
+        poss_out [a] = pos;
+        qrots_out[a] = qrot;
+        vposs_out[a] = vpos;
+        vrots_out[a] = vrot;
     }
 }
 
@@ -4337,8 +4352,8 @@ void rigid_body_pairff_multimol_kernel(
 //  Kernel 16: rigid_body_pairff_multimol_persistent_kernel
 // ==================================================================
 //
-//  Same as multimol_kernel but with an internal niter loop + software
-//  global barrier using atomic counters. One kernel launch = N steps.
+//  Same physics as multimol_kernel but with an internal niter loop, ping-pong
+//  body state, and a software global barrier. One kernel launch = N steps.
 //
 //  WARNING: Requires ALL workgroups to be simultaneously resident.
 //  If the GPU cannot schedule all n_mols workgroups at once, the
@@ -4352,6 +4367,10 @@ void rigid_body_pairff_multimol_persistent_kernel(
     __global       float4*   qrots,
     __global       float4*   vposs,
     __global       float4*   vrots,
+    __global       float4*   poss_alt,
+    __global       float4*   qrots_alt,
+    __global       float4*   vposs_alt,
+    __global       float4*   vrots_alt,
     __global       float4*   fire_state,
     __global const cl_Mat3*  I_body_inv,
     __global const cl_Mat3*  I_body,
@@ -4422,20 +4441,12 @@ void rigid_body_pairff_multimol_persistent_kernel(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     for (int step = 0; step < niter; ++step) {
-        // --- Global barrier (start of step): wait for all WGs to finish previous step ---
-        // For step 0, no wait needed. For step > 0, spin until barrier
-        // counter has been incremented by all WGs for the previous step.
-        // After step s-1, each WG did atomic_add → g_barrier = n_wg * s.
-        // So at start of step s, wait until g_barrier >= n_wg * s.
-        // Use atomic_add(0) as atomic read (OpenCL C 1.2 has no atomic_load).
-        barrier(CLK_LOCAL_MEM_FENCE);
-        if (lid == 0 && step > 0) {
-            int target = n_wg * step;
-            while (atomic_add(g_barrier, 0) < target) {}
-            // Ensure other WGs' global writes are visible to this WG
-            mem_fence(CLK_GLOBAL_MEM_FENCE);
-        }
-        barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
+        __global volatile float4* poss_src = (step & 1) ? poss_alt : poss;
+        __global volatile float4* qrots_src = (step & 1) ? qrots_alt : qrots;
+        __global volatile float4* poss_dst = (step & 1) ? poss : poss_alt;
+        __global volatile float4* qrots_dst = (step & 1) ? qrots : qrots_alt;
+        __global volatile float4* vposs_dst = (step & 1) ? vposs : vposs_alt;
+        __global volatile float4* vrots_dst = (step & 1) ? vrots : vrots_alt;
 
         if      (lid == 0) R.a = (float4){ quat_to_a(qrot), 0.f };
         else if (lid == 1) R.b = (float4){ quat_to_b(qrot), 0.f };
@@ -4472,8 +4483,8 @@ void rigid_body_pairff_multimol_persistent_kernel(
             const int n_tile = mols[j+1] - j0;
             if (lid == 0) {
                 Ln_tile = n_tile;
-                posj  = poss[j];
-                qrotj = qrots[j];
+                posj  = poss_src[j];
+                qrotj = qrots_src[j];
             }
             barrier(CLK_LOCAL_MEM_FENCE);
             if      (lid == 0) Rj.a = (float4){ quat_to_a(qrotj), 0.f };
@@ -4582,24 +4593,32 @@ void rigid_body_pairff_multimol_persistent_kernel(
             vrot.xyz += alpha_body * dta;
             pos.xyz  += vpos.xyz * dtl;
             qrot = normalize(quat_mult(qrot, make_qrot_taylor(vrot.xyz * dta)));
-            // Write updated pose to global memory so other WGs see it next step
-            poss [a] = pos;
-            qrots[a] = qrot;
-            vposs[a] = vpos;
-            vrots[a] = vrot;
+            // Ping-pong writes cannot race with current-step reads.
+            poss_dst [a] = pos;
+            qrots_dst[a] = qrot;
+            vposs_dst[a] = vpos;
+            vrots_dst[a] = vrot;
             if (use_fire) fire_state[a] = (float4)(dt_lin, dt_ang, damp_lin, damp_ang);
-            // Flush writes to L2 before signaling via atomic
             mem_fence(CLK_GLOBAL_MEM_FENCE);
         }
         barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
-        // --- Global barrier (end of step): signal completion ---
         if (lid == 0) {
             atomic_add(g_barrier, 1);
+            const int target = n_wg * (step + 1);
+            while (atomic_add(g_barrier, 0) < target) {}
+            mem_fence(CLK_GLOBAL_MEM_FENCE);
         }
-        // All work-items must reach the fence so memory ordering is correct
         barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
     }
+
+    if ((niter & 1) && lid == 0) {
+        poss[a] = pos;
+        qrots[a] = qrot;
+        vposs[a] = vpos;
+        vrots[a] = vrot;
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
 
     // Final world positions
     if      (lid == 0) R.a = (float4){ quat_to_a(qrot), 0.f };
@@ -4624,15 +4643,14 @@ void rigid_body_pairff_multimol_persistent_kernel(
 //  All molecules in ONE workgroup — local barrier synchronizes everything.
 //  Internal niter loop is fully correct (no global barrier needed).
 //
-//  Limitation: total atoms across all molecules must fit in local memory
-//  and WORKGROUP_SIZE*ATOMS_PER_THREAD. With WG=32, APT=4 → max 128 atoms
-//  per molecule, but total atoms across all molecules must be ≤ 128
-//  (since all atoms are distributed across threads).
+//  Limitation: each molecule must fit WORKGROUP_SIZE*ATOMS_PER_THREAD and
+//  MAX_STATIC_ATOMS. With WG=32, APT=4 → max 128 atoms per molecule.
 //  For larger systems, use multimol_kernel (Strategy A) or
 //  multimol_persistent_kernel (Strategy C).
 //
-//  Gauss-Seidel update: molecules integrated sequentially within each step.
-//  All threads parallelize over atoms of the current molecule.
+//  Jacobi update: all molecule forces are evaluated from one local snapshot,
+//  then all poses are integrated together after a workgroup barrier.
+//  Threads parallelize over atoms of the current molecule.
 
 #ifndef MAX_MULTIMOL_WG
 #define MAX_MULTIMOL_WG 32
@@ -4857,6 +4875,9 @@ void rigid_body_pairff_multimol_single_wg_kernel(
                 float3 tq_world = Ltorq[0].xyz;
                 body_force [a] = (float4)(f, 0.0f);
                 body_torque[a] = (float4)(tq_world, 0.0f);
+#if 0
+                // Historical Gauss-Seidel integration updated Lpos/Lqrot here,
+                // allowing later molecules in the same step to see new state.
                 const float3 tq_body   = mat3_dot_T(R, tq_world);
                 const float3 L_body     = mat3_dot(Ibody, vrot.xyz);
                 const float3 gyro       = cross(vrot.xyz, L_body);
@@ -4880,9 +4901,47 @@ void rigid_body_pairff_multimol_single_wg_kernel(
                 Lvpos[a]   = vpos;
                 Lvrot[a]   = vrot;
                 if (use_fire) Lfstate[a] = (float4)(dt_lin, dt_ang, damp_lin, damp_ang);
+#endif
             }
             barrier(CLK_LOCAL_MEM_FENCE);
-        } // end molecule loop (Gauss-Seidel sweep)
+        } // end force loop over molecules
+
+        barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
+        if (lid == 0) {
+            for (int a = 0; a < n_mols; a++) {
+                float4 pos = Lpos[a], qrot = Lqrot[a], vpos = Lvpos[a], vrot = Lvrot[a];
+                cl_Mat3 Ra;
+                Ra.a = (float4)(quat_to_a(qrot), 0.0f);
+                Ra.b = (float4)(quat_to_b(qrot), 0.0f);
+                Ra.c = (float4)(quat_to_c(qrot), 0.0f);
+                const float3 f = body_force[a].xyz;
+                const float3 tq_body = mat3_dot_T(Ra, body_torque[a].xyz);
+                const float3 L_body = mat3_dot(LIbody[a], vrot.xyz);
+                const float3 alpha_body = mat3_dot(LIinv[a], tq_body - cross(vrot.xyz, L_body));
+                float dt_lin, dt_ang, damp_lin, damp_ang;
+                const int resume_fire = use_fire && (Lfstate[a].x > 0.0f);
+                dt_lin = resume_fire ? Lfstate[a].x : dt;
+                dt_ang = resume_fire ? Lfstate[a].y : dt;
+                damp_lin = resume_fire ? Lfstate[a].z : md_params.x;
+                damp_ang = resume_fire ? Lfstate[a].w : md_params.y;
+                if (use_fire) {
+                    vpos.xyz = rigid_update_FIRE(f, vpos.xyz, &dt_lin, &damp_lin, dtmin, dtmax, damp0_lin);
+                    vrot.xyz = rigid_update_FIRE(tq_body, vrot.xyz, &dt_ang, &damp_ang, dtmin, dtmax, damp0_ang);
+                } else {
+                    vpos.xyz *= damp_lin;
+                    vrot.xyz *= damp_ang;
+                }
+                const float dtl = use_fire ? dt_lin : dt;
+                const float dta = use_fire ? dt_ang : dt;
+                vpos.xyz += f * (dtl * Linv_mass[a]);
+                vrot.xyz += alpha_body * dta;
+                pos.xyz += vpos.xyz * dtl;
+                qrot = normalize(quat_mult(qrot, make_qrot_taylor(vrot.xyz * dta)));
+                Lpos[a] = pos; Lqrot[a] = qrot; Lvpos[a] = vpos; Lvrot[a] = vrot;
+                if (use_fire) Lfstate[a] = (float4)(dt_lin, dt_ang, damp_lin, damp_ang);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
     } // end step loop
 
     // Final: write all molecules' state back to global memory

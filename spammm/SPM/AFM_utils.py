@@ -4526,6 +4526,64 @@ def compute_stm(projector, eigvecs, eigvals, scan_xs, scan_ys, heights,
     return stm_grid
 
 
+def compute_stm_fgr(projector, eigvecs, eigvals, scan_xs, scan_ys, heights,
+                    atoms_dict, basis_ang, enames, species_per_atom,
+                    tables, tip_type0, name_to_smp,
+                    mo_indices, *, tip_orbital='s', tip_elem='C',
+                    mode='tau', rcut=15.0, taper_w=2.0,
+                    degen_thresh_eV=0.005):
+    """Standard (flat, constant-height) STM with the FGR transfer kernel (H−E·S).
+
+    Mirrors ``compute_stm`` but uses ``project_mo_stm_fgr_slice`` (long-tail SK
+    ``stm_fgr_sk_tau_scan_real``) instead of the legacy ``project_orbital_dense_points_exp``.
+    ``tables/tip_type0/name_to_smp`` are prebuilt by ``_stm_fgr_prepare_tables``.
+
+    When ``degen_thresh_eV > 0``, each requested MO is expanded to its near-degenerate
+    cluster (|E−E0| ≤ thresh) and I is summed over the union — the physically correct
+    sum over a degenerate manifold (PTCDA HOMO 1.8 meV split etc.). Set 0 to disable.
+
+    ``field`` is not accepted: FGR always returns intensity I=|c_t†(H−ES)c_s|² (ldos-like).
+
+    Returns:
+        stm_grid: (nx_s, ny_s, nz_s) FGR STM intensity
+    """
+    mo_list = [int(i) for i in mo_indices]
+    nmo = int(eigvecs.shape[0])
+    bad = [int(i) for i in mo_list if (int(i) < 0 or int(i) >= nmo)]
+    if len(bad) > 0:
+        raise ValueError(f"STM(FGR): MO indices out of range {bad}; valid=[0,{nmo-1}]")
+
+    degen_thresh = float(degen_thresh_eV)
+    if degen_thresh > 0:
+        ev = np.asarray(eigvals, dtype=np.float64)
+        expanded = set(mo_list)
+        for m in list(mo_list):
+            E0 = float(ev[m])
+            expanded.update(i for i in range(len(ev)) if abs(float(ev[i]) - E0) <= degen_thresh)
+        mo_list = sorted(expanded)
+    n_partners = len(mo_list) - len(mo_indices)
+    print(f"  [STM(FGR)] MOs={mo_list}  mode={mode}  rcut={rcut}  taper_w={taper_w}")
+    if n_partners > 0:
+        print(f"  [STM(FGR)] summing I over {len(mo_list)} MOs (degen thresh={degen_thresh} eV, +{n_partners} partners)")
+
+    nx_s, ny_s, nz_s = len(scan_xs), len(scan_ys), len(heights)
+    stm_grid = np.zeros((nx_s, ny_s, nz_s), dtype=np.float32)
+    for iz, h in enumerate(heights):
+        for imo in mo_list:
+            arr = project_mo_stm_fgr_slice(
+                projector, eigvecs[imo], atoms_dict, basis_ang, enames, species_per_atom,
+                scan_xs, scan_ys, float(h), tables, tip_type0, name_to_smp,
+                E_tunnel_Ha=float(eigvals[imo]), tip_orbital=tip_orbital, tip_elem=tip_elem,
+                mode=mode, rcut=float(rcut), taper_w=float(taper_w), intensity=True)
+            stm_grid[:, :, iz] += arr
+        if iz == 0:
+            print(f"  [STM(FGR)] z={h:.3f} Å  I range=[{stm_grid[:,:,iz].min():.3e},"
+                  f"{stm_grid[:,:,iz].max():.3e}]")
+    print(f"  [STM(FGR)] STM grid shape: {stm_grid.shape}, range: "
+          f"[{stm_grid.min():.4e}, {stm_grid.max():.4e}]")
+    return stm_grid
+
+
 def compute_bond_resolved_stm(projector, eigvecs, eigvals, scan_xs, scan_ys, heights,
                               tip_disp, norb_per_atom, orb_offsets, atoms_dict,
                               lumo_offsets=None, mo_indices=None, field='ldos', use_exp_basis=True,

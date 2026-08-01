@@ -87,6 +87,11 @@ def restore_state(rbd, state):
 
 def register_multimol_kernels(rbd):
     """Register kernel headers for the new multimol kernels on the rbd instance."""
+    required = ("rigid_body_pairff_multimol_kernel", "rigid_body_pairff_multimol_persistent_kernel", "rigid_body_pairff_multimol_single_wg_kernel")
+    missing = [name for name in required if name not in rbd.kernelheaders]
+    if missing:
+        raise RuntimeError(f"RigidBodyPairFF did not register production multimol kernels: {missing}")
+    return
     rbd.kernelheaders["rigid_body_pairff_multimol_kernel"] = """__kernel
 void rigid_body_pairff_multimol_kernel(
     __global const int*      mols,
@@ -178,18 +183,9 @@ def strategy_A_naive(rbd, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, fire=F
     anti-pattern we want to measure. Same kernel as A_optimized, just
     with all the avoidable Python overhead.
     """
-    kname = "rigid_body_pairff_multimol_kernel"
-    krnl = cl.Kernel(rbd.prg, kname)
-    gs = (rbd.roundUpGlobalSize(rbd.n_bodies * rbd.nloc),)
-    ls = (rbd.nloc,)
     for _ in range(n_steps):
-        rbd.kernel_params['dt'] = np.float32(dt)
-        rbd.kernel_params['niter'] = np.int32(1)
-        rbd.kernel_params['md_params'] = np.array(
-            [lin_damp, ang_damp, 1.0, -1.0 if fire else 1.0], dtype=np.float32)
-        args = rbd.generate_kernel_args(kname)
-        krnl(rbd.queue, gs, ls, *args)
-        rbd.queue.finish()
+        rbd._multimol_launchers.clear()
+        rbd.run_multimol_md(1, dt=dt, lin_damp=lin_damp, ang_damp=ang_damp, fire=fire)
 
 
 def strategy_A_optimized(rbd, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, fire=False):
@@ -198,21 +194,12 @@ def strategy_A_optimized(rbd, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, fi
     Retain kernel object, set_args once, bare enqueue_nd_range_kernel per step,
     single finish() at end. Uses the new multimol_kernel (all molecules move).
     """
-    kname = "rigid_body_pairff_multimol_kernel"
-    krnl = cl.Kernel(rbd.prg, kname)
-    # Build args once — all buffer handles are persistent
-    rbd.kernel_params['dt'] = np.float32(dt)
-    rbd.kernel_params['niter'] = np.int32(1)
-    rbd.kernel_params['md_params'] = np.array(
-        [lin_damp, ang_damp, 1.0, -1.0 if fire else 1.0], dtype=np.float32)
-    args = rbd.generate_kernel_args(kname)
-    krnl.set_args(*args)
-    gs = (rbd.roundUpGlobalSize(rbd.n_bodies * rbd.nloc),)
-    ls = (rbd.nloc,)
-    q = rbd.queue
-    for _ in range(n_steps):
-        cl.enqueue_nd_range_kernel(q, krnl, gs, ls)
-    q.finish()
+    rbd.run_multimol_md(n_steps, dt=dt, lin_damp=lin_damp, ang_damp=ang_damp, fire=fire)
+
+
+def strategy_A_eventless(rbd, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, fire=False):
+    """Exact ping-pong MD using the optional eventless OpenCL enqueue."""
+    rbd.run_multimol_md(n_steps, dt=dt, lin_damp=lin_damp, ang_damp=ang_damp, fire=fire, eventless=True)
 
 
 def strategy_A_niter(rbd, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, fire=False, K=10):
@@ -228,22 +215,8 @@ def strategy_A_niter(rbd, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, fire=F
     Accuracy degrades with K (stale positions), but for relaxation the
     error is often acceptable and self-correcting.
     """
-    kname = "rigid_body_pairff_multimol_kernel"
-    krnl = cl.Kernel(rbd.prg, kname)
-    rbd.kernel_params['dt'] = np.float32(dt)
-    rbd.kernel_params['md_params'] = np.array(
-        [lin_damp, ang_damp, 1.0, -1.0 if fire else 1.0], dtype=np.float32)
-    gs = (rbd.roundUpGlobalSize(rbd.n_bodies * rbd.nloc),)
-    ls = (rbd.nloc,)
-    q = rbd.queue
-    remaining = n_steps
-    while remaining > 0:
-        steps_this = min(K, remaining)
-        remaining -= steps_this
-        rbd.kernel_params['niter'] = np.int32(steps_this)
-        args = rbd.generate_kernel_args(kname)
-        krnl(q, gs, ls, *args)
-    q.finish()
+    rbd._multimol_launchers.clear()
+    rbd.run_multimol_md(n_steps, dt=dt, lin_damp=lin_damp, ang_damp=ang_damp, fire=fire, batch=K)
 
 
 def strategy_A_niter_opt(rbd, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, fire=False, K=10):
@@ -252,27 +225,12 @@ def strategy_A_niter_opt(rbd, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, fi
     The niter parameter changes per launch (last chunk may be smaller),
     so we re-set only that one arg. Even faster than A_niter.
     """
-    kname = "rigid_body_pairff_multimol_kernel"
-    krnl = cl.Kernel(rbd.prg, kname)
-    rbd.kernel_params['dt'] = np.float32(dt)
-    rbd.kernel_params['niter'] = np.int32(K)
-    rbd.kernel_params['md_params'] = np.array(
-        [lin_damp, ang_damp, 1.0, -1.0 if fire else 1.0], dtype=np.float32)
-    args = rbd.generate_kernel_args(kname)
-    krnl.set_args(*args)
-    gs = (rbd.roundUpGlobalSize(rbd.n_bodies * rbd.nloc),)
-    ls = (rbd.nloc,)
-    q = rbd.queue
-    n_full = n_steps // K
-    n_rem = n_steps % K
-    for _ in range(n_full):
-        cl.enqueue_nd_range_kernel(q, krnl, gs, ls)
-    if n_rem > 0:
-        krnl.set_args(*args)
-        # Re-set only niter arg (last argument, index = num_args - 1)
-        krnl.set_arg(krnl.num_args - 1, np.int32(n_rem))
-        cl.enqueue_nd_range_kernel(q, krnl, gs, ls)
-    q.finish()
+    rbd.run_multimol_md(n_steps, dt=dt, lin_damp=lin_damp, ang_damp=ang_damp, fire=fire, batch=K)
+
+
+def strategy_A_predict(rbd, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, fire=False, K=10):
+    """Approximate K-step chunks with constant-velocity partner prediction."""
+    rbd.run_multimol_md(n_steps, dt=dt, lin_damp=lin_damp, ang_damp=ang_damp, fire=fire, batch=K, predict_partners=True)
 
 
 def measure_launch_overhead(rbd, n_launches=1000):
@@ -281,8 +239,10 @@ def measure_launch_overhead(rbd, n_launches=1000):
     krnl = cl.Kernel(rbd.prg, kname)
     rbd.kernel_params['dt'] = np.float32(0.0)
     rbd.kernel_params['niter'] = np.int32(0)  # 0 iterations = empty kernel
+    rbd.kernel_params['predict_partners'] = np.int32(0)
     rbd.kernel_params['md_params'] = np.array([0.92, 0.88, 1.0, 1.0], dtype=np.float32)
-    args = rbd.generate_kernel_args(kname)
+    overrides = dict(poss_in=rbd.buffer_dict['poss'], qrots_in=rbd.buffer_dict['qrots'], vposs_in=rbd.buffer_dict['vposs'], vrots_in=rbd.buffer_dict['vrots'], poss_out=rbd.buffer_dict['poss_alt'], qrots_out=rbd.buffer_dict['qrots_alt'], vposs_out=rbd.buffer_dict['vposs_alt'], vrots_out=rbd.buffer_dict['vrots_alt'])
+    args = rbd.generate_kernel_args(kname, overrides=overrides)
     krnl.set_args(*args)
     gs = (rbd.roundUpGlobalSize(rbd.n_bodies * rbd.nloc),)
     ls = (rbd.nloc,)
@@ -302,25 +262,7 @@ def strategy_C_persistent(rbd, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, f
     One kernel launch, niter=n_steps internal loop.
     WARNING: may deadlock if not all workgroups are simultaneously resident.
     """
-    kname = "rigid_body_pairff_multimol_persistent_kernel"
-    krnl = cl.Kernel(rbd.prg, kname)
-    # Allocate barrier counter buffer (1 int, reset to 0)
-    n_wg = rbd.n_bodies
-    barrier_buf = cl.Buffer(rbd.ctx, cl.mem_flags.READ_WRITE, 4)
-    cl.enqueue_fill_buffer(rbd.queue, barrier_buf, np.int32(0), 0, 4)
-    rbd.kernel_params['dt'] = np.float32(dt)
-    rbd.kernel_params['niter'] = np.int32(n_steps)
-    rbd.kernel_params['n_wg'] = np.int32(n_wg)
-    rbd.kernel_params['md_params'] = np.array(
-        [lin_damp, ang_damp, 1.0, -1.0 if fire else 1.0], dtype=np.float32)
-    # Build args with barrier buffer override
-    rbd.kernel_params['g_barrier'] = barrier_buf
-    args = rbd.generate_kernel_args(kname)
-    krnl.set_args(*args)
-    gs = (rbd.roundUpGlobalSize(n_wg * rbd.nloc),)
-    ls = (rbd.nloc,)
-    krnl(rbd.queue, gs, ls, *args)
-    rbd.queue.finish()
+    rbd.run_multimol_persistent(n_steps, dt=dt, lin_damp=lin_damp, ang_damp=ang_damp, fire=fire)
 
 
 def strategy_D_stale(rbd, n_steps, K=10, dt=0.05, lin_damp=0.92, ang_damp=0.88, fire=False):
@@ -351,18 +293,7 @@ def strategy_E_single_wg(rbd, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, fi
     All molecules in one workgroup, local barrier, Gauss-Seidel update.
     One kernel launch, niter=n_steps internal loop.
     """
-    kname = "rigid_body_pairff_multimol_single_wg_kernel"
-    krnl = cl.Kernel(rbd.prg, kname)
-    rbd.kernel_params['dt'] = np.float32(dt)
-    rbd.kernel_params['niter'] = np.int32(n_steps)
-    rbd.kernel_params['md_params'] = np.array(
-        [lin_damp, ang_damp, 1.0, -1.0 if fire else 1.0], dtype=np.float32)
-    args = rbd.generate_kernel_args(kname)
-    krnl.set_args(*args)
-    gs = (rbd.nloc,)  # single workgroup
-    ls = (rbd.nloc,)
-    krnl(rbd.queue, gs, ls, *args)
-    rbd.queue.finish()
+    rbd.run_multimol_single_wg(n_steps, dt=dt, lin_damp=lin_damp, ang_damp=ang_damp, fire=fire)
 
 
 # ─── Benchmark harness ───────────────────────────────────────────────────
@@ -442,8 +373,10 @@ def run_benchmark(mol_name, nmol, n_steps, strategies, dt=0.05, spacing=6.0, z=3
     strategy_map = {
         'A_naive':      ('A_naive',      strategy_A_naive,      {}),
         'A_opt':        ('A_opt',        strategy_A_optimized,  {}),
+        'A_eventless':  ('A_eventless',  strategy_A_eventless,  {}),
         'A_niter':      ('A_niter',      strategy_A_niter,      {'K': K}),
         'A_niter_opt':  ('A_niter_opt',  strategy_A_niter_opt,  {'K': K}),
+        'A_predict':     ('A_predict',     strategy_A_predict,    {'K': K}),
         'C_persist':    ('C_persist',    strategy_C_persistent, {}),
         'D_stale':      ('D_stale',      strategy_D_stale,      {'K': K}),
         'E_singlewg':   ('E_singlewg',   strategy_E_single_wg,  {}),

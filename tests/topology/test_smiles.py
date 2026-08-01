@@ -50,6 +50,8 @@ def test_bad_smiles_fails_loud():
 
 def test_smiles_panel_visual(visual_output_dir, make_review):
     """L2: grid of recognizable molecules from SMILES (REVIEW PNG)."""
+    if visual_output_dir is None:
+        pytest.skip('visual mode off (use --visual or --develop)')
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt

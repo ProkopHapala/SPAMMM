@@ -548,7 +548,9 @@ class MoleculeEditorBackend:
                             bond_exists = True
                             break
                     if not bond_exists:
-                        self.graph.add_bond(a, b)
+                        # sp2-sp2 ring bonds default to aromatic (1.5); others single (1.0)
+                        order = 1.5 if (a.npi == 1 and b.npi == 1) else 1.0
+                        self.graph.add_bond(a, b, order=order)
 
     def set_atom_valency(self, node_key, npi):
         """Set npi (pi bond count) for atom at node_key. npi in {0,1,2}."""
@@ -1499,7 +1501,8 @@ class MoleculeEditorBackend:
                                     e, elements.ELEMENT_DICT[e][0],
                                     pin=nk, parent=None,
                                     npi=self._get_element_default_npi(e))
-            a.charge = float(qs[i])
+            if i < len(qs):
+                a.charge = float(qs[i])
             atoms_map[i] = a
         # Add bonds from file (only between heavy atoms that were added)
         if bonds is not None and len(bonds) > 0:
@@ -1525,7 +1528,8 @@ class MoleculeEditorBackend:
                 a = self.graph.add_atom(np.array(p, dtype=np.float64), 'H',
                                     elements.ELEMENT_DICT['H'][0],
                                     pin=None, parent=best_a, npi=-1)
-                a.charge = float(qs[i])
+                if i < len(qs):
+                    a.charge = float(qs[i])
                 self.graph.add_bond(a, best_a, order=1.0)
         self.graph.sync_neighbor_lists()
         self._rings_dirty = True

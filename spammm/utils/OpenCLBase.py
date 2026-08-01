@@ -41,6 +41,7 @@ Major Functionality:
    - _flat32(): Convert array to C-contiguous float32
    - _int32(): Convert array to C-contiguous int32
    - extract_kernel_headers(): Parse kernel signatures from source
+   - bind_ndrange(): Retain work sizes and optionally omit unused OpenCL events
 
 Design Pattern:
 --------------
@@ -111,6 +112,8 @@ result = my_kernel_function(new_data, bTryAllocate=False)
 
 import os
 import re
+import ctypes
+import ctypes.util
 import numpy as np
 import pyopencl as cl
 from . import clUtils as clu
@@ -212,6 +215,35 @@ class OpenCLBase:
         self.buffer_dict = {}
         self.kernelheaders = {}
         self.prg = None
+
+    def bind_ndrange(self, kernel, global_size, local_size, eventless=False):
+        """Bind a persistent kernel/work-size launch, optionally without an OpenCL event."""
+        global_size = tuple(int(v) for v in global_size)
+        local_size = None if local_size is None else tuple(int(v) for v in local_size)
+        if not eventless:
+            enqueue = cl.enqueue_nd_range_kernel
+            queue = self.queue
+            return lambda: enqueue(queue, kernel, global_size, local_size)
+        if self.queue.properties & cl.command_queue_properties.OUT_OF_ORDER_EXEC_MODE_ENABLE:
+            raise ValueError("eventless NDRange launch requires an in-order command queue")
+        libname = ctypes.util.find_library('OpenCL')
+        if libname is None:
+            raise RuntimeError("eventless NDRange launch requires the OpenCL ICD library")
+        opencl = ctypes.CDLL(libname)
+        self._eventless_opencl = opencl
+        enqueue = opencl.clEnqueueNDRangeKernel
+        enqueue.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t), ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]
+        enqueue.restype = ctypes.c_int
+        queue_ptr = ctypes.c_void_p(self.queue.int_ptr)
+        kernel_ptr = ctypes.c_void_p(kernel.int_ptr)
+        gws = (ctypes.c_size_t * len(global_size))(*global_size)
+        lws = None if local_size is None else (ctypes.c_size_t * len(local_size))(*local_size)
+        def launch(kernel_ref=kernel):
+            _ = kernel_ref
+            err = enqueue(queue_ptr, kernel_ptr, len(global_size), None, gws, lws, 0, None, None)
+            if err != 0:
+                raise RuntimeError(f"clEnqueueNDRangeKernel(event=NULL) failed with OpenCL error {err}")
+        return launch
     
     def load_program(self, kernel_path=None, rel_path=None, base_path=None, bPrint=False, bMakeHeaders=True, build_options=None):
         """

@@ -12,6 +12,7 @@ Key functionality:
   - **RigidBodyPairFF**: allmol shared multi-mol layout (`from_molecules`);
     `set_active_body` = index only (persistent dynamics); `attach_pairff_faf`
     for substrate; `tip_pull_scan` / `world_sites_all_bodies` for AFM-like pulls;
+    ping-pong `run_multimol_md` for synchronous all-mobile dynamics;
     replica PairFF evaluation reports fused real-atom/CoM clash flags for MC/GA;
     Vispy map uses `faf_fit` + `potential_to_rgba` display SSOT
 
@@ -231,7 +232,7 @@ class RigidBodyDynamics(OpenCLBase):
             os.path.join(kernel_dir, 'Forces.cl'),
             os.path.join(kernel_dir, 'rigid.cl'),
         ]
-        if not self.load_program_multi(kernel_paths, build_options=build_options, bMakeHeaders=False):
+        if not self.load_program_multi(kernel_paths, build_options=build_options, bMakeHeaders=True):
             raise RuntimeError("Failed to load rigid body kernels")
 
         self.debug = bool(debug)
@@ -244,7 +245,7 @@ class RigidBodyDynamics(OpenCLBase):
         self.mol_offsets = None
         self.max_atoms_body = 0
 
-        self.kernelheaders = {
+        self.kernelheaders.update({
             "rigid_body_dynamics_kernel": """__kernel
 void rigid_body_dynamics_kernel(
     __global const int*      mols,
@@ -385,7 +386,7 @@ void rigid_body_folded_newton_replicas_kernel(
     const float              f2tol,
     const int                niter
 )"""
-        }
+        })
 
         self.kernel_params = {}
         self.kernel_args = None
@@ -419,6 +420,8 @@ void rigid_body_folded_newton_replicas_kernel(
     def realloc(self, n_bodies, num_atoms):
         if num_atoms > self.max_atoms_per_body:
             raise ValueError(f"num_atoms={num_atoms} exceeds max_atoms_per_body={self.max_atoms_per_body}")
+        if hasattr(self, '_multimol_launchers'):
+            self._multimol_launchers.clear()
         self.n_bodies = int(n_bodies)
         self.num_atoms = int(num_atoms)
         self.total_atoms = self.n_bodies * self.num_atoms
@@ -435,6 +438,10 @@ void rigid_body_folded_newton_replicas_kernel(
         self.create_buffer('qrots',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('vposs',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('vrots',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('poss_alt',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('qrots_alt', self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('vposs_alt', self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('vrots_alt', self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('fire_state', self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('newton_state', self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('I_body_inv', self.n_bodies * mat3_size,      mf.READ_ONLY)
@@ -479,6 +486,8 @@ void rigid_body_folded_newton_replicas_kernel(
             raise ValueError(f"atom_counts must be positive, got {counts}")
         if int(counts.max()) > self.max_atoms_per_body:
             raise ValueError(f"max(atom_counts)={int(counts.max())} exceeds max_atoms_per_body={self.max_atoms_per_body}")
+        if hasattr(self, '_multimol_launchers'):
+            self._multimol_launchers.clear()
         n_mols = int(counts.shape[0])
         total = int(counts.sum())
         self.n_bodies = n_mols
@@ -500,6 +509,10 @@ void rigid_body_folded_newton_replicas_kernel(
         self.create_buffer('qrots',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('vposs',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('vrots',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('poss_alt',  self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('qrots_alt', self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('vposs_alt', self.n_bodies * bytes_per_body, mf.READ_WRITE)
+        self.create_buffer('vrots_alt', self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('fire_state', self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('newton_state', self.n_bodies * bytes_per_body, mf.READ_WRITE)
         self.create_buffer('I_body_inv', self.n_bodies * mat3_size, mf.READ_ONLY)
@@ -1812,6 +1825,7 @@ void rigid_body_pairff_unified_allmol_faf_kernel(
         self.pairff_allmol_faf_args = None
         self.krnl_pairff_allmol_faf = None
         self.krnl_pairff_energy_replica = None
+        self._multimol_launchers = {}
         self.n_energy_replica = 0
         self._energy_active_mols = None
         self.pairff_mode = PAIRFF_MODE_LEGACY
@@ -2125,6 +2139,7 @@ void rigid_body_pairff_energy_replica_kernel(
             mode: 'legacy' or 'unified' (default: keep current pairff_mode).
             beta: Compact-exp beta for unified mode (default: morse_alpha, or 1.7).
         """
+        self._multimol_launchers.clear()
         if mode is not None:
             mode = str(mode).lower()
             if mode not in (PAIRFF_MODE_LEGACY, PAIRFF_MODE_UNIFIED):
@@ -2351,6 +2366,98 @@ void rigid_body_pairff_energy_replica_kernel(
         if self.allmol_mode:
             self._refresh_static_view_hosts()
         return self
+
+    def _multimol_launch_pair(self, niter, dt, lin_damp, ang_damp, fire, predict_partners, eventless):
+        """Return cached A→B/B→A launchers for one concurrent multi-molecule chunk."""
+        if not self.allmol_mode or self.pairff_mode != PAIRFF_MODE_UNIFIED:
+            raise RuntimeError("concurrent multi-molecule MD requires from_molecules() with unified PairFF")
+        if self.faf_mode:
+            raise RuntimeError("concurrent multi-molecule MD with FAF is not implemented; disable FAF instead of silently omitting it")
+        niter = int(niter)
+        if niter < 1:
+            raise ValueError(f"niter must be positive, got {niter}")
+        key = (niter, float(dt), float(lin_damp), float(ang_damp), bool(fire), bool(predict_partners), bool(eventless))
+        cached = self._multimol_launchers.get(key)
+        if cached is not None:
+            return cached
+        kname = "rigid_body_pairff_multimol_kernel"
+        self.kernel_params['dt'] = np.float32(dt)
+        self.kernel_params['niter'] = np.int32(niter)
+        self.kernel_params['predict_partners'] = np.int32(bool(predict_partners))
+        self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, -1.0 if fire else 1.0], dtype=np.float32)
+        ab = dict(poss_in=self.buffer_dict['poss'], qrots_in=self.buffer_dict['qrots'], vposs_in=self.buffer_dict['vposs'], vrots_in=self.buffer_dict['vrots'], poss_out=self.buffer_dict['poss_alt'], qrots_out=self.buffer_dict['qrots_alt'], vposs_out=self.buffer_dict['vposs_alt'], vrots_out=self.buffer_dict['vrots_alt'])
+        ba = dict(poss_in=self.buffer_dict['poss_alt'], qrots_in=self.buffer_dict['qrots_alt'], vposs_in=self.buffer_dict['vposs_alt'], vrots_in=self.buffer_dict['vrots_alt'], poss_out=self.buffer_dict['poss'], qrots_out=self.buffer_dict['qrots'], vposs_out=self.buffer_dict['vposs'], vrots_out=self.buffer_dict['vrots'])
+        krnl_ab = cl.Kernel(self.prg, kname)
+        krnl_ba = cl.Kernel(self.prg, kname)
+        krnl_ab.set_args(*self.generate_kernel_args(kname, overrides=ab))
+        krnl_ba.set_args(*self.generate_kernel_args(kname, overrides=ba))
+        gs = (self.roundUpGlobalSize(self.n_bodies * self.nloc),)
+        ls = (self.nloc,)
+        cached = (self.bind_ndrange(krnl_ab, gs, ls, eventless=eventless), self.bind_ndrange(krnl_ba, gs, ls, eventless=eventless))
+        self._multimol_launchers[key] = cached
+        return cached
+
+    def run_multimol_md(self, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, fire=False, batch=1, predict_partners=False, eventless=False, sync=True):
+        """Run all-mobile PairFF MD; batch=1 is synchronous Jacobi, batch>1 is approximate."""
+        n_steps = int(n_steps)
+        batch = int(batch)
+        if n_steps < 1 or batch < 1:
+            raise ValueError(f"n_steps and batch must be positive, got {n_steps}, {batch}")
+        n_full, n_rem = divmod(n_steps, batch)
+        launch_ab, launch_ba = self._multimol_launch_pair(batch, dt, lin_damp, ang_damp, fire, predict_partners, eventless)
+        use_alt = False
+        for _ in range(n_full):
+            (launch_ba if use_alt else launch_ab)()
+            use_alt = not use_alt
+        if n_rem:
+            rem_ab, rem_ba = self._multimol_launch_pair(n_rem, dt, lin_damp, ang_damp, fire, predict_partners, eventless)
+            (rem_ba if use_alt else rem_ab)()
+            use_alt = not use_alt
+        if use_alt:
+            cl.enqueue_copy(self.queue, self.buffer_dict['poss'], self.buffer_dict['poss_alt'])
+            cl.enqueue_copy(self.queue, self.buffer_dict['qrots'], self.buffer_dict['qrots_alt'])
+            cl.enqueue_copy(self.queue, self.buffer_dict['vposs'], self.buffer_dict['vposs_alt'])
+            cl.enqueue_copy(self.queue, self.buffer_dict['vrots'], self.buffer_dict['vrots_alt'])
+        if sync:
+            self.queue.finish()
+
+    def run_multimol_single_wg(self, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, fire=False, eventless=False, sync=True):
+        """Run exact simultaneous multi-molecule MD inside one workgroup."""
+        if not self.allmol_mode or self.pairff_mode != PAIRFF_MODE_UNIFIED or self.faf_mode:
+            raise RuntimeError("single-workgroup multi-molecule MD requires unified allmol PairFF without FAF")
+        if int(n_steps) < 1:
+            raise ValueError(f"n_steps must be positive, got {n_steps}")
+        if self.n_bodies > 32:
+            raise ValueError(f"single-workgroup multi-molecule MD supports at most 32 molecules, got {self.n_bodies}")
+        kname = "rigid_body_pairff_multimol_single_wg_kernel"
+        self.kernel_params['dt'] = np.float32(dt)
+        self.kernel_params['niter'] = np.int32(n_steps)
+        self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, -1.0 if fire else 1.0], dtype=np.float32)
+        krnl = cl.Kernel(self.prg, kname)
+        krnl.set_args(*self.generate_kernel_args(kname))
+        self.bind_ndrange(krnl, (self.nloc,), (self.nloc,), eventless=eventless)()
+        if sync:
+            self.queue.finish()
+
+    def run_multimol_persistent(self, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, fire=False, eventless=False):
+        """Run experimental resident-workgroup MD with ping-pong state and a software global barrier."""
+        if not self.allmol_mode or self.pairff_mode != PAIRFF_MODE_UNIFIED or self.faf_mode:
+            raise RuntimeError("persistent multi-molecule MD requires unified allmol PairFF without FAF")
+        if int(n_steps) < 1:
+            raise ValueError(f"n_steps must be positive, got {n_steps}")
+        if self.n_bodies > self.ctx.devices[0].max_compute_units:
+            raise ValueError(f"persistent kernel requires n_mols <= compute units ({self.ctx.devices[0].max_compute_units}), got {self.n_bodies}")
+        kname = "rigid_body_pairff_multimol_persistent_kernel"
+        self.check_buf('g_barrier', np.int32().itemsize)
+        self.kernel_params['n_wg'] = np.int32(self.n_bodies)
+        self.kernel_params['niter'] = np.int32(n_steps)
+        self.kernel_params['dt'] = np.float32(dt)
+        self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, -1.0 if fire else 1.0], dtype=np.float32)
+        cl.enqueue_fill_buffer(self.queue, self.buffer_dict['g_barrier'], np.int32(0), 0, np.int32().itemsize)
+        krnl = cl.Kernel(self.prg, kname)
+        krnl.set_args(*self.generate_kernel_args(kname))
+        self.bind_ndrange(krnl, (self.roundUpGlobalSize(self.n_bodies * self.nloc),), (self.nloc,), eventless=eventless)()
+        self.queue.finish()
 
     def run_pairff(self, num_steps, dt, lin_damp=0.92, ang_damp=0.88, fire=False, faf=None):
         """Run PairFF (optional fused FAF) for num_steps inside one GPU launch.

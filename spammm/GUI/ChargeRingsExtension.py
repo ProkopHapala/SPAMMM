@@ -14,7 +14,7 @@ import numpy as np
 from PyQt5 import QtWidgets, QtCore
 
 from .ExtensionManager import UIComponents
-from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, GridPlacer
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, AutoGridPlacer
 
 _DATA = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data', 'charge_rings')
 
@@ -52,23 +52,23 @@ def build_ui(window):
     apply_tight(layout)
 
     # --- Preset ---
-    g0 = GridPlacer(cols=6)
+    g0 = AutoGridPlacer(cols=4)
     window.cr_preset = QtWidgets.QComboBox()
     window.cr_preset.addItems(['symmetric_trimer', 'fig3_trimer', 'Ruslan_long', 'Ruslan_short', 'square_tetramer'])
-    g0.add_pair("Preset:", window.cr_preset, label_span=1, input_span=3)
+    g0.add_pair("Preset:", window.cr_preset)
     window.cr_load_preset_btn = QtWidgets.QPushButton('Load preset')
     window.cr_load_preset_btn.clicked.connect(lambda: load_preset(window))
-    g0.add(window.cr_load_preset_btn, span=2)
+    g0.add(window.cr_load_preset_btn)
     layout.addLayout(g0.layout())
 
     # --- JSON I/O ---
-    g1 = GridPlacer(cols=6)
+    g1 = AutoGridPlacer(cols=4)
     window.cr_load_json_btn = QtWidgets.QPushButton('Load JSON…')
     window.cr_load_json_btn.clicked.connect(lambda: load_json(window))
-    g1.add(window.cr_load_json_btn, span=3)
+    g1.add(window.cr_load_json_btn)
     window.cr_save_json_btn = QtWidgets.QPushButton('Save JSON…')
     window.cr_save_json_btn.clicked.connect(lambda: save_json(window))
-    g1.add(window.cr_save_json_btn, span=3)
+    g1.add(window.cr_save_json_btn)
     layout.addLayout(g1.layout())
 
     # --- Param spins (scrollable) ---
@@ -76,9 +76,7 @@ def build_ui(window):
     scroll.setWidgetResizable(True)
     scroll.setMaximumHeight(280)
     spin_host = QtWidgets.QWidget()
-    form = QtWidgets.QFormLayout(spin_host)
-    form.setContentsMargins(0, 0, 0, 0)
-    form.setSpacing(1)
+    g_spins = AutoGridPlacer(cols=4)
     window.cr_spins = {}
     for label, key, lo, hi, step, dec in _SPIN_SPEC:
         if dec == 0:
@@ -92,7 +90,8 @@ def build_ui(window):
             sp.setDecimals(dec)
         sp.setMaximumWidth(90)
         window.cr_spins[key] = sp
-        form.addRow(label, sp)
+        g_spins.add_pair(label, sp)
+    spin_host.setLayout(g_spins.layout())
     scroll.setWidget(spin_host)
     layout.addWidget(scroll)
 
@@ -100,25 +99,25 @@ def build_ui(window):
     window.cr_bMirror.setChecked(True)
     window.cr_bRamp = QtWidgets.QCheckBox('bRamp')
     window.cr_bRamp.setChecked(True)
-    g_chk = GridPlacer(cols=6)
-    g_chk.add(window.cr_bMirror, span=3)
-    g_chk.add(window.cr_bRamp, span=3)
+    g_chk = AutoGridPlacer(cols=4)
+    g_chk.add(window.cr_bMirror)
+    g_chk.add(window.cr_bRamp)
     layout.addLayout(g_chk.layout())
 
     # --- Calc buttons ---
-    g_calc = GridPlacer(cols=6)
+    g_calc = AutoGridPlacer(cols=4)
     window.cr_xy_btn = QtWidgets.QPushButton('Calc XY')
     window.cr_xy_btn.setToolTip('Constant-VBias xy STM + dI/dV; overlay xV cut line')
     window.cr_xy_btn.clicked.connect(lambda: calc_xy(window))
-    g_calc.add(window.cr_xy_btn, span=2)
+    g_calc.add(window.cr_xy_btn)
     window.cr_xv_btn = QtWidgets.QPushButton('Calc xV')
     window.cr_xv_btn.setToolTip('Line×voltage scan (diamonds / NDR) + state probs')
     window.cr_xv_btn.clicked.connect(lambda: calc_xv(window))
-    g_calc.add(window.cr_xv_btn, span=2)
+    g_calc.add(window.cr_xv_btn)
     window.cr_1d_btn = QtWidgets.QPushButton('Calc 1D')
     window.cr_1d_btn.setToolTip('Fixed-V line cut + many-body P(s)')
     window.cr_1d_btn.clicked.connect(lambda: calc_1d(window))
-    g_calc.add(window.cr_1d_btn, span=2)
+    g_calc.add(window.cr_1d_btn)
     layout.addLayout(g_calc.layout())
 
     window.cr_status = QtWidgets.QLabel('Status: Load preset or JSON, then Calc')

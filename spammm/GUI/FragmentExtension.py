@@ -13,7 +13,7 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 import numpy as np
 
 from .ExtensionManager import UIComponents
-from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, GridPlacer
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, AutoGridPlacer
 
 # Distinct color palette for fragments (RGBA)
 FRAGMENT_COLORS = [
@@ -37,50 +37,50 @@ def build_ui(window):
     apply_tight(layout)
 
     # --- Main button: Fragments (split by bridges) ---
-    g0 = GridPlacer(cols=6)
+    g0 = AutoGridPlacer(cols=4)
     window.frag_split_btn = QtWidgets.QPushButton("Fragments")
     window.frag_split_btn.clicked.connect(lambda: _on_fragments(window))
-    g0.add(window.frag_split_btn, span=3)
+    g0.add(window.frag_split_btn)
     window.frag_min_size_spin = QtWidgets.QSpinBox()
     window.frag_min_size_spin.setRange(1, 50)
     window.frag_min_size_spin.setValue(2)
     window.frag_min_size_spin.setMaximumWidth(40)
-    g0.add_pair("min:", window.frag_min_size_spin, label_span=1, input_span=2)
+    g0.add_pair("min:", window.frag_min_size_spin)
     layout.addLayout(g0.layout())
 
     # --- Analysis buttons row 1 ---
-    g1 = GridPlacer(cols=6)
+    g1 = AutoGridPlacer(cols=4)
     window.frag_components_btn = QtWidgets.QPushButton("Components")
     window.frag_components_btn.clicked.connect(lambda: _on_components(window))
-    g1.add(window.frag_components_btn, span=2)
+    g1.add(window.frag_components_btn)
 
     window.frag_bridges_btn = QtWidgets.QPushButton("Bridges")
     window.frag_bridges_btn.clicked.connect(lambda: _on_bridges(window))
-    g1.add(window.frag_bridges_btn, span=2)
+    g1.add(window.frag_bridges_btn)
 
     window.frag_ap_btn = QtWidgets.QPushButton("Articulation")
     window.frag_ap_btn.clicked.connect(lambda: _on_articulation(window))
-    g1.add(window.frag_ap_btn, span=2)
+    g1.add(window.frag_ap_btn)
     layout.addLayout(g1.layout())
 
     # --- Analysis buttons row 2 ---
-    g2 = GridPlacer(cols=6)
+    g2 = AutoGridPlacer(cols=4)
     window.frag_local_btn = QtWidgets.QPushButton("Local Bridges")
     window.frag_local_btn.clicked.connect(lambda: _on_local_bridges(window))
-    g2.add(window.frag_local_btn, span=4)
+    g2.add(window.frag_local_btn)
 
     window.frag_local_dist_spin = QtWidgets.QSpinBox()
     window.frag_local_dist_spin.setRange(2, 20)
     window.frag_local_dist_spin.setValue(3)
     window.frag_local_dist_spin.setMaximumWidth(40)
-    g2.add(window.frag_local_dist_spin, span=2)
+    g2.add(window.frag_local_dist_spin)
     layout.addLayout(g2.layout())
 
     # --- Analysis buttons row 3 ---
-    g3 = GridPlacer(cols=6)
+    g3 = AutoGridPlacer(cols=4)
     window.frag_biconn_btn = QtWidgets.QPushButton("BiComponents")
     window.frag_biconn_btn.clicked.connect(lambda: _on_biconnected(window))
-    g3.add(window.frag_biconn_btn, span=6)
+    g3.add(window.frag_biconn_btn)
     layout.addLayout(g3.layout())
 
     # --- Clear button ---

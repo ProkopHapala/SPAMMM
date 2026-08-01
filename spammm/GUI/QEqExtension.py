@@ -11,7 +11,7 @@ from PyQt5 import QtWidgets, QtCore
 import numpy as np
 
 from .ExtensionManager import UIComponents
-from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, GridPlacer
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, AutoGridPlacer
 from spammm.forcefields.QEq import solve, solve_cholesky, solve_lu, KE
 from spammm.topology.FFparams import read_element_types
 import os
@@ -29,41 +29,41 @@ def build_ui(window):
     apply_tight(layout)
 
     # --- Method selector ---
-    g1 = GridPlacer(cols=6)
+    g1 = AutoGridPlacer(cols=4)
     window.qeq_method_combo = QtWidgets.QComboBox()
     window.qeq_method_combo.addItems(['cholesky', 'lu'])
     window.qeq_method_combo.setMaximumWidth(100)
-    g1.add_pair("Method:", window.qeq_method_combo, label_span=1, input_span=5)
+    g1.add_pair("Method:", window.qeq_method_combo)
     layout.addLayout(g1.layout())
 
     # --- Q_target ---
-    g2 = GridPlacer(cols=6)
+    g2 = AutoGridPlacer(cols=4)
     window.qeq_qtarget_spin = QtWidgets.QDoubleSpinBox()
     window.qeq_qtarget_spin.setRange(-100.0, 100.0)
     window.qeq_qtarget_spin.setSingleStep(0.1)
     window.qeq_qtarget_spin.setValue(0.0)
     window.qeq_qtarget_spin.setMaximumWidth(80)
-    g2.add_pair("Q_total:", window.qeq_qtarget_spin, label_span=1, input_span=5)
+    g2.add_pair("Q_total:", window.qeq_qtarget_spin)
     layout.addLayout(g2.layout())
 
     # --- Solve button ---
-    g_solve = GridPlacer(cols=6)
+    g_solve = AutoGridPlacer(cols=4)
     window.qeq_solve_btn = QtWidgets.QPushButton("Solve QEq")
     window.qeq_solve_btn.clicked.connect(lambda: _on_solve(window))
-    g_solve.add(window.qeq_solve_btn, span=6)
+    g_solve.add(window.qeq_solve_btn)
     layout.addLayout(g_solve.layout())
 
     # --- Plot ESP button + z-height ---
-    g_esp = GridPlacer(cols=6)
+    g_esp = AutoGridPlacer(cols=4)
     window.qeq_esp_z_spin = QtWidgets.QDoubleSpinBox()
     window.qeq_esp_z_spin.setRange(-10.0, 20.0)
     window.qeq_esp_z_spin.setSingleStep(0.5)
     window.qeq_esp_z_spin.setValue(3.0)
     window.qeq_esp_z_spin.setMaximumWidth(SPIN_MAX_WIDTH)
-    g_esp.add_pair("ESP z:", window.qeq_esp_z_spin, label_span=1, input_span=2)
+    g_esp.add_pair("ESP z:", window.qeq_esp_z_spin)
     window.qeq_plot_esp_btn = QtWidgets.QPushButton("Plot ESP")
     window.qeq_plot_esp_btn.clicked.connect(lambda: _on_plot_esp(window))
-    g_esp.add(window.qeq_plot_esp_btn, span=3)
+    g_esp.add(window.qeq_plot_esp_btn)
     layout.addLayout(g_esp.layout())
 
     # --- Status ---

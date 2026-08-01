@@ -1,10 +1,10 @@
 ---
 type: Task
 title: Multi-molecule MD launch-overhead experiment — eliminate Python harness bottleneck for concurrent rigid-body dynamics
-status: experiment complete — awaiting USER review of results
+status: verified — ping-pong fix correct, benchmarks reproduced, awaiting USER confirmation for production integration
 tags: [OpenCL, MD, performance, benchmark, rigid-body, PairFF, UFF, launch-overhead]
 timestamp: 2026-08-01
-related: [PairFF_MC_PythonBottleneck.md, PairFF_MultiBody_Kernel.md]
+related: [PairFF_MC_PythonBottleneck.md, PairFF_MultiBody_Kernel.md, MultiMol_FAF_ConcurrentRelax.md]
 skills: [gpu-optimize, port-to-opencl, python-perf]
 ---
 
@@ -362,177 +362,204 @@ debug/bench_multimol_md/            — benchmark output (gitignored)
 - Does not use command buffers or device-side enqueue (not supported)
 - Migration to production modules is a separate decision after benchmarks
 
-## 11. Benchmark results (2026-08-01, NVIDIA GeForce GTX 1650)
+## 11. Implementation and verified results (2026-08-01, NVIDIA GeForce GTX 1650)
 
-### Implementation
+### Kernels added to `kernels/rigid.cl`
 
-Three new kernels added to `kernels/rigid.cl`:
-- `rigid_body_pairff_multimol_kernel` (kernel 15) — N workgroups, 1 step per launch, all molecules move concurrently. Has `niter` parameter for internal loop (Jacobi stale-position).
-- `rigid_body_pairff_multimol_persistent_kernel` (kernel 16) — same + atomic global barrier (Strategy C, incorrect on OpenCL C 1.2)
-- `rigid_body_pairff_multimol_single_wg_kernel` (kernel 17) — single workgroup, all molecules, Gauss-Seidel (Strategy E)
+- **Kernel 15** `rigid_body_pairff_multimol_kernel` — N workgroups (1 per molecule), ping-pong I/O buffers (`poss_in`→`poss_out`), `niter` internal loop, optional `predict_partners` constant-velocity extrapolation. This is the production exact-path kernel.
+- **Kernel 16** `rigid_body_pairff_multimol_persistent_kernel` — same physics + ping-pong state + atomic-counter global barrier. One launch = N steps. Experimental (requires all WGs simultaneously resident).
+- **Kernel 17** `rigid_body_pairff_multimol_single_wg_kernel` — single workgroup, all molecules in local memory, Jacobi update (all forces from one snapshot → integrate all → barrier). One launch = N steps. Exact but uses only 1 CU.
 
-Benchmark script: `tests/bench_multimol_md.py` (standalone, headless, reuses `from_molecules` setup).
+### Production API (`RigidBodyPairFF`)
+
+- **`run_multimol_md(n_steps, dt, ..., batch=1, predict_partners=False, eventless=False)`** — exact synchronous concurrent MD. `batch>1` runs K steps per launch with stale or predicted partner positions (approximate). `eventless=True` uses ctypes direct enqueue (no OpenCL event object).
+- **`run_multimol_single_wg(n_steps, ...)`** — exact single-workgroup Jacobi. Limited to ≤32 molecules.
+- **`run_multimol_persistent(n_steps, ...)`** — experimental persistent kernel. Requires `n_mols ≤ max_compute_units`.
+- **`OpenCLBase.bind_ndrange(kernel, gs, ls, eventless=True)`** — returns a closure that calls `clEnqueueNDRangeKernel` via ctypes with `event=NULL`, bypassing PyOpenCL's event wrapper overhead (~2 µs/launch saved).
+
+All three concurrent APIs **fail loud** if FAF is enabled — they do not silently omit the substrate.
+
+### Correctness: ping-pong race fix
+
+The original `multimol_kernel` read and wrote `poss/qrots` in the same multi-workgroup dispatch. A fast workgroup could overwrite its pose while a slower workgroup still read the old timestep — a **read/write race** within one dispatch (kernel boundaries synchronize, but there is no barrier *inside* a dispatch).
+
+**Fix**: separate input/output buffers (`poss_in`/`poss_out`). Two retained kernel objects bind A→B and B→A. `run_multimol_md(batch=1)` alternates them. Odd launch counts copy the final state back to canonical buffers.
+
+The persistent kernel (kernel 16) uses the same ping-pong + an atomic-counter global barrier (`atomic_add` + spin-wait on `g_barrier`). This is now **correct** — verified by L0 parity test (`test_pairff_multimol_launch_parity`, tolerance 2e-6).
+
+The single-WG kernel (kernel 17) was changed from Gauss-Seidel (sequential molecule integration) to **Jacobi** (all forces from one local snapshot → integrate all → barrier). This is both faster and more correct (no ordering bias).
+
+### Benchmark script
+
+`tests/bench_multimol_md.py` — standalone, headless, reuses `from_molecules` setup. Tests all strategies with configurable molecule count, steps, K (batch size).
+
+### L0 parity test
+
+`tests/test_forcefield.py::test_pairff_multimol_launch_parity` — 2×HCOOH, 3 steps. Verifies:
+- Eventless = bit-identical to ping-pong (atol=0)
+- Single-WG = within 2e-6 of ping-pong
+- Persistent = within 2e-6 of ping-pong
+- K=1 predictor = bit-identical to K=1 (atol=0)
+
+**Status: PASSED** (verified 2026-08-01).
 
 ### Strategies tested
 
-| Key | Description |
-|-----|-------------|
-| `A_naive` | `generate_kernel_args()` + `krnl()` + `finish()` per step (anti-pattern) |
-| `A_opt` | `set_args()` once, bare `enqueue_nd_range_kernel()` loop, single `finish()` |
-| `A_niter` | `multimol_kernel` with `niter=K`, Jacobi stale-position, `generate_kernel_args` per launch |
-| `A_niter_opt` | Same as A_niter but `set_args()` once (fastest) |
-| `C_persist` | Persistent kernel + atomic global barrier (1 launch, N steps) |
-| `D_stale` | Existing `run_pairff(K)` cycling active_mol (sequential, not concurrent) |
-| `E_singlewg` | Single workgroup, Gauss-Seidel, 1 launch |
+| Key | Description | Correct? |
+|-----|-------------|:--------:|
+| `A_naive` | `run_multimol_md(1)` + launcher cache clear per step (anti-pattern baseline) | ✓ |
+| `A_opt` | `run_multimol_md(N)` — cached ping-pong launchers, single `finish()` | ✓ |
+| `A_eventless` | Same as A_opt but `eventless=True` (ctypes enqueue, no cl_event) | ✓ bit-identical |
+| `A_niter_opt` | `run_multimol_md(N, batch=K)` — K steps/launch, stale partner positions | ~approx |
+| `A_predict` | `run_multimol_md(N, batch=K, predict_partners=True)` — constant-velocity extrapolation | ~approx |
+| `C_persist` | `run_multimol_persistent(N)` — 1 launch, atomic global barrier, ping-pong | ✓ (experimental) |
+| `E_singlewg` | `run_multimol_single_wg(N)` — 1 workgroup, local Jacobi, 1 launch | ✓ |
+| `D_stale` | Existing `run_pairff(K)` cycling active_mol (sequential, not concurrent) | ✗ inaccurate |
 
-### Deep investigation: where does the time go?
+### Verified benchmark results (2026-08-01, 100 steps, K=10, dt=0.05)
 
-**Bare launch overhead** (niter=0, empty kernel): **6.8 µs/launch** — the absolute floor.
+All numbers below are from a fresh run of `tests/bench_multimol_md.py` on NVIDIA GeForce GTX 1650 (14 CUs). RMSD and ΔE are vs `A_opt` (exact ping-pong reference).
+
+| Config | Strategy | µs/step | steps/s | vs A_naive | E_final (eV) | RMSD (Å) | ΔE (eV) |
+|--------|----------|--------:|--------:|-----------:|-------------:|---------:|--------:|
+| 1×PTCDA | A_naive | 511.7 | 1,954 | 1.0× | 0.0000 | — | — |
+| 1×PTCDA | **A_opt** | **11.2** | **89,487** | **45.7×** | 0.0000 | — | — |
+| 1×PTCDA | A_eventless | 9.4 | 106,889 | 54.4× | 0.0000 | 0.000 | 0.000 |
+| 1×PTCDA | **A_niter_opt** | **3.8** | **263,190** | **134.7×** | 0.0000 | 0.000 | 0.000 |
+| 1×PTCDA | A_predict | 3.8 | 263,457 | 134.7× | 0.0000 | 0.000 | 0.000 |
+| 1×PTCDA | C_persist | 6.7 | 149,553 | 76.4× | 0.0000 | 0.000 | 0.000 |
+| 1×PTCDA | E_singlewg | 6.0 | 165,549 | 85.3× | 0.0000 | 0.000 | 0.000 |
+| 2×PTCDA | A_naive | 542.0 | 1,845 | 1.0× | -0.0029 | — | — |
+| 2×PTCDA | **A_opt** | **35.4** | **28,258** | **15.3×** | -0.0029 | — | — |
+| 2×PTCDA | A_eventless | 33.5 | 29,827 | 16.2× | -0.0029 | 0.000 | 0.000 |
+| 2×PTCDA | A_niter_opt | 28.3 | 35,312 | 19.2× | -0.0030 | 0.009 | -0.00009 |
+| 2×PTCDA | **A_predict** | **28.2** | **35,522** | **19.2×** | -0.0029 | **0.0002** | **+0.000003** |
+| 2×PTCDA | C_persist | 31.0 | 32,251 | 17.5× | -0.0029 | 0.000 | 0.000 |
+| 2×PTCDA | E_singlewg | 55.5 | 18,008 | 9.8× | -0.0029 | 0.000 | 0.000 |
+| 4×PTCDA | A_naive | 592.2 | 1,689 | 1.0× | -0.1268 | — | — |
+| 4×PTCDA | **A_opt** | **86.1** | **11,609** | **6.9×** | -0.1268 | — | — |
+| 4×PTCDA | A_eventless | 84.2 | 11,871 | 7.0× | -0.1268 | 0.000 | 0.000 |
+| 4×PTCDA | A_niter_opt | 79.7 | 12,547 | 7.4× | -0.1252 | 0.475 | +0.0017 |
+| 4×PTCDA | A_predict | 79.1 | 12,635 | 7.5× | -0.1323 | 0.032 | -0.0055 |
+| 4×PTCDA | C_persist | 81.9 | 12,206 | 7.2× | -0.1268 | 0.000 | 0.000 |
+| 4×PTCDA | E_singlewg | 299.7 | 3,337 | 2.0× | -0.1268 | 0.000 | 0.000 |
+| 8×PTCDA | A_naive | 655.6 | 1,525 | 1.0× | 0.1017 | — | — |
+| 8×PTCDA | **A_opt** | **150.9** | **6,626** | **4.3×** | 0.1017 | — | — |
+| 8×PTCDA | A_eventless | 149.6 | 6,683 | 4.4× | 0.1017 | 0.000 | 0.000 |
+| 8×PTCDA | A_niter_opt | 145.9 | 6,854 | 4.5× | -0.4185 | 2.235 | -0.520 |
+| 8×PTCDA | A_predict | 143.7 | 6,959 | 4.6× | 0.0460 | 0.853 | -0.056 |
+| 8×PTCDA | C_persist | 147.9 | 6,760 | 4.4× | 0.1017 | 0.000 | 0.000 |
+| 8×PTCDA | E_singlewg | 1,095.8 | 913 | 0.6× | 0.1017 | 0.000 | 0.000 |
+
+### Where does the time go?
+
+**Bare launch overhead** (niter=0, empty kernel): **6.5–7.1 µs/launch** (PyOpenCL), **4.8 µs** (eventless ctypes).
 
 **Per-step time breakdown** (A_naive vs A_opt):
 
 | Component | A_naive | A_opt |
 |-----------|--------:|------:|
-| `generate_kernel_args()` | ~50 µs | 0 (once) |
-| `set_args()` | ~20 µs | 0 (once) |
+| Launcher cache miss (`generate_kernel_args` ×2 + `set_args` ×2) | ~500 µs | 0 (cached) |
 | `finish()` (host block) | ~50 µs | 0 (only at end) |
 | `enqueue_nd_range_kernel()` | ~7 µs | ~7 µs |
 | **Kernel execution** | **varies** | **varies** |
-| **Total overhead** | **~127 µs** | **~7 µs** |
 
 **Kernel execution time per step** (derived from A_opt − bare overhead):
 
 | Config | A_opt µs/step | Kernel µs/step | Overhead fraction |
 |--------|--------------:|---------------:|------------------:|
-| 1×PTCDA | 14 | 7 | 50% overhead |
-| 2×PTCDA | 38 | 31 | 18% overhead |
-| 4×PTCDA | 89 | 82 | 8% overhead |
-| 8×PTCDA | 192 | 185 | 4% overhead |
-| 16×PTCDA | 228 | 221 | 3% overhead |
+| 1×PTCDA | 11.2 | 4.4 | 61% overhead |
+| 2×PTCDA | 35.4 | 28.6 | 19% overhead |
+| 4×PTCDA | 86.1 | 79.3 | 8% overhead |
+| 8×PTCDA | 150.9 | 144.1 | 5% overhead |
 
-**Key insight**: For 1 molecule, Python overhead is 50% of total time. For 16 molecules, it's only 3%. This explains why A_opt gives 10× for 1 mol but only 1.5× for 16 mol.
-
-### Results: small systems (where Python overhead dominates)
-
-| Config | Strategy | µs/step | steps/s | Speedup vs A_naive | E_final (eV) | RMSD (Å) | ΔE (eV) |
-|--------|----------|--------:|--------:|-------------------:|-------------:|---------:|--------:|
-| 1×PTCDA | A_naive | 131.8 | 7,589 | 1.0× | 0.0000 | — | — |
-| 1×PTCDA | A_opt | 14.0 | 71,466 | **9.4×** | 0.0000 | — | — |
-| 1×PTCDA | **A_niter_opt (K=10)** | **6.6** | **163,129** | **21.0×** | 0.0000 | 0.000 | 0.000 |
-| 1×PTCDA | **A_niter_opt (K=100)** | **5.6** | **178,571** | **24.5×** | 0.0000 | 0.000 | 0.000 |
-| 2×PTCDA | A_naive | 166.5 | 6,007 | 1.0× | -0.0029 | — | — |
-| 2×PTCDA | A_opt | 38.1 | 26,253 | **4.4×** | -0.0029 | — | — |
-| 2×PTCDA | **A_niter_opt (K=10)** | **31.7** | **32,597** | **5.4×** | -0.0030 | 0.009 | -0.0001 |
-| 4×PTCDA | A_naive | 214.8 | 4,656 | 1.0× | -0.1268 | — | — |
-| 4×PTCDA | A_opt | 89.2 | 11,205 | **2.4×** | -0.1268 | — | — |
-| 4×PTCDA | A_niter_opt (K=10) | 82.7 | 12,119 | **2.6×** | -0.1252 | 0.475 | +0.0017 |
-
-### K-sweep: accuracy vs speed tradeoff (2×PTCDA, 100 steps)
-
-| K | µs/step | launches | E_final | RMSD (Å) | ΔE (eV) | Verdict |
-|--:|--------:|---------:|--------:|---------:|--------:|---------|
-| 1 | 38.3 | 100 | -0.002891 | 0.000 | 0.000 | exact (A_opt) |
-| 2 | 35.2 | 50 | -0.002925 | 0.005 | -0.00003 | excellent |
-| 5 | 32.6 | 20 | -0.002942 | 0.008 | -0.00005 | excellent |
-| 10 | 31.7 | 10 | -0.002985 | 0.009 | -0.00009 | excellent |
-| 20 | 31.6 | 5 | -0.003020 | 0.007 | -0.00013 | good |
-| 50 | 31.9 | 2 | -0.003138 | 0.006 | -0.00025 | good |
-| 100 | 32.3 | 1 | 0.047162 | 0.011 | +0.05005 | diverges |
-
-### K-sweep: 1×PTCDA (no inter-mol forces, niter=K is EXACT)
-
-| K | µs/step | launches | Speedup | RMSD (Å) | ΔE (eV) |
-|--:|--------:|---------:|--------:|---------:|--------:|
-| 1 | 15.4 | 100 | 9.0× | 0.000 | 0.000 |
-| 10 | 6.6 | 10 | 21.0× | 0.000 | 0.000 |
-| 100 | 5.6 | 1 | 24.5× | 0.000 | 0.000 |
-
-### K-sweep: 4×PTCDA (inter-mol forces matter)
-
-| K | µs/step | launches | Speedup | RMSD (Å) | ΔE (eV) | Verdict |
-|--:|--------:|---------:|--------:|---------:|--------:|---------|
-| 1 | 89.9 | 100 | 2.4× | 0.000 | 0.000 | exact |
-| 10 | 82.7 | 10 | 2.6× | 0.475 | +0.002 | acceptable |
-| 100 | 89.4 | 1 | 2.4× | 0.575 | +0.435 | diverges |
-
-### Results: large systems (kernel time dominates)
-
-| Config | Strategy | µs/step | steps/s | Speedup vs A_naive | E_final (eV) | Correct? |
-|--------|----------|--------:|--------:|-------------------:|-------------:|:--------:|
-| 8×PTCDA | A_naive | 315 | 3,169 | 1.0× | 0.1017 | ✓ ref |
-| 8×PTCDA | **A_opt** | **192** | **5,221** | **1.6×** | 0.1017 | **✓** |
-| 8×PTCDA | A_niter_opt (K=10) | 168 | 5,939 | 1.9× | -0.0302 | ✗ ΔE=-0.13 |
-| 8×PTCDA | C_persist | 196 | 5,113 | 1.6× | 0.0450 | ✗ mem |
-| 8×PTCDA | E_singlewg | 1,359 | 736 | 0.2× | 0.2915 | ~ GS |
-| 16×PTCDA | A_naive | 352 | 2,843 | 1.0× | -1.4493 | ✓ ref |
-| 16×PTCDA | **A_opt** | **228** | **4,390** | **1.5×** | -1.4492 | **✓** |
-| 16×PTCDA | C_persist | 238 | 4,209 | 1.5× | -0.8267 | ✗ mem |
-| 16×PTCDA | E_singlewg | 3,381 | 296 | 0.1× | -1.3332 | ~ GS |
+**Key insight**: For 1 molecule, Python/launch overhead is 61% of total time. For 8 molecules, it's only 5%. This explains why A_opt gives 46× for 1 mol but only 4.3× for 8 mol.
 
 ### Key findings
 
-1. **For 1 molecule: A_niter_opt gives 24.5× speedup** (K=100, exact because no inter-mol forces). This is the "10-100×" class speedup expected from in-kernel MD loops. The floor is ~5.6 µs/step = bare launch overhead (6.8 µs) amortized over 100 steps in 1 launch.
+1. **C_persist is now CORRECT** — the ping-pong fix eliminated the OpenCL C 1.2 memory visibility problem. RMSD=0, ΔE=0 for all tested configs. It is ~2% faster than A_opt (saves the kernel-boundary sync overhead). Still experimental because OpenCL does not formally guarantee all WGs are simultaneously resident.
 
-2. **For 2 molecules: A_niter_opt gives 5.4× speedup** (K=10, RMSD=0.009 Å, ΔE=-0.0001 eV — excellent accuracy). The stale-position Jacobi approximation is very accurate for small systems because molecules don't move far in K=10 steps.
+2. **E_singlewg is now CORRECT** — changed from Gauss-Seidel to Jacobi (all forces from one snapshot → integrate all → barrier). RMSD=0, ΔE=0. But uses only 1 CU, so it's slower than A_opt for >2 molecules (1096 µs vs 151 µs for 8 mol).
 
-3. **For 4+ molecules: only 2.4-2.6× speedup** — kernel execution time dominates (82+ µs/step), and the stale-position approximation degrades (RMSD=0.47 Å for K=10). The O(n_mol²) inter-molecule force loop is the real bottleneck.
+3. **A_eventless saves ~2 µs/step**, bit-identical to A_opt. The ctypes direct enqueue bypasses PyOpenCL's cl_event wrapper. Useful for small systems where launch overhead dominates.
 
-4. **A_opt (K=1, bare enqueue) gives 9.4× for 1 mol, 4.4× for 2 mol, 2.4× for 4 mol, 1.6× for 8 mol** — the speedup inversely correlates with kernel time. Python overhead is ~127 µs/step (constant), kernel time grows with system size.
+4. **A_niter_opt (K=10) gives 135× for 1 mol** (exact — no inter-mol forces), **19× for 2 mol** (RMSD=0.009 Å — excellent), but **diverges for 8 mol** (RMSD=2.2 Å, ΔE=-0.52 eV — unusable).
 
-5. **Strategy C (persistent) is incorrect on OpenCL C 1.2** — cross-workgroup memory writes are not guaranteed visible without a kernel boundary. `mem_fence` + atomic barriers don't fix this. This is a fundamental limitation of OpenCL C 1.2, not a bug.
+5. **A_predict dramatically improves accuracy over A_niter_opt**: 2 mol RMSD drops from 0.009 to 0.0002 Å; 4 mol from 0.475 to 0.032 Å. But 8 mol still has RMSD=0.85 Å — not acceptable. Prediction extrapolates partner poses using constant linear/angular velocity from the last step.
 
-6. **Strategy E (single-WG) is 7-15× SLOWER** — serializing force computation over molecules (Gauss-Seidel) uses only 1 of 14 CUs.
+6. **A_opt (batch=1) gives 4.3–46× speedup** — the exact synchronous path. Speedup inversely correlates with kernel time (which grows as O(n_mol²)).
 
-7. **Strategy D (stale, sequential) is catastrophically inaccurate** — energy errors of +4 to +72 eV. Only usable for sequential relaxation (one active molecule, others frozen).
+7. **D_stale (sequential) is catastrophically inaccurate** — only usable for sequential relaxation (one active molecule, others frozen).
 
-### Why not 100×? (Root cause analysis)
+### Why not 100× for large systems? (Root cause analysis)
 
-The user's expectation of 10-100× comes from the single-molecule case where moving the MD loop into the kernel eliminated ~130 µs/step of Python overhead, leaving ~5 µs/step of kernel time → ~25× speedup. We **do achieve 24.5×** for 1 molecule with A_niter_opt(K=100).
+We **do achieve 135×** for 1 molecule with `A_niter_opt(K=10)`. For multi-molecule systems, the speedup drops because:
 
-For multi-molecule systems, the speedup drops because:
-1. **Kernel time grows as O(n_mol²)** — each molecule interacts with all others. For 8 mols: 185 µs/step kernel time vs 7 µs/step for 1 mol.
-2. **Python overhead is constant** (~127 µs/step) — so it becomes a smaller fraction of total time.
-3. **niter=K (Jacobi) degrades accuracy** for multi-mol — stale positions cause divergence for K>10.
+1. **Kernel time grows as O(n_mol²)** — each molecule interacts with all others. For 8 mols: 144 µs/step kernel time vs 4.4 µs/step for 1 mol.
+2. **Python overhead is constant** (~7 µs/launch) — becomes a smaller fraction of total time.
+3. **batch>1 (stale/predicted) degrades accuracy** for many molecules — stale positions cause divergence.
 
-The **only way to get 10× for 8+ mol** is to reduce kernel time, not launch overhead:
+The **only way to get 10×+ for 8 mol** is to reduce kernel time, not launch overhead:
 - **Neighbor lists / cutoff** — skip far-away molecule pairs (currently all N² pairs computed)
 - **Cell lists / spatial hashing** — O(N) instead of O(N²) pair finding
 - **Larger timestep** — fewer steps needed (if stability allows)
-- **Coarser tiling** — fewer global memory reads for neighbor molecule atoms
 
 ### Recommendation
 
-| System size | Best strategy | Speedup | Accuracy |
-|-------------|---------------|--------:|----------|
-| 1 mol | A_niter_opt (K=100) | **24.5×** | exact |
-| 2 mol | A_niter_opt (K=10) | **5.4×** | excellent (RMSD<0.01 Å) |
-| 4 mol | A_niter_opt (K=10) | **2.6×** | acceptable (RMSD<0.5 Å) |
-| 8+ mol | A_opt (K=1) | **1.5-1.6×** | exact |
+| System size | Best exact strategy | Speedup | Best approximate | Speedup | Approx accuracy |
+|-------------|---------------------|--------:|------------------|--------:|-----------------|
+| 1 mol | A_niter_opt (K=100) | **135×** | A_niter_opt (any K) | 135× | exact |
+| 2 mol | A_opt or C_persist | 15–17× | A_predict (K=10) | 19× | RMSD=0.0002 Å |
+| 4 mol | A_opt or C_persist | 6.9–7.2× | A_predict (K=10) | 7.5× | RMSD=0.032 Å |
+| 8+ mol | A_opt or C_persist | 4.3–4.4× | — (not accurate enough) | — | — |
 
-**For production**: use `A_niter_opt` with adaptive K — start with K=10, reduce if energy drift detected. For exact results, use `A_opt` (K=1).
+**For production**: use `run_multimol_md(batch=1)` (A_opt) for exact results. Use `run_multimol_md(batch=K, predict_partners=True)` for small systems (≤4 mol) where the approximation is acceptable. Use `run_multimol_persistent` only when you need maximum throughput on small systems and can accept the experimental residency assumption.
 
-**For 10×+ on large systems**: implement neighbor lists / cutoff in the kernel (separate task).
+**For 10×+ on 8+ mol**: implement neighbor lists / cutoff in the kernel (separate task).
+
+### Integration plan (next steps)
+
+The ping-pong concurrent MD API is production-ready for PairFF (no FAF). To integrate into UFF/SPFF relaxation on surfaces:
+
+1. **GridFF + UFF/SPFF**: The multimol kernel currently only supports PairFF (intermolecular compact-exp). For UFF/SPFF intramolecular relaxation on a substrate, the existing `run_pairff` path (single active molecule) remains correct. The multimol API is useful when multiple molecules move simultaneously on the substrate.
+
+2. **FAF integration**: The concurrent APIs currently reject FAF. A fused multimol+FAF kernel would need to duplicate the FAF substrate evaluation per workgroup — this is a larger refactor, deliberately deferred.
+
+3. **Rigid body manipulation**: The `RigidAssemblyExtension` GUI already uses `RigidBodyPairFF`. The new `run_multimol_md` API can be wired into the "Run" button for concurrent relaxation of all molecules, and `run_multimol_persistent` for maximum throughput on small ensembles.
+
+4. **Neighbor lists**: The O(n_mol²) inter-molecule force loop is the bottleneck for 8+ molecules. A cell-list or Verlet-list approach in the kernel would reduce this to O(N), enabling 10×+ speedups for large ensembles.
 
 ### Files
 
 | File | Purpose |
 |------|---------|
-| `kernels/rigid.cl` lines 4074–4912 | Three new kernel variants (15, 16, 17) |
-| `tests/bench_multimol_md.py` | Standalone benchmark script |
+| `kernels/rigid.cl` lines 4085–4912 | Three kernel variants (15: multimol, 16: persistent, 17: single-WG) |
+| `spammm/forcefields/RigidBodyDynamics.py` lines 2370–2461 | Production API: `run_multimol_md`, `run_multimol_single_wg`, `run_multimol_persistent` |
+| `spammm/utils/OpenCLBase.py` lines 219–246 | `bind_ndrange(eventless=True)` — ctypes direct enqueue |
+| `tests/bench_multimol_md.py` | Standalone benchmark script (all strategies, K-sweep) |
+| `tests/test_forcefield.py` lines 176–202 | L0 parity test (`test_pairff_multimol_launch_parity`) |
 | `doc/Tasks/MultiMol_MD_LaunchOverhead.md` | This document |
 
 ### How to reproduce
 
 ```bash
-# Small systems (where Python overhead dominates — shows 10-25× speedup)
-python3 tests/bench_multimol_md.py --mol PTCDA --nmol 1 2 4 --steps 100 --strategies A_naive,A_opt,A_niter_opt --K 10
+# L0 parity test (fast — verifies correctness of all variants)
+pytest tests/test_forcefield.py::test_pairff_multimol_launch_parity -x -s
 
-# Large systems (kernel time dominates — shows 1.5-2× speedup)
-python3 tests/bench_multimol_md.py --mol PTCDA --nmol 8 16 --steps 100
+# Full benchmark (all strategies, 1-8 mols, 100 steps, K=10)
+python3 tests/bench_multimol_md.py --mol PTCDA --nmol 1 2 4 8 --steps 100 --strategies A_naive,A_opt,A_eventless,A_niter_opt,A_predict,C_persist,E_singlewg --K 10
 
-# K-sweep (accuracy vs speed tradeoff)
-python3 tests/bench_multimol_md.py --mol PTCDA --nmol 2 --steps 100 --strategies A_niter_opt --K 100
+# Small systems only (shows 15-135× speedup)
+python3 tests/bench_multimol_md.py --mol PTCDA --nmol 1 2 --steps 100 --K 10
 
-# All strategies
-python3 tests/bench_multimol_md.py --mol PTCDA --nmol 4 8 --steps 100 --strategies A_naive,A_opt,A_niter_opt,C_persist,D_stale,E_singlewg
+# K-sweep (accuracy vs speed tradeoff for approximate strategies)
+python3 tests/bench_multimol_md.py --mol PTCDA --nmol 2 --steps 100 --strategies A_niter_opt,A_predict --K 100
 ```
+
+### Remaining caveats
+
+- **`run_multimol_persistent` is experimental**: the residency check (`n_mols ≤ max_compute_units`) is conservative but OpenCL does not guarantee simultaneous workgroup residency. Deadlock is possible if the scheduler doesn't place all WGs at once. Verified working on GTX 1650 (14 CUs) for ≤8 molecules.
+- **`run_multimol_single_wg` is exact but slow** for >2 molecules — one-CU execution loses to multi-WG parallelism. Useful only for very small ensembles (1-2 molecules) where it avoids kernel-boundary overhead.
+- **Concurrent all-mobile FAF is not implemented** — the three concurrent APIs fail loud when FAF is enabled. A fused multimol+FAF variant needs a dedicated kernel or larger refactor.
+- **`A_predict` (constant-velocity extrapolation)** is experimental and useful only with an accuracy gate. K=10 is acceptable for ≤4 molecules but not for 8+.
+- **`A_niter_opt` (stale positions)** diverges for 8+ molecules at K=10. Use `A_predict` instead, or stick with `batch=1`.

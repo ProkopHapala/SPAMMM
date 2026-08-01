@@ -96,8 +96,11 @@ def test_mol_export_import():
     pos1_heavy = pos1[heavy_mask1]
     assert len(pos0_heavy) == len(pos1_heavy), f"heavy atom count mismatch: {len(pos0_heavy)} vs {len(pos1_heavy)}"
     assert np.allclose(pos1_heavy, pos0_heavy, atol=1e-3), "heavy atom positions mismatch!"
-    # MOL should preserve bonds (6 ring bonds between C atoms)
-    assert nb1 == nb0, f"bond count mismatch: {nb1} vs {nb0}"
+    # MOL file stores only heavy-heavy bonds; load_mol adds C-H bonds on import.
+    # Compare heavy-only bond counts (filter bonds where both atoms are heavy).
+    def heavy_bonds(bonds, es):
+        return sum(1 for i, j in bonds if es[i] not in ('H', 'E') and es[j] not in ('H', 'E'))
+    assert heavy_bonds(bonds1, es1) == heavy_bonds(bonds0, es0), f"heavy bond count mismatch: {heavy_bonds(bonds1, es1)} vs {heavy_bonds(bonds0, es0)}"
     print("  PASSED ✓")
 
 
@@ -126,7 +129,10 @@ def test_mol2_export_import():
     pos1_heavy = pos1[heavy_mask1]
     assert len(pos0_heavy) == len(pos1_heavy), f"heavy atom count mismatch: {len(pos0_heavy)} vs {len(pos1_heavy)}"
     assert np.allclose(pos1_heavy, pos0_heavy, atol=1e-3), "heavy atom positions mismatch!"
-    assert nb1 == nb0, f"bond count mismatch: {nb1} vs {nb0}"
+    # MOL2 file stores only heavy-heavy bonds; load_mol adds C-H bonds on import.
+    def heavy_bonds(bonds, es):
+        return sum(1 for i, j in bonds if es[i] not in ('H', 'E') and es[j] not in ('H', 'E'))
+    assert heavy_bonds(bonds1, es1) == heavy_bonds(bonds0, es0), f"heavy bond count mismatch: {heavy_bonds(bonds1, es1)} vs {heavy_bonds(bonds0, es0)}"
     print("  PASSED ✓")
 
 

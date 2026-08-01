@@ -61,7 +61,13 @@ def test_afm_contact_surface_scan(xyz):
     assert sep.coeffs is not None
     assert sep.n_coeff < 50000, f"unexpected coeff count {sep.n_coeff}"
     apos = afm.atoms_arr[:, :3]
-    z_probe = float(apos[:, 2].max()) + 1.2
+    # Query ABOVE the contact surface (h0_max + offset), not above bare atom zmax.
+    # The separable basis is zero for z < h0 (clamped by fmax(z-h0, 0) in the kernel),
+    # so querying at zmax+1.2 (below h0 for benzene where h0~2.5 > zmax=0) gives a
+    # degenerate fit evaluation that cannot match the brute force. The fit was done
+    # at z = h0_max + [1.0, 1.2, 1.5], so query at h0_max + 1.2 (inside fit region).
+    h0_max = float(np.max(sep.h0_map)) if sep.h0_map is not None else float(apos[:, 2].max())
+    z_probe = h0_max + 1.2
     pts_ref = np.column_stack([apos[::2, 0], apos[::2, 1], np.full(len(apos[::2]), z_probe)]).astype(np.float32)
     _, F_ref = afm._brute_afm_morse_c_queries(pts_ref)
     _, F_fit = afm._cs_fit_helper().eval_separable(pts_ref, sep)
