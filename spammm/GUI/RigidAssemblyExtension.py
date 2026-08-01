@@ -52,12 +52,13 @@ import numpy as np
 from PyQt5 import QtWidgets, QtCore
 
 from .ExtensionManager import UIComponents
-from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, GridPlacer
 from .EditModeHandlers import EditModeHandler
 from .CollapsibleSection import CollapsibleSection
 
 from spammm.forcefields.RigidEnsemble import RigidEnsemble
-from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF, _body_sites_world, _quat_to_matrix_np, load_molecule, graph_to_rigid_fragments
+from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF, _body_sites_world, _quat_to_matrix_np
+from spammm.forcefields.RigidBodyUtils import load_molecule, graph_to_rigid_fragments, greedy_energy_step, grid_pos
 from spammm.surfaces.FoldedRigid import remap_fit_for_molecule
 
 # Molecule paths for dropdown (data, not logic)
@@ -237,14 +238,7 @@ def _on_build(window):
             _status(window, f'Loading {mol_name}...')
             apos, enames, REQs, bonds = load_molecule(MOL_PATHS[mol_name], qeq=(mol_name not in _NO_QEQ) and (not window.ra_no_qeq_chk.isChecked()), name=mol_name)
             molecules = [(apos, enames, REQs)] * nmol
-            # Grid positions (same pattern as testplot grid_pos)
-            nx = int(np.ceil(np.sqrt(nmol)))
-            pos = np.zeros((nmol, 3), dtype=np.float32)
-            for i in range(nmol):
-                ix, iy = i % nx, i // nx
-                pos[i, 0] = (ix - 0.5 * (nx - 1)) * spacing
-                pos[i, 1] = (iy - 0.5 * (nx - 1)) * spacing
-                pos[i, 2] = z_mol
+            pos = grid_pos(nmol, spacing=spacing, z=z_mol)
             quat = np.tile(np.array([0, 0, 0, 1], dtype=np.float32), (nmol, 1))
             # Small random rotation per molecule (like testplot)
             rng = np.random.default_rng(int(window.ra_seed_spin.value()))
@@ -307,7 +301,7 @@ def _on_mc_step(window):
     seed = int(window.ra_seed_spin.value()) + 1000 + int(window.ra_mc_step_count)
     moved = [int(window.ra_mc_step_count) % nmol]
     pos, quat = ens.get_poses()
-    pos, quat, E0, Ebest, acc, Ebatch = rbd.greedy_energy_step(
+    pos, quat, E0, Ebest, acc, Ebatch = greedy_energy_step(rbd,
         pos, quat, moved, n_trial=n_trial, dxy=dxy, dphi=dphi,
         seed=seed, rmin_com=0.0, rmin_atom=float(window.ra_rmin_atom_spin.value()),
         k_pack=k_pack,
@@ -579,45 +573,41 @@ def build_ui(window):
     build_l.setSpacing(SPACING)
 
     # Source selector: "From file" (load pre-defined molecule) vs "From editor" (split graph)
-    src_row = QtWidgets.QHBoxLayout()
-    src_row.addWidget(QtWidgets.QLabel('Source:'))
+    g = GridPlacer(cols=6)
     window.ra_source_combo = QtWidgets.QComboBox()
     window.ra_source_combo.addItems(['From file', 'From editor'])
     window.ra_source_combo.setToolTip('From file: load nmol copies of a pre-defined molecule.\n'
                                        'From editor: split the current AtomicGraph into connected '
                                        'components (independent fragments); each fragment → one rigid body.')
-    src_row.addWidget(window.ra_source_combo)
-    src_row.addStretch()
-    build_l.addLayout(src_row)
-
-    row0 = QtWidgets.QHBoxLayout()
-    row0.addWidget(QtWidgets.QLabel('Mol:'))
+    g.add_pair("Source:", window.ra_source_combo, label_span=1, input_span=5)
+    g.newrow()
     window.ra_mol_combo = QtWidgets.QComboBox()
     window.ra_mol_combo.addItems(sorted(MOL_PATHS.keys()))
-    row0.addWidget(window.ra_mol_combo)
+    g.add_pair("Mol:", window.ra_mol_combo, label_span=1, input_span=3)
     window.ra_nmol_spin = QtWidgets.QSpinBox(); window.ra_nmol_spin.setRange(1, 64); window.ra_nmol_spin.setValue(4); window.ra_nmol_spin.setMaximumWidth(50)
-    row0.addWidget(QtWidgets.QLabel('nmol:')); row0.addWidget(window.ra_nmol_spin)
-    window.ra_spacing_spin = QtWidgets.QDoubleSpinBox(); window.ra_spacing_spin.setRange(2.0, 50.0); window.ra_spacing_spin.setValue(16.0); window.ra_spacing_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_spacing_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    row0.addWidget(QtWidgets.QLabel('spacing:')); row0.addWidget(window.ra_spacing_spin)
-    build_l.addLayout(row0)
+    g.add_pair("nmol:", window.ra_nmol_spin, label_span=1, input_span=1)
+    g.newrow()
+    window.ra_spacing_spin = QtWidgets.QDoubleSpinBox(); window.ra_spacing_spin.setRange(2.0, 50.0); window.ra_spacing_spin.setValue(16.0); window.ra_spacing_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g.add_pair("spacing:", window.ra_spacing_spin, label_span=1, input_span=2)
+    window.ra_z_spin = QtWidgets.QDoubleSpinBox(); window.ra_z_spin.setRange(-5.0, 20.0); window.ra_z_spin.setSingleStep(0.1); window.ra_z_spin.setValue(3.0); window.ra_z_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g.add_pair("z_mol:", window.ra_z_spin, label_span=1, input_span=2)
+    g.newrow()
+    window.ra_z_init_spin = QtWidgets.QDoubleSpinBox(); window.ra_z_init_spin.setRange(0.0, 10.0); window.ra_z_init_spin.setSingleStep(0.1); window.ra_z_init_spin.setValue(3.0); window.ra_z_init_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g.add_pair("z_init:", window.ra_z_init_spin, label_span=1, input_span=2)
+    window.ra_seed_spin = QtWidgets.QSpinBox(); window.ra_seed_spin.setRange(0, 100000); window.ra_seed_spin.setValue(3); window.ra_seed_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g.add_pair("seed:", window.ra_seed_spin, label_span=1, input_span=2)
+    build_l.addLayout(g.layout())
 
-    row1 = QtWidgets.QHBoxLayout()
-    window.ra_z_spin = QtWidgets.QDoubleSpinBox(); window.ra_z_spin.setRange(-5.0, 20.0); window.ra_z_spin.setSingleStep(0.1); window.ra_z_spin.setValue(3.0); window.ra_z_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_z_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    row1.addWidget(QtWidgets.QLabel('z_mol:')); row1.addWidget(window.ra_z_spin)
-    window.ra_z_init_spin = QtWidgets.QDoubleSpinBox(); window.ra_z_init_spin.setRange(0.0, 10.0); window.ra_z_init_spin.setSingleStep(0.1); window.ra_z_init_spin.setValue(3.0); window.ra_z_init_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_z_init_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    row1.addWidget(QtWidgets.QLabel('z_init:')); row1.addWidget(window.ra_z_init_spin)
-    window.ra_seed_spin = QtWidgets.QSpinBox(); window.ra_seed_spin.setRange(0, 100000); window.ra_seed_spin.setValue(3); window.ra_seed_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_seed_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    row1.addWidget(QtWidgets.QLabel('seed:')); row1.addWidget(window.ra_seed_spin)
-    build_l.addLayout(row1)
-
-    row2 = QtWidgets.QHBoxLayout()
+    # Checkboxes + Build button
+    g_chk = GridPlacer(cols=6)
     window.ra_no_qeq_chk = QtWidgets.QCheckBox('no QEq')
+    g_chk.add(window.ra_no_qeq_chk, span=2)
     window.ra_no_faf_chk = QtWidgets.QCheckBox('no FAF')
-    row2.addWidget(window.ra_no_qeq_chk); row2.addWidget(window.ra_no_faf_chk); row2.addStretch()
+    g_chk.add(window.ra_no_faf_chk, span=2)
     window.ra_build_btn = QtWidgets.QPushButton('Build')
     window.ra_build_btn.clicked.connect(lambda: _on_build(window))
-    row2.addWidget(window.ra_build_btn)
-    build_l.addLayout(row2)
+    g_chk.add(window.ra_build_btn, span=2)
+    build_l.addLayout(g_chk.layout())
     build_sec.setContent(build_host)
     layout.addWidget(build_sec)
 
@@ -627,36 +617,34 @@ def build_ui(window):
     mc_l = QtWidgets.QVBoxLayout(mc_host)
     mc_l.setSpacing(SPACING)
 
-    mc_row1 = QtWidgets.QHBoxLayout()
-    window.ra_ntrial_spin = QtWidgets.QSpinBox(); window.ra_ntrial_spin.setRange(1, 4096); window.ra_ntrial_spin.setValue(128); window.ra_ntrial_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_ntrial_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    mc_row1.addWidget(QtWidgets.QLabel('n_trial:')); mc_row1.addWidget(window.ra_ntrial_spin)
-    window.ra_dxy_spin = QtWidgets.QDoubleSpinBox(); window.ra_dxy_spin.setRange(0.01, 10.0); window.ra_dxy_spin.setSingleStep(0.1); window.ra_dxy_spin.setValue(1.5); window.ra_dxy_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_dxy_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    mc_row1.addWidget(QtWidgets.QLabel('dxy:')); mc_row1.addWidget(window.ra_dxy_spin)
-    window.ra_dphi_spin = QtWidgets.QDoubleSpinBox(); window.ra_dphi_spin.setRange(0.01, 3.0); window.ra_dphi_spin.setSingleStep(0.05); window.ra_dphi_spin.setValue(0.8); window.ra_dphi_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_dphi_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    mc_row1.addWidget(QtWidgets.QLabel('dphi:')); mc_row1.addWidget(window.ra_dphi_spin)
-    mc_l.addLayout(mc_row1)
+    g_mc = GridPlacer(cols=6)
+    window.ra_ntrial_spin = QtWidgets.QSpinBox(); window.ra_ntrial_spin.setRange(1, 4096); window.ra_ntrial_spin.setValue(128); window.ra_ntrial_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g_mc.add_pair("n_trial:", window.ra_ntrial_spin, label_span=1, input_span=2)
+    window.ra_dxy_spin = QtWidgets.QDoubleSpinBox(); window.ra_dxy_spin.setRange(0.01, 10.0); window.ra_dxy_spin.setSingleStep(0.1); window.ra_dxy_spin.setValue(1.5); window.ra_dxy_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g_mc.add_pair("dxy:", window.ra_dxy_spin, label_span=1, input_span=2)
+    g_mc.newrow()
+    window.ra_dphi_spin = QtWidgets.QDoubleSpinBox(); window.ra_dphi_spin.setRange(0.01, 3.0); window.ra_dphi_spin.setSingleStep(0.05); window.ra_dphi_spin.setValue(0.8); window.ra_dphi_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g_mc.add_pair("dphi:", window.ra_dphi_spin, label_span=1, input_span=2)
+    window.ra_kpack_spin = QtWidgets.QDoubleSpinBox(); window.ra_kpack_spin.setRange(0.0, 1.0); window.ra_kpack_spin.setSingleStep(0.01); window.ra_kpack_spin.setValue(0.03); window.ra_kpack_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g_mc.add_pair("k_pack:", window.ra_kpack_spin, label_span=1, input_span=2)
+    g_mc.newrow()
+    window.ra_rmin_atom_spin = QtWidgets.QDoubleSpinBox(); window.ra_rmin_atom_spin.setRange(0.0, 5.0); window.ra_rmin_atom_spin.setSingleStep(0.1); window.ra_rmin_atom_spin.setValue(1.6); window.ra_rmin_atom_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g_mc.add_pair("rmin:", window.ra_rmin_atom_spin, label_span=1, input_span=2)
+    window.ra_mc_nsteps_spin = QtWidgets.QSpinBox(); window.ra_mc_nsteps_spin.setRange(1, 100000); window.ra_mc_nsteps_spin.setValue(50); window.ra_mc_nsteps_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g_mc.add_pair("n_steps:", window.ra_mc_nsteps_spin, label_span=1, input_span=2)
+    mc_l.addLayout(g_mc.layout())
 
-    mc_row2 = QtWidgets.QHBoxLayout()
-    window.ra_kpack_spin = QtWidgets.QDoubleSpinBox(); window.ra_kpack_spin.setRange(0.0, 1.0); window.ra_kpack_spin.setSingleStep(0.01); window.ra_kpack_spin.setValue(0.03); window.ra_kpack_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_kpack_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    mc_row2.addWidget(QtWidgets.QLabel('k_pack:')); mc_row2.addWidget(window.ra_kpack_spin)
-    window.ra_rmin_atom_spin = QtWidgets.QDoubleSpinBox(); window.ra_rmin_atom_spin.setRange(0.0, 5.0); window.ra_rmin_atom_spin.setSingleStep(0.1); window.ra_rmin_atom_spin.setValue(1.6); window.ra_rmin_atom_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_rmin_atom_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    mc_row2.addWidget(QtWidgets.QLabel('rmin_atom:')); mc_row2.addWidget(window.ra_rmin_atom_spin)
-    window.ra_mc_nsteps_spin = QtWidgets.QSpinBox(); window.ra_mc_nsteps_spin.setRange(1, 100000); window.ra_mc_nsteps_spin.setValue(50); window.ra_mc_nsteps_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_mc_nsteps_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    mc_row2.addWidget(QtWidgets.QLabel('n_steps:')); mc_row2.addWidget(window.ra_mc_nsteps_spin)
-    mc_l.addLayout(mc_row2)
-
-    mc_row3 = QtWidgets.QHBoxLayout()
+    g_mc_btn = GridPlacer(cols=6)
     window.ra_mc_step_btn = QtWidgets.QPushButton('Step')
     window.ra_mc_step_btn.clicked.connect(lambda: _on_mc_step(window))
-    mc_row3.addWidget(window.ra_mc_step_btn)
+    g_mc_btn.add(window.ra_mc_step_btn, span=2)
     window.ra_mc_run_btn = QtWidgets.QPushButton('Run')
     window.ra_mc_run_btn.clicked.connect(lambda: _on_mc_run(window))
-    mc_row3.addWidget(window.ra_mc_run_btn)
+    g_mc_btn.add(window.ra_mc_run_btn, span=2)
     window.ra_mc_reset_btn = QtWidgets.QPushButton('Reset')
     window.ra_mc_reset_btn.clicked.connect(lambda: _on_mc_reset(window))
-    mc_row3.addWidget(window.ra_mc_reset_btn)
-    mc_row3.addStretch()
-    mc_l.addLayout(mc_row3)
+    g_mc_btn.add(window.ra_mc_reset_btn, span=2)
+    mc_l.addLayout(g_mc_btn.layout())
     mc_sec.setContent(mc_host)
     layout.addWidget(mc_sec)
 
@@ -665,14 +653,15 @@ def build_ui(window):
     drag_host = QtWidgets.QWidget()
     drag_l = QtWidgets.QVBoxLayout(drag_host)
     drag_l.setSpacing(SPACING)
-    drag_row = QtWidgets.QHBoxLayout()
-    window.ra_k_spring_spin = QtWidgets.QDoubleSpinBox(); window.ra_k_spring_spin.setRange(0.01, 1000.0); window.ra_k_spring_spin.setSingleStep(0.5); window.ra_k_spring_spin.setValue(20.0); window.ra_k_spring_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_k_spring_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    drag_row.addWidget(QtWidgets.QLabel('k_spring:')); drag_row.addWidget(window.ra_k_spring_spin)
-    window.ra_drag_nrelax_spin = QtWidgets.QSpinBox(); window.ra_drag_nrelax_spin.setRange(0, 500); window.ra_drag_nrelax_spin.setValue(20); window.ra_drag_nrelax_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_drag_nrelax_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    drag_row.addWidget(QtWidgets.QLabel('n_relax:')); drag_row.addWidget(window.ra_drag_nrelax_spin)
-    window.ra_drag_dt_spin = QtWidgets.QDoubleSpinBox(); window.ra_drag_dt_spin.setRange(0.0001, 0.5); window.ra_drag_dt_spin.setSingleStep(0.005); window.ra_drag_dt_spin.setValue(0.02); window.ra_drag_dt_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_drag_dt_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    drag_row.addWidget(QtWidgets.QLabel('dt:')); drag_row.addWidget(window.ra_drag_dt_spin)
-    drag_l.addLayout(drag_row)
+    g_drag = GridPlacer(cols=6)
+    window.ra_k_spring_spin = QtWidgets.QDoubleSpinBox(); window.ra_k_spring_spin.setRange(0.01, 1000.0); window.ra_k_spring_spin.setSingleStep(0.5); window.ra_k_spring_spin.setValue(20.0); window.ra_k_spring_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g_drag.add_pair("k_spring:", window.ra_k_spring_spin, label_span=1, input_span=2)
+    window.ra_drag_nrelax_spin = QtWidgets.QSpinBox(); window.ra_drag_nrelax_spin.setRange(0, 500); window.ra_drag_nrelax_spin.setValue(20); window.ra_drag_nrelax_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g_drag.add_pair("n_relax:", window.ra_drag_nrelax_spin, label_span=1, input_span=2)
+    g_drag.newrow()
+    window.ra_drag_dt_spin = QtWidgets.QDoubleSpinBox(); window.ra_drag_dt_spin.setRange(0.0001, 0.5); window.ra_drag_dt_spin.setSingleStep(0.005); window.ra_drag_dt_spin.setValue(0.02); window.ra_drag_dt_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g_drag.add_pair("dt:", window.ra_drag_dt_spin, label_span=1, input_span=2)
+    drag_l.addLayout(g_drag.layout())
     drag_hint = QtWidgets.QLabel('Activate "RA Drag" edit mode (toolbar), then LMB drag atoms in the scene.')
     drag_hint.setWordWrap(True)
     drag_l.addWidget(drag_hint)
@@ -685,46 +674,41 @@ def build_ui(window):
     pme_l = QtWidgets.QVBoxLayout(pme_host)
     pme_l.setSpacing(SPACING)
 
-    def _pme_spin(key, lo, hi, step, val, decimals=3, width=60):
+    def _pme_spin(key, lo, hi, step, val, decimals=3, width=70):
         s = QtWidgets.QDoubleSpinBox(); s.setRange(lo, hi); s.setSingleStep(step); s.setDecimals(decimals); s.setValue(val); s.setMaximumWidth(width)
         setattr(window, f'ra_pme_{key}_spin', s)
         return s
 
-    pme_row1 = QtWidgets.QHBoxLayout()
-    pme_row1.addWidget(QtWidgets.QLabel('Esite:')); pme_row1.addWidget(_pme_spin('esite', -1.0, 1.0, 0.01, 0.0))
-    pme_row1.addWidget(QtWidgets.QLabel('W:')); pme_row1.addWidget(_pme_spin('W', 0.0, 0.5, 0.01, 0.05))
-    pme_row1.addWidget(QtWidgets.QLabel('Q0:')); pme_row1.addWidget(_pme_spin('Q0', 0.0, 5.0, 0.1, 0.0, decimals=2))
-    pme_row1.addWidget(QtWidgets.QLabel('Qzz:')); pme_row1.addWidget(_pme_spin('Qzz', -20.0, 20.0, 0.5, 0.0, decimals=2))
-    pme_l.addLayout(pme_row1)
-
-    pme_row2 = QtWidgets.QHBoxLayout()
-    pme_row2.addWidget(QtWidgets.QLabel('VBias:')); pme_row2.addWidget(_pme_spin('vbias', 0.0, 3.0, 0.05, 1.0))
-    pme_row2.addWidget(QtWidgets.QLabel('z_tip:')); pme_row2.addWidget(_pme_spin('ztip', 1.0, 15.0, 0.5, 5.0, decimals=2))
-    pme_row2.addWidget(QtWidgets.QLabel('Temp:')); pme_row2.addWidget(_pme_spin('temp', 0.1, 100.0, 0.5, 1.0, decimals=2))
-    pme_row2.addWidget(QtWidgets.QLabel('GammaT:')); pme_row2.addWidget(_pme_spin('gammat', 1e-4, 1.0, 0.01, 0.01, decimals=4))
-    pme_l.addLayout(pme_row2)
-
-    pme_row3 = QtWidgets.QHBoxLayout()
-    pme_row3.addWidget(QtWidgets.QLabel('decay:')); pme_row3.addWidget(_pme_spin('decay', 0.05, 2.0, 0.05, 0.5))
-    pme_row3.addWidget(QtWidgets.QLabel('L:')); pme_row3.addWidget(_pme_spin('L', 5.0, 40.0, 1.0, 20.0, decimals=1))
-    pme_row3.addWidget(QtWidgets.QLabel('npix:')); 
-    npix_s = QtWidgets.QSpinBox(); npix_s.setRange(20, 200); npix_s.setValue(80); npix_s.setMaximumWidth(SPIN_MAX_WIDTH); npix_s.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+    g_pme = GridPlacer(cols=4)
+    g_pme.add_pair("Esite:", _pme_spin('esite', -1.0, 1.0, 0.01, 0.0), label_span=1, input_span=1)
+    g_pme.add_pair("W:", _pme_spin('W', 0.0, 0.5, 0.01, 0.05), label_span=1, input_span=1)
+    g_pme.newrow()
+    g_pme.add_pair("Q0:", _pme_spin('Q0', 0.0, 5.0, 0.1, 0.0, decimals=2), label_span=1, input_span=1)
+    g_pme.add_pair("Qzz:", _pme_spin('Qzz', -20.0, 20.0, 0.5, 0.0, decimals=2), label_span=1, input_span=1)
+    g_pme.newrow()
+    g_pme.add_pair("VBias:", _pme_spin('vbias', 0.0, 3.0, 0.05, 1.0), label_span=1, input_span=1)
+    g_pme.add_pair("z_tip:", _pme_spin('ztip', 1.0, 15.0, 0.5, 5.0, decimals=2), label_span=1, input_span=1)
+    g_pme.newrow()
+    g_pme.add_pair("Temp:", _pme_spin('temp', 0.1, 100.0, 0.5, 1.0, decimals=2), label_span=1, input_span=1)
+    g_pme.add_pair("GammaT:", _pme_spin('gammat', 1e-4, 1.0, 0.01, 0.01, decimals=4), label_span=1, input_span=1)
+    g_pme.newrow()
+    g_pme.add_pair("decay:", _pme_spin('decay', 0.05, 2.0, 0.05, 0.5), label_span=1, input_span=1)
+    g_pme.add_pair("L:", _pme_spin('L', 5.0, 40.0, 1.0, 20.0, decimals=1), label_span=1, input_span=1)
+    g_pme.newrow()
+    npix_s = QtWidgets.QSpinBox(); npix_s.setRange(20, 200); npix_s.setValue(80); npix_s.setMaximumWidth(SPIN_MAX_WIDTH)
     window.ra_pme_npix_spin = npix_s
-    pme_row3.addWidget(npix_s)
-    pme_l.addLayout(pme_row3)
+    g_pme.add_pair("npix:", npix_s, label_span=1, input_span=1)
+    g_pme.add_pair("zV0:", _pme_spin('zV0', -5.0, 5.0, 0.1, 0.0, decimals=2), label_span=1, input_span=1)
+    g_pme.newrow()
+    g_pme.add_pair("radius:", _pme_spin('radius', 1.0, 20.0, 0.1, 5.0, decimals=2), label_span=1, input_span=1)
+    g_pme.add_pair("phiRot:", _pme_spin('phirot', -6.3, 6.3, 0.1, 0.0), label_span=1, input_span=1)
+    pme_l.addLayout(g_pme.layout())
 
-    pme_row4 = QtWidgets.QHBoxLayout()
-    pme_row4.addWidget(QtWidgets.QLabel('zV0:')); pme_row4.addWidget(_pme_spin('zV0', -5.0, 5.0, 0.1, 0.0, decimals=2))
-    pme_row4.addWidget(QtWidgets.QLabel('radius:')); pme_row4.addWidget(_pme_spin('radius', 1.0, 20.0, 0.1, 5.0, decimals=2))
-    pme_row4.addWidget(QtWidgets.QLabel('phiRot:')); pme_row4.addWidget(_pme_spin('phirot', -6.3, 6.3, 0.1, 0.0))
-    pme_l.addLayout(pme_row4)
-
-    pme_btn_row = QtWidgets.QHBoxLayout()
+    g_pme_btn = GridPlacer(cols=4)
     window.ra_pme_xy_btn = QtWidgets.QPushButton('Scan XY')
     window.ra_pme_xy_btn.clicked.connect(lambda: _on_pme_scan_xy(window))
-    pme_btn_row.addWidget(window.ra_pme_xy_btn)
-    pme_btn_row.addStretch()
-    pme_l.addLayout(pme_btn_row)
+    g_pme_btn.add(window.ra_pme_xy_btn, span=2)
+    pme_l.addLayout(g_pme_btn.layout())
     pme_hint = QtWidgets.QLabel('Sites = rigid-molecule CoMs from the ensemble, oriented by R(q). '
                                  'PME n_sites ≤ 4; first min(n_bodies,4) bodies used.')
     pme_hint.setWordWrap(True)

@@ -141,7 +141,8 @@ def test_uff_energy_finite(xyz):
 @pytest.mark.gpu
 def test_pairff_replica_clash_channel_matches_cpu():
     """Kernel-14 clash flag must match real-atom CPU distances without changing energy."""
-    from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF, _body_sites_world, load_molecule
+    from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF, _body_sites_world
+    from spammm.forcefields.RigidBodyUtils import load_molecule
     import os
     _HCOOH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'xyz', 'HCOOH.xyz')
     apos, enames, REQs, _ = load_molecule(_HCOOH, qeq=False, name='formic_acid')

@@ -14,7 +14,7 @@ import numpy as np
 from PyQt5 import QtWidgets, QtCore
 
 from .ExtensionManager import UIComponents
-from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, GridPlacer
 
 _DATA = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data', 'charge_rings')
 
@@ -52,25 +52,24 @@ def build_ui(window):
     apply_tight(layout)
 
     # --- Preset ---
-    row0 = QtWidgets.QHBoxLayout()
-    row0.addWidget(QtWidgets.QLabel('Preset:'))
+    g0 = GridPlacer(cols=6)
     window.cr_preset = QtWidgets.QComboBox()
     window.cr_preset.addItems(['symmetric_trimer', 'fig3_trimer', 'Ruslan_long', 'Ruslan_short', 'square_tetramer'])
-    row0.addWidget(window.cr_preset)
+    g0.add_pair("Preset:", window.cr_preset, label_span=1, input_span=3)
     window.cr_load_preset_btn = QtWidgets.QPushButton('Load preset')
     window.cr_load_preset_btn.clicked.connect(lambda: load_preset(window))
-    row0.addWidget(window.cr_load_preset_btn)
-    layout.addLayout(row0)
+    g0.add(window.cr_load_preset_btn, span=2)
+    layout.addLayout(g0.layout())
 
     # --- JSON I/O ---
-    row1 = QtWidgets.QHBoxLayout()
+    g1 = GridPlacer(cols=6)
     window.cr_load_json_btn = QtWidgets.QPushButton('Load JSON…')
     window.cr_load_json_btn.clicked.connect(lambda: load_json(window))
-    row1.addWidget(window.cr_load_json_btn)
+    g1.add(window.cr_load_json_btn, span=3)
     window.cr_save_json_btn = QtWidgets.QPushButton('Save JSON…')
     window.cr_save_json_btn.clicked.connect(lambda: save_json(window))
-    row1.addWidget(window.cr_save_json_btn)
-    layout.addLayout(row1)
+    g1.add(window.cr_save_json_btn, span=3)
+    layout.addLayout(g1.layout())
 
     # --- Param spins (scrollable) ---
     scroll = QtWidgets.QScrollArea()
@@ -101,27 +100,26 @@ def build_ui(window):
     window.cr_bMirror.setChecked(True)
     window.cr_bRamp = QtWidgets.QCheckBox('bRamp')
     window.cr_bRamp.setChecked(True)
-    rowf = QtWidgets.QHBoxLayout()
-    rowf.addWidget(window.cr_bMirror)
-    rowf.addWidget(window.cr_bRamp)
-    rowf.addStretch()
-    layout.addLayout(rowf)
+    g_chk = GridPlacer(cols=6)
+    g_chk.add(window.cr_bMirror, span=3)
+    g_chk.add(window.cr_bRamp, span=3)
+    layout.addLayout(g_chk.layout())
 
     # --- Calc buttons ---
-    rowc = QtWidgets.QHBoxLayout()
+    g_calc = GridPlacer(cols=6)
     window.cr_xy_btn = QtWidgets.QPushButton('Calc XY')
     window.cr_xy_btn.setToolTip('Constant-VBias xy STM + dI/dV; overlay xV cut line')
     window.cr_xy_btn.clicked.connect(lambda: calc_xy(window))
-    rowc.addWidget(window.cr_xy_btn)
+    g_calc.add(window.cr_xy_btn, span=2)
     window.cr_xv_btn = QtWidgets.QPushButton('Calc xV')
     window.cr_xv_btn.setToolTip('Line×voltage scan (diamonds / NDR) + state probs')
     window.cr_xv_btn.clicked.connect(lambda: calc_xv(window))
-    rowc.addWidget(window.cr_xv_btn)
+    g_calc.add(window.cr_xv_btn, span=2)
     window.cr_1d_btn = QtWidgets.QPushButton('Calc 1D')
     window.cr_1d_btn.setToolTip('Fixed-V line cut + many-body P(s)')
     window.cr_1d_btn.clicked.connect(lambda: calc_1d(window))
-    rowc.addWidget(window.cr_1d_btn)
-    layout.addLayout(rowc)
+    g_calc.add(window.cr_1d_btn, span=2)
+    layout.addLayout(g_calc.layout())
 
     window.cr_status = QtWidgets.QLabel('Status: Load preset or JSON, then Calc')
     window.cr_status.setWordWrap(True)

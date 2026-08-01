@@ -21,7 +21,7 @@ import numpy as np
 
 from ..forcefields.FFController import FFController, DEFAULT_DT, DEFAULT_DAMP, DEFAULT_FLIMIT
 from .ExtensionManager import UIComponents
-from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, GridPlacer
 
 
 def build_ui(window):
@@ -38,76 +38,64 @@ def build_ui(window):
         window.ff_controller = FFController()
 
     # --- Row 1: FF type + Build ---
-    row1 = QtWidgets.QHBoxLayout()
-    row1.addWidget(QtWidgets.QLabel("FF:"))
+    g1 = GridPlacer(cols=6)
     window.relax_ff_combo = QtWidgets.QComboBox()
     window.relax_ff_combo.addItems(["SPFF", "UFF"])
     window.relax_ff_combo.setMaximumWidth(60)
-    row1.addWidget(window.relax_ff_combo)
+    g1.add_pair("FF:", window.relax_ff_combo, label_span=1, input_span=2)
     window.relax_build_btn = QtWidgets.QPushButton("Build")
-    window.relax_build_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.relax_build_btn.clicked.connect(lambda: _on_build_ff(window))
-    row1.addWidget(window.relax_build_btn)
-    row1.addStretch()
-    layout.addLayout(row1)
+    g1.add(window.relax_build_btn, span=3)
+    layout.addLayout(g1.layout())
 
     # --- Row 2: nSteps + Step button ---
-    row2 = QtWidgets.QHBoxLayout()
-    row2.addWidget(QtWidgets.QLabel("nSteps:"))
+    g2 = GridPlacer(cols=6)
     window.relax_steps_spin = QtWidgets.QSpinBox()
     window.relax_steps_spin.setRange(1, 100000)
     window.relax_steps_spin.setValue(100)
-    window.relax_steps_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.relax_steps_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    row2.addWidget(window.relax_steps_spin)
+    window.relax_steps_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g2.add_pair("nSteps:", window.relax_steps_spin, label_span=1, input_span=2)
     window.relax_step_btn = QtWidgets.QPushButton("Step")
-    window.relax_step_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.relax_step_btn.clicked.connect(lambda: _on_step(window))
-    row2.addWidget(window.relax_step_btn)
-    row2.addStretch()
-    layout.addLayout(row2)
+    g2.add(window.relax_step_btn, span=3)
+    layout.addLayout(g2.layout())
 
     # --- Row 3: dt + damp ---
-    row3 = QtWidgets.QHBoxLayout()
-    row3.addWidget(QtWidgets.QLabel("dt:"))
+    g3 = GridPlacer(cols=6)
     window.relax_dt_spin = QtWidgets.QDoubleSpinBox()
     window.relax_dt_spin.setRange(0.001, 1.0)
     window.relax_dt_spin.setSingleStep(0.005)
     window.relax_dt_spin.setValue(DEFAULT_DT)
-    window.relax_dt_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.relax_dt_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    row3.addWidget(window.relax_dt_spin)
-    row3.addWidget(QtWidgets.QLabel("damp:"))
+    window.relax_dt_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g3.add_pair("dt:", window.relax_dt_spin, label_span=1, input_span=2)
     window.relax_damp_spin = QtWidgets.QDoubleSpinBox()
     window.relax_damp_spin.setRange(0.0, 1.0)
     window.relax_damp_spin.setSingleStep(0.05)
     window.relax_damp_spin.setValue(DEFAULT_DAMP)
-    window.relax_damp_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.relax_damp_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
-    row3.addWidget(window.relax_damp_spin)
-    row3.addStretch()
-    layout.addLayout(row3)
+    window.relax_damp_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g3.add_pair("damp:", window.relax_damp_spin, label_span=1, input_span=2)
+    layout.addLayout(g3.layout())
 
     # --- Row 4: Relax + Interactive + Serial checkbox ---
-    row4 = QtWidgets.QHBoxLayout()
+    g4 = GridPlacer(cols=6)
     window.relax_run_btn = QtWidgets.QPushButton("Relax")
-    window.relax_run_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.relax_run_btn.clicked.connect(lambda: _on_relax(window))
-    row4.addWidget(window.relax_run_btn)
+    g4.add(window.relax_run_btn, span=2)
     from .ShortcutRegistry import encode_keystroke
     window.relax_interactive_btn = QtWidgets.QPushButton(f"Interactive [{encode_keystroke('Space')}]")
     window.relax_interactive_btn.setCheckable(True)
-    window.relax_interactive_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.relax_interactive_btn.clicked.connect(lambda checked: _on_interactive(window, checked))
-    row4.addWidget(window.relax_interactive_btn)
+    g4.add(window.relax_interactive_btn, span=2)
     window.relax_serial_chk = QtWidgets.QCheckBox("Serial")
     window.relax_serial_chk.setChecked(True)
     window.relax_serial_chk.setToolTip("Use single-kernel local-memory relaxation (150x faster for small molecules)")
     window.relax_serial_chk.toggled.connect(lambda checked: _on_serial_toggled(window, checked))
-    row4.addWidget(window.relax_serial_chk)
+    g4.add(window.relax_serial_chk, span=1)
     window.relax_debug_chk = QtWidgets.QCheckBox("Debug FF")
     window.relax_debug_chk.setChecked(False)
     window.relax_debug_chk.setToolTip("Print all arrays sent to GPU after build (atom types, npi, neighbors, bond params, etc.)")
-    row4.addWidget(window.relax_debug_chk)
-    row4.addStretch()
-    layout.addLayout(row4)
+    g4.add(window.relax_debug_chk, span=1)
+    layout.addLayout(g4.layout())
 
     # --- Energy + Fmax display ---
     window.relax_energy_label = QtWidgets.QLabel("E: ---  | Fmax: ---")
@@ -120,19 +108,16 @@ def build_ui(window):
     layout.addWidget(sep)
 
     # --- Pin controls ---
-    row_pin = QtWidgets.QHBoxLayout()
+    g_pin = GridPlacer(cols=6)
     window.relax_pin_btn = QtWidgets.QPushButton("Pin Sel")
-    window.relax_pin_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.relax_pin_btn.setEnabled(False)
     window.relax_pin_btn.clicked.connect(lambda: _on_pin_selected(window))
-    row_pin.addWidget(window.relax_pin_btn)
+    g_pin.add(window.relax_pin_btn, span=3)
     window.relax_unpin_btn = QtWidgets.QPushButton("Unpin All")
-    window.relax_unpin_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.relax_unpin_btn.setEnabled(False)
     window.relax_unpin_btn.clicked.connect(lambda: _on_unpin_all(window))
-    row_pin.addWidget(window.relax_unpin_btn)
-    row_pin.addStretch()
-    layout.addLayout(row_pin)
+    g_pin.add(window.relax_unpin_btn, span=3)
+    layout.addLayout(g_pin.layout())
 
     # --- Status ---
     window.relax_status_label = QtWidgets.QLabel("Status: Not built")

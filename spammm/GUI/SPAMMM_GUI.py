@@ -68,7 +68,7 @@ from spammm.GUI.VispyUtils import compute_bond_colors_by_length, generate_atom_l
 
 from spammm.GUI.ExtensionManager import ExtensionManager, ExtensionNotAvailableError
 from spammm.GUI.CollapsibleSection import CollapsibleSection
-from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, GridPlacer
 
 class SPAMMMWindow(BaseGUI):
     sig_geometry_changed = QtCore.pyqtSignal()  # Emitted whenever atom geometry changes
@@ -337,92 +337,85 @@ class SPAMMMWindow(BaseGUI):
         """Merged Builder and Editor section as collapsible panel."""
         layout = QtWidgets.QVBoxLayout()
         apply_tight(layout, margins=0, spacing=SPACING)
-        
-        # Edit Mode (from Builder)
-        self.label("Edit Mode:", layout=layout)
-        self.mode_combo = self.comboBox(["Unified", "Hex1", "Hex2", "Atom", "Bond", "Ring", "pi", "Select"], self.set_edit_mode, layout=layout)
-        
-        # Atom type and auto h-cap (from Builder)
-        row = QtWidgets.QHBoxLayout()
-        # Ring size spinbox (visible in Ring mode)
+
+        # --- Parameters (label+input pairs in grid) ---
+        g = GridPlacer(cols=6)
+        self.mode_combo = self.comboBox(["Unified", "Hex1", "Hex2", "Atom", "Bond", "Ring", "pi", "Select"], self.set_edit_mode)
+        g.add_pair("Edit Mode:", self.mode_combo, label_span=2, input_span=4)
+        g.newrow()
+        # Ring size (visible in Ring mode only)
         self.ring_size_label = QtWidgets.QLabel("Ring size:")
         self.ring_size_spinbox = self.spinBox(5, 1.0, max_width=50, vmin=3, vmax=12, int_mode=True)
         self.ring_size_label.setVisible(False)
         self.ring_size_spinbox.setVisible(False)
-        self.label("Type:", layout=row)
-        self.atom_combo = self.comboBox(["C", "N", "O"], self.set_atom_type, layout=row)
-        self.auto_h_cap_btn = self.button("Auto H", self.toggle_auto_h_cap, layout=row)
-        self.auto_h_cap_btn.setCheckable(True)
-        self.auto_h_cap_btn.setChecked(self.backend.auto_h_cap)
-        self.auto_bonds_btn = self.button("Auto Bonds", self.toggle_auto_recalc_bonds, layout=row)
-        self.auto_bonds_btn.setCheckable(True)
-        self.auto_bonds_btn.setChecked(self.backend.auto_recalc_bonds)
-        layout.addLayout(row)
-
-        # Ring size row (visible only in Ring mode)
-        row_ring = QtWidgets.QHBoxLayout()
-        row_ring.addWidget(self.ring_size_label)
-        row_ring.addWidget(self.ring_size_spinbox)
-        layout.addLayout(row_ring)
-
-        # Pick radius (kept in main editors section)
-        row_grid = QtWidgets.QHBoxLayout()
-        self.label("Pick Radius:", layout=row_grid)
+        g.add(self.ring_size_label, span=2)
+        g.add(self.ring_size_spinbox, span=2)
+        self.atom_combo = self.comboBox(["C", "N", "O"], self.set_atom_type)
+        g.add_pair("Type:", self.atom_combo, label_span=1, input_span=2)
+        g.newrow()
         self.pick_radius_spinbox = self.spinBox(0.5, 0.1, max_width=60, vmin=0.1, vmax=5.0)
         self.pick_radius_spinbox.valueChanged.connect(self.set_pick_radius)
-        row_grid.addWidget(self.pick_radius_spinbox)
-        layout.addLayout(row_grid)
+        g.add_pair("Pick R:", self.pick_radius_spinbox, label_span=2, input_span=2)
+        self.label_combo = self.comboBox(["Elem+Idx", "Atom Type", "Pi Orbitals", "Z-Height", "Charge", "Bond Len"], self.set_label_mode)
+        g.add_pair("Labels:", self.label_combo, label_span=1, input_span=2)
+        layout.addLayout(g.layout())
 
-        # Editor buttons (from Editor)
-        row1 = QtWidgets.QHBoxLayout()
-        self.button("Snap", self.reset_offsets, layout=row1)
-        self.button("Adj H", self.adjust_h, layout=row1)
-        self.button("AutoBonds", self.recalc_bonds, layout=row1)
-        layout.addLayout(row1)
-        
-        # Labels combo (from Editor)
-        row2 = QtWidgets.QHBoxLayout()
-        self.label("Labels:", layout=row2)
-        self.label_combo = self.comboBox(["Element+Index", "Atomic Type", "Pi Orbitals", "Z-Height", "Charge", "Bond Lengths"], self.set_label_mode, layout=row2)
-        layout.addLayout(row2)
-        
-        # Visualization buttons (from Editor)
-        row3 = QtWidgets.QHBoxLayout()
+        # --- Auto toggles (checkable buttons fill cells) ---
+        g2 = GridPlacer(cols=6)
+        self.auto_h_cap_btn = self.button("Auto H", self.toggle_auto_h_cap)
+        self.auto_h_cap_btn.setCheckable(True)
+        self.auto_h_cap_btn.setChecked(self.backend.auto_h_cap)
+        g2.add(self.auto_h_cap_btn, span=3)
+        self.auto_bonds_btn = self.button("Auto Bonds", self.toggle_auto_recalc_bonds)
+        self.auto_bonds_btn.setCheckable(True)
+        self.auto_bonds_btn.setChecked(self.backend.auto_recalc_bonds)
+        g2.add(self.auto_bonds_btn, span=3)
+        layout.addLayout(g2.layout())
+
+        # --- Edit actions ---
+        g3 = GridPlacer(cols=6)
+        g3.add(self.button("Snap", self.reset_offsets), span=2)
+        g3.add(self.button("Adj H", self.adjust_h), span=2)
+        g3.add(self.button("AutoBonds", self.recalc_bonds), span=2)
+        layout.addLayout(g3.layout())
+
+        # --- View toggles ---
+        g4 = GridPlacer(cols=6)
         self.bond_viz_mode = False
-        self.button("Bond Colors", self.toggle_bond_viz, layout=row3).setCheckable(True)
+        bond_btn = self.button("Bond Colors", self.toggle_bond_viz)
+        bond_btn.setCheckable(True)
+        g4.add(bond_btn, span=3)
         self.debug_view_mode = True
-        self.debug_btn = self.button("Debug View", self.toggle_debug_view, layout=row3)
+        self.debug_btn = self.button("Debug View", self.toggle_debug_view)
         self.debug_btn.setCheckable(True)
         self.debug_btn.setChecked(True)
-        layout.addLayout(row3)
+        g4.add(self.debug_btn, span=3)
+        layout.addLayout(g4.layout())
 
-        # 2D / 3D view mode
-        row_view = QtWidgets.QHBoxLayout()
+        # --- 2D/3D view mode ---
         from spammm.GUI.ShortcutRegistry import encode_keystroke
-        self.b2Dview_chk = QtWidgets.QCheckBox(f"2D view (planar edit) [{encode_keystroke(['Enter', 'Return'])}]")
+        self.b2Dview_chk = QtWidgets.QCheckBox(f"2D view [{encode_keystroke(['Enter', 'Return'])}]")
         self.b2Dview_chk.setChecked(True)
         self.b2Dview_chk.setToolTip("Checked: top-down hex/empty edit. Unchecked: ortho 3D (Enter toggles). Space = run/stop FF.")
         self.b2Dview_chk.toggled.connect(self._on_b2Dview_toggled)
-        row_view.addWidget(self.b2Dview_chk)
+        layout.addWidget(self.b2Dview_chk)
         self.view_debug_chk = QtWidgets.QCheckBox("Ray debug")
         self.view_debug_chk.setChecked(False)
         self.view_debug_chk.setToolTip("Draw mouse ray + hit point (transform sanity)")
         self.view_debug_chk.toggled.connect(lambda c: self.scene.set_view_debug(c))
-        row_view.addWidget(self.view_debug_chk)
-        row_view.addStretch()
-        layout.addLayout(row_view)
-        
-        # Export/Import buttons
-        row4 = QtWidgets.QHBoxLayout()
-        self.button("Show", self.show_xyz, layout=row4)
-        self.button("Export", self.export_structure, layout=row4)
-        self.button("Import", self.import_structure, layout=row4)
-        layout.addLayout(row4)
-        
+        layout.addWidget(self.view_debug_chk)
+
+        # --- File I/O ---
+        g5 = GridPlacer(cols=6)
+        g5.add(self.button("Show", self.show_xyz), span=2)
+        g5.add(self.button("Export", self.export_structure), span=2)
+        g5.add(self.button("Import", self.import_structure), span=2)
+        layout.addLayout(g5.layout())
+
         # Wrap layout in QWidget for CollapsibleSection
         widget = QtWidgets.QWidget()
         widget.setLayout(layout)
-        
+
         # Wrap in CollapsibleSection
         sec = CollapsibleSection("Editors", collapsed=True, parent=self)
         sec.setContent(widget)
@@ -509,44 +502,39 @@ class SPAMMMWindow(BaseGUI):
         layout = QtWidgets.QVBoxLayout()
         apply_tight(layout, margins=0, spacing=SPACING)
 
-        # Row 1: a_CC (lattice constant) | Transpose toggle
-        row1 = QtWidgets.QHBoxLayout()
-        self.label("a_CC:", layout=row1)
+        # --- Parameters (grid-aligned label+input) ---
+        g = GridPlacer(cols=6)
         self.a_CC_spin = self.spinBox(1.42, 0.01, max_width=55, vmin=0.5, vmax=5.0, decimals=3)
         self.a_CC_spin.valueChanged.connect(self.set_a_CC)
-        row1.addWidget(self.a_CC_spin)
-        self.grid_transpose_btn = self.button("T-Grid", self.transpose_grid_only, layout=row1)
-        self.grid_transpose_btn.setCheckable(True)
-        self.grid_transpose_btn.setChecked(self.backend.grid.transpose)
-        self.button("T-All", self.transpose_grid, layout=row1)
-        self.button("Flip X", self.flip_x_geometry, layout=row1)
-        self.button("Flip Y", self.flip_y_geometry, layout=row1)
-        layout.addLayout(row1)
-
-        # Row 2: Rotate° | Offset unit checkbox
-        row2 = QtWidgets.QHBoxLayout()
-        self.label("Rot°:", layout=row2)
+        g.add_pair("a_CC:", self.a_CC_spin, label_span=1, input_span=2)
         self.grid_rotate_spin = self.spinBox(0.0, 1.0, max_width=55, vmin=-180.0, vmax=180.0, decimals=1)
         self.grid_rotate_spin.valueChanged.connect(self.set_grid_rotation)
-        row2.addWidget(self.grid_rotate_spin)
-        self.grid_offset_unit_chk = self.checkBox("grid units", checked=True, callback=self.toggle_offset_unit, layout=row2)
-        layout.addLayout(row2)
-
-        # Row 3: Offset X, Y (step depends on unit mode)
-        row3 = QtWidgets.QHBoxLayout()
-        self.label("Off:", layout=row3)
+        g.add_pair("Rot°:", self.grid_rotate_spin, label_span=1, input_span=2)
+        g.newrow()
         self.grid_offset_x_spin = self.spinBox(0.0, 1.0, max_width=50, vmin=-20.0, vmax=20.0, decimals=3)
         self.grid_offset_x_spin.valueChanged.connect(self.set_grid_offset_x)
-        row3.addWidget(self.grid_offset_x_spin)
+        g.add_pair("Off X:", self.grid_offset_x_spin, label_span=1, input_span=2)
         self.grid_offset_y_spin = self.spinBox(0.0, 1.0, max_width=50, vmin=-20.0, vmax=20.0, decimals=3)
         self.grid_offset_y_spin.valueChanged.connect(self.set_grid_offset_y)
-        row3.addWidget(self.grid_offset_y_spin)
-        layout.addLayout(row3)
+        g.add_pair("Off Y:", self.grid_offset_y_spin, label_span=1, input_span=2)
+        layout.addLayout(g.layout())
 
-        # Row 4: Reset
-        row4 = QtWidgets.QHBoxLayout()
-        self.button("Reset Grid", self.reset_grid_transform, layout=row4)
-        layout.addLayout(row4)
+        # --- Grid unit toggle ---
+        self.grid_offset_unit_chk = self.checkBox("grid units", checked=True, callback=self.toggle_offset_unit)
+        layout.addWidget(self.grid_offset_unit_chk)
+
+        # --- Grid action buttons (fill cells) ---
+        g2 = GridPlacer(cols=6)
+        self.grid_transpose_btn = self.button("T-Grid", self.transpose_grid_only)
+        self.grid_transpose_btn.setCheckable(True)
+        self.grid_transpose_btn.setChecked(self.backend.grid.transpose)
+        g2.add(self.grid_transpose_btn, span=2)
+        g2.add(self.button("T-All", self.transpose_grid), span=1)
+        g2.add(self.button("Flip X", self.flip_x_geometry), span=1)
+        g2.add(self.button("Flip Y", self.flip_y_geometry), span=1)
+        g2.newrow()
+        g2.add(self.button("Reset Grid", self.reset_grid_transform), span=3)
+        layout.addLayout(g2.layout())
 
         widget = QtWidgets.QWidget()
         widget.setLayout(layout)
@@ -632,101 +620,60 @@ class SPAMMMWindow(BaseGUI):
     def create_ribbon_section(self):
         layout = QtWidgets.QVBoxLayout()
         apply_tight(layout, margins=0, spacing=SPACING)
-        
-        # Shared inputs (used by both single and two-ribbon)
-        shared_layout = QtWidgets.QHBoxLayout()
-        shared_layout.setContentsMargins(0, 0, 0, 0)
-        shared_layout.setSpacing(2)
-        
-        rows_label = QtWidgets.QLabel("Rows:")
-        rows_label.setFixedWidth(30)
+
+        # --- Shared ribbon params (grid-aligned) ---
+        g = GridPlacer(cols=6)
         self.ribbon_rows_spinbox = self.spinBox(4, 1.0, max_width=50, vmin=1, vmax=20, int_mode=True)
-        shared_layout.addWidget(rows_label)
-        shared_layout.addWidget(self.ribbon_rows_spinbox)
-        
-        bottom_label = QtWidgets.QLabel("Bot:")
-        bottom_label.setFixedWidth(25)
+        g.add_pair("Rows:", self.ribbon_rows_spinbox, label_span=1, input_span=2)
         self.ribbon_bottom_edit = QtWidgets.QLineEdit()
         self.ribbon_bottom_edit.setPlaceholderText("n/N/o/O/H/h")
         self.ribbon_bottom_edit.setMaximumWidth(80)
-        shared_layout.addWidget(bottom_label)
-        shared_layout.addWidget(self.ribbon_bottom_edit)
-        
-        top_label = QtWidgets.QLabel("Top:")
-        top_label.setFixedWidth(25)
+        g.add_pair("Bot:", self.ribbon_bottom_edit, label_span=1, input_span=2)
+        g.newrow()
         self.ribbon_top_edit = QtWidgets.QLineEdit()
         self.ribbon_top_edit.setPlaceholderText("n/N/o/O/H/h")
         self.ribbon_top_edit.setMaximumWidth(80)
-        shared_layout.addWidget(top_label)
-        shared_layout.addWidget(self.ribbon_top_edit)
-        
-        layout.addLayout(shared_layout)
-        
-        # Generate buttons side by side
-        btn_layout = QtWidgets.QHBoxLayout()
-        btn_layout.setContentsMargins(0, 0, 0, 0)
-        btn_layout.setSpacing(2)
-        self.button("Single", self.generate_single_ribbon, layout=btn_layout)
-        self.button("Two", self.generate_two_ribbons, layout=btn_layout)
-        layout.addLayout(btn_layout)
-        
-        # Two-ribbon specific inputs (collapsible)
+        g.add_pair("Top:", self.ribbon_top_edit, label_span=1, input_span=2)
+        layout.addLayout(g.layout())
+
+        # --- Generate buttons ---
+        g2 = GridPlacer(cols=6)
+        g2.add(self.button("Single", self.generate_single_ribbon), span=3)
+        g2.add(self.button("Two", self.generate_two_ribbons), span=3)
+        layout.addLayout(g2.layout())
+
+        # --- Two-ribbon options (collapsible group box) ---
         two_ribbon_group = QtWidgets.QGroupBox("Two-Ribbon Options")
         two_ribbon_group.setCheckable(True)
         two_ribbon_group.setChecked(False)
         two_ribbon_group.toggled.connect(lambda checked: two_ribbon_group.setVisible(checked))
         two_ribbon_group.setVisible(False)  # hide initially — toggled signal doesn't fire on setChecked
         two_ribbon_layout = QtWidgets.QVBoxLayout()
-        two_ribbon_layout.setContentsMargins(0, 0, 0, 0)
-        two_ribbon_layout.setSpacing(2)
-        
-        # Ribbon 2 inputs
-        r2_layout = QtWidgets.QHBoxLayout()
-        r2_layout.setContentsMargins(0, 0, 0, 0)
-        r2_layout.setSpacing(2)
-        
-        r2_rows_label = QtWidgets.QLabel("R2:")
-        r2_rows_label.setFixedWidth(20)
+        apply_tight(two_ribbon_layout)
+
+        g3 = GridPlacer(cols=6)
         self.ribbon2_rows_spinbox = self.spinBox(4, 1.0, max_width=50, vmin=1, vmax=20, int_mode=True)
-        r2_layout.addWidget(r2_rows_label)
-        r2_layout.addWidget(self.ribbon2_rows_spinbox)
-        
-        r2_bottom_label = QtWidgets.QLabel("Bot:")
-        r2_bottom_label.setFixedWidth(25)
+        g3.add_pair("R2:", self.ribbon2_rows_spinbox, label_span=1, input_span=2)
         self.ribbon2_bottom_edit = QtWidgets.QLineEdit()
         self.ribbon2_bottom_edit.setPlaceholderText("n/N/o/O/H/h")
         self.ribbon2_bottom_edit.setMaximumWidth(80)
-        r2_layout.addWidget(r2_bottom_label)
-        r2_layout.addWidget(self.ribbon2_bottom_edit)
-        
-        r2_top_label = QtWidgets.QLabel("Top:")
-        r2_top_label.setFixedWidth(25)
+        g3.add_pair("Bot:", self.ribbon2_bottom_edit, label_span=1, input_span=2)
+        g3.newrow()
         self.ribbon2_top_edit = QtWidgets.QLineEdit()
         self.ribbon2_top_edit.setPlaceholderText("n/N/o/O/H/h")
         self.ribbon2_top_edit.setMaximumWidth(80)
-        r2_layout.addWidget(r2_top_label)
-        r2_layout.addWidget(self.ribbon2_top_edit)
-        
-        two_ribbon_layout.addLayout(r2_layout)
-        
-        # H-bond spacing
-        hb_layout = QtWidgets.QHBoxLayout()
-        hb_layout.setContentsMargins(0, 0, 0, 0)
-        hb_layout.setSpacing(2)
-        hb_label = QtWidgets.QLabel("H-bond:")
-        hb_label.setFixedWidth(50)
+        g3.add_pair("Top:", self.ribbon2_top_edit, label_span=1, input_span=2)
         self.ribbon_L_Hb_spinbox = self.spinBox(3.0, 0.1, max_width=60, vmin=2.0, vmax=10.0)
-        hb_layout.addWidget(hb_label)
-        hb_layout.addWidget(self.ribbon_L_Hb_spinbox)
-        two_ribbon_layout.addLayout(hb_layout)
-        
+        g3.add_pair("H-bond:", self.ribbon_L_Hb_spinbox, label_span=1, input_span=2)
+        two_ribbon_layout.addLayout(g3.layout())
+
         two_ribbon_group.setLayout(two_ribbon_layout)
         layout.addWidget(two_ribbon_group)
-        
+
         # Wrap layout in QWidget for CollapsibleSection
         widget = QtWidgets.QWidget()
         widget.setLayout(layout)
-        
+
         # Wrap in CollapsibleSection
         sec = CollapsibleSection("Ribbon", collapsed=True, parent=self)
         sec.setContent(widget)

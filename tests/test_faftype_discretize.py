@@ -9,7 +9,7 @@ Run:  pytest tests/test_faftype_discretize.py -s
 import os
 import numpy as np
 import pytest
-from spammm.forcefields.RigidBodyDynamics import load_molecule
+from spammm.forcefields.RigidBodyUtils import load_molecule
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _PTCDA = os.path.join(_REPO, 'data', 'xyz', 'PTCDA.xyz')

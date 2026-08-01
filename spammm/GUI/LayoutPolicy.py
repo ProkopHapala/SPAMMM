@@ -56,6 +56,66 @@ def apply_tight(layout, margins=MARGIN, spacing=SPACING):
     return layout
 
 
+class GridPlacer:
+    """Excel-like grid layout: panel width divided into N equal cells.
+
+    Each widget occupies 1+ cells. Widgets that need more space span multiple
+    cells (like merging Excel cells). Auto-wraps to next row when full.
+
+    Label+input pairs are treated as ONE component (label cell + input cells).
+
+    Usage:
+        g = GridPlacer(cols=6)
+        g.add(button, span=1)           # small button = 1 cell
+        g.add(button, span=2)           # medium button = 2 cells
+        g.add_pair("Pick R:", spin, input_span=2)  # label=1 + input=2 = 3 cells
+        g.newrow()                      # force new row
+        layout.addLayout(g.layout())
+    """
+    def __init__(self, cols=6):
+        self._grid = QtWidgets.QGridLayout()
+        apply_tight(self._grid)
+        self._cols = cols
+        self._row = 0
+        self._col = 0
+
+    def _place(self, span):
+        if self._col + span > self._cols and self._col > 0:
+            self._row += 1
+            self._col = 0
+        start = self._col
+        self._col += span
+        return self._row, start, span
+
+    def add(self, widget, span=1):
+        """Add a widget occupying `span` cells."""
+        r, c, s = self._place(span)
+        self._grid.addWidget(widget, r, c, 1, s)
+        return self
+
+    def add_pair(self, label_text, widget, label_span=1, input_span=2):
+        """Add a label + input as one logical unit (label_span + input_span cells)."""
+        total = label_span + input_span
+        if self._col + total > self._cols and self._col > 0:
+            self._row += 1
+            self._col = 0
+        lbl = QtWidgets.QLabel(label_text)
+        self._grid.addWidget(lbl, self._row, self._col, 1, label_span)
+        self._grid.addWidget(widget, self._row, self._col + label_span, 1, input_span)
+        self._col += total
+        return self
+
+    def newrow(self):
+        """Force next row."""
+        self._row += 1
+        self._col = 0
+        return self
+
+    def layout(self):
+        """Return the underlying QGridLayout."""
+        return self._grid
+
+
 def make_vbox(parent=None, tight=True):
     """Create a QVBoxLayout with policy margins/spacing applied."""
     lay = QtWidgets.QVBoxLayout(parent)
@@ -274,9 +334,9 @@ def enforce_tight(widget):
     ROBUST enforcement — runs AFTER the entire UI is built, catches everything.
 
     Policy per widget type:
-      - Buttons, Labels, Checkboxes: Maximum (natural width, no expansion)
+      - Buttons: Preferred (fill grid cell, don't expand beyond sizeHint)
+      - Labels, Checkboxes: Maximum (natural width, don't expand)
       - Combos, Spinboxes: Preferred (show full content, fill available space)
-        — these must be READABLE, not squeezed to 1-2 chars
 
     Uses findChildren() which returns ALL descendants recursively.
 
@@ -287,11 +347,12 @@ def enforce_tight(widget):
     Fixed = QtWidgets.QSizePolicy.Fixed
     Pref = QtWidgets.QSizePolicy.Preferred
 
-    # Buttons, labels, checkboxes → Maximum (natural width, don't expand)
+    # Buttons → Preferred (fill grid cell, don't expand beyond sizeHint)
     for w in widget.findChildren(QtWidgets.QPushButton):
-        w.setSizePolicy(Max, Fixed)
+        w.setSizePolicy(Pref, Fixed)
     for w in widget.findChildren(QtWidgets.QToolButton):
-        w.setSizePolicy(Max, Fixed)
+        w.setSizePolicy(Pref, Fixed)
+    # Labels, checkboxes → Maximum (natural width, don't expand)
     for w in widget.findChildren(QtWidgets.QLabel):
         w.setSizePolicy(Max, Fixed)
     for w in widget.findChildren(QtWidgets.QCheckBox):

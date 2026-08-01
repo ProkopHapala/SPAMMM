@@ -172,3 +172,80 @@ The next step is to replace `QHBoxLayout` button rows with `FlowLayout` so widge
 Files to update:
 - `SPAMMM_GUI.py` — `create_editors_section`, `create_grid_section`, `create_ribbon_section`, `create_accessibility_section`
 - All `*Extension.py` — button rows that currently use `QHBoxLayout`
+
+---
+
+## 7. Layout organization suggestions (2026-08-01)
+
+The tight layout rules (zero margins, Maximum policy, fixed panel width) are now enforced. But the layout looks disorganized because rows are ad-hoc `QHBoxLayout` with no column alignment. Here's how to make it organized and aligned WITHOUT breaking the tight rules:
+
+### 7.1 Use `QGridLayout` for label+input pairs (aligned columns)
+
+**Problem:** Current rows like `QHBoxLayout` with `QLabel("Esite:") + spinbox + QLabel("W:") + spinbox` have no column alignment — labels have different widths so spinboxes start at different x positions.
+
+**Fix:** Use `QGridLayout` with 4 columns (label, input, label, input):
+```
+  Esite: [____]   W:    [____]
+  Q0:    [____]   Qzz:  [____]
+  VBias: [____]   z_tip:[____]
+```
+Labels in columns 0,2 are right-aligned (or left-aligned with fixed width); inputs in columns 1,3 are left-aligned. This creates a clean grid.
+
+**Already done:** PME panel in RigidAssemblyExtension (converted from 4 QHBoxLayout rows to one QGridLayout).
+
+**To apply to:**
+- AFM Parameters (Density/Grid, Scan, Physics groups — already use QGridLayout, just need `apply_tight`)
+- AFM STM/Orbitals (already QGridLayout)
+- RigidAssembly build/MC/drag sections (currently QHBoxLayout with label+spin pairs)
+
+### 7.2 Use `QFormLayout` for single label+input rows
+
+For sections with a single label+input per row (like "Pick Radius: [___]"), `QFormLayout` automatically aligns labels in a left column and inputs in a right column. It's cleaner than manual `QHBoxLayout` + fixed-width labels.
+
+### 7.3 Group buttons into logical blocks with `QGroupBox` or sub-sections
+
+**Problem:** Buttons like "Snap", "Adj H", "AutoBonds", "Bond Colors", "Debug View" are all in one row with no visual grouping.
+
+**Fix:** Group by function:
+- **Build block:** Auto H, Auto Bonds, AutoBonds
+- **Edit block:** Snap, Adj H
+- **View block:** Bond Colors, Debug View
+
+Use `QGroupBox` (with the tight stylesheet, it's just a thin border + title) or separate rows with a small label header.
+
+### 7.4 Spinbox width based on value range, not a fixed cap
+
+**Problem:** PME spinboxes with `width=60` can't show `-20.00` or `0.0001` (4 decimals).
+
+**Fix:** Compute width from the value range:
+```python
+def spin_width(vmax, decimals=3):
+    chars = len(f"{vmax:.{decimals}f}") + 2  # +2 for arrows
+    return max(50, chars * 8)  # 8px per char at 8pt font
+```
+Or simply use `SPIN_MAX_WIDTH=70` (already done) and let `Preferred` policy fill available space.
+
+### 7.5 Consistent label widths within a section
+
+Labels like "Esite:", "W:", "GammaT:" have very different widths. In a `QGridLayout`, set the label column to a fixed width so all labels align:
+```python
+pme_grid.setColumnMinimumWidth(0, 50)  # label column
+pme_grid.setColumnMinimumWidth(2, 50)  # second label column
+```
+
+### 7.6 Visual hierarchy with CollapsibleSection
+
+The existing `CollapsibleSection` already provides good hierarchy. The key is to use sub-sections within extensions:
+- Extension → CollapsibleSection (e.g. "Rigid Assembly")
+  - Sub-section: "Build" (grid of build params)
+  - Sub-section: "MC / GA" (grid of MC params + buttons)
+  - Sub-section: "PME" (grid of PME params + scan buttons)
+
+### 7.7 Priority order for implementation
+
+1. **PME grid** (done) — converted from QHBoxLayout to QGridLayout
+2. **RigidAssembly build/MC/drag** — convert label+spin rows to QGridLayout
+3. **AFM Parameters** — already QGridLayout, just verify `apply_tight` is applied
+4. **Main GUI editors section** — group buttons into logical blocks
+5. **Main GUI grid section** — convert to QGridLayout
+6. **All extensions** — audit and convert label+spin rows to QGridLayout

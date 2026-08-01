@@ -13,7 +13,7 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 import numpy as np
 
 from .ExtensionManager import UIComponents
-from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, GridPlacer
 
 # Distinct color palette for fragments (RGBA)
 FRAGMENT_COLORS = [
@@ -37,67 +37,54 @@ def build_ui(window):
     apply_tight(layout)
 
     # --- Main button: Fragments (split by bridges) ---
-    row0 = QtWidgets.QHBoxLayout()
+    g0 = GridPlacer(cols=6)
     window.frag_split_btn = QtWidgets.QPushButton("Fragments")
-    window.frag_split_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.frag_split_btn.clicked.connect(lambda: _on_fragments(window))
-    row0.addWidget(window.frag_split_btn)
-
+    g0.add(window.frag_split_btn, span=3)
     window.frag_min_size_spin = QtWidgets.QSpinBox()
     window.frag_min_size_spin.setRange(1, 50)
     window.frag_min_size_spin.setValue(2)
     window.frag_min_size_spin.setMaximumWidth(40)
-    row0.addWidget(QtWidgets.QLabel("min:"))
-    row0.addWidget(window.frag_min_size_spin)
-    row0.addStretch()
-    layout.addLayout(row0)
+    g0.add_pair("min:", window.frag_min_size_spin, label_span=1, input_span=2)
+    layout.addLayout(g0.layout())
 
     # --- Analysis buttons row 1 ---
-    row1 = QtWidgets.QHBoxLayout()
+    g1 = GridPlacer(cols=6)
     window.frag_components_btn = QtWidgets.QPushButton("Components")
-    window.frag_components_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.frag_components_btn.clicked.connect(lambda: _on_components(window))
-    row1.addWidget(window.frag_components_btn)
+    g1.add(window.frag_components_btn, span=2)
 
     window.frag_bridges_btn = QtWidgets.QPushButton("Bridges")
-    window.frag_bridges_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.frag_bridges_btn.clicked.connect(lambda: _on_bridges(window))
-    row1.addWidget(window.frag_bridges_btn)
+    g1.add(window.frag_bridges_btn, span=2)
 
     window.frag_ap_btn = QtWidgets.QPushButton("Articulation")
-    window.frag_ap_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.frag_ap_btn.clicked.connect(lambda: _on_articulation(window))
-    row1.addWidget(window.frag_ap_btn)
-    row1.addStretch()
-    layout.addLayout(row1)
+    g1.add(window.frag_ap_btn, span=2)
+    layout.addLayout(g1.layout())
 
     # --- Analysis buttons row 2 ---
-    row2 = QtWidgets.QHBoxLayout()
+    g2 = GridPlacer(cols=6)
     window.frag_local_btn = QtWidgets.QPushButton("Local Bridges")
-    window.frag_local_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.frag_local_btn.clicked.connect(lambda: _on_local_bridges(window))
-    row2.addWidget(window.frag_local_btn)
+    g2.add(window.frag_local_btn, span=4)
 
     window.frag_local_dist_spin = QtWidgets.QSpinBox()
     window.frag_local_dist_spin.setRange(2, 20)
     window.frag_local_dist_spin.setValue(3)
     window.frag_local_dist_spin.setMaximumWidth(40)
-    row2.addWidget(window.frag_local_dist_spin)
-    row2.addStretch()
-    layout.addLayout(row2)
+    g2.add(window.frag_local_dist_spin, span=2)
+    layout.addLayout(g2.layout())
 
     # --- Analysis buttons row 3 ---
-    row3 = QtWidgets.QHBoxLayout()
+    g3 = GridPlacer(cols=6)
     window.frag_biconn_btn = QtWidgets.QPushButton("BiComponents")
-    window.frag_biconn_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.frag_biconn_btn.clicked.connect(lambda: _on_biconnected(window))
-    row3.addWidget(window.frag_biconn_btn)
-    row3.addStretch()
-    layout.addLayout(row3)
+    g3.add(window.frag_biconn_btn, span=6)
+    layout.addLayout(g3.layout())
 
     # --- Clear button ---
     window.frag_clear_btn = QtWidgets.QPushButton("Clear Highlight")
-    window.frag_clear_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.frag_clear_btn.clicked.connect(lambda: _on_clear(window))
     layout.addWidget(window.frag_clear_btn)
 

@@ -41,14 +41,8 @@ DATA_XYZ = os.path.join(REPO_ROOT, 'data', 'xyz')
 DATA_FITS = os.path.join(REPO_ROOT, 'data', 'fits')
 DEFAULT_HCOOH_FIT = os.path.join(DATA_FITS, 'hcooh_nacl.npz')
 
-from spammm.topology.FFparams import load_xyz_with_REQs
 from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF
-
-
-def load_molecule(fname):
-    """Load XYZ molecule with REQ parameters."""
-    apos, REQs, enames, Zs, lvec = load_xyz_with_REQs(fname)
-    return np.asarray(apos, dtype=np.float32), REQs, enames
+from spammm.forcefields.RigidBodyUtils import grid_pos, load_molecule
 
 
 def _resolve_xyz(path_or_name):
@@ -65,18 +59,6 @@ def _resolve_xyz(path_or_name):
     raise FileNotFoundError(f"Molecule XYZ not found: {path_or_name} (tried {cand})")
 
 
-def _grid_positions(n, spacing=6.0, z=0.0):
-    """Place N CoMs on an XY grid centered at origin."""
-    nx = int(np.ceil(np.sqrt(n)))
-    pos = np.zeros((n, 3), dtype=np.float32)
-    for i in range(n):
-        ix, iy = i % nx, i // nx
-        pos[i, 0] = (ix - 0.5 * (nx - 1)) * spacing
-        pos[i, 1] = (iy - 0.5 * (nx - 1)) * spacing
-        pos[i, 2] = z
-    return pos
-
-
 def _build_multibody(molecules, labels, active, spacing, args):
     """Shared constructor for identical or mixed multi-body scenes."""
     n = len(molecules)
@@ -84,7 +66,7 @@ def _build_multibody(molecules, labels, active, spacing, args):
         raise SystemExit(f'--active {active} out of range for {n} molecules')
     if args.pairff_mode != 'unified':
         raise SystemExit('multi-body mode requires --pairff-mode unified')
-    body_pos = _grid_positions(n, spacing=spacing, z=0.0)
+    body_pos = grid_pos(n, spacing=spacing, z=0.0)
     print(f"Multi-body PairFF: {n} molecules, active={active}, spacing={spacing}")
     for i, lab in enumerate(labels):
         print(f"  [{i}] {lab}  CoM={body_pos[i]}")
@@ -154,13 +136,13 @@ def main():
         paths = [_resolve_xyz(p) for p in args.mols]
         molecules, labels = [], []
         for p in paths:
-            apos, REQs, enames = load_molecule(p)
+            apos, enames, REQs, _bonds = load_molecule(p)
             molecules.append((apos, enames, REQs))
             labels.append(os.path.basename(p))
         rbd = _build_multibody(molecules, labels, int(args.active), args.spacing, args)
         faf_mol = paths[0]
     elif args.bodies and args.bodies > 1:
-        dyn_apos, dyn_REQs, dyn_enames = load_molecule(os.path.join(DATA_XYZ, 'HCOOH.xyz'))
+        dyn_apos, dyn_enames, dyn_REQs, _bonds = load_molecule(os.path.join(DATA_XYZ, 'HCOOH.xyz'))
         n = int(args.bodies)
         molecules = [(dyn_apos, dyn_enames, dyn_REQs)] * n
         labels = [f'HCOOH#{i}' for i in range(n)]
@@ -168,8 +150,8 @@ def main():
         faf_mol = os.path.join(DATA_XYZ, 'HCOOH.xyz')
     else:
         # --- Classic: uracil static + HCOOH dynamic ---
-        static_apos, static_REQs, static_enames = load_molecule(os.path.join(DATA_XYZ, 'uracil.xyz'))
-        dyn_apos, dyn_REQs, dyn_enames = load_molecule(os.path.join(DATA_XYZ, 'HCOOH.xyz'))
+        static_apos, static_enames, static_REQs, _bonds = load_molecule(os.path.join(DATA_XYZ, 'uracil.xyz'))
+        dyn_apos, dyn_enames, dyn_REQs, _bonds = load_molecule(os.path.join(DATA_XYZ, 'HCOOH.xyz'))
 
         print(f"Static (uracil): {len(static_enames)} atoms — {static_enames}")
         print(f"Dynamic (HCOOH): {len(dyn_enames)} atoms — {dyn_enames}")

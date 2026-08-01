@@ -29,6 +29,7 @@ Consolidation strategy: `doc/Tasks/RepoConsolidation.md` (eat FireCore/ppafm int
 - [ ] reorganize extension (Build, Relax, on Surface, SPM)
 
 - most are really tight I like that, but some like "STM orbitals" and "Parameters" sub panel in "AFM" extension still seem to have some mmarings between lines
+- In particular ribbon extension have some block of wiggetrs which sems to be shaded out and they overlap with the main wiggets, 
 
 
 

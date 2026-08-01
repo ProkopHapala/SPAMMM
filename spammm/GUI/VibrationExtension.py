@@ -14,7 +14,7 @@ import os
 from PyQt5 import QtCore, QtWidgets
 
 from .ExtensionManager import UIComponents
-from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, GridPlacer
 from .plotutils import show_in_plot_window
 from spammm.AtomicSystem import AtomicSystem
 from spammm.dynamics.Vibrations import run_vibrations, FREQ_UNIT_LABELS, format_freq, format_E_zpe
@@ -57,26 +57,23 @@ def build_ui(window):
     layout = QtWidgets.QVBoxLayout(panel)
     apply_tight(layout)
 
-    row1 = QtWidgets.QHBoxLayout()
-    row1.addWidget(QtWidgets.QLabel("Backend:"))
+    g1 = GridPlacer(cols=6)
     window.vib_backend_combo = QtWidgets.QComboBox()
     window.vib_backend_combo.addItems(['UFF', 'SPFF', 'DFTB'])
     window.vib_backend_combo.setCurrentText('UFF')
     window.vib_backend_combo.setToolTip('UFF: GPU force field. SPFF: pi-aware FF. DFTB: native Hessian via DFTB+.')
     window.vib_backend_combo.setMaximumWidth(72)
-    row1.addWidget(window.vib_backend_combo)
-    row1.addWidget(QtWidgets.QLabel("Units:"))
+    g1.add_pair("Backend:", window.vib_backend_combo, label_span=1, input_span=1)
     window.vib_unit_combo = QtWidgets.QComboBox()
     for label, key in _UNIT_ITEMS:
         window.vib_unit_combo.addItem(label, key)
     window.vib_unit_combo.setMaximumWidth(80)
     window.vib_unit_combo.currentIndexChanged.connect(lambda _: _on_unit_changed(window))
-    row1.addWidget(window.vib_unit_combo)
+    g1.add_pair("Units:", window.vib_unit_combo, label_span=1, input_span=1)
     window.vib_compute_btn = QtWidgets.QPushButton("Compute Modes")
     window.vib_compute_btn.clicked.connect(lambda: _on_compute(window))
-    row1.addWidget(window.vib_compute_btn)
-    row1.addStretch()
-    layout.addLayout(row1)
+    g1.add(window.vib_compute_btn, span=2)
+    layout.addLayout(g1.layout())
 
     window.vib_status_label = QtWidgets.QLabel("Status: Ready — click a row to plot")
     window.vib_status_label.setWordWrap(True)

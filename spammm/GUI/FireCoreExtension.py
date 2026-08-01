@@ -12,7 +12,7 @@ import numpy as np
 from PyQt5 import QtWidgets
 
 from .ExtensionManager import UIComponents
-from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, GridPlacer
 from spammm.GUI import VispyUtils as vu
 from spammm import elements
 
@@ -34,29 +34,27 @@ def build_ui(window):
     window.orbital_info_label.setWordWrap(True)
     layout.addWidget(window.orbital_info_label)
 
-    row1 = QtWidgets.QHBoxLayout()
-    row1.addWidget(QtWidgets.QLabel("Z:"))
+    g1 = GridPlacer(cols=6)
     window.z_height_spinbox = window.spinBox(2.0, 0.5, vmin=-10.0, vmax=20.0)
-    row1.addWidget(window.z_height_spinbox)
-    row1.addWidget(QtWidgets.QLabel("Orb:"))
+    g1.add_pair("Z:", window.z_height_spinbox, label_span=1, input_span=2)
     window.orbital_spinbox = window.spinBox(0, vmin=0, vmax=999, enabled=False, callback=lambda v: _update_orbital_energy_label(window, v), int_mode=True)
-    row1.addWidget(window.orbital_spinbox)
-    layout.addLayout(row1)
+    g1.add_pair("Orb:", window.orbital_spinbox, label_span=1, input_span=2)
+    layout.addLayout(g1.layout())
 
-    row2 = QtWidgets.QHBoxLayout()
+    g2 = GridPlacer(cols=6)
     window.plot_orb_btn = QtWidgets.QPushButton("Plot Orb")
     window.plot_orb_btn.setEnabled(False)
     window.plot_orb_btn.clicked.connect(lambda: _on_plot_orbital(window))
-    row2.addWidget(window.plot_orb_btn)
+    g2.add(window.plot_orb_btn, span=2)
     window.plot_density_btn = QtWidgets.QPushButton("Plot Dens")
     window.plot_density_btn.setEnabled(False)
     window.plot_density_btn.clicked.connect(lambda: _on_plot_density(window))
-    row2.addWidget(window.plot_density_btn)
+    g2.add(window.plot_density_btn, span=2)
     window.plot_delta_btn = QtWidgets.QPushButton("Plot Delta")
     window.plot_delta_btn.setEnabled(False)
     window.plot_delta_btn.clicked.connect(lambda: _on_plot_delta_rho(window))
-    row2.addWidget(window.plot_delta_btn)
-    layout.addLayout(row2)
+    g2.add(window.plot_delta_btn, span=2)
+    layout.addLayout(g2.layout())
 
     fdata_btn = QtWidgets.QPushButton("Set Fdata")
     fdata_btn.clicked.connect(lambda: _on_set_fdata_path(window))

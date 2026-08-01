@@ -58,7 +58,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from spammm.AtomicSystem import AtomicSystem
-from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF, _body_sites_world, load_molecule
+from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF, _body_sites_world
+from spammm.forcefields.RigidBodyUtils import load_molecule, greedy_energy_step, grid_pos, assembly_real_atoms, write_xyz
 from spammm.forcefields.RigidEnsemble import RigidEnsemble
 from spammm.surfaces.FoldedRigid import (
     Z_SURF_TOP, NACL_SUBSTRATE, load_substrate, replicate_substrate,
@@ -67,53 +68,6 @@ from spammm.surfaces.FoldedRigid import (
 from spammm.surfaces.surface_plots import plot_assembly_on_substrate
 
 OUT_ROOT = os.path.join(REPO, 'debug', 'testplot_pairff_energy_mc')
-
-
-def grid_pos(n, spacing, z=0.0):
-    nx = int(np.ceil(np.sqrt(n)))
-    pos = np.zeros((n, 3), dtype=np.float32)
-    for i in range(n):
-        ix, iy = i % nx, i // nx
-        pos[i, 0] = (ix - 0.5 * (nx - 1)) * spacing
-        pos[i, 1] = (iy - 0.5 * (nx - 1)) * spacing
-        pos[i, 2] = z
-    return pos
-
-
-def assembly_real_atoms(packs, pos, quat, bonds0):
-    """Concatenate real-atom world frames + replicated intramolecular bonds.
-
-    bonds0: single (N,2) array (reused for all packs, single-species) or list of
-    (N_i,2) arrays (one per pack, multi-species).
-    """
-    worlds, enames, bonds = [], [], []
-    off = 0
-    bonds_list = bonds0 if isinstance(bonds0, (list, tuple)) else [bonds0] * len(packs)
-    for j, pack in enumerate(packs):
-        w = _body_sites_world(pack['rel'], pos[j], quat[j])
-        m = pack['types'] == 0
-        wr = w[m]
-        er = [e for e, t in zip(pack['enames'], pack['types']) if t == 0]
-        worlds.append(wr)
-        enames.extend(er)
-        b0 = bonds_list[j] if j < len(bonds_list) else bonds_list[0]
-        if b0 is not None and len(b0):
-            bonds.extend([(int(a) + off, int(b) + off) for a, b in b0])
-        off += len(wr)
-    return np.vstack(worlds).astype(np.float32), enames, np.asarray(bonds, dtype=np.int32)
-
-
-def write_xyz(path, packs, pos, quat, comment=''):
-    lines = []
-    for j, pack in enumerate(packs):
-        w = _body_sites_world(pack['rel'], pos[j], quat[j])
-        for e, t, p in zip(pack['enames'], pack['types'], w):
-            if t != 0:
-                continue
-            lines.append(f'{e:2s} {p[0]:12.6f} {p[1]:12.6f} {p[2]:12.6f}')
-    with open(path, 'w') as f:
-        f.write(f'{len(lines)}\n{comment}\n')
-        f.write('\n'.join(lines) + '\n')
 
 
 def parity_check(rbd, pos, quat):
@@ -399,7 +353,7 @@ def main():
     for step in range(args.steps):
         moved = [step % n_total]
         t_step0 = time.perf_counter()
-        pos, quat, E0, Ebest, acc, Ebatch = rbd.greedy_energy_step(
+        pos, quat, E0, Ebest, acc, Ebatch = greedy_energy_step(rbd,
             pos, quat, moved, n_trial=args.ntrial, dxy=args.dxy, dphi=args.dphi,
             seed=args.seed + 1000 + step, rmin_com=args.rmin, rmin_atom=args.rmin_atom,
             k_pack=args.k_pack,
