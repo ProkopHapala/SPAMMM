@@ -14,6 +14,7 @@ import numpy as np
 from PyQt5 import QtWidgets, QtCore
 
 from .ExtensionManager import UIComponents
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
 
 _DATA = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data', 'charge_rings')
 
@@ -48,8 +49,7 @@ _SPIN_SPEC = [
 def build_ui(window):
     panel = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(panel)
-    layout.setSpacing(2)
-    layout.setContentsMargins(2, 2, 2, 2)
+    apply_tight(layout)
 
     # --- Preset ---
     row0 = QtWidgets.QHBoxLayout()

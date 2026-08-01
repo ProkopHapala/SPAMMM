@@ -12,6 +12,7 @@ import numpy as np
 import os
 
 from .ExtensionManager import UIComponents
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
 from spammm.GUI.EditModeHandlers import EditModeHandler
 from spammm.GUI.VispyUtils import compute_bond_colors_by_length, compute_bond_colors_by_delta
 from spammm.topology.hbond_utils import find_hbonds_graph, default_mapping
@@ -23,8 +24,7 @@ from spammm.GUI.rc_esp_view import open_rc_esp_animation, update_rc_esp_frame
 def build_ui(window):
     panel = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(panel)
-    layout.setSpacing(2)
-    layout.setContentsMargins(2, 2, 2, 2)
+    apply_tight(layout)
 
     row_geo = QtWidgets.QHBoxLayout()
     window.rc_import_btn = QtWidgets.QPushButton("Import from Graph")

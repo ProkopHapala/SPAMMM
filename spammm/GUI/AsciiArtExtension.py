@@ -3,6 +3,7 @@ from PyQt5 import QtWidgets, QtCore
 import numpy as np
 
 from .ExtensionManager import UIComponents
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
 from spammm.topology.ascii_art_heterocycle import parse_ascii_art, ASCII_EXAMPLES, resolve_hbond_pairs, _build_target_valence, jacobi_relax_bond_lengths
 from spammm.topology.KekulePure import make_n_pi
 
@@ -10,8 +11,7 @@ from spammm.topology.KekulePure import make_n_pi
 def build_ui(window):
     panel = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(panel)
-    layout.setSpacing(2)
-    layout.setContentsMargins(2, 2, 2, 2)
+    apply_tight(layout)
 
     row1 = QtWidgets.QHBoxLayout()
     row1.addWidget(QtWidgets.QLabel("Example:"))
@@ -20,7 +20,7 @@ def build_ui(window):
     window.kek_example_combo.setMaximumWidth(150)
     row1.addWidget(window.kek_example_combo)
     window.kek_load_example_btn = QtWidgets.QPushButton("Load")
-    window.kek_load_example_btn.setMaximumWidth(60)
+    window.kek_load_example_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.kek_load_example_btn.clicked.connect(lambda: load_ascii_example(window))
     row1.addWidget(window.kek_load_example_btn)
     row1.addStretch()
@@ -33,7 +33,7 @@ def build_ui(window):
 
     row3 = QtWidgets.QHBoxLayout()
     window.kek_generate_btn = QtWidgets.QPushButton("Generate")
-    window.kek_generate_btn.setMaximumWidth(80)
+    window.kek_generate_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.kek_generate_btn.clicked.connect(lambda: generate_ascii_molecule(window))
     row3.addWidget(window.kek_generate_btn)
     window.kek_hydrogens_chk = QtWidgets.QCheckBox("Add H")

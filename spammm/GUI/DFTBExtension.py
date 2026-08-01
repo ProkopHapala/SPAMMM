@@ -9,6 +9,7 @@ Wired through ExtensionManager as 'dftb' extension.
 from PyQt5 import QtWidgets
 
 from .ExtensionManager import UIComponents
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
 
 
 def build_ui(window):
@@ -18,8 +19,7 @@ def build_ui(window):
     """
     panel = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(panel)
-    layout.setSpacing(3)
-    layout.setContentsMargins(2, 2, 2, 2)
+    apply_tight(layout)
 
     relax_btn = QtWidgets.QPushButton("Relax (DFTB+)")
     relax_btn.clicked.connect(lambda: _on_relax(window))

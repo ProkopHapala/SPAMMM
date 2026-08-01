@@ -110,9 +110,19 @@ class BaseGUI(QtWidgets.QMainWindow):
         self.main_widget = QtWidgets.QWidget(self)
         self.setCentralWidget(self.main_widget)
     
-    def button(self, text, callback=None, tooltip=None, layout=None):
-        """Create QPushButton with optional callback, tooltip, and auto-add to layout."""
+    def button(self, text, callback=None, tooltip=None, layout=None, shortcut=None):
+        """Create QPushButton with optional callback, tooltip, and auto-add to layout.
+
+        Button is natural width (Maximum size policy) — only as wide as its text.
+        If shortcut is set (a (key, modifiers) tuple, e.g. ('Z', ('Control',))),
+        the shortcut is registered in ShortcutRegistry (with conflict check) and
+        the button label is auto-formatted with the Unicode keystroke, e.g. 'Undo [⌃Z]'.
+        """
         btn = QtWidgets.QPushButton(text)
+        btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+        if shortcut is not None:
+            from spammm.GUI.ShortcutRegistry import ShortcutRegistry
+            ShortcutRegistry.register_button(btn, text, shortcut)
         if callback is not None: btn.clicked.connect(callback)
         if tooltip  is not None: btn.setToolTip(tooltip)
         if layout   is not None: layout.addWidget(btn)
@@ -127,8 +137,12 @@ class BaseGUI(QtWidgets.QMainWindow):
         return chk
 
     def comboBox(self, items=None, callback=None, layout=None, pass_index=False):
-        """Create QComboBox with optional items, callback, and auto-add to layout."""
+        """Create QComboBox with optional items, callback, and auto-add to layout.
+
+        Natural width (Maximum size policy) — only as wide as its items.
+        """
         cb = QtWidgets.QComboBox()
+        cb.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
         if items is not None:    cb.addItems(items)
         if callback is not None:
             if pass_index:
@@ -138,14 +152,20 @@ class BaseGUI(QtWidgets.QMainWindow):
         if layout   is not None: layout.addWidget(cb)
         return cb
 
-    def spinBox(self, value=0.0, step=0.1, max_width=80, vmin=-1e9, vmax=1e9, decimals=4, enabled=True, callback=None, layout=None, label=None, int_mode=False):
-        """Create QSpinBox (int_mode=True) or QDoubleSpinBox (default) with auto-add to layout."""
+    def spinBox(self, value=0.0, step=0.1, max_width=None, vmin=-1e9, vmax=1e9, decimals=4, enabled=True, callback=None, layout=None, label=None, int_mode=False):
+        """Create QSpinBox (int_mode=True) or QDoubleSpinBox (default) with auto-add to layout.
+
+        Maximum size policy — only as wide as needed (capped by SPIN_MAX_WIDTH).
+        """
+        from spammm.GUI.LayoutPolicy import SPIN_MAX_WIDTH
+        if max_width is None: max_width = SPIN_MAX_WIDTH
         spin = QtWidgets.QSpinBox() if int_mode else QtWidgets.QDoubleSpinBox()
         spin.setDecimals(decimals) if not int_mode else None
         spin.setSingleStep(int(step) if int_mode else step)
         spin.setRange(vmin, vmax)
         spin.setValue(value)
         spin.setMaximumWidth(max_width)
+        spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
         spin.setEnabled(enabled)
         if callback is not None: spin.valueChanged.connect(callback)
         elif hasattr(self, 'on_param_changed'): spin.valueChanged.connect(self.on_param_changed)

@@ -22,6 +22,8 @@ Usage:
 
 from PyQt5 import QtWidgets, QtCore, QtGui
 
+from spammm.GUI.LayoutPolicy import MARGIN, SPACING, ROW_SPACING
+
 
 class CollapsibleSection(QtWidgets.QWidget):
     """A titled panel whose content area can be toggled open/closed."""
@@ -54,8 +56,8 @@ class CollapsibleSection(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Fixed,
         )
         self._content_layout = QtWidgets.QVBoxLayout(self._content)
-        self._content_layout.setContentsMargins(4, 0, 0, 4)
-        self._content_layout.setSpacing(2)
+        self._content_layout.setContentsMargins(MARGIN, 0, 0, MARGIN)
+        self._content_layout.setSpacing(ROW_SPACING)
 
         # --- separator line ---
         line = QtWidgets.QFrame()

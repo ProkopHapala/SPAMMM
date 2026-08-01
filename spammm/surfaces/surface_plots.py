@@ -22,10 +22,37 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from .FoldedRigid import nearest_substrate_distance
+from .FoldedRigid import (
+    nearest_substrate_distance, eval_folded_potential_grid, faf_type_idx_for_probe,
+)
 
 ELEMENT_COLORS = {'H': 'lightgray', 'C': 'black', 'O': 'red', 'N': 'blue', 'Na': 'goldenrod', 'Cl': 'green', 'S': 'yellow'}
 ELEMENT_SIZES = {'H': 50, 'C': 120, 'O': 140, 'N': 130, 'Na': 180, 'Cl': 180, 'S': 150}
+
+
+def _draw_substrate_atoms(ax, sub_apos, sub_enames, axes=(0, 1), alpha=0.55, label=True):
+    """Draw substrate ions as CPK-colored circles (Na=goldenrod, Cl=green, ...).
+
+    Shared by plot_molecule_substrate_xy/_xz and plot_assembly_on_substrate so the
+    Na/Cl checkerboard is rendered consistently across all substrate plots.
+
+    Vectorized: one ax.scatter call per unique element (NOT per atom). A per-atom
+    Python loop here is catastrophic — 3000+ ions × scatter = ~20s/frame.
+    """
+    ax1, ax2 = axes
+    sub_apos = np.asarray(sub_apos[:, :3], dtype=np.float64)
+    enames = np.asarray(sub_enames)
+    for e in set(sub_enames):
+        mask = enames == e
+        if not mask.any():
+            continue
+        c = ELEMENT_COLORS.get(e, 'gray')
+        s = ELEMENT_SIZES.get(e, 100)
+        ax.scatter(sub_apos[mask, ax1], sub_apos[mask, ax2], c=c, s=s, zorder=2,
+                   edgecolors='black', linewidths=0.5, alpha=alpha)
+    if label:
+        for e, p in zip(sub_enames, sub_apos):
+            ax.text(p[ax1], p[ax2], e, fontsize=6, ha='center', va='center', zorder=4)
 
 
 def plot_relaxation(traj, save_dir, name='relax'):
@@ -62,12 +89,7 @@ def plot_molecule_substrate_xy(ax, mol_apos, mol_enames, sub_apos, sub_enames, t
         bonds: list of (i,j) tuples for molecule bonds
         highlight_element: element name to highlight in molecule (e.g. 'O')
     """
-    sub_apos = np.asarray(sub_apos[:, :3], dtype=np.float64)
-    for i, (e, p) in enumerate(zip(sub_enames, sub_apos)):
-        c = ELEMENT_COLORS.get(e, 'gray')
-        s = ELEMENT_SIZES.get(e, 100)
-        ax.scatter(p[0], p[1], c=c, s=s, zorder=2, edgecolors='black', linewidths=0.5)
-        ax.text(p[0], p[1], e, fontsize=6, ha='center', va='center', zorder=4)
+    _draw_substrate_atoms(ax, sub_apos, sub_enames, axes=(0, 1))
     if bonds:
         for i, j in bonds:
             ax.plot([mol_apos[i, 0], mol_apos[j, 0]], [mol_apos[i, 1], mol_apos[j, 1]], 'k-', linewidth=1.5, zorder=3)
@@ -85,12 +107,7 @@ def plot_molecule_substrate_xy(ax, mol_apos, mol_enames, sub_apos, sub_enames, t
 
 def plot_molecule_substrate_xz(ax, mol_apos, mol_enames, sub_apos, sub_enames, title='', bonds=None, highlight_element=None, highlight_color='magenta'):
     """Side-view (XZ) plot of molecule on substrate."""
-    sub_apos = np.asarray(sub_apos[:, :3], dtype=np.float64)
-    for i, (e, p) in enumerate(zip(sub_enames, sub_apos)):
-        c = ELEMENT_COLORS.get(e, 'gray')
-        s = ELEMENT_SIZES.get(e, 100)
-        ax.scatter(p[0], p[2], c=c, s=s, zorder=2, edgecolors='black', linewidths=0.5)
-        ax.text(p[0], p[2], e, fontsize=6, ha='center', va='center', zorder=4)
+    _draw_substrate_atoms(ax, sub_apos, sub_enames, axes=(0, 2))
     if bonds:
         for i, j in bonds:
             ax.plot([mol_apos[i, 0], mol_apos[j, 0]], [mol_apos[i, 2], mol_apos[j, 2]], 'k-', linewidth=1.5, zorder=3)
@@ -437,6 +454,120 @@ def plot_pairff_faf_background(Esum, extent, vmax, apos_fixed, enames_fixed,
         plt.close(fig)
         return save_path
     return fig
+
+
+def _faf_probe_type(fit, probe_type='auto'):
+    """Pick FAF atom-type index for the substrate heatmap.
+
+    'auto'  → most-negative-Q row in fit['unique_REQs'] (shows the Na/Cl Coulomb
+              checkerboard; a neutral probe like C only sees uniform Pauli repulsion).
+    int     → explicit type index.
+    None    → skip FAF (caller decides).
+    """
+    if probe_type is None or fit is None:
+        return None
+    if isinstance(probe_type, (int, np.integer)):
+        return int(probe_type)
+    ureq = np.asarray(fit.get('unique_REQs', []), dtype=np.float64)
+    if len(ureq) == 0:
+        return 0
+    return int(np.argmin(ureq[:, 2]))  # most negative Q
+
+
+def plot_assembly_on_substrate(ax, mol_apos, mol_enames, mol_bonds=None,
+                               sub_apos=None, sub_enames=None,
+                               fit=None, z_eval=None, probe_type='auto',
+                               charges=None, com_pos=None,
+                               title='', xlim=None, ylim=None,
+                               ngrid=120, extent_pad=4.0,
+                               draw_substrate=True, draw_faf=True):
+    """Top-view rigid-assembly plot: FAF substrate heatmap + Na/Cl ions + molecule + CoM.
+
+    Unified headless presentation matching demo_pairFF's Vispy map (charged-probe
+    FAF so the Na/Cl checkerboard is visible) with explicit substrate ions drawn
+    on top, plus the molecule skeleton (bonds + atoms) and CoM markers.
+
+    Reuses (no reinvention):
+      - eval_folded_potential_grid / faf_type_idx_for_probe (FoldedRigid) for FAF
+      - _draw_substrate_atoms (local) for Na/Cl ions
+      - plotBonds / plotAtoms (plotUtils) for the molecule skeleton
+
+    Args:
+      ax: matplotlib Axes (drawn onto; caller owns the figure).
+      mol_apos: (n,3) real-atom world positions of the assembled molecules.
+      mol_enames: list of n element names.
+      mol_bonds: (m,2) int array of intramolecular bond index pairs, or None.
+      sub_apos / sub_enames: substrate ions (already replicated to the view); if
+        None and draw_substrate, the FAF extent is used with no ions drawn.
+      fit: FAF fit dict (load_fit output); None → no heatmap.
+      z_eval: z [Å] at which to evaluate FAF (molecule plane). None → no heatmap.
+      probe_type: 'auto' (most-negative-Q type), int (explicit), or None (skip FAF).
+      charges: (n,) per-atom charges for red/blue atom coloring; None → CPK by element.
+      com_pos: (nmol,3) CoM positions for lime markers; None → skip.
+      xlim/ylim: lock axes (for multi-panel / GIF frame stability).
+      Returns (xmin, xmax, ymin, ymax) extent so callers can lock subsequent panels.
+    """
+    from spammm.plotUtils import plotBonds, plotAtoms
+    from spammm import elements as _elements
+    mol_apos = np.asarray(mol_apos[:, :3], dtype=np.float32)
+    all_xy = mol_apos[:, :2]
+    pad = extent_pad
+    xmin, xmax = float(all_xy[:, 0].min() - pad), float(all_xy[:, 0].max() + pad)
+    ymin, ymax = float(all_xy[:, 1].min() - pad), float(all_xy[:, 1].max() + pad)
+    if xlim is not None: xmin, xmax = float(xlim[0]), float(xlim[1])
+    if ylim is not None: ymin, ymax = float(ylim[0]), float(ylim[1])
+
+    plt.sca(ax)
+    # 1) FAF substrate heatmap (charged probe → Na/Cl checkerboard visible)
+    if draw_faf and fit is not None and z_eval is not None:
+        ityp = _faf_probe_type(fit, probe_type)
+        if ityp is not None:
+            xs = np.linspace(xmin, xmax, ngrid)
+            ys = np.linspace(ymin, ymax, ngrid)
+            V = eval_folded_potential_grid(fit, ityp, xs, ys, z_eval)
+            vmax = max(abs(np.nanmin(V)), abs(np.nanmax(V)), 1e-9)
+            im = ax.imshow(V, extent=(xmin, xmax, ymin, ymax), origin='lower',
+                           cmap='RdBu_r', vmin=-vmax, vmax=vmax,
+                           aspect='equal', interpolation='bilinear', alpha=0.7)
+            ureq = np.asarray(fit.get('unique_REQs', []), dtype=np.float64)
+            qlab = f'Q={ureq[ityp, 2]:+.2f}' if len(ureq) else f'type {ityp}'
+            plt.colorbar(im, ax=ax, fraction=0.04, pad=0.02, label=f'V_FAF({qlab}) [eV]')
+
+    # 2) Substrate ions (Na=goldenrod, Cl=green) — the checkerboard the user sees
+    if draw_substrate and sub_apos is not None and len(sub_apos):
+        _draw_substrate_atoms(ax, sub_apos, sub_enames, axes=(0, 1), alpha=0.85)
+
+    # 3) Molecule skeleton: bonds + atoms (charge-colored or CPK)
+    if mol_bonds is not None and len(mol_bonds):
+        plotBonds(links=mol_bonds, ps=mol_apos, axes=(0, 1), colors='#333333', lws=0.8)
+    if charges is not None:
+        q = np.asarray(charges, dtype=np.float64)
+        norm = matplotlib.colors.TwoSlopeNorm(vmin=min(q.min(), -0.05), vcenter=0.0,
+                                              vmax=max(q.max(), 0.05))
+        cmap = plt.cm.RdBu_r
+        colors = [cmap(norm(qi)) for qi in q]
+        sizes = [40.0 + 600.0 * abs(qi) for qi in q]
+    else:
+        colors = [_elements.ELEMENT_DICT[e][8] if e in _elements.ELEMENT_DICT else '#888888'
+                  for e in mol_enames]
+        sizes = [_elements.ELEMENT_DICT[e][6] * 90.0 if e in _elements.ELEMENT_DICT else 80.0
+                 for e in mol_enames]
+    plotAtoms(apos=mol_apos, es=mol_enames, colors=colors, sizes=sizes, axes=(0, 1), marker='o')
+    if charges is not None:
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm); sm.set_array([])
+        plt.colorbar(sm, ax=ax, fraction=0.04, pad=0.02, label='Q [e]')
+
+    # 4) CoM markers
+    if com_pos is not None and len(com_pos):
+        com_pos = np.asarray(com_pos)
+        ax.plot(com_pos[:, 0], com_pos[:, 1], 'x', color='lime', ms=8, mew=1.5, zorder=8)
+
+    ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax)
+    ax.set_aspect('equal')
+    ax.set_title(title)
+    ax.set_xlabel('x [Å]'); ax.set_ylabel('y [Å]')
+    ax.grid(True, alpha=0.2)
+    return (xmin, xmax, ymin, ymax)
 
 
 def render_pairff_tip_pull_movie(traj, Esum, extent, vmax, active_body, save_dir,

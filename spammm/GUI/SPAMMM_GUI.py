@@ -68,6 +68,7 @@ from spammm.GUI.VispyUtils import compute_bond_colors_by_length, generate_atom_l
 
 from spammm.GUI.ExtensionManager import ExtensionManager, ExtensionNotAvailableError
 from spammm.GUI.CollapsibleSection import CollapsibleSection
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow
 
 class SPAMMMWindow(BaseGUI):
     sig_geometry_changed = QtCore.pyqtSignal()  # Emitted whenever atom geometry changes
@@ -110,6 +111,7 @@ class SPAMMMWindow(BaseGUI):
         self.scene.sig_drag_state.connect(self.on_drag_state)
         self.scene.sig_rmb_remove.connect(self.on_atom_remove)
         self.scene.sig_camera_changed.connect(self.refresh_view)
+        self.scene.sig_camera_changed.connect(self.sync_zoom_slider)
         self.scene.sig_link_bond.connect(self.on_link_bond)
         self.scene.sig_link_to_pos.connect(self.on_link_to_pos)
         self.scene.sig_atom_clicked.connect(self.on_atom_clicked)
@@ -117,6 +119,9 @@ class SPAMMMWindow(BaseGUI):
         self.refresh_view()
 
     def initUI(self):
+        # Reset shortcut registry — all shortcuts are re-registered during initUI()
+        from spammm.GUI.ShortcutRegistry import ShortcutRegistry
+        ShortcutRegistry.reset()
         # --- Central Widget (Vispy Scene) ---
         self.scene = vu.AtomScene(bgcolor=(0.95, 0.95, 0.95), backend=self.backend)
         self.scene.pick_radius = self.pick_radius
@@ -151,13 +156,15 @@ class SPAMMMWindow(BaseGUI):
         main_layout = QtWidgets.QHBoxLayout(main_widget)
         
         # Create side panel content (inside a scroll area)
+        from spammm.GUI.LayoutPolicy import PANEL_TARGET_WIDTH, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH
         side_content = QtWidgets.QWidget()
+        side_content.setMaximumWidth(PANEL_MAX_WIDTH)
         side_layout = QtWidgets.QVBoxLayout(side_content)
-        side_layout.setSpacing(1)
-        side_layout.setContentsMargins(0, 0, 0, 0)
+        apply_tight(side_layout, margins=0, spacing=ROW_SPACING)
         
         # Add sections
         side_layout.addWidget(self.create_editors_section())
+        side_layout.addWidget(self.create_accessibility_section())
         side_layout.addWidget(self.create_grid_section())
         side_layout.addWidget(self.create_ribbon_section())
         self._build_extension_panels(side_layout)
@@ -167,13 +174,20 @@ class SPAMMMWindow(BaseGUI):
         scroll = QtWidgets.QScrollArea()
         scroll.setWidget(side_content)
         scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(300)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(PANEL_MIN_WIDTH)
+        scroll.setMaximumWidth(PANEL_MAX_WIDTH)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         scroll.setFrameStyle(QtWidgets.QFrame.NoFrame)
+
+        # Use QSplitter for resizable panel
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter.addWidget(scroll)
+        splitter.addWidget(self.scene.canvas.native)
+        splitter.setStretchFactor(1, 1)  # Give more stretch to the canvas
+        splitter.setSizes([PANEL_TARGET_WIDTH, 724])  # Initial sizes: panel=target, canvas=rest
         
         # Add to main layout
-        main_layout.addWidget(scroll)
-        main_layout.addWidget(self.scene.canvas.native)
+        main_layout.addWidget(splitter)
         
         self.setCentralWidget(main_widget)
 
@@ -227,6 +241,44 @@ class SPAMMMWindow(BaseGUI):
         self.error_dialog = True     # Show QMessageBox
         self.error_statusbar = True  # Update status bar
         self.apply_view_mode()
+        self._register_shortcuts()
+
+    def _register_shortcuts(self):
+        """Register this window's keyboard shortcuts in the centralized ShortcutRegistry.
+
+        Each extension registers its own shortcuts in its build_ui(). Here we
+        register the global shortcuts that belong to the main GUI window.
+        The registry is reset at the start of initUI() (before AtomScene registers
+        camera shortcuts), so a fresh window starts clean.
+        """
+        from spammm.GUI.ShortcutRegistry import ShortcutRegistry
+        # Enter / Return → toggle 2D/3D view
+        ShortcutRegistry.register(['Enter', 'Return'], description="Toggle 2D/3D view (b2Dview)", group="Global",
+                                  callback=lambda w: w.toggle_b2Dview())
+        # Space → toggle FF run/stop
+        ShortcutRegistry.register(['Space', ' '], description="Toggle interactive FF run/stop", group="Global",
+                                  callback=lambda w: w.toggle_run_simulation())
+        # Ctrl+Z → undo
+        ShortcutRegistry.register('Z', ('Control',), description="Undo", group="Global",
+                                  callback=lambda w: w.undo())
+        # Ctrl+V → paste
+        ShortcutRegistry.register('V', ('Control',), description="Paste atoms from clipboard", group="Global",
+                                  callback=lambda w: w.paste_copied_atoms())
+        # Ctrl+C → copy (requires selection)
+        ShortcutRegistry.register('C', ('Control',), description="Copy selected atoms — Select mode", group="Select",
+                                  context_fn=lambda w: len(w.scene.get_selected_ids()) > 0,
+                                  callback=lambda w: w.copy_selected_atoms())
+        # Delete → delete selected (requires selection)
+        ShortcutRegistry.register('Delete', description="Delete selected atoms — Select mode", group="Select",
+                                  context_fn=lambda w: len(w.scene.get_selected_ids()) > 0,
+                                  callback=lambda w: w.delete_selected_atoms())
+        # Numpad +/- → ring size (Ring mode only)
+        ShortcutRegistry.register(['+', 'KP_ADD', '='], description="Increase ring size — Ring mode", group="Ring",
+                                  context_fn=lambda w: w.edit_mode == 'Ring',
+                                  callback=lambda w: w.ring_size_spinbox.setValue(min(int(w.ring_size_spinbox.value()) + 1, w.ring_size_spinbox.maximum())))
+        ShortcutRegistry.register(['-', 'KP_SUBTRACT', '_'], description="Decrease ring size — Ring mode", group="Ring",
+                                  context_fn=lambda w: w.edit_mode == 'Ring',
+                                  callback=lambda w: w.ring_size_spinbox.setValue(max(int(w.ring_size_spinbox.value()) - 1, w.ring_size_spinbox.minimum())))
 
     def _raise(self, msg, title="Error", dialog_type="critical"):
         """Reusable error handling function.
@@ -279,7 +331,7 @@ class SPAMMMWindow(BaseGUI):
     def create_editors_section(self):
         """Merged Builder and Editor section as collapsible panel."""
         layout = QtWidgets.QVBoxLayout()
-        layout.setSpacing(3)
+        apply_tight(layout, margins=0, spacing=SPACING)
         
         # Edit Mode (from Builder)
         self.label("Edit Mode:", layout=layout)
@@ -341,7 +393,8 @@ class SPAMMMWindow(BaseGUI):
 
         # 2D / 3D view mode
         row_view = QtWidgets.QHBoxLayout()
-        self.b2Dview_chk = QtWidgets.QCheckBox("2D view (planar edit)")
+        from spammm.GUI.ShortcutRegistry import encode_keystroke
+        self.b2Dview_chk = QtWidgets.QCheckBox(f"2D view (planar edit) [{encode_keystroke(['Enter', 'Return'])}]")
         self.b2Dview_chk.setChecked(True)
         self.b2Dview_chk.setToolTip("Checked: top-down hex/empty edit. Unchecked: ortho 3D (Enter toggles). Space = run/stop FF.")
         self.b2Dview_chk.toggled.connect(self._on_b2Dview_toggled)
@@ -370,10 +423,86 @@ class SPAMMMWindow(BaseGUI):
         sec.setContent(widget)
         return sec
 
+    def create_accessibility_section(self):
+        """Laptop accessibility controls for zoom and view when mouse is not available."""
+        layout = QtWidgets.QVBoxLayout()
+        apply_tight(layout, margins=0, spacing=SPACING)
+        
+        # Zoom controls
+        self.label("Zoom:", layout=layout)
+        
+        # Zoom slider (logarithmic scale for better UX)
+        zoom_row = QtWidgets.QHBoxLayout()
+        self.zoom_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.zoom_slider.setRange(-100, 100)  # Logarithmic scale
+        self.zoom_slider.setValue(0)  # Center = 1.0 zoom
+        self.zoom_slider.setToolTip("Zoom in/out (logarithmic scale)")
+        self.zoom_slider.valueChanged.connect(self.on_zoom_slider_changed)
+        zoom_row.addWidget(self.zoom_slider)
+        layout.addLayout(zoom_row)
+        
+        # Zoom buttons (+/-)
+        zoom_btn_row = QtWidgets.QHBoxLayout()
+        self.zoom_in_btn = self.button("Zoom In", self.zoom_in, layout=zoom_btn_row)
+        self.zoom_out_btn = self.button("Zoom Out", self.zoom_out, layout=zoom_btn_row)
+        self.reset_zoom_btn = self.button("Reset View", self.reset_view, layout=zoom_btn_row)
+        layout.addLayout(zoom_btn_row)
+        
+        # Wrap in QWidget for CollapsibleSection
+        widget = QtWidgets.QWidget()
+        widget.setLayout(layout)
+        
+        # Wrap in CollapsibleSection (collapsed by default since it's for accessibility)
+        sec = CollapsibleSection("Laptop Accessibility", collapsed=True, parent=self)
+        sec.setContent(widget)
+        return sec
+
+    def on_zoom_slider_changed(self, value):
+        """Handle zoom slider change (logarithmic scale)."""
+        # Convert slider value (-100 to 100) to zoom factor (exponential)
+        # value=0 -> zoom=1.0, value=100 -> zoom=10.0, value=-100 -> zoom=0.1
+        import math
+        zoom_factor = math.exp(value * 0.05)  # 0.05 gives reasonable range
+        self.scene.set_zoom(zoom_factor)
+
+    def zoom_in(self):
+        """Zoom in by factor of 1.5."""
+        current_zoom = self.scene.get_zoom()
+        self.scene.set_zoom(current_zoom * 1.5)
+
+    def zoom_out(self):
+        """Zoom out by factor of 1.5."""
+        current_zoom = self.scene.get_zoom()
+        self.scene.set_zoom(current_zoom / 1.5)
+
+    def reset_view(self):
+        """Reset camera to default view."""
+        self.scene.reset_view()
+        self.scene.fit_to_atoms(margin=1.8)
+        # Reset slider to center
+        self.zoom_slider.blockSignals(True)
+        self.zoom_slider.setValue(0)
+        self.zoom_slider.blockSignals(False)
+
+    def sync_zoom_slider(self):
+        """Sync zoom slider with current camera zoom (called when camera changes via mouse wheel)."""
+        if not hasattr(self, 'zoom_slider'):
+            return
+        import math
+        current_zoom = self.scene.get_zoom()
+        # Convert zoom factor to slider value (inverse of on_zoom_slider_changed)
+        # zoom=1.0 -> value=0, zoom=10.0 -> value=100, zoom=0.1 -> value=-100
+        if current_zoom > 0:
+            slider_value = math.log(current_zoom) / 0.05
+            slider_value = max(-100, min(100, slider_value))
+            self.zoom_slider.blockSignals(True)
+            self.zoom_slider.setValue(int(slider_value))
+            self.zoom_slider.blockSignals(False)
+
     def create_grid_section(self):
         """Grid transform controls in a compact collapsible panel."""
         layout = QtWidgets.QVBoxLayout()
-        layout.setSpacing(2)
+        apply_tight(layout, margins=0, spacing=SPACING)
 
         # Row 1: a_CC (lattice constant) | Transpose toggle
         row1 = QtWidgets.QHBoxLayout()
@@ -439,9 +568,9 @@ class SPAMMMWindow(BaseGUI):
                     wrapper = QtWidgets.QWidget()
                     w_layout = QtWidgets.QVBoxLayout(wrapper)
                     w_layout.setContentsMargins(0, 0, 0, 0)
-                    w_layout.setSpacing(2)
+                    w_layout.setSpacing(SPACING)
                     help_btn = QtWidgets.QPushButton("?")
-                    help_btn.setMaximumWidth(24)
+                    help_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
                     help_btn.setToolTip("Show help")
                     help_btn.clicked.connect(lambda checked=False, n=name, t=ui.help_text: self._show_extension_help(n, t))
                     hbox = QtWidgets.QHBoxLayout()
@@ -497,8 +626,7 @@ class SPAMMMWindow(BaseGUI):
 
     def create_ribbon_section(self):
         layout = QtWidgets.QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        apply_tight(layout, margins=0, spacing=SPACING)
         
         # Shared inputs (used by both single and two-ribbon)
         shared_layout = QtWidgets.QHBoxLayout()
@@ -973,50 +1101,10 @@ class SPAMMMWindow(BaseGUI):
             self.statusBar().showMessage("Selection Mode: RMB drag to select | Delete: Remove | Ctrl-C: Copy | Ctrl-V: Paste | LMB: Drag selected")
 
     def on_key_press(self, event):
-        """Handle keyboard shortcuts."""
-        # Enter: 2D/3D view toggle; Space: run/stop interactive FF
-        if event.key in ('Enter', 'Return'):
-            self.toggle_b2Dview()
-            event.handled = True
+        """Handle keyboard shortcuts — dispatches via ShortcutRegistry (SSOT)."""
+        from spammm.GUI.ShortcutRegistry import ShortcutRegistry
+        if ShortcutRegistry.dispatch(event, self):
             return
-        if event.key in ('Space', ' '):
-            self.toggle_run_simulation()
-            event.handled = True
-            return
-
-        selected = self.scene.get_selected_ids()
-
-        # Check for Control modifier (Vispy uses tuple of strings)
-        ctrl_pressed = 'Control' in event.modifiers if isinstance(event.modifiers, (tuple, list)) else False
-
-        # Ctrl-V works even without selection (paste from clipboard)
-        if event.key == 'V' and ctrl_pressed:
-            self.paste_copied_atoms()
-            return
-        # Ctrl-Z works even without selection (undo)
-        if event.key == 'Z' and ctrl_pressed:
-            self.undo()
-            return
-
-        # Numpad +/- changes ring size in Ring mode (synced with spinbox)
-        if self.edit_mode == 'Ring' and event.key in ('+', 'KP_ADD', '='):
-            val = int(self.ring_size_spinbox.value()) + 1
-            self.ring_size_spinbox.setValue(min(val, self.ring_size_spinbox.maximum()))
-            return
-        if self.edit_mode == 'Ring' and event.key in ('-', 'KP_SUBTRACT', '_'):
-            val = int(self.ring_size_spinbox.value()) - 1
-            self.ring_size_spinbox.setValue(max(val, self.ring_size_spinbox.minimum()))
-            return
-
-        if not selected:
-            return
-
-        # Delete key - remove selected atoms
-        if event.key == 'Delete':
-            self.delete_selected_atoms()
-        # Ctrl-C - copy selected atoms
-        elif event.key == 'C' and ctrl_pressed:
-            self.copy_selected_atoms()
 
     def delete_selected_atoms(self):
         """Delete currently selected atoms by Atom._id."""

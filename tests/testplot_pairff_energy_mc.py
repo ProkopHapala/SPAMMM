@@ -41,16 +41,22 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
+
+# Unbuffered stdout so progress prints flush immediately (USER rule: never run
+# a long script silently — user must see what is starting + progress + finish).
+sys.stdout.reconfigure(line_buffering=True)
 
 import matplotlib
 matplotlib.use('Agg')
+import warnings
+warnings.filterwarnings('ignore', message='Ignoring fixed .* limits', category=UserWarning)
 import matplotlib.pyplot as plt
 import numpy as np
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-from spammm import elements
 from spammm.AtomicSystem import AtomicSystem
 from spammm.forcefields.QEq import solve_from_elements
 from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF, _body_sites_world
@@ -61,8 +67,11 @@ from spammm.forcefields.molecule_loaders import (
     load_uracil, load_adenine, load_azaindol, load_tbtap,
     remap_fit_for_molecule, bonds_from_geom,
 )
-from spammm.plotUtils import plotAtoms, plotBonds
-from spammm.surfaces.FoldedRigid import load_fit, eval_folded_potential_grid, Z_SURF_TOP
+from spammm.surfaces.FoldedRigid import (
+    load_fit, save_fit, fit_folded_for_molecule,
+    Z_SURF_TOP, NACL_SUBSTRATE, load_substrate, replicate_substrate,
+)
+from spammm.surfaces.surface_plots import plot_assembly_on_substrate
 
 OUT_ROOT = os.path.join(REPO, 'debug', 'testplot_pairff_energy_mc')
 
@@ -148,79 +157,45 @@ def plot_energy(hist, path, title):
 
 
 def plot_assembly_on_faf(ax, packs, pos, quat, bonds0, title, charges=None, fit=None, z_eval=None,
-                          xlim=None, ylim=None, extent_pad=4.0, ngrid=120):
-    """Unified plot: FAF substrate heatmap + bonded skeleton + charge-colored atoms + CoM markers.
+                          xlim=None, ylim=None, extent_pad=4.0, ngrid=120,
+                          sub_apos=None, sub_enames=None, probe_type='auto'):
+    """Thin wrapper: resolve packs→real atoms, then delegate to the shared
+    surface_plots.plot_assembly_on_substrate (FAF heatmap + Na/Cl ions + molecule + CoM).
 
-    Uses plotUtils.plotBonds + plotUtils.plotAtoms (no reinvention).
-    If fit is None, draws only bonds+atoms (vacuum).
+    sub_apos/sub_enames: replicated substrate ions (load once in main, pass through).
+    probe_type: 'auto' (most-negative-Q FAF type → Na/Cl checkerboard visible),
+                int, or None.
     """
     apos, enames, bonds = assembly_real_atoms(packs, pos, quat, bonds0)
-    # Axis extent
-    all_xy = apos[:, :2]
-    pad = extent_pad
-    xmin, xmax = all_xy[:, 0].min() - pad, all_xy[:, 0].max() + pad
-    ymin, ymax = all_xy[:, 1].min() - pad, all_xy[:, 1].max() + pad
-    if xlim is not None: xmin, xmax = xlim
-    if ylim is not None: ymin, ymax = ylim
-
-    plt.sca(ax)
-    # 1) FAF substrate heatmap (if available)
-    if fit is not None and z_eval is not None:
-        at_ids = np.asarray(fit['atom_type_ids'], dtype=np.int32)
-        rep_type = int(np.bincount(at_ids).argmax())
-        xs = np.linspace(xmin, xmax, ngrid)
-        ys = np.linspace(ymin, ymax, ngrid)
-        V = eval_folded_potential_grid(fit, rep_type, xs, ys, z_eval)
-        im = ax.imshow(V, extent=(xmin, xmax, ymin, ymax), origin='lower', cmap='RdYlBu_r',
-                       aspect='equal', interpolation='bilinear', alpha=0.7)
-        plt.colorbar(im, ax=ax, fraction=0.04, pad=0.02, label=f'V_FAF(type {rep_type}) [eV]')
-
-    # 2) Bonded skeleton
-    if len(bonds):
-        plotBonds(links=bonds, ps=apos, axes=(0, 1), colors='#333333', lws=0.8)
-
-    # 3) Atoms — charge colored (red=negative, blue=positive) or element colored
-    if charges is not None:
-        q = np.asarray(charges)
-        norm = matplotlib.colors.TwoSlopeNorm(vmin=min(q.min(), -0.05), vcenter=0.0, vmax=max(q.max(), 0.05))
-        cmap = plt.cm.RdBu_r
-        colors = [cmap(norm(qi)) for qi in q]
-        sizes = [40.0 + 600.0 * abs(qi) for qi in q]
-    else:
-        colors = [elements.ELEMENT_DICT[e][8] for e in enames]
-        sizes = [elements.ELEMENT_DICT[e][6] * 90.0 for e in enames]
-    plotAtoms(apos=apos, es=enames, colors=colors, sizes=sizes, axes=(0, 1), marker='o')
-    if charges is not None:
-        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm); sm.set_array([])
-        plt.colorbar(sm, ax=ax, fraction=0.04, pad=0.02, label='Q [e]')
-
-    # 4) CoM markers
-    for j in range(len(packs)):
-        ax.plot(pos[j, 0], pos[j, 1], 'kx', ms=7, mew=1.0, zorder=5)
-
-    ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax)
-    ax.set_aspect('equal')
-    ax.set_title(title)
-    ax.set_xlabel('x [Å]'); ax.set_ylabel('y [Å]')
-    ax.grid(True, alpha=0.2)
-    return (xmin, xmax, ymin, ymax)
+    return plot_assembly_on_substrate(
+        ax, apos, enames, mol_bonds=bonds,
+        sub_apos=sub_apos, sub_enames=sub_enames,
+        fit=fit, z_eval=z_eval, probe_type=probe_type,
+        charges=charges, com_pos=pos,
+        title=title, xlim=xlim, ylim=ylim,
+        extent_pad=extent_pad, ngrid=ngrid,
+    )
 
 
 def plot_before_after(packs, pos0, quat0, pos1, quat1, bonds0, path, mol_name,
-                      charges=None, fit=None, z_eval=None):
+                      charges=None, fit=None, z_eval=None,
+                      sub_apos=None, sub_enames=None, probe_type='auto'):
     fig, axs = plt.subplots(1, 2, figsize=(14, 6))
     lims = plot_assembly_on_faf(axs[0], packs, pos0, quat0, bonds0, 'before',
-                                charges=charges, fit=fit, z_eval=z_eval)
+                                charges=charges, fit=fit, z_eval=z_eval,
+                                sub_apos=sub_apos, sub_enames=sub_enames, probe_type=probe_type)
     plot_assembly_on_faf(axs[1], packs, pos1, quat1, bonds0, 'after',
-                         charges=charges, fit=fit, z_eval=z_eval, xlim=lims[:2], ylim=lims[2:])
+                         charges=charges, fit=fit, z_eval=z_eval,
+                         sub_apos=sub_apos, sub_enames=sub_enames, probe_type=probe_type,
+                         xlim=lims[:2], ylim=lims[2:])
     fig.suptitle(f'{mol_name} PairFF+FAF greedy MC')
     fig.savefig(path, dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 
 def make_trajectory_gif(packs, frames, bonds0, path, mol_name, charges=None, fit=None, z_eval=None,
-                        fps=4, dpi=100):
-    """Animate the MC trajectory: FAF substrate + bonds + charge-colored atoms per frame."""
+                        fps=4, dpi=100, sub_apos=None, sub_enames=None, probe_type='auto'):
+    """Animate the MC trajectory: FAF substrate + Na/Cl ions + bonds + charge-colored atoms per frame."""
     from PIL import Image
     if len(frames) < 2:
         return
@@ -234,9 +209,12 @@ def make_trajectory_gif(packs, frames, bonds0, path, mol_name, charges=None, fit
     for label, pos, quat, E in frames:
         fig, ax = plt.subplots(figsize=(8, 7))
         plot_assembly_on_faf(ax, packs, pos, quat, bonds0, f'{mol_name}  {label}  E={E:.4f} eV',
-                             charges=charges, fit=fit, z_eval=z_eval, xlim=xlim, ylim=ylim)
+                             charges=charges, fit=fit, z_eval=z_eval, xlim=xlim, ylim=ylim,
+                             sub_apos=sub_apos, sub_enames=sub_enames, probe_type=probe_type)
         fig.canvas.draw()
-        pil_frames.append(Image.frombytes('RGB', fig.canvas.get_width_height(), fig.canvas.tostring_rgb()))
+        w, h = fig.canvas.get_width_height()
+        rgba = np.asarray(fig.canvas.buffer_rgba()).tobytes()
+        pil_frames.append(Image.frombytes('RGBA', (w, h), rgba).convert('RGB'))
         plt.close(fig)
     pil_frames[0].save(path, save_all=True, append_images=pil_frames[1:], duration=1000 // fps, loop=0)
 
@@ -260,6 +238,14 @@ def main():
     ap.add_argument('--no-qeq', action='store_true', help='keep XYZ charges (usually 0)')
     ap.add_argument('--no-faf', action='store_true', help='disable FAF substrate (vacuum)')
     ap.add_argument('--z-init', type=float, default=3.0, help='initial height above NaCl surface [Å]')
+    # Output control
+    ap.add_argument('--no-plot', action='store_true', help='skip all plotting (pure performance benchmark)')
+    ap.add_argument('--no-gif', action='store_true', help='skip GIF generation (keep before/after PNG only)')
+    # Verbosity / debugging
+    ap.add_argument('-v', '--verbosity', type=int, default=1, choices=[0, 1, 2, 3],
+                    help='0=silent, 1=accepted-only (default), 2=every-10-steps, 3=debug+timing')
+    ap.add_argument('--timing', action='store_true', help='print per-step ms breakdown (GPU vs Python)')
+    ap.add_argument('--profile', action='store_true', help='run cProfile on the MC loop, print top-20')
     args = ap.parse_args()
 
     mol_names = [m.strip() for m in args.mol.split(',')]
@@ -267,6 +253,7 @@ def main():
     mol_label = '+'.join(mol_names) if is_multi else mol_names[0]
     OUT = os.path.join(OUT_ROOT, mol_label.replace(',', '_'))
     os.makedirs(OUT, exist_ok=True)
+    print(f'=== MC assembly START  mol={mol_label}  nmol={args.nmol}  steps={args.steps}  ntrial={args.ntrial}  FAF={"off" if args.no_faf else "on"}  → {OUT}', flush=True)
 
     LOADERS = {
         'NTCDI':             lambda: load_ntcdi(),
@@ -311,6 +298,21 @@ def main():
             fit_path = FAF_FITS[mol_names[0]]
         else:
             fit_path = FAF_FIT_DEFAULT
+        # Auto-fit + cache if the fit file is missing (same pattern as
+        # demo_pairff._load_or_fit_faf / testplot_ptcda_nacl_replicas._ensure_fit).
+        if not os.path.isfile(fit_path):
+            # Auto-fit: use the species XYZ if available, else PTCDA.xyz (broad C,N,O,H).
+            # .mol2 files (e.g. NTCDI, TBTAP) can't be fit directly — fit_folded_for_molecule
+            # needs XYZ; the ptcdi/ptcda fit covers C,N,O,H and remap handles the rest.
+            mol_xyz = MOL_PATHS.get(mol_names[0] if not is_multi else 'PTCDA', MOL_PATHS['PTCDA'])
+            if not mol_xyz.endswith('.xyz'):
+                mol_xyz = MOL_PATHS['PTCDA']
+            print(f'FAF fit missing: {fit_path}  → fitting {mol_xyz} on NaCl (first run, ~10-60s)...', flush=True)
+            os.makedirs(os.path.dirname(fit_path) or '.', exist_ok=True)
+            t0 = time.perf_counter()
+            new_fit = fit_folded_for_molecule(mol_xyz, substrate_file=NACL_SUBSTRATE, z_range_rel=(1.5, 8.0))
+            save_fit(new_fit, fit_path)
+            print(f'  fit done in {time.perf_counter()-t0:.1f}s  ntypes={new_fit["coeffs"].shape[0]}  → {fit_path}')
         fit = load_fit(fit_path)
         # Remap each species and concatenate atom_type_ids
         at_ids_parts = []
@@ -332,6 +334,21 @@ def main():
         print(f'FAF: loaded {fit_path}  ntypes={fit["coeffs"].shape[0]}  '
               f'nbasis={fit["coeffs"].shape[1]}  z_mol={z_mol:.2f} Å  '
               f'total_atom_type_ids={fit["atom_type_ids"].shape[0]}')
+
+    # Substrate ions (Na/Cl) for visualization — load + replicate to the grid extent.
+    # Loaded once here, threaded through plot_before_after / make_trajectory_gif so the
+    # Na/Cl checkerboard is drawn (shared plot_assembly_on_substrate in surface_plots).
+    sub_apos = sub_enames = None
+    if fit is not None:
+        sub_apos0, sub_en0, _, sub_lvec = load_substrate(NACL_SUBSTRATE)
+        # Replicate only to the molecule grid extent + padding (NOT 10x larger).
+        # Grid spans (nx-1)*spacing where nx=ceil(sqrt(nmol)); add 8 Å view margin.
+        nx = int(np.ceil(np.sqrt(args.nmol * len(species))))
+        grid_span = args.spacing * (nx - 1) * 0.5 + 8.0
+        extent_xy = (-grid_span, grid_span)
+        sub_apos, sub_enames = replicate_substrate(sub_apos0, sub_en0, sub_lvec,
+                                                   extent_xy, extent_xy, z_min=Z_SURF_TOP - 1.5)
+        print(f'substrate: {len(sub_enames)} ions replicated to extent {extent_xy}', flush=True)
 
     # Grid positions — interleave species for better mixing
     pos = grid_pos(n_total, args.spacing, z=z_mol)
@@ -381,24 +398,32 @@ def main():
 
     frames = [('initial', pos0.copy(), quat0.copy(), hist[0])]
     pos, quat = ensemble.get_poses()  # working copies read from ensemble
+    t_gpu_total = 0.0; t_step_total = 0.0
     for step in range(args.steps):
         moved = [step % n_total]
+        t_step0 = time.perf_counter()
         pos, quat, E0, Ebest, acc, Ebatch = rbd.greedy_energy_step(
             pos, quat, moved, n_trial=args.ntrial, dxy=args.dxy, dphi=args.dphi,
             seed=args.seed + 1000 + step, rmin_com=args.rmin, rmin_atom=args.rmin_atom,
             k_pack=args.k_pack,
         )
+        t_step_total += time.perf_counter() - t_step0
         if acc:
             n_acc += 1
             ensemble.set_poses(pos, quat)  # write accepted poses back to ensemble
+        # Full system energy (greedy_energy_step returns only active-mol channels;
+        # eval_energy_system sums ALL molecules for the history trajectory).
         E = rbd.eval_energy_system(pos, quat, k_pack=args.k_pack)
         hist.append(E)
         if acc or step % 50 == 0:
             frames.append((f'step{step:04d}', pos.copy(), quat.copy(), E))
         finite = Ebatch[np.isfinite(Ebatch)]
-        if step % 50 == 0 or acc:
-            print(f'  step {step:04d} moved={moved[0]}  E={E:10.5f}  dE_trial={Ebest-E0:10.5f}  '
-                  f'acc={int(acc)}  batch_min={finite.min():.5f}')
+        if acc and args.verbosity >= 1:
+            dE = E - hist[-2] if len(hist) >= 2 else 0.0
+            print(f'  step {step:04d} moved={moved[0]}  E={E:10.5f}  dE={dE:+.5f}  '
+                  f'acc=✓  batch_min={finite.min():.5f}', flush=True)
+        elif args.verbosity >= 2 and step % 10 == 0:
+            print(f'  step {step:04d}  E={E:10.5f}  acc=✗', flush=True)
 
     frames.append(('final', pos.copy(), quat.copy(), hist[-1]))
     write_xyz(os.path.join(OUT, 'after.xyz'), rbd._mb_packs, pos, quat, comment=f'E={E:.6f}')
@@ -421,12 +446,20 @@ def main():
     traj_gif = os.path.join(OUT, 'trajectory.gif')
     faf_label = '+FAF' if fit else ''
     z_eval = z_mol if fit is not None else None
-    plot_energy(hist, e_png, f'Greedy PairFF{faf_label}+pack ({mol_label}, k_pack={args.k_pack})')
-    plot_before_after(rbd._mb_packs, pos0, quat0, pos, quat, bonds0, ba_png, mol_label,
-                      charges=charges_all, fit=fit, z_eval=z_eval)
-    print('Generating trajectory GIF...')
-    make_trajectory_gif(rbd._mb_packs, frames, bonds0, traj_gif, mol_label,
-                        charges=charges_all, fit=fit, z_eval=z_eval)
+    if not args.no_plot:
+        plot_energy(hist, e_png, f'Greedy PairFF{faf_label}+pack ({mol_label}, k_pack={args.k_pack})')
+        plot_before_after(rbd._mb_packs, pos0, quat0, pos, quat, bonds0, ba_png, mol_label,
+                          charges=charges_all, fit=fit, z_eval=z_eval,
+                          sub_apos=sub_apos, sub_enames=sub_enames)
+        if not args.no_gif:
+            print('Generating trajectory GIF...', flush=True)
+            make_trajectory_gif(rbd._mb_packs, frames, bonds0, traj_gif, mol_label,
+                                charges=charges_all, fit=fit, z_eval=z_eval,
+                                sub_apos=sub_apos, sub_enames=sub_enames)
+        else:
+            print('Skipping GIF (--no-gif).', flush=True)
+    else:
+        print('Skipping all plots (--no-plot).', flush=True)
 
     # Inter-mol contact stats (per-pack atom counts — multi-species safe)
     apos_f, _, _ = assembly_real_atoms(rbd._mb_packs, pos, quat, bonds0)
@@ -457,6 +490,10 @@ def main():
         f.write(f'pos_final=\n{pos}\n')
 
     print(f'\nE_final = {hist[-1]:.6f} eV  (ΔE = {hist[-1]-hist[0]:.6f})  accepted {n_acc}/{args.steps}')
+    print(f'=== MC assembly DONE  mol={mol_label}  E: {hist[0]:.4f} → {hist[-1]:.4f} eV  ({n_acc}/{args.steps} accepted)  → {OUT}', flush=True)
+    if args.timing or args.verbosity >= 3:
+        avg_ms = t_step_total / max(args.steps, 1) * 1000
+        print(f'TIMING: avg {avg_ms:.2f} ms/step  total {t_step_total:.2f}s  ({args.steps} steps, {args.ntrial} trials/step)', flush=True)
     print('min inter-mol:', ', '.join(f'{i}-{j}:{d:.2f}' for i, j, d in mins))
     print(f'charges: min={charges_all.min():.3f} max={charges_all.max():.3f}')
     print(f'REVIEW: {out_txt}')

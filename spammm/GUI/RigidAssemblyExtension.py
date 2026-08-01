@@ -52,6 +52,7 @@ import numpy as np
 from PyQt5 import QtWidgets, QtCore
 
 from .ExtensionManager import UIComponents
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
 from .EditModeHandlers import EditModeHandler
 from .CollapsibleSection import CollapsibleSection
 
@@ -539,8 +540,7 @@ def build_ui(window):
     """Build the Rigid Assembly extension panel."""
     panel = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(panel)
-    layout.setSpacing(2)
-    layout.setContentsMargins(2, 2, 2, 2)
+    apply_tight(layout)
 
     # State defaults
     window.ra_ensemble = None
@@ -557,7 +557,7 @@ def build_ui(window):
     build_sec = CollapsibleSection("Build Assembly", collapsed=False)
     build_host = QtWidgets.QWidget()
     build_l = QtWidgets.QVBoxLayout(build_host)
-    build_l.setSpacing(2)
+    build_l.setSpacing(SPACING)
 
     # Source selector: "From file" (load pre-defined molecule) vs "From editor" (split graph)
     src_row = QtWidgets.QHBoxLayout()
@@ -578,16 +578,16 @@ def build_ui(window):
     row0.addWidget(window.ra_mol_combo)
     window.ra_nmol_spin = QtWidgets.QSpinBox(); window.ra_nmol_spin.setRange(1, 64); window.ra_nmol_spin.setValue(4); window.ra_nmol_spin.setMaximumWidth(50)
     row0.addWidget(QtWidgets.QLabel('nmol:')); row0.addWidget(window.ra_nmol_spin)
-    window.ra_spacing_spin = QtWidgets.QDoubleSpinBox(); window.ra_spacing_spin.setRange(2.0, 50.0); window.ra_spacing_spin.setValue(16.0); window.ra_spacing_spin.setMaximumWidth(60)
+    window.ra_spacing_spin = QtWidgets.QDoubleSpinBox(); window.ra_spacing_spin.setRange(2.0, 50.0); window.ra_spacing_spin.setValue(16.0); window.ra_spacing_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_spacing_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     row0.addWidget(QtWidgets.QLabel('spacing:')); row0.addWidget(window.ra_spacing_spin)
     build_l.addLayout(row0)
 
     row1 = QtWidgets.QHBoxLayout()
-    window.ra_z_spin = QtWidgets.QDoubleSpinBox(); window.ra_z_spin.setRange(-5.0, 20.0); window.ra_z_spin.setSingleStep(0.1); window.ra_z_spin.setValue(3.0); window.ra_z_spin.setMaximumWidth(60)
+    window.ra_z_spin = QtWidgets.QDoubleSpinBox(); window.ra_z_spin.setRange(-5.0, 20.0); window.ra_z_spin.setSingleStep(0.1); window.ra_z_spin.setValue(3.0); window.ra_z_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_z_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     row1.addWidget(QtWidgets.QLabel('z_mol:')); row1.addWidget(window.ra_z_spin)
-    window.ra_z_init_spin = QtWidgets.QDoubleSpinBox(); window.ra_z_init_spin.setRange(0.0, 10.0); window.ra_z_init_spin.setSingleStep(0.1); window.ra_z_init_spin.setValue(3.0); window.ra_z_init_spin.setMaximumWidth(60)
+    window.ra_z_init_spin = QtWidgets.QDoubleSpinBox(); window.ra_z_init_spin.setRange(0.0, 10.0); window.ra_z_init_spin.setSingleStep(0.1); window.ra_z_init_spin.setValue(3.0); window.ra_z_init_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_z_init_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     row1.addWidget(QtWidgets.QLabel('z_init:')); row1.addWidget(window.ra_z_init_spin)
-    window.ra_seed_spin = QtWidgets.QSpinBox(); window.ra_seed_spin.setRange(0, 100000); window.ra_seed_spin.setValue(3); window.ra_seed_spin.setMaximumWidth(60)
+    window.ra_seed_spin = QtWidgets.QSpinBox(); window.ra_seed_spin.setRange(0, 100000); window.ra_seed_spin.setValue(3); window.ra_seed_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_seed_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     row1.addWidget(QtWidgets.QLabel('seed:')); row1.addWidget(window.ra_seed_spin)
     build_l.addLayout(row1)
 
@@ -606,23 +606,23 @@ def build_ui(window):
     mc_sec = CollapsibleSection("MC / GA Optimization", collapsed=False)
     mc_host = QtWidgets.QWidget()
     mc_l = QtWidgets.QVBoxLayout(mc_host)
-    mc_l.setSpacing(2)
+    mc_l.setSpacing(SPACING)
 
     mc_row1 = QtWidgets.QHBoxLayout()
-    window.ra_ntrial_spin = QtWidgets.QSpinBox(); window.ra_ntrial_spin.setRange(1, 4096); window.ra_ntrial_spin.setValue(128); window.ra_ntrial_spin.setMaximumWidth(60)
+    window.ra_ntrial_spin = QtWidgets.QSpinBox(); window.ra_ntrial_spin.setRange(1, 4096); window.ra_ntrial_spin.setValue(128); window.ra_ntrial_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_ntrial_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     mc_row1.addWidget(QtWidgets.QLabel('n_trial:')); mc_row1.addWidget(window.ra_ntrial_spin)
-    window.ra_dxy_spin = QtWidgets.QDoubleSpinBox(); window.ra_dxy_spin.setRange(0.01, 10.0); window.ra_dxy_spin.setSingleStep(0.1); window.ra_dxy_spin.setValue(1.5); window.ra_dxy_spin.setMaximumWidth(60)
+    window.ra_dxy_spin = QtWidgets.QDoubleSpinBox(); window.ra_dxy_spin.setRange(0.01, 10.0); window.ra_dxy_spin.setSingleStep(0.1); window.ra_dxy_spin.setValue(1.5); window.ra_dxy_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_dxy_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     mc_row1.addWidget(QtWidgets.QLabel('dxy:')); mc_row1.addWidget(window.ra_dxy_spin)
-    window.ra_dphi_spin = QtWidgets.QDoubleSpinBox(); window.ra_dphi_spin.setRange(0.01, 3.0); window.ra_dphi_spin.setSingleStep(0.05); window.ra_dphi_spin.setValue(0.8); window.ra_dphi_spin.setMaximumWidth(60)
+    window.ra_dphi_spin = QtWidgets.QDoubleSpinBox(); window.ra_dphi_spin.setRange(0.01, 3.0); window.ra_dphi_spin.setSingleStep(0.05); window.ra_dphi_spin.setValue(0.8); window.ra_dphi_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_dphi_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     mc_row1.addWidget(QtWidgets.QLabel('dphi:')); mc_row1.addWidget(window.ra_dphi_spin)
     mc_l.addLayout(mc_row1)
 
     mc_row2 = QtWidgets.QHBoxLayout()
-    window.ra_kpack_spin = QtWidgets.QDoubleSpinBox(); window.ra_kpack_spin.setRange(0.0, 1.0); window.ra_kpack_spin.setSingleStep(0.01); window.ra_kpack_spin.setValue(0.03); window.ra_kpack_spin.setMaximumWidth(60)
+    window.ra_kpack_spin = QtWidgets.QDoubleSpinBox(); window.ra_kpack_spin.setRange(0.0, 1.0); window.ra_kpack_spin.setSingleStep(0.01); window.ra_kpack_spin.setValue(0.03); window.ra_kpack_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_kpack_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     mc_row2.addWidget(QtWidgets.QLabel('k_pack:')); mc_row2.addWidget(window.ra_kpack_spin)
-    window.ra_rmin_atom_spin = QtWidgets.QDoubleSpinBox(); window.ra_rmin_atom_spin.setRange(0.0, 5.0); window.ra_rmin_atom_spin.setSingleStep(0.1); window.ra_rmin_atom_spin.setValue(1.6); window.ra_rmin_atom_spin.setMaximumWidth(60)
+    window.ra_rmin_atom_spin = QtWidgets.QDoubleSpinBox(); window.ra_rmin_atom_spin.setRange(0.0, 5.0); window.ra_rmin_atom_spin.setSingleStep(0.1); window.ra_rmin_atom_spin.setValue(1.6); window.ra_rmin_atom_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_rmin_atom_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     mc_row2.addWidget(QtWidgets.QLabel('rmin_atom:')); mc_row2.addWidget(window.ra_rmin_atom_spin)
-    window.ra_mc_nsteps_spin = QtWidgets.QSpinBox(); window.ra_mc_nsteps_spin.setRange(1, 100000); window.ra_mc_nsteps_spin.setValue(50); window.ra_mc_nsteps_spin.setMaximumWidth(60)
+    window.ra_mc_nsteps_spin = QtWidgets.QSpinBox(); window.ra_mc_nsteps_spin.setRange(1, 100000); window.ra_mc_nsteps_spin.setValue(50); window.ra_mc_nsteps_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_mc_nsteps_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     mc_row2.addWidget(QtWidgets.QLabel('n_steps:')); mc_row2.addWidget(window.ra_mc_nsteps_spin)
     mc_l.addLayout(mc_row2)
 
@@ -645,13 +645,13 @@ def build_ui(window):
     drag_sec = CollapsibleSection("Drag (anchor spring)", collapsed=True)
     drag_host = QtWidgets.QWidget()
     drag_l = QtWidgets.QVBoxLayout(drag_host)
-    drag_l.setSpacing(2)
+    drag_l.setSpacing(SPACING)
     drag_row = QtWidgets.QHBoxLayout()
-    window.ra_k_spring_spin = QtWidgets.QDoubleSpinBox(); window.ra_k_spring_spin.setRange(0.01, 1000.0); window.ra_k_spring_spin.setSingleStep(0.5); window.ra_k_spring_spin.setValue(20.0); window.ra_k_spring_spin.setMaximumWidth(70)
+    window.ra_k_spring_spin = QtWidgets.QDoubleSpinBox(); window.ra_k_spring_spin.setRange(0.01, 1000.0); window.ra_k_spring_spin.setSingleStep(0.5); window.ra_k_spring_spin.setValue(20.0); window.ra_k_spring_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_k_spring_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     drag_row.addWidget(QtWidgets.QLabel('k_spring:')); drag_row.addWidget(window.ra_k_spring_spin)
-    window.ra_drag_nrelax_spin = QtWidgets.QSpinBox(); window.ra_drag_nrelax_spin.setRange(0, 500); window.ra_drag_nrelax_spin.setValue(20); window.ra_drag_nrelax_spin.setMaximumWidth(60)
+    window.ra_drag_nrelax_spin = QtWidgets.QSpinBox(); window.ra_drag_nrelax_spin.setRange(0, 500); window.ra_drag_nrelax_spin.setValue(20); window.ra_drag_nrelax_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_drag_nrelax_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     drag_row.addWidget(QtWidgets.QLabel('n_relax:')); drag_row.addWidget(window.ra_drag_nrelax_spin)
-    window.ra_drag_dt_spin = QtWidgets.QDoubleSpinBox(); window.ra_drag_dt_spin.setRange(0.0001, 0.5); window.ra_drag_dt_spin.setSingleStep(0.005); window.ra_drag_dt_spin.setValue(0.02); window.ra_drag_dt_spin.setMaximumWidth(60)
+    window.ra_drag_dt_spin = QtWidgets.QDoubleSpinBox(); window.ra_drag_dt_spin.setRange(0.0001, 0.5); window.ra_drag_dt_spin.setSingleStep(0.005); window.ra_drag_dt_spin.setValue(0.02); window.ra_drag_dt_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.ra_drag_dt_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     drag_row.addWidget(QtWidgets.QLabel('dt:')); drag_row.addWidget(window.ra_drag_dt_spin)
     drag_l.addLayout(drag_row)
     drag_hint = QtWidgets.QLabel('Activate "RA Drag" edit mode (toolbar), then LMB drag atoms in the scene.')
@@ -664,7 +664,7 @@ def build_ui(window):
     pme_sec = CollapsibleSection("PME (Charge Rings)", collapsed=True)
     pme_host = QtWidgets.QWidget()
     pme_l = QtWidgets.QVBoxLayout(pme_host)
-    pme_l.setSpacing(2)
+    pme_l.setSpacing(SPACING)
 
     def _pme_spin(key, lo, hi, step, val, decimals=3, width=60):
         s = QtWidgets.QDoubleSpinBox(); s.setRange(lo, hi); s.setSingleStep(step); s.setDecimals(decimals); s.setValue(val); s.setMaximumWidth(width)
@@ -689,7 +689,7 @@ def build_ui(window):
     pme_row3.addWidget(QtWidgets.QLabel('decay:')); pme_row3.addWidget(_pme_spin('decay', 0.05, 2.0, 0.05, 0.5))
     pme_row3.addWidget(QtWidgets.QLabel('L:')); pme_row3.addWidget(_pme_spin('L', 5.0, 40.0, 1.0, 20.0, decimals=1))
     pme_row3.addWidget(QtWidgets.QLabel('npix:')); 
-    npix_s = QtWidgets.QSpinBox(); npix_s.setRange(20, 200); npix_s.setValue(80); npix_s.setMaximumWidth(60)
+    npix_s = QtWidgets.QSpinBox(); npix_s.setRange(20, 200); npix_s.setValue(80); npix_s.setMaximumWidth(SPIN_MAX_WIDTH); npix_s.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.ra_pme_npix_spin = npix_s
     pme_row3.addWidget(npix_s)
     pme_l.addLayout(pme_row3)

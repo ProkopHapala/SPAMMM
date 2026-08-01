@@ -22,6 +22,7 @@ import numpy as np
 from PyQt5 import QtWidgets, QtCore
 from spammm.GUI.CollapsibleSection import CollapsibleSection
 from spammm.GUI.ExtensionManager import UIComponents
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
 
 
 # ============================================================
@@ -1320,8 +1321,7 @@ def build_ui(window):
     """Build AFM panel for KekuleExplorerGUI."""
     panel = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(panel)
-    layout.setSpacing(3)
-    layout.setContentsMargins(2, 2, 2, 2)
+    apply_tight(layout)
 
     # --- State variables ---
     window._afm_density   = None
@@ -1404,7 +1404,7 @@ def build_ui(window):
     param_sec = CollapsibleSection("Parameters", collapsed=True, parent=panel)
     param_widget = QtWidgets.QWidget()
     param_layout = QtWidgets.QVBoxLayout(param_widget)
-    param_layout.setSpacing(2)
+    param_layout.setSpacing(SPACING)
     param_layout.setContentsMargins(0, 0, 0, 0)
 
     density_group = QtWidgets.QGroupBox("Density / Grid")
@@ -1572,7 +1572,7 @@ def build_ui(window):
     viz_sec = CollapsibleSection("Visualization", collapsed=True, parent=panel)
     viz_widget = QtWidgets.QWidget()
     viz_layout = QtWidgets.QVBoxLayout(viz_widget)
-    viz_layout.setSpacing(2)
+    viz_layout.setSpacing(SPACING)
 
     window.afm_component_combo = QtWidgets.QComboBox()
     window.afm_component_combo.addItems([

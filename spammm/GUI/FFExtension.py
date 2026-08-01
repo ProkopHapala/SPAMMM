@@ -21,6 +21,7 @@ import numpy as np
 
 from ..forcefields.FFController import FFController, DEFAULT_DT, DEFAULT_DAMP, DEFAULT_FLIMIT
 from .ExtensionManager import UIComponents
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
 
 
 def build_ui(window):
@@ -30,8 +31,7 @@ def build_ui(window):
     """
     panel = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(panel)
-    layout.setSpacing(2)
-    layout.setContentsMargins(2, 2, 2, 2)
+    apply_tight(layout)
 
     # Create controller instance on the window
     if not hasattr(window, 'ff_controller'):
@@ -45,7 +45,7 @@ def build_ui(window):
     window.relax_ff_combo.setMaximumWidth(60)
     row1.addWidget(window.relax_ff_combo)
     window.relax_build_btn = QtWidgets.QPushButton("Build")
-    window.relax_build_btn.setMaximumWidth(80)
+    window.relax_build_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.relax_build_btn.clicked.connect(lambda: _on_build_ff(window))
     row1.addWidget(window.relax_build_btn)
     row1.addStretch()
@@ -57,10 +57,10 @@ def build_ui(window):
     window.relax_steps_spin = QtWidgets.QSpinBox()
     window.relax_steps_spin.setRange(1, 100000)
     window.relax_steps_spin.setValue(100)
-    window.relax_steps_spin.setMaximumWidth(70)
+    window.relax_steps_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.relax_steps_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     row2.addWidget(window.relax_steps_spin)
     window.relax_step_btn = QtWidgets.QPushButton("Step")
-    window.relax_step_btn.setMaximumWidth(60)
+    window.relax_step_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.relax_step_btn.clicked.connect(lambda: _on_step(window))
     row2.addWidget(window.relax_step_btn)
     row2.addStretch()
@@ -73,14 +73,14 @@ def build_ui(window):
     window.relax_dt_spin.setRange(0.001, 1.0)
     window.relax_dt_spin.setSingleStep(0.005)
     window.relax_dt_spin.setValue(DEFAULT_DT)
-    window.relax_dt_spin.setMaximumWidth(70)
+    window.relax_dt_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.relax_dt_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     row3.addWidget(window.relax_dt_spin)
     row3.addWidget(QtWidgets.QLabel("damp:"))
     window.relax_damp_spin = QtWidgets.QDoubleSpinBox()
     window.relax_damp_spin.setRange(0.0, 1.0)
     window.relax_damp_spin.setSingleStep(0.05)
     window.relax_damp_spin.setValue(DEFAULT_DAMP)
-    window.relax_damp_spin.setMaximumWidth(70)
+    window.relax_damp_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.relax_damp_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     row3.addWidget(window.relax_damp_spin)
     row3.addStretch()
     layout.addLayout(row3)
@@ -88,12 +88,13 @@ def build_ui(window):
     # --- Row 4: Relax + Interactive + Serial checkbox ---
     row4 = QtWidgets.QHBoxLayout()
     window.relax_run_btn = QtWidgets.QPushButton("Relax")
-    window.relax_run_btn.setMaximumWidth(70)
+    window.relax_run_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.relax_run_btn.clicked.connect(lambda: _on_relax(window))
     row4.addWidget(window.relax_run_btn)
-    window.relax_interactive_btn = QtWidgets.QPushButton("Interactive")
+    from .ShortcutRegistry import encode_keystroke
+    window.relax_interactive_btn = QtWidgets.QPushButton(f"Interactive [{encode_keystroke('Space')}]")
     window.relax_interactive_btn.setCheckable(True)
-    window.relax_interactive_btn.setMaximumWidth(90)
+    window.relax_interactive_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.relax_interactive_btn.clicked.connect(lambda checked: _on_interactive(window, checked))
     row4.addWidget(window.relax_interactive_btn)
     window.relax_serial_chk = QtWidgets.QCheckBox("Serial")
@@ -121,12 +122,12 @@ def build_ui(window):
     # --- Pin controls ---
     row_pin = QtWidgets.QHBoxLayout()
     window.relax_pin_btn = QtWidgets.QPushButton("Pin Sel")
-    window.relax_pin_btn.setMaximumWidth(60)
+    window.relax_pin_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.relax_pin_btn.setEnabled(False)
     window.relax_pin_btn.clicked.connect(lambda: _on_pin_selected(window))
     row_pin.addWidget(window.relax_pin_btn)
     window.relax_unpin_btn = QtWidgets.QPushButton("Unpin All")
-    window.relax_unpin_btn.setMaximumWidth(70)
+    window.relax_unpin_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.relax_unpin_btn.setEnabled(False)
     window.relax_unpin_btn.clicked.connect(lambda: _on_unpin_all(window))
     row_pin.addWidget(window.relax_unpin_btn)
@@ -442,12 +443,12 @@ def _on_interactive(window, checked):
         ctrl.md.set_md_params(dt=dt, damp=damp, Flimit=DEFAULT_FLIMIT)
         window._relax_timer.start(30)  # ~30ms = ~33fps
         window.relax_status_label.setText("Status: Interactive ON")
-        window.relax_interactive_btn.setText("Stop Interactive")
+        window.relax_interactive_btn.setText(f"Stop Interactive [{encode_keystroke('Space')}]")
     else:
         if hasattr(window, '_relax_timer'):
             window._relax_timer.stop()
         window.relax_status_label.setText("Status: Interactive OFF")
-        window.relax_interactive_btn.setText("Interactive")
+        window.relax_interactive_btn.setText(f"Interactive [{encode_keystroke('Space')}]")
 
 
 def _interactive_tick(window):
@@ -485,7 +486,7 @@ def _interactive_tick(window):
             window._relax_timer.stop()
         window.relax_status_label.setText(f"Status: Interactive ERROR: {e}")
         window.relax_interactive_btn.setChecked(False)
-        window.relax_interactive_btn.setText("Interactive")
+        window.relax_interactive_btn.setText(f"Interactive [{encode_keystroke('Space')}]")
         import traceback; traceback.print_exc()
 
 

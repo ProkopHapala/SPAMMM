@@ -12,6 +12,7 @@ from PyQt5 import QtWidgets, QtCore
 import numpy as np
 
 from .ExtensionManager import UIComponents
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
 from spammm.topology.KekulePure import run_kekule_solver, localize_kekule, make_n_pi
 
 
@@ -22,8 +23,7 @@ def build_ui(window):
     """
     panel = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(panel)
-    layout.setSpacing(2)
-    layout.setContentsMargins(2, 2, 2, 2)
+    apply_tight(layout)
 
     # --- Row 4: Kekule solver parameters ---
     row4 = QtWidgets.QHBoxLayout()
@@ -31,20 +31,20 @@ def build_ui(window):
     window.kek_kval_spin = QtWidgets.QDoubleSpinBox()
     window.kek_kval_spin.setRange(0.1, 1000.0)
     window.kek_kval_spin.setValue(50.0)
-    window.kek_kval_spin.setMaximumWidth(60)
+    window.kek_kval_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.kek_kval_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     row4.addWidget(window.kek_kval_spin)
     row4.addWidget(QtWidgets.QLabel("Kloc:"))
     window.kek_kloc_spin = QtWidgets.QDoubleSpinBox()
     window.kek_kloc_spin.setRange(0.0, 100.0)
     window.kek_kloc_spin.setValue(5.0)
-    window.kek_kloc_spin.setMaximumWidth(60)
+    window.kek_kloc_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.kek_kloc_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     row4.addWidget(window.kek_kloc_spin)
     row4.addWidget(QtWidgets.QLabel("Karo:"))
     window.kek_karo_spin = QtWidgets.QDoubleSpinBox()
     window.kek_karo_spin.setRange(0.0, 10.0)
     window.kek_karo_spin.setSingleStep(0.1)
     window.kek_karo_spin.setValue(0.5)
-    window.kek_karo_spin.setMaximumWidth(60)
+    window.kek_karo_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.kek_karo_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     row4.addWidget(window.kek_karo_spin)
     row4.addStretch()
     layout.addLayout(row4)
@@ -55,11 +55,11 @@ def build_ui(window):
     window.kek_aromatic_chk.setChecked(True)
     row5.addWidget(window.kek_aromatic_chk)
     window.kek_solve_btn = QtWidgets.QPushButton("Solve")
-    window.kek_solve_btn.setMaximumWidth(90)
+    window.kek_solve_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.kek_solve_btn.clicked.connect(lambda: _on_solve(window))
     row5.addWidget(window.kek_solve_btn)
     window.kek_solve_current_btn = QtWidgets.QPushButton("Solve Current")
-    window.kek_solve_current_btn.setMaximumWidth(100)
+    window.kek_solve_current_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.kek_solve_current_btn.clicked.connect(lambda: _on_solve_current(window))
     row5.addWidget(window.kek_solve_current_btn)
     row5.addStretch()
@@ -68,7 +68,7 @@ def build_ui(window):
     # --- Row 5b: Localize (phase 2) + sym_break noise + seed ---
     row5b = QtWidgets.QHBoxLayout()
     window.kek_localize_btn = QtWidgets.QPushButton("Localize")
-    window.kek_localize_btn.setMaximumWidth(80)
+    window.kek_localize_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.kek_localize_btn.setToolTip("Run localization (phase 2): snap delocalized bond orders to integer (0/1) or aromatic (0.5)")
     window.kek_localize_btn.clicked.connect(lambda: _on_localize(window))
     row5b.addWidget(window.kek_localize_btn)
@@ -84,10 +84,10 @@ def build_ui(window):
     window.kek_seed_spin = QtWidgets.QSpinBox()
     window.kek_seed_spin.setRange(0, 999999)
     window.kek_seed_spin.setValue(42)
-    window.kek_seed_spin.setMaximumWidth(60)
+    window.kek_seed_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.kek_seed_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     row5b.addWidget(window.kek_seed_spin)
     window.kek_newseed_btn = QtWidgets.QPushButton("New")
-    window.kek_newseed_btn.setMaximumWidth(50)
+    window.kek_newseed_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.kek_newseed_btn.setToolTip("Generate a random seed")
     window.kek_newseed_btn.clicked.connect(lambda: window.kek_seed_spin.setValue(np.random.randint(1, 999999)))
     row5b.addWidget(window.kek_newseed_btn)

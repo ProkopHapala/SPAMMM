@@ -11,6 +11,7 @@ from PyQt5 import QtWidgets, QtCore
 import numpy as np
 
 from .ExtensionManager import UIComponents
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
 from spammm.forcefields.QEq import solve, solve_cholesky, solve_lu, KE
 from spammm.topology.FFparams import read_element_types
 import os
@@ -25,8 +26,7 @@ def build_ui(window):
     """
     panel = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(panel)
-    layout.setSpacing(2)
-    layout.setContentsMargins(2, 2, 2, 2)
+    apply_tight(layout)
 
     # --- Method selector ---
     row1 = QtWidgets.QHBoxLayout()
@@ -62,7 +62,7 @@ def build_ui(window):
     window.qeq_esp_z_spin.setRange(-10.0, 20.0)
     window.qeq_esp_z_spin.setSingleStep(0.5)
     window.qeq_esp_z_spin.setValue(3.0)
-    window.qeq_esp_z_spin.setMaximumWidth(60)
+    window.qeq_esp_z_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.qeq_esp_z_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     row_esp.addWidget(window.qeq_esp_z_spin)
     window.qeq_plot_esp_btn = QtWidgets.QPushButton("Plot ESP")
     window.qeq_plot_esp_btn.clicked.connect(lambda: _on_plot_esp(window))

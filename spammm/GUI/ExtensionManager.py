@@ -22,6 +22,7 @@ extensions and raises a loud error on any attribute access.
 """
 
 import importlib, os, json, traceback
+from PyQt5 import QtWidgets
 
 # ---------------------------------------------------------------------------
 # Exceptions

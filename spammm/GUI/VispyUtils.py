@@ -367,7 +367,28 @@ class AtomScene(QtCore.QObject):
         self.canvas.events.mouse_wheel.connect(self._on_mouse_wheel)
         self.canvas.events.key_press.connect(self._on_key_press)
 
+        self._register_camera_shortcuts()
         self._apply_camera_mode()
+
+    def _register_camera_shortcuts(self):
+        """Register camera shortcuts as documentation-only (callback=None).
+
+        Dispatch stays in _on_key_press (direction-dependent pan/rotate logic),
+        but these entries appear in help/cheatsheet auto-generation.
+        """
+        from spammm.GUI.ShortcutRegistry import ShortcutRegistry
+        ShortcutRegistry.register(
+            ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Up', 'Down', 'Left', 'Right'],
+            description="2D: pan · 3D: rotate view", group="Camera")
+        ShortcutRegistry.register(
+            ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'],
+            modifiers=('Shift',),
+            description="Pan (both 2D and 3D modes)", group="Camera")
+        ShortcutRegistry.register('Scroll', description="Zoom in/out", group="Camera")
+        for key, name in [('5', 'Top'), ('2', 'Front'), ('8', 'Back'), ('4', 'Left'), ('6', 'Right'), ('0', 'Bottom')]:
+            ShortcutRegistry.register([key, f'KP_{key}'],
+                                      description=f"{name} view" + (" (3D only)" if key != '5' else " — default"),
+                                      group="Camera")
 
     @property
     def widget(self):

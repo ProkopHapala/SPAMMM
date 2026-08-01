@@ -36,9 +36,14 @@ SPAMMM (Scanning Probe Accelerated Modeling of Microscopy and Manipulation) is a
 
 ## Performance & Languages
 
+* **GUI layout: maximally tight.** Zero margins, minimal spacing, widgets only as wide as their content (Maximum size policy). Side panel width-limited, does not push canvas. As many controls as possible in limited area — no wasted space. See `doc/Tasks/GUI_TightLayout.md`.
+
 * Minimize Python orchestration; push compute to OpenCL kernels. Flat arrays, cache-aware, preallocate. See skill:`python-perf`, skill:`port-to-opencl`.
 * GPU/OpenCL : memory latency, gather over scatter, local memory, minimize host-device transfers. See skill:`gpu-optimize`.
 * **OpenCL device:** always prefer **NVIDIA GPU** (`OpenCLBase.select_device(preferred_vendor='nvidia')`). Never report PoCL/CPU timings as GPU. Agents must run OpenCL Shell commands unrestricted (`all`) so the NVIDIA ICD is visible — see `doc/AGENTS/notes/opencl-nvidia-device.md` and `.cursor/rules/opencl-nvidia-gpu.mdc`.
+* **Python is the harness, not the engine** (skill:`python-perf`). NEVER write hot loops in Python — batch via NumPy or push to OpenCL. Per-atom `ax.scatter` loops, `for r in range(n_trial)` quaternion math, per-trial distance checks are all violations. If a loop is unavoidable, profile (`cProfile`) and confirm <1% of runtime.
+* **Simulation code lives in pyOpenCL kernels** (skill:`gpu-optimize`, skill:`port-to-opencl`). Kernels must be well-parallelized: use workgroups, local memory, minimize host-device transfers and kernel launch overhead. Python only orchestrates.
+* **Long-running scripts MUST print unbuffered progress** (`flush=True` or `PYTHONUNBUFFERED=1`). NEVER run silently for minutes — print what is starting, accepted steps with energy decrease, and when finished. The user will not wait for scripts with no output.
 
 ## Documentation & Navigation
 

@@ -21,6 +21,7 @@ import traceback
 from vispy import scene as vscene
 
 from .ExtensionManager import UIComponents
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
 from .EditModeHandlers import EditModeHandler
 from .CollapsibleSection import CollapsibleSection
 from .VispyUtils import make_grid_mesh_data, colormap_rgba
@@ -824,8 +825,7 @@ def build_ui(window):
     """Build the Folded Rigid extension panel."""
     panel = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(panel)
-    layout.setSpacing(2)
-    layout.setContentsMargins(2, 2, 2, 2)
+    apply_tight(layout)
 
     # State defaults
     window.fr_fit_result = None
@@ -863,10 +863,10 @@ def build_ui(window):
 
     # COM / drag spring
     pos_row = QtWidgets.QHBoxLayout()
-    window.fr_x_spin = QtWidgets.QDoubleSpinBox(); window.fr_x_spin.setRange(-100.0, 100.0); window.fr_x_spin.setSingleStep(0.1); window.fr_x_spin.setValue(0.0); window.fr_x_spin.setMaximumWidth(70)
-    window.fr_y_spin = QtWidgets.QDoubleSpinBox(); window.fr_y_spin.setRange(-100.0, 100.0); window.fr_y_spin.setSingleStep(0.1); window.fr_y_spin.setValue(0.0); window.fr_y_spin.setMaximumWidth(70)
-    window.fr_z_spin = QtWidgets.QDoubleSpinBox(); window.fr_z_spin.setRange(0.1, 50.0); window.fr_z_spin.setSingleStep(0.1); window.fr_z_spin.setValue(2.5); window.fr_z_spin.setMaximumWidth(70)
-    window.fr_k_spring_spin = QtWidgets.QDoubleSpinBox(); window.fr_k_spring_spin.setRange(0.01, 1000.0); window.fr_k_spring_spin.setSingleStep(0.5); window.fr_k_spring_spin.setValue(2.0); window.fr_k_spring_spin.setMaximumWidth(70)
+    window.fr_x_spin = QtWidgets.QDoubleSpinBox(); window.fr_x_spin.setRange(-100.0, 100.0); window.fr_x_spin.setSingleStep(0.1); window.fr_x_spin.setValue(0.0); window.fr_x_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.fr_x_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+    window.fr_y_spin = QtWidgets.QDoubleSpinBox(); window.fr_y_spin.setRange(-100.0, 100.0); window.fr_y_spin.setSingleStep(0.1); window.fr_y_spin.setValue(0.0); window.fr_y_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.fr_y_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+    window.fr_z_spin = QtWidgets.QDoubleSpinBox(); window.fr_z_spin.setRange(0.1, 50.0); window.fr_z_spin.setSingleStep(0.1); window.fr_z_spin.setValue(2.5); window.fr_z_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.fr_z_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+    window.fr_k_spring_spin = QtWidgets.QDoubleSpinBox(); window.fr_k_spring_spin.setRange(0.01, 1000.0); window.fr_k_spring_spin.setSingleStep(0.5); window.fr_k_spring_spin.setValue(2.0); window.fr_k_spring_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.fr_k_spring_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
 
     pos_row.addWidget(QtWidgets.QLabel("x:")); pos_row.addWidget(window.fr_x_spin)
     pos_row.addWidget(QtWidgets.QLabel("y:")); pos_row.addWidget(window.fr_y_spin)
@@ -877,11 +877,11 @@ def build_ui(window):
 
     # Dynamics parameters
     dyn_row = QtWidgets.QHBoxLayout()
-    window.fr_niter_spin = QtWidgets.QSpinBox(); window.fr_niter_spin.setRange(1, 10000000); window.fr_niter_spin.setValue(250); window.fr_niter_spin.setMaximumWidth(70)
-    window.fr_dt_spin = QtWidgets.QDoubleSpinBox(); window.fr_dt_spin.setRange(0.0001, 1.0); window.fr_dt_spin.setSingleStep(0.001); window.fr_dt_spin.setValue(0.02); window.fr_dt_spin.setMaximumWidth(60)
-    window.fr_fconv_spin = QtWidgets.QDoubleSpinBox(); window.fr_fconv_spin.setRange(0.0, 100.0); window.fr_fconv_spin.setSingleStep(0.001); window.fr_fconv_spin.setValue(0.0); window.fr_fconv_spin.setDecimals(5); window.fr_fconv_spin.setMaximumWidth(70)
-    window.fr_lin_damp_spin = QtWidgets.QDoubleSpinBox(); window.fr_lin_damp_spin.setRange(0.0, 1.0); window.fr_lin_damp_spin.setSingleStep(0.01); window.fr_lin_damp_spin.setValue(0.95); window.fr_lin_damp_spin.setMaximumWidth(60)
-    window.fr_ang_damp_spin = QtWidgets.QDoubleSpinBox(); window.fr_ang_damp_spin.setRange(0.0, 1.0); window.fr_ang_damp_spin.setSingleStep(0.01); window.fr_ang_damp_spin.setValue(0.90); window.fr_ang_damp_spin.setMaximumWidth(60)
+    window.fr_niter_spin = QtWidgets.QSpinBox(); window.fr_niter_spin.setRange(1, 10000000); window.fr_niter_spin.setValue(250); window.fr_niter_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.fr_niter_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+    window.fr_dt_spin = QtWidgets.QDoubleSpinBox(); window.fr_dt_spin.setRange(0.0001, 1.0); window.fr_dt_spin.setSingleStep(0.001); window.fr_dt_spin.setValue(0.02); window.fr_dt_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.fr_dt_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+    window.fr_fconv_spin = QtWidgets.QDoubleSpinBox(); window.fr_fconv_spin.setRange(0.0, 100.0); window.fr_fconv_spin.setSingleStep(0.001); window.fr_fconv_spin.setValue(0.0); window.fr_fconv_spin.setDecimals(5); window.fr_fconv_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.fr_fconv_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+    window.fr_lin_damp_spin = QtWidgets.QDoubleSpinBox(); window.fr_lin_damp_spin.setRange(0.0, 1.0); window.fr_lin_damp_spin.setSingleStep(0.01); window.fr_lin_damp_spin.setValue(0.95); window.fr_lin_damp_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.fr_lin_damp_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+    window.fr_ang_damp_spin = QtWidgets.QDoubleSpinBox(); window.fr_ang_damp_spin.setRange(0.0, 1.0); window.fr_ang_damp_spin.setSingleStep(0.01); window.fr_ang_damp_spin.setValue(0.90); window.fr_ang_damp_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.fr_ang_damp_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
 
     dyn_row.addWidget(QtWidgets.QLabel("n_iter:")); dyn_row.addWidget(window.fr_niter_spin)
     dyn_row.addWidget(QtWidgets.QLabel("dt:")); dyn_row.addWidget(window.fr_dt_spin)
@@ -909,13 +909,13 @@ def build_ui(window):
     pot_row = QtWidgets.QHBoxLayout()
     pot_row.addWidget(QtWidgets.QLabel("type:"))
     window.fr_potential_type_combo = QtWidgets.QComboBox()
-    window.fr_potential_type_combo.setMaximumWidth(120)
+    window.fr_potential_type_combo.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.fr_potential_type_combo.addItem("O (q=-0.4)")
     window.fr_potential_type_combo.addItem("H (q=+0.2)")
     window.fr_potential_type_combo.currentIndexChanged.connect(lambda idx: _on_potential_type_changed(window, idx))
     pot_row.addWidget(window.fr_potential_type_combo)
 
-    window.fr_potential_span_spin = QtWidgets.QDoubleSpinBox(); window.fr_potential_span_spin.setRange(1.0, 50.0); window.fr_potential_span_spin.setSingleStep(0.5); window.fr_potential_span_spin.setValue(8.0); window.fr_potential_span_spin.setMaximumWidth(60)
+    window.fr_potential_span_spin = QtWidgets.QDoubleSpinBox(); window.fr_potential_span_spin.setRange(1.0, 50.0); window.fr_potential_span_spin.setSingleStep(0.5); window.fr_potential_span_spin.setValue(8.0); window.fr_potential_span_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.fr_potential_span_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.fr_potential_n_spin = QtWidgets.QSpinBox(); window.fr_potential_n_spin.setRange(8, 256); window.fr_potential_n_spin.setValue(64); window.fr_potential_n_spin.setMaximumWidth(50)
     pot_row.addWidget(QtWidgets.QLabel("span:")); pot_row.addWidget(window.fr_potential_span_spin)
     pot_row.addWidget(QtWidgets.QLabel("n:")); pot_row.addWidget(window.fr_potential_n_spin)
@@ -949,8 +949,7 @@ def build_ui(window):
     # ------------------------------------------------------------------
     adv = CollapsibleSection("Fitting & Scans", collapsed=True)
     adv_layout = QtWidgets.QVBoxLayout()
-    adv_layout.setSpacing(2)
-    adv_layout.setContentsMargins(2, 2, 2, 2)
+    apply_tight(adv_layout)
     adv_widget = QtWidgets.QWidget()
     adv_widget.setLayout(adv_layout)
 
@@ -961,7 +960,7 @@ def build_ui(window):
     window.fr_substrate_edit.setReadOnly(True)
     row_sub.addWidget(window.fr_substrate_edit)
     window.fr_substrate_btn = QtWidgets.QPushButton("...")
-    window.fr_substrate_btn.setMaximumWidth(30)
+    window.fr_substrate_btn.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.fr_substrate_btn.clicked.connect(lambda: _on_pick_substrate(window))
     row_sub.addWidget(window.fr_substrate_btn)
     adv_layout.addLayout(row_sub)
@@ -970,7 +969,7 @@ def build_ui(window):
     fit_row = QtWidgets.QHBoxLayout()
     window.fr_nu_spin = QtWidgets.QSpinBox(); window.fr_nu_spin.setRange(1, 32); window.fr_nu_spin.setValue(4); window.fr_nu_spin.setMaximumWidth(50)
     window.fr_nv_spin = QtWidgets.QSpinBox(); window.fr_nv_spin.setRange(1, 32); window.fr_nv_spin.setValue(4); window.fr_nv_spin.setMaximumWidth(50)
-    window.fr_alpha_spin = QtWidgets.QDoubleSpinBox(); window.fr_alpha_spin.setRange(0.1, 10.0); window.fr_alpha_spin.setSingleStep(0.1); window.fr_alpha_spin.setValue(1.8); window.fr_alpha_spin.setMaximumWidth(60)
+    window.fr_alpha_spin = QtWidgets.QDoubleSpinBox(); window.fr_alpha_spin.setRange(0.1, 10.0); window.fr_alpha_spin.setSingleStep(0.1); window.fr_alpha_spin.setValue(1.8); window.fr_alpha_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.fr_alpha_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     fit_row.addWidget(QtWidgets.QLabel("nu:")); fit_row.addWidget(window.fr_nu_spin)
     fit_row.addWidget(QtWidgets.QLabel("nv:")); fit_row.addWidget(window.fr_nv_spin)
     fit_row.addWidget(QtWidgets.QLabel("α:")); fit_row.addWidget(window.fr_alpha_spin)
@@ -979,8 +978,8 @@ def build_ui(window):
 
     # Fit z range
     zrange_row = QtWidgets.QHBoxLayout()
-    window.fr_zmin_spin = QtWidgets.QDoubleSpinBox(); window.fr_zmin_spin.setRange(0.1, 20.0); window.fr_zmin_spin.setSingleStep(0.1); window.fr_zmin_spin.setValue(1.5); window.fr_zmin_spin.setMaximumWidth(60)
-    window.fr_zmax_spin = QtWidgets.QDoubleSpinBox(); window.fr_zmax_spin.setRange(0.1, 50.0); window.fr_zmax_spin.setSingleStep(0.1); window.fr_zmax_spin.setValue(8.0); window.fr_zmax_spin.setMaximumWidth(60)
+    window.fr_zmin_spin = QtWidgets.QDoubleSpinBox(); window.fr_zmin_spin.setRange(0.1, 20.0); window.fr_zmin_spin.setSingleStep(0.1); window.fr_zmin_spin.setValue(1.5); window.fr_zmin_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.fr_zmin_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+    window.fr_zmax_spin = QtWidgets.QDoubleSpinBox(); window.fr_zmax_spin.setRange(0.1, 50.0); window.fr_zmax_spin.setSingleStep(0.1); window.fr_zmax_spin.setValue(8.0); window.fr_zmax_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.fr_zmax_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     zrange_row.addWidget(QtWidgets.QLabel("fit z range:"))
     zrange_row.addWidget(window.fr_zmin_spin)
     zrange_row.addWidget(QtWidgets.QLabel("-"))
@@ -1004,9 +1003,9 @@ def build_ui(window):
 
     # Scan parameters
     scan_row = QtWidgets.QHBoxLayout()
-    window.fr_scan_span_spin = QtWidgets.QDoubleSpinBox(); window.fr_scan_span_spin.setRange(0.1, 50.0); window.fr_scan_span_spin.setSingleStep(0.1); window.fr_scan_span_spin.setValue(2.0); window.fr_scan_span_spin.setMaximumWidth(60)
+    window.fr_scan_span_spin = QtWidgets.QDoubleSpinBox(); window.fr_scan_span_spin.setRange(0.1, 50.0); window.fr_scan_span_spin.setSingleStep(0.1); window.fr_scan_span_spin.setValue(2.0); window.fr_scan_span_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.fr_scan_span_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     window.fr_scan_n_spin = QtWidgets.QSpinBox(); window.fr_scan_n_spin.setRange(2, 64); window.fr_scan_n_spin.setValue(5); window.fr_scan_n_spin.setMaximumWidth(50)
-    window.fr_z_scan_spin = QtWidgets.QDoubleSpinBox(); window.fr_z_scan_spin.setRange(0.1, 50.0); window.fr_z_scan_spin.setSingleStep(0.1); window.fr_z_scan_spin.setValue(3.0); window.fr_z_scan_spin.setMaximumWidth(60)
+    window.fr_z_scan_spin = QtWidgets.QDoubleSpinBox(); window.fr_z_scan_spin.setRange(0.1, 50.0); window.fr_z_scan_spin.setSingleStep(0.1); window.fr_z_scan_spin.setValue(3.0); window.fr_z_scan_spin.setMaximumWidth(SPIN_MAX_WIDTH); window.fr_z_scan_spin.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
     scan_row.addWidget(QtWidgets.QLabel("span:")); scan_row.addWidget(window.fr_scan_span_spin)
     scan_row.addWidget(QtWidgets.QLabel("n:")); scan_row.addWidget(window.fr_scan_n_spin)
     scan_row.addWidget(QtWidgets.QLabel("scan z:")); scan_row.addWidget(window.fr_z_scan_spin)

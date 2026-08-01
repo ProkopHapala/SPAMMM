@@ -14,6 +14,7 @@ import os
 from PyQt5 import QtCore, QtWidgets
 
 from .ExtensionManager import UIComponents
+from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH
 from .plotutils import show_in_plot_window
 from spammm.AtomicSystem import AtomicSystem
 from spammm.dynamics.Vibrations import run_vibrations, FREQ_UNIT_LABELS, format_freq, format_E_zpe
@@ -54,8 +55,7 @@ def _table_headers(unit: str):
 def build_ui(window):
     panel = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(panel)
-    layout.setSpacing(2)
-    layout.setContentsMargins(2, 2, 2, 2)
+    apply_tight(layout)
 
     row1 = QtWidgets.QHBoxLayout()
     row1.addWidget(QtWidgets.QLabel("Backend:"))

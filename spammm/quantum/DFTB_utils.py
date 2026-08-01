@@ -62,11 +62,17 @@ def _check_sk_path():
 # Validate at module load time
 DFTB_EXE = _check_dftb_exe()
 SK_LIB_PATH, AVAILABLE_SK_SETS = _check_sk_path()
-DEFAULT_SK_SET = AVAILABLE_SK_SETS[0] if AVAILABLE_SK_SETS else None
+# Prefer 3ob-3-1 (general-purpose, has C/H/N/O/P/S + metals) as default; fall back to first available
+DEFAULT_SK_SET = '3ob-3-1' if '3ob-3-1' in AVAILABLE_SK_SETS else (AVAILABLE_SK_SETS[0] if AVAILABLE_SK_SETS else None)
 
 def get_sk_path(sk_set=None):
     sk_set = sk_set or DEFAULT_SK_SET
     if sk_set is None:             raise RuntimeError(f"No SK set specified. Available: {AVAILABLE_SK_SETS}")
+    # Use get_dftb_sk_path() for smart subdir resolution (handles mio/mio-1-1, library/3ob-3-1, etc.)
+    p = get_dftb_sk_path(sk_set)
+    if p and os.path.isdir(p):
+        return p.rstrip('/') + '/'
+    # Fallback: naive join
     sk_path = os.path.join(SK_LIB_PATH, sk_set)
     if not os.path.isdir(sk_path): raise RuntimeError(f"SK set not found: {sk_path}. Available: {AVAILABLE_SK_SETS}")
     return sk_path.rstrip('/') + '/'

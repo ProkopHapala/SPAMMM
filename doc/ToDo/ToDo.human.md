@@ -22,6 +22,23 @@ Consolidation strategy: `doc/Tasks/RepoConsolidation.md` (eat FireCore/ppafm int
 
 - [x] 3D view (ortho editor mode: `Enter` / `b2Dview`; Ring/atom/bond work; hex 2D-only) — `doc/Tasks/GUI_Editor_3D_ViewMode.md`
 - [ ] Molecuar Browser
+- [ ] add menu to load example moleucles form assiart of SMILES
+
+
+## GUI Laptop
+
+- [x] zoom-in / zoom out when mouse is not accessible (add sime slidebar), +/- button also not accesible on laptop, 3D viweport buttons, maybe make special pannel like "laptop accesability" — implemented: "Laptop Accessibility" collapsible section (zoom slider + Zoom In/Out/Reset buttons), `tests/GUI/test_accessibility_section.py`
+- [x] The panel have fixed size - allow user to change size of side panel, also make sure if panel does not fit there is horizonal scrollbar — implemented: QSplitter (resizable 200–600px), horizontal scrollbar AsNeeded
+
+
+## GUI Help + Shortcuts
+
+- [ ] Help/cheatsheet panel in GUI + centralized shortcut registry (buttons auto-show key, help auto-generates) → `doc/Tasks/GUI_HelpPanel_ShortcutRegistry.md`
+  - USER decisions (2026-08-01): Unicode modifiers `⌃⇧⌥`; both side-panel section + Help menu dialog; auto-generate cheatsheet from registry; mouse actions stay hardwired (not in registry) but documented in cheatsheet + help panel
+  - Architecture (CORRECTED 2026-08-01): Registry = generic mechanism only (conflict detection, encoding, label sync, help gen). Extensions register their own shortcuts — NO central hardcoded action list. Fail-loud on conflict.
+- [ ] Reorganize user-facing docs: move `doc/KekuleSolverVisualization.md` → `user_guide/` → `doc/Tasks/GUI_HelpPanel_ShortcutRegistry.md` §5
+
+
 
 
 # Problems Found
@@ -44,5 +61,5 @@ Consolidation strategy: `doc/Tasks/RepoConsolidation.md` (eat FireCore/ppafm int
 
 # longer
 
-- [ ] reoranize the editor menu - a but overcomplicated and slow, key-sortcuts
+- [ ] reoranize the editor menu - a but overcomplicated and slow, key-sortcuts → `doc/Tasks/GUI_HelpPanel_ShortcutRegistry.md`
 - [x] 3D view
