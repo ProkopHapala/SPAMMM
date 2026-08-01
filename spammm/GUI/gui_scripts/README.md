@@ -24,10 +24,24 @@ The panel remembers these per script in QSettings.
 
 ## File index
 
-- **conference_demo.py** — Paced generator: build 4×PTCDA → greedy MC assembly →
-  AFM (S1–S4) → BR-STM → PME charge rings. Conference workflow SSOT.
-  - Example (fast): `./run_gui.sh --script spammm/GUI/gui_scripts/conference_demo.py -- --n-step 200`
-  - Example (paced): `./run_gui.sh --script spammm/GUI/gui_scripts/conference_demo.py --script-delay-ms 300 --script-points-per-frame 5 --script-barriers -- --n-step 200`
+- **conference_demo.py** — Paced generator: build 4×PTCDA → deterministic
+  1000×512 greedy windmill candidate → full default 3ob DFTB+ AFM → default
+  LUMO BR-STM. It validates and never overwrites the AFM backend/projection/z=3 Å
+  defaults. Add `--pme` for the optional charge-rings phase.
+  - Example (fast): `./run_gui.sh --script spammm/GUI/gui_scripts/conference_demo.py`
+  - Example (paced): `./run_gui.sh --script spammm/GUI/gui_scripts/conference_demo.py --script-delay-ms 300 --script-points-per-frame 5 --script-barriers`
+- **ptcda_interactive_drag.py** — Build 4×QEq-PTCDA on the NaCl FAF, select
+  RA Drag, and enable concurrent all-molecule relaxation. Pick an O and pull it
+  toward the center to exercise binding/collisions and surface stick-slip.
+  - Example: `./run_gui.sh --script spammm/GUI/gui_scripts/ptcda_interactive_drag.py`
+- **ptcda_drag_demo.py** — Paced generator: build 2×PTCDA on NaCl → relax →
+  programmatically drag corner O[29] 16 Å across the surface via the same drag
+  handler as interactive mouse (FIRE relaxation per step) → capture VisPy canvas
+  frames → GIF. Shows FAF substrate heatmap, anchor spring line, and three
+  growing trajectory lines (dragged O=red, anchor target=blue, opposite corner=green).
+  - Example: `./run_gui.sh --script spammm/GUI/gui_scripts/ptcda_drag_demo.py`
+  - Custom: `-- --drag-x 20 --n-relax 300 --anchor-atom 29 --opposite-atom 27`
+  - Report: [`doc/Reports/PTCDA_DragDemo_StickSlip_2026-08-01.md`](../../../doc/Reports/PTCDA_DragDemo_StickSlip_2026-08-01.md)
 - **folded_rigid_setup.py** — Load a molecule, fit or load a folded substrate
   potential, and start the `FoldedRigid` extension in run or manip (drag) mode.
   - Arguments: `--mol`, `--substrate`, `--fit`, `--fit-fit`, `--run`, `--step`,

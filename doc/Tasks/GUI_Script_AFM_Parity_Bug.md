@@ -2,6 +2,42 @@
 
 ## Status: UNRESOLVED — needs investigation by a more capable agent
 
+## 2026-08-01 implementation under USER review
+
+The investigation found two independent state/path mismatches and implemented
+candidate corrections. This status remains **UNRESOLVED** until the USER reviews
+the resulting windmill, AFM, and BR-STM images.
+
+1. **Rigid pose height was split by 3.25 Å.** `_on_build()` created
+   `RigidEnsemble` at `z=+3.0`, while `attach_pairff_faf()` moved only GPU
+   `poss` and `_mb_pos` to `Z_SURF_TOP + 3.0 = -0.25`. Display/AFM read the
+   ensemble; accepted MC moves uploaded it back to the GPU. The build now
+   resolves the absolute FAF height before creating any pose store and fails
+   loud if ensemble/GPU/`_mb_*` differ.
+2. **The script was not using the AFM product-button path.** Its manual S1–S4
+   sequence called `run_afm_stage3()`, which reads cached stock `rho_scf`;
+   the default prolonged product path `_run_afm_s1_to_s4()` explicitly computes
+   the prolonged Pauli density. `conference_demo.py` now calls
+   `run_afm_full_pipeline()`, the same function as the **AFM** button, then
+   `run_br_stm()`, the same function as the **BR-STM** button.
+3. `_sync_display()` now explicitly marks the AFM geometry dirty in addition
+   to the existing strong geometry hash.
+4. The script no longer writes AFM backend, projection, MO, or height widgets.
+   It validates the untouched defaults and fails loud if they are not
+   `3ob-3-1`, `DFTB FDBM (prolonged)`, `prolonged`, and `z=3.0 Å`.
+
+NVIDIA end-to-end evidence from the real GUI:
+
+```text
+4×PTCDA MC: accepted=26/1000, E_final=-0.274403 eV
+AFM defaults: 3ob-3-1, DFTB FDBM (prolonged), z=3.0 Å
+AFM |dxy|_max=1.1573 Å
+BR-STM grid finite, nonzero, max=4.0908e-07
+```
+
+The numerical path and postconditions now pass; visual parity still requires
+USER confirmation and must not be marked resolved before that review.
+
 ## The Core Requirement
 
 **GUI scripts must use the EXACT same code path as manual user clicking.** This is the entire point of the GUI scripting system — it exists so that demonstrations are reproducible and debuggable. If a script calls different functions, uses different parameters, or takes a different code path than manual clicking, it defeats the purpose. The script should be a thin orchestrator that calls the same `run_afm_stage1/2/3/4`, `run_br_stm`, etc. functions that the GUI buttons call, with the same default parameters.

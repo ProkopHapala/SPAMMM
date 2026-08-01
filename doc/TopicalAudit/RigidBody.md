@@ -9,7 +9,7 @@ timestamp: 2026-07-30
 
 ## Summary
 
-SPAMMM treats adsorbed molecules as **6-DOF rigid bodies** (CoM translation + quaternion orientation) for PairFF, FoldedRigid surface dynamics, Assembly packing, RigidBodyAFM, and (intended) ChargeRings PME gating. Physics and kernels are mature; what is **missing** is a shared authoritative host store of per-molecule `(pos, qrot)` analogous to `AtomicGraph` for atoms. Today poses live in GPU buffers (`poss`/`qrots`), PairFF host mirrors (`_mb_pos`/`_mb_quat`), Assembly/SPFF transform matrices, and ChargeRings ad-hoc `spos`+φ-only `rots` — none of which sync to each other. Connecting PME tip–sample multipoles to the same molecules that PairFF/Assembly/FoldedRigid move **requires** a pose SSOT (design: [`Tasks/RigidMoleculePose_SSOT.md`](../Tasks/RigidMoleculePose_SSOT.md)).
+SPAMMM treats adsorbed molecules as **6-DOF rigid bodies** (CoM translation + quaternion orientation) for PairFF, FoldedRigid surface dynamics, Assembly packing, RigidBodyAFM, and ChargeRings PME gating. `RigidEnsemble` is now the authoritative host pose store inside `RigidAssemblyExtension`; GPU `poss/qrots` and PairFF `_mb_*` are checked mirrors, and AtomicGraph is a one-way display derivative. Cross-session Assembly/FoldedRigid integration still uses parallel pose representations.
 
 **Quaternion convention (SSOT where used):** `qrot = (qx, qy, qz, qw)` — xyzw, identity `[0,0,0,1]` (`kernels/rigid.cl` L17; `_quat_to_matrix_np`).
 
@@ -47,6 +47,7 @@ Proposed name (TBD): `RigidEnsemble` / `MoleculePoseGraph` — see SSOT task. **
 | Python | `spammm/quantum/PauliSolverCL.py` | **active** | uploads `pSites` + flat `rots` | 3×3 | PME consumer |
 | GUI | `spammm/GUI/FoldedRigidExtension.py` | **active** | `window.fr_rbd` + COM spins | identity at setup | GPU→`AtomicGraph.update_positions_from_array` one-way |
 | GUI | `spammm/GUI/RigidBodyVispy.py` | **active** | reads RBD/PairFF + `_mb_*` | from GPU/host | PairFF demo Vispy (not main GUI) |
+| GUI | `spammm/GUI/RigidAssemblyExtension.py` | **active** | `RigidEnsemble` authority + checked GPU/`_mb_*` mirrors | quat xyzw | All-mobile PairFF+FAF drag, MC, PME, one-way AtomicGraph display |
 | GUI | `spammm/GUI/ChargeRingsExtension.py` | **active** | rebuilt each scan | φ only | No molecule registry |
 | Topology | `spammm/topology/AtomicGraph.py` | **active** | per-atom `Atom.pos` | none | Atomic SSOT only |
 | Toolbox | `spammm/AtomicSystem.py` | **active** | flat `apos` | 3×3 rot mats | `orient*`, `addSystems`; not RBD store |
@@ -114,6 +115,8 @@ RigidEnsemble.bodies[i].pos, qrot   ← sole write authority
 | Host → GPU | `upload_replica_poses` | MC/GA trial poses |
 | GPU → Host | `download_outputs` | pos, quats, apos_world, forces |
 | GPU → Host PairFF | `sync_active_pose_from_gpu` | `_mb_pos`, `_mb_quat` |
+| RigidAssembly GPU → host | `_sync_ensemble_from_gpu` | all GPU poses → `_mb_*` → authoritative `RigidEnsemble` |
+| RigidAssembly host → GPU | `_upload_poses_to_gpu` | ensemble poses → GPU + `_mb_*`, then dynamics reset |
 | GPU → AtomicGraph | `FoldedRigidExtension._update_graph` | `update_positions_from_array` then `_sync_sys` |
 | PME | `PauliSolverCL.scan_current_tip` | fresh `spos`/`rots` every scan — **no reverse sync** |
 | Assembly → RBD | *(none)* | winners stay as transform arrays |
@@ -142,7 +145,7 @@ Documented dual language today (`doc/topical_audit.md` §3b): *“AtomicGraph SS
 4. **Assembly / SPFF** — matrix transforms; no shared quat store with RBD.
 5. **Demos / MC** — local `pos`/`quat` arrays (`demo_pairff.py`, `testplot_pairff_energy_mc.py`).
 6. **Replica imaging** — one pose per scan pixel (`testplot_ptcda_nacl_replicas.py`); scan-grid authority, not ensemble.
-7. **Main GUI PairFF** — unfinished ([`PairFF_GUI_Integration.md`](../Tasks/PairFF_GUI_Integration.md)); risk of inventing another bridge.
+7. **Main GUI PairFF** — `RigidAssemblyExtension` now owns a checked bridge; other rigid GUI extensions remain separate sessions.
 
 ## Open issues
 
@@ -152,7 +155,7 @@ Documented dual language today (`doc/topical_audit.md` §3b): *“AtomicGraph SS
 - [ ] CoM definition: mass CoM (RBD) vs geometric center vs charge centroid — pick per template
 - [ ] PME `n_sites ≤ 4` vs large ensembles — need active subset / spectator pad
 - [ ] FoldedRigid “dual SSOT” language must be rewritten once pose SSOT exists
-- [ ] Main GUI: one shared “Rigid molecules” pose list for ChargeRings + PairFF + FoldedRigid
+- [ ] Main GUI: extend the `RigidAssemblyExtension` pose authority across separate FoldedRigid/Assembly sessions; current PairFF+PME bridge is implemented but awaits USER visual confirmation
 - [ ] Cosserat / Frenkel deferred — both should consume the same pose SSOT if built
 - [ ] Formal L0: move one body → PME Esite / gating at tip-above-CoM changes with `R(q)`
 - [ ] Decision gate in task: sync policy, module name, package location — before any PR

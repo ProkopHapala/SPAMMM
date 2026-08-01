@@ -109,6 +109,112 @@ def test_on_build_creates_ensemble_and_rbd(ra_window):
     assert 'NVIDIA' in dev or 'RTX' in dev, f'Expected NVIDIA GPU, got {dev}'
 
 
+def test_on_build_faf_keeps_all_pose_stores_synchronized(ra_window):
+    """FAF absolute height must agree in ensemble, GPU, and RBD host mirrors."""
+    from spammm.GUI.RigidAssemblyExtension import _on_build
+    from spammm.surfaces.FoldedRigid import Z_SURF_TOP
+
+    w = ra_window
+    w.ra_mol_combo.setCurrentText('PTCDA')
+    w.ra_nmol_spin.setValue(1)
+    w.ra_z_spin.setValue(3.0)
+    w.ra_z_init_spin.setValue(3.0)
+    w.ra_no_faf_chk.setChecked(False)
+    w.ra_no_qeq_chk.setChecked(False)
+    _on_build(w)
+
+    pos_ens, quat_ens = w.ra_ensemble.get_poses()
+    out = w.ra_rbd.download_outputs()
+    z_expected = float(Z_SURF_TOP + 3.0)
+    np.testing.assert_allclose(pos_ens[:, 2], z_expected, atol=1e-6)
+    np.testing.assert_allclose(out['pos'][:, :3], pos_ens, atol=1e-6)
+    np.testing.assert_allclose(out['quats'], quat_ens, atol=1e-6)
+    np.testing.assert_allclose(w.ra_rbd._mb_pos, pos_ens, atol=1e-6)
+    np.testing.assert_allclose(w.ra_rbd._mb_quat, quat_ens, atol=1e-6)
+    assert np.abs(w.ra_rbd._mb_packs[0]['REQ_base'][:, 2]).max() > 1e-3, 'Default PTCDA build must retain QEq charges'
+
+
+def test_display_index_maps_to_body_and_gpu_site(ra_window):
+    """Dense real-atom scene indices must map across PairFF dummy sites."""
+    from spammm.GUI.RigidAssemblyExtension import _display_index_to_body_site, _on_build
+
+    w = ra_window
+    w.ra_mol_combo.setCurrentText('PTCDA')
+    w.ra_nmol_spin.setValue(2)
+    w.ra_no_faf_chk.setChecked(True)
+    _on_build(w)
+
+    packs = w.ra_rbd._mb_packs
+    nreal0 = int((packs[0]['types'] == 0).sum())
+    real1 = np.flatnonzero(packs[1]['types'] == 0)
+    body, gpu_site = _display_index_to_body_site(w, nreal0)
+    assert body == 1
+    assert gpu_site == int(w.ra_rbd.mol_offsets[1] + real1[0])
+    with pytest.raises(IndexError):
+        _display_index_to_body_site(w, 2 * nreal0)
+
+
+def test_all_mobile_drag_step_moves_partners_and_resynchronizes(ra_window):
+    """An O anchor uses FAF kernel 15, moves partners, and commits every pose."""
+    from spammm.GUI.RigidAssemblyExtension import _on_build, _set_anchors, _sync_ensemble_from_gpu
+    from spammm.forcefields.RigidBodyDynamics import _body_sites_world
+
+    w = ra_window
+    w.ra_mol_combo.setCurrentText('PTCDA')
+    w.ra_nmol_spin.setValue(2)
+    w.ra_spacing_spin.setValue(16.0)
+    w.ra_no_faf_chk.setChecked(False)
+    w.ra_no_qeq_chk.setChecked(False)
+    w.ra_k_spring_spin.setValue(0.2)
+    _on_build(w)
+
+    pos0, quat0 = w.ra_ensemble.get_poses()
+    pack0 = w.ra_rbd._mb_packs[0]
+    io = next(i for i, (e, t) in enumerate(zip(pack0['enames'], pack0['types'])) if e == 'O' and t == 0)
+    site = int(w.ra_rbd.mol_offsets[0] + io)
+    atom0 = _body_sites_world(pack0['rel'][io:io + 1, :3], pos0[0], quat0[0])[0]
+    _set_anchors(w, site, atom0 + np.array([0.2, 0.0, 0.0], dtype=np.float32))
+    w.ra_rbd.run_multimol_md(20, dt=0.02, fire=True, faf=True)
+    _sync_ensemble_from_gpu(w)
+
+    pos1, quat1 = w.ra_ensemble.get_poses()
+    assert np.isfinite(pos1).all() and np.isfinite(quat1).all()
+    assert np.linalg.norm(pos1[0] - pos0[0]) > 1e-7, 'anchored molecule did not move'
+    assert np.linalg.norm(pos1[1] - pos0[1]) > 1e-7, 'partner remained frozen'
+    out = w.ra_rbd.download_outputs()
+    np.testing.assert_allclose(out['pos'][:, :3], pos1, atol=1e-6)
+    np.testing.assert_allclose(out['quats'], quat1, atol=1e-6)
+    np.testing.assert_allclose(w.ra_rbd._mb_pos, pos1, atol=1e-6)
+    np.testing.assert_allclose(w.ra_rbd._mb_quat, quat1, atol=1e-6)
+
+
+@pytest.mark.slow
+def test_ptcda_windmill_1000_step_reference(ra_window):
+    """The GUI MC path reproduces the reference 4×PTCDA minimum candidate."""
+    from spammm.GUI.RigidAssemblyExtension import _on_build, _on_mc_step
+
+    w = ra_window
+    w.ra_mol_combo.setCurrentText('PTCDA')
+    w.ra_nmol_spin.setValue(4)
+    w.ra_spacing_spin.setValue(16.0)
+    w.ra_seed_spin.setValue(3)
+    w.ra_no_faf_chk.setChecked(False)
+    w.ra_no_qeq_chk.setChecked(False)
+    w.ra_ntrial_spin.setValue(512)
+    _on_build(w)
+    n_accept = 0
+    last = None
+    for i in range(1000):
+        last = _on_mc_step(w, update_ui=False)
+        n_accept += int(last['accepted'])
+        if (i + 1) % 100 == 0:
+            print(f'windmill MC {i + 1}/1000 E={last["E"]:.6f} accepted={n_accept}', flush=True)
+    pos, _ = w.ra_ensemble.get_poses()
+    assert n_accept == 26
+    assert last['E'] == pytest.approx(-0.274403, abs=2e-5)
+    np.testing.assert_allclose(pos[:, 2], -0.25, atol=1e-6)
+
+
 def test_mc_step_parity_vs_testplot(ra_window):
     """One MC step from the extension matches the testplot harness for the same config.
 

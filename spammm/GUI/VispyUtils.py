@@ -12,10 +12,13 @@ Key functionality:
   - Force visualization: render atomic forces as colored arrows
   - Bond color by length or by type
   - Efficient GPU batch updates (positions, colors, bonds)
+  - **Substrate visualization:** `update_faf_map_overlay` — shared FAF potential
+    heatmap (reuses `RigidBodyVispy.potential_to_rgba` display SSOT + `eval_folded_potential_grid`).
+    Used by FoldedRigidExtension, RigidAssemblyExtension, and demo scripts.
 
-Role in SPAMMM: The rendering engine. Used by KekuleExplorerGUI as the main 3D
+Role in SPAMMM: The rendering engine. Used by SPAMMM_GUI as the main 3D
 canvas and by any module that needs molecular visualization (AFMExtension,
-MolecularBrowser when ported to VisPy).
+RigidAssemblyExtension, FoldedRigidExtension, demo scripts).
 """
 
 import numpy as np
@@ -2424,3 +2427,82 @@ def create_heatmap_window(data_2d, extent, title="Heatmap", cmap='bwr', symmetri
     view.camera.rect = (-w/2, -h/2, w, h)
 
     return canvas, view
+
+
+# ---------------------------------------------------------------------------
+# FAF potential map overlay — shared substrate visualization
+# Reuses RigidBodyVispy.potential_to_rgba (display SSOT) + eval_folded_potential_grid
+# so the main AtomScene shows the same FAF heatmap as demo_pairff.py.
+# ---------------------------------------------------------------------------
+
+
+def update_faf_map_overlay(scene, fit, z_eval, extent, step=0.1, probe_type='auto',
+                           image_attr='faf_map_image', visible=True):
+    """Create/update a VisPy Image overlay showing the FAF substrate potential map.
+
+    This is the same visualization as demo_pairff.py / RigidBodyVispy._recompute_map:
+    evaluates the FAF potential on a 2D grid at z_eval and displays it via
+    potential_to_rgba (vmax=|Emin| display SSOT).
+
+    Args:
+        scene: the AtomScene (or any object with ``view.scene`` attribute).
+        fit: FAF fit dict (load_fit / load_or_fit_faf output).
+        z_eval: z height [Å] at which to evaluate the potential (absolute, not relative).
+        extent: (xmin, xmax, ymin, ymax) in world coordinates.
+        step: grid resolution [Å] (default 0.1).
+        probe_type: 'auto' (most-negative-Q type → Na/Cl checkerboard visible),
+                    int (explicit type index), or None (skip).
+        image_attr: attribute name on ``scene`` to cache the Image visual.
+        visible: initial visibility.
+
+    Returns the Image visual.
+    """
+    from spammm.surfaces.FoldedRigid import eval_folded_potential_grid, faf_type_idx_for_probe, faf_fit_mode, FAF_MODE_FACTOR
+    from spammm.GUI.RigidBodyVispy import potential_to_rgba
+
+    if fit is None or probe_type is None:
+        img = getattr(scene, image_attr, None)
+        if img is not None:
+            img.visible = False
+        return img
+
+    # Resolve probe type
+    if probe_type == 'auto':
+        ureq = np.asarray(fit.get('unique_REQs', []), dtype=np.float64)
+        if len(ureq) == 0:
+            ityp = 0
+        else:
+            ityp = int(np.argmin(ureq[:, 2]))  # most negative Q
+    else:
+        ityp = int(probe_type)
+
+    xmin, xmax, ymin, ymax = extent
+    xs = np.arange(float(xmin), float(xmax) + step, step)
+    ys = np.arange(float(ymin), float(ymax) + step, step)
+
+    mode = faf_fit_mode(fit)
+    if mode == FAF_MODE_FACTOR:
+        # Factorized: show substrate Coulomb potential (Na/Cl checkerboard)
+        Emap = eval_folded_potential_grid(fit, 0, xs, ys, z_eval, component='coulomb_phi')
+    else:
+        Emap = eval_folded_potential_grid(fit, ityp, xs, ys, z_eval)
+
+    rgba = potential_to_rgba(Emap)
+
+    import vispy.scene as vscene
+    parent = scene.view.scene if hasattr(scene, 'view') else scene
+    img = getattr(scene, image_attr, None)
+    if img is None:
+        img = vscene.visuals.Image(parent=parent)
+        img.set_gl_state('translucent', depth_test=False)
+        img.order = -1
+        setattr(scene, image_attr, img)
+
+    img.set_data(rgba)
+    # Map image pixels to world coordinates
+    from vispy.visuals.transforms import STTransform
+    dx = (float(xmax) - float(xmin)) / max(len(xs) - 1, 1)
+    dy = (float(ymax) - float(ymin)) / max(len(ys) - 1, 1)
+    img.transform = STTransform(translate=(float(xmin), float(ymin), -0.1), scale=(dx, dy, 1))
+    img.visible = visible
+    return img

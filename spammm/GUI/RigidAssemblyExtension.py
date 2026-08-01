@@ -10,9 +10,9 @@ editor-drawn fragments (AtomicGraph connected components).
                 rigid body at its mass-weighted CoM. When the assembly atom count differs
                 from the editor graph, the graph is rebuilt from the assembly's world atoms
                 (same pattern as `FoldedRigidExtension._ensure_backend_matched`).
-  - **Drag**  : pick an atom in the main scene, pull the active molecule with an anchor
-                spring (reuses `RigidBodyDynamics.update_anchors` + `run_pairff`); on
-                release the pose is written back to the ensemble.
+  - **Drag**  : pick an atom in the main scene, pull its molecule with an anchor spring
+                while all molecules relax concurrently; on release all poses are written
+                back to the ensemble.
   - **MC/GA** : greedy best-of-batch planar moves (reuses
                 `RigidBodyPairFF.greedy_energy_step` / `eval_energy_system`); accepted
                 poses are written to the ensemble.
@@ -34,7 +34,7 @@ Design (locked, see `doc/Tasks/RigidMoleculePose_SSOT.md`):
 Reuse map (no duplication):
   - MC:        `RigidBodyPairFF.greedy_energy_step` / `eval_energy_system` / `packing_energy`
   - Drag:      `EditModeHandler` base + `FRManipMode`-style anchor pattern +
-               `RigidBodyDynamics.update_anchors` / `run_pairff` / `set_active_body`
+               `RigidBodyDynamics.update_anchors` / `run_multimol_md`
   - PME:       `pauli_scan.scan_xy` / `scan_xV` / `scan_1d` / `embed_sites_pme4` +
                `PauliSolverCL`; `RigidEnsemble.get_poses()` → `spos` + `R(q)`
   - Loaders:   `spammm.forcefields.RigidBodyDynamics.load_molecule` (general loader) +
@@ -59,7 +59,7 @@ from .CollapsibleSection import CollapsibleSection
 from spammm.forcefields.RigidEnsemble import RigidEnsemble
 from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF, _body_sites_world, _quat_to_matrix_np
 from spammm.forcefields.RigidBodyUtils import load_molecule, graph_to_rigid_fragments, greedy_energy_step, grid_pos
-from spammm.surfaces.FoldedRigid import remap_fit_for_molecule
+from spammm.surfaces.FoldedRigid import Z_SURF_TOP, remap_fit_for_molecule
 
 # Molecule paths for dropdown (data, not logic)
 _MOL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'data', 'mol')
@@ -169,10 +169,37 @@ def _sync_display(window):
     apos, enames = _assembly_world_atoms(window)
     if apos is not None:
         _update_graph(window, apos, enames)
+        dirty = getattr(window, '_afm_dirty', None)
+        if dirty is not None:
+            dirty.mark_geometry_changed()
+
+
+def _update_ra_substrate_overlay(window):
+    """Show FAF substrate potential map under the assembly (shared VispyUtils.update_faf_map_overlay).
+
+    Uses the same potential_to_rgba display SSOT as demo_pairff.py / RigidBodyVispy.
+    Only called when FAF is enabled (window.ra_fit is not None).
+    """
+    fit = getattr(window, 'ra_fit', None)
+    if fit is None:
+        return
+    from spammm.surfaces.FoldedRigid import Z_SURF_TOP
+    from .VispyUtils import update_faf_map_overlay
+    apos, _ = _assembly_world_atoms(window)
+    if apos is None or len(apos) == 0:
+        return
+    pad = 6.0
+    extent = (float(apos[:, 0].min() - pad), float(apos[:, 0].max() + pad),
+              float(apos[:, 1].min() - pad), float(apos[:, 1].max() + pad))
+    z_eval = Z_SURF_TOP + float(window.ra_z_init_spin.value())
+    visible = getattr(window, 'ra_show_substrate', True)
+    img = update_faf_map_overlay(window.scene, fit, z_eval, extent,
+                                 image_attr='ra_substrate_map', visible=visible)
+    window.ra_substrate_map = img
 
 
 def _upload_poses_to_gpu(window):
-    """Push ensemble poses into the RigidBodyPairFF GPU buffers (poss/qrots)."""
+    """Push authoritative ensemble poses into GPU and RBD host mirrors."""
     ens = window.ra_ensemble
     rbd = window.ra_rbd
     if ens is None or rbd is None:
@@ -183,6 +210,37 @@ def _upload_poses_to_gpu(window):
     pos4[:, 3] = getattr(rbd, 'mass_trans', 1.0)
     rbd.toGPU('poss', pos4)
     rbd.toGPU('qrots', quat.astype(np.float32).copy())
+    rbd._mb_pos = pos.astype(np.float32).copy()
+    rbd._mb_quat = quat.astype(np.float32).copy()
+    rbd.reset_dynamics_state()
+
+
+def _sync_ensemble_from_gpu(window):
+    """Commit all GPU rigid poses to the authoritative ensemble."""
+    ens = window.ra_ensemble
+    rbd = window.ra_rbd
+    if ens is None or rbd is None:
+        return
+    rbd.sync_active_pose_from_gpu()
+    ens.set_poses(rbd._mb_pos, rbd._mb_quat)
+
+
+def _display_index_to_body_site(window, display_idx):
+    """Map dense real-atom scene index to (body, flat PairFF site), skipping dummies."""
+    rbd = window.ra_rbd
+    if rbd is None or rbd._mb_packs is None:
+        raise RuntimeError('Build assembly before mapping scene atoms')
+    i = int(display_idx)
+    if i < 0:
+        raise IndexError(f'display atom index {i} is negative')
+    real0 = 0
+    for body, pack in enumerate(rbd._mb_packs):
+        real_sites = np.flatnonzero(pack['types'] == 0)
+        if i < real0 + len(real_sites):
+            local_site = int(real_sites[i - real0])
+            return body, int(rbd.mol_offsets[body] + local_site)
+        real0 += len(real_sites)
+    raise IndexError(f'display atom index {i} outside {real0} real assembly atoms')
 
 
 # ─── setup: build ensemble + RigidBodyPairFF from selected molecules ─────────
@@ -201,6 +259,8 @@ def _on_build(window):
     """
     source = window.ra_source_combo.currentText()
     z_mol = float(window.ra_z_spin.value())
+    faf_enabled = source != 'From editor' and not window.ra_no_faf_chk.isChecked()
+    z_body = float(Z_SURF_TOP + window.ra_z_init_spin.value()) if faf_enabled else z_mol
     try:
         if source == 'From editor':
             # ── AtomicGraph → fragments → rigid bodies ──────────────────────
@@ -220,9 +280,9 @@ def _on_build(window):
                 return
             molecules = [(f[0], f[1], f[2]) for f in fragments]  # (apos_rel, enames, REQs)
             nmol = len(fragments)
-            # Body positions = CoMs (already computed); z set to z_mol
+            # Body positions = CoMs (already computed); editor builds do not use FAF.
             pos = coms.astype(np.float32).copy()
-            pos[:, 2] = z_mol
+            pos[:, 2] = z_body
             quat = np.tile(np.array([0, 0, 0, 1], dtype=np.float32), (nmol, 1))
             tids = [f'frag{i}' for i in range(nmol)]
             bonds_list = [f[3] for f in fragments]
@@ -238,10 +298,13 @@ def _on_build(window):
             _status(window, f'Loading {mol_name}...')
             apos, enames, REQs, bonds = load_molecule(MOL_PATHS[mol_name], qeq=(mol_name not in _NO_QEQ) and (not window.ra_no_qeq_chk.isChecked()), name=mol_name)
             molecules = [(apos, enames, REQs)] * nmol
-            pos = grid_pos(nmol, spacing=spacing, z=z_mol)
+            pos = grid_pos(nmol, spacing=spacing, z=z_body)
             quat = np.tile(np.array([0, 0, 0, 1], dtype=np.float32), (nmol, 1))
-            # Small random rotation per molecule (like testplot)
+            # Exact deterministic testplot initialization: lateral jitter first,
+            # then one small rotation around each grid orientation.
             rng = np.random.default_rng(int(window.ra_seed_spin.value()))
+            pos[:, 0] += rng.normal(0, 0.6, size=nmol).astype(np.float32)
+            pos[:, 1] += rng.normal(0, 0.6, size=nmol).astype(np.float32)
             for i in range(nmol):
                 phi0 = (i * 0.5 * np.pi) + float(rng.uniform(-0.35, 0.35))
                 quat[i] = np.array([0, 0, np.sin(0.5 * phi0), np.cos(0.5 * phi0)], dtype=np.float32)
@@ -255,7 +318,7 @@ def _on_build(window):
         _status(window, f'Building PairFF ({nmol} mols)...')
         window.ra_rbd = RigidBodyPairFF.from_molecules(
             molecules, pos, quats=quat, active_body=0,
-            He=-0.1, rc=3.0, w=0.7, k_z=0.0, z_target=z_mol, Hs=1.0, beta=1.7,
+            He=-0.1, rc=3.0, w=0.7, k_z=0.0, z_target=z_body, Hs=1.0, beta=1.7,
         )
         # Optional FAF substrate (only for file source — fragments have no fit)
         if source != 'From editor' and not window.ra_no_faf_chk.isChecked():
@@ -272,10 +335,17 @@ def _on_build(window):
             window.ra_fit = None
         # Cache per-pack bonds for display
         window.ra_bonds0 = bonds_list
+        out = window.ra_rbd.download_outputs()
+        err = max(float(np.max(np.abs(out['pos'][:, :3] - pos))), float(np.max(np.abs(out['quats'] - quat))), float(np.max(np.abs(window.ra_rbd._mb_pos - pos))), float(np.max(np.abs(window.ra_rbd._mb_quat - quat))))
+        if err > 1e-5:
+            raise RuntimeError(f'Rigid pose synchronization failed after build: max error {err:.3e}')
         window.ra_E_last = window.ra_rbd.eval_energy_system(pos, quat, k_pack=float(window.ra_kpack_spin.value()))
         window.ra_kpack_last = float(window.ra_kpack_spin.value())
         _status(window, f'Built: {window.ra_ensemble.summary()}  device={window.ra_rbd.ctx.devices[0].name}')
         _sync_display(window)
+        # Show substrate overlay when FAF is enabled (shared VispyUtils)
+        if window.ra_fit is not None:
+            _update_ra_substrate_overlay(window)
     except Exception as e:
         import traceback; traceback.print_exc()
         _status(window, f'Build FAILED: {e}')
@@ -358,7 +428,7 @@ def _on_mc_reset(window):
 
 # ─── Drag mode (edit-mode handler) ───────────────────────────────────────────
 def _set_anchors(window, idx, target):
-    """Set anchor spring on atom `idx` of the active molecule to `target` (world)."""
+    """Set one spring on flat PairFF site `idx` to `target` (world)."""
     rbd = window.ra_rbd
     if rbd is None:
         return
@@ -368,6 +438,36 @@ def _set_anchors(window, idx, target):
         anchors[idx, :3] = target
         anchors[idx, 3] = float(window.ra_k_spring_spin.value())
     rbd.update_anchors(anchors)
+
+
+def _update_anchor_visuals(window, atom_world_pos, anchor_target):
+    """Draw red line from anchored atom to anchor target + red cross marker at target.
+
+    Reuses the same pattern as RigidBodyVispy.anchor_line/anchor_marker.
+    Creates the visuals lazily on first call, cached on window.
+    """
+    import vispy.scene as vscene
+    if not hasattr(window, 'ra_anchor_line'):
+        window.ra_anchor_line = vscene.visuals.Line(
+            parent=window.scene.view.scene, color=(1, 0, 0, 0.8), width=2.0,
+            antialias=True, method='gl', connect='segments')
+        window.ra_anchor_line.set_gl_state('translucent', depth_test=False)
+        window.ra_anchor_line.order = 10
+    if not hasattr(window, 'ra_anchor_marker'):
+        window.ra_anchor_marker = vscene.visuals.Markers(parent=window.scene.view.scene)
+        window.ra_anchor_marker.set_gl_state('translucent', depth_test=False)
+        window.ra_anchor_marker.order = 11
+    if atom_world_pos is None or anchor_target is None:
+        window.ra_anchor_line.visible = False
+        window.ra_anchor_marker.visible = False
+        return
+    line_pos = np.array([atom_world_pos[:3], anchor_target[:3]], dtype=np.float32)
+    window.ra_anchor_line.set_data(line_pos)
+    window.ra_anchor_line.visible = True
+    window.ra_anchor_marker.set_data(
+        pos=np.asarray(anchor_target[:3], dtype=np.float32).reshape(1, 3),
+        face_color=(1, 0, 0, 1), size=12, edge_width=0, symbol='cross')
+    window.ra_anchor_marker.visible = True
 
 
 def _closest_point_on_ray(atom_pos, r0, rd):
@@ -381,14 +481,16 @@ def _closest_point_on_ray(atom_pos, r0, rd):
 
 def _make_ramdrag_mode(window):
     class RAManipMode(EditModeHandler):
-        status_msg = "RigidAssembly Drag: LMB pick+drag atom to pull active molecule; release to drop"
+        status_msg = "RigidAssembly Drag: LMB pick+drag atom; all rigid molecules relax; release to drop"
         lock_drag = True
         capture_move = True
 
         def on_activate(self):
             if getattr(window, 'ra_rbd', None) is None:
                 _status(window, "RA Drag: press Build first")
-            self._pin = -1
+            self._pin_display = -1
+            self._pin_site = -1
+            self._pin_body = -1
 
         def _pick_idx(self, event):
             atom_id, dist = window.scene._pick_id_from_mouse(event.pos, max_dist=window.pick_radius)
@@ -402,45 +504,57 @@ def _make_ramdrag_mode(window):
             idx = self._pick_idx(event)
             if idx < 0:
                 return
-            self._pin = idx
+            body, site = _display_index_to_body_site(window, idx)
+            window.ra_rbd.set_active_body(body)
+            window.ra_rbd.reset_dynamics_state()
+            self._pin_display = idx
+            self._pin_site = site
+            self._pin_body = body
             atom_pos = window.scene._pos[idx].astype(np.float64)
             r0, rd = window.scene._ray_from_mouse(event.pos)
             target = _closest_point_on_ray(atom_pos, r0, rd).astype(np.float32)
-            _set_anchors(window, idx, target)
-            _status(window, f"Pinned atom idx={idx}; drag to pull")
+            _set_anchors(window, site, target)
+            _update_anchor_visuals(window, atom_pos, target)
+            _status(window, f"Pinned atom {idx} on molecule {body}; all molecules mobile")
 
         def on_move(self, p_world, r0=None, rd=None):
-            if self._pin < 0:
+            if self._pin_display < 0:
                 return
             rbd = window.ra_rbd
             if rbd is None:
                 return
-            atom_pos = window.scene._pos[self._pin].astype(np.float64)
+            atom_pos = window.scene._pos[self._pin_display].astype(np.float64)
             if r0 is not None and rd is not None:
                 target = _closest_point_on_ray(atom_pos, r0, rd)
             else:
                 target = np.array([p_world[0], p_world[1], atom_pos[2]], dtype=np.float64)
-            _set_anchors(window, self._pin, target.astype(np.float32))
-            # Run a few PairFF steps to let the spring pull the molecule
+            _set_anchors(window, self._pin_site, target.astype(np.float32))
+            _update_anchor_visuals(window, atom_pos, target)
+            # Concurrent kernel: the dragged molecule pulls while all partners and
+            # their charged O sites respond to PairFF + FAF substrate forces.
             n_relax = int(window.ra_drag_nrelax_spin.value())
             dt = float(window.ra_drag_dt_spin.value())
             if n_relax > 0:
-                rbd.run_pairff(n_relax, dt, fire=True)
-                # Sync active pose back to ensemble
-                rbd.sync_active_pose_from_gpu()
-                pos_h, quat_h = rbd._mb_pos, rbd._mb_quat
-                window.ra_ensemble.set_poses(pos_h, quat_h)
+                rbd.run_multimol_md(n_relax, dt, fire=True, faf=None)
+                _sync_ensemble_from_gpu(window)
                 _sync_display(window)
+                # After relaxation, update line endpoint to the relaxed atom position
+                atom_pos = window.scene._pos[self._pin_display].astype(np.float64)
+                _update_anchor_visuals(window, atom_pos, target)
 
         def on_release(self, event, p_world, ctrl):
             if event.button != 1:
                 return
-            if self._pin < 0:
+            if self._pin_display < 0:
                 return
             _set_anchors(window, -1, np.zeros(3, dtype=np.float32))
-            self._pin = -1
+            _update_anchor_visuals(window, None, None)  # hide anchor visuals
+            window.ra_rbd.reset_dynamics_state()
+            self._pin_display = -1
+            self._pin_site = -1
+            self._pin_body = -1
             window.scene._pick_active = False
-            _status(window, "Drag released; pose written to ensemble")
+            _status(window, "Drag released; all rigid poses written to ensemble")
     return RAManipMode(window)
 
 

@@ -1,32 +1,34 @@
 #!/usr/bin/env python3
-"""Conference demo — full SPAMMM workflow: build 4×PTCDA → greedy assembly →
-AFM → BR-STM → PME charge rings.
+"""Four-PTCDA demo: deterministic windmill assembly → default AFM → BR-STM.
 
 Paced generator script (yields ctx.frame / ctx.barrier). Run fast from CLI or slow
 with visible frames from the Script Runner panel / Scripts menu.
 
   # Fast (defaults)
-  ./run_gui.sh --script spammm/GUI/gui_scripts/conference_demo.py -- --n-step 200
+  ./run_gui.sh --script spammm/GUI/gui_scripts/conference_demo.py
 
   # Paced, 5 MC steps per frame, 300 ms delay, honor barriers
   ./run_gui.sh --script spammm/GUI/gui_scripts/conference_demo.py \
-    --script-delay-ms 300 --script-points-per-frame 5 --script-barriers -- --n-step 200
+    --script-delay-ms 300 --script-points-per-frame 5 --script-barriers
 
 Doc: doc/Tasks/GUI_Scripting_DemoRunner.md
 """
 import argparse
 import os
+import numpy as np
 
 from spammm.GUI import gui_script_utils as GSU
 
 
 def run(window, argv=None, ctx=None):
     p = argparse.ArgumentParser(description='SPAMMM conference demo')
-    p.add_argument('--n-step', type=int, default=200, help='greedy MC steps')
+    p.add_argument('--n-step', type=int, default=1000, help='greedy MC steps (1000 reproduces the reference windmill candidate)')
+    p.add_argument('--ntrial', type=int, default=512, help='best-of-batch trials per MC step')
     p.add_argument('--mol', type=str, default='PTCDA', help='molecule name in MOL_PATHS')
     p.add_argument('--nmol', type=int, default=4, help='number of molecules')
+    p.add_argument('--pme', action='store_true', help='also run the optional PME charge-rings panel')
     args = p.parse_args(argv or [])
-    print(f"[conference_demo] start: mol={args.mol} nmol={args.nmol} n_step={args.n_step}", flush=True)
+    print(f"[conference_demo] start: mol={args.mol} nmol={args.nmol} n_step={args.n_step} ntrial={args.ntrial}", flush=True)
 
     from spammm.GUI import RigidAssemblyExtension as RA
     from spammm.GUI import AFMExtension as AFM
@@ -44,6 +46,7 @@ def run(window, argv=None, ctx=None):
     GSU.set_combo_text(window.ra_source_combo, 'From file')
     GSU.set_combo_text(window.ra_mol_combo, args.mol)
     GSU.set_spin_value(window.ra_nmol_spin, args.nmol)
+    GSU.set_spin_value(window.ra_ntrial_spin, args.ntrial)
     # NOTE: do NOT override ra_z_spin — use GUI default (3.0).
     # AFM scan heights are RELATIVE to mol_z (atomPos[:,2].max()), so z_mol
     # only affects MC substrate physics, not the AFM scan distance.
@@ -59,70 +62,66 @@ def run(window, argv=None, ctx=None):
     # === Phase 2: Greedy MC assembly optimization ===
     yield ctx.frame('Running greedy Monte Carlo assembly…')
     last = None
+    n_accept = 0
     for i0, i1 in ctx.batches(args.n_step):
         for i in range(i0, i1):
             last = RA._on_mc_step(window, update_ui=(i + 1 == i1))
+            n_accept += int(last is not None and last['accepted'])
         if last is not None:
             print(f"[conference_demo] MC {i1}/{args.n_step}: E={last['E']:.6f} accepted={last['accepted']}", flush=True)
             yield ctx.frame(f"Greedy assembly: {i1}/{args.n_step}, E={last['E']:.6f}")
         else:
             yield ctx.frame(f"Greedy assembly: {i1}/{args.n_step} (no summary)")
-    print(f"[conference_demo] MC done: {args.n_step} steps, E={last['E']:.6f}" if last else "[conference_demo] MC done", flush=True)
+    print(f"[conference_demo] MC done: {args.n_step} steps, accepted={n_accept}, E={last['E']:.6f}" if last else "[conference_demo] MC done", flush=True)
     # Re-fit viewport after MC (poses may have shifted)
     if hasattr(window.scene, 'fit_to_atoms'):
         window.scene.fit_to_atoms(margin=3.0)
         GSU.process_events(window)
 
-    # === Phase 3: AFM simulation (staged for visible boundaries) ===
+    # === Phase 3: default AFM product (same function as the AFM button) ===
     yield ctx.barrier('Assembly ready — Continue to AFM')
     GSU.expand_extension_panel(window, 'afm', open=True)
-    # Ensure DFTB FDBM backend (BR-STM requires it; no silent Morse fallback)
-    if hasattr(window, 'afm_backend_combo'):
-        GSU.set_combo_text(window.afm_backend_combo, 'DFTB FDBM (prolonged)')
-        print(f"[conference_demo] AFM backend: {window.afm_backend_combo.currentText()}", flush=True)
-    # NOTE: do NOT override AFM scan params (hmin/hmax/hstep/amp/scan_range/z_plot).
-    # Use GUI defaults — the script must use the same code path as manual clicking.
-    # AFM heights are RELATIVE to mol_z, so defaults (hmin=3.7, hmax=4.7, z_plot=3.0)
-    # always scan 3.7-4.7 Å above the molecule regardless of z_mol.
-    print(f"[conference_demo] AFM params (GUI defaults): hmin={window.afm_hmin_spin.value()} hmax={window.afm_hmax_spin.value()} z_plot={window.afm_z_height_spin.value()} scan_range={window.afm_scan_range_spin.value()}", flush=True)
-    # Select LUMO for STM/BR-STM: MO list "1" relative to HOMO (0=HOMO, +1=LUMO)
-    if hasattr(window, 'afm_stm_mo_list'):
-        window.afm_stm_mo_list.setText('1')
-    if hasattr(window, 'afm_stm_relative_mo'):
-        window.afm_stm_relative_mo.setChecked(True)
-    print("[conference_demo] STM MO selection: LUMO (relative +1 from HOMO)", flush=True)
-    print("[conference_demo] AFM S1: DFTB+ SCF…", flush=True)
-    yield ctx.frame('AFM S1: DFTB+ SCF…')
-    AFM.run_afm_stage1(window)
-    print("[conference_demo] AFM S2: density projection…", flush=True)
-    yield ctx.frame('AFM S1 complete; projecting density…')
-    AFM.run_afm_stage2(window)
-    print("[conference_demo] AFM S3: potentials…", flush=True)
-    yield ctx.frame('AFM S2 complete; building potentials…')
-    AFM.run_afm_stage3(window)
-    print("[conference_demo] AFM S4: probe relaxation…", flush=True)
-    yield ctx.frame('AFM S3 complete; relaxing probe particle…')
-    AFM.run_afm_stage4(window)
-    print("[conference_demo] AFM image complete", flush=True)
-    yield ctx.frame('AFM image complete')
+    actual_defaults = {
+        'basis': window.afm_basis_combo.currentText(),
+        'backend': window.afm_backend_combo.currentText(),
+        'projection': window.afm_projection_combo.currentText(),
+        'z_plot': float(window.afm_z_height_spin.value()),
+    }
+    expected_defaults = {'basis': '3ob-3-1', 'backend': 'DFTB FDBM (prolonged)', 'projection': 'prolonged', 'z_plot': 3.0}
+    if actual_defaults != expected_defaults:
+        raise RuntimeError(f'AFM widgets are not at the required GUI defaults; script will not overwrite them: actual={actual_defaults}, expected={expected_defaults}')
+    print(f"[conference_demo] AFM defaults unchanged: {actual_defaults}", flush=True)
+    yield ctx.frame('Default 3ob DFTB+ AFM: S1–S4…')
+    AFM.run_afm_full_pipeline(window)
+    tip = window._afm_results['tip_disp']
+    dxy_max = float(np.hypot(tip['dx'], tip['dy']).max())
+    bond_length = float(window.afm_bond_length_spin.value())
+    if not np.isfinite(dxy_max) or dxy_max < 0.01 or dxy_max > bond_length:
+        raise RuntimeError(f'AFM probe distortion is outside physical postcondition: |dxy|_max={dxy_max:.6f} Å, bond_length={bond_length:.3f} Å')
+    print(f"[conference_demo] AFM image complete: |dxy|_max={dxy_max:.4f} Å", flush=True)
+    yield ctx.frame(f'AFM image complete; |dxy| max={dxy_max:.3f} Å')
 
-    # === Phase 4: Bond-resolved STM (LUMO of PTCDA) ===
+    # === Phase 4: default bond-resolved STM (default relative +1 = LUMO) ===
     yield ctx.barrier('Continue to bond-resolved STM')
-    print("[conference_demo] BR-STM (LUMO)…", flush=True)
+    print("[conference_demo] BR-STM (GUI-default LUMO)…", flush=True)
     AFM.run_br_stm(window)
+    br = np.asarray(window._afm_results['br_stm_grid'])
+    if not np.isfinite(br).all() or float(np.max(np.abs(br))) == 0.0:
+        raise RuntimeError('BR-STM postcondition failed: grid is non-finite or identically zero')
     print("[conference_demo] BR-STM complete", flush=True)
     yield ctx.frame('BR-STM complete')
 
-    # === Phase 5: PME charge rings ===
-    yield ctx.barrier('Continue to PME charge rings')
-    GSU.expand_extension_panel(window, 'rigid_assembly', open=True)
-    print("[conference_demo] PME charge rings XY scan…", flush=True)
-    RA._on_pme_scan_xy(window)
-    print("[conference_demo] PME complete", flush=True)
-    yield ctx.frame('PME charge-rings image complete')
+    # Optional legacy conference phase.
+    if args.pme:
+        yield ctx.barrier('Continue to PME charge rings')
+        GSU.expand_extension_panel(window, 'rigid_assembly', open=True)
+        print("[conference_demo] PME charge rings XY scan…", flush=True)
+        RA._on_pme_scan_xy(window)
+        print("[conference_demo] PME complete", flush=True)
+        yield ctx.frame('PME charge-rings image complete')
 
     print("[conference_demo] done", flush=True)
-    return {'n_step': args.n_step, 'mol': args.mol, 'nmol': args.nmol}
+    return {'n_step': args.n_step, 'ntrial': args.ntrial, 'accepted': n_accept, 'E': None if last is None else last['E'], 'dxy_max': dxy_max, 'mol': args.mol, 'nmol': args.nmol}
 
 
 if __name__ == '__main__':

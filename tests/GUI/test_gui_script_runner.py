@@ -276,6 +276,7 @@ def test_bundled_scripts_excludes_offline_and_underscore():
     # conference_demo should be present
     names = [os.path.basename(p) for _, p in items]
     assert 'conference_demo.py' in names
+    assert 'ptcda_interactive_drag.py' in names
     assert 'azaindol_draw_offline.py' not in names
     # sorted by filename
     assert names == sorted(names)

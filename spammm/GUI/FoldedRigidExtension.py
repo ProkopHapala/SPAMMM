@@ -24,7 +24,7 @@ from .ExtensionManager import UIComponents
 from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, AutoGridPlacer
 from .EditModeHandlers import EditModeHandler
 from .CollapsibleSection import CollapsibleSection
-from .VispyUtils import make_grid_mesh_data, colormap_rgba
+from .VispyUtils import make_grid_mesh_data, colormap_rgba, update_faf_map_overlay
 from spammm.surfaces import FoldedRigid
 from spammm.topology.FFparams import load_xyz_with_REQs
 
@@ -33,17 +33,6 @@ from spammm.topology.FFparams import load_xyz_with_REQs
 DEFAULT_SUBSTRATE = FoldedRigid.NACL_SUBSTRATE
 
 # Color/size for substrate overlay (same convention as surface_plots)
-_SUB_COLORS = {
-    'H': (0.75, 0.75, 0.75, 1.0),
-    'C': (0.0, 0.0, 0.0, 1.0),
-    'N': (0.0, 0.0, 1.0, 1.0),
-    'O': (1.0, 0.0, 0.0, 1.0),
-    'Na': (0.85, 0.65, 0.13, 1.0),
-    'Cl': (0.0, 0.5, 0.0, 1.0),
-    'S': (1.0, 1.0, 0.0, 1.0),
-}
-
-
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
@@ -164,24 +153,21 @@ def _load_and_replicate_substrate(window):
 
 
 def _update_substrate_overlay(window):
-    """Create/update the vispy substrate overlay in the main scene."""
-    if not hasattr(window, 'fr_substrate_markers'):
-        window.fr_substrate_markers = vscene.visuals.Markers(parent=window.scene.view.scene)
-        window.fr_substrate_markers.set_gl_state('translucent', depth_test=False)
-        window.fr_substrate_markers.order = 0
-    rep_pos, rep_names = _load_and_replicate_substrate(window)
-    if rep_pos is None or len(rep_pos) == 0:
-        window.fr_substrate_markers.visible = False
+    """Create/update the FAF substrate potential map overlay (shared VispyUtils.update_faf_map_overlay).
+
+    Shows the same FAF heatmap as demo_pairff.py / RigidBodyVispy._recompute_map,
+    using potential_to_rgba (display SSOT).
+    """
+    fit = getattr(window, 'fr_fit_result', None)
+    if fit is None:
         return
-    colors = np.array([_SUB_COLORS.get(e, (0.5, 0.5, 0.5, 1.0)) for e in rep_names], dtype=np.float32)
-    sizes = np.array([120 if e in ('Na', 'Cl') else 80 for e in rep_names], dtype=np.float32)
-    window.fr_substrate_markers.set_data(
-        pos=rep_pos.astype(np.float32),
-        symbol='disc',
-        face_color=colors,
-        size=sizes,
-    )
-    window.fr_substrate_markers.visible = getattr(window, 'fr_show_substrate', False)
+    z = FoldedRigid.Z_SURF_TOP + float(window.fr_z_spin.value())
+    span = float(window.fr_potential_span_spin.value())
+    extent = (-span, span, -span, span)
+    visible = getattr(window, 'fr_show_substrate', False)
+    img = update_faf_map_overlay(window.scene, fit, z, extent,
+                                 image_attr='fr_substrate_map', visible=visible)
+    window.fr_substrate_map = img
 
 
 def _toggle_substrate(window, checked=None):
@@ -195,8 +181,8 @@ def _toggle_substrate(window, checked=None):
         except Exception as e:
             _status(window, f"Substrate overlay failed: {e}")
             window.fr_show_substrate = False
-    elif hasattr(window, 'fr_substrate_markers'):
-        window.fr_substrate_markers.visible = False
+    elif hasattr(window, 'fr_substrate_map'):
+        window.fr_substrate_map.visible = False
 
 
 def _get_potential_type_idx(window):
@@ -214,7 +200,7 @@ def _get_potential_type_idx(window):
 
 
 def _update_potential_overlay(window):
-    """Create/update the vispy potential slice mesh in the main scene (XY plane at current z)."""
+    """Create/update the vispy potential slice mesh in the main scene (shared VispyUtils)."""
     fit = getattr(window, 'fr_fit_result', None)
     if fit is None:
         raise ValueError("No fit loaded — Load Fit first")
@@ -226,13 +212,10 @@ def _update_potential_overlay(window):
     rgba, vmin, vmax = colormap_rgba(E, cmap='bwr', symmetric=True, alpha=0.6)
     xs, ys = a, b
     zs = np.full((n, n), z, dtype=np.float32)
-    verts, faces, cols = make_grid_mesh_data(xs, ys, zs, colors=rgba)
-    if not hasattr(window, 'fr_potential_mesh'):
-        window.fr_potential_mesh = vscene.visuals.Mesh(parent=window.scene.view.scene)
-        window.fr_potential_mesh.set_gl_state('translucent', depth_test=False)
-        window.fr_potential_mesh.order = -1
-    window.fr_potential_mesh.set_data(vertices=verts, faces=faces, vertex_colors=cols)
-    window.fr_potential_mesh.visible = getattr(window, 'fr_show_potential', False)
+    visible = getattr(window, 'fr_show_potential', False)
+    mesh = update_potential_overlay(window.scene, xs, ys, zs, rgba,
+                                    mesh_attr='fr_potential_mesh', visible=visible)
+    window.fr_potential_mesh = mesh
 
 
 def _toggle_potential(window, checked=None):

@@ -712,6 +712,18 @@ void rigid_body_folded_newton_replicas_kernel(
         if finish:
             self.queue.finish()
 
+    def reset_dynamics_state(self, finish=True):
+        """Zero rigid-body momenta and optimizer history after a pose/anchor discontinuity."""
+        z = np.zeros((self.n_bodies, 4), dtype=np.float32)
+        self.toGPU('vposs', z)
+        self.toGPU('vrots', z)
+        if 'vposs_alt' in self.buffer_dict:
+            self.toGPU('vposs_alt', z)
+            self.toGPU('vrots_alt', z)
+        self.reset_optimizer_state(finish=False)
+        if finish:
+            self.queue.finish()
+
     def upload_anchors(self):
         self.toGPU('anchors', self.anchors)
 
@@ -3012,7 +3024,9 @@ void rigid_body_pairff_energy_replica_kernel(
         rbd.toGPU('apos_body', apos4)
         rbd.toGPU('apos_world', np.zeros((rbd.total_atoms, 4), dtype=np.float32))
         rbd.toGPU('atom_force', np.zeros((rbd.total_atoms, 4), dtype=np.float32))
-        rbd.toGPU('anchors', np.zeros((rbd.total_atoms, 4), dtype=np.float32))
+        rbd.anchors = np.zeros((rbd.total_atoms, 4), dtype=np.float32)
+        rbd.anchors[:, 3] = -1.0
+        rbd.toGPU('anchors', rbd.anchors)
         rbd.upload_dyn_types_req(type_flat, req_flat)
 
         pos4 = np.zeros((n, 4), dtype=np.float32)

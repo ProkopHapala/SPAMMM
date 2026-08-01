@@ -137,7 +137,7 @@ This **is** a supplement to:
 - **Audit Document:** [nonbonding_forcefields.md](nonbonding_forcefields.md)
 
 ### 2b2. PairFF (rigid-body intermolecular)
-- Compact-exp / Morse pairwise FF with epair + σ-hole dummies; shared allmol GPU buffers; one active 6-DOF body; optional fused FAF substrate; **energy-only replica kernel** for MC/GA optimizers
+- Compact-exp / Morse pairwise FF with epair + σ-hole dummies; shared allmol GPU buffers; active-only and concurrent all-mobile 6-DOF dynamics; optional fused FAF substrate; **energy-only replica kernel** for MC/GA optimizers
 - **Key files:** `spammm/forcefields/RigidBodyDynamics.py` (`RigidBodyPairFF`), `spammm/GUI/RigidBodyVispy.py`, `spammm/surfaces/FoldedRigid.py`, `demos/demo_pairff.py`
 - **Kernels:** `kernels/rigid.cl` (7–13: allmol ± FAF MD; **14: `rigid_body_pairff_energy_replica_kernel`** — energy + fused clash flags, 2D launch `(nactive*64, n_replica)`, WG=64, float4 channels, ~3.1 KiB LM; **15: `rigid_body_pairff_multimol_kernel`** — concurrent all-molecule MD, ping-pong I/O, `niter` loop, optional `predict_partners`; **16: `rigid_body_pairff_multimol_persistent_kernel`** — same + atomic global barrier (experimental, requires all WGs resident); **17: `rigid_body_pairff_multimol_single_wg_kernel`** — single-WG Jacobi, exact but 1-CU only), `kernels/Forces.cl` (`compact_exp_pair_EF`)
 - **User manual:** [demos/PairFF_manual.md](../demos/PairFF_manual.md)
@@ -145,7 +145,7 @@ This **is** a supplement to:
 - **Design report:** [Topics/ForceFields/PairFF.md](Topics/ForceFields/PairFF.md)
 - **Tasks:** [Tasks/PairFF_MultiBody_Kernel.md](Tasks/PairFF_MultiBody_Kernel.md) (Done), [Tasks/PairFF_FAF_Substrate.md](Tasks/PairFF_FAF_Substrate.md) (Done), [Tasks/PairFF_RigidEnergy_MC_GA.md](Tasks/PairFF_RigidEnergy_MC_GA.md) (K1+P1+H1+F done; H2 SA pending), [Tasks/PairFF_MC_PythonBottleneck.md](Tasks/PairFF_MC_PythonBottleneck.md) (implementation tested; 79–89 → 0.66 ms/step, awaiting USER confirmation), [Tasks/RigidMoleculePose_SSOT.md](Tasks/RigidMoleculePose_SSOT.md) (design locked), [Tasks/MultiMol_MD_LaunchOverhead.md](Tasks/MultiMol_MD_LaunchOverhead.md) (verified — ping-pong concurrent MD, 4–135× speedup, awaiting integration)
 - **Driver:** `tests/testplot_pairff_energy_mc.py` → `debug/testplot_pairff_energy_mc/<mol>/` (8 molecules: PTCDA, formic acid, terephthalic acid, NTCDI, TBTAP, azaindol, uracil, adenine; **multi-species** `--mol adenine,uracil`; FAF substrate, charge colors, GIF trajectory)
-- **Caveats:** multi-body/FAF need unified mode + NVIDIA; ≤128 sites/molecule; map omits Coulomb; main GUI not wired yet; **no shared host pose SSOT** yet (GPU/`_mb_*`/Assembly/PME forked); greedy MC stalls in deep minima (21–75/1000 accepted) — SA (H2) needed; **concurrent multimol MD (kernels 15–17) rejects FAF** — fused variant not yet implemented; **persistent kernel (16) is experimental** — requires all WGs simultaneously resident
+- **Caveats:** multi-body/FAF need unified mode + NVIDIA; ≤128 sites/molecule; map omits Coulomb; the main GUI uses `RigidEnsemble` with checked GPU/`_mb_*` mirrors; greedy MC stalls in deep minima (21–75/1000 accepted) — SA (H2) needed; kernel 15 supports concurrent FAF while persistent/single-WG variants remain restricted/experimental.
 
 ### 2c. Charge Equilibration
 - QEq charge transfer method
@@ -194,7 +194,7 @@ Interactive rigid-body dynamics of a small molecule on a periodic substrate usin
 | `kernels/rigid.cl` | active | `rigid_body_folded_kernel` folded basis force/torque + anchor springs |
 | `spammm/GUI/SPAMMM_GUI.py` | active | Mouse dispatch (`on_mouse_press/move/release`), `refresh_view` no-bonds fix, extension integration |
 | `spammm/GUI/EditModeHandlers.py` | active | `on_move` ray-origin/direction, `on_release` hook base class |
-| `spammm/GUI/RigidAssemblyExtension.py` | active | Unified rigid-body GUI: Drag + MC/GA + PME in one panel; single `RigidEnsemble` + `RigidBodyPairFF`; reuses `greedy_energy_step` / `update_anchors` / `pauli_scan.scan_xy`. L0: `tests/GUI/test_rigid_assembly_extension.py` |
+| `spammm/GUI/RigidAssemblyExtension.py` | active | Unified rigid-body GUI: checked ensemble↔GPU↔host pose sync; dense-scene→dummy-site anchor mapping; kernel-15 all-mobile PairFF+FAF drag; MC/GA + PME. L0: `tests/GUI/test_rigid_assembly_extension.py` |
 | `spammm/forcefields/molecule_loaders.py` | active | Shared rigid-body molecule loaders (XYZ/mol2 + QEq + bonds); reused by `testplot_pairff_energy_mc.py` + `RigidAssemblyExtension` |
 | `data/fits/h2o_nacl.npz` | data | Cached H2O/NaCl folded basis fit (`nu=4, nv=4`) |
 
@@ -211,11 +211,12 @@ Interactive rigid-body dynamics of a small molecule on a periodic substrate usin
 ```bash
 ./run_gui.sh --script spammm/GUI/gui_scripts/folded_rigid_setup.py -- --mol data/xyz/H2O.xyz --fit data/fits/h2o_nacl.npz --run
 ./run_gui.sh --script spammm/GUI/gui_scripts/folded_rigid_setup.py -- --mol data/xyz/H2O.xyz --fit data/fits/h2o_nacl.npz --manip
+./run_gui.sh --script spammm/GUI/gui_scripts/ptcda_interactive_drag.py
 ```
 
 **Tests:** `tests/surfaces/test_folded_relax.py` (smoke), manual `Run`/`drag` L2 review.
 
-**Open issues:** `Run` speed is GPU-timer-limited; the `Run` timer interval is auto-scaled with `n_iter`. No L0 pytest for the GUI drag path yet. Newton translation/rotation coordinates are not nondimensionalized; the replica kernel uses centered Hessian differences while the single-body workgroup kernel still uses forward differences.
+**Open issues:** `Run` speed is GPU-timer-limited; the `Run` timer interval is auto-scaled with `n_iter`. RigidAssembly has numerical L0 coverage for all-mobile anchored drag, but visible NaCl stick-slip awaits USER review. Newton translation/rotation coordinates are not nondimensionalized; the replica kernel uses centered Hessian differences while the single-body workgroup kernel still uses forward differences.
 
 ## 3c. Contact Surface (quasi-2D static AFM)
 
@@ -306,9 +307,13 @@ L0: `tests/SPM/test_afm_contact_surface.py`. L2: `tests/testplot_contact_surface
 - Main GUI: VisPy-based molecular editor with extension plugins
 - **Key files:** `spammm/GUI/SPAMMM_GUI.py`, `spammm/GUI/BaseGUI.py`, `spammm/GUI/GLGUI.py`, `spammm/GUI/VispyUtils.py`, `spammm/GUI/MoleculeViewer.py`, `spammm/GUI/MolecularBrowser.py`, `spammm/GUI/ExtensionManager.py`, `spammm/GUI/EditModeHandlers.py`
 - **Edit modes:** Unified (atom/bond/hex/empty), Atom, Bond, Ring (edge+corner+hex), Hex (paint/toggle), pi, Select
-- **Extensions:** `KekuleExtension.py`, `AFMExtension.py`, `FFExtension.py`, `QEqExtension.py`, `VibrationExtension.py`
+- **Extensions:** `KekuleExtension.py`, `AFMExtension.py`, `FFExtension.py`, `QEqExtension.py`, `VibrationExtension.py`, `RigidAssemblyExtension.py`, `FoldedRigidExtension.py`
+- **Substrate visualization (FAF potential map):** `VispyUtils.update_faf_map_overlay` — shared function reusing `RigidBodyVispy.potential_to_rgba` (display SSOT, vmax=|Emin|) + `FoldedRigid.eval_folded_potential_grid`. Used by `FoldedRigidExtension`, `RigidAssemblyExtension`, and `ptcda_drag_demo.py`. Same visualization as `demos/demo_pairff.py`.
+- **Anchor visualization (drag spring):** `RigidAssemblyExtension._update_anchor_visuals` — red line (atom→target) + red cross marker (at target). Wired into `RAManipMode.on_press/on_move/on_release` for interactive + script dragging.
+- **GUI scripting:** `gui_script_runner.py` + `gui_script_utils.py` (GSU). Scripts call the same functions as GUI buttons. See [GUI_Scripting_DemoRunner.md](Tasks/GUI_Scripting_DemoRunner.md).
 - **Design docs:** [GUI.desing.md](GUI.desing.md), [GUI_FF_Relaxation.md](GUI_FF_Relaxation.md), [GUI_topology_edit.desing.md](GUI_topology_edit.desing.md)
 - **Audit Document:** [molecular_topology_editors.md](molecular_topology_editors.md), [gui_audit.md](gui_audit.md)
+- **Reports:** [PTCDA_DragDemo_StickSlip_2026-08-01.md](Reports/PTCDA_DragDemo_StickSlip_2026-08-01.md) — drag demo with FAF substrate, anchor lines, trajectory visualization
 
 ---
 

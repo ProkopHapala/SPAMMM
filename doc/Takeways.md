@@ -327,6 +327,81 @@ PIC needs its own fit knobs; do not assume separable recipes transfer.
 
 ---
 
+## GUI scripts must use the GUI code path
+
+**Symptom:** A "GUI script" produced a GIF that looked nothing like what the GUI shows —
+wrong rendering, no substrate, artificial-looking physics.
+
+**Root cause:** The script bypassed the GUI: direct `rbd.run_multimol_md()` + matplotlib
+rendering instead of calling the same drag handler (`RAManipMode.on_move`) that the mouse
+uses, and capturing from the VisPy canvas via `GSU.capture_canvas_png`.
+
+**Fix / pattern:**
+- Build via `GSU.click_button(window.ra_build_btn)` (same as clicking Build)
+- Drag via `_set_anchors` + `rbd.run_multimol_md(fire=True)` + `_sync_display` (same as `RAManipMode.on_move`)
+- Capture via `GSU.capture_canvas_png(window, path, fit=False)` (VisPy canvas, fixed camera)
+- Render via existing `potential_to_rgba` / `update_faf_map_overlay` — never reinvent
+
+**Takeaway:** GUI scripts are thin orchestrators calling the same functions as GUI buttons.
+Bypassing the GUI defeats the purpose — the script must be reproducible by manual clicking.
+
+**Reference:** `doc/Reports/PTCDA_DragDemo_StickSlip_2026-08-01.md`
+
+---
+
+## Reuse existing visualization — never reinvent
+
+**Symptom:** User angry: "I said use the surface visualization from `demo_pairff.py`!
+You implemented huge atoms bigger than the whole PTCDA molecule and no map of the potential!"
+
+**Root cause:** Instead of reusing `RigidBodyVispy.potential_to_rgba` + `eval_folded_potential_grid`
+(the FAF potential heatmap that `demo_pairff.py` already shows), I drew Na/Cl ion disc markers
+from scratch — giant circles that obscured the molecules and showed no potential landscape.
+
+**Fix / pattern:**
+- `from spammm.GUI.RigidBodyVispy import potential_to_rgba` — display SSOT (vmax=|Emin|)
+- `VispyUtils.update_faf_map_overlay(scene, fit, z, extent)` — shared function for any extension
+- Before writing rendering code, check `demo_*.py` and existing extensions first
+
+**Takeaway:** When the user names a specific file/function, read it and reuse it.
+Do not invent an alternative visualization.
+
+**Reference:** `doc/Reports/PTCDA_DragDemo_StickSlip_2026-08-01.md` §2.2
+
+---
+
+## Camera must stay fixed during animation capture
+
+**Symptom:** "Do not move the camera, it makes it difficult to follow the motion."
+
+**Root cause:** `GSU.capture_canvas_png()` defaults to `fit=True`, calling `fit_to_atoms()`
+every frame — the viewport recenters on the molecule as it drifts.
+
+**Fix:** `capture_canvas_png(..., fit=False)`. One `fit_to_atoms` at the start, then lock.
+
+**Takeaway:** For any multi-frame capture where the molecule moves, use `fit=False`.
+
+---
+
+## Anchor visualization belongs in the drag handler, not the script
+
+**Symptom:** "I do not see the position of the anchor. Draw a line connecting the anchor
+and anchored atom during dragging (also when user drags by mouse)."
+
+**Root cause:** The RA drag handler (`RAManipMode`) had no anchor visualization — unlike
+`RigidBodyVispy` which has `anchor_line` + `anchor_marker`. The demo script set anchors
+but never rendered them.
+
+**Fix:** `_update_anchor_visuals(window, atom_pos, target)` in `RigidAssemblyExtension.py`,
+wired into `on_press/on_move/on_release`. Works for interactive mouse dragging AND scripts.
+
+**Takeaway:** Demo-script-only visuals are a code smell. If it's useful for the demo,
+add it to the interactive handler so both paths benefit.
+
+**Reference:** `doc/Reports/PTCDA_DragDemo_StickSlip_2026-08-01.md` §4.2
+
+---
+
 ## Adding to this document
 
 When you spend time on a non-obvious bug or pattern:

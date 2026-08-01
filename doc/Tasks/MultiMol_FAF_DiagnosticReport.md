@@ -6,6 +6,58 @@
 
 ---
 
+## 2026-08-01 implementation under USER review
+
+The original report mixed valid GUI integration faults with two invalid physics
+comparisons. Candidate corrections are implemented and numerically tested, but
+visible stick-slip remains **UNRESOLVED** pending USER interaction/review.
+
+- The GUI build had a 3.25 Å pose split: ensemble/display at `+3.0 Å`, but
+  FAF GPU/host poses at `Z_SURF_TOP+3.0=-0.25 Å`. All pose stores now start at
+  the same absolute FAF height and are checked after build.
+- Scene picking returned a dense **real-atom** index, but the anchor buffer is
+  indexed over real + epair/σ-hole sites. The drag path now maps
+  `display index → body → flat GPU site`.
+- `from_molecules()` uploaded anchors but did not initialize `rbd.anchors`;
+  first drag therefore raised `AttributeError`. Host and GPU anchors now start
+  together with `w=-1` (disabled).
+- GUI dragging previously ran the active-only `run_pairff()` path, so partner
+  molecules were frozen. It now uses FAF-capable concurrent kernel 15 through
+  `run_multimol_md(..., faf=True/None)`, downloads all poses, and commits them
+  to `RigidEnsemble` and `AtomicGraph`.
+- Momentum/FIRE/Newton state is reset at pose and drag discontinuities; spring
+  release cannot leave hidden momentum for the next manipulation.
+- PTCDA is loaded with QEq in the interactive GUI script; measured charge range
+  is `[-0.368,+0.363] e`.
+
+The earlier “40% tensor Fx mismatch” is not reproduced by the current
+tensor-vs-flat parity test: relative errors are approximately
+`E=6e-8`, `F=4e-8`, `torque=1.8e-7` on NVIDIA. The comparison of a single
+bare O–Na pair with a neutral periodic NaCl lattice is also not a valid FAF
+amplitude reference because the other lattice ions screen/cancel the pair.
+A direct periodic/Ewald physical parity test is still needed before making a
+claim about absolute lateral corrugation.
+
+Current evidence:
+
+```text
+all-mobile anchored drag step: dragged body moves, partner body moves,
+ensemble == GPU == _mb_* (atol=1e-6)
+multimol FAF relaxation: E 522.902649 → -1.193753 eV
+real GUI setup: GTX 1650, 4×PTCDA, FAF=True, max |Q|=0.368 e
+```
+
+Run the interactive review:
+
+```bash
+./run_gui.sh --script spammm/GUI/gui_scripts/ptcda_interactive_drag.py
+```
+
+Pick an O atom and pull it toward the center. Whether the motion shows the
+expected lattice-scale stick-slip remains a USER visual/physical verdict.
+
+---
+
 ## Symptom
 
 Dragging a PTCDA molecule across NaCl surface with FAF should show **discrete
