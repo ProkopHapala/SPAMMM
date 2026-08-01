@@ -26,18 +26,18 @@ from .FoldedRigid import (
     nearest_substrate_distance, eval_folded_potential_grid, faf_type_idx_for_probe,
 )
 
-ELEMENT_COLORS = {'H': 'lightgray', 'C': 'black', 'O': 'red', 'N': 'blue', 'Na': 'goldenrod', 'Cl': 'green', 'S': 'yellow'}
-ELEMENT_SIZES = {'H': 50, 'C': 120, 'O': 140, 'N': 130, 'Na': 180, 'Cl': 180, 'S': 150}
+ELEMENT_COLORS = {'H': 'lightgray', 'C': 'black', 'O': 'red', 'N': 'blue', 'Na': 'gold', 'Cl': 'lime', 'S': 'yellow'}
+ELEMENT_SIZES = {'H': 50, 'C': 120, 'O': 140, 'N': 130, 'Na': 20, 'Cl': 20, 'S': 150}
 
 
-def _draw_substrate_atoms(ax, sub_apos, sub_enames, axes=(0, 1), alpha=0.55, label=True):
-    """Draw substrate ions as CPK-colored circles (Na=goldenrod, Cl=green, ...).
+def _draw_substrate_atoms(ax, sub_apos, sub_enames, axes=(0, 1), alpha=0.9, label=False):
+    """Draw substrate ions as small dots (Na=gold, Cl=lime, ...).
 
     Shared by plot_molecule_substrate_xy/_xz and plot_assembly_on_substrate so the
     Na/Cl checkerboard is rendered consistently across all substrate plots.
 
-    Vectorized: one ax.scatter call per unique element (NOT per atom). A per-atom
-    Python loop here is catastrophic — 3000+ ions × scatter = ~20s/frame.
+    Uses '.' marker with small size so ions do NOT occlude the FAF heatmap.
+    Vectorized: one ax.scatter call per unique element (NOT per atom).
     """
     ax1, ax2 = axes
     sub_apos = np.asarray(sub_apos[:, :3], dtype=np.float64)
@@ -47,9 +47,8 @@ def _draw_substrate_atoms(ax, sub_apos, sub_enames, axes=(0, 1), alpha=0.55, lab
         if not mask.any():
             continue
         c = ELEMENT_COLORS.get(e, 'gray')
-        s = ELEMENT_SIZES.get(e, 100)
-        ax.scatter(sub_apos[mask, ax1], sub_apos[mask, ax2], c=c, s=s, zorder=2,
-                   edgecolors='black', linewidths=0.5, alpha=alpha)
+        s = ELEMENT_SIZES.get(e, 20)
+        ax.scatter(sub_apos[mask, ax1], sub_apos[mask, ax2], c=c, s=s, marker='.', zorder=3, alpha=alpha)
     if label:
         for e, p in zip(sub_enames, sub_apos):
             ax.text(p[ax1], p[ax2], e, fontsize=6, ha='center', va='center', zorder=4)

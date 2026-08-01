@@ -21,6 +21,7 @@ SPAMMM (Scanning Probe Accelerated Modeling of Microscopy and Manipulation) is a
 - Never copy-paste between apps — extract to shared lib and include.
 - **Ask, don't guess** — when you encounter problem which where you are not sure, ask the user instead of trying to infer it.
 - **NEVER mark an issue as "fixed", "resolved", or "done" without explicit USER confirmation.** This applies to bug reports, task documents, ToDo items, and any status tracking. A code change is NOT proof of a fix. You must: (1) run a test or verification that demonstrates the fix, (2) show the result to the USER, (3) wait for USER confirmation before updating any status field. Violating this rule is considered a critical error. When in doubt, leave the status as "investigating" or "unverified".
+- **in devin always use deving tools to adit files, never** (`python3 << 'PYEOF'` heredocs, `sed -i`, `cat >`, `echo >>`, shell redirects). ALWAYS use the Devin `edit`/`write`/`read` tools so changes appear in the IDE diff viewer for USER review. Shell-based edits are invisible to the user and cannot be reviewed or reverted easily.
 
 ## Debugging & Testing
 
@@ -43,6 +44,7 @@ SPAMMM (Scanning Probe Accelerated Modeling of Microscopy and Manipulation) is a
 * **OpenCL device:** always prefer **NVIDIA GPU** (`OpenCLBase.select_device(preferred_vendor='nvidia')`). Never report PoCL/CPU timings as GPU. Agents must run OpenCL Shell commands unrestricted (`all`) so the NVIDIA ICD is visible — see `doc/AGENTS/notes/opencl-nvidia-device.md` and `.cursor/rules/opencl-nvidia-gpu.mdc`.
 * **Python is the harness, not the engine** (skill:`python-perf`). NEVER write hot loops in Python — batch via NumPy or push to OpenCL. Per-atom `ax.scatter` loops, `for r in range(n_trial)` quaternion math, per-trial distance checks are all violations. If a loop is unavoidable, profile (`cProfile`) and confirm <1% of runtime.
 * **Simulation code lives in pyOpenCL kernels** (skill:`gpu-optimize`, skill:`port-to-opencl`). Kernels must be well-parallelized: use workgroups, local memory, minimize host-device transfers and kernel launch overhead. Python only orchestrates.
+* **Fuse secondary checks into existing kernels** (skill:`gpu-optimize` § "Fusing Secondary Checks"). If a kernel already computes a distance/overlap, add clash/collision flags in the same loop — never recompute on host. Reuse reserved `float4.w` channels for secondary results. Only check active-vs-partner pairs (frozen-frozen is invariant). Use active-set incremental updates (`E += ΔE_active`) on host — see skill:`python-perf` §6.
 * **Long-running scripts MUST print unbuffered progress** (`flush=True` or `PYTHONUNBUFFERED=1`). NEVER run silently for minutes — print what is starting, accepted steps with energy decrease, and when finished. The user will not wait for scripts with no output.
 
 ## Documentation & Navigation

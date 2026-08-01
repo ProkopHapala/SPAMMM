@@ -185,7 +185,7 @@ Each workgroup for \((r, i)\) with \(i\in A\) writes:
 | `E.x` | \(E_{i,A\setminus\{i\}}\) — PairFF of \(i\) vs **other active** molecules in same replica |
 | `E.y` | \(E_{i,F}\) — PairFF of \(i\) vs **frozen** molecules |
 | `E.z` | \(E_{\mathrm{one},i}\) — FAF + Kz + anchors (one-body) |
-| `E.w` | reserved (`0`) or debug (`E.x+E.y+E.z`) |
+| `E.w` | fused active-vs-partner clash count (`0` when clash cutoffs are disabled) |
 
 Buffer:
 
@@ -337,9 +337,9 @@ Energy-only kernel must cut that pressure so many replica WGs hide latency.
 | `Lparam[256]` | 1024 |
 | three-channel reduction, WG=64 | 768 |
 | pose/rotation/indices + alignment | 96 |
-| **NVIDIA compiler total** | **2912** |
+| **NVIDIA compiler total (pre-clash K1)** | **2912** |
 
-On the RTX 3090, `2912×16 = 46592 < 49152` bytes, so local memory permits 16 resident two-warp workgroups. Partner molecules and active molecules larger than 64 sites stream in chunks; there is no silent 128-site truncation.
+The fused clash reduction adds 256 B, for about 3.1 KiB/workgroup in the current kernel. Partner molecules and active molecules larger than 64 sites stream in chunks; there is no silent 128-site truncation.
 
 Preliminary full-residency estimate (not selected):
 
@@ -490,7 +490,7 @@ Reference: reuse compact-exp CPU path from HBondFF / existing PairFF map helpers
 | Phase | Deliverable | Status |
 |-------|-------------|--------|
 | **D** (this doc) | Design locked | ✅ done |
-| **K1** | Energy kernel + channel reduce; FAF optional via `nbasis` | ✅ done — `kernels/rigid.cl` kernel 14, WG=64, 2912 B LM, 64 regs, 0 spills |
+| **K1** | Energy kernel + channel reduce; FAF optional via `nbasis` | ✅ done — `kernels/rigid.cl` kernel 14, WG=64; fused clash flag added 2026-08-01, implementation tested and awaiting USER confirmation |
 | **P1** | `eval_energy_replicas` + `energy_changed` on `RigidBodyPairFF` | ✅ done — `RigidBodyDynamics.py` L2428–2648 |
 | **H1** | Greedy planar harness, `nactive=1`, no FAF | ✅ done — `greedy_energy_step` + `tests/testplot_pairff_energy_mc.py` |
 | **H2** | Metropolis/SA one-liner; multi-`nactive` moves | ⏳ pending — greedy MC stalls (21–75/1000 acc); SA is next |

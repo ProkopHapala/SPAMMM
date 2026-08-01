@@ -3815,13 +3815,15 @@ void rigid_body_pairff_unified_allmol_faf_kernel(
 //    local  = (RIGID_ENERGY_WG, 1)
 //    group  = (active slot, replica)
 //
-//  E_out = (PairFF vs active, PairFF vs frozen, one-body, reserved).
+//  E_out = (PairFF vs active, PairFF vs frozen, one-body, clash count).
 //  The host obtains the changed-set energy as 0.5*sum(E.x)+sum(E.y+E.z).
+//  Clash checks reuse PairFF distances and cover each active molecule against
+//  every partner; frozen-frozen pairs are invariant across a trial batch.
 //
 //  NVIDIA design:
 //    - 64 threads = two warps; one private site/thread avoids register spills.
 //    - One 64-site scratch tile is reused by PairFF and 32-basis FAF tiles.
-//    - Local footprint is ~2.9 KiB/WG, allowing 16 resident WGs in 48 KiB.
+//    - Local footprint is ~3.1 KiB/WG, allowing 15 resident WGs in 48 KiB.
 //    - Larger molecules are streamed in chunks instead of being truncated.
 
 #ifndef RIGID_ENERGY_WG
@@ -3847,6 +3849,7 @@ void rigid_body_pairff_energy_replica_kernel(
     const int                        nactive,
     const int                        nmol,
     const int                        n_replica,
+    const float2                     clash_r2,
     const float4                     pairff_params,
     const float                      beta,
     const float                      z_target,
@@ -3874,7 +3877,7 @@ void rigid_body_pairff_energy_replica_kernel(
 
     __local float4  Lsite[RIGID_ENERGY_SITE_TILE];       // PairFF: xyz,g; FAF: basis params
     __local float   Lparam[RIGID_ENERGY_SITE_TILE*4];    // PairFF: REQ;   FAF: type-major coeff tile
-    __local float   Lsum[3*RIGID_ENERGY_WG];
+    __local float   Lsum[4*RIGID_ENERGY_WG];
     __local cl_Mat3 LR;
     __local float4  Lpos;
     __local int     Lj0, Lnj, Lpartner_active;
@@ -3889,6 +3892,7 @@ void rigid_body_pairff_energy_replica_kernel(
     float E_active = 0.0f;
     float E_frozen = 0.0f;
     float E_one    = 0.0f;
+    float E_clash  = 0.0f;
 
     for (int abase = 0; abase < na; abase += RIGID_ENERGY_WG*RIGID_ENERGY_SITES_PER_THREAD) {
         if (lid == 0) {
@@ -3924,6 +3928,8 @@ void rigid_body_pairff_energy_replica_kernel(
                 Lnj = mols[j+1] - Lj0;
                 const float4 q = normalize(qrots[ipose0 + j]);
                 Lpos = poss[ipose0 + j];
+                const float2 dcom = poss[ipose0 + ia].xy - Lpos.xy;
+                if (clash_r2.x > 0.0f && dot(dcom, dcom) < clash_r2.x) E_clash = 1.0f;
                 LR.a = (float4)(quat_to_a(q), 0.0f);
                 LR.b = (float4)(quat_to_b(q), 0.0f);
                 LR.c = (float4)(quat_to_c(q), 0.0f);
@@ -3960,6 +3966,7 @@ void rigid_body_pairff_energy_replica_kernel(
                         const float4 REQ_j = vload4(t, Lparam);
                         const float gj = Lsite[t].w;
                         const float gij = gi * gj;
+                        if (clash_r2.y > 0.0f && gij > 0.5f && r2 < clash_r2.y) E_clash = 1.0f;
                         const float R0 = gij * (REQ_i.x + REQ_j.x);
                         const float w  = REQ_i.w + REQ_j.w;
                         const float rho_c = R0 + inv_beta_n;
@@ -4019,14 +4026,16 @@ void rigid_body_pairff_energy_replica_kernel(
     Lsum[lid]                     = E_active;
     Lsum[RIGID_ENERGY_WG + lid]   = E_frozen;
     Lsum[2*RIGID_ENERGY_WG + lid] = E_one;
+    Lsum[3*RIGID_ENERGY_WG + lid] = E_clash;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int stride = RIGID_ENERGY_WG >> 1; stride > 0; stride >>= 1) {
         if (lid < stride) {
             Lsum[lid]                     += Lsum[lid + stride];
             Lsum[RIGID_ENERGY_WG + lid]   += Lsum[RIGID_ENERGY_WG + lid + stride];
             Lsum[2*RIGID_ENERGY_WG + lid] += Lsum[2*RIGID_ENERGY_WG + lid + stride];
+            Lsum[3*RIGID_ENERGY_WG + lid] += Lsum[3*RIGID_ENERGY_WG + lid + stride];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (lid == 0) E_out[irepl*nactive + islot] = (float4)(Lsum[0], Lsum[RIGID_ENERGY_WG], Lsum[2*RIGID_ENERGY_WG], 0.0f);
+    if (lid == 0) E_out[irepl*nactive + islot] = (float4)(Lsum[0], Lsum[RIGID_ENERGY_WG], Lsum[2*RIGID_ENERGY_WG], Lsum[3*RIGID_ENERGY_WG]);
 }

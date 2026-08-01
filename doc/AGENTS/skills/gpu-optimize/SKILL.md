@@ -64,6 +64,36 @@ __global float4* props; // {charge, mass, flags, _pad}
 - Parallelize as much work as possible in a single kernel (broad parallelism) rather than calling many small kernels in sequence
 - Fuse multiple kernel operations into one where possible
 
+## Fusing Secondary Checks Into Existing Kernels
+
+If a kernel already computes a quantity (distances, overlaps, etc.), fuse any secondary check that depends on the same quantity into the same kernel — do NOT recompute it on the host or in a separate kernel. This is the single highest-impact optimization when a Python post-processing loop follows a GPU kernel.
+
+**Pattern (from PairFF MC clash detection, 2026-08-01):** kernel 14 already computes every active-site/partner-site distance `r2` for PairFF energy. Clash detection (`r2 < rmin_atom²`) was fused into the same distance loop, gating on `gij > 0.5` (both real atoms). CoM distance checked once per active/partner pair. Result: 82.7 ms Python loop → 0 ms (overlapped with energy kernel). 93% of MC step time eliminated.
+
+```
+// Already computing r2 for energy — add clash flag in the same branch
+if (clash_r2.y > 0.0f && gij > 0.5f && r2 < clash_r2.y) E_clash = 1.0f;
+// CoM check once per partner, reusing poss already loaded
+const float2 dcom = poss[ipose0 + ia].xy - Lpos.xy;
+if (clash_r2.x > 0.0f && dot(dcom, dcom) < clash_r2.x) E_clash = 1.0f;
+```
+
+Rules:
+- **Never recompute on host what the kernel already computed.** If the kernel has `r2`, the host should not call `_body_sites_world` + `np.einsum` to get `r2` again.
+- **Gate secondary checks on existing conditions.** Clash only applies to real-atom pairs (`gij > 0.5`), not electron pairs — reuse the existing type classification.
+- **Only check active-vs-partner, not frozen-frozen.** Frozen-frozen geometry is invariant across a trial batch (only the active set moves). Recomputing frozen-frozen pairs cannot affect the result. This avoids a global reduction.
+- **Report via existing output channels.** Use reserved/unused `float4.w` components to carry secondary results back to the host — no new buffers, no new transfers.
+
+## Reuse Reserved Output Channels
+
+OpenCL kernels often output `float4` where only `.xyz` are used. The `.w` component is frequently reserved/unused. Repurpose it for secondary results instead of adding new output buffers or host-device transfers.
+
+**Example:** kernel 14's `E_out = (E_active, E_frozen, E_one, reserved)` → `E_out = (E_active, E_frozen, E_one, clash_count)`. Zero additional memory, zero additional transfer. The host reads `E_chan[..., 3] > 0.0` for clash flags; `energy_changed` deliberately ignores `.w`.
+
+## Redundant Synchronization
+
+`queue.finish()` before a **blocking** `clEnqueueReadBuffer` (PyOpenCL `fromGPU`) is redundant — the blocking read already waits for all queued operations. Only use `finish()` when you need to synchronize before a **non-blocking** operation or when the host needs the queue empty for a side effect.
+
 ## Branching & Atomics
 
 - Avoid divergent branching (warp/workgroup divergence) — all threads should take same path

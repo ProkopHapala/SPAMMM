@@ -267,6 +267,8 @@ def _on_build(window):
             window.ra_fit = None
         # Cache per-pack bonds for display
         window.ra_bonds0 = bonds_list
+        window.ra_E_last = window.ra_rbd.eval_energy_system(pos, quat, k_pack=float(window.ra_kpack_spin.value()))
+        window.ra_kpack_last = float(window.ra_kpack_spin.value())
         _status(window, f'Built: {window.ra_ensemble.summary()}  device={window.ra_rbd.ctx.devices[0].name}')
         _sync_display(window)
     except Exception as e:
@@ -287,6 +289,10 @@ def _on_mc_step(window):
     dxy = float(window.ra_dxy_spin.value())
     dphi = float(window.ra_dphi_spin.value())
     k_pack = float(window.ra_kpack_spin.value())
+    if window.ra_kpack_last != k_pack:
+        pos0, quat0 = ens.get_poses()
+        window.ra_E_last = rbd.eval_energy_system(pos0, quat0, k_pack=k_pack)
+        window.ra_kpack_last = k_pack
     seed = int(window.ra_seed_spin.value()) + 1000 + int(window.ra_mc_step_count)
     moved = [int(window.ra_mc_step_count) % nmol]
     pos, quat = ens.get_poses()
@@ -299,7 +305,8 @@ def _on_mc_step(window):
         ens.set_poses(pos, quat)
         _upload_poses_to_gpu(window)
         _sync_display(window)
-    E = rbd.eval_energy_system(pos, quat, k_pack=k_pack)
+        window.ra_E_last += Ebest - E0
+    E = window.ra_E_last
     window.ra_mc_step_count += 1
     window.ra_E_last = float(E)
     finite = Ebatch[np.isfinite(Ebatch)]
@@ -549,6 +556,7 @@ def build_ui(window):
     window.ra_bonds0 = None
     window.ra_mc_step_count = 0
     window.ra_E_last = 0.0
+    window.ra_kpack_last = None
     window.ra_pme_solver = None
     window.ra_pme_xy = None
     window._ra_plot_windows = []

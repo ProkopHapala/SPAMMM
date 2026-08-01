@@ -272,7 +272,7 @@ AFMulator adds `AFM.cl` for full scan stack.
 | `folded_FT_perturb` | Same after ±eps along one of 6 DOFs (FD Hessian column) |
 | `rigid_solve6_lm` | `(A+λI)x=b` — GE + partial pivoting; return 0 if singular |
 | `rigid_update_FIRE` | Bitzek-style velocity zeroing + dt/damp adapt |
-| `rigid_body_pairff_energy_replica_kernel` | Pure replica×active PairFF+FAF/Kz/anchor energy channels; 64-thread NVIDIA tile path |
+| `rigid_body_pairff_energy_replica_kernel` | Replica×active PairFF+FAF/Kz/anchor energy plus fused real-atom/CoM clash flags; 64-thread NVIDIA tile path |
 
 **Caveat:** Gyroscopic term ω×(I·ω) must use body-frame inertia. Folded setup scales both `I` and `I⁻¹` with the requested effective mass; changing translation alone is inconsistent. FIRE when `md_params.w < 0`. Python: `run_folded(..., fire=True)`, `run_folded_newton` / `run_folded_newton_replicas`; host FD Newton is `relax_newton_host` (debug only).
 

@@ -60,11 +60,15 @@ First call: allocates buffers. Subsequent calls with same sizes: skips allocatio
 
 **Workflow:** Setup references → Scan microtests → Structural integrity → Block-level parity → Dense reassembly → End-to-end term → Debug drill (bisect).
 
-## GPU Kernel Perforamnce Guidelines
+## GPU Kernel Performance Guidelines
 
 - Design around memory latency and cache efficiency.
 - Prefer "gather" operations over "scatter" designs where possible.
 - Avoid branching, atomics, and unnecessary synchronization in GPU kernels.
 - Maximize the efficiency of shared/local memory and workgroups.
 - Avoid unnecessary host-device data transfers.
+- **Fuse secondary checks into existing kernels** — if the kernel already computes distances/overlaps, add clash/collision/geometry flags in the same loop. Do NOT recompute on host. See skill:`gpu-optimize` § "Fusing Secondary Checks".
+- **Reuse reserved output channels** (`float4.w`) for secondary results instead of new buffers.
+- **Only check active-vs-partner pairs** when only the active set moves — frozen-frozen is invariant.
+- **Active-set incremental updates on host** — use `E += ΔE_active` not full recompute. See skill:`python-perf` §6.
 

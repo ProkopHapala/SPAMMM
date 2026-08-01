@@ -12,6 +12,7 @@ Key functionality:
   - **RigidBodyPairFF**: allmol shared multi-mol layout (`from_molecules`);
     `set_active_body` = index only (persistent dynamics); `attach_pairff_faf`
     for substrate; `tip_pull_scan` / `world_sites_all_bodies` for AFM-like pulls;
+    replica PairFF evaluation reports fused real-atom/CoM clash flags for MC/GA;
     Vispy map uses `faf_fit` + `potential_to_rgba` display SSOT
 
 Role in SPAMMM: Rigid engine for AFM manipulation (`RigidBodyAFM.py`) and
@@ -1803,6 +1804,7 @@ void rigid_body_pairff_energy_replica_kernel(
     const int               nactive,
     const int               nmol,
     const int               n_replica,
+    const float2            clash_r2,
     const float4            pairff_params,
     const float             beta,
     const float             z_target,
@@ -2468,6 +2470,7 @@ void rigid_body_pairff_energy_replica_kernel(
             self.kernel_params['folded_meta'] = np.array([0, 1, 0, 0], dtype=np.int32)
         if 'folded_lvec2d' not in self.kernel_params:
             self.kernel_params['folded_lvec2d'] = np.array([1.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        self.kernel_params.setdefault('clash_r2', np.zeros(2, dtype=np.float32))
         return self
 
     def set_active_mols(self, active_mols):
@@ -2514,11 +2517,13 @@ void rigid_body_pairff_energy_replica_kernel(
             raise ValueError(f"E_chan shape {E.shape}, expected (R,nactive,4) or (nactive,4)")
         return 0.5 * E[..., 0].sum(axis=-1) + E[..., 1].sum(axis=-1) + E[..., 2].sum(axis=-1)
 
-    def eval_energy_replicas(self, poss=None, qrots=None, active_mols=None, bTryAllocate=True):
+    def eval_energy_replicas(self, poss=None, qrots=None, active_mols=None, bTryAllocate=True, rmin_com=0.0, rmin_atom=0.0):
         """Launch energy_replica kernel; return E_chan (n_replica, nactive, 4).
 
         poss/qrots: optional upload; else reuse last replica buffers.
         active_mols: optional int list; else last set_active_mols / all molecules.
+        E_chan[...,3] is a fused active-vs-environment clash count when either
+        minimum distance is positive; energy_changed deliberately ignores it.
         """
         nmol = int(self.n_bodies)
         if active_mols is not None:
@@ -2547,6 +2552,7 @@ void rigid_body_pairff_energy_replica_kernel(
         self.kernel_params['nactive'] = np.int32(nactive)
         self.kernel_params['nmol'] = np.int32(nmol)
         self.kernel_params['n_replica'] = np.int32(n_replica)
+        self.kernel_params['clash_r2'] = np.square(np.maximum(np.asarray([rmin_com, rmin_atom], dtype=np.float32), 0.0))
         if self.krnl_pairff_energy_replica is None:
             self.krnl_pairff_energy_replica = cl.Kernel(self.prg, "rigid_body_pairff_energy_replica_kernel")
         args = self.generate_kernel_args(
@@ -2561,7 +2567,6 @@ void rigid_body_pairff_energy_replica_kernel(
         global_size = (nactive * wg, n_replica)
         local_size = (wg, 1)
         self.krnl_pairff_energy_replica(self.queue, global_size, local_size, *args)
-        self.queue.finish()
         E = np.empty((n_replica * nactive, 4), dtype=np.float32)
         self.fromGPU('E_out', E)
         return E.reshape(n_replica, nactive, 4)
@@ -2601,58 +2606,34 @@ void rigid_body_pairff_energy_replica_kernel(
         quat = np.asarray(quat, dtype=np.float32).reshape(nmol, 4).copy()
         moved = np.asarray(moved, dtype=np.int32).ravel()
         n_trial = int(n_trial)
+        if n_trial < 1:
+            raise ValueError(f"n_trial must be positive, got {n_trial}")
         poss = np.zeros((n_trial, nmol, 4), dtype=np.float32)
+        poss[:, :, :3] = pos[None, :, :]
         qrots = np.tile(quat[None, :, :], (n_trial, 1, 1))
-        for r in range(n_trial):
-            poss[r, :, :3] = pos
-            for i in moved:
-                if r == 0:
-                    continue
-                poss[r, i, 0] += float(rng.normal(0.0, dxy))
-                poss[r, i, 1] += float(rng.normal(0.0, dxy))
-                dphi_i = float(rng.normal(0.0, dphi))
-                half = 0.5 * dphi_i
-                dq = np.array([0.0, 0.0, np.sin(half), np.cos(half)], dtype=np.float32)
-                qrots[r, i] = self._quat_normalize(self._quat_mul(quat[i], dq))
-        E_chan = self.eval_energy_replicas(poss, qrots, active_mols=moved)
+        if n_trial > 1:
+            rnd = rng.normal(size=(n_trial - 1, moved.size, 3))
+            poss[1:, moved, 0] += (rnd[..., 0] * dxy).astype(np.float32)
+            poss[1:, moved, 1] += (rnd[..., 1] * dxy).astype(np.float32)
+            s = np.sin(0.5 * rnd[..., 2] * dphi)
+            c = np.cos(0.5 * rnd[..., 2] * dphi)
+            q0 = quat[moved][None, :, :]
+            qr = np.empty((n_trial - 1, moved.size, 4), dtype=np.float32)
+            qr[..., 0] = q0[..., 0] * c + q0[..., 1] * s
+            qr[..., 1] = q0[..., 1] * c - q0[..., 0] * s
+            qr[..., 2] = q0[..., 3] * s + q0[..., 2] * c
+            qr[..., 3] = q0[..., 3] * c - q0[..., 2] * s
+            qr /= np.linalg.norm(qr, axis=-1, keepdims=True)
+            qrots[1:, moved, :] = qr
+        E_chan = self.eval_energy_replicas(poss, qrots, active_mols=moved, rmin_com=rmin_com, rmin_atom=rmin_atom)
         E = self.energy_changed(E_chan)
         if k_pack > 0.0:
-            for r in range(n_trial):
-                E[r] = float(E[r]) + self.packing_energy(poss[r, :, :3], k_pack, pack_center)
-        need_clash = (rmin_com > 0.0) or (rmin_atom > 0.0)
-        if need_clash:
-            real_rel = []
-            if self._mb_packs is not None and rmin_atom > 0.0:
-                for pack in self._mb_packs:
-                    m = pack['types'] == 0
-                    real_rel.append(np.asarray(pack['rel'][m, :3], dtype=np.float32))
-            for r in range(1, n_trial):  # keep replica 0
-                pxy = poss[r, :, :2]
-                if rmin_com > 0.0:
-                    clash = False
-                    for i in range(nmol):
-                        for j in range(i + 1, nmol):
-                            if float(np.linalg.norm(pxy[i] - pxy[j])) < rmin_com:
-                                clash = True
-                                break
-                        if clash:
-                            break
-                    if clash:
-                        E[r] = np.inf
-                        continue
-                if rmin_atom > 0.0 and real_rel:
-                    worlds = [_body_sites_world(real_rel[j], poss[r, j, :3], qrots[r, j]) for j in range(nmol)]
-                    clash = False
-                    for i in range(nmol):
-                        for j in range(i + 1, nmol):
-                            d = worlds[i][:, None, :] - worlds[j][None, :, :]
-                            if float(np.min(np.einsum('ijk,ijk->ij', d, d))) < rmin_atom * rmin_atom:
-                                clash = True
-                                break
-                        if clash:
-                            break
-                    if clash:
-                        E[r] = np.inf
+            d = poss[:, :, :2] - np.asarray(pack_center, dtype=np.float32)[None, None, :2]
+            E += 0.5 * k_pack * np.sum(d * d, axis=(1, 2))
+        if (rmin_com > 0.0) or (rmin_atom > 0.0):
+            clash = np.any(E_chan[..., 3] > 0.0, axis=1)
+            clash[0] = False  # replica 0 is the current state and remains the reference
+            E[clash] = np.inf
         E0 = float(E[0])
         ibest = int(np.argmin(E))
         Ebest = float(E[ibest])

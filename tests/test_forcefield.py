@@ -137,6 +137,39 @@ def test_uff_energy_finite(xyz):
     assert np.all(np.isfinite(E)), 'UFF energy is NaN/Inf'
     assert E[0] > 0, f'UFF energy should be positive (harmonic bonds+angles): {E[0]}'
 
+
+@pytest.mark.gpu
+def test_pairff_replica_clash_channel_matches_cpu():
+    """Kernel-14 clash flag must match real-atom CPU distances without changing energy."""
+    from spammm.forcefields.RigidBodyDynamics import RigidBodyPairFF, _body_sites_world
+    from spammm.forcefields.molecule_loaders import load_formic_acid
+    apos, enames, REQs, _ = load_formic_acid(qeq=False)
+    pos = np.array([[0.0, 0.0, 0.0], [8.0, 0.0, 0.0]], dtype=np.float32)
+    quat = np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (2, 1))
+    rbd = RigidBodyPairFF.from_molecules([(apos, enames, REQs)] * 2, pos, quats=quat)
+    poss = np.zeros((3, 2, 4), dtype=np.float32)
+    poss[:, :, :3] = pos[None, :, :]
+    poss[1, 1, :3] = pos[0]
+    qrots = np.tile(quat[None, :, :], (3, 1, 1))
+    E0 = rbd.eval_energy_replicas(poss, qrots, active_mols=[0])
+    Ea = rbd.eval_energy_replicas(poss, qrots, active_mols=[0], rmin_atom=1.6)
+    Em = rbd.eval_energy_replicas(poss, qrots, active_mols=[0], rmin_com=2.0)
+    Ec = rbd.eval_energy_replicas(poss, qrots, active_mols=[0], rmin_com=2.0, rmin_atom=1.6)
+    np.testing.assert_allclose(Ea[..., :3], E0[..., :3], rtol=0.0, atol=0.0)
+    np.testing.assert_array_equal(Ea[:, 0, 3] > 0.0, [False, True, False])
+    np.testing.assert_array_equal(Em[:, 0, 3] > 0.0, [False, True, False])
+    real = np.asarray(rbd._mb_packs[0]['types']) == 0
+    rel = np.asarray(rbd._mb_packs[0]['rel'])[real]
+    cpu_clash = []
+    for ir in range(3):
+        wi = _body_sites_world(rel, poss[ir, 0, :3], qrots[ir, 0])
+        wj = _body_sites_world(rel, poss[ir, 1, :3], qrots[ir, 1])
+        d2min = np.min(np.sum((wi[:, None, :] - wj[None, :, :])**2, axis=-1))
+        dcom = poss[ir, 0, :2] - poss[ir, 1, :2]
+        cpu_clash.append((d2min < 1.6**2) or (np.dot(dcom, dcom) < 2.0**2))
+    np.testing.assert_array_equal(Ec[:, 0, 3] > 0.0, cpu_clash)
+
+
 @pytest.mark.gpu
 def test_uff_force_newton3(xyz):
     """Net force on isolated molecule should be ~0 (Newton's 3rd law)."""

@@ -411,9 +411,9 @@ def main():
         if acc:
             n_acc += 1
             ensemble.set_poses(pos, quat)  # write accepted poses back to ensemble
-        # Full system energy (greedy_energy_step returns only active-mol channels;
-        # eval_energy_system sums ALL molecules for the history trajectory).
-        E = rbd.eval_energy_system(pos, quat, k_pack=args.k_pack)
+            # Frozen-frozen terms are invariant, so the active-channel delta is
+            # the exact full-system delta; avoid a second replica launch/step.
+            E += Ebest - E0
         hist.append(E)
         if acc or step % 50 == 0:
             frames.append((f'step{step:04d}', pos.copy(), quat.copy(), E))
