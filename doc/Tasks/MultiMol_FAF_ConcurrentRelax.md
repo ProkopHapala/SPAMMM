@@ -523,3 +523,59 @@ This is substantially larger than the rigid task because it needs variable topol
 | `data/fits/*.npz` | FAF input fits; convert/materialize to canonical runtime coefficients |
 | `data/substrates/NaCl_1x1_L3.xyz` | Primary substrate |
 | `data/substrates/CaF2_3x3_6L.xyz` | Sheared-cell validation substrate |
+
+---
+
+## 14. IMPLEMENTATION STATUS (Stage 0–3 complete, pending USER review)
+
+### 14.1 What was implemented
+
+**Stage 0 — Tensor FAF evaluator (`kernels/rigid.cl` lines 861–923)**
+- `folded_eval_tensor_rigid()`: Fourier-recurrence FAF evaluator using materialized scalar coefficients.
+- Replaces ~224 trig + 112 exp calls (flat evaluator) with 2 `sincos` + 7 exp per atom for the standard 4×4×7 basis.
+- Returns `float4(.xyz = F = -∇E, .w = E)` — same contract as `folded_eval_basis_rigid`/`grad_rigid`.
+
+**Stage 2 — Kernel 15 FAF extension (`kernels/rigid.cl` lines 4193–4245, 4368–4378)**
+- Added 5 new kernel arguments: `do_faf`, `folded_site_coeffs`, `folded_z_params`, `folded_tensor_meta` (int4: nu, nv, nz, total_sites), `folded_lvec2d`.
+- `do_faf=0` branch is bit-identical to pre-FAF kernel 15 (no new code paths execute, dummy buffers bound).
+- `do_faf=1` calls `folded_eval_tensor_rigid` per atom inside the per-atom force/torque reduction loop, after pairwise forces and before anchor forces.
+
+**Stage 1 — Coefficient materialization (`RigidBodyDynamics.py` `_materialize_multimol_faf`)**
+- Converts typed OR factorized FAF fits to one scalar `c(site, basis)` at upload time.
+- Basis-major layout: `site_coeffs[b * total_sites + site]` for coalesced reads.
+- Validates regular tensor-product basis (ku=iu, kv=iv, per-iz alpha, constant z0); rejects irregular bases.
+- Uploads `folded_site_coeffs`, `folded_z_params`, `folded_tensor_meta`, `folded_lvec2d`.
+
+**Stage 3 — Host launch path (`RigidBodyDynamics.py` `_multimol_launch_pair`, `run_multimol_md`)**
+- `run_multimol_md(faf=None)`: `None` follows `self.faf_mode`; `True`/`False` explicitly enables/disables.
+- `_multimol_launch_pair(faf=...)`: binds FAF buffers + `do_faf=1` when True; binds dummy buffers + `do_faf=0` when False.
+- Launcher cache key extended with `faf` flag; FAF materialization invalidates cached launchers.
+- `bench_multimol_md.py::measure_launch_overhead` updated to bind dummy FAF args.
+
+### 14.2 Tests (`tests/test_multimol_faf.py` — 4 tests, all passing)
+
+| Test | Level | What it verifies |
+|------|-------|------------------|
+| `test_multimol_faf_disabled_regression` | L0a | `faf=False` bit-identical to pre-FAF kernel (rtol=0, atol=0) |
+| `test_multimol_faf_tensor_vs_flat_parity` | L0b | Tensor evaluator (kernel 15) matches flat evaluator (kernel 13) for 1 mol (rtol=1e-5) |
+| `test_multimol_faf_relaxation` | L0c | 2 PTCDA + FAF: energy decreases over 200 MD steps |
+| `test_multimol_faf_typed_fit` | L0d | Typed fit also runs through tensor evaluator (finite energy) |
+
+### 14.3 Verification results (GTX 1650, NVIDIA OpenCL)
+
+- `tests/test_multimol_faf.py`: 4/4 passed.
+- `tests/test_forcefield.py`: 29/29 passed (no regression).
+- `tests/bench_multimol_md.py`: runs successfully; `A_opt` strategy 197 µs/step (8×PTCDA), 233 µs/step (16×PTCDA).
+- FAF relaxation: E0=522.5 eV → E1=-0.98 eV over 200 steps (2 PTCDA, factorized fit).
+
+### 14.4 Pending (not yet implemented)
+
+- **Stage 4**: Performance microbenchmark (tensor vs flat evaluator timing).
+- **Stage 5**: Concurrent vs sequential crossover benchmark (kernel 15+FAF vs kernel 13 active-body cycling).
+- **Stage 6**: Interactive relaxation integration (GUI `RigidAssemblyExtension`).
+- **GridFF integration**: Not started; FAF is the primary substrate path.
+- **Flexible UFF/SPFF assemblies** (§11): separate follow-up task.
+
+### 14.5 Status
+
+**Unverified** — pending USER review of L0 test output and L1 timing data.

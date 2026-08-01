@@ -241,6 +241,16 @@ def measure_launch_overhead(rbd, n_launches=1000):
     rbd.kernel_params['niter'] = np.int32(0)  # 0 iterations = empty kernel
     rbd.kernel_params['predict_partners'] = np.int32(0)
     rbd.kernel_params['md_params'] = np.array([0.92, 0.88, 1.0, 1.0], dtype=np.float32)
+    # Ensure FAF dummy args exist (kernel 15 now has do_faf + FAF buffers)
+    rbd.kernel_params.setdefault('do_faf', np.int32(0))
+    rbd.kernel_params.setdefault('folded_tensor_meta', np.array([0, 0, 0, 0], dtype=np.int32))
+    rbd.kernel_params.setdefault('folded_lvec2d', np.array([1.0, 0.0, 0.0, 1.0], dtype=np.float32))
+    if 'folded_site_coeffs' not in rbd.buffer_dict:
+        rbd.check_buf('folded_site_coeffs', 4)
+        rbd.toGPU('folded_site_coeffs', np.zeros(1, dtype=np.float32))
+    if 'folded_z_params' not in rbd.buffer_dict:
+        rbd.check_buf('folded_z_params', 16)
+        rbd.toGPU('folded_z_params', np.zeros((1, 4), dtype=np.float32))
     overrides = dict(poss_in=rbd.buffer_dict['poss'], qrots_in=rbd.buffer_dict['qrots'], vposs_in=rbd.buffer_dict['vposs'], vrots_in=rbd.buffer_dict['vrots'], poss_out=rbd.buffer_dict['poss_alt'], qrots_out=rbd.buffer_dict['qrots_alt'], vposs_out=rbd.buffer_dict['vposs_alt'], vrots_out=rbd.buffer_dict['vrots_alt'])
     args = rbd.generate_kernel_args(kname, overrides=overrides)
     krnl.set_args(*args)

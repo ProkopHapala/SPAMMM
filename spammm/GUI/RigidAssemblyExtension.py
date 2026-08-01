@@ -282,13 +282,25 @@ def _on_build(window):
 
 
 # ─── MC/GA mode ──────────────────────────────────────────────────────────────
-def _on_mc_step(window):
-    """Run one greedy MC step over all molecules (round-robin moved index)."""
+def _on_mc_step(window, update_ui=True):
+    """Run one greedy MC step over all molecules (round-robin moved index).
+
+    update_ui=True (default, used by the button and _on_mc_run): syncs the scene and
+    status on acceptance, preserving existing behavior. update_ui=False skips scene
+    sync and status pump so a paced script can run several steps per visual frame;
+    the caller is responsible for refreshing the final pose of the batch (call with
+    update_ui=True on the last point, even if that trial is rejected — _sync_display
+    reads the authoritative ensemble pose, not the rejected trial).
+
+    Returns a summary dict {step, E0, Ebest, E, accepted, batch_min} or None if not
+    built.
+    """
     ens = window.ra_ensemble
     rbd = window.ra_rbd
     if ens is None or rbd is None:
-        _status(window, 'Build assembly first')
-        return
+        if update_ui:
+            _status(window, 'Build assembly first')
+        return None
     nmol = len(ens)
     n_trial = int(window.ra_ntrial_spin.value())
     dxy = float(window.ra_dxy_spin.value())
@@ -309,13 +321,19 @@ def _on_mc_step(window):
     if acc:
         ens.set_poses(pos, quat)
         _upload_poses_to_gpu(window)
-        _sync_display(window)
         window.ra_E_last += Ebest - E0
     E = window.ra_E_last
     window.ra_mc_step_count += 1
     window.ra_E_last = float(E)
     finite = Ebatch[np.isfinite(Ebatch)]
-    _status(window, f'MC step {window.ra_mc_step_count}: E={E:.5f}  acc={int(acc)}  batch_min={finite.min():.5f}')
+    batch_min = float(finite.min()) if len(finite) else float('nan')
+    if update_ui:
+        # Always sync the current authoritative pose, even if this trial rejected,
+        # so an accepted pose from earlier in the batch is still displayed.
+        _sync_display(window)
+        _status(window, f'MC step {window.ra_mc_step_count}: E={E:.5f}  acc={int(acc)}  batch_min={batch_min:.5f}')
+    return {'step': int(window.ra_mc_step_count), 'E0': float(E0), 'Ebest': float(Ebest),
+            'E': float(E), 'accepted': bool(acc), 'batch_min': batch_min}
 
 
 def _on_mc_run(window):

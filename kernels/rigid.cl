@@ -858,6 +858,76 @@ inline float folded_coeff_rigid(__local const float* coeffs, int ib, int nbasis,
     return factorized ? dot(vload4(ib, coeffs), plqh) : coeffs[ityp*nbasis + ib];
 }
 
+// ---- Tensor-product FAF evaluator (materialized scalar coefficients) --------
+//
+// Same linear physics as folded_eval_basis_rigid/grad_rigid but uses Fourier
+// recurrence (one sincos per axis + cmul chain) instead of calling cos/sin
+// for every basis function.  For nu=nv=4, nz=7 this cuts special-function work
+// from ~224 trig + 112 exp to 2 sincos + 7 exp per atom.
+//
+// Coefficients are pre-materialized on the host to one scalar per (site,basis)
+// (typed OR factorized → same runtime format) and stored basis-major:
+//     site_coeffs[b * total_sites + site]
+// so all work-items in a warp read adjacent site values for a fixed basis b.
+//
+// The basis MUST be a regular tensor product with index (iu*nv+iv)*nz+iz,
+// ku=iu, kv=iv, and per-iz (alpha,z0).  Irregular legacy bases are rejected
+// on the host (caller checks before launch).
+//
+// Returns float4 (.xyz = force F = -∇E, .w = energy E).
+inline float4 folded_eval_tensor_rigid(
+    float3 p_world, int site, int total_sites,
+    __global const float*  site_coeffs,   // [nbasis * total_sites] basis-major
+    __global const float4* z_params,       // [nz] (alpha, z0, 0, 0)
+    int nu, int nv, int nz,
+    float4 invLvec2d                       // (du/dx, du/dy, dv/dx, dv/dy)
+){
+    float u = invLvec2d.x*p_world.x + invLvec2d.y*p_world.y;
+    float v = invLvec2d.z*p_world.x + invLvec2d.w*p_world.y;
+    u = u - floor(u); v = v - floor(v);
+    float cu, su = sincos(2.0f*M_PI_F*u, &cu);
+    float cv, sv = sincos(2.0f*M_PI_F*v, &cv);
+    float2 z1_u = (float2)(cu, su);
+    float2 z1_v = (float2)(cv, sv);
+    // Private arrays: harmonic recurrences + z exponentials
+    float2 cu_arr[16]; float2 cv_arr[16];   // up to 16 harmonics per axis
+    float  bz_arr[16];  float  dbz_arr[16]; // up to 16 z exponentials
+    cu_arr[0] = (float2)(1.0f, 0.0f);
+    cv_arr[0] = (float2)(1.0f, 0.0f);
+    for (int i = 1; i < nu; i++) cu_arr[i] = (float2)(cu_arr[i-1].x*z1_u.x - cu_arr[i-1].y*z1_u.y, cu_arr[i-1].x*z1_u.y + cu_arr[i-1].y*z1_u.x);
+    for (int i = 1; i < nv; i++) cv_arr[i] = (float2)(cv_arr[i-1].x*z1_v.x - cv_arr[i-1].y*z1_v.y, cv_arr[i-1].x*z1_v.y + cv_arr[i-1].y*z1_v.x);
+    for (int iz = 0; iz < nz; iz++) {
+        float alpha = z_params[iz].x, z0 = z_params[iz].y;
+        float dz = fmax(0.0f, p_world.z - z0);
+        bz_arr[iz]   = exp(-alpha * dz);
+        dbz_arr[iz]  = (p_world.z > z0) ? (-alpha * bz_arr[iz]) : 0.0f;
+    }
+    float E = 0.0f, dEdu = 0.0f, dEdv = 0.0f, dEdz = 0.0f;
+    for (int iv = 0; iv < nv; iv++) {
+        float by  = cv_arr[iv].x;
+        float dby = -2.0f*M_PI_F*(float)iv * cv_arr[iv].y;
+        for (int iu = 0; iu < nu; iu++) {
+            float bx  = cu_arr[iu].x;
+            float dbx = -2.0f*M_PI_F*(float)iu * cu_arr[iu].y;
+            for (int iz = 0; iz < nz; iz++) {
+                float bz = bz_arr[iz], dbz = dbz_arr[iz];
+                float B  = bx * by * bz;
+                int b = (iu*nv + iv)*nz + iz;
+                float c = site_coeffs[b * total_sites + site];
+                E    += c * B;
+                dEdu += c * (dbx * by  * bz);
+                dEdv += c * (bx  * dby * bz);
+                dEdz += c * (bx  * by  * dbz);
+            }
+        }
+    }
+    float3 f;
+    f.x = -(dEdu * invLvec2d.x + dEdv * invLvec2d.z);
+    f.y = -(dEdu * invLvec2d.y + dEdv * invLvec2d.w);
+    f.z = -dEdz;
+    return (float4)(f, E);
+}
+
 // ==================================================================
 //  Kernel: rigid_body_folded_kernel  — MD / FIRE, one body per workgroup
 // ==================================================================
@@ -4123,7 +4193,12 @@ void rigid_body_pairff_multimol_kernel(
     const float              dt,
     const float4             md_params,
     const int                niter,
-    const int                predict_partners
+    const int                predict_partners,
+    const int                do_faf,
+    __global const float*    folded_site_coeffs,
+    __global const float4*   folded_z_params,
+    const int4               folded_tensor_meta,
+    const float4             folded_lvec2d
 ) {
     const int gid   = get_group_id(0);
     const int lid   = get_local_id(0);
@@ -4157,6 +4232,17 @@ void rigid_body_pairff_multimol_kernel(
     float dt_lin = resume_fire ? fstate.x : dt, dt_ang = resume_fire ? fstate.y : dt;
     float damp_lin = resume_fire ? fstate.z : md_params.x, damp_ang = resume_fire ? fstate.w : md_params.y;
     const float inv_beta_n = 8.0f / fmax(beta, 1e-6f);
+    // FAF tensor metadata (uniform across the workgroup → no divergence)
+    const int nu_faf  = folded_tensor_meta.x;
+    const int nv_faf  = folded_tensor_meta.y;
+    const int nz_faf  = folded_tensor_meta.z;
+    const int nsite_faf = folded_tensor_meta.w;
+    float4 invLvec2d_faf;
+    if (do_faf) {
+        float ax = folded_lvec2d.x, bx = folded_lvec2d.y, ay = folded_lvec2d.z, by = folded_lvec2d.w;
+        float det = ax*by - bx*ay;
+        invLvec2d_faf = (float4)( by/det, -bx/det, -ay/det, ax/det );
+    }
 
     if (lid == 0) {
         pos      = poss_in[a];
@@ -4279,6 +4365,12 @@ void rigid_body_pairff_multimol_kernel(
             const float3 p_world = p_store[i];
             const float3 r_world = r_store[i];
             const int ia = ia_store[i];
+            // FAF substrate force (tensor evaluator, materialized scalar coeffs)
+            if (do_faf) {
+                float4 ef = folded_eval_tensor_rigid(p_world, ia, nsite_faf, folded_site_coeffs, folded_z_params, nu_faf, nv_faf, nz_faf, invLvec2d_faf);
+                f += ef.xyz;
+                E += ef.w;
+            }
             float4 anchor = anchors[ia];
             if (anchor.w > 0.0f) {
                 float3 d = p_world - anchor.xyz;

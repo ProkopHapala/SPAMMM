@@ -170,6 +170,11 @@ EXTENSION_REGISTRY = {
         dependencies=['pyopencl'], req_paths=[],
         build_ui='build_ui',
     ),
+    'gui_scripts': dict(
+        module='spammm.GUI.gui_script_runner', class_name=None,
+        dependencies=[], req_paths=[],
+        build_ui='build_ui',
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -195,6 +200,7 @@ DEFAULT_CONFIG = {
     'folded_rigid': dict(enabled=True),
     'charge_rings': dict(enabled=True),
     'rigid_assembly': dict(enabled=True),
+    'gui_scripts': dict(enabled=True),
 }
 
 # ---------------------------------------------------------------------------

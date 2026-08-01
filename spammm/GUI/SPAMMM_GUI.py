@@ -284,6 +284,10 @@ class SPAMMMWindow(BaseGUI):
         ShortcutRegistry.register(['-', 'KP_SUBTRACT', '_'], description="Decrease ring size — Ring mode", group="Ring",
                                   context_fn=lambda w: w.edit_mode == 'Ring',
                                   callback=lambda w: w.ring_size_spinbox.setValue(max(int(w.ring_size_spinbox.value()) - 1, w.ring_size_spinbox.minimum())))
+        # F8 → Continue past a script barrier (Script Runner)
+        ShortcutRegistry.register('F8', description="Continue script past barrier", group="Script Runner",
+                                  context_fn=lambda w: getattr(getattr(w, '_gui_script_controller', None), 'state', 'IDLE') == 'PAUSED',
+                                  callback=lambda w: w._scripts_continue())
 
     def _raise(self, msg, title="Error", dialog_type="critical"):
         """Reusable error handling function.
@@ -553,7 +557,7 @@ class SPAMMMWindow(BaseGUI):
         self._ext_view_modes = {}   # label -> callback
         self._extension_sections = {}  # extension key / panel title -> CollapsibleSection
 
-        EXTENSION_TITLES = {'ff': 'Force Field', 'afm': 'AFM', 'dftb': 'DFTB', 'firecore': 'FireCore', 'qeq': 'QEq Charges', 'kekule': 'Kekule Solver', 'ascii': 'ASCII Builder', 'fragments': 'Fragments', 'reaction_coord': 'Reaction coordinate', 'vibrations': 'Vibrations', 'folded_rigid': 'Folded Rigid', 'charge_rings': 'Charge Rings (PME)', 'rigid_assembly': 'Rigid Assembly'}
+        EXTENSION_TITLES = {'ff': 'Force Field', 'afm': 'AFM', 'dftb': 'DFTB', 'firecore': 'FireCore', 'qeq': 'QEq Charges', 'kekule': 'Kekule Solver', 'ascii': 'ASCII Builder', 'fragments': 'Fragments', 'reaction_coord': 'Reaction coordinate', 'vibrations': 'Vibrations', 'folded_rigid': 'Folded Rigid', 'charge_rings': 'Charge Rings (PME)', 'rigid_assembly': 'Rigid Assembly', 'gui_scripts': 'Script Runner'}
         for name in self.extensions.enabled_extensions():
             ui = self.extensions.build_ui(name, self)
             title = EXTENSION_TITLES.get(name, name.capitalize())
@@ -767,6 +771,113 @@ class SPAMMMWindow(BaseGUI):
     def create_menus(self):
         # Settings Menu
         self.settings_menu = self.menuBar().addMenu("Settings")
+        # Scripts Menu (bridge to the Script Runner extension panel)
+        self._build_scripts_menu()
+
+    def _build_scripts_menu(self):
+        """Scripts menu: open/select scripts, Continue, Stop. A thin bridge to the
+        Script Runner extension panel — no duplicate configuration UI here."""
+        from spammm.GUI import gui_script_runner as GSR
+        self.scripts_menu = self.menuBar().addMenu("Scripts")
+
+        open_act = self.scripts_menu.addAction("Open Script Runner")
+        open_act.triggered.connect(lambda: self._scripts_open_panel())
+
+        select_act = self.scripts_menu.addAction("Select Script…")
+        select_act.triggered.connect(lambda: self._scripts_select_and_open())
+
+        self.scripts_bundled_menu = self.scripts_menu.addMenu("Bundled")
+        self._scripts_refresh_bundled()
+
+        refresh_act = self.scripts_menu.addAction("Refresh Scripts")
+        refresh_act.triggered.connect(lambda: self._scripts_refresh_bundled())
+
+        self.scripts_menu.addSeparator()
+
+        self.scripts_continue_act = self.scripts_menu.addAction("Continue")
+        self.scripts_continue_act.setEnabled(False)
+        self.scripts_continue_act.setShortcut(QtGui.QKeySequence(QtCore.Qt.Key_F8))
+        self.scripts_continue_act.setShortcutContext(QtCore.Qt.WindowShortcut)
+        self.scripts_continue_act.triggered.connect(lambda: self._scripts_continue())
+
+        self.scripts_stop_act = self.scripts_menu.addAction("Stop")
+        self.scripts_stop_act.setEnabled(False)
+        self.scripts_stop_act.triggered.connect(lambda: self._scripts_stop())
+
+        # Global F8 shortcut (window-wide, independent of canvas focus)
+        self.scripts_continue_qsc = QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_F8), self)
+        self.scripts_continue_qsc.setContext(QtCore.Qt.WindowShortcut)
+        self.scripts_continue_qsc.activated.connect(lambda: self._scripts_continue())
+
+        # Reflect controller state into menu actions
+        ctrl = getattr(self, '_gui_script_controller', None)
+        if ctrl is not None:
+            ctrl.state_changed.connect(lambda s: self._scripts_refresh_actions())
+            ctrl.finished.connect(lambda v: self._scripts_refresh_actions())
+            ctrl.failed.connect(lambda e: self._scripts_refresh_actions())
+            ctrl.cancelled.connect(lambda: self._scripts_refresh_actions())
+        self._scripts_refresh_actions()
+
+    def _scripts_refresh_bundled(self):
+        """Populate the Bundled submenu (no import during discovery)."""
+        from spammm.GUI import gui_script_runner as GSR
+        self.scripts_bundled_menu.clear()
+        for display, path in GSR.bundled_scripts():
+            act = self.scripts_bundled_menu.addAction(display)
+            act.setToolTip(path)
+            act.setData(path)
+            act.triggered.connect(lambda checked=False, p=path: self._scripts_select_path(p))
+
+    def _scripts_open_panel(self):
+        """Expand and focus the Script Runner extension panel."""
+        from spammm.GUI import gui_script_utils as GSU
+        GSU.expand_extension_panel(self, 'gui_scripts', open=True)
+
+    def _scripts_select_path(self, path):
+        """Select a script in the panel combo and open the panel."""
+        from spammm.GUI import gui_script_utils as GSU
+        GSU.expand_extension_panel(self, 'gui_scripts', open=True)
+        combo = getattr(self, 'sr_script_combo', None)
+        if combo is None:
+            return
+        idx = combo.findData(path)
+        combo.blockSignals(True)
+        if idx < 0:
+            combo.addItem(os.path.basename(path), path)
+            idx = combo.count() - 1
+        combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+        # Manually trigger settings restore (signals were blocked)
+        from spammm.GUI.gui_script_runner import _on_script_selected
+        _on_script_selected(self)
+
+    def _scripts_select_and_open(self):
+        """Browse for an arbitrary trusted .py, add it to the panel, and open it."""
+        from spammm.GUI import gui_script_utils as GSU
+        GSU.expand_extension_panel(self, 'gui_scripts', open=True)
+        start = self.work_dir if hasattr(self, 'work_dir') else os.getcwd()
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Select GUI script', start, 'Python (*.py)')
+        if path:
+            self._scripts_select_path(os.path.abspath(path))
+
+    def _scripts_continue(self):
+        ctrl = getattr(self, '_gui_script_controller', None)
+        if ctrl is not None:
+            ctrl.continue_barrier()
+
+    def _scripts_stop(self):
+        ctrl = getattr(self, '_gui_script_controller', None)
+        if ctrl is not None:
+            ctrl.stop()
+        self._scripts_refresh_actions()
+
+    def _scripts_refresh_actions(self):
+        """Enable Continue/Stop based on controller state."""
+        from spammm.GUI.gui_script_runner import IDLE as GSR_IDLE
+        ctrl = getattr(self, '_gui_script_controller', None)
+        state = ctrl.state if ctrl is not None else GSR_IDLE
+        self.scripts_continue_act.setEnabled(state == 'PAUSED')
+        self.scripts_stop_act.setEnabled(state in ('RUNNING', 'PAUSED'))
 
     def _init_mode_handlers(self):
         """Instantiate handler objects for each built-in edit mode."""
@@ -1618,6 +1729,9 @@ if __name__ == "__main__":
     parser.add_argument('--mol', '-m', type=str, default=None, metavar='PATH', help='Molecule file to load on startup (.xyz/.mol/.mol2)')
     parser.add_argument('--dir', '-d', type=str, default=None, metavar='PATH', help='Working directory for save/load dialogs')
     parser.add_argument('--script', '-s', type=str, default=None, metavar='PATH', help='GUI control script (must define run(window, argv)); args after -- go to script')
+    parser.add_argument('--script-delay-ms', type=int, default=0, metavar='MS', help='Presentation delay after each script frame (0 = fast)')
+    parser.add_argument('--script-points-per-frame', type=int, default=0, metavar='N', help='Points per visual frame for ctx.batches() (0 = one batch, fast)')
+    parser.add_argument('--script-barriers', action='store_true', default=False, help='Honor ctx.barrier() pauses in generator scripts')
     args, script_argv = parser.parse_known_args()
 
     app = QtWidgets.QApplication(sys.argv)
@@ -1631,11 +1745,12 @@ if __name__ == "__main__":
         debug_print(2, f"Loaded molecule from CLI: {args.mol}")
         QtWidgets.QApplication.processEvents()
     if args.script:
-        from spammm.GUI.gui_script_runner import run_gui_script
+        from spammm.GUI.gui_script_runner import run_gui_script, ScriptOptions
         script_argv = list(script_argv)
         if script_argv and script_argv[0] == '--':
             script_argv = script_argv[1:]
-        print(f"[GUI] Running control script: {args.script} argv={script_argv}")
-        run_gui_script(window, args.script, script_argv)
+        opts = ScriptOptions(delay_ms=args.script_delay_ms, points_per_frame=args.script_points_per_frame, honor_barriers=args.script_barriers)
+        print(f"[GUI] Running control script: {args.script} argv={script_argv} options=(delay={opts.delay_ms} ppf={opts.points_per_frame} barriers={opts.honor_barriers})")
+        run_gui_script(window, args.script, script_argv, options=opts)
         QtWidgets.QApplication.processEvents()
     sys.exit(app.exec_())

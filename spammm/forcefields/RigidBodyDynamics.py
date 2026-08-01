@@ -2299,26 +2299,106 @@ void rigid_body_pairff_energy_replica_kernel(
             raise ValueError(f"folded types length {out.shape[0]} != total_atoms {self.total_atoms}")
         return out
 
-    def _folded_plqh_all_sites(self, alpha_morse):
-        """Build runtime FAF PLQH for real sites; dummy PairFF sites get zero."""
-        def one(types, req_base):
+    def _folded_plqh_all_sites(self, alpha_morse, plqh_override=None):
+        """Build runtime FAF PLQH for real sites; dummy PairFF sites get zero.
+
+        plqh_override: (n_real, 4) array from the fit file — used as-is for real
+        atoms instead of re-deriving from runtime REQs.  This preserves the
+        charges (Q column) that were present during fitting even when the
+        runtime REQs were loaded with qeq=False (Q=0).
+        """
+        def one(types, req_base, plqh_base=None):
             types = np.asarray(types, dtype=np.int32)
             out = np.zeros((len(types), 4), dtype=np.float32)
             real = types == 0
-            req_base = np.asarray(req_base, dtype=np.float32).reshape(-1, 4)
-            if int(real.sum()) != len(req_base):
-                raise ValueError(f"_folded_plqh_all_sites(): {int(real.sum())} real sites != {len(req_base)} REQ rows")
-            out[real] = _reqs_to_plq(req_base, alpha=float(alpha_morse))
+            if plqh_base is not None:
+                plqh_base = np.asarray(plqh_base, dtype=np.float32).reshape(-1, 4)
+                if int(real.sum()) != len(plqh_base):
+                    raise ValueError(f"_folded_plqh_all_sites(): {int(real.sum())} real sites != {len(plqh_base)} PLQH rows")
+                out[real] = plqh_base
+            else:
+                req_base = np.asarray(req_base, dtype=np.float32).reshape(-1, 4)
+                if int(real.sum()) != len(req_base):
+                    raise ValueError(f"_folded_plqh_all_sites(): {int(real.sum())} real sites != {len(req_base)} REQ rows")
+                out[real] = _reqs_to_plq(req_base, alpha=float(alpha_morse))
             return out
+        if plqh_override is not None:
+            plqh_override = np.asarray(plqh_override, dtype=np.float32).reshape(-1, 4)
         if self.allmol_mode and self._mb_packs is not None:
-            out = np.vstack([one(p['types'], p['REQ_base']) for p in self._mb_packs])
+            if plqh_override is not None:
+                out = np.vstack([one(p['types'], p['REQ_base'], plqh_override) for p in self._mb_packs])
+            else:
+                out = np.vstack([one(p['types'], p['REQ_base']) for p in self._mb_packs])
         elif self._dyn_REQ_base is not None:
-            out = one(self.dyn_type_host, self._dyn_REQ_base)
+            out = one(self.dyn_type_host, self._dyn_REQ_base, plqh_override)
         else:
             raise ValueError("_folded_plqh_all_sites(): molecule base REQ parameters are unavailable")
         if out.shape != (self.total_atoms, 4):
             raise ValueError(f"_folded_plqh_all_sites(): got {out.shape}, expected ({self.total_atoms},4)")
         return out
+
+    def _materialize_multimol_faf(self):
+        """Materialize per-site scalar FAF coefficients in basis-major layout for kernel 15.
+
+        Converts typed OR factorized FAF fits to one scalar c(site, basis) and uploads:
+          - folded_site_coeffs: [nbasis * total_sites] float32, basis-major (b * total_sites + site)
+          - folded_z_params:    [nz] float4 (alpha, z0, 0, 0)
+          - folded_tensor_meta:  int4 (nu, nv, nz, total_sites)
+        Requires a regular tensor-product basis (ku=iu, kv=iv, per-iz alpha, constant z0).
+        """
+        fp = getattr(self, 'folded_params', None)
+        if fp is None:
+            raise RuntimeError("_materialize_multimol_faf(): call init_folded() first")
+        kxyz = np.asarray(fp['kxyz'], dtype=np.float32).reshape(-1, 4)
+        nbasis = kxyz.shape[0]
+        total_sites = self.total_atoms
+        kus  = np.unique(kxyz[:, 0]).astype(np.int32)
+        kvs  = np.unique(kxyz[:, 1]).astype(np.int32)
+        alphas = np.unique(kxyz[:, 2])
+        z0s   = np.unique(kxyz[:, 3])
+        nu, nv, nz = len(kus), len(kvs), len(alphas)
+        if nu * nv * nz != nbasis:
+            raise ValueError(f"_materialize_multimol_faf(): irregular basis nbasis={nbasis} != {nu}*{nv}*{nz}={nu*nv*nz}; tensor evaluator requires regular tensor product")
+        if len(z0s) != 1:
+            raise ValueError(f"_materialize_multimol_faf(): z0 must be constant for tensor evaluator, got {len(z0s)} unique values")
+        # Verify basis index ordering: (iu*nv+iv)*nz+iz
+        for iu in range(nu):
+            for iv in range(nv):
+                for iz in range(nz):
+                    b = (iu * nv + iv) * nz + iz
+                    row = kxyz[b]
+                    if int(row[0]) != int(kus[iu]) or int(row[1]) != int(kvs[iv]) or abs(row[2] - alphas[iz]) > 1e-6:
+                        raise ValueError(f"_materialize_multimol_faf(): basis index ordering mismatch at b={b}")
+        # Materialize c[site, basis] (total_sites, nbasis)
+        factorized = int(fp['meta'][1]) < 0
+        if factorized:
+            coeffs4 = np.asarray(fp['coeffs'], dtype=np.float32).reshape(-1, 4)  # (nbasis, 4)
+            plqh = np.asarray(fp['atom_type'], dtype=np.float32).reshape(-1, 4)  # (total_sites, 4)
+            if plqh.shape[0] != total_sites:
+                raise ValueError(f"_materialize_multimol_faf(): factorized atom_type length {plqh.shape[0]} != total_atoms {total_sites}")
+            c = (plqh @ coeffs4.T).astype(np.float32)  # (total_sites, nbasis)
+        else:
+            coeffs = np.asarray(fp['coeffs'], dtype=np.float32).reshape(-1, nbasis)  # (ntypes, nbasis)
+            types = np.asarray(fp['atom_type'], dtype=np.int32).ravel()  # (total_sites,)
+            if types.shape[0] != total_sites:
+                raise ValueError(f"_materialize_multimol_faf(): typed atom_type length {types.shape[0]} != total_atoms {total_sites}")
+            ntypes = coeffs.shape[0]
+            types_clamped = np.clip(types, 0, ntypes - 1)
+            c = coeffs[types_clamped].astype(np.float32)  # (total_sites, nbasis)
+            c[types < 0] = 0.0  # dummy sites get zero FAF
+        # Transpose to basis-major: site_coeffs[b * total_sites + site]
+        site_coeffs = np.ascontiguousarray(c.T, dtype=np.float32)  # (nbasis, total_sites)
+        z_params = np.zeros((max(nz, 1), 4), dtype=np.float32)
+        z_params[:nz, 0] = alphas
+        z_params[:nz, 1] = z0s[0]
+        self.check_buf('folded_site_coeffs', site_coeffs.nbytes)
+        self.toGPU('folded_site_coeffs', site_coeffs)
+        self.check_buf('folded_z_params', z_params.nbytes)
+        self.toGPU('folded_z_params', z_params)
+        self.kernel_params['folded_tensor_meta'] = np.array([nu, nv, nz, total_sites], dtype=np.int32)
+        self.kernel_params['folded_lvec2d'] = np.asarray(fp['lvec2d'], dtype=np.float32)
+        self._multimol_launchers.clear()  # invalidate cached launchers
+        return site_coeffs, z_params, (nu, nv, nz, total_sites)
 
     def attach_pairff_faf(self, fit_result, z_init=3.5, k_z=0.0, enable=True):
         """Bind FAF substrate to this PairFF instance (dynamics + Vispy map).
@@ -2348,7 +2428,10 @@ void rigid_body_pairff_energy_replica_kernel(
         )
         mode = faf_fit_mode(fit_result)
         if mode == FAF_MODE_FACTOR:
-            atype = self._folded_plqh_all_sites(float(fit_result.get('alpha_morse', 1.8)))
+            # Use the fit's atom_plqh (has correct charges from fitting) when
+            # available; fall back to re-deriving from runtime REQs.
+            plqh_override = fit_result.get('atom_plqh')
+            atype = self._folded_plqh_all_sites(float(fit_result.get('alpha_morse', 1.8)), plqh_override=plqh_override)
             coeffs = np.asarray(fit_result['coeffs4'], dtype=np.float32)
             ntypes, nbasis = -1, int(coeffs.reshape(-1, 4).shape[0])
         else:
@@ -2367,16 +2450,21 @@ void rigid_body_pairff_energy_replica_kernel(
             self._refresh_static_view_hosts()
         return self
 
-    def _multimol_launch_pair(self, niter, dt, lin_damp, ang_damp, fire, predict_partners, eventless):
-        """Return cached A→B/B→A launchers for one concurrent multi-molecule chunk."""
+    def _multimol_launch_pair(self, niter, dt, lin_damp, ang_damp, fire, predict_partners, eventless, faf=False):
+        """Return cached A→B/B→A launchers for one concurrent multi-molecule chunk.
+
+        faf=True binds the tensor FAF substrate forces (requires init_folded() +
+        _materialize_multimol_faf()); faf=False binds dummy buffers and do_faf=0
+        (bit-identical to the pre-FAF kernel 15).
+        """
         if not self.allmol_mode or self.pairff_mode != PAIRFF_MODE_UNIFIED:
             raise RuntimeError("concurrent multi-molecule MD requires from_molecules() with unified PairFF")
-        if self.faf_mode:
-            raise RuntimeError("concurrent multi-molecule MD with FAF is not implemented; disable FAF instead of silently omitting it")
         niter = int(niter)
         if niter < 1:
             raise ValueError(f"niter must be positive, got {niter}")
-        key = (niter, float(dt), float(lin_damp), float(ang_damp), bool(fire), bool(predict_partners), bool(eventless))
+        if faf and not getattr(self, 'folded_params', None):
+            raise RuntimeError("run_multimol_md(faf=True) requires init_folded() + _materialize_multimol_faf() first")
+        key = (niter, float(dt), float(lin_damp), float(ang_damp), bool(fire), bool(predict_partners), bool(eventless), bool(faf))
         cached = self._multimol_launchers.get(key)
         if cached is not None:
             return cached
@@ -2385,6 +2473,22 @@ void rigid_body_pairff_energy_replica_kernel(
         self.kernel_params['niter'] = np.int32(niter)
         self.kernel_params['predict_partners'] = np.int32(bool(predict_partners))
         self.kernel_params['md_params'] = np.array([lin_damp, ang_damp, 1.0, -1.0 if fire else 1.0], dtype=np.float32)
+        if faf:
+            self.kernel_params['do_faf'] = np.int32(1)
+            # folded_site_coeffs, folded_z_params, folded_tensor_meta, folded_lvec2d already in buffer_dict/kernel_params
+        else:
+            self.kernel_params['do_faf'] = np.int32(0)
+            # Bind minimal dummy buffers so the kernel can be launched without FAF data
+            if 'folded_site_coeffs' not in self.buffer_dict:
+                self.check_buf('folded_site_coeffs', 4)
+                self.toGPU('folded_site_coeffs', np.zeros(1, dtype=np.float32))
+            if 'folded_z_params' not in self.buffer_dict:
+                self.check_buf('folded_z_params', 16)
+                self.toGPU('folded_z_params', np.zeros((1, 4), dtype=np.float32))
+            if 'folded_tensor_meta' not in self.kernel_params:
+                self.kernel_params['folded_tensor_meta'] = np.array([0, 0, 0, 0], dtype=np.int32)
+            if 'folded_lvec2d' not in self.kernel_params:
+                self.kernel_params['folded_lvec2d'] = np.array([1.0, 0.0, 0.0, 1.0], dtype=np.float32)
         ab = dict(poss_in=self.buffer_dict['poss'], qrots_in=self.buffer_dict['qrots'], vposs_in=self.buffer_dict['vposs'], vrots_in=self.buffer_dict['vrots'], poss_out=self.buffer_dict['poss_alt'], qrots_out=self.buffer_dict['qrots_alt'], vposs_out=self.buffer_dict['vposs_alt'], vrots_out=self.buffer_dict['vrots_alt'])
         ba = dict(poss_in=self.buffer_dict['poss_alt'], qrots_in=self.buffer_dict['qrots_alt'], vposs_in=self.buffer_dict['vposs_alt'], vrots_in=self.buffer_dict['vrots_alt'], poss_out=self.buffer_dict['poss'], qrots_out=self.buffer_dict['qrots'], vposs_out=self.buffer_dict['vposs'], vrots_out=self.buffer_dict['vrots'])
         krnl_ab = cl.Kernel(self.prg, kname)
@@ -2397,20 +2501,33 @@ void rigid_body_pairff_energy_replica_kernel(
         self._multimol_launchers[key] = cached
         return cached
 
-    def run_multimol_md(self, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, fire=False, batch=1, predict_partners=False, eventless=False, sync=True):
-        """Run all-mobile PairFF MD; batch=1 is synchronous Jacobi, batch>1 is approximate."""
+    def run_multimol_md(self, n_steps, dt=0.05, lin_damp=0.92, ang_damp=0.88, fire=False, batch=1, predict_partners=False, eventless=False, sync=True, faf=None):
+        """Run concurrent multi-molecule PairFF MD.
+
+        batch=1 is synchronous Jacobi (exact); batch>1 is approximate (stale positions).
+        faf=None follows self.faf_mode; faf=True/False explicitly enables/disables the
+        tensor FAF substrate forces in kernel 15 (requires init_folded() +
+        _materialize_multimol_faf() when True).
+        """
+        if faf is None:
+            faf = bool(getattr(self, 'faf_mode', False))
         n_steps = int(n_steps)
         batch = int(batch)
         if n_steps < 1 or batch < 1:
             raise ValueError(f"n_steps and batch must be positive, got {n_steps}, {batch}")
+        if faf:
+            if not getattr(self, 'folded_params', None):
+                raise RuntimeError("run_multimol_md(faf=True) requires init_folded() first")
+            if 'folded_site_coeffs' not in self.buffer_dict:
+                self._materialize_multimol_faf()
         n_full, n_rem = divmod(n_steps, batch)
-        launch_ab, launch_ba = self._multimol_launch_pair(batch, dt, lin_damp, ang_damp, fire, predict_partners, eventless)
+        launch_ab, launch_ba = self._multimol_launch_pair(batch, dt, lin_damp, ang_damp, fire, predict_partners, eventless, faf=faf)
         use_alt = False
         for _ in range(n_full):
             (launch_ba if use_alt else launch_ab)()
             use_alt = not use_alt
         if n_rem:
-            rem_ab, rem_ba = self._multimol_launch_pair(n_rem, dt, lin_damp, ang_damp, fire, predict_partners, eventless)
+            rem_ab, rem_ba = self._multimol_launch_pair(n_rem, dt, lin_damp, ang_damp, fire, predict_partners, eventless, faf=faf)
             (rem_ba if use_alt else rem_ab)()
             use_alt = not use_alt
         if use_alt:
