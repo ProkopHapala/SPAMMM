@@ -621,6 +621,14 @@ def _pme_params(window):
         'decay': float(window.ra_pme_decay_spin.value()),
         'L': float(window.ra_pme_L_spin.value()),
         'npix': int(window.ra_pme_npix_spin.value()),
+        'nx': int(window.ra_pme_nx_spin.value()),
+        'nV': int(window.ra_pme_nV_spin.value()),
+        'Vmin': float(window.ra_pme_Vmin_spin.value()),
+        'Vmax': float(window.ra_pme_Vmax_spin.value()),
+        'p1_x': float(window.ra_pme_p1x_spin.value()),
+        'p1_y': float(window.ra_pme_p1y_spin.value()),
+        'p2_x': float(window.ra_pme_p2x_spin.value()),
+        'p2_y': float(window.ra_pme_p2y_spin.value()),
         'GammaS': float(window.ra_pme_gammat_spin.value()),
         'dQ': 0.02,
         'zQd': 0.0,
@@ -657,22 +665,101 @@ def _on_pme_scan_xy(window):
         xy = ps.scan_xy(solver, spos4, rots4, params, return_probs=False)
         window.ra_pme_xy = xy
         _status(window, f'PME XY done: STM range=[{xy["STM"].min():.3e},{xy["STM"].max():.3e}]')
-        _show_pme_xy(window, xy, spos4)
+        _show_pme_xy(window, xy, spos4, params)
     except Exception as e:
         import traceback; traceback.print_exc()
         _status(window, f'PME XY FAILED: {e}')
 
 
-def _show_pme_xy(window, xy, spos):
-    """Plot PME XY result in a matplotlib popup (reuses ChargeRingsExtension pattern)."""
+def _show_pme_xy(window, xy, spos, params=None):
+    """Plot PME XY result: STM + dI/dV at fixed VBias, with xV cut line overlay."""
     import matplotlib
     matplotlib.use('Qt5Agg')
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
-    im = ax.imshow(xy['STM'], extent=xy['extent'], origin='lower', cmap='seismic')
-    ax.plot(spos[:xy['n_active'], 0], spos[:xy['n_active'], 1], 'c+', ms=10, mew=1.5)
-    plt.colorbar(im, ax=ax, label='STM')
-    ax.set_title(f"PME XY  n_active={xy['n_active']}")
+    VBias = float(params['VBias']) if params else float(xy.get('VBias', 0.0))
+    p1 = (float(params['p1_x']), float(params['p1_y'])) if params else None
+    p2 = (float(params['p2_x']), float(params['p2_y'])) if params else None
+    fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+    im0 = axs[0].imshow(xy['STM'], extent=xy['extent'], origin='lower', cmap='inferno')
+    axs[0].plot(spos[:xy['n_active'], 0], spos[:xy['n_active'], 1], 'c+', ms=10, mew=1.5)
+    if p1 is not None and p2 is not None:
+        axs[0].plot([p1[0], p2[0]], [p1[1], p2[1]], 'w-', lw=1.5, label='xV cut')
+        axs[0].plot([p1[0], p2[0]], [p1[1], p2[1]], 'wo', ms=4)
+        axs[0].legend(loc='upper right', fontsize=8)
+    axs[0].set_title(f"PME XY STM  V={VBias:.2f}V  n_active={xy['n_active']}")
+    axs[0].set_xlabel('x [Å]'); axs[0].set_ylabel('y [Å]')
+    fig.colorbar(im0, ax=axs[0], fraction=0.046)
+    if xy.get('dIdV') is not None:
+        sc = max(np.nanmax(np.abs(xy['dIdV'])), 1e-30)
+        im1 = axs[1].imshow(xy['dIdV'], extent=xy['extent'], origin='lower', cmap='bwr', vmin=-sc, vmax=sc)
+        axs[1].plot(spos[:xy['n_active'], 0], spos[:xy['n_active'], 1], 'k+', ms=10, mew=1.5)
+        if p1 is not None and p2 is not None:
+            axs[1].plot([p1[0], p2[0]], [p1[1], p2[1]], 'w-', lw=1.5)
+            axs[1].plot([p1[0], p2[0]], [p1[1], p2[1]], 'wo', ms=4)
+        axs[1].set_title(f'dI/dV  V={VBias:.2f}V  (rings / NDR)')
+        axs[1].set_xlabel('x [Å]'); axs[1].set_ylabel('y [Å]')
+        fig.colorbar(im1, ax=axs[1], fraction=0.046)
+    fig.tight_layout()
+    fig.show()
+    window._ra_plot_windows = getattr(window, '_ra_plot_windows', [])
+    window._ra_plot_windows.append(fig)
+
+
+def _on_pme_scan_xv(window):
+    """Run PME xV line×voltage scan over the assembly sites (NDR / charge rings)."""
+    from spammm.quantum import pauli_scan as ps
+    if window.ra_ensemble is None:
+        _status(window, 'Build assembly first')
+        return
+    try:
+        spos4, rots4, n_act = _poses_to_pme_sites(window)
+        if spos4 is None:
+            _status(window, 'No sites for PME')
+            return
+        params = _pme_params(window)
+        params['nsite'] = n_act
+        solver = _get_pme_solver(window)
+        nx = int(params.get('nx', 100))
+        nV = int(params.get('nV', 80))
+        Vmin = float(params.get('Vmin', 0.0))
+        Vmax = float(params.get('Vmax', params['VBias']))
+        _status(window, f'PME xV scan: {n_act} sites V=[{Vmin:.2f},{Vmax:.2f}]...')
+        QtWidgets.QApplication.processEvents()
+        xv = ps.scan_xV(solver, spos4, rots4, params, nx=nx, nV=nV, Vmin=Vmin, Vmax=Vmax, return_probs=True)
+        window.ra_pme_xv = xv
+        ndr_min = float(xv['dIdV'].min())
+        _status(window, f'PME xV done: Imax={xv["STM"].max():.3e} NDRmin={ndr_min:.2e}')
+        _show_pme_xv(window, xv, spos4, params)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        _status(window, f'PME xV FAILED: {e}')
+
+
+def _show_pme_xv(window, xv, spos, params=None):
+    """Plot PME xV result: STM(x,V) + dI/dV(x,V) with NDR + VBias horizontal line."""
+    import matplotlib
+    matplotlib.use('Qt5Agg')
+    import matplotlib.pyplot as plt
+    V = xv['Vbiases']
+    x = xv['dist_axis']
+    Vmin, Vmax = float(V[0]), float(V[-1])
+    VBias = float(params['VBias']) if params else None
+    fig, axs = plt.subplots(1, 2, figsize=(14, 5))
+    im0 = axs[0].imshow(xv['STM'], aspect='auto', origin='lower', extent=[x[0], x[-1], Vmin, Vmax], cmap='inferno')
+    if VBias is not None and Vmin <= VBias <= Vmax:
+        axs[0].axhline(VBias, color='cyan', lw=1.5, ls='--', label=f'XY @ V={VBias:.2f}')
+        axs[0].legend(loc='upper right', fontsize=8)
+    axs[0].set_title(f"PME xV STM  n_active={xv['n_active']}")
+    axs[0].set_xlabel('distance along cut [Å]'); axs[0].set_ylabel('V [V]')
+    fig.colorbar(im0, ax=axs[0], fraction=0.046)
+    sc = max(np.nanmax(np.abs(xv['dIdV'])), 1e-30)
+    im1 = axs[1].imshow(xv['dIdV'], aspect='auto', origin='lower', extent=[x[0], x[-1], Vmin, Vmax], cmap='bwr', vmin=-sc, vmax=sc)
+    if VBias is not None and Vmin <= VBias <= Vmax:
+        axs[1].axhline(VBias, color='cyan', lw=1.5, ls='--')
+    ndr_min = float(xv['dIdV'].min())
+    axs[1].set_title(f'dI/dV  NDR={ndr_min<0}  min={ndr_min:.2e}')
+    axs[1].set_xlabel('distance along cut [Å]'); axs[1].set_ylabel('V [V]')
+    fig.colorbar(im1, ax=axs[1], fraction=0.046)
     fig.tight_layout()
     fig.show()
     window._ra_plot_windows = getattr(window, '_ra_plot_windows', [])
@@ -812,34 +899,54 @@ def build_ui(window):
         return s
 
     g_pme = AutoGridPlacer(cols=4)
-    g_pme.add_pair("Esite:", _pme_spin('esite', -1.0, 1.0, 0.01, 0.0))
+    g_pme.add_pair("Esite:", _pme_spin('esite', -1.0, 1.0, 0.01, -0.09))
     g_pme.add_pair("W:", _pme_spin('W', 0.0, 0.5, 0.01, 0.05))
     g_pme.newrow()
-    g_pme.add_pair("Q0:", _pme_spin('Q0', 0.0, 5.0, 0.1, 0.0, decimals=2))
+    g_pme.add_pair("Q0:", _pme_spin('Q0', 0.0, 5.0, 0.1, 1.0, decimals=2))
     g_pme.add_pair("Qzz:", _pme_spin('Qzz', -20.0, 20.0, 0.5, 0.0, decimals=2))
     g_pme.newrow()
-    g_pme.add_pair("VBias:", _pme_spin('vbias', 0.0, 3.0, 0.05, 1.0))
-    g_pme.add_pair("z_tip:", _pme_spin('ztip', 1.0, 15.0, 0.5, 5.0, decimals=2))
+    g_pme.add_pair("VBias:", _pme_spin('vbias', 0.0, 3.0, 0.05, 1.2))
+    g_pme.add_pair("z_tip:", _pme_spin('ztip', 1.0, 15.0, 0.5, 6.0, decimals=2))
     g_pme.newrow()
-    g_pme.add_pair("Temp:", _pme_spin('temp', 0.1, 100.0, 0.5, 1.0, decimals=2))
+    g_pme.add_pair("Temp:", _pme_spin('temp', 0.1, 100.0, 0.5, 2.6, decimals=2))
     g_pme.add_pair("GammaT:", _pme_spin('gammat', 1e-4, 1.0, 0.01, 0.01, decimals=4))
     g_pme.newrow()
-    g_pme.add_pair("decay:", _pme_spin('decay', 0.05, 2.0, 0.05, 0.5))
+    g_pme.add_pair("decay:", _pme_spin('decay', 0.05, 2.0, 0.05, 0.3))
     g_pme.add_pair("L:", _pme_spin('L', 5.0, 40.0, 1.0, 20.0, decimals=1))
     g_pme.newrow()
-    npix_s = QtWidgets.QSpinBox(); npix_s.setRange(20, 200); npix_s.setValue(80); npix_s.setMaximumWidth(SPIN_MAX_WIDTH)
+    npix_s = QtWidgets.QSpinBox(); npix_s.setRange(20, 200); npix_s.setValue(100); npix_s.setMaximumWidth(SPIN_MAX_WIDTH)
     window.ra_pme_npix_spin = npix_s
     g_pme.add_pair("npix:", npix_s)
-    g_pme.add_pair("zV0:", _pme_spin('zV0', -5.0, 5.0, 0.1, 0.0, decimals=2))
+    g_pme.add_pair("zV0:", _pme_spin('zV0', -5.0, 5.0, 0.1, -0.9, decimals=2))
     g_pme.newrow()
     g_pme.add_pair("radius:", _pme_spin('radius', 1.0, 20.0, 0.1, 5.0, decimals=2))
     g_pme.add_pair("phiRot:", _pme_spin('phirot', -6.3, 6.3, 0.1, 0.0))
+    # xV scan params
+    g_pme.newrow()
+    nx_s = QtWidgets.QSpinBox(); nx_s.setRange(20, 200); nx_s.setValue(100); nx_s.setMaximumWidth(SPIN_MAX_WIDTH)
+    window.ra_pme_nx_spin = nx_s
+    g_pme.add_pair("nx:", nx_s)
+    nV_s = QtWidgets.QSpinBox(); nV_s.setRange(20, 200); nV_s.setValue(80); nV_s.setMaximumWidth(SPIN_MAX_WIDTH)
+    window.ra_pme_nV_spin = nV_s
+    g_pme.add_pair("nV:", nV_s)
+    g_pme.newrow()
+    g_pme.add_pair("Vmin:", _pme_spin('Vmin', 0.0, 2.0, 0.05, 0.5, decimals=3))
+    g_pme.add_pair("Vmax:", _pme_spin('Vmax', 0.1, 3.0, 0.05, 1.5, decimals=3))
+    g_pme.newrow()
+    g_pme.add_pair("p1_x:", _pme_spin('p1x', -40.0, 40.0, 0.5, -15.0, decimals=2))
+    g_pme.add_pair("p1_y:", _pme_spin('p1y', -40.0, 40.0, 0.5, 0.0, decimals=2))
+    g_pme.newrow()
+    g_pme.add_pair("p2_x:", _pme_spin('p2x', -40.0, 40.0, 0.5, 15.0, decimals=2))
+    g_pme.add_pair("p2_y:", _pme_spin('p2y', -40.0, 40.0, 0.5, 0.0, decimals=2))
     pme_l.addLayout(g_pme.layout())
 
     g_pme_btn = AutoGridPlacer(cols=4)
     window.ra_pme_xy_btn = QtWidgets.QPushButton('Scan XY')
     window.ra_pme_xy_btn.clicked.connect(lambda: _on_pme_scan_xy(window))
     g_pme_btn.add(window.ra_pme_xy_btn)
+    window.ra_pme_xv_btn = QtWidgets.QPushButton('Scan xV')
+    window.ra_pme_xv_btn.clicked.connect(lambda: _on_pme_scan_xv(window))
+    g_pme_btn.add(window.ra_pme_xv_btn)
     pme_l.addLayout(g_pme_btn.layout())
     pme_hint = QtWidgets.QLabel('Sites = rigid-molecule CoMs from the ensemble, oriented by R(q). '
                                  'PME n_sites ≤ 4; first min(n_bodies,4) bodies used.')

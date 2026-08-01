@@ -117,8 +117,12 @@ def run(window, argv=None, ctx=None):
         GSU.expand_extension_panel(window, 'rigid_assembly', open=True)
         print("[conference_demo] PME charge rings XY scan…", flush=True)
         RA._on_pme_scan_xy(window)
-        print("[conference_demo] PME complete", flush=True)
-        yield ctx.frame('PME charge-rings image complete')
+        print("[conference_demo] PME XY complete", flush=True)
+        yield ctx.frame('PME charge-rings XY image complete')
+        print("[conference_demo] PME charge rings xV scan (NDR)…", flush=True)
+        RA._on_pme_scan_xv(window)
+        print("[conference_demo] PME xV complete", flush=True)
+        yield ctx.frame('PME charge-rings xV (NDR) complete')
 
     print("[conference_demo] done", flush=True)
     return {'n_step': args.n_step, 'ntrial': args.ntrial, 'accepted': n_accept, 'E': None if last is None else last['E'], 'dxy_max': dxy_max, 'mol': args.mol, 'nmol': args.nmol}

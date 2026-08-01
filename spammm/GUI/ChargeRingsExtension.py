@@ -202,7 +202,10 @@ def load_preset(window):
             p['nsite'] = len(spos)
         elif name == 'square_tetramer':
             geom = ps.default_geometry_path('square_tetramer.txt')
-            p = ps.ruslan_default_params(geometry_file=geom, nsite=4, Qzz=0.0, W=0.05)
+            # NDR regime: match fig3_trimer params (Qzz=0, low VBias, low Temp)
+            # ruslan_default_params has VBias=2.0 which is too high — washes out NDR
+            p = ps.ruslan_default_params(geometry_file=geom, nsite=4, Qzz=0.0, W=0.05,
+                                         VBias=0.85, Temp=2.6, z_tip=6.0, zV0=-0.9, zVd=20.0)
         else:
             p = ps.symmetric_trimer_params()
         p.setdefault('nx', 100)
