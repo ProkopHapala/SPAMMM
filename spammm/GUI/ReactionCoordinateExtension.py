@@ -123,7 +123,7 @@ def build_ui(window):
 
     class RCPinMode(EditModeHandler):
         status_msg = "RC pin — click atoms to toggle spatial constraint"
-        def on_atom_click(self, atom_id):
+        def on_atom_click(self, atom_id, shift=False):
             handle_rc_pin_click(window, atom_id)
 
     window.register_mode_handler('rc_pin', RCPinMode(window))

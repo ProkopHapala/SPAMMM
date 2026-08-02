@@ -294,7 +294,10 @@ class SequenceHost:
 
 
 def run_azaindol_draw(host: SequenceHost, *, do_relax=False, out_dir=None):
-    """Execute the shared draw sequence. Returns list of snapshot paths."""
+    """Execute the shared draw sequence. Generator: yields title after each snapshot.
+
+    Paths are stored on ``host.paths`` after iteration completes.
+    """
     from spammm.topology.MoleculeEditorBackend import MoleculeEditorBackend
     b = host.backend()
     paths = []
@@ -315,13 +318,16 @@ def run_azaindol_draw(host: SequenceHost, *, do_relax=False, out_dir=None):
 
     # --- Drawing: empty → hover hex → click hex → hover bond+preview → click pent → N×2 ---
     snap('00_empty', '0) Empty canvas — Ring mode, Auto H off')
+    yield '0) Empty canvas — Ring mode, Auto H off'
     snap('00b_hover_hex', '0b) Hover hex tile (orange nodes + cyan foreshadow)',
          cursor_xy=cx, hover_hex=(0, 0))
+    yield '0b) Hover hex tile (orange nodes + cyan foreshadow)'
 
     host.add_hex(0, 0)
     host.refresh()
     snap('01_hex', '1) Click — hex ring materialized',
          cursor_xy=cx, hover_hex=(0, 0))
+    yield '1) Click — hex ring materialized'
 
     host.set_ring_size(5)
     bond = pick_rightmost_bond(b)
@@ -336,11 +342,13 @@ def run_azaindol_draw(host: SequenceHost, *, do_relax=False, out_dir=None):
     snap('01b_hover_bond', '1b) Hover bond — cyan 5-ring foreshadow (before click)',
          cursor_xy=cursor_bond, bond_highlight=(bond.a._id, bond.b._id),
          ring_preview=preview)
+    yield '1b) Hover bond — cyan 5-ring foreshadow (before click)'
 
     new_pent = host.add_adj_ring(bond, 5, side)
     host.refresh()
     snap('02_pentagon', '2) Click — pentagon fused to hex',
          cursor_xy=cursor_bond, highlight_ids=[a._id for a in new_pent])
+    yield '2) Click — pentagon fused to hex'
 
     n_ids = azaindol_nitrogen_ids(b, bond, new_pent)
     # Prefer pyridine (hex) then pyrrole (pent) for storytelling
@@ -353,30 +361,36 @@ def run_azaindol_draw(host: SequenceHost, *, do_relax=False, out_dir=None):
     a_hex = b.graph.atoms[n_hex]
     snap('02b_hover_N1', '2b) Atom mode N — hover pyridine site (hex)',
          cursor_xy=a_hex.pos[:2], hover_atom_id=n_hex, highlight_ids=[n_hex, n_pent])
+    yield '2b) Atom mode N — hover pyridine site (hex)'
     host.set_atom_element(n_hex, 'N')
     host.refresh()
     snap('02c_N1_done', '2c) Click — first C→N (pyridine)',
          cursor_xy=a_hex.pos[:2], highlight_ids=[n_hex])
+    yield '2c) Click — first C→N (pyridine)'
 
     a_pent = b.graph.atoms[n_pent]
     snap('02d_hover_N2', '2d) Hover pyrrole site (pentagon)',
          cursor_xy=a_pent.pos[:2], hover_atom_id=n_pent, highlight_ids=[n_hex, n_pent])
+    yield '2d) Hover pyrrole site (pentagon)'
     host.set_atom_element(n_pent, 'N')
     b.set_atom_npi_by_id(n_pent, 0)  # pyrrole NH: nπ=0
     host.refresh()
     snap('03_azaindol_skel', '3) Click — second C→N (pyrrole nπ=0) → azaindol',
          cursor_xy=a_pent.pos[:2], highlight_ids=[n_hex, n_pent])
+    yield '3) Click — second C→N (pyrrole nπ=0) → azaindol'
 
     host.set_auto_h(True)
     host.add_h_caps()
     host.refresh()
     snap('04_hydrogens', '4) Explicit hydrogens (Auto H / add caps)')
+    yield '4) Explicit hydrogens (Auto H / add caps)'
 
     if do_relax:
         host.set_edit_mode('Select')
         b.run_relaxation(workdir=os.path.join(out_dir or '.', 'dftb_relax'))
         host.refresh()
         snap('04b_relaxed', '4b) DFTB relaxation')
+        yield '4b) DFTB relaxation'
 
     all_ids = alive_atom_ids(b)
     host.set_edit_mode('Select')
@@ -385,9 +399,11 @@ def run_azaindol_draw(host: SequenceHost, *, do_relax=False, out_dir=None):
     com = selection_com_xy(b, all_ids)
     snap('05_selected', '5) Block-select monomer — δ/φ handles',
          selection_ids=all_ids, cursor_xy=com + np.array([0.3, -0.3]))
+    yield '5) Block-select monomer — δ/φ handles'
     host.copy_selection()
     snap('05b_copied', '5b) Copy (Ctrl-C)',
          selection_ids=all_ids, cursor_xy=com + np.array([0.3, -0.3]))
+    yield '5b) Copy (Ctrl-C)'
 
     mono_com = selection_com_xy(b, all_ids)
     new_ids = host.paste_selection()
@@ -402,6 +418,7 @@ def run_azaindol_draw(host: SequenceHost, *, do_relax=False, out_dir=None):
     snap('06_pasted', '6) Paste (Ctrl-V) — sticky δ-move',
          selection_ids=new_ids, xform_mode='move',
          cursor_xy=np.array([aabb[0], aabb[2]]) if aabb else paste_com0)
+    yield '6) Paste (Ctrl-V) — sticky δ-move'
 
     host.rotate_selected(180.0)
     host.refresh()
@@ -409,6 +426,7 @@ def run_azaindol_draw(host: SequenceHost, *, do_relax=False, out_dir=None):
     snap('07_rotated', '7) Rotate selection 180° — φ handle',
          selection_ids=new_ids, xform_mode='rotate',
          cursor_xy=np.array([aabb[1], aabb[3]]) if aabb else selection_com_xy(b, new_ids))
+    yield '7) Rotate selection 180° — φ handle'
 
     paste_com = selection_com_xy(b, new_ids)
     target = mono_com + delta
@@ -418,8 +436,10 @@ def run_azaindol_draw(host: SequenceHost, *, do_relax=False, out_dir=None):
     snap('08_dimer', '8) Translate → azaindol dimer — δ handle',
          selection_ids=new_ids, xform_mode='move',
          cursor_xy=np.array([aabb[0], aabb[2]]) if aabb else selection_com_xy(b, new_ids))
+    yield '8) Translate → azaindol dimer — δ handle'
 
     host.select_ids([])
     host.refresh()
     snap('09_done', '9) Done — azaindol dimer')
-    return paths
+    yield '9) Done — azaindol dimer'
+    host.paths = paths

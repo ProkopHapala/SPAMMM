@@ -36,6 +36,7 @@
 | `RMB` | — | Remove/delete (mode-dependent) | All modes |
 | `LMB` | Ctrl | Drag atom→atom: create bond | Atom/Unified |
 | `LMB` | Ctrl | Drag to empty: create atom+bond | Unified |
+| `LMB` | Shift | Cycle npi (sp3→sp2→sp) on atom click | Atom/Unified |
 | `Middle` | — | Toggle H at position | Atom/Pi/Unified |
 
 ### 2D vs 3D view
@@ -61,6 +62,7 @@ All-in-one mode — context-sensitive.
 | Action | Effect |
 |--------|--------|
 | LMB on atom | Cycle atom type (C→N→O→C) |
+| Shift+LMB on atom | Cycle npi (sp3→sp2→sp) |
 | LMB on bond | Cycle bond order (single→double→triple→aromatic) |
 | LMB on hex center | Add hexagonal ring |
 | LMB on empty space | Add free atom (current type) |
@@ -76,6 +78,7 @@ Focused atom editing.
 |--------|--------|
 | LMB on empty | Add free atom |
 | LMB on atom | Set atom to current type |
+| Shift+LMB on atom | Cycle npi (sp3→sp2→sp) |
 | LMB drag | Move atom |
 | RMB on atom | Delete (Ctrl: bridge neighbors) |
 | Ctrl+LMB drag | Create bond |

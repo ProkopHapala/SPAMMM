@@ -700,7 +700,7 @@ def _plot_potential_slice_dialog(window, a, b, E, plane, fixed_val, ityp, fit):
 def _build_edit_mode_handlers(window):
     class FRPinMode(EditModeHandler):
         status_msg = "FoldedRigid: click atom to select pin atom"
-        def on_atom_click(self, atom_id):
+        def on_atom_click(self, atom_id, shift=False):
             idx = window.scene._id_to_idx.get(atom_id, -1)
             window._fr_pin_idx = idx
             window._fr_pin_atom_id = atom_id

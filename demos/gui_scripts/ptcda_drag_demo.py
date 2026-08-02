@@ -49,6 +49,7 @@ def run(window, argv=None, ctx=None):
 
     # === Phase 1: Build via GUI (same as ptcda_interactive_drag) ===
     yield ctx.frame(f'Configuring {args.nmol}×PTCDA on NaCl…')
+    GSU.set_label_mode(window, 'None')  # hide atom labels — distracting in demos
     GSU.expand_extension_panel(window, 'rigid_assembly', open=True)
     GSU.set_combo_text(window.ra_source_combo, 'From file')
     GSU.set_combo_text(window.ra_mol_combo, 'PTCDA')

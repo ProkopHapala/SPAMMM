@@ -541,15 +541,17 @@ def _on_browse(window):
 
 
 def _on_script_selected(window):
-    """Restore remembered argv + pacing for the selected script."""
+    """Restore remembered argv for the selected script.
+
+    Pacing (delay/ppf/barriers) is NOT restored here — those are global presentation
+    settings the user sets once. Restoring them per-script would silently overwrite
+    the user's manually set delay when selecting a script from the menu.
+    """
     path = window.sr_script_combo.currentData()
     if not path:
         return
     st = load_script_settings(path)
     window.sr_argv_edit.setText(st.get('argv', ''))
-    window.sr_delay_spin.setValue(st.get('delay_ms', 0))
-    window.sr_ppf_spin.setValue(st.get('points_per_frame', 0))
-    window.sr_barrier_chk.setChecked(st.get('honor_barriers', False))
 
 
 def _on_run(window):

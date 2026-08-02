@@ -1436,6 +1436,7 @@ class AtomScene(QtCore.QObject):
     def _on_mouse_press(self, ev):
         # Store Ctrl state for RMB bridge removal in GUI
         self._last_ctrl = 'Control' in ev.modifiers if isinstance(ev.modifiers, (tuple, list)) else False
+        self._last_shift = 'Shift' in ev.modifiers if isinstance(ev.modifiers, (tuple, list)) else False
         if ev.button in (2, 3):
             if self._selection_mode:
                 # Sticky xform: RMB also commits/exits

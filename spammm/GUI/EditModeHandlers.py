@@ -150,7 +150,7 @@ class EditModeHandler:
     def on_release(self, event, p_world, ctrl): pass
     def on_rmb_atom(self, atom_id, ctrl): pass
     def on_link(self, from_id, to_id): pass
-    def on_atom_click(self, atom_id): pass
+    def on_atom_click(self, atom_id, shift=False): pass
 
     # ── Shared helpers ──────────────────────────────────────────────────────
 
@@ -202,7 +202,7 @@ class EditModeHandler:
 # ── Unified mode ────────────────────────────────────────────────────────────
 
 class UnifiedMode(EditModeHandler):
-    status_msg = "Unified: LMB atom=change type/drag | bond=cycle order | hex=add ring | empty=add atom | RMB=delete | Ctrl=modifier"
+    status_msg = "Unified: LMB atom=change type/drag | Shift+LMB=cycle npi | bond=cycle order | hex=add ring | empty=add atom | RMB=delete | Ctrl+bond"
     link_mode = True
 
     _BOND_ORDER_NAMES = {1.0: 'single', 1.5: 'aromatic', 2.0: 'double', 3.0: 'triple'}
@@ -318,17 +318,27 @@ class UnifiedMode(EditModeHandler):
     def on_link(self, from_id, to_id):
         self._create_bond(from_id, to_id)
 
-    def on_atom_click(self, atom_id):
-        debug_print(2, f"[ATOM_CLICKED] atom_id={atom_id}")
+    def on_atom_click(self, atom_id, shift=False):
+        debug_print(2, f"[ATOM_CLICKED] atom_id={atom_id} shift={shift}")
         self._push_undo()
-        self.backend.cycle_atom_type(atom_id)
+        if shift:
+            idx_map = getattr(self.backend, '_atom_idx_map', {})
+            idx = idx_map.get(int(atom_id))
+            if idx is not None:
+                current_npi = self.backend.atom_npi[idx]
+                new_npi = (current_npi + 1) % 3
+                self.backend.set_atom_npi_by_id(atom_id, new_npi)
+                if self.backend.auto_h_cap:
+                    self.backend.adjust_h()
+        else:
+            self.backend.cycle_atom_type(atom_id)
         self._refresh()
 
 
 # ── Atom mode ───────────────────────────────────────────────────────────────
 
 class AtomMode(EditModeHandler):
-    status_msg = "LMB: Add/Change type/Drag move | Ctrl+LMB drag: Create bond | RMB: Delete (Ctrl: bridge neighbors) | Scroll: Zoom"
+    status_msg = "LMB: Add/Change type/Drag move | Shift+LMB: Cycle npi | Ctrl+LMB drag: Create bond | RMB: Delete (Ctrl: bridge) | Scroll: Zoom"
     link_mode = True
 
     def on_press(self, event, p_world, ctrl):
@@ -359,10 +369,20 @@ class AtomMode(EditModeHandler):
     def on_link(self, from_id, to_id):
         self._create_bond(from_id, to_id)
 
-    def on_atom_click(self, atom_id):
-        debug_print(2, f"[ATOM_CLICKED] atom_id={atom_id}")
+    def on_atom_click(self, atom_id, shift=False):
+        debug_print(2, f"[ATOM_CLICKED] atom_id={atom_id} shift={shift}")
         self._push_undo()
-        self.backend.set_atom_type_by_id(atom_id, self.cur_atom_type)
+        if shift:
+            idx_map = getattr(self.backend, '_atom_idx_map', {})
+            idx = idx_map.get(int(atom_id))
+            if idx is not None:
+                current_npi = self.backend.atom_npi[idx]
+                new_npi = (current_npi + 1) % 3
+                self.backend.set_atom_npi_by_id(atom_id, new_npi)
+                if self.backend.auto_h_cap:
+                    self.backend.adjust_h()
+        else:
+            self.backend.set_atom_type_by_id(atom_id, self.cur_atom_type)
         self._refresh()
 
 
@@ -389,8 +409,8 @@ class PiMode(EditModeHandler):
             if self._block_planar(): return
             self._toggle_h_at(p_world)
 
-    def on_atom_click(self, atom_id):
-        debug_print(2, f"[ATOM_CLICKED] atom_id={atom_id} (pi cycle)")
+    def on_atom_click(self, atom_id, shift=False):
+        debug_print(2, f"[ATOM_CLICKED] atom_id={atom_id} (pi cycle) shift={shift}")
         idx_map = getattr(self.backend, '_atom_idx_map', {})
         idx = idx_map.get(int(atom_id))
         if idx is None: return

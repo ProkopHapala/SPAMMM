@@ -42,6 +42,7 @@ def run(window, argv=None, ctx=None):
 
     # === Phase 1: Build 4×PTCDA assembly on substrate ===
     yield ctx.frame(f'Configuring {args.nmol}×{args.mol} assembly…')
+    GSU.set_label_mode(window, 'None')  # hide atom labels — distracting in demos
     GSU.expand_extension_panel(window, 'rigid_assembly', open=True)
     GSU.set_combo_text(window.ra_source_combo, 'From file')
     GSU.set_combo_text(window.ra_mol_combo, args.mol)

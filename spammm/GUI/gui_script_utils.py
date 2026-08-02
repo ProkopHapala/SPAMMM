@@ -91,6 +91,12 @@ def set_edit_mode(window, mode):
     process_events(window)
 
 
+def set_label_mode(window, mode):
+    """Set atom label mode: 'None', 'Elem+Idx', 'Atom Type', 'Pi Orbitals', 'Z-Height', 'Charge', 'Bond Len'."""
+    window.set_label_mode(mode)
+    process_events(window)
+
+
 def extension_panel(window, key, open=True):
     """Backward-compatible alias for expand_extension_panel."""
     return expand_extension_panel(window, key, open=open)

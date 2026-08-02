@@ -6,6 +6,7 @@ from spammm.GUI.gui_script_utils import expand_extension_panel, process_events, 
 from spammm.GUI.AsciiArtExtension import load_ascii_example
 from spammm.GUI.ReactionCoordinateExtension import import_from_graph, configure_scan, run_scan, run_preview_scan, show_scan_frame, enable_bond_length_visualization, load_npz_path
 from spammm.quantum.hbond_scan import build_ascii_hbond_system
+from spammm.topology.AtomicGraph import AtomicGraph
 
 
 def _cache_npz_path(name):
@@ -24,6 +25,8 @@ def prepare_rc_scan_review(window, name='2Quinolone', pair=0, dx=0.2, method='pm
     load_ascii_example(window, name)
     set_spin_value(window.kek_relax_spin, relax_steps)
     atoms = build_ascii_hbond_system(name)
+    # Clear graph from previous demos so ensure_sys() won't overwrite our sys
+    window.backend.graph = AtomicGraph()
     window.backend.sys = atoms
     if hasattr(window, 'refresh_view'):
         window.refresh_view()
@@ -38,7 +41,11 @@ def prepare_rc_scan_review(window, name='2Quinolone', pair=0, dx=0.2, method='pm
         print(f"REVIEW: loading cached relaxed trajectory: {cache_path}")
         load_npz_path(window, cache_path)
     elif run_dftb:
-        run_scan(window)
+        ds = run_scan(window)
+        if ds is None:
+            n_hb = len(getattr(window, 'rc_hbonds', []))
+            raise RuntimeError(f'run_scan returned None — no H-bonds found (rc_hbonds={n_hb}). '
+                               f'The graph may not have been cleared from a previous demo.')
     else:
         print("NOTE: --preview without cache — rigid endpoints, only H atoms move along slider.")
         print("      Run once WITHOUT --preview for DFTB-relaxed path (~1–2 min), then --preview reuses cache.")

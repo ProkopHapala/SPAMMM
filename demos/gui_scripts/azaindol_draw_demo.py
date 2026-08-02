@@ -134,7 +134,7 @@ def _parse_argv(argv):
     return p.parse_args(argv)
 
 
-def run(window, argv=None):
+def run(window, argv=None, ctx=None):
     args = _parse_argv(argv or [])
     out = args.out or os.path.join(os.path.dirname(__file__), '..', '..', '..', 'debug', 'azaindol_draw_demo')
     out = os.path.abspath(out)
@@ -142,8 +142,17 @@ def run(window, argv=None):
     if hasattr(window, 'b2Dview_chk') and not window.b2Dview_chk.isChecked():
         window.b2Dview_chk.setChecked(True)
         GSU.process_events(window)
+    GSU.set_label_mode(window, 'None')  # hide atom labels — distracting in demos
     host = GuiHost(window, out, full_window=not args.canvas_only, zoom_out=args.zoom_out)
-    paths = run_azaindol_draw(host, do_relax=args.relax, out_dir=out)
+    # run_azaindol_draw is now a generator — drive it with ctx.frame() for pacing
+    gen = run_azaindol_draw(host, do_relax=args.relax, out_dir=out)
+    if ctx is not None:
+        for title in gen:
+            yield ctx.frame(title)
+    else:
+        for title in gen:
+            pass
+    paths = host.paths
     xyz = os.path.join(out, 'azaindol_dimer_drawn.xyz')
     window.backend.save_xyz(xyz, comment='azaindol_draw_demo')
     print(f'REVIEW: {xyz}')

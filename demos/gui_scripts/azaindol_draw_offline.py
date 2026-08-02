@@ -126,7 +126,9 @@ def main(argv=None):
     out = os.path.abspath(out)
     os.makedirs(out, exist_ok=True)
     host = OfflineHost(out)
-    paths = run_azaindol_draw(host, do_relax=args.relax, out_dir=out)
+    for _ in run_azaindol_draw(host, do_relax=args.relax, out_dir=out):
+        pass
+    paths = host.paths
     xyz = args.save_xyz or os.path.join(out, 'azaindol_dimer_drawn.xyz')
     host.b.save_xyz(xyz, comment='azaindol_draw_offline')
     print(f'REVIEW: {xyz}')

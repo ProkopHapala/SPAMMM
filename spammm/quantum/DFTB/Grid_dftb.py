@@ -238,6 +238,14 @@ class GridProjector(OpenCLBase):
             build_opts.append(f"-DMAX_ORBS={self.basis_meta['max_shells'] * 9}") # conservative upper bound
 
         self.load_program_multi(cl_paths, build_options=build_opts if len(build_opts)>0 else None)
+        # Cache kernels to avoid RepeatedKernelRetrieval warnings (pyopencl creates a new cl.Kernel on each prg.name access)
+        self._krn_count_atoms_per_block = cl.Kernel(self.prg, 'count_atoms_per_block')
+        self._krn_fill_task_atoms = cl.Kernel(self.prg, 'fill_task_atoms')
+        self._krn_compact_tasks = cl.Kernel(self.prg, 'compact_tasks')
+        self._krn_project_density_dense = cl.Kernel(self.prg, 'project_density_dense')
+        self._krn_project_density_dense_points = cl.Kernel(self.prg, 'project_density_dense_points')
+        self._krn_build_stm_transfer_sk_tables = cl.Kernel(self.prg, 'build_stm_transfer_sk_tables')
+        self._krn_stm_fgr_sk_tau_scan_real = cl.Kernel(self.prg, 'stm_fgr_sk_tau_scan_real')
 
     def check_overlap_sphere_aabb(self, center, radius, box_min, box_max):
         """ Fast AABB-Sphere collision: Find closest point in box to sphere center """
@@ -335,7 +343,7 @@ class GridProjector(OpenCLBase):
         T0 = time.perf_counter_ns()
         # 2. Kernel 1: Count atoms per block
         cl.enqueue_fill_buffer(self.queue, self.gtask_block_counts_buff, np.int32(0), 0, n_blocks_total * 4)
-        self.prg.count_atoms_per_block(
+        self._krn_count_atoms_per_block(
             self.queue, (natoms,), None,
             self.gtask_grid_buff, np.int32(natoms), self.gtask_atoms_buff, np.int32(block_res),
             np.int32(n_blocks_xyz[0]), np.int32(n_blocks_xyz[1]), np.int32(n_blocks_xyz[2]),
@@ -350,7 +358,7 @@ class GridProjector(OpenCLBase):
         # 3. Kernel 2: Fill task_atoms
         cl.enqueue_fill_buffer(self.queue, self.gtask_task_atoms_raw_buff, np.int32(-1), 0, n_blocks_total * nMaxAtom * 4)
         cl.enqueue_fill_buffer(self.queue, self.gtask_block_fill_buff, np.int32(0), 0, n_blocks_total * 4)
-        self.prg.fill_task_atoms(
+        self._krn_fill_task_atoms(
             self.queue, (natoms,), None,
             self.gtask_grid_buff, np.int32(natoms), self.gtask_atoms_buff, np.int32(block_res),
             np.int32(n_blocks_xyz[0]), np.int32(n_blocks_xyz[1]), np.int32(n_blocks_xyz[2]),
@@ -393,7 +401,7 @@ class GridProjector(OpenCLBase):
         self.toGPU_(self.gtask_task_offsets_buff, h_task_offsets)
 
         T0 = time.perf_counter_ns()
-        self.prg.compact_tasks(
+        self._krn_compact_tasks(
             self.queue, (int(n_blocks_xyz[0]), int(n_blocks_xyz[1]), int(n_blocks_xyz[2])), None,
             np.int32(n_blocks_xyz[0]), np.int32(n_blocks_xyz[1]), np.int32(n_blocks_xyz[2]),
             self.gtask_block_counts_buff, self.gtask_task_offsets_buff, self.gtask_task_atoms_raw_buff,
@@ -1030,7 +1038,7 @@ class GridProjector(OpenCLBase):
         self.toGPU_(self.fgr_tau4_buff, tau4_table)
         self.toGPU_(self.fgr_taupi_buff, tau_pp_pi_table)
 
-        self.prg.stm_fgr_sk_tau_scan_real(
+        self._krn_stm_fgr_sk_tau_scan_real(
             self.queue, (int(npts),), None,
             np.int32(npts),
             self.fgr_tip_centers_buff,
@@ -1081,7 +1089,7 @@ class GridProjector(OpenCLBase):
         self.toGPU_(self.fgrb_Hpi_buff, Hpp_pi)
         self.toGPU_(self.fgrb_S4_buff, S4)
         self.toGPU_(self.fgrb_Spi_buff, Spp_pi)
-        self.prg.build_stm_transfer_sk_tables(
+        self._krn_build_stm_transfer_sk_tables(
             self.queue, (int(n),), None,
             np.int32(n),
             self.fgrb_H4_buff, self.fgrb_Hpi_buff,
@@ -1282,7 +1290,7 @@ class GridProjector(OpenCLBase):
         self.toGPU_(self.opt_dm_buff,     dm_dense)
         
         gs = (int(len(points)),)
-        self.prg.project_density_dense_points(
+        self._krn_project_density_dense_points(
             self.queue, gs, None,
             np.int32(len(points)),
             self.opt_points_buff, self.opt_atoms_buff, np.int32(natoms),
@@ -1411,7 +1419,7 @@ class GridProjector(OpenCLBase):
         gs = (max(n_tasks, 1) * ls[0],)
         
         T0 = time.perf_counter_ns()
-        self.prg.project_density_dense(
+        self._krn_project_density_dense(
             self.queue, gs, ls,
             self.dproj_grid_buff, np.int32(n_tasks),
             self.dproj_tasks_buff, self.dproj_atoms_buff, self.dproj_task_atoms_buff,

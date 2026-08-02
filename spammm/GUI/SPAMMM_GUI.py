@@ -352,7 +352,7 @@ class SPAMMMWindow(BaseGUI):
         self.pick_radius_spinbox = self.spinBox(0.5, 0.1, max_width=60, vmin=0.1, vmax=5.0)
         self.pick_radius_spinbox.valueChanged.connect(self.set_pick_radius)
         g.add_pair("Pick R:", self.pick_radius_spinbox)
-        self.label_combo = self.comboBox(["Elem+Idx", "Atom Type", "Pi Orbitals", "Z-Height", "Charge", "Bond Len"], self.set_label_mode)
+        self.label_combo = self.comboBox(["None", "Elem+Idx", "Atom Type", "Pi Orbitals", "Z-Height", "Charge", "Bond Len"], self.set_label_mode)
         g.add_pair("Labels:", self.label_combo)
         layout.addLayout(g.layout())
 
@@ -412,6 +412,14 @@ class SPAMMMWindow(BaseGUI):
         self.view_debug_chk.setToolTip("Draw mouse ray + hit point (transform sanity)")
         self.view_debug_chk.toggled.connect(lambda c: self.scene.set_view_debug(c))
         layout.addWidget(self.view_debug_chk)
+
+        # --- Mouse hints (mode-sensitive cheatsheet) ---
+        self.mouse_hints_chk = self.checkBox("Mouse Hints", checked=True, callback=self._toggle_mouse_hints)
+        layout.addWidget(self.mouse_hints_chk)
+        self.mouse_hints_label = self.label("")
+        self.mouse_hints_label.setWordWrap(True)
+        self.mouse_hints_label.setStyleSheet("font-size: 8pt; color: #555; padding: 2px;")
+        layout.addWidget(self.mouse_hints_label)
 
         # --- File I/O ---
         g5 = AutoGridPlacer(cols=4)
@@ -771,6 +779,10 @@ class SPAMMMWindow(BaseGUI):
     def create_menus(self):
         # Settings Menu
         self.settings_menu = self.menuBar().addMenu("Settings")
+        # Help Menu (cheatsheet)
+        help_menu = self.menuBar().addMenu("Help")
+        cheatsheet_act = help_menu.addAction("Mouse Cheatsheet…")
+        cheatsheet_act.triggered.connect(self._show_cheatsheet)
         # Scripts Menu (bridge to the Script Runner extension panel)
         self._build_scripts_menu()
 
@@ -942,6 +954,8 @@ class SPAMMMWindow(BaseGUI):
         self.scene.ring_preview_line.visible = False
         if h.status_msg:
             self.statusBar().showMessage(h.status_msg)
+            if hasattr(self, 'mouse_hints_label') and self.mouse_hints_chk.isChecked():
+                self.mouse_hints_label.setText(h.status_msg)
         h.on_activate()
 
     def set_atom_type(self, atype):
@@ -1461,7 +1475,8 @@ class SPAMMMWindow(BaseGUI):
         debug_print(2, f"[ON_ATOM_CLICKED] atom_id={atom_id} mode={self.edit_mode}")
         h = self.mode_handlers.get(self.edit_mode)
         if h and h.on_atom_click:
-            h.on_atom_click(atom_id)
+            shift = getattr(self.scene, '_last_shift', False)
+            h.on_atom_click(atom_id, shift)
 
     def on_mouse_press(self, event):
         """Dispatch mouse press to mode handler."""
@@ -1475,6 +1490,31 @@ class SPAMMMWindow(BaseGUI):
         if p_world is None: return
         debug_print(2, f"[GUI_PRESS] mode={self.edit_mode} b2D={self.b2Dview} pos=({p_world[0]:.2f},{p_world[1]:.2f},{p_world[2]:.2f}) ctrl={ctrl}")
         h.on_press(event, p_world, ctrl)
+
+    def _toggle_mouse_hints(self):
+        visible = self.mouse_hints_chk.isChecked()
+        self.mouse_hints_label.setVisible(visible)
+        if visible:
+            h = self.mode_handlers.get(self.edit_mode)
+            if h and h.status_msg:
+                self.mouse_hints_label.setText(h.status_msg)
+
+    def _show_cheatsheet(self):
+        """Open the GUI cheatsheet markdown in a read-only text dialog."""
+        import os
+        cheatsheet_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'user_guide', 'GUI_CHEATSHEET.md')
+        try:
+            with open(cheatsheet_path, 'r') as f:
+                content = f.read()
+        except FileNotFoundError:
+            content = f"Cheatsheet not found at: {cheatsheet_path}"
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("GUI Cheatsheet")
+        dialog.resize(600, 700)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        self.textEdit(content, read_only=True, min_size=(560, 640), layout=dialog.layout(), plain=True)
+        self.button("Close", dialog.accept, layout=dialog.layout())
+        dialog.exec_()
 
     def reset_offsets(self):
         self._push_undo()
@@ -1617,6 +1657,17 @@ class SPAMMMWindow(BaseGUI):
 
         if pos.size == 0:
             self.scene.set_data(np.zeros((0,3)))
+            # Clear all line visuals — stale bonds/H-bonds/bond-orders linger otherwise
+            for v in (self.scene.bond_lines, self.scene.bond_colored_lines,
+                      self.scene.ch_bond_lines, self.scene.hbond_lines,
+                      self.scene.bond_order_lines):
+                v.set_data(np.zeros((0, 3), dtype=np.float32))
+                v.visible = False
+            self.scene.set_bond_orders(None, None)
+            self.scene.set_frag_highlights()
+            self.scene.text_labels.visible = False
+            self.scene.canvas.update()
+            QtWidgets.QApplication.processEvents()
             return
 
         # Colors based on elements

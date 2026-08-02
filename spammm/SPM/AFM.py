@@ -1932,8 +1932,11 @@ class _FDBMGpyFFT:
         self._afm_prg = None  # AFMulator.prg for Round-2 kernels
 
     def bind_afm_program(self, prg):
-        """Attach AFMulator OpenCL program (fdbm_* kernels)."""
+        """Attach AFMulator OpenCL program (fdbm_* kernels) and cache kernel objects."""
         self._afm_prg = prg
+        self._krn_fdbm_pad_roll_f32 = cl.Kernel(prg, 'fdbm_pad_roll_f32')
+        self._krn_fdbm_xyz_to_fft_c64 = cl.Kernel(prg, 'fdbm_xyz_to_fft_c64')
+        self._krn_fdbm_fft_real_to_xyz_f32 = cl.Kernel(prg, 'fdbm_fft_real_to_xyz_f32')
 
     @staticmethod
     def is_fft_friendly(n):
@@ -2019,14 +2022,14 @@ class _FDBMGpyFFT:
             raise RuntimeError("_FDBMGpyFFT: bind_afm_program() required for device xyz→FFT path")
         gs, ls = self._gs3()
         nx, ny, nz = self._shape
-        prg.fdbm_xyz_to_fft_c64(self.queue, gs, ls, xyz_cl.data, fft_buf.data,
+        self._krn_fdbm_xyz_to_fft_c64(self.queue, gs, ls, xyz_cl.data, fft_buf.data,
                                 np.int32(nx), np.int32(ny), np.int32(nz))
 
     def _fft_real_to_xyz_cl(self, fft_buf, xyz_cl):
         prg = self._afm_prg
         gs, ls = self._gs3()
         nx, ny, nz = self._shape
-        prg.fdbm_fft_real_to_xyz_f32(self.queue, gs, ls, fft_buf.data, xyz_cl.data,
+        self._krn_fdbm_fft_real_to_xyz_f32(self.queue, gs, ls, fft_buf.data, xyz_cl.data,
                                      np.int32(nx), np.int32(ny), np.int32(nz))
 
     def fft_forward(self, buf):
@@ -2084,7 +2087,7 @@ class _FDBMGpyFFT:
         if dest_cl is None:
             dest_cl = self._xyz_a
         gs, ls = self._gs3(target_shape)
-        prg.fdbm_pad_roll_f32(
+        self._krn_fdbm_pad_roll_f32(
             self.queue, gs, ls,
             src_cl.data, np.int32(sx), np.int32(sy), np.int32(sz),
             dest_cl.data, np.int32(nx), np.int32(ny), np.int32(nz),

@@ -205,6 +205,9 @@ def _ensure_height_covers(window, z_want, margin=1.0):
     Recomputes S4 (df/tip_disp); S5/S6 only if those grids already exist.
     Returns True if a recompute happened.
     """
+    # Guard against re-entrant calls (slider drag can stack valueChanged events)
+    if getattr(window, '_afm_height_expanding', False):
+        return False
     res = window._afm_results
     if res is None or 'heights' not in res:
         return False
@@ -236,94 +239,106 @@ def _ensure_height_covers(window, z_want, margin=1.0):
         f"Z={z:.2f}Å outside [{h0:.2f},{h1:.2f}] — expanding df window to "
         f"[{new_min:.2f},{new_max:.2f}] (+{margin:.1f}Å margin, amp={amp:.2f}) and recomputing...")
 
-    # Sync Parameter spins without firing mark_scan (we handle recompute here)
-    if hasattr(window, 'afm_hmin_spin'):
-        window.afm_hmin_spin.blockSignals(True)
-        window.afm_hmax_spin.blockSignals(True)
-        window.afm_hmin_spin.setRange(1.0, 12.0)
-        window.afm_hmax_spin.setRange(1.5, 15.0)
-        window.afm_hmin_spin.setValue(new_min)
-        window.afm_hmax_spin.setValue(new_max)
-        window.afm_hmin_spin.blockSignals(False)
-        window.afm_hmax_spin.blockSignals(False)
+    # Set re-entrancy guard — slider drag can stack valueChanged events
+    window._afm_height_expanding = True
+    try:
+        # Sync Parameter spins without firing mark_scan (we handle recompute here)
+        if hasattr(window, 'afm_hmin_spin'):
+            window.afm_hmin_spin.blockSignals(True)
+            window.afm_hmax_spin.blockSignals(True)
+            window.afm_hmin_spin.setRange(1.0, 12.0)
+            window.afm_hmax_spin.setRange(1.5, 15.0)
+            window.afm_hmin_spin.setValue(new_min)
+            window.afm_hmax_spin.setValue(new_max)
+            window.afm_hmin_spin.blockSignals(False)
+            window.afm_hmax_spin.blockSignals(False)
 
-    pipe = _ensure_pipeline(window)
-    params = _get_pipeline_params(window)
-    if getattr(window, '_afm_pipeline_params', None) is not None:
-        window._afm_pipeline_params['hmin'] = new_min
-        window._afm_pipeline_params['hmax'] = new_max
-        window._afm_pipeline_params['hstep'] = hstep
-    _h_df, _h_Fz, h_scan, amp, _ = _sync_pipe_heights_amp(pipe, params)
-    new_heights = pipe.heights
+        pipe = _ensure_pipeline(window)
+        params = _get_pipeline_params(window)
+        if getattr(window, '_afm_pipeline_params', None) is not None:
+            window._afm_pipeline_params['hmin'] = new_min
+            window._afm_pipeline_params['hmax'] = new_max
+            window._afm_pipeline_params['hstep'] = hstep
+        _h_df, _h_Fz, h_scan, amp, _ = _sync_pipe_heights_amp(pipe, params)
+        new_heights = pipe.heights
 
-    had_stm = 'stm_grid' in res
-    had_br = 'br_stm_grid' in res
-    had_afm = ('df' in res) and ('tip_disp' in res)
+        had_stm = 'stm_grid' in res
+        had_br = 'br_stm_grid' in res
+        had_afm = ('df' in res) and ('tip_disp' in res)
 
-    # Height change → S4 cache invalid
-    window._afm_dirty.mark('s4')
-    if had_stm or had_br:
-        window._afm_dirty.mark('s5')
-    if had_br:
-        window._afm_dirty.mark('s6')
-    if os.path.exists(pipe.cache_stage4):
-        try:
-            os.remove(pipe.cache_stage4)
-        except OSError:
-            pass
+        # Height change → S4 cache invalid
+        window._afm_dirty.mark('s4')
+        if had_stm or had_br:
+            window._afm_dirty.mark('s5')
+        if had_br:
+            window._afm_dirty.mark('s6')
+        if os.path.exists(pipe.cache_stage4):
+            try:
+                os.remove(pipe.cache_stage4)
+            except OSError:
+                pass
 
-    if had_afm or had_br:
-        if window._afm_potentials is None or 'F_total' not in window._afm_potentials:
-            _run_afm_s1_to_s4(window, plot=False)
+        if had_afm or had_br:
+            if window._afm_potentials is None or 'F_total' not in window._afm_potentials:
+                _run_afm_s1_to_s4(window, plot=False)
+            else:
+                from spammm.SPM import AFM as afm_mod
+                _update_afm_status(window, f"Stage 4: PP relax on amp-aware heights [{float(h_scan[0]):.2f},{float(h_scan[-1]):.2f}]...")
+                _df_legacy, tip_disp, FEs_relax = pipe.stage4_relax(
+                    window._afm_potentials['F_total'], force_recompute=True,
+                    relax_params={'K_LAT': params['klat'], 'bond_length': params.get('bond_length', 3.0)},
+                    ppm_mode=True,
+                )
+                Fz = np.asarray(FEs_relax[:, :, :, 2], dtype=np.float32)
+                dz = float(pipe.heights[1] - pipe.heights[0])
+                df = afm_mod.compute_df_amp(Fz, dz, amp=float(amp))
+                window._afm_dirty.clean('s4')
+                prev = dict(window._afm_results or {})
+                window._afm_results = {
+                    'df': df, 'tip_disp': tip_disp, 'FEs_relax': FEs_relax,
+                    'heights': pipe.heights, 'scan_xs': pipe.scan_xs, 'scan_ys': pipe.scan_ys,
+                    'amp': float(amp), 'backend': 'fdbm',
+                }
+                for k in ('stm_grid', 'br_stm_grid'):
+                    if k in prev:
+                        window._afm_results[k] = prev[k]
         else:
-            from spammm.SPM import AFM as afm_mod
-            _update_afm_status(window, f"Stage 4: PP relax on amp-aware heights [{float(h_scan[0]):.2f},{float(h_scan[-1]):.2f}]...")
-            _df_legacy, tip_disp, FEs_relax = pipe.stage4_relax(
-                window._afm_potentials['F_total'], force_recompute=True,
-                relax_params={'K_LAT': params['klat'], 'bond_length': params.get('bond_length', 3.0)},
-                ppm_mode=True,
-            )
-            Fz = np.asarray(FEs_relax[:, :, :, 2], dtype=np.float32)
-            dz = float(pipe.heights[1] - pipe.heights[0])
-            df = afm_mod.compute_df_amp(Fz, dz, amp=float(amp))
-            window._afm_dirty.clean('s4')
-            prev = dict(window._afm_results or {})
-            window._afm_results = {
-                'df': df, 'tip_disp': tip_disp, 'FEs_relax': FEs_relax,
-                'heights': pipe.heights, 'scan_xs': pipe.scan_xs, 'scan_ys': pipe.scan_ys,
-                'amp': float(amp), 'backend': 'fdbm',
-            }
-            for k in ('stm_grid', 'br_stm_grid'):
-                if k in prev:
-                    window._afm_results[k] = prev[k]
-    else:
-        # STM-only session: just update height labels stored in results
-        window._afm_results['heights'] = pipe.heights
-        window._afm_results['scan_xs'] = pipe.scan_xs
-        window._afm_results['scan_ys'] = pipe.scan_ys
+            # STM-only session: just update height labels stored in results
+            window._afm_results['heights'] = pipe.heights
+            window._afm_results['scan_xs'] = pipe.scan_xs
+            window._afm_results['scan_ys'] = pipe.scan_ys
 
-    if (had_stm or had_br) and window._afm_eigvecs is not None:
-        sp = _get_stm_params_from_ui(window)
-        _update_afm_status(window, "Recomputing STM on expanded heights...")
-        window._afm_results['stm_grid'] = pipe.stage5_stm(
-            window._afm_eigvecs, window._afm_eigvals,
-            lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
-            field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
-        window._afm_dirty.clean('s5')
-        if had_br and 'tip_disp' in window._afm_results:
-            _update_afm_status(window, "Recomputing BR-STM on expanded heights...")
-            window._afm_results['br_stm_grid'] = pipe.stage6_br_stm(
-                window._afm_eigvecs, window._afm_eigvals, window._afm_results['tip_disp'],
+        if (had_stm or had_br) and window._afm_eigvecs is not None:
+            sp = _get_stm_params_from_ui(window)
+            _update_afm_status(window, "Recomputing STM on expanded heights...")
+            window._afm_results['stm_grid'] = pipe.stage5_stm(
+                window._afm_eigvecs, window._afm_eigvals,
                 lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
-                field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'])
-            window._afm_dirty.clean('s6')
+                field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'],
+                **_fgr_stage_kwargs(sp))
+            window._afm_dirty.clean('s5')
+            if had_br and 'tip_disp' in window._afm_results:
+                _update_afm_status(window, "Recomputing BR-STM on expanded heights...")
+                window._afm_results['br_stm_grid'] = pipe.stage6_br_stm(
+                    window._afm_eigvecs, window._afm_eigvals, window._afm_results['tip_disp'],
+                    lumo_offsets=sp['lumo_offsets'], mo_indices=sp['mo_indices'],
+                    field=sp['field'], exp_beta=sp['exp_beta'], exp_r0=sp['exp_r0'],
+                    **_fgr_stage_kwargs(sp))
+                window._afm_dirty.clean('s6')
+        elif had_stm or had_br:
+            # eigvecs lost (e.g. molecule changed) — stale STM/BR-STM grids have old height dim
+            _update_afm_status(window, "WARNING: eigvecs unavailable — STM/BR-STM grids not recomputed for new heights. Re-run BR-STM.")
+            window._afm_results.pop('stm_grid', None)
+            window._afm_results.pop('br_stm_grid', None)
 
-    _update_afm_status(
-        window,
-        f"Height range now df-window [{new_min:.2f},{new_max:.2f}]  scan [{float(new_heights[0]):.2f},{float(new_heights[-1]):.2f}] Å  ({len(new_heights)} slices)")
-    if hasattr(window, '_afm_refresh_dirty_label'):
-        window._afm_refresh_dirty_label()
-    return True
+        _update_afm_status(
+            window,
+            f"Height range now df-window [{new_min:.2f},{new_max:.2f}]  scan [{float(new_heights[0]):.2f},{float(new_heights[-1]):.2f}] Å  ({len(new_heights)} slices)")
+        if hasattr(window, '_afm_refresh_dirty_label'):
+            window._afm_refresh_dirty_label()
+        return True
+    finally:
+        window._afm_height_expanding = False
 
 
 def _get_pipeline_params(window):
@@ -385,7 +400,9 @@ def _ensure_pipeline(window):
     if not needs_reinit:
         # Reinit if geometry identity changed (atom count, centroid) or key params
         prev = window._afm_pipeline_params
-        reinit_keys = {'basis', 'step', 'margin', 'z_extra', 'scan_range', 'hmin', 'hmax', 'hstep', 'backend'}
+        # NOTE: hmin/hmax/hstep are NOT here — height changes only need S4/S5/S6 recompute,
+        # not full pipeline reinit (which recreates DFTB backend + grid geometry).
+        reinit_keys = {'basis', 'step', 'margin', 'z_extra', 'scan_range', 'backend'}
         needs_reinit = any(params[k] != prev.get(k) for k in reinit_keys)
         if not needs_reinit:
             # Check geometry — strong hash of all positions + element types
@@ -865,7 +882,19 @@ def plot_brstm_panel(window):
         _amp_br = float(window.afm_amp_spin.value()) if hasattr(window, 'afm_amp_spin') else 1.0
         _ensure_height_covers(window, z_height + _amp_br, margin=1.0)
 
+        # Re-check grids after _ensure_height_covers may have replaced _afm_results
+        if 'stm_grid' not in window._afm_results or 'br_stm_grid' not in window._afm_results:
+            raise ValueError("STM/BR-STM grids lost during height expansion — re-run BR-STM.")
+        if window._afm_results['stm_grid'] is None or window._afm_results['br_stm_grid'] is None:
+            raise ValueError("STM/BR-STM grids are None after height expansion — re-run BR-STM.")
+
         heights = np.asarray(window._afm_results['heights'], dtype=np.float64)
+        # Validate grid z-dim matches heights (stale grids from old height range would crash)
+        nz_h = len(heights)
+        for key, grid in (('stm_grid', window._afm_results['stm_grid']),
+                          ('br_stm_grid', window._afm_results['br_stm_grid'])):
+            if grid is not None and grid.shape[2] != nz_h:
+                raise ValueError(f"{key} has {grid.shape[2]} z-slices but heights has {nz_h} — re-run BR-STM.")
         # amp-aware z-slicing (skill:afm-plotting): z_height = h_Fz (physical z, label).
         # df at oscillation center iz_df (h_df = h_Fz + amp); dxy/STM/BR-STM at iz_Fz (h_Fz).
         # Using one iz for all shifts df by amp vs the others — CLI fixed this (idx_df/idx_Fz).
@@ -1630,15 +1659,43 @@ def build_ui(window):
     g_viz.add(window.afm_live_update)
     viz_layout.addLayout(g_viz.layout())
 
+    # Debounce z-height changes: scrolling the wheel fires valueChanged every 0.1 step.
+    # Fast path (z in range): plot immediately. Slow path (z out of range): debounce 300ms
+    # so we only recompute S4/S5/S6 once after the user stops scrolling.
+    from PyQt5.QtCore import QTimer as _QTimer
+    window._afm_z_debounce = _QTimer()
+    window._afm_z_debounce.setSingleShot(True)
+    window._afm_z_debounce.setInterval(300)
+
+    def _debounced_z_plot():
+        try:
+            plot_afm_slice(window)
+        except Exception as e:
+            _update_afm_status(window, f"Z-update failed: {e}")
+    window._afm_z_debounce.timeout.connect(_debounced_z_plot)
+
     def on_z_height_changed():
-        if window.afm_live_update.isChecked():
-            has_data = (window._afm_results is not None) or (window._afm_potentials is not None) or (window._afm_density is not None)
-            if has_data:
+        if not window.afm_live_update.isChecked():
+            return
+        has_data = (window._afm_results is not None) or (window._afm_potentials is not None) or (window._afm_density is not None)
+        if not has_data:
+            return
+        # Fast path: if z is within computed heights, plot immediately (no recompute needed)
+        res = window._afm_results
+        if res is not None and 'heights' in res:
+            heights = np.asarray(res['heights'], dtype=np.float64)
+            z = float(window.afm_z_height_spin.value())
+            amp = float(window.afm_amp_spin.value()) if hasattr(window, 'afm_amp_spin') else 1.0
+            if (heights.min() - 1e-6) <= z <= (heights.max() + 1e-6) and \
+               (heights.min() - 1e-6) <= (z + amp) <= (heights.max() + 1e-6):
                 try:
-                    # plot_afm_slice / BR panel call _ensure_height_covers if needed
                     plot_afm_slice(window)
                 except Exception as e:
                     _update_afm_status(window, f"Z-update failed: {e}")
+                return
+        # Slow path: z outside range — debounce to avoid recompute per scroll step
+        window._afm_z_debounce.start()
+
     window.afm_z_height_spin.valueChanged.connect(on_z_height_changed)
 
     g_lim = AutoGridPlacer(cols=4)
