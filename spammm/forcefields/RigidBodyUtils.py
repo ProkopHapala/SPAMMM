@@ -8,8 +8,24 @@ MC/GA optimization, AFM manipulation, grid placement, trajectory I/O.
 Pattern: same as `spammm/surfaces/FoldedRigid.py` — functions take `rbd` as
 first arg, call its GPU methods, return results. No GPU code here.
 
+Key functions:
+- **`graph_to_rigid_fragments`** — split AtomicGraph into rigid bodies via
+  `find_connected_components`. Atoms within each fragment are in BFS order
+  (not file order) — callers must use the same order for display sync.
+- **`build_mixed_species_assembly`** — round-robin body ordering for multi-species
+  assemblies. Deterministic, interleaved by copy.
+- **`compute_combined_probe_map`** — E_map = E_PairFF(static) + E_FAF(NaCl).
+  Dynamic molecules excluded. Headless (no Qt/Vispy). Warm recompute ~254ms (CPU).
+
 Used by: GUI extensions (RigidAssemblyExtension, FoldedRigidExtension),
-demos (demo_pairff), tests (testplot_pairff_energy_mc, test_forcefield).
+demos (demo_pairff, static_obstacle_drag_demo), tests (test_body_state,
+testplot_pairff_energy_mc, test_forcefield).
+
+Caveats:
+- `graph_to_rigid_fragments` returns atoms in BFS order — the display graph must
+  be rebuilt to match (see `RigidAssemblyExtension._ensure_backend_matched`).
+- `compute_combined_probe_map` is CPU-only; warm recompute exceeds 0.2s budget
+  for large assemblies. GPU map kernel deferred.
 """
 import numpy as np
 
@@ -103,6 +119,156 @@ def graph_to_rigid_fragments(graph, qeq=True, planarize=True):
         fragments.append((apos_rel, enames, REQs, bonds))
 
     return fragments, coms
+
+
+# =============================================================================
+# Mixed-species assembly builder (shared by GUI + testplot)
+# =============================================================================
+
+def build_mixed_species_assembly(mol_names, nmol, mol_paths, no_qeq_set, spacing, z_body, seed,
+                                 qeq=True):
+    """Build aligned mixed-species assembly data in round-robin body order.
+
+    Body order is deterministic and interleaved:
+      copy 0: species[0], species[1], ..., species[N-1]
+      copy 1: species[0], species[1], ..., species[N-1]
+
+    This ensures molecules, tids, bonds_list, and display atom ranges all use
+    the same order.  Do NOT use the testplot's grouped-by-species ordering.
+
+    Args:
+        mol_names: list of species name strings (keys in mol_paths)
+        nmol: copies per species (total bodies = nmol * len(mol_names))
+        mol_paths: dict {name: path}
+        no_qeq_set: set of names that should skip QEq (use file charges)
+        spacing: grid spacing in Angstrom
+        z_body: body CoM z coordinate
+        seed: RNG seed for jitter + rotation init
+        qeq: whether to run QEq (overridden by no_qeq_set per species)
+
+    Returns:
+        molecules: list of (apos, enames, REQs) tuples, length n_total
+        tids: list of species name strings, length n_total
+        bonds_list: list of bond arrays, length n_total
+        pos: (n_total, 3) f32 grid positions with jitter
+        quat: (n_total, 4) f32 quaternions with rotation init
+        species_data: list of (apos, enames, REQs, bonds) per species (for FAF)
+    """
+    n_species = len(mol_names)
+    n_total = nmol * n_species
+
+    # Load each species once
+    species_data = []
+    for mn in mol_names:
+        if mn not in mol_paths:
+            raise ValueError(f'Unknown molecule: {mn}. Available: {sorted(mol_paths.keys())}')
+        sd = load_molecule(mol_paths[mn], qeq=qeq and (mn not in no_qeq_set), name=mn)
+        species_data.append(sd)
+
+    # Round-robin body order: copy 0 of each species, then copy 1, etc.
+    molecules = []
+    tids = []
+    bonds_list = []
+    for copy_idx in range(nmol):
+        for sp_idx in range(n_species):
+            apos, enames, REQs, bonds = species_data[sp_idx]
+            molecules.append((apos, enames, REQs))
+            tids.append(mol_names[sp_idx])
+            bonds_list.append(bonds)
+
+    # Grid positions + deterministic jitter/rotation (same pattern as _on_build)
+    pos = grid_pos(n_total, spacing=spacing, z=z_body)
+    rng = np.random.default_rng(int(seed))
+    pos[:, 0] += rng.normal(0, 0.6, size=n_total).astype(np.float32)
+    pos[:, 1] += rng.normal(0, 0.6, size=n_total).astype(np.float32)
+    quat = np.tile(np.array([0, 0, 0, 1], dtype=np.float32), (n_total, 1))
+    for i in range(n_total):
+        phi0 = (i * 0.5 * np.pi) + float(rng.uniform(-0.35, 0.35))
+        quat[i] = np.array([0, 0, np.sin(0.5 * phi0), np.cos(0.5 * phi0)], dtype=np.float32)
+
+    return molecules, tids, bonds_list, pos, quat, species_data
+
+
+# =============================================================================
+# Headless combined PairFF+FAF probe map (shared by GUI + tests)
+# =============================================================================
+
+def compute_combined_probe_map(rbd, fit, frozen_mask, probe_R0, probe_E0, probe_q,
+                               z_probe, margin=4.0, step=0.1, beta=1.7,
+                               He=-1.0, Hs=0.0, w=0.7):
+    """Compute E_map = E_PairFF(static mols) + E_FAF(NaCl) on a 2D grid at z_probe.
+
+    Headless (no Qt/VisPy). Reuses compute_potential_map_unified from RigidBodyVispy
+    and eval_folded_potential_grid from FoldedRigid.  Dynamic molecules are excluded
+    — only frozen (static) bodies contribute to the PairFF part.
+
+    Args:
+        rbd: RigidBodyPairFF with _mb_packs populated
+        fit: FAF fit dict (or None for no FAF)
+        frozen_mask: (n_bodies,) bool array — True = static (contributes to map)
+        probe_R0, probe_E0, probe_q: probe parameters
+        z_probe: absolute z height for map evaluation
+        margin, step: grid extent margin and step in Angstrom
+        beta, He, Hs, w: PairFF parameters
+
+    Returns:
+        E_sum: (ny, nx) float64 — combined PairFF + FAF potential
+        E_pairff: (ny, nx) float64 — PairFF contribution only
+        E_faf: (ny, nx) float64 or None — FAF contribution only
+        xs: (nx,) float64 — x axis
+        ys: (ny,) float64 — y axis
+        extent: [xmin, xmax, ymin, ymax]
+    """
+    from spammm.GUI.RigidBodyVispy import compute_potential_map_unified
+    from spammm.surfaces.FoldedRigid import eval_folded_potential_grid, faf_type_idx_for_probe, faf_fit_mode, FAF_MODE_FACTOR
+
+    # Gather world sites from frozen (static) bodies only
+    frozen_mask = np.asarray(frozen_mask, dtype=bool)
+    sites_pos, sites_REQ, sites_enames, sites_types = [], [], [], []
+    for j, pack in enumerate(rbd._mb_packs):
+        if j >= len(frozen_mask) or not frozen_mask[j]:
+            continue
+        pos_j = rbd._mb_pos[j]
+        quat_j = rbd._mb_quat[j]
+        world = _body_sites_world(pack['rel'], pos_j, quat_j)
+        sites_pos.append(world)
+        sites_REQ.append(pack['REQ_ext'])
+        sites_enames.extend(pack['enames'])
+        sites_types.append(pack['types'])
+
+    if sites_pos:
+        static_apos = np.vstack(sites_pos).astype(np.float64)
+        static_REQ = np.vstack(sites_REQ).astype(np.float64)
+        static_types = np.concatenate(sites_types).astype(np.int32)
+        E_pairff, xs, ys, extent = compute_potential_map_unified(
+            static_apos, static_REQ, sites_enames, static_types,
+            probe_R0, probe_E0, probe_q, z_height=z_probe, margin=margin, step=step,
+            He=He, Hs=Hs, w=w, beta=beta)
+    else:
+        # No static molecules: empty PairFF layer; extent from all bodies or FAF default
+        all_pos = rbd._mb_pos
+        margin_f, step_f = float(margin), float(step)
+        xmin, ymin = float(all_pos[:, 0].min() - margin_f), float(all_pos[:, 1].min() - margin_f)
+        xmax, ymax = float(all_pos[:, 0].max() + margin_f), float(all_pos[:, 1].max() + margin_f)
+        xs = np.arange(xmin, xmax + step_f, step_f)
+        ys = np.arange(ymin, ymax + step_f, step_f)
+        E_pairff = np.zeros((len(ys), len(xs)), dtype=np.float64)
+        extent = [xmin, xmax, ymin, ymax]
+
+    # FAF contribution
+    E_faf = None
+    if fit is not None:
+        mode = faf_fit_mode(fit)
+        if mode == FAF_MODE_FACTOR:
+            probe_REQH = np.array([float(probe_R0), float(np.sqrt(max(float(probe_E0), 0.0))),
+                                   float(probe_q), 0.0], dtype=np.float32)
+            E_faf = eval_folded_potential_grid(fit, 0, xs, ys, z_probe, atom_REQH=probe_REQH)
+        else:
+            ityp = faf_type_idx_for_probe(fit, probe_R0, probe_E0, probe_q)
+            E_faf = eval_folded_potential_grid(fit, ityp, xs, ys, z_probe)
+
+    E_sum = E_pairff + (E_faf if E_faf is not None else 0.0)
+    return E_sum, E_pairff, E_faf, xs, ys, extent
 
 
 # =============================================================================

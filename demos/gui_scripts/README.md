@@ -43,6 +43,14 @@ The panel remembers these per script in QSettings.
   - Custom: `-- --drag-x 20 --n-relax 300 --anchor-atom 29 --opposite-atom 27`
   - Format: `--format gif|mp4|both` (default: `both` — MP4 is ~10x smaller than GIF)
   - Report: [`doc/Reports/PTCDA_DragDemo_StickSlip_2026-08-01.md`](../../../doc/Reports/PTCDA_DragDemo_StickSlip_2026-08-01.md)
+- **static_obstacle_drag_demo.py** — Paced generator: build mixed-species
+  NTCDI(static) + uracil(dynamic) on NaCl → freeze NTCDI as static obstacles →
+  compute combined PairFF(static)+FAF probe map → drag uracil O atom through
+  the obstacle field (FIRE relaxation per step) → capture VisPy canvas frames →
+  GIF/MP4. Shows probe map overlay, anchor spring line, trajectory lines.
+  - Example: `./run_gui.sh --script demos/gui_scripts/static_obstacle_drag_demo.py`
+  - Custom: `-- --drag-x 20 --n-relax 300 --nmol 2`
+  - Format: `--format gif|mp4|both` (default: `both`)
 - **folded_rigid_setup.py** — Load a molecule, fit or load a folded substrate
   potential, and start the `FoldedRigid` extension in run or manip (drag) mode.
   - Arguments: `--mol`, `--substrate`, `--fit`, `--fit-fit`, `--run`, `--step`,

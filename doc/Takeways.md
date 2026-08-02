@@ -428,6 +428,39 @@ add it to the interactive handler so both paths benefit.
 
 ---
 
+## Graph rebuild enames check (Rigid Assembly display sync)
+
+**Context:** `RigidAssemblyExtension._ensure_backend_matched` rebuilds the display
+graph from the assembly's world atoms when the atom count differs from the editor
+graph. Used for "From file" builds (e.g. 4×PTCDA=104 atoms vs 0 in editor).
+
+**Symptom (2026-08-03):** Loading a benzoic acid dimer from the editor and splitting
+via connected components produced **scrambled atom colors and bonds** — the display
+looked like random connections despite correct dynamics.
+
+**Root cause:**
+
+| Layer | Atom order |
+|-------|-----------|
+| Editor graph (XYZ file) | file order: C1, C2, ..., O1, O2, H1, ... |
+| `graph_to_rigid_fragments` (BFS) | BFS order within each connected component |
+
+Both have 30 atoms, so the count-only check in `_ensure_backend_matched` passed.
+`update_positions_from_array` then assigned assembly-ordered positions to
+graph-ordered atoms — scrambling bonds and colors.
+
+**Fix:** `_ensure_backend_matched` now checks that the **enames sequences match**,
+not just the count. If they differ, the graph is rebuilt from the assembly's atom
+order with correct bonds from `ra_bonds0`.
+
+**Takeaway:** Atom count equality is necessary but **not sufficient** for
+graph-assembly synchronization. Always check enames (or stable atom-ID mapping).
+
+**Reference:** `doc/Reports/StaticObstacle_DragDemo_2026-08-03.md` §3.1,
+`doc/Caveats.md` §9
+
+---
+
 ## Adding to this document
 
 When you spend time on a non-obvious bug or pattern:

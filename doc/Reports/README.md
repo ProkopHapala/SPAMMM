@@ -6,6 +6,7 @@ Validated and review-ready scientific results, with exact methods, artifacts, re
 - **ContactSurface_2p5D_vs_GridFF_2026-07-24.md** — **SSOT** coarse 2.5D contact-sep vs Morse+Coulomb GridFF: sphere `h₀`, `h0_R_scale=0.75`, atom-scale `bspl/scan` dx; PTCDA + helicene artifacts; status investigating.
 - **Assembly_ContactSurface_AFM_helicene_2026-07-24.md** — Helicene SAM assembly → contact-sep AFM; PBC/overlay fixes; points at 2.5D vs GridFF report for parity.
 - **PTCDA_NaCl_Rigid_Newton_FIRE_Relaxation.md** — Why aggressive rigid Newton creates noisy basin selection, how staged LM damping restores Newton–FIRE consistency, and practical solver tradeoffs.
+- **StaticObstacle_DragDemo_2026-08-03.md** — Dimer split via connected components, static/dynamic/deleted body-state gating (kernels 14+15), combined PairFF(static)+FAF probe map, mid-drag toggle demo; caveats: graph rebuild enames check, FAF for editor builds.
 - **PTCDA_FDBM_prolonged_basis.md** — Stock 3ob versus SA-prolonged PTCDA density tails, Pauli fitting, and AFM images.
 - **PySCF_GPU_CO_zscan_PTCDA.md** — Site-correct GPU pySCF CO–PTCDA interaction scans, timing, reference data, and limitations.
 - **Kriging_DFT_vs_DFTB_FDBM_pyridine.md** — Pyridine+CO: Kriging DFT GridFF vs FDBM from cubes and DFTB; Δρ recipes vs basis tails; dual-basis Slater rules; plotting SSOT; session history (investigating).

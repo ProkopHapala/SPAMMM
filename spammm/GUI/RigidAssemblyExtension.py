@@ -5,14 +5,19 @@ One panel, three modes, all sharing a single `RigidEnsemble` (pose SSOT) and a s
 editor-drawn fragments (AtomicGraph connected components).
 
   - **Build** : "From file" loads nmol copies of a pre-defined molecule (PTCDA, NTCDI, …)
-                onto a grid. "From editor" splits `backend.graph` into connected components
-                via `graph_to_rigid_fragments` — each disconnected fragment becomes one
-                rigid body at its mass-weighted CoM. When the assembly atom count differs
-                from the editor graph, the graph is rebuilt from the assembly's world atoms
-                (same pattern as `FoldedRigidExtension._ensure_backend_matched`).
+                onto a grid. Supports comma-separated species (e.g. "NTCDI,uracil") for
+                mixed-species assemblies (round-robin body order). "From editor" splits
+                `backend.graph` into connected components via `graph_to_rigid_fragments`
+                — each disconnected fragment becomes one rigid body at its mass-weighted
+                CoM. FAF substrate is fitted on the first fragment for editor builds.
+                When the assembly atom count or enames differ from the editor graph,
+                the graph is rebuilt from the assembly's world atoms (same pattern as
+                `FoldedRigidExtension._ensure_backend_matched`). **Caveat:** enames must
+                match, not just count — see `doc/Caveats.md` §9.
   - **Drag**  : pick an atom in the main scene, pull its molecule with an anchor spring
                 while all molecules relax concurrently; on release all poses are written
-                back to the ensemble.
+                back to the ensemble. **Shift+LMB** toggles dynamic↔static,
+                **RMB** soft-deletes (rejected on last live body).
   - **MC/GA** : greedy best-of-batch planar moves (reuses
                 `RigidBodyPairFF.greedy_energy_step` / `eval_energy_system`); accepted
                 poses are written to the ensemble.
@@ -73,6 +78,7 @@ MOL_PATHS = {
     'azaindol':          os.path.join(_XYZ_DIR, 'azaindol.xyz'),
     'uracil':            os.path.join(_XYZ_DIR, 'uracil.xyz'),
     'adenine':           os.path.join(_XYZ_DIR, 'adenine.xyz'),
+    'benzoic_acid':      os.path.join(_XYZ_DIR, 'benzoic_acid.xyz'),
 }
 _NO_QEQ = {'NTCDI'}  # NTCDI.mol2 has good file charges
 
@@ -83,6 +89,61 @@ def _status(window, msg):
     if lbl is not None:
         lbl.setText(msg)
         QtWidgets.QApplication.processEvents()
+
+
+def _body_state_counts(window):
+    """Return (n_dynamic, n_static, n_deleted) from the RBD body-state buffer."""
+    rbd = window.ra_rbd
+    if rbd is None or rbd._body_state_host is None:
+        return 0, 0, 0
+    s = rbd._body_state_host
+    return int((s == 1).sum()), int((s == 0).sum()), int((s < 0).sum())
+
+
+def _toggle_body_state(window, body):
+    """Toggle dynamic ↔ static for the given body. Syncs GPU pose → ensemble first."""
+    rbd = window.ra_rbd
+    ens = window.ra_ensemble
+    if rbd is None or ens is None:
+        return
+    # Sync latest GPU pose into ensemble before freezing (per spec §1.2)
+    _sync_ensemble_from_gpu(window)
+    cur = int(rbd._body_state_host[body])
+    new_state = 0 if cur == 1 else 1  # toggle dynamic ↔ static
+    rbd.set_body_state(body, new_state)
+    # Update ensemble metadata (active = not static)
+    ens._bodies[body].active = (new_state == 1)
+    _update_state_overlays(window)
+    n_dyn, n_stat, n_del = _body_state_counts(window)
+    _status(window, f"Body {body}: {'dynamic' if new_state == 1 else 'static'}  (dynamic={n_dyn} static={n_stat} deleted={n_del})")
+
+
+def _soft_delete_body(window, body):
+    """Soft-delete a body (state=-1). Reject if it's the last live body."""
+    rbd = window.ra_rbd
+    ens = window.ra_ensemble
+    if rbd is None or ens is None:
+        return
+    s = rbd._body_state_host.copy()
+    n_live = int((s >= 0).sum())
+    if n_live <= 1:
+        _status(window, "Cannot delete the last live body")
+        return
+    s[body] = -1
+    rbd.set_body_states(s)
+    ens._bodies[body].alive = False
+    _update_state_overlays(window)
+    n_dyn, n_stat, n_del = _body_state_counts(window)
+    _status(window, f"Body {body}: deleted  (dynamic={n_dyn} static={n_stat} deleted={n_del})")
+
+
+def _update_state_overlays(window):
+    """Refresh static outline overlay + status counts. Called after state changes."""
+    # TODO: static outline overlay (Phase C visual)
+    n_dyn, n_stat, n_del = _body_state_counts(window)
+    lbl = getattr(window, 'ra_state_counts_label', None)
+    if lbl is not None:
+        lbl.setText(f"dyn={n_dyn} stat={n_stat} del={n_del}")
 
 
 def _assembly_world_atoms(window):
@@ -119,7 +180,13 @@ def _ensure_backend_matched(window, atom_positions, enames_all):
         return
     atom_list = [a for a in backend.graph.atoms.values() if a.alive]
     if len(atom_list) == len(atom_positions):
-        return  # counts match — just update positions
+        # Counts match — but enames may differ (e.g. editor XYZ order vs assembly BFS order)
+        # Only skip rebuild if enames also match
+        if enames_all is not None and len(enames_all) == len(atom_positions):
+            graph_enames = [str(a.ename) for a in atom_list]
+            if graph_enames == list(enames_all):
+                return  # counts AND enames match — just update positions
+        # Enames differ but counts match — fall through to rebuild
     if enames_all is None or len(enames_all) != len(atom_positions):
         return  # can't rebuild without enames
     # Rebuild graph from assembly atoms (same pattern as FoldedRigidExtension)
@@ -198,6 +265,93 @@ def _update_ra_substrate_overlay(window):
     window.ra_substrate_map = img
 
 
+def _ra_frozen_mask(window):
+    """Bool array: True = static (frozen) body.  Derived from RBD body_state_host."""
+    rbd = window.ra_rbd
+    if rbd is None or rbd._body_state_host is None:
+        return np.zeros(0, dtype=bool)
+    return rbd._body_state_host == 0
+
+
+def _ra_probe_params(window):
+    """Read probe R0/E0/Q from the RA probe controls."""
+    return (float(window.ra_probe_R0_spin.value()),
+            float(window.ra_probe_E0_spin.value()),
+            float(window.ra_probe_q_spin.value()))
+
+
+def _on_probe_preset(window, which):
+    """Apply H+ or O− probe preset: fill R0/E0 from AtomTypes, set Q, update toggle buttons."""
+    from spammm.forcefields.QEq import get_atom_types
+    _, atom_types = get_atom_types()
+    if which == 'Hp':
+        ename, q = 'H', 0.4
+        window.ra_probe_Hp_btn.setChecked(True)
+        window.ra_probe_Om_btn.setChecked(False)
+    else:
+        ename, q = 'O', -0.4
+        window.ra_probe_Hp_btn.setChecked(False)
+        window.ra_probe_Om_btn.setChecked(True)
+    at = atom_types.get(ename)
+    R0 = float(at.RvdW) if at else 1.5
+    E0 = float(at.EvdW) if at else 0.002
+    window.ra_probe_combo.blockSignals(True)
+    window.ra_probe_combo.setCurrentText(ename)
+    window.ra_probe_combo.blockSignals(False)
+    window.ra_probe_R0_spin.setValue(R0)
+    window.ra_probe_E0_spin.setValue(E0)
+    window.ra_probe_q_spin.setValue(q)
+    _recompute_ra_combined_map(window)
+
+
+def _recompute_ra_combined_map(window):
+    """Recompute the combined PairFF(static) + FAF probe map and update the overlay.
+
+    Uses compute_combined_probe_map (shared headless helper in RigidBodyUtils).
+    Caches the result in window.ra_combined_map for e-pair/sigma-hole overlays.
+    """
+    rbd = window.ra_rbd
+    if rbd is None:
+        return
+    from spammm.forcefields.RigidBodyUtils import compute_combined_probe_map
+    from spammm.surfaces.FoldedRigid import Z_SURF_TOP
+    from spammm.GUI.RigidBodyVispy import potential_to_rgba
+    import vispy.scene as vscene
+    from vispy.visuals.transforms import STTransform
+    fit = getattr(window, 'ra_fit', None)
+    frozen_mask = _ra_frozen_mask(window)
+    probe_R0, probe_E0, probe_q = _ra_probe_params(window)
+    z_probe = Z_SURF_TOP + float(window.ra_probe_z_spin.value())
+    beta = 1.7
+    E_sum, E_pairff, E_faf, xs, ys, extent = compute_combined_probe_map(
+        rbd, fit, frozen_mask, probe_R0, probe_E0, probe_q, z_probe, beta=beta)
+    # Cache for e-pair/sigma-hole overlay
+    window.ra_combined_map = {'E_sum': E_sum, 'E_pairff': E_pairff, 'E_faf': E_faf,
+                              'xs': xs, 'ys': ys, 'extent': extent, 'z_probe': z_probe}
+    rgba = potential_to_rgba(E_sum)
+    visible = getattr(window, 'ra_show_map', True)
+    # Hide the FAF substrate overlay when the combined map is shown (avoids double-overlay white box)
+    if visible:
+        sub_img = getattr(window.scene, 'ra_substrate_map', None)
+        if sub_img is not None:
+            sub_img.visible = False
+    parent = window.scene.view.scene if hasattr(window.scene, 'view') else window.scene
+    img = getattr(window.scene, 'ra_combined_map_img', None)
+    if img is None:
+        img = vscene.visuals.Image(parent=parent)
+        img.set_gl_state('translucent', depth_test=False)
+        img.order = -1  # same z-order as FAF substrate overlay
+        setattr(window.scene, 'ra_combined_map_img', img)
+    img.set_data(rgba)
+    xmin, xmax, ymin, ymax = extent
+    dx = (float(xmax) - float(xmin)) / max(len(xs) - 1, 1)
+    dy = (float(ymax) - float(ymin)) / max(len(ys) - 1, 1)
+    img.transform = STTransform(translate=(float(xmin), float(ymin), -0.1), scale=(dx, dy, 1))
+    img.visible = visible
+    window.ra_combined_map_img = img
+    _status(window, f"Map recomputed: range=[{E_sum.min():.3f},{E_sum.max():.3f}]  grid={len(xs)}x{len(ys)}")
+
+
 def _upload_poses_to_gpu(window):
     """Push authoritative ensemble poses into GPU and RBD host mirrors."""
     ens = window.ra_ensemble
@@ -259,7 +413,7 @@ def _on_build(window):
     """
     source = window.ra_source_combo.currentText()
     z_mol = float(window.ra_z_spin.value())
-    faf_enabled = source != 'From editor' and not window.ra_no_faf_chk.isChecked()
+    faf_enabled = not window.ra_no_faf_chk.isChecked()
     z_body = float(Z_SURF_TOP + window.ra_z_init_spin.value()) if faf_enabled else z_mol
     try:
         if source == 'From editor':
@@ -288,28 +442,26 @@ def _on_build(window):
             bonds_list = [f[3] for f in fragments]
             _status(window, f'Found {nmol} fragments (sizes: {[len(f[1]) for f in fragments]})')
         else:
-            # ── From file (existing path) ────────────────────────────────────
-            mol_name = window.ra_mol_combo.currentText()
+            # ── From file (existing path, now supports comma-separated species) ──
+            mol_text = window.ra_mol_combo.currentText().strip()
+            mol_names = [m.strip() for m in mol_text.split(',') if m.strip()]
+            if not mol_names:
+                _status(window, 'No molecule name(s) specified')
+                return
+            for mn in mol_names:
+                if mn not in MOL_PATHS:
+                    _status(window, f'Unknown molecule: {mn}')
+                    return
             nmol = int(window.ra_nmol_spin.value())
             spacing = float(window.ra_spacing_spin.value())
-            if mol_name not in MOL_PATHS:
-                _status(window, f'Unknown molecule: {mol_name}')
-                return
-            _status(window, f'Loading {mol_name}...')
-            apos, enames, REQs, bonds = load_molecule(MOL_PATHS[mol_name], qeq=(mol_name not in _NO_QEQ) and (not window.ra_no_qeq_chk.isChecked()), name=mol_name)
-            molecules = [(apos, enames, REQs)] * nmol
-            pos = grid_pos(nmol, spacing=spacing, z=z_body)
-            quat = np.tile(np.array([0, 0, 0, 1], dtype=np.float32), (nmol, 1))
-            # Exact deterministic testplot initialization: lateral jitter first,
-            # then one small rotation around each grid orientation.
-            rng = np.random.default_rng(int(window.ra_seed_spin.value()))
-            pos[:, 0] += rng.normal(0, 0.6, size=nmol).astype(np.float32)
-            pos[:, 1] += rng.normal(0, 0.6, size=nmol).astype(np.float32)
-            for i in range(nmol):
-                phi0 = (i * 0.5 * np.pi) + float(rng.uniform(-0.35, 0.35))
-                quat[i] = np.array([0, 0, np.sin(0.5 * phi0), np.cos(0.5 * phi0)], dtype=np.float32)
-            tids = [mol_name] * nmol
-            bonds_list = [bonds] * nmol
+            _status(window, f'Loading {mol_text} ({nmol} copies each)...')
+            from spammm.forcefields.RigidBodyUtils import build_mixed_species_assembly
+            molecules, tids, bonds_list, pos, quat, species_data = build_mixed_species_assembly(
+                mol_names, nmol, MOL_PATHS, _NO_QEQ, spacing, z_body,
+                int(window.ra_seed_spin.value()), qeq=not window.ra_no_qeq_chk.isChecked())
+            # For FAF: use first species' data (single-species case) or species_data (mixed)
+            apos, enames, REQs, bonds = species_data[0]
+            mol_name = mol_names[0]
 
         # Build ensemble (pose SSOT)
         window.ra_ensemble = RigidEnsemble.from_poses(tids, pos, quat)
@@ -320,15 +472,36 @@ def _on_build(window):
             molecules, pos, quats=quat, active_body=0,
             He=-0.1, rc=3.0, w=0.7, k_z=0.0, z_target=z_body, Hs=1.0, beta=1.7,
         )
-        # Optional FAF substrate (only for file source — fragments have no fit)
-        if source != 'From editor' and not window.ra_no_faf_chk.isChecked():
-            mol_name = window.ra_mol_combo.currentText()
-            from spammm.surfaces.FoldedRigid import load_or_fit_faf
-            fit = load_or_fit_faf((apos, enames, REQs), mol_name=mol_name)
-            fit = remap_fit_for_molecule(fit, REQs)
-            # Tile atom_type_ids for nmol copies (all same species)
-            at_ids = np.tile(fit['atom_type_ids'], nmol).astype(np.int32)
-            fit['atom_type_ids'] = at_ids
+        # Optional FAF substrate
+        if faf_enabled:
+            from spammm.surfaces.FoldedRigid import load_or_fit_faf, faf_fit_mode, FAF_MODE_TYPED, FAF_MODE_FACTOR
+            if source == 'From editor':
+                # Editor build: fit on first fragment's atoms
+                f0 = fragments[0]
+                # Derive mol_name from enames for cache filename (e.g. "benzoic_acid" from CCOOH...)
+                editor_mol_name = 'editor_frag0'
+                fit = load_or_fit_faf((f0[0], f0[1], f0[2]), mol_name=editor_mol_name)
+                mode = faf_fit_mode(fit)
+                if mode == FAF_MODE_TYPED:
+                    at_ids_parts = [remap_fit_for_molecule(fit, f[2])['atom_type_ids'] for f in fragments]
+                    fit['atom_type_ids'] = np.concatenate(at_ids_parts).astype(np.int32)
+                else:
+                    n_real_total = sum(len(f[1]) for f in fragments)
+                    fit['atom_type_ids'] = np.zeros(n_real_total, dtype=np.int32)
+            else:
+                n_total = len(molecules)
+                fit = load_or_fit_faf((apos, enames, REQs), mol_name=mol_names[0])
+                mode = faf_fit_mode(fit)
+                if mode == FAF_MODE_TYPED:
+                    at_ids_parts = []
+                    for copy_idx in range(nmol):
+                        for sp_idx, (sp_apos, sp_enames, sp_REQs, _) in enumerate(species_data):
+                            sp_fit = remap_fit_for_molecule(fit, sp_REQs)
+                            at_ids_parts.append(sp_fit['atom_type_ids'])
+                    fit['atom_type_ids'] = np.concatenate(at_ids_parts).astype(np.int32)
+                else:
+                    n_real_total = sum(len(sd[2]) for sd in species_data) * nmol
+                    fit['atom_type_ids'] = np.zeros(n_real_total, dtype=np.int32)
             window.ra_rbd.attach_pairff_faf(fit, z_init=float(window.ra_z_init_spin.value()), k_z=0.0, enable=True)
             window.ra_fit = fit
         else:
@@ -481,7 +654,7 @@ def _closest_point_on_ray(atom_pos, r0, rd):
 
 def _make_ramdrag_mode(window):
     class RAManipMode(EditModeHandler):
-        status_msg = "RigidAssembly Drag: LMB pick+drag atom; all rigid molecules relax; release to drop"
+        status_msg = "RA Drag: LMB drag dynamic mol; Shift+LMB toggle static; RMB delete"
         lock_drag = True
         capture_move = True
 
@@ -501,10 +674,21 @@ def _make_ramdrag_mode(window):
         def on_press(self, event, p_world, ctrl):
             if event.button != 1:
                 return
+            shift = getattr(window.scene, '_last_shift', False)
             idx = self._pick_idx(event)
             if idx < 0:
                 return
             body, site = _display_index_to_body_site(window, idx)
+            # Shift+LMB: toggle dynamic ↔ static (per spec §1.2)
+            if shift:
+                _toggle_body_state(window, body)
+                return
+            # Plain LMB on static body: do not attach anchor
+            rbd = window.ra_rbd
+            if rbd._body_state_host is not None and int(rbd._body_state_host[body]) != 1:
+                _status(window, f"Body {body} is static — Shift+LMB to toggle, RMB to delete")
+                return
+            # Plain LMB on dynamic body: existing drag behavior
             window.ra_rbd.set_active_body(body)
             window.ra_rbd.reset_dynamics_state()
             self._pin_display = idx
@@ -515,7 +699,15 @@ def _make_ramdrag_mode(window):
             target = _closest_point_on_ray(atom_pos, r0, rd).astype(np.float32)
             _set_anchors(window, site, target)
             _update_anchor_visuals(window, atom_pos, target)
-            _status(window, f"Pinned atom {idx} on molecule {body}; all molecules mobile")
+            _status(window, f"Pinned atom {idx} on molecule {body}; dragging")
+
+        def on_rmb_atom(self, atom_id, ctrl):
+            """RMB on atom → soft-delete the body (per spec §1.2)."""
+            idx = window.scene._id_to_idx_safe(atom_id)
+            if idx < 0:
+                return
+            body, _ = _display_index_to_body_site(window, idx)
+            _soft_delete_body(window, body)
 
         def on_move(self, p_world, r0=None, rd=None):
             if self._pin_display < 0:
@@ -801,6 +993,7 @@ def build_ui(window):
     g.add_pair("Source:", window.ra_source_combo)
     g.newrow()
     window.ra_mol_combo = QtWidgets.QComboBox()
+    window.ra_mol_combo.setEditable(True)
     window.ra_mol_combo.addItems(sorted(MOL_PATHS.keys()))
     g.add_pair("Mol:", window.ra_mol_combo)
     window.ra_nmol_spin = QtWidgets.QSpinBox(); window.ra_nmol_spin.setRange(1, 64); window.ra_nmol_spin.setValue(4); window.ra_nmol_spin.setMaximumWidth(50)
@@ -955,9 +1148,50 @@ def build_ui(window):
     pme_sec.setContent(pme_host)
     layout.addWidget(pme_sec)
 
+    # ─── Probe map controls ──────────────────────────────────────────────
+    map_sec = CollapsibleSection("Probe Map", collapsed=False)
+    map_host = QtWidgets.QWidget(); map_l = QtWidgets.QVBoxLayout(map_host)
+    map_l.setContentsMargins(2, 2, 2, 2); map_l.setSpacing(2)
+    g_map = AutoGridPlacer(cols=4)
+    # Probe element combo + H+/O− presets
+    window.ra_probe_combo = QtWidgets.QComboBox()
+    window.ra_probe_combo.addItems(['H', 'O'])
+    window.ra_probe_combo.setMaximumWidth(COMBO_MAX_WIDTH)
+    g_map.add_pair("Probe:", window.ra_probe_combo)
+    window.ra_probe_Hp_btn = QtWidgets.QPushButton('H+')
+    window.ra_probe_Hp_btn.setCheckable(True); window.ra_probe_Hp_btn.setMaximumWidth(40)
+    window.ra_probe_Hp_btn.clicked.connect(lambda: _on_probe_preset(window, 'Hp'))
+    g_map.add(window.ra_probe_Hp_btn)
+    window.ra_probe_Om_btn = QtWidgets.QPushButton('O−')
+    window.ra_probe_Om_btn.setCheckable(True); window.ra_probe_Om_btn.setMaximumWidth(40)
+    window.ra_probe_Om_btn.clicked.connect(lambda: _on_probe_preset(window, 'Om'))
+    g_map.add(window.ra_probe_Om_btn)
+    g_map.newrow()
+    window.ra_probe_R0_spin = QtWidgets.QDoubleSpinBox(); window.ra_probe_R0_spin.setRange(0.0, 5.0); window.ra_probe_R0_spin.setSingleStep(0.01); window.ra_probe_R0_spin.setDecimals(3); window.ra_probe_R0_spin.setValue(1.443); window.ra_probe_R0_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g_map.add_pair("R0:", window.ra_probe_R0_spin)
+    window.ra_probe_E0_spin = QtWidgets.QDoubleSpinBox(); window.ra_probe_E0_spin.setRange(0.0, 1.0); window.ra_probe_E0_spin.setSingleStep(1e-4); window.ra_probe_E0_spin.setDecimals(5); window.ra_probe_E0_spin.setValue(0.00191); window.ra_probe_E0_spin.setMaximumWidth(56)
+    g_map.add_pair("E0:", window.ra_probe_E0_spin)
+    g_map.newrow()
+    window.ra_probe_q_spin = QtWidgets.QDoubleSpinBox(); window.ra_probe_q_spin.setRange(-5.0, 5.0); window.ra_probe_q_spin.setSingleStep(0.05); window.ra_probe_q_spin.setDecimals(2); window.ra_probe_q_spin.setValue(0.40); window.ra_probe_q_spin.setMaximumWidth(42)
+    g_map.add_pair("Q:", window.ra_probe_q_spin)
+    window.ra_probe_z_spin = QtWidgets.QDoubleSpinBox(); window.ra_probe_z_spin.setRange(0.0, 10.0); window.ra_probe_z_spin.setSingleStep(0.1); window.ra_probe_z_spin.setDecimals(2); window.ra_probe_z_spin.setValue(3.0); window.ra_probe_z_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    g_map.add_pair("z:", window.ra_probe_z_spin)
+    g_map.newrow()
+    window.ra_show_map_chk = QtWidgets.QCheckBox("Show map")
+    window.ra_show_map_chk.setChecked(True)
+    g_map.add(window.ra_show_map_chk)
+    window.ra_recompute_map_btn = QtWidgets.QPushButton('Recompute')
+    window.ra_recompute_map_btn.clicked.connect(lambda: _recompute_ra_combined_map(window))
+    g_map.add(window.ra_recompute_map_btn)
+    map_l.addLayout(g_map.layout())
+    map_sec.setContent(map_host)
+    layout.addWidget(map_sec)
+
     # ─── Status ───────────────────────────────────────────────────────────
     window.ra_status_label = QtWidgets.QLabel('Ready')
     layout.addWidget(window.ra_status_label)
+    window.ra_state_counts_label = QtWidgets.QLabel('dyn=0 stat=0 del=0')
+    layout.addWidget(window.ra_state_counts_label)
     layout.addStretch()
 
     # ─── Edit modes ───────────────────────────────────────────────────────

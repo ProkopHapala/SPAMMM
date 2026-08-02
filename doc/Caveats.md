@@ -206,3 +206,43 @@ Quasi-2D contact-sep is meant to **approximate** Morse(+Coulomb), not invent sha
 | CLI | `run_spm.py es-diag` → `tests/SPM/testplot_fdbm_relax.py` |
 | Contact-surface fit / scan | `spammm/SPM/AFM.py` → `fit_contact_surface`, `run_scan_contact` |
 | Assembly AFM compare | `run_assembly_afm.py --compare-dir` |
+
+---
+
+## 9. Rigid Assembly — graph↔assembly synchronization
+
+**Context:** `RigidAssemblyExtension._ensure_backend_matched` rebuilds the display
+graph from the assembly's world atoms when the atom count differs from the editor
+graph. This is needed for "From file" builds (e.g. 4×PTCDA=104 atoms vs 0 in editor).
+
+**Trap (2026-08-03):** When loading a dimer from the editor and splitting via
+connected components (`graph_to_rigid_fragments`), the fragments have atoms in
+**BFS order** within each component, while the editor graph has atoms in **XYZ file
+order**. Both have the same count (e.g. 30), so the old count-only check passed and
+`update_positions_from_array` assigned assembly-ordered positions to graph-ordered
+atoms — **scrambling bonds and atom colors**.
+
+**Fix:** `_ensure_backend_matched` now also checks that the **enames sequences match**.
+If they differ (same count, different order), the graph is rebuilt from the assembly's
+atom order with correct bonds from `ra_bonds0`.
+
+**Rule:** Atom count equality is necessary but **not sufficient** for graph-assembly
+synchronization. The enames sequence (or a stable atom-ID mapping) must also match.
+
+See [Takeways.md](Takeways.md) → "Graph rebuild enames check".
+
+---
+
+## 10. Rigid Assembly — FAF for editor builds
+
+**Context:** The "From editor" source in the RA panel builds rigid bodies from
+`AtomicGraph.find_connected_components`. Previously, FAF was hardcoded off for
+editor builds (`faf_enabled = source != 'From editor'`).
+
+**Fix (2026-08-03):** FAF is now enabled for editor builds. The fit is computed on
+the first fragment's atoms with `mol_name='editor_frag0'` for cache filename.
+
+**Caveat:** `load_or_fit_faf(mol, mol_name=None)` crashes with
+`AttributeError: 'NoneType' object has no attribute 'lower'` because the cache
+path uses `mol_name.lower()`. Always pass a valid string `mol_name`.
+

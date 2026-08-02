@@ -382,3 +382,64 @@ def test_on_build_from_file_rebuilds_graph(ra_window):
     n_atoms = apos.shape[0]
     alive_atoms = [a for a in w.backend.graph.atoms.values() if a.alive]
     assert len(alive_atoms) == n_atoms, f'Graph has {len(alive_atoms)} atoms, assembly has {n_atoms}'
+
+
+def test_ra_gesture_state_toggle_and_delete(ra_window):
+    """Shift+LMB toggles static/dynamic; RMB soft-deletes; last live body protected."""
+    from spammm.GUI.RigidAssemblyExtension import (
+        _on_build, _toggle_body_state, _soft_delete_body, _body_state_counts)
+    w = ra_window
+    w.ra_mol_combo.setCurrentText('PTCDA')
+    w.ra_nmol_spin.setValue(3)
+    w.ra_no_faf_chk.setChecked(True)
+    _on_build(w)
+
+    # Initially all dynamic
+    n_dyn, n_stat, n_del = _body_state_counts(w)
+    assert n_dyn == 3 and n_stat == 0 and n_del == 0
+
+    # Toggle body 1 → static
+    _toggle_body_state(w, 1)
+    n_dyn, n_stat, n_del = _body_state_counts(w)
+    assert n_dyn == 2 and n_stat == 1 and n_del == 0
+    assert w.ra_ensemble._bodies[1].active == False
+
+    # Toggle body 1 back → dynamic
+    _toggle_body_state(w, 1)
+    n_dyn, n_stat, n_del = _body_state_counts(w)
+    assert n_dyn == 3 and n_stat == 0 and n_del == 0
+
+    # Delete body 1
+    _soft_delete_body(w, 1)
+    n_dyn, n_stat, n_del = _body_state_counts(w)
+    assert n_del == 1
+    assert w.ra_ensemble._bodies[1].alive == False
+
+    # Delete body 0 → body 2 still live → should succeed (2 live → 1 live)
+    _soft_delete_body(w, 0)
+    n_dyn, n_stat, n_del = _body_state_counts(w)
+    assert n_del == 2, f"body 0 should be deleted (n_del={n_del})"
+
+    # Now only body 2 is live → reject deletion of last live body
+    _soft_delete_body(w, 2)
+    n_dyn, n_stat, n_del = _body_state_counts(w)
+    assert n_del == 2, f"last live body was deleted (n_del={n_del})"
+
+
+def test_ra_mixed_species_build(ra_window):
+    """Comma-separated molecule names build a mixed-species assembly."""
+    from spammm.GUI.RigidAssemblyExtension import _on_build
+    w = ra_window
+    w.ra_mol_combo.setCurrentText('PTCDA,formic_acid')
+    w.ra_nmol_spin.setValue(1)
+    w.ra_no_faf_chk.setChecked(True)
+    _on_build(w)
+    assert w.ra_ensemble is not None
+    assert len(w.ra_ensemble) == 2  # 1 copy × 2 species
+    # Body 0 = PTCDA, Body 1 = formic_acid (round-robin order)
+    assert w.ra_ensemble._bodies[0].tid == 'PTCDA'
+    assert w.ra_ensemble._bodies[1].tid == 'formic_acid'
+    # Different atom counts per pack
+    n0 = int((w.ra_rbd._mb_packs[0]['types'] == 0).sum())
+    n1 = int((w.ra_rbd._mb_packs[1]['types'] == 0).sum())
+    assert n0 != n1, f"mixed species should have different atom counts: PTCDA={n0}, HCOOH={n1}"

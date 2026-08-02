@@ -3950,7 +3950,8 @@ void rigid_body_pairff_energy_replica_kernel(
     const int4                       folded_meta,
     const float4                     folded_lvec2d,
     __global const float4*  restrict anchors,
-    __global float4*        restrict E_out
+    __global float4*        restrict E_out,
+    __global const int*     restrict body_state
 ) {
     const int lid    = get_local_id(0);
     const int islot  = get_group_id(0);
@@ -3958,6 +3959,11 @@ void rigid_body_pairff_energy_replica_kernel(
     if (islot >= nactive || irepl >= n_replica) return;
 
     const int ia     = active_mols[islot];
+    // Skip deleted active bodies (state < 0): write zero energy.
+    if (body_state && body_state[ia] < 0) {
+        if (lid == 0) E_out[irepl * nactive + islot] = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
     const int ia0    = mols[ia];
     const int na     = mols[ia+1] - ia0;
     const int ipose0 = irepl * nmol;
@@ -4017,6 +4023,7 @@ void rigid_body_pairff_energy_replica_kernel(
         // PairFF partner tiles. Classification is once per partner, not per site pair.
         for (int j = 0; j < nmol; j++) {
             if (j == ia) continue;
+            if (body_state && body_state[j] < 0) continue;  // skip deleted partners
             if (lid == 0) {
                 Lj0 = mols[j];
                 Lnj = mols[j+1] - Lj0;
@@ -4198,12 +4205,15 @@ void rigid_body_pairff_multimol_kernel(
     __global const float*    folded_site_coeffs,
     __global const float4*   folded_z_params,
     const int4               folded_tensor_meta,
-    const float4             folded_lvec2d
+    const float4             folded_lvec2d,
+    __global const int*      body_state
 ) {
     const int gid   = get_group_id(0);
     const int lid   = get_local_id(0);
     const int lsize = get_local_size(0);
     const int a     = gid;  // each workgroup integrates its own molecule
+    // body_state: +1 dynamic, 0 static, -1 deleted. Default (no buffer) = dynamic.
+    const int state_a = body_state ? body_state[a] : 1;
     __local float4 pos;
     __local float4 qrot;
     __local float4 vpos;
@@ -4291,6 +4301,7 @@ void rigid_body_pairff_multimol_kernel(
 
         for (int j = 0; j < n_mols; j++) {
             if (j == a) continue;
+            if (body_state && body_state[j] < 0) continue;  // skip deleted partners
             const int j0 = mols[j];
             const int n_tile = mols[j+1] - j0;
             if (lid == 0) {
@@ -4399,23 +4410,28 @@ void rigid_body_pairff_multimol_kernel(
             float3 tq_world = Ltorq[0].xyz;
             body_force [a] = (float4)(f, 0.0f);
             body_torque[a] = (float4)(tq_world, 0.0f);
-            const float3 tq_body   = mat3_dot_T(R, tq_world);
-            const float3 L_body     = mat3_dot(Ibody, vrot.xyz);
-            const float3 gyro       = cross(vrot.xyz, L_body);
-            const float3 alpha_body = mat3_dot(Iinv_body, tq_body - gyro);
-            if (use_fire) {
-                vpos.xyz = rigid_update_FIRE(f,       vpos.xyz, &dt_lin, &damp_lin, dtmin, dtmax, damp0_lin);
-                vrot.xyz = rigid_update_FIRE(tq_body, vrot.xyz, &dt_ang, &damp_ang, dtmin, dtmax, damp0_ang);
-            } else {
-                vpos.xyz *= damp_lin;
-                vrot.xyz *= damp_ang;
+            if (state_a > 0) {  // dynamic body: integrate
+                const float3 tq_body   = mat3_dot_T(R, tq_world);
+                const float3 L_body     = mat3_dot(Ibody, vrot.xyz);
+                const float3 gyro       = cross(vrot.xyz, L_body);
+                const float3 alpha_body = mat3_dot(Iinv_body, tq_body - gyro);
+                if (use_fire) {
+                    vpos.xyz = rigid_update_FIRE(f,       vpos.xyz, &dt_lin, &damp_lin, dtmin, dtmax, damp0_lin);
+                    vrot.xyz = rigid_update_FIRE(tq_body, vrot.xyz, &dt_ang, &damp_ang, dtmin, dtmax, damp0_ang);
+                } else {
+                    vpos.xyz *= damp_lin;
+                    vrot.xyz *= damp_ang;
+                }
+                const float dtl = use_fire ? dt_lin : dt;
+                const float dta = use_fire ? dt_ang : dt;
+                vpos.xyz += f * (dtl * inv_mass);
+                vrot.xyz += alpha_body * dta;
+                pos.xyz  += vpos.xyz * dtl;
+                qrot = normalize(quat_mult(qrot, make_qrot_taylor(vrot.xyz * dta)));
+            } else {  // static or deleted: zero velocity, keep pose
+                vpos = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+                vrot = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
             }
-            const float dtl = use_fire ? dt_lin : dt;
-            const float dta = use_fire ? dt_ang : dt;
-            vpos.xyz += f * (dtl * inv_mass);
-            vrot.xyz += alpha_body * dta;
-            pos.xyz  += vpos.xyz * dtl;
-            qrot = normalize(quat_mult(qrot, make_qrot_taylor(vrot.xyz * dta)));
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
@@ -4432,7 +4448,8 @@ void rigid_body_pairff_multimol_kernel(
         apos_world[ia].xyz = p_world;
     }
     if (lid == 0) {
-        if (use_fire) fire_state[a] = (float4)(dt_lin, dt_ang, damp_lin, damp_ang);
+        if (use_fire && state_a > 0) fire_state[a] = (float4)(dt_lin, dt_ang, damp_lin, damp_ang);
+        else if (use_fire)           fire_state[a] = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
         poss_out [a] = pos;
         qrots_out[a] = qrot;
         vposs_out[a] = vpos;

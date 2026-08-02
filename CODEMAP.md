@@ -37,7 +37,8 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `LFFSolver.py` — linearized projective Jacobi (K₁₂/K₁₃/K₁₄ from UFF; soft FAF)
 - `SPFFbuilder.py` — SPFF topology/buffer builder
 - `UFFbuilder.py` — UFF topology/buffer builder
-- `RigidBodyDynamics.py` — rigid body dynamics integrator
+- `RigidBodyDynamics.py` — rigid body dynamics integrator; `RigidBodyPairFF` with per-body state (dynamic/static/deleted), mixed-species packs, factorized PLQH, `body_state` GPU buffer
+- `RigidBodyUtils.py` — shared helpers: `build_mixed_species_assembly` (round-robin body order), `compute_combined_probe_map` (PairFF static + FAF), `graph_to_rigid_fragments` (connected-components split)
 - `RigidBodyAFM.py` — rigid body AFM tip dynamics
 - `Assembly.py` — hexagonal SAM rigid-body packing search (orchestration + `AssemblyOCL`)
 - `AssemblyPlot.py` — assembly top views, clash/strain diagnostics, XYZ export
@@ -104,7 +105,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `gui_script_runner.py` — runs control scripts after `window.show()`
 - `gui_script_utils.py` — script helpers; demo overlays; `capture_window_png` / `frames_to_gif`
 - `azaindol_draw_sequence.py` — shared hex→azaindol→dimer draw sequence (SVG + GUI hosts)
-- `gui_scripts/` — `rc_scan_*`, `azaindol_draw_demo.py` / `azaindol_draw_offline.py`, `folded_rigid_setup.py`
+- `gui_scripts/` — `rc_scan_*`, `azaindol_draw_demo.py` / `azaindol_draw_offline.py`, `folded_rigid_setup.py`, `ptcda_drag_demo.py`, `static_obstacle_drag_demo.py` (dimer split + static/dynamic toggle + combined probe map)
 - `plotutils.py` — Qt 2D plot window wrapper; re-exports `spammm.plotUtils` ESP helpers
 - `CollapsibleSection.py` — UI collapsible section widget
 - `shaders/` — GLSL shaders
@@ -149,6 +150,8 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `test_relax_serial.py` — SPFF serial vs batch parity
 - `test_relax_flat1.py` — flat_1 PAH vacuum/substrate timing
 - `test_relax_ptcda_faf.py` — PTCDA+FAF: SPFF/UFF fused + LFF topology/sweep
+- `test_body_state.py` — PairFF body-state L0 tests (all-dynamic parity, frozen invariant, static interaction, deletion parity k14+k15, mixed-species FAF, map decomposition)
+- `GUI/test_rigid_assembly_extension.py` — RA extension GUI tests (build, display index, drag step, MC parity, gestures, mixed-species)
 - `test_vibrations.py` — normal modes (H2O fast; benzene/PTCDA slow); `debug/test_vibrations/`
 - `test_surface.py` — Ewald vs brute, GridFF, folded function
 - `test_folded_relax.py` — rigid body relaxation + manipulation

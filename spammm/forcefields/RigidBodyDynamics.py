@@ -14,7 +14,10 @@ Key functionality:
     for substrate; `tip_pull_scan` / `world_sites_all_bodies` for AFM-like pulls;
     ping-pong `run_multimol_md` for synchronous all-mobile dynamics;
     replica PairFF evaluation reports fused real-atom/CoM clash flags for MC/GA;
-    Vispy map uses `faf_fit` + `potential_to_rgba` display SSOT
+    Vispy map uses `faf_fit` + `potential_to_rgba` display SSOT;
+    **per-body state** (`set_body_state`/`set_body_states`): +1=dynamic,
+    0=static (skip integration, still PairFF partner), <0=deleted (skip entirely);
+    `body_state` GPU buffer gates kernels 14+15; `_body_state_host` is the host mirror
 
 Role in SPAMMM: Rigid engine for AFM manipulation (`RigidBodyAFM.py`) and
 interactive PairFF docking (`demos/demo_pairff.py`). Kernels in `rigid.cl`.
@@ -1866,7 +1869,8 @@ void rigid_body_pairff_energy_replica_kernel(
     const int4              folded_meta,
     const float4            folded_lvec2d,
     __global const float4*  anchors,
-    __global float4*        E_out
+    __global float4*        E_out,
+    __global const int*     body_state
 )"""
         self.n_env_mols = 0
         self.n_env_sites = 0
@@ -1877,6 +1881,7 @@ void rigid_body_pairff_energy_replica_kernel(
         self._mb_packs = None
         self._mb_pos = None
         self._mb_quat = None
+        self._body_state_host = None
         self.active_body = 0
         self.static_n = 0
         self.static_apos_host = None
@@ -2338,7 +2343,17 @@ void rigid_body_pairff_energy_replica_kernel(
             plqh_override = np.asarray(plqh_override, dtype=np.float32).reshape(-1, 4)
         if self.allmol_mode and self._mb_packs is not None:
             if plqh_override is not None:
-                out = np.vstack([one(p['types'], p['REQ_base'], plqh_override) for p in self._mb_packs])
+                # Mixed-species: plqh_override from one species' fit may not match every pack.
+                # Per spec §2.5: build PLQH per pack from that pack's runtime REQ_base when
+                # the override doesn't match, preserving fit charges only where it does.
+                parts = []
+                for p in self._mb_packs:
+                    n_real = int((np.asarray(p['types']) == 0).sum())
+                    if n_real == len(plqh_override):
+                        parts.append(one(p['types'], p['REQ_base'], plqh_override))
+                    else:
+                        parts.append(one(p['types'], p['REQ_base']))
+                out = np.vstack(parts)
             else:
                 out = np.vstack([one(p['types'], p['REQ_base']) for p in self._mb_packs])
         elif self._dyn_REQ_base is not None:
@@ -2461,6 +2476,48 @@ void rigid_body_pairff_energy_replica_kernel(
         if self.allmol_mode:
             self._refresh_static_view_hosts()
         return self
+
+    def set_body_states(self, states):
+        """Upload per-body state vector: +1 dynamic, 0 static, -1 deleted.
+
+        Validates length/values, uploads into the persistent body_state buffer,
+        and clears velocities/FIRE for non-dynamic bodies. Does NOT reallocate
+        molecule data or invalidate cached launchers (buffer object is unchanged).
+        """
+        if not self.allmol_mode:
+            raise RuntimeError("set_body_states requires from_molecules() / allmol_mode")
+        states = np.asarray(states, dtype=np.int32).ravel()
+        n = int(self.n_bodies)
+        if states.shape[0] != n:
+            raise ValueError(f"body_state length {states.shape[0]} != n_bodies {n}")
+        if states.min() < -1 or states.max() > 1:
+            raise ValueError(f"body_state values must be in [-1,0,+1], got min={states.min()} max={states.max()}")
+        self._body_state_host = states.copy()
+        self.toGPU('body_state', self._body_state_host)
+        # Clear velocities/FIRE for non-dynamic bodies so stale momentum cannot reappear
+        out = self.download_selected(('lin_mom', 'ang_mom', 'fire_state'))
+        vposs = out['lin_mom'].copy()
+        vrots = out['ang_mom'].copy()
+        fire = out['fire_state'].copy()
+        nondyn = states != 1
+        vposs[nondyn] = 0.0
+        vrots[nondyn] = 0.0
+        fire[nondyn] = 0.0
+        self.toGPU('vposs', vposs)
+        self.toGPU('vrots', vrots)
+        self.toGPU('fire_state', fire)
+        self.queue.finish()
+
+    def set_body_state(self, body, state):
+        """One-body convenience wrapper for set_body_states."""
+        if self._body_state_host is None:
+            raise RuntimeError("set_body_state requires from_molecules() first")
+        states = self._body_state_host.copy()
+        body = int(body)
+        if body < 0 or body >= len(states):
+            raise ValueError(f"body {body} out of range [0,{len(states)})")
+        states[body] = int(state)
+        self.set_body_states(states)
 
     def _multimol_launch_pair(self, niter, dt, lin_damp, ang_damp, fire, predict_partners, eventless, faf=False):
         """Return cached A→B/B→A launchers for one concurrent multi-molecule chunk.
@@ -2760,6 +2817,10 @@ void rigid_body_pairff_energy_replica_kernel(
         if 'folded_lvec2d' not in self.kernel_params:
             self.kernel_params['folded_lvec2d'] = np.array([1.0, 0.0, 0.0, 1.0], dtype=np.float32)
         self.kernel_params.setdefault('clash_r2', np.zeros(2, dtype=np.float32))
+        # body_state buffer: ensure it exists (from_molecules creates it; fallback for older paths)
+        if 'body_state' not in self.buffer_dict:
+            self.check_buf('body_state', max(nmol, 1) * np.int32().itemsize, mf.READ_ONLY)
+            self.toGPU('body_state', np.ones(max(nmol, 1), dtype=np.int32))
         return self
 
     def set_active_mols(self, active_mols):
@@ -3048,6 +3109,10 @@ void rigid_body_pairff_energy_replica_kernel(
         rbd.toGPU('body_torque', zero4)
         rbd.toGPU('I_body_inv', _ensure_cl_mat3(Iinv, n))
         rbd.toGPU('I_body', _ensure_cl_mat3(I, n))
+        # Per-body state: +1 dynamic, 0 static, -1 deleted. Default all-dynamic.
+        rbd._body_state_host = np.ones(n, dtype=np.int32)
+        rbd.check_buf('body_state', n * np.int32().itemsize, cl.mem_flags.READ_ONLY)
+        rbd.toGPU('body_state', rbd._body_state_host)
         rbd.mass_trans = float(mass_trans)
         rbd.mass_rot = float(mass_rot)
         rbd.kernel_params['n_mols'] = np.int32(n)
