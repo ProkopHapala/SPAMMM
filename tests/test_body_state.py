@@ -49,7 +49,7 @@ def _reset(rbd, pos, quat):
 
 
 def _state(rbd):
-    return rbd.download_selected(('pos', 'quats', 'lin_mom', 'ang_mom', 'body_force', 'body_torque'))
+    return rbd.download_selected(('pos', 'quats', 'lin_mom', 'ang_mom', 'body_force', 'body_torque', 'fire_state'))
 
 
 # ─── L0-1: All-dynamic regression ──────────────────────────────────────────
@@ -100,6 +100,9 @@ def test_frozen_body_does_not_move():
                                err_msg="frozen body has nonzero velocity")
     np.testing.assert_allclose(out['ang_mom'][1, :3], 0.0, atol=0.0,
                                err_msg="frozen body has nonzero angular velocity")
+    # Body 1 FIRE state exactly zero (no stale optimizer state)
+    np.testing.assert_allclose(out['fire_state'][1], 0.0, atol=0.0,
+                               err_msg="frozen body has nonzero FIRE state")
     # At least one dynamic body moved
     moved = any(np.linalg.norm(out['pos'][i, :3] - pos[i]) > 1e-7 for i in (0, 2))
     assert moved, "no dynamic body moved"
@@ -162,6 +165,11 @@ def test_deletion_matches_rebuilt_reference():
     # Body 2 in 3-body = body 1 in 2-body
     np.testing.assert_allclose(del_out['pos'][2, :3], ref['pos'][1, :3], rtol=2e-6, atol=2e-6,
                                err_msg="deletion parity: body 2 pos mismatch")
+    # Forces must also match (not just positions)
+    np.testing.assert_allclose(del_out['body_force'][0, :3], ref['body_force'][0, :3], rtol=2e-6, atol=2e-6,
+                               err_msg="deletion parity: body 0 force mismatch")
+    np.testing.assert_allclose(del_out['body_force'][2, :3], ref['body_force'][1, :3], rtol=2e-6, atol=2e-6,
+                               err_msg="deletion parity: body 2 force mismatch")
 
 
 # ─── L0-5: Kernel 14 (MC energy) deletion parity ───────────────────────────
@@ -338,18 +346,116 @@ def test_combined_map_decomposition_and_invalidation():
                                    err_msg="map decomposition: E_sum != E_pairff + E_faf")
     assert np.isfinite(E_sum).all(), "map has non-finite values"
 
-    # Invalidation: dynamic-only pose change (body 1 moves) must NOT change the map
-    # (body 1 is dynamic, excluded from map; only frozen body 0 contributes)
+    # Invalidation: dynamic-only pose change (body 1 moves) must NOT change the
+    # static PairFF contribution. With F12, the grid extent includes all live atoms,
+    # so moving the dynamic body changes the grid extent — but the E_pairff values
+    # at the same grid coordinates must be identical. Compare the overlapping region.
     pos_moved = pos.copy()
     pos_moved[1, 0] += 2.0  # move dynamic body 1
     rbd.toGPU('poss', np.concatenate([pos_moved, np.ones((2, 1), dtype=np.float32)], axis=1).astype(np.float32))
     rbd._mb_pos = pos_moved.copy()
-    E_sum2, _, _, _, _, _ = compute_combined_probe_map(
+    E_sum2, E_pairff2, _, xs2, ys2, _ = compute_combined_probe_map(
         rbd, fit, frozen_mask, probe_R0, probe_E0, probe_q, z_probe, beta=1.7)
-    np.testing.assert_allclose(E_sum2, E_sum, rtol=0.0, atol=0.0,
-                               err_msg="map changed when only dynamic body moved (should be invariant)")
+    # Find overlapping x/y region between the two grids
+    x_lo = max(float(xs[0]), float(xs2[0]))
+    x_hi = min(float(xs[-1]), float(xs2[-1]))
+    y_lo = max(float(ys[0]), float(ys2[0]))
+    y_hi = min(float(ys[-1]), float(ys2[-1]))
+    step = float(xs[1] - xs[0])
+    # Find overlapping indices
+    ix0 = int(round((x_lo - float(xs[0])) / step))
+    ix1 = int(round((x_hi - float(xs[0])) / step))
+    iy0 = int(round((y_lo - float(ys[0])) / step))
+    iy1 = int(round((y_hi - float(ys[0])) / step))
+    ix0b = int(round((x_lo - float(xs2[0])) / step))
+    ix1b = int(round((x_hi - float(xs2[0])) / step))
+    iy0b = int(round((y_lo - float(ys2[0])) / step))
+    iy1b = int(round((y_hi - float(ys2[0])) / step))
+    # Compare E_pairff (static-only contribution) in the overlapping region
+    E_pairff_overlap = E_pairff[iy0:iy1+1, ix0:ix1+1]
+    E_pairff2_overlap = E_pairff2[iy0b:iy1b+1, ix0b:ix1b+1]
+    assert E_pairff_overlap.shape == E_pairff2_overlap.shape, \
+        f"overlap shapes {E_pairff_overlap.shape} vs {E_pairff2_overlap.shape}"
+    np.testing.assert_allclose(E_pairff2_overlap, E_pairff_overlap, rtol=1e-10, atol=1e-10,
+                               err_msg="static PairFF contribution changed when only dynamic body moved")
 
     print(f"[map] E_sum range=[{E_sum.min():.3f},{E_sum.max():.3f}]  "
           f"E_pairff range=[{E_pairff.min():.3f},{E_pairff.max():.3f}]  "
           f"E_faf range=[{E_faf.min():.3f},{E_faf.max():.3f}]  "
           f"grid={len(xs)}x{len(ys)}")
+
+
+# ─── L0-9: Mixed-species nmol=2 interleaved ordering ──────────────────────
+@pytest.mark.gpu
+def test_mixed_species_nmol2_ordering():
+    """nmol=2 with 2 species must produce round-robin interleaved body order:
+    copy 0: species[0], species[1]; copy 1: species[0], species[1].
+    Verifies tids, bonds_list, and per-pack enames match the expected order."""
+    from spammm.forcefields.RigidBodyUtils import build_mixed_species_assembly
+
+    _MOL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'mol')
+    _XYZ_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'xyz')
+    mol_paths = {
+        'NTCDI':  os.path.join(_MOL_DIR, 'NTCDI.mol2'),
+        'uracil': os.path.join(_XYZ_DIR, 'uracil.xyz'),
+    }
+    no_qeq = {'NTCDI'}
+    mol_names = ['NTCDI', 'uracil']
+
+    molecules, tids, bonds_list, pos, quat, species_data = build_mixed_species_assembly(
+        mol_names, 2, mol_paths, no_qeq, 16.0, 3.0, seed=3, qeq=True)
+
+    # 2 species × 2 copies = 4 bodies, interleaved: NTCDI, uracil, NTCDI, uracil
+    assert len(molecules) == 4, f"expected 4 bodies, got {len(molecules)}"
+    assert tids == ['NTCDI', 'uracil', 'NTCDI', 'uracil'], f"tids={tids} (expected interleaved)"
+    assert len(bonds_list) == 4
+
+    # Verify per-pack enames: packs 0,2 = NTCDI; packs 1,3 = uracil
+    # Compare only real-atom enames (packs include dummy 'E'/'Sh' sites)
+    rbd = RigidBodyPairFF.from_molecules(molecules, pos, quats=quat, active_body=0)
+    ntcdi_enames = list(species_data[0][1])
+    uracil_enames = list(species_data[1][1])
+    def real_enames(pack):
+        types = pack['types']
+        return [e for i, e in enumerate(pack['enames']) if types[i] == 0]
+    pack0_enames = real_enames(rbd._mb_packs[0])
+    pack1_enames = real_enames(rbd._mb_packs[1])
+    pack2_enames = real_enames(rbd._mb_packs[2])
+    pack3_enames = real_enames(rbd._mb_packs[3])
+    assert pack0_enames == ntcdi_enames, "pack 0 real enames != NTCDI"
+    assert pack1_enames == uracil_enames, "pack 1 real enames != uracil"
+    assert pack2_enames == ntcdi_enames, "pack 2 real enames != NTCDI (copy 1)"
+    assert pack3_enames == uracil_enames, "pack 3 real enames != uracil (copy 1)"
+
+    print(f"[nmol2] tids={tids}  pack sizes={[len(p['enames']) for p in rbd._mb_packs]}")
+
+
+# ─── L0-10: Static body force is zero (kernel 15 early-exit) ──────────────
+@pytest.mark.gpu
+def test_static_body_force_is_zero():
+    """After kernel 15 early-exit, static body must have zero force/torque
+    (not just zero velocity). Deleted bodies must also have zero force."""
+    n = 3
+    pos = np.array([[0, 0, 0], [5, 0, 0], [10, 0, 0]], dtype=np.float32)
+    quat = np.tile(np.array([0, 0, 0, 1], dtype=np.float32), (n, 1))
+
+    rbd = _build_hcooh(n)
+    _reset(rbd, pos, quat)
+    rbd.set_body_state(1, 0)   # static
+    rbd.set_body_state(2, -1)  # deleted
+    rbd.run_multimol_md(1, dt=0.0)  # force eval only
+
+    out = _state(rbd)
+    # Static body 1: zero force/torque
+    np.testing.assert_allclose(out['body_force'][1, :3], 0.0, atol=0.0,
+                               err_msg="static body has nonzero force (early-exit failed)")
+    np.testing.assert_allclose(out['body_torque'][1, :3], 0.0, atol=0.0,
+                               err_msg="static body has nonzero torque (early-exit failed)")
+    # Deleted body 2: zero force/torque
+    np.testing.assert_allclose(out['body_force'][2, :3], 0.0, atol=0.0,
+                               err_msg="deleted body has nonzero force (early-exit failed)")
+    np.testing.assert_allclose(out['body_torque'][2, :3], 0.0, atol=0.0,
+                               err_msg="deleted body has nonzero torque (early-exit failed)")
+    # Dynamic body 0: must have nonzero force (partners exist in scene)
+    f0 = np.linalg.norm(out['body_force'][0, :3])
+    assert f0 > 1e-6, f"dynamic body 0 has zero force (f={f0}) — partners not contributing?"

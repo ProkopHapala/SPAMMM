@@ -181,8 +181,13 @@ def _load_compact_exp():
 
 def compute_potential_map_unified(static_apos, static_REQ, static_enames, static_types,
                                   probe_R0, probe_E0, probe_q, z_height=0.0, margin=4.0, step=0.1,
-                                  He=-1.0, Hs=0.0, w=0.7, beta=1.7, atom_types=None):
-    """2D map for unified compact-exp PairFF (no Coulomb), matching GPU mixing."""
+                                  He=-1.0, Hs=0.0, w=0.7, beta=1.7, atom_types=None,
+                                  xs=None, ys=None):
+    """2D map for unified compact-exp PairFF (no Coulomb), matching GPU mixing.
+
+    If xs/ys are provided, uses them as the grid axes (extent comes from caller).
+    Otherwise derives extent from static_apos + margin.
+    """
     compact_EF, _ = _load_compact_exp()
     apos = np.asarray(static_apos, dtype=np.float64)
     REQs = np.asarray(static_REQ, dtype=np.float64).copy()
@@ -197,10 +202,13 @@ def compute_potential_map_unified(static_apos, static_REQ, static_enames, static
         else:
             REQs[i, 3] = 0.0
 
-    xmin, ymin = apos[:, 0].min() - margin, apos[:, 1].min() - margin
-    xmax, ymax = apos[:, 0].max() + margin, apos[:, 1].max() + margin
-    xs = np.arange(xmin, xmax + step, step)
-    ys = np.arange(ymin, ymax + step, step)
+    if xs is None or ys is None:
+        xmin, ymin = apos[:, 0].min() - margin, apos[:, 1].min() - margin
+        xmax, ymax = apos[:, 0].max() + margin, apos[:, 1].max() + margin
+        xs = np.arange(xmin, xmax + step, step)
+        ys = np.arange(ymin, ymax + step, step)
+    else:
+        xmin, xmax, ymin, ymax = float(xs[0]), float(xs[-1]), float(ys[0]), float(ys[-1])
     X, Y = np.meshgrid(xs, ys)
     Emap = np.zeros_like(X, dtype=np.float64)
 

@@ -472,3 +472,104 @@ When you spend time on a non-obvious bug or pattern:
 
 Keep entries self-contained so they help someone who hits the same class of problem in
 a different module.
+
+---
+
+## processEvents re-entrancy in vispy mouse callbacks
+
+**Context:** `SPAMMM_GUI.refresh_view()` and `_status()` (in `RigidAssemblyExtension.py`)
+end with `QtWidgets.QApplication.processEvents()`. The RA drag handler calls
+`on_move` → `_sync_display` → `refresh_view()` during mouse move events.
+
+**Symptom (2026-08-03):** `RuntimeError: EventEmitter loop detected!` flooding stderr
+during interactive drag in `ra_drag` mode. GUI becomes unresponsive.
+
+**Root cause:** `processEvents()` processes pending Qt events synchronously. When called
+from within a vispy `mouse_move` callback, it re-enters `mouse_move` on the same vispy
+EventEmitter → `_emitting > 1` → RuntimeError. This was a **pre-existing latent bug** —
+the drag mode's `on_move` → `refresh_view` path simply exposed it.
+
+**Fix:**
+- `_in_mouse_callback` flag on the window, set `True` during
+  `on_mouse_press`/`on_mouse_move`/`on_mouse_release` (via try/finally)
+- `refresh_view()` and `_status()` skip `processEvents()` when flag is set
+- `canvas.update()` alone schedules the repaint; Qt processes it on the next natural
+  event loop iteration
+
+**Takeaway:** `processEvents()` must never be called from within a Qt/vispy event
+callback. It processes pending events synchronously, causing re-entrant emission. Use a
+re-entrancy guard flag instead.
+
+**Reference:** `doc/Reports/StaticObstacle_DragDemo_2026-08-03.md` §8.3
+
+---
+
+## Diagnostic visualization parameters ≠ simulation parameters
+
+**Context:** The combined PairFF+FAF probe map in `RigidAssemblyExtension` uses
+`He=-1.0, Hs=0.0, w=0.7` for the probe map visualization, while the assembly's PairFF
+dynamics use `He=-0.1, Hs=1.0`.
+
+**Symptom (2026-08-03):** After "fixing" the map's He/Hs to match the assembly's PairFF
+values (review finding F2), the H+ probe map lost its attractive blue minima at electron
+pairs — the visualization became flat and uninformative. USER objected.
+
+**Root cause:** The map is a **diagnostic tool** that shows where a test probe would be
+attracted/repelled. `He=-1.0` gives full negative charge to lone pairs (attractive to
+H+); `Hs=0.0` disables sigma-hole contribution for cleaner H-bond visualization. These
+are display-only amplification parameters, not the physical PairFF parameters used in
+dynamics.
+
+**Fix:** Reverted to `He=-1.0, Hs=0.0, w=0.7` for the map. The assembly's PairFF dynamics
+use the correct `He=-0.1, Hs=1.0` independently. Demo default probe switched from O− to
+H+ to better visualize e-pair attraction.
+
+**Takeaway:** Do not "fix" display-only constants to match physics parameters without
+checking the visual result. Diagnostic visualizations intentionally amplify contrast.
+
+**Reference:** `doc/Reports/StaticObstacle_DragDemo_2026-08-03.md` §8.2
+
+---
+
+## VisPy scene detection — use `hasattr(view)`, not `isinstance(Node)`
+
+**Context:** `_recompute_ra_combined_map` and other RA overlay functions need to detect
+whether `window.scene` is a real VisPy scene (create visuals) or a test mock (skip).
+
+**Symptom (2026-08-03):** After adding an `isinstance(window.scene, Node)` guard, the
+combined map overlay disappeared in the real GUI.
+
+**Root cause:** Test mocks don't subclass `vispy.scene.Node`, so the guard was added to
+skip visual creation for mocks. But the check was inverted — it also skipped real scenes
+because `AtomScene` doesn't directly subclass `Node` in the expected way.
+
+**Fix:** Check `hasattr(window.scene, 'view')` — real VisPy scenes have a `view`
+attribute (the `SceneCanvas.view`), test mocks don't.
+
+**Takeaway:** For VisPy scene detection in dual GUI/test code, use duck-typing
+(`hasattr`) rather than `isinstance` against vispy base classes. The class hierarchy is
+not always what you expect.
+
+**Reference:** `doc/Reports/StaticObstacle_DragDemo_2026-08-03.md` §8.1
+
+---
+
+## Per-pack PLQH by molecular identity, not atom count
+
+**Context:** Factorized FAF uses per-atom PLQH (Pauli/London/Charge/Q) arrays from cached
+fits. For mixed-species assemblies, each pack needs its own PLQH.
+
+**Symptom (2026-08-03):** Two chemically different molecules with equal real-atom counts
+received the same PLQH array — wrong FAF forces. The `editor_frag0` cache name also
+collided across different editor fragments.
+
+**Root cause:** `_folded_plqh_all_sites` decided whether to reuse the first fit's
+`atom_plqh` solely by atom count. Equal count ≠ same molecule.
+
+**Fix:** Build PLQH per-pack from runtime `REQ_base`. Verify molecular identity for
+cache loads (not just cache name).
+
+**Takeaway:** Atom count is not molecular identity. When reusing per-atom data across
+packs, verify the molecule matches — not just the size.
+
+**Reference:** `doc/Reports/StaticObstacle_DragDemo_2026-08-03.md` §7.2 (F8)

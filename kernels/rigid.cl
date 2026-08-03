@@ -4269,6 +4269,20 @@ void rigid_body_pairff_multimol_kernel(
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
+    // Early exit for static/deleted bodies: skip all force calculation, just write pose back
+    if (state_a <= 0) {
+        if (lid == 0) {
+            poss_out[a]  = pos;
+            qrots_out[a] = qrot;
+            vposs_out[a] = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+            vrots_out[a] = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+            body_force[a]  = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+            body_torque[a] = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+            if (use_fire) fire_state[a] = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        return;
+    }
+
     for (int step = 0; step < niter; ++step) {
         if      (lid == 0) R.a = (float4){ quat_to_a(qrot), 0.f };
         else if (lid == 1) R.b = (float4){ quat_to_b(qrot), 0.f };

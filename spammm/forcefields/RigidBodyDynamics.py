@@ -2071,10 +2071,11 @@ void rigid_body_pairff_energy_replica_kernel(
         self._dyn_enames = list(pack['enames'])
 
     def sync_active_pose_from_gpu(self):
-        """Copy all molecule poses from GPU into host multi-body state."""
+        """Copy all molecule poses from GPU into host multi-body state.
+        Only downloads pos + quats (not velocities/forces) for speed."""
         if self._mb_packs is None:
             return
-        out = self.download_outputs()
+        out = self.download_selected(('pos', 'quats'))
         self._mb_pos = out['pos'][:, :3].copy()
         self._mb_quat = out['quats'].copy()
 
@@ -2316,13 +2317,17 @@ void rigid_body_pairff_energy_replica_kernel(
             raise ValueError(f"folded types length {out.shape[0]} != total_atoms {self.total_atoms}")
         return out
 
-    def _folded_plqh_all_sites(self, alpha_morse, plqh_override=None):
+    def _folded_plqh_all_sites(self, alpha_morse, plqh_override=None, fit_enames=None):
         """Build runtime FAF PLQH for real sites; dummy PairFF sites get zero.
 
         plqh_override: (n_real, 4) array from the fit file — used as-is for real
         atoms instead of re-deriving from runtime REQs.  This preserves the
         charges (Q column) that were present during fitting even when the
         runtime REQs were loaded with qeq=False (Q=0).
+        fit_enames: enames list from the fit file — used to verify molecular identity
+        per pack. Only packs whose real-atom enames match fit_enames use the override;
+        others derive PLQH from runtime REQs (avoids collisions between different
+        species with equal real-atom counts).
         """
         def one(types, req_base, plqh_base=None):
             types = np.asarray(types, dtype=np.int32)
@@ -2346,12 +2351,21 @@ void rigid_body_pairff_energy_replica_kernel(
                 # Mixed-species: plqh_override from one species' fit may not match every pack.
                 # Per spec §2.5: build PLQH per pack from that pack's runtime REQ_base when
                 # the override doesn't match, preserving fit charges only where it does.
+                # Match by enames sequence (not just atom count) to avoid collisions between
+                # different species with equal real-atom counts.
+                plqh_override = np.asarray(plqh_override, dtype=np.float32).reshape(-1, 4)
+                fit_enames_list = list(fit_enames) if fit_enames is not None else None
                 parts = []
                 for p in self._mb_packs:
-                    n_real = int((np.asarray(p['types']) == 0).sum())
-                    if n_real == len(plqh_override):
+                    types = np.asarray(p['types'], dtype=np.int32)
+                    real = types == 0
+                    n_real = int(real.sum())
+                    pack_real_enames = [e for i, e in enumerate(p['enames']) if real[i]]
+                    # Use override only if count matches AND enames match (molecular identity check)
+                    if n_real == len(plqh_override) and (fit_enames_list is None or pack_real_enames == fit_enames_list):
                         parts.append(one(p['types'], p['REQ_base'], plqh_override))
                     else:
+                        # Different species — derive from runtime REQs
                         parts.append(one(p['types'], p['REQ_base']))
                 out = np.vstack(parts)
             else:
@@ -2458,7 +2472,8 @@ void rigid_body_pairff_energy_replica_kernel(
             # Use the fit's atom_plqh (has correct charges from fitting) when
             # available; fall back to re-deriving from runtime REQs.
             plqh_override = fit_result.get('atom_plqh')
-            atype = self._folded_plqh_all_sites(float(fit_result.get('alpha_morse', 1.8)), plqh_override=plqh_override)
+            fit_enames = fit_result.get('enames')
+            atype = self._folded_plqh_all_sites(float(fit_result.get('alpha_morse', 1.8)), plqh_override=plqh_override, fit_enames=fit_enames)
             coeffs = np.asarray(fit_result['coeffs4'], dtype=np.float32)
             ntypes, nbasis = -1, int(coeffs.reshape(-1, 4).shape[0])
         else:

@@ -88,7 +88,8 @@ def _status(window, msg):
     lbl = getattr(window, 'ra_status_label', None)
     if lbl is not None:
         lbl.setText(msg)
-        QtWidgets.QApplication.processEvents()
+        if not getattr(window, '_in_mouse_callback', False):
+            QtWidgets.QApplication.processEvents()
 
 
 def _body_state_counts(window):
@@ -101,25 +102,31 @@ def _body_state_counts(window):
 
 
 def _toggle_body_state(window, body):
-    """Toggle dynamic ↔ static for the given body. Syncs GPU pose → ensemble first."""
+    """Toggle dynamic ↔ static for the given body. Syncs GPU pose → ensemble first.
+    Rejects deleted bodies (state < 0) — they must be undeleted explicitly."""
     rbd = window.ra_rbd
     ens = window.ra_ensemble
     if rbd is None or ens is None:
         return
+    cur = int(rbd._body_state_host[body])
+    if cur < 0:
+        _status(window, f"Body {body} is deleted — cannot toggle")
+        return
     # Sync latest GPU pose into ensemble before freezing (per spec §1.2)
     _sync_ensemble_from_gpu(window)
-    cur = int(rbd._body_state_host[body])
     new_state = 0 if cur == 1 else 1  # toggle dynamic ↔ static
     rbd.set_body_state(body, new_state)
     # Update ensemble metadata (active = not static)
     ens._bodies[body].active = (new_state == 1)
     _update_state_overlays(window)
+    _recompute_ra_combined_map_if_visible(window)
     n_dyn, n_stat, n_del = _body_state_counts(window)
     _status(window, f"Body {body}: {'dynamic' if new_state == 1 else 'static'}  (dynamic={n_dyn} static={n_stat} deleted={n_del})")
 
 
 def _soft_delete_body(window, body):
-    """Soft-delete a body (state=-1). Reject if it's the last live body."""
+    """Soft-delete a body (state=-1). Reject if it's the last live body.
+    Hides the body from rendering and picking by zeroing its display atoms."""
     rbd = window.ra_rbd
     ens = window.ra_ensemble
     if rbd is None or ens is None:
@@ -133,13 +140,14 @@ def _soft_delete_body(window, body):
     rbd.set_body_states(s)
     ens._bodies[body].alive = False
     _update_state_overlays(window)
+    _sync_display(window)  # rebuilds display atoms, excluding deleted bodies
+    _recompute_ra_combined_map_if_visible(window)
     n_dyn, n_stat, n_del = _body_state_counts(window)
     _status(window, f"Body {body}: deleted  (dynamic={n_dyn} static={n_stat} deleted={n_del})")
 
 
 def _update_state_overlays(window):
-    """Refresh static outline overlay + status counts. Called after state changes."""
-    # TODO: static outline overlay (Phase C visual)
+    """Refresh status counts. Called after state changes."""
     n_dyn, n_stat, n_del = _body_state_counts(window)
     lbl = getattr(window, 'ra_state_counts_label', None)
     if lbl is not None:
@@ -147,8 +155,9 @@ def _update_state_overlays(window):
 
 
 def _assembly_world_atoms(window):
-    """Flat (n_atoms_total, 3) world positions of all bodies from the ensemble + packs.
+    """Flat (n_atoms_total, 3) world positions of all LIVE bodies from the ensemble + packs.
 
+    Deleted bodies (state < 0) are excluded from rendering and picking.
     Uses each pack's `rel` (body-frame sites, real atoms only) + ensemble poses.
     Returns (apos (n,3) f32, enames list[str]) or (None, None) if not built.
     """
@@ -157,13 +166,18 @@ def _assembly_world_atoms(window):
     if ens is None or rbd is None or rbd._mb_packs is None:
         return None, None
     pos, quat = ens.get_poses()
+    body_state = rbd._body_state_host
     worlds = []
     enames_all = []
     for j, pack in enumerate(rbd._mb_packs):
+        if j < len(body_state) and body_state[j] < 0:
+            continue  # skip deleted bodies
         m = pack['types'] == 0
         rel_real = pack['rel'][m, :3]
         worlds.append(_body_sites_world(rel_real, pos[j], quat[j]))
         enames_all.extend([e for i, e in enumerate(pack['enames']) if m[i]])
+    if not worlds:
+        return np.zeros((0, 3), dtype=np.float32), []
     return np.vstack(worlds).astype(np.float32), enames_all
 
 
@@ -298,10 +312,23 @@ def _on_probe_preset(window, which):
     window.ra_probe_combo.blockSignals(True)
     window.ra_probe_combo.setCurrentText(ename)
     window.ra_probe_combo.blockSignals(False)
+    window.ra_probe_R0_spin.blockSignals(True)
+    window.ra_probe_E0_spin.blockSignals(True)
+    window.ra_probe_q_spin.blockSignals(True)
     window.ra_probe_R0_spin.setValue(R0)
     window.ra_probe_E0_spin.setValue(E0)
     window.ra_probe_q_spin.setValue(q)
+    window.ra_probe_R0_spin.blockSignals(False)
+    window.ra_probe_E0_spin.blockSignals(False)
+    window.ra_probe_q_spin.blockSignals(False)
     _recompute_ra_combined_map(window)
+
+
+def _recompute_ra_combined_map_if_visible(window):
+    """Recompute the combined map only if the 'Show map' checkbox is checked."""
+    chk = getattr(window, 'ra_show_map_chk', None)
+    if chk is not None and chk.isChecked():
+        _recompute_ra_combined_map(window)
 
 
 def _recompute_ra_combined_map(window):
@@ -322,34 +349,71 @@ def _recompute_ra_combined_map(window):
     frozen_mask = _ra_frozen_mask(window)
     probe_R0, probe_E0, probe_q = _ra_probe_params(window)
     z_probe = Z_SURF_TOP + float(window.ra_probe_z_spin.value())
+    # Probe map visualization parameters: use strong He/Hs for clear H-bond visualization.
+    # These are visualization-only values (not the assembly's PairFF He/Hs) — the probe
+    # map shows where a test particle would form H-bonds, requiring strong electron-pair
+    # contrast. He=-1.0 gives full negative charge to lone pairs (attractive to H+);
+    # Hs=0.0 disables sigma-hole contribution for cleaner H-bond visualization.
+    He = -1.0
+    Hs = 0.0
+    w = 0.7
     beta = 1.7
     E_sum, E_pairff, E_faf, xs, ys, extent = compute_combined_probe_map(
-        rbd, fit, frozen_mask, probe_R0, probe_E0, probe_q, z_probe, beta=beta)
+        rbd, fit, frozen_mask, probe_R0, probe_E0, probe_q, z_probe,
+        beta=beta, He=He, Hs=Hs, w=w)
     # Cache for e-pair/sigma-hole overlay
     window.ra_combined_map = {'E_sum': E_sum, 'E_pairff': E_pairff, 'E_faf': E_faf,
                               'xs': xs, 'ys': ys, 'extent': extent, 'z_probe': z_probe}
     rgba = potential_to_rgba(E_sum)
-    visible = getattr(window, 'ra_show_map', True)
+    chk = getattr(window, 'ra_show_map_chk', None)
+    visible = chk.isChecked() if chk is not None else True
     # Hide the FAF substrate overlay when the combined map is shown (avoids double-overlay white box)
     if visible:
         sub_img = getattr(window.scene, 'ra_substrate_map', None)
         if sub_img is not None:
             sub_img.visible = False
-    parent = window.scene.view.scene if hasattr(window.scene, 'view') else window.scene
-    img = getattr(window.scene, 'ra_combined_map_img', None)
-    if img is None:
-        img = vscene.visuals.Image(parent=parent)
-        img.set_gl_state('translucent', depth_test=False)
-        img.order = -1  # same z-order as FAF substrate overlay
-        setattr(window.scene, 'ra_combined_map_img', img)
-    img.set_data(rgba)
-    xmin, xmax, ymin, ymax = extent
-    dx = (float(xmax) - float(xmin)) / max(len(xs) - 1, 1)
-    dy = (float(ymax) - float(ymin)) / max(len(ys) - 1, 1)
-    img.transform = STTransform(translate=(float(xmin), float(ymin), -0.1), scale=(dx, dy, 1))
-    img.visible = visible
-    window.ra_combined_map_img = img
+    # Only create/update Vispy visual if scene has a real Vispy view (not a test mock)
+    if hasattr(window.scene, 'view'):
+        parent = window.scene.view.scene
+        img = getattr(window.scene, 'ra_combined_map_img', None)
+        if img is None:
+            img = vscene.visuals.Image(parent=parent)
+            img.set_gl_state('translucent', depth_test=False)
+            img.order = -1  # same z-order as FAF substrate overlay
+            setattr(window.scene, 'ra_combined_map_img', img)
+        img.set_data(rgba)
+        xmin, xmax, ymin, ymax = extent
+        dx = (float(xmax) - float(xmin)) / max(len(xs) - 1, 1)
+        dy = (float(ymax) - float(ymin)) / max(len(ys) - 1, 1)
+        img.transform = STTransform(translate=(float(xmin), float(ymin), -0.1), scale=(dx, dy, 1))
+        img.visible = visible
+        window.ra_combined_map_img = img
     _status(window, f"Map recomputed: range=[{E_sum.min():.3f},{E_sum.max():.3f}]  grid={len(xs)}x{len(ys)}")
+
+
+def _on_show_map_toggled(window, checked):
+    """Show/hide the combined map overlay without recomputing (uses cached image)."""
+    img = getattr(window.scene, 'ra_combined_map_img', None) or getattr(window, 'ra_combined_map_img', None)
+    if img is not None:
+        img.visible = checked
+    if checked:
+        # Hide FAF substrate when combined map is visible
+        sub_img = getattr(window.scene, 'ra_substrate_map', None)
+        if sub_img is not None:
+            sub_img.visible = False
+        # Recompute only if no cached map exists
+        if getattr(window, 'ra_combined_map', None) is None:
+            _recompute_ra_combined_map(window)
+    else:
+        # Restore FAF substrate if it was visible before
+        sub_img = getattr(window.scene, 'ra_substrate_map', None)
+        if sub_img is not None:
+            sub_img.visible = True
+
+
+def _on_epairs_toggled(window, checked):
+    """Placeholder — e-pairs are rendered as atoms in the scene, no overlay needed."""
+    pass
 
 
 def _upload_poses_to_gpu(window):
@@ -380,15 +444,19 @@ def _sync_ensemble_from_gpu(window):
 
 
 def _display_index_to_body_site(window, display_idx):
-    """Map dense real-atom scene index to (body, flat PairFF site), skipping dummies."""
+    """Map dense real-atom scene index to (body, flat PairFF site), skipping dummies.
+    Deleted bodies (state < 0) are skipped — their atoms are not in the display."""
     rbd = window.ra_rbd
     if rbd is None or rbd._mb_packs is None:
         raise RuntimeError('Build assembly before mapping scene atoms')
     i = int(display_idx)
     if i < 0:
         raise IndexError(f'display atom index {i} is negative')
+    body_state = rbd._body_state_host
     real0 = 0
     for body, pack in enumerate(rbd._mb_packs):
+        if body < len(body_state) and body_state[body] < 0:
+            continue  # skip deleted bodies
         real_sites = np.flatnonzero(pack['types'] == 0)
         if i < real0 + len(real_sites):
             local_site = int(real_sites[i - real0])
@@ -478,8 +546,11 @@ def _on_build(window):
             if source == 'From editor':
                 # Editor build: fit on first fragment's atoms
                 f0 = fragments[0]
-                # Derive mol_name from enames for cache filename (e.g. "benzoic_acid" from CCOOH...)
-                editor_mol_name = 'editor_frag0'
+                # Derive mol_name from enames hash for cache filename — avoids collisions
+                # between different editor fragments with equal atom counts
+                import hashlib
+                enames_sig = ','.join(f0[1])
+                editor_mol_name = 'editor_' + hashlib.md5(enames_sig.encode()).hexdigest()[:8]
                 fit = load_or_fit_faf((f0[0], f0[1], f0[2]), mol_name=editor_mol_name)
                 mode = faf_fit_mode(fit)
                 if mode == FAF_MODE_TYPED:
@@ -519,6 +590,8 @@ def _on_build(window):
         # Show substrate overlay when FAF is enabled (shared VispyUtils)
         if window.ra_fit is not None:
             _update_ra_substrate_overlay(window)
+        # Compute combined probe map (if Show map is checked)
+        _recompute_ra_combined_map_if_visible(window)
     except Exception as e:
         import traceback; traceback.print_exc()
         _status(window, f'Build FAILED: {e}')
@@ -545,6 +618,13 @@ def _on_mc_step(window, update_ui=True):
             _status(window, 'Build assembly first')
         return None
     nmol = len(ens)
+    # Only propose moves for live dynamic bodies (state == +1)
+    body_state = rbd._body_state_host
+    dynamic_bodies = [j for j in range(nmol) if body_state[j] == 1]
+    if not dynamic_bodies:
+        if update_ui:
+            _status(window, 'No dynamic bodies — cannot run MC')
+        return None
     n_trial = int(window.ra_ntrial_spin.value())
     dxy = float(window.ra_dxy_spin.value())
     dphi = float(window.ra_dphi_spin.value())
@@ -554,7 +634,8 @@ def _on_mc_step(window, update_ui=True):
         window.ra_E_last = rbd.eval_energy_system(pos0, quat0, k_pack=k_pack)
         window.ra_kpack_last = k_pack
     seed = int(window.ra_seed_spin.value()) + 1000 + int(window.ra_mc_step_count)
-    moved = [int(window.ra_mc_step_count) % nmol]
+    # Round-robin among dynamic bodies only
+    moved = [dynamic_bodies[int(window.ra_mc_step_count) % len(dynamic_bodies)]]
     pos, quat = ens.get_poses()
     pos, quat, E0, Ebest, acc, Ebatch = greedy_energy_step(rbd,
         pos, quat, moved, n_trial=n_trial, dxy=dxy, dphi=dphi,
@@ -1156,6 +1237,7 @@ def build_ui(window):
     # Probe element combo + H+/O− presets
     window.ra_probe_combo = QtWidgets.QComboBox()
     window.ra_probe_combo.addItems(['H', 'O'])
+    window.ra_probe_combo.setCurrentText('O')
     window.ra_probe_combo.setMaximumWidth(COMBO_MAX_WIDTH)
     g_map.add_pair("Probe:", window.ra_probe_combo)
     window.ra_probe_Hp_btn = QtWidgets.QPushButton('H+')
@@ -1163,23 +1245,28 @@ def build_ui(window):
     window.ra_probe_Hp_btn.clicked.connect(lambda: _on_probe_preset(window, 'Hp'))
     g_map.add(window.ra_probe_Hp_btn)
     window.ra_probe_Om_btn = QtWidgets.QPushButton('O−')
-    window.ra_probe_Om_btn.setCheckable(True); window.ra_probe_Om_btn.setMaximumWidth(40)
+    window.ra_probe_Om_btn.setCheckable(True); window.ra_probe_Om_btn.setChecked(True); window.ra_probe_Om_btn.setMaximumWidth(40)
     window.ra_probe_Om_btn.clicked.connect(lambda: _on_probe_preset(window, 'Om'))
     g_map.add(window.ra_probe_Om_btn)
     g_map.newrow()
-    window.ra_probe_R0_spin = QtWidgets.QDoubleSpinBox(); window.ra_probe_R0_spin.setRange(0.0, 5.0); window.ra_probe_R0_spin.setSingleStep(0.01); window.ra_probe_R0_spin.setDecimals(3); window.ra_probe_R0_spin.setValue(1.443); window.ra_probe_R0_spin.setMaximumWidth(SPIN_MAX_WIDTH)
+    window.ra_probe_R0_spin = QtWidgets.QDoubleSpinBox(); window.ra_probe_R0_spin.setRange(0.0, 5.0); window.ra_probe_R0_spin.setSingleStep(0.01); window.ra_probe_R0_spin.setDecimals(3); window.ra_probe_R0_spin.setValue(1.75); window.ra_probe_R0_spin.setMaximumWidth(SPIN_MAX_WIDTH)
     g_map.add_pair("R0:", window.ra_probe_R0_spin)
-    window.ra_probe_E0_spin = QtWidgets.QDoubleSpinBox(); window.ra_probe_E0_spin.setRange(0.0, 1.0); window.ra_probe_E0_spin.setSingleStep(1e-4); window.ra_probe_E0_spin.setDecimals(5); window.ra_probe_E0_spin.setValue(0.00191); window.ra_probe_E0_spin.setMaximumWidth(56)
+    window.ra_probe_E0_spin = QtWidgets.QDoubleSpinBox(); window.ra_probe_E0_spin.setRange(0.0, 1.0); window.ra_probe_E0_spin.setSingleStep(1e-4); window.ra_probe_E0_spin.setDecimals(5); window.ra_probe_E0_spin.setValue(0.00260); window.ra_probe_E0_spin.setMaximumWidth(56)
     g_map.add_pair("E0:", window.ra_probe_E0_spin)
     g_map.newrow()
-    window.ra_probe_q_spin = QtWidgets.QDoubleSpinBox(); window.ra_probe_q_spin.setRange(-5.0, 5.0); window.ra_probe_q_spin.setSingleStep(0.05); window.ra_probe_q_spin.setDecimals(2); window.ra_probe_q_spin.setValue(0.40); window.ra_probe_q_spin.setMaximumWidth(42)
+    window.ra_probe_q_spin = QtWidgets.QDoubleSpinBox(); window.ra_probe_q_spin.setRange(-5.0, 5.0); window.ra_probe_q_spin.setSingleStep(0.05); window.ra_probe_q_spin.setDecimals(2); window.ra_probe_q_spin.setValue(-0.40); window.ra_probe_q_spin.setMaximumWidth(42)
     g_map.add_pair("Q:", window.ra_probe_q_spin)
     window.ra_probe_z_spin = QtWidgets.QDoubleSpinBox(); window.ra_probe_z_spin.setRange(0.0, 10.0); window.ra_probe_z_spin.setSingleStep(0.1); window.ra_probe_z_spin.setDecimals(2); window.ra_probe_z_spin.setValue(3.0); window.ra_probe_z_spin.setMaximumWidth(SPIN_MAX_WIDTH)
     g_map.add_pair("z:", window.ra_probe_z_spin)
     g_map.newrow()
     window.ra_show_map_chk = QtWidgets.QCheckBox("Show map")
     window.ra_show_map_chk.setChecked(True)
+    window.ra_show_map_chk.toggled.connect(lambda checked: _on_show_map_toggled(window, checked))
     g_map.add(window.ra_show_map_chk)
+    window.ra_epairs_chk = QtWidgets.QCheckBox("e-pairs")
+    window.ra_epairs_chk.setChecked(True)
+    window.ra_epairs_chk.toggled.connect(lambda checked: _on_epairs_toggled(window, checked))
+    g_map.add(window.ra_epairs_chk)
     window.ra_recompute_map_btn = QtWidgets.QPushButton('Recompute')
     window.ra_recompute_map_btn.clicked.connect(lambda: _recompute_ra_combined_map(window))
     g_map.add(window.ra_recompute_map_btn)

@@ -40,7 +40,8 @@ def run(window, argv=None, ctx=None):
     from spammm.GUI.RigidAssemblyExtension import (
         _set_anchors, _sync_ensemble_from_gpu, _sync_display,
         _update_ra_substrate_overlay, _update_anchor_visuals,
-        _toggle_body_state, _recompute_ra_combined_map, _body_state_counts)
+        _toggle_body_state, _recompute_ra_combined_map, _body_state_counts,
+        _on_probe_preset)
 
     REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     dimer_path = args.dimer or os.path.join(REPO_ROOT, 'data', 'xyz', 'benzoicacid_dimer.xyz')
@@ -93,7 +94,8 @@ def run(window, argv=None, ctx=None):
     n_dyn, n_stat, n_del = _body_state_counts(window)
     print(f'[static_obstacle_drag_demo] States: dynamic={n_dyn} static={n_stat} deleted={n_del}', flush=True)
 
-    # Compute combined probe map (PairFF from static body 0)
+    # Compute combined probe map — H+ probe shows attractive blue minima at electron pairs
+    _on_probe_preset(window, 'Hp')
     _recompute_ra_combined_map(window)
     GSU.process_events(window)
     yield ctx.frame(f'Body 0 frozen (static), body 1 dynamic — probe map computed')
@@ -148,7 +150,9 @@ def run(window, argv=None, ctx=None):
     atoms_relax = np.empty((rbd.total_atoms, 4), dtype=np.float32)
     rbd.fromGPU('apos_world', atoms_relax); rbd.queue.finish()
     anchor_base = atoms_relax[anchor_flat, :3].copy()
-    E_relax = float(atoms_relax[:, 3].sum())
+    # Use eval_energy_system for a proper total energy (kernel .w channel double-counts pairs)
+    pos_r, quat_r = window.ra_ensemble.get_poses()
+    E_relax = float(rbd.eval_energy_system(pos_r, quat_r, k_pack=0.0))
     print(f'[static_obstacle_drag_demo] Relaxed: E={E_relax:.4f}, anchor={anchor_base}', flush=True)
 
     # Set anchor at relaxed position
@@ -233,7 +237,9 @@ def run(window, argv=None, ctx=None):
         GSU.process_events(window)
         atoms = np.empty((rbd.total_atoms, 4), dtype=np.float32)
         rbd.fromGPU('apos_world', atoms); rbd.queue.finish()
-        E = float(atoms[:, 3].sum())
+        # Use eval_energy_system for proper total energy (.w channel double-counts pairs)
+        pos_e, quat_e = window.ra_ensemble.get_poses()
+        E = float(rbd.eval_energy_system(pos_e, quat_e, k_pack=0.0))
         anchor_act = atoms[anchor_flat, :3].copy()
         capture_frame(step, E, anchor_act, target)
         if step % 10 == 0 or step == n_steps:

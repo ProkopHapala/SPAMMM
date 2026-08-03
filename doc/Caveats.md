@@ -246,3 +246,87 @@ the first fragment's atoms with `mol_name='editor_frag0'` for cache filename.
 `AttributeError: 'NoneType' object has no attribute 'lower'` because the cache
 path uses `mol_name.lower()`. Always pass a valid string `mol_name`.
 
+---
+
+## 11. Rigid Assembly — processEvents re-entrancy in vispy mouse callbacks
+
+**Context:** `SPAMMM_GUI.refresh_view()` and `RigidAssemblyExtension._status()` end with
+`QtWidgets.QApplication.processEvents()`. The RA drag handler calls `on_move` →
+`_sync_display` → `refresh_view()` during mouse move events.
+
+**Trap (2026-08-03):** `processEvents()` processes pending Qt events synchronously. When
+called from within a vispy `mouse_move` callback, it re-enters `mouse_move` on the same
+vispy EventEmitter → `_emitting > 1` → `RuntimeError: EventEmitter loop detected!`.
+
+This is a **pre-existing latent bug** — `processEvents()` was in `refresh_view()` before
+the RA drag feature. The drag mode's `on_move` → `refresh_view` path simply exposed it.
+
+**Fix:** `_in_mouse_callback` flag on the window, set `True` during
+`on_mouse_press`/`on_mouse_move`/`on_mouse_release` (via try/finally).
+`refresh_view()` and `_status()` skip `processEvents()` when flag is set.
+
+**Rule:** `processEvents()` must never be called from within a Qt/vispy event callback.
+Use a re-entrancy guard flag instead. `canvas.update()` alone schedules the repaint.
+
+See [Takeways.md](Takeways.md) → "processEvents re-entrancy in vispy mouse callbacks".
+
+---
+
+## 12. Rigid Assembly — diagnostic map parameters ≠ simulation parameters
+
+**Context:** The combined PairFF+FAF probe map in `RigidAssemblyExtension` uses
+`He=-1.0, Hs=0.0, w=0.7` for visualization, while the assembly's PairFF dynamics use
+`He=-0.1, Hs=1.0`.
+
+**Trap (2026-08-03):** "Fixing" the map's He/Hs to match the assembly's PairFF values
+(review finding F2) made the H+ probe map lose its attractive blue minima at electron
+pairs — the diagnostic visualization became flat and useless.
+
+**Rule:** The combined probe map is a **diagnostic tool**, not a physical energy
+calculation. `He=-1.0` gives full negative charge to lone pairs (attractive to H+);
+`Hs=0.0` disables sigma-hole contribution for cleaner H-bond visualization. These are
+display-only amplification parameters. The assembly's PairFF dynamics use the correct
+`He=-0.1, Hs=1.0` independently.
+
+Do not "fix" display-only constants to match physics parameters without checking the
+visual result.
+
+See [Takeways.md](Takeways.md) → "Diagnostic visualization parameters ≠ simulation
+parameters".
+
+---
+
+## 13. Rigid Assembly — VisPy scene detection in dual GUI/test code
+
+**Context:** RA overlay functions (`_recompute_ra_combined_map`, `_update_anchor_visuals`,
+etc.) need to detect whether `window.scene` is a real VisPy scene (create visuals) or a
+test mock (skip).
+
+**Trap (2026-08-03):** `isinstance(window.scene, vispy.scene.Node)` fails for real scenes
+because `AtomScene` doesn't subclass `Node` in the expected way. Using it as a guard
+caused the combined map overlay to disappear in the real GUI.
+
+**Rule:** Use `hasattr(window.scene, 'view')` — real VisPy scenes have a `view`
+attribute (the `SceneCanvas.view`), test mocks don't. Duck-typing over `isinstance`
+for vispy class hierarchy checks.
+
+See [Takeways.md](Takeways.md) → "VisPy scene detection — use `hasattr(view)`, not
+`isinstance(Node)`".
+
+---
+
+## 14. Rigid Assembly — per-pack PLQH by molecular identity, not atom count
+
+**Context:** Factorized FAF uses per-atom PLQH (Pauli/London/Charge/Q) arrays from cached
+fits. For mixed-species assemblies, each pack needs its own PLQH.
+
+**Trap (2026-08-03):** `_folded_plqh_all_sites` decided whether to reuse the first fit's
+`atom_plqh` solely by atom count. Two chemically different molecules with equal
+real-atom counts received the same PLQH array — wrong FAF forces. The `editor_frag0`
+cache name also collided across different editor fragments.
+
+**Rule:** Atom count is not molecular identity. Build PLQH per-pack from runtime
+`REQ_base`. Verify molecular identity for cache loads (not just cache name).
+
+See [Takeways.md](Takeways.md) → "Per-pack PLQH by molecular identity, not atom count".
+

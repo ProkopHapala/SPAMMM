@@ -115,7 +115,23 @@ def graph_to_rigid_fragments(graph, qeq=True, planarize=True):
             apos_rel[:, 2] = 0.0
         q_frag = np.array([q_all[atom_to_idx[a._id]] for a in comp], dtype=np.float32)
         REQs = make_REQs_from_enames(enames, q_frag, atom_types)
-        bonds = _bonds_from_geom(apos_rel, enames)
+        # Extract bonds from the authoritative AtomicGraph (not re-inferred from geometry)
+        comp_ids = {a._id for a in comp}
+        comp_id_list = [a._id for a in comp]
+        id_to_local = {aid: li for li, aid in enumerate(comp_id_list)}
+        frag_bonds = []
+        if hasattr(graph, 'bonds'):
+            for b in graph.bonds.values():
+                if not getattr(b, 'alive', True):
+                    continue
+                a_id, b_id = b.a._id, b.b._id
+                if a_id in comp_ids and b_id in comp_ids:
+                    frag_bonds.append([id_to_local[a_id], id_to_local[b_id]])
+        if frag_bonds:
+            bonds = np.array(frag_bonds, dtype=np.int32)
+        else:
+            # Fallback: infer from geometry if graph has no bonds
+            bonds = _bonds_from_geom(apos_rel, enames)
         fragments.append((apos_rel, enames, REQs, bonds))
 
     return fragments, coms
@@ -222,38 +238,50 @@ def compute_combined_probe_map(rbd, fit, frozen_mask, probe_R0, probe_E0, probe_
     from spammm.GUI.RigidBodyVispy import compute_potential_map_unified
     from spammm.surfaces.FoldedRigid import eval_folded_potential_grid, faf_type_idx_for_probe, faf_fit_mode, FAF_MODE_FACTOR
 
-    # Gather world sites from frozen (static) bodies only
+    # Gather world sites from frozen (static) bodies only (for PairFF energy)
+    # but compute grid extent from ALL live real atoms (so dynamic bodies stay in view)
     frozen_mask = np.asarray(frozen_mask, dtype=bool)
+    body_state = getattr(rbd, '_body_state_host', None)
     sites_pos, sites_REQ, sites_enames, sites_types = [], [], [], []
+    all_live_xy = []  # xy of all live real atoms for extent
     for j, pack in enumerate(rbd._mb_packs):
-        if j >= len(frozen_mask) or not frozen_mask[j]:
-            continue
+        is_deleted = body_state is not None and j < len(body_state) and body_state[j] < 0
         pos_j = rbd._mb_pos[j]
         quat_j = rbd._mb_quat[j]
         world = _body_sites_world(pack['rel'], pos_j, quat_j)
+        if not is_deleted:
+            m_real = pack['types'] == 0
+            all_live_xy.append(world[m_real, :2])
+        if j >= len(frozen_mask) or not frozen_mask[j] or is_deleted:
+            continue
         sites_pos.append(world)
         sites_REQ.append(pack['REQ_ext'])
         sites_enames.extend(pack['enames'])
         sites_types.append(pack['types'])
 
+    # Grid extent from all live real atoms (not just static)
+    margin_f, step_f = float(margin), float(step)
+    if all_live_xy:
+        all_xy = np.vstack(all_live_xy).astype(np.float64)
+        xmin, ymin = float(all_xy[:, 0].min() - margin_f), float(all_xy[:, 1].min() - margin_f)
+        xmax, ymax = float(all_xy[:, 0].max() + margin_f), float(all_xy[:, 1].max() + margin_f)
+    else:
+        xmin, ymin = -margin_f, -margin_f
+        xmax, ymax = margin_f, margin_f
+    xs = np.arange(xmin, xmax + step_f, step_f)
+    ys = np.arange(ymin, ymax + step_f, step_f)
+    extent = [xmin, xmax, ymin, ymax]
+
     if sites_pos:
         static_apos = np.vstack(sites_pos).astype(np.float64)
         static_REQ = np.vstack(sites_REQ).astype(np.float64)
         static_types = np.concatenate(sites_types).astype(np.int32)
-        E_pairff, xs, ys, extent = compute_potential_map_unified(
+        E_pairff, _, _, _ = compute_potential_map_unified(
             static_apos, static_REQ, sites_enames, static_types,
             probe_R0, probe_E0, probe_q, z_height=z_probe, margin=margin, step=step,
-            He=He, Hs=Hs, w=w, beta=beta)
+            He=He, Hs=Hs, w=w, beta=beta, xs=xs, ys=ys)
     else:
-        # No static molecules: empty PairFF layer; extent from all bodies or FAF default
-        all_pos = rbd._mb_pos
-        margin_f, step_f = float(margin), float(step)
-        xmin, ymin = float(all_pos[:, 0].min() - margin_f), float(all_pos[:, 1].min() - margin_f)
-        xmax, ymax = float(all_pos[:, 0].max() + margin_f), float(all_pos[:, 1].max() + margin_f)
-        xs = np.arange(xmin, xmax + step_f, step_f)
-        ys = np.arange(ymin, ymax + step_f, step_f)
         E_pairff = np.zeros((len(ys), len(xs)), dtype=np.float64)
-        extent = [xmin, xmax, ymin, ymax]
 
     # FAF contribution
     E_faf = None

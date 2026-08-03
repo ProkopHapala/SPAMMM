@@ -1414,28 +1414,36 @@ class SPAMMMWindow(BaseGUI):
 
     def on_mouse_move(self, event):
         """Update cursor cross + dispatch to mode handler for hover highlighting."""
-        p_world, r0, rd = self._mouse_world_and_ray(event)
-        if p_world is None: return
-        self.cursor_markers.set_data(pos=np.array([p_world]), symbol='cross', edge_width=2, edge_color='red', face_color='transparent', size=10)
-        self.scene.update_view_debug(event.pos, hit=p_world)
-        self.backend.detect_geometry_rings()
-        self._clear_hover()
-        h = self.mode_handlers.get(self.edit_mode)
-        if h and h.on_move:
-            h.on_move(p_world, r0, rd)
-            if getattr(h, 'capture_move', False):
-                event.handled = True
+        self._in_mouse_callback = True
+        try:
+            p_world, r0, rd = self._mouse_world_and_ray(event)
+            if p_world is None: return
+            self.cursor_markers.set_data(pos=np.array([p_world]), symbol='cross', edge_width=2, edge_color='red', face_color='transparent', size=10)
+            self.scene.update_view_debug(event.pos, hit=p_world)
+            self.backend.detect_geometry_rings()
+            self._clear_hover()
+            h = self.mode_handlers.get(self.edit_mode)
+            if h and h.on_move:
+                h.on_move(p_world, r0, rd)
+                if getattr(h, 'capture_move', False):
+                    event.handled = True
+        finally:
+            self._in_mouse_callback = False
 
     def on_mouse_release(self, event):
         """Dispatch mouse release to mode handler."""
-        if getattr(event, 'handled', False):
-            return
-        h = self.mode_handlers.get(self.edit_mode)
-        if h is None or h.on_release is None: return
-        ctrl = 'Control' in event.modifiers if isinstance(event.modifiers, (tuple, list)) else False
-        p_world, r0, rd = self._mouse_world_and_ray(event)
-        if p_world is None: return
-        h.on_release(event, p_world, ctrl)
+        self._in_mouse_callback = True
+        try:
+            if getattr(event, 'handled', False):
+                return
+            h = self.mode_handlers.get(self.edit_mode)
+            if h is None or h.on_release is None: return
+            ctrl = 'Control' in event.modifiers if isinstance(event.modifiers, (tuple, list)) else False
+            p_world, r0, rd = self._mouse_world_and_ray(event)
+            if p_world is None: return
+            h.on_release(event, p_world, ctrl)
+        finally:
+            self._in_mouse_callback = False
 
     def on_atom_remove(self, atom_id):
         """Signal callback: RMB on atom dispatched to mode handler."""
@@ -1480,16 +1488,20 @@ class SPAMMMWindow(BaseGUI):
 
     def on_mouse_press(self, event):
         """Dispatch mouse press to mode handler."""
-        if getattr(event, 'handled', False):
-            debug_print(2, f"[GUI_PRESS] SKIPPED (event.handled=True) mode={self.edit_mode}")
-            return
-        h = self.mode_handlers.get(self.edit_mode)
-        if h is None or h.on_press is None: return
-        ctrl = 'Control' in event.modifiers if isinstance(event.modifiers, (tuple, list)) else False
-        p_world, r0, rd = self._mouse_world_and_ray(event)
-        if p_world is None: return
-        debug_print(2, f"[GUI_PRESS] mode={self.edit_mode} b2D={self.b2Dview} pos=({p_world[0]:.2f},{p_world[1]:.2f},{p_world[2]:.2f}) ctrl={ctrl}")
-        h.on_press(event, p_world, ctrl)
+        self._in_mouse_callback = True
+        try:
+            if getattr(event, 'handled', False):
+                debug_print(2, f"[GUI_PRESS] SKIPPED (event.handled=True) mode={self.edit_mode}")
+                return
+            h = self.mode_handlers.get(self.edit_mode)
+            if h is None or h.on_press is None: return
+            ctrl = 'Control' in event.modifiers if isinstance(event.modifiers, (tuple, list)) else False
+            p_world, r0, rd = self._mouse_world_and_ray(event)
+            if p_world is None: return
+            debug_print(2, f"[GUI_PRESS] mode={self.edit_mode} b2D={self.b2Dview} pos=({p_world[0]:.2f},{p_world[1]:.2f},{p_world[2]:.2f}) ctrl={ctrl}")
+            h.on_press(event, p_world, ctrl)
+        finally:
+            self._in_mouse_callback = False
 
     def _toggle_mouse_hints(self):
         visible = self.mouse_hints_chk.isChecked()
@@ -1584,6 +1596,9 @@ class SPAMMMWindow(BaseGUI):
         self.refresh_view()
 
     def refresh_view(self):
+        # Re-entrancy guard: skip processEvents() if called from within a mouse callback
+        # (prevents vispy EventEmitter loop detected! RuntimeError)
+        _in_mouse_cb = getattr(self, '_in_mouse_callback', False)
         # 0. Update Guide Grid
         guides = self.backend.get_guide_points()
         self.grid_markers.set_data(
@@ -1667,7 +1682,8 @@ class SPAMMMWindow(BaseGUI):
             self.scene.set_frag_highlights()
             self.scene.text_labels.visible = False
             self.scene.canvas.update()
-            QtWidgets.QApplication.processEvents()
+            if not _in_mouse_cb:
+                QtWidgets.QApplication.processEvents()
             return
 
         # Colors based on elements
@@ -1766,7 +1782,8 @@ class SPAMMMWindow(BaseGUI):
 
         # Force immediate canvas update to avoid async rendering lag
         self.scene.canvas.update()
-        QtWidgets.QApplication.processEvents()
+        if not _in_mouse_cb:
+            QtWidgets.QApplication.processEvents()
 
 # FireCore / legacy alias
 KekuleExplorerWindow = SPAMMMWindow
