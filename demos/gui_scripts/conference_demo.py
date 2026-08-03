@@ -26,7 +26,6 @@ def run(window, argv=None, ctx=None):
     p.add_argument('--ntrial', type=int, default=512, help='best-of-batch trials per MC step')
     p.add_argument('--mol', type=str, default='PTCDA', help='molecule name in MOL_PATHS')
     p.add_argument('--nmol', type=int, default=4, help='number of molecules')
-    p.add_argument('--pme', action='store_true', help='also run the optional PME charge-rings panel')
     args = p.parse_args(argv or [])
     print(f"[conference_demo] start: mol={args.mol} nmol={args.nmol} n_step={args.n_step} ntrial={args.ntrial}", flush=True)
 
@@ -58,7 +57,7 @@ def run(window, argv=None, ctx=None):
     if hasattr(window.scene, 'fit_to_atoms'):
         window.scene.fit_to_atoms(margin=3.0)
         GSU.process_events(window)
-    yield ctx.frame(f'Built {args.nmol}×{args.mol} ({len(window.ra_ensemble)} mols)')
+    yield ctx.frame(f'Built {args.nmol}×{args.mol} ({len(window.ra_ensemble)} mols)', delay_ms=1000)
 
     # === Phase 2: Greedy MC assembly optimization ===
     yield ctx.frame('Running greedy Monte Carlo assembly…')
@@ -112,18 +111,16 @@ def run(window, argv=None, ctx=None):
     print("[conference_demo] BR-STM complete", flush=True)
     yield ctx.frame('BR-STM complete')
 
-    # Optional legacy conference phase.
-    if args.pme:
-        yield ctx.barrier('Continue to PME charge rings')
-        GSU.expand_extension_panel(window, 'rigid_assembly', open=True)
-        print("[conference_demo] PME charge rings XY scan…", flush=True)
-        RA._on_pme_scan_xy(window)
-        print("[conference_demo] PME XY complete", flush=True)
-        yield ctx.frame('PME charge-rings XY image complete')
-        print("[conference_demo] PME charge rings xV scan (NDR)…", flush=True)
-        RA._on_pme_scan_xv(window)
-        print("[conference_demo] PME xV complete", flush=True)
-        yield ctx.frame('PME charge-rings xV (NDR) complete')
+    # PME charge-rings phase — always runs (XY + xV projections)
+    GSU.expand_extension_panel(window, 'rigid_assembly', open=True)
+    print("[conference_demo] PME charge rings XY scan…", flush=True)
+    RA._on_pme_scan_xy(window)
+    print("[conference_demo] PME XY complete", flush=True)
+    yield ctx.frame('PME charge-rings XY image complete')
+    print("[conference_demo] PME charge rings xV scan (NDR)…", flush=True)
+    RA._on_pme_scan_xv(window)
+    print("[conference_demo] PME xV complete", flush=True)
+    yield ctx.frame('PME charge-rings xV (NDR) complete')
 
     print("[conference_demo] done", flush=True)
     return {'n_step': args.n_step, 'ntrial': args.ntrial, 'accepted': n_accept, 'E': None if last is None else last['E'], 'dxy_max': dxy_max, 'mol': args.mol, 'nmol': args.nmol}

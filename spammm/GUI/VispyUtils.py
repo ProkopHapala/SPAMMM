@@ -437,6 +437,11 @@ class AtomScene(QtCore.QObject):
         self._colors_base = None if colors is None else colors.copy()
         self._sizes = None if sizes is None else sizes
         self._bonds = None if bonds is None else np.asarray(bonds, dtype=np.int32)
+        # Clear stale bond-order bonds if atom count changed (refresh_view will
+        # call set_bond_orders with the correct bonds after set_data)
+        if self._bond_order_bonds is not None and self._bond_order_bonds.max() >= n:
+            self._bond_order_bonds = None
+            self._bond_orders = None
         self._forces = None if forces is None else _as_f32(forces)
         self._force_scale = float(force_scale)
         self._redraw()
@@ -1186,6 +1191,19 @@ class AtomScene(QtCore.QObject):
             b = self._bond_order_bonds
             bo = self._bond_orders
             pos = self._pos
+            n_atoms = pos.shape[0]
+            # Skip stale bond-order bonds whose indices are out of bounds for the
+            # current _pos (set_data may run _redraw before set_bond_orders is updated)
+            in_bounds = (b[:, 0] < n_atoms) & (b[:, 1] < n_atoms)
+            if not in_bounds.all():
+                b = b[in_bounds]
+                bo = bo[in_bounds]
+            if len(b) == 0:
+                self._bond_order_bonds = None
+                self._bond_orders = None
+            else:
+                self._bond_order_bonds = b
+                self._bond_orders = bo
             # Build segments: single=1 line, aromatic=1 green line, double=2 parallel lines
             seg_list = []
             col_list = []
