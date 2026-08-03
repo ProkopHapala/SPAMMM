@@ -507,10 +507,13 @@ def _on_unpin_all(window):
     ctrl = window.ff_controller
     if not ctrl.is_built:
         return
-    ctrl.clear_pins()
-    # Clear scene fixed mask
-    if hasattr(window, 'scene'):
+    if hasattr(window, 'backend'):
+        window.backend.clear_constraints()
+        mask = window.backend.constraint_mask()
+    else:
         mask = np.zeros(ctrl.natoms, dtype=bool)
+    ctrl.set_pinned(mask, window.scene._pos.copy() if hasattr(window, 'scene') else None)
+    if hasattr(window, 'scene'):
         window.scene.set_fixed_mask(mask)
     window.relax_status_label.setText("Status: All pins cleared")
 
@@ -554,9 +557,13 @@ def handle_pin_click(window, atom_idx):
     ctrl = window.ff_controller
     if not ctrl.is_built:
         return
-    pinned = ctrl.toggle_pin(atom_idx)
-    # Update scene fixed mask
-    mask = ctrl.get_pinned_mask()
+    if hasattr(window, 'backend'):
+        pinned = window.backend.toggle_constraint_by_index(atom_idx)
+        mask = window.backend.constraint_mask()
+        ctrl.set_pinned(mask, window.scene._pos.copy() if hasattr(window, 'scene') else None)
+    else:
+        pinned = ctrl.toggle_pin(atom_idx)
+        mask = ctrl.get_pinned_mask()
     if hasattr(window, 'scene'):
         window.scene.set_fixed_mask(mask)
     state = "pinned" if pinned else "unpinned"

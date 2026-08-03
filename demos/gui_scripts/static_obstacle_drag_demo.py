@@ -1,20 +1,13 @@
-#!/usr/bin/env python3
-"""Static-obstacle drag demo: drag a dynamic molecule through frozen obstacles.
+"""Menu-loaded static-obstacle animation macro.
 
 Loads a benzoic acid dimer from XYZ, splits it into two rigid bodies via
 connected components (From editor), freezes one as a static obstacle, and drags
-the other TOWARD it so they interact. Mid-drag, toggles the static molecule to
-dynamic and back to demonstrate the static↔dynamic switching.
+the other TOWARD it so they interact. This file is a GUI macro selected from
+Scripts → Bundled; its sequencing parameters are intentionally fixed.
 
 Frames are captured from the VisPy canvas → GIF/MP4.
 
-Run:
-  ./run_gui.sh --script demos/gui_scripts/static_obstacle_drag_demo.py
-
-  # Bigger drag, more relaxation:
-  ./run_gui.sh --script demos/gui_scripts/static_obstacle_drag_demo.py -- --drag-x 10 --n-relax 300
 """
-import argparse
 import os
 import time
 import numpy as np
@@ -24,17 +17,10 @@ from spammm.GUI import gui_script_utils as GSU
 
 
 def run(window, argv=None, ctx=None):
-    p = argparse.ArgumentParser(description='Static-obstacle drag demo: dimer split + drag + toggle')
-    p.add_argument('--dimer', type=str, default=None,
-                   help='path to dimer XYZ (default: data/xyz/benzoicacid_dimer.xyz)')
-    p.add_argument('--spring', type=float, default=0.2, help='anchor spring [PairFF internal units]')
-    p.add_argument('--dt', type=float, default=0.02)
-    p.add_argument('--n-relax', type=int, default=200, help='FIRE relaxation steps per drag step')
-    p.add_argument('--drag-step', type=float, default=0.15, help='anchor movement per drag step [Å]')
-    p.add_argument('--drag-x', type=float, default=8.0, help='total drag distance [Å]')
-    p.add_argument('--out', type=str, default=None, help='output dir (default: debug/static_obstacle_drag_demo)')
-    p.add_argument('--format', type=str, default='both', choices=['gif', 'mp4', 'both'], help='output format (default: both)')
-    args = p.parse_args(argv or [])
+    _ = argv
+    spring, dt, n_relax = 0.2, 0.02, 200
+    drag_step, drag_x = 0.15, 8.0
+    output_format = 'both'
 
     from spammm.GUI import RigidAssemblyExtension as RA
     from spammm.GUI.RigidAssemblyExtension import (
@@ -44,12 +30,14 @@ def run(window, argv=None, ctx=None):
         _on_probe_preset)
 
     REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    dimer_path = args.dimer or os.path.join(REPO_ROOT, 'data', 'xyz', 'benzoicacid_dimer.xyz')
+    dimer_path = os.path.join(REPO_ROOT, 'data', 'xyz', 'benzoicacid_dimer.xyz')
     if not os.path.isfile(dimer_path):
         raise FileNotFoundError(f'Dimer XYZ not found: {dimer_path}')
 
-    outdir = args.out or os.path.join('debug', 'static_obstacle_drag_demo')
+    outdir = os.path.join('debug', 'static_obstacle_drag_demo', 'static')
+    frames_dir = os.path.join(outdir, 'frames')
     os.makedirs(outdir, exist_ok=True)
+    os.makedirs(frames_dir, exist_ok=True)
 
     # === Phase 1: Load dimer into editor ===
     yield ctx.frame(f'Loading benzoic acid dimer…')
@@ -69,9 +57,9 @@ def run(window, argv=None, ctx=None):
     GSU.set_combo_text(window.ra_source_combo, 'From editor')
     GSU.set_check(window.ra_no_qeq_chk, False)
     GSU.set_check(window.ra_no_faf_chk, False)  # FAF on — NaCl substrate
-    GSU.set_spin_value(window.ra_k_spring_spin, args.spring)
-    GSU.set_spin_value(window.ra_drag_dt_spin, args.dt)
-    GSU.set_spin_value(window.ra_drag_nrelax_spin, args.n_relax)
+    GSU.set_spin_value(window.ra_k_spring_spin, spring)
+    GSU.set_spin_value(window.ra_drag_dt_spin, dt)
+    GSU.set_spin_value(window.ra_drag_nrelax_spin, n_relax)
     GSU.click_button(window.ra_build_btn)
     if window.ra_ensemble is None or window.ra_rbd is None:
         raise RuntimeError('RA build from editor failed')
@@ -143,7 +131,7 @@ def run(window, argv=None, ctx=None):
     # === Phase 5: Relaxation (settle, no anchor) ===
     yield ctx.frame(f'Relaxing on surface…')
     _set_anchors(window, -1, np.zeros(3, dtype=np.float32))
-    rbd.run_multimol_md(300, dt=args.dt, lin_damp=0.95, ang_damp=0.95, faf=None)
+    rbd.run_multimol_md(300, dt=dt, lin_damp=0.95, ang_damp=0.95, faf=None)
     _sync_ensemble_from_gpu(window)
     _sync_display(window)
     GSU.process_events(window)
@@ -171,12 +159,9 @@ def run(window, argv=None, ctx=None):
         v.set_gl_state('translucent', depth_test=False)
         v.order = 9
 
-    # === Phase 6: Drag loop — drag TOWARD static body, with mid-drag toggle ===
-    n_steps = int(np.ceil(args.drag_x / args.drag_step))
-    # Toggle at 50% of drag: static→dynamic→static
-    toggle_step = n_steps // 2
-    print(f'[static_obstacle_drag_demo] Drag: {n_steps} steps × {args.drag_step:.2f} Å = {args.drag_x:.1f} Å total, '
-          f'toggle at step {toggle_step}', flush=True)
+    # === Phase 6: Drag loop — drag TOWARD the static body ===
+    n_steps = int(np.ceil(drag_x / drag_step))
+    print(f'[static_obstacle_drag_demo] Drag: {n_steps} steps × {drag_step:.2f} Å = {drag_x:.1f} Å total', flush=True)
     yield ctx.frame(f'Dragging dynamic body TOWARD static obstacle ({n_steps} steps)…')
 
     pil_frames = []
@@ -189,7 +174,7 @@ def run(window, argv=None, ctx=None):
         traj_anchor_line.set_data(np.array(traj_anchor, dtype=np.float32))
         _update_anchor_visuals(window, anchor_pos, anchor_target)
         GSU.process_events(window)
-        png_path = os.path.join(outdir, f'_frame_{step:04d}.png')
+        png_path = os.path.join(frames_dir, f'_frame_{step:04d}.png')
         GSU.capture_canvas_png(window, png_path, fit=False)
         pil_frames.append(Image.open(png_path).convert('RGB'))
         print(f'[static_obstacle_drag_demo] step={step:3d}/{n_steps}  E={E:.4f}  {label}', flush=True)
@@ -198,40 +183,12 @@ def run(window, argv=None, ctx=None):
 
     for step in range(1, n_steps + 1):
         # Move anchor target toward static body
-        dist = step * args.drag_step
+        dist = step * drag_step
         target_xy = anchor_base[:2] + drag_unit * dist
         target = np.array([target_xy[0], target_xy[1], anchor_base[2]], dtype=np.float32)
         _set_anchors(window, anchor_flat, target)
 
-        # Mid-drag toggle: at toggle_step, switch body 0 static→dynamic, run a few steps, then back
-        if step == toggle_step:
-            yield ctx.frame(f'Toggling body 0: static → dynamic (both molecules free)…')
-            _toggle_body_state(window, 0)  # static → dynamic
-            n_dyn, n_stat, n_del = _body_state_counts(window)
-            print(f'[static_obstacle_drag_demo] TOGGLE: body 0 now dynamic (dyn={n_dyn} stat={n_stat})', flush=True)
-            # Recompute map (no static bodies → PairFF part is zero)
-            _recompute_ra_combined_map(window)
-            GSU.process_events(window)
-            # Run a few relaxation steps with both dynamic
-            rbd.run_multimol_md(50, args.dt, fire=True, faf=None)
-            _sync_ensemble_from_gpu(window)
-            _sync_display(window)
-            GSU.process_events(window)
-            atoms = np.empty((rbd.total_atoms, 4), dtype=np.float32)
-            rbd.fromGPU('apos_world', atoms); rbd.queue.finish()
-            E = float(atoms[:, 3].sum())
-            anchor_act = atoms[anchor_flat, :3].copy()
-            capture_frame(step, E, anchor_act, target, label='BOTH DYNAMIC')
-
-            yield ctx.frame(f'Toggling body 0 back: dynamic → static…')
-            _toggle_body_state(window, 0)  # dynamic → static
-            n_dyn, n_stat, n_del = _body_state_counts(window)
-            print(f'[static_obstacle_drag_demo] TOGGLE: body 0 now static (dyn={n_dyn} stat={n_stat})', flush=True)
-            _recompute_ra_combined_map(window)
-            GSU.process_events(window)
-            continue
-
-        rbd.run_multimol_md(args.n_relax, args.dt, fire=True, faf=None)
+        rbd.run_multimol_md(n_relax, dt, fire=True, faf=None)
         _sync_ensemble_from_gpu(window)
         _sync_display(window)
         GSU.process_events(window)
@@ -249,14 +206,14 @@ def run(window, argv=None, ctx=None):
     print(f'[static_obstacle_drag_demo] Drag done in {elapsed:.1f}s ({n_steps} steps)', flush=True)
 
     # === Phase 7: Save GIF and/or MP4 ===
-    frame_paths = [os.path.join(outdir, f'_frame_{i:04d}.png') for i in range(len(pil_frames))]
+    frame_paths = [os.path.join(frames_dir, f'_frame_{i:04d}.png') for i in range(len(pil_frames))]
     gif_path = None
-    if args.format in ('gif', 'both'):
+    if output_format in ('gif', 'both'):
         gif_path = os.path.join(outdir, 'static_obstacle_drag_demo.gif')
         pil_frames[0].save(gif_path, save_all=True, append_images=pil_frames[1:],
                            duration=150, loop=0, optimize=True)
         print(f'REVIEW: {gif_path}', flush=True)
-    if args.format in ('mp4', 'both'):
+    if output_format in ('mp4', 'both'):
         try:
             mp4_path = os.path.join(outdir, 'static_obstacle_drag_demo.mp4')
             GSU.frames_to_video(frame_paths, mp4_path, fps=10)
@@ -267,10 +224,6 @@ def run(window, argv=None, ctx=None):
     pil_frames[-1].save(os.path.join(outdir, 'frame_last.png'))
     print(f'REVIEW: {os.path.join(outdir, "frame_first.png")}', flush=True)
     print(f'REVIEW: {os.path.join(outdir, "frame_last.png")}', flush=True)
-    for p in frame_paths:
-        if os.path.exists(p):
-            os.remove(p)
-
     # Release anchor
     _set_anchors(window, -1, np.zeros(3, dtype=np.float32))
     _update_anchor_visuals(window, None, None)
@@ -281,11 +234,8 @@ def run(window, argv=None, ctx=None):
     _sync_display(window)
     GSU.process_events(window)
 
+    if hasattr(window, 'set_manipulation_context'):
+        window.set_manipulation_context('rigid_assembly')
+    GSU.set_edit_mode(window, 'Manipulate')
     yield ctx.frame(f'Demo done: {len(pil_frames)} frames → {gif_path}')
     return {'n_frames': len(pil_frames), 'gif_path': gif_path, 'n_steps': n_steps}
-
-
-if __name__ == '__main__':
-    import sys
-    print('Use: ./run_gui.sh --script demos/gui_scripts/static_obstacle_drag_demo.py', file=sys.stderr)
-    raise SystemExit(1)

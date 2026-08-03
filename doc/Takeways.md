@@ -504,30 +504,29 @@ re-entrancy guard flag instead.
 
 ---
 
-## Diagnostic visualization parameters ≠ simulation parameters
+## Diagnostic visualization parameters ≠ simulation parameters (SUPERSEDED)
 
-**Context:** The combined PairFF+FAF probe map in `RigidAssemblyExtension` uses
-`He=-1.0, Hs=0.0, w=0.7` for the probe map visualization, while the assembly's PairFF
-dynamics use `He=-0.1, Hs=1.0`.
+> **Superseded 2026-08-03** by [RigidAssembly_Demo_MapMode_Consolidation.md](Tasks/RigidAssembly_Demo_MapMode_Consolidation.md)
+> §0: "The raw map must use the exact PairFF data used by dynamics. No display-only
+> He/Hs substitution is allowed." The map now reads `beta` from `rbd.pairff_params_host`
+> and uses the same `pairff_unified_site_EF` inline primitive as the dynamics kernels.
+> The color-scale contrast issue was instead solved by the **nuclear exclusion mask**
+> (C3) — excluding nuclear singularities from `vmin/vmax` estimation — and the
+> **color scale rule** (`vmin=Emin, vmax=|Emin|`, C1). See
+> `.devin/skills/centralized-plotting/SKILL.md` §§"Color Scale Rule", "Nuclear exclusion".
 
-**Symptom (2026-08-03):** After "fixing" the map's He/Hs to match the assembly's PairFF
-values (review finding F2), the H+ probe map lost its attractive blue minima at electron
-pairs — the visualization became flat and uninformative. USER objected.
+**Original context (F2, pre-consolidation):** The combined PairFF+FAF probe map in
+`RigidAssemblyExtension` used `He=-1.0, Hs=0.0, w=0.7` for the probe map visualization,
+while the assembly's PairFF dynamics used `He=-0.1, Hs=1.0`. After "fixing" the map's
+He/Hs to match the assembly's PairFF values (review finding F2), the H+ probe map lost
+its attractive blue minima at electron pairs. The temporary fix was to revert to
+display-only `He=-1.0, Hs=0.0`. The permanent fix (consolidation) is to use honest
+parameters + nuclear exclusion mask + symmetric `|Emin|` color scale.
 
-**Root cause:** The map is a **diagnostic tool** that shows where a test probe would be
-attracted/repelled. `He=-1.0` gives full negative charge to lone pairs (attractive to
-H+); `Hs=0.0` disables sigma-hole contribution for cleaner H-bond visualization. These
-are display-only amplification parameters, not the physical PairFF parameters used in
-dynamics.
-
-**Fix:** Reverted to `He=-1.0, Hs=0.0, w=0.7` for the map. The assembly's PairFF dynamics
-use the correct `He=-0.1, Hs=1.0` independently. Demo default probe switched from O− to
-H+ to better visualize e-pair attraction.
-
-**Takeaway:** Do not "fix" display-only constants to match physics parameters without
-checking the visual result. Diagnostic visualizations intentionally amplify contrast.
-
-**Reference:** `doc/Reports/StaticObstacle_DragDemo_2026-08-03.md` §8.2
+**Takeaway (still valid):** Do not "fix" display-only constants to match physics
+parameters without checking the visual result. But when a permanent codepath-parity
+fix is available, prefer it over display-only hacks — and solve the contrast problem
+at the color-scale level, not by altering the physics.
 
 ---
 
@@ -551,6 +550,31 @@ attribute (the `SceneCanvas.view`), test mocks don't.
 not always what you expect.
 
 **Reference:** `doc/Reports/StaticObstacle_DragDemo_2026-08-03.md` §8.1
+
+---
+
+## Nuclear exclusion: mask for color scale, not NaN holes in the map
+
+**Context:** The combined PairFF+FAF probe map has infinitely deep attractive wells at
+real-atom nuclei (compact-exp + damped Coulomb). These dominate `|Emin|` and wash out the
+chemically meaningful attractive basins and FAF corrugation.
+
+**First attempt (rejected):** Set pixels within 1 Å of any real atom to NaN in both the
+GPU kernel and CPU reference; render NaN pixels transparent. This produced "disturbing
+white areas" per USER feedback — the map looked discontinuous and broken.
+
+**Second attempt (accepted):** Compute the physical energy at every pixel (no NaN holes).
+Return a separate boolean `exclude_mask` (True within 1 Å of any real atom). Use the mask
+**only** to exclude nuclear singularities from `vmin/vmax` estimation
+(`E_for_lim = E[~exclude_mask]`). The map itself is fully finite and displayed everywhere.
+
+**Takeaway:** Display continuity matters more than hiding nuclear singularities. The map
+should be physically complete everywhere; only the color scale derivation should exclude
+the singularities. NaN holes in a 2D potential map are visually disturbing and break the
+perception of the energy landscape.
+
+**Reference:** `doc/Reports/StaticObstacle_DragDemo_2026-08-03.md` §9.3;
+`.devin/skills/centralized-plotting/SKILL.md` §"Nuclear exclusion"
 
 ---
 

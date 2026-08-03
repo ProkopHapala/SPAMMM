@@ -16,6 +16,17 @@ def debug_print(level, message):
         print(message)
 
 
+def closest_point_on_ray(point, r0, rd):
+    """Return the closest point on a mouse ray to a world-space point."""
+    point = np.asarray(point, dtype=np.float64)
+    r0 = np.asarray(r0, dtype=np.float64)
+    rd = np.asarray(rd, dtype=np.float64)
+    rd2 = float(np.dot(rd, rd))
+    if rd2 < 1e-12:
+        return r0.copy()
+    return r0 + rd * float(np.dot(point - r0, rd) / rd2)
+
+
 class EditModeHandler:
     """Base class for all edit modes. Subclasses override hooks as needed.
 
@@ -197,6 +208,55 @@ class EditModeHandler:
 
     def _hover_bond(self, bond):
         self.scene.hover_bond_line.set_data(pos=np.array([bond.a.pos, bond.b.pos], dtype=np.float32))
+
+
+class ManipulateMode(EditModeHandler):
+    """Dispatch one canonical manipulation mode to the explicit context adapter."""
+    status_msg = "Manipulate: LMB drag rigid body | RMB state/delete | Shift+LMB constraint"
+    lock_drag = True
+
+    def _adapter(self):
+        context = getattr(self.gui, 'active_manipulation_context', None)
+        adapter = getattr(self.gui, '_manipulation_adapters', {}).get(context)
+        if adapter is None and context is not None:
+            self.gui.statusBar().showMessage(f"Build/Setup for {context} before manipulating")
+        return adapter
+
+    def on_activate(self):
+        adapter = self._adapter()
+        if adapter is not None and adapter.on_activate:
+            adapter.on_activate()
+        self.capture_move = bool(getattr(adapter, 'capture_move', False))
+
+    def on_press(self, event, p_world, ctrl):
+        adapter = self._adapter()
+        if adapter is not None and adapter.on_press:
+            adapter.on_press(event, p_world, ctrl)
+        self.capture_move = bool(getattr(adapter, 'capture_move', False))
+
+    def on_move(self, p_world, r0=None, rd=None):
+        adapter = self._adapter()
+        if adapter is not None and adapter.on_move:
+            adapter.on_move(p_world, r0, rd)
+        self.capture_move = bool(getattr(adapter, 'capture_move', False))
+
+    def on_release(self, event, p_world, ctrl):
+        adapter = self._adapter()
+        if adapter is not None and adapter.on_release:
+            adapter.on_release(event, p_world, ctrl)
+
+    def on_rmb_atom(self, atom_id, ctrl):
+        adapter = self._adapter()
+        if adapter is not None and adapter.on_rmb_atom:
+            adapter.on_rmb_atom(atom_id, ctrl)
+
+    def on_atom_click(self, atom_id, shift=False):
+        if shift and hasattr(self.gui, 'toggle_spatial_constraint'):
+            self.gui.toggle_spatial_constraint(atom_id)
+            return
+        adapter = self._adapter()
+        if adapter is not None and adapter.on_atom_click:
+            adapter.on_atom_click(atom_id, shift)
 
 
 # ── Unified mode ────────────────────────────────────────────────────────────

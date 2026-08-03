@@ -929,6 +929,61 @@ inline float4 folded_eval_tensor_rigid(
 }
 
 // ==================================================================
+//  Fused probe-map grid evaluator
+// ==================================================================
+// One work-item evaluates one XY pixel. PairFF uses the same site-pair
+// primitive as unified dynamics; FAF uses the tensor evaluator above with
+// one materialized probe site. Output channels are (total, PairFF, FAF, 0).
+// The host computes a nuclear-exclusion mask from atom positions to exclude
+// nuclear singularities from vmin/vmax estimation; the kernel itself fills
+// every pixel with the physical energy (no NaN holes in the display).
+__kernel
+void rigid_body_pairff_probe_grid(
+    __global const float4* static_apos,
+    __global const float4* static_REQ,
+    __global const int*    static_type,
+    const int              n_static,
+    const float4           probe_REQ,
+    const float             beta,
+    const int               nx,
+    const int               ny,
+    const float             x0,
+    const float             y0,
+    const float             step,
+    const float             z_probe,
+    __global const float*   probe_site_coeffs,
+    __global const float4*  probe_z_params,
+    const int4              probe_tensor_meta,
+    const float4            invLvec2d,
+    const int               do_faf,
+    __global float4*        E_out
+) {
+    const int gid = get_global_id(0);
+    const int npx = nx * ny;
+    if (gid >= npx) return;
+    const int ix = gid % nx;
+    const int iy = gid / nx;
+    const float3 p = (float3)(x0 + step * (float)ix,
+                              y0 + step * (float)iy,
+                              z_probe);
+    float E_pair = 0.0f;
+    for (int j = 0; j < n_static; ++j) {
+        const float4 ev = pairff_unified_site_EF(
+            p - static_apos[j].xyz, probe_REQ, 0,
+            static_REQ[j], static_type[j], beta);
+        E_pair += ev.w;
+    }
+    float E_faf = 0.0f;
+    if (do_faf) {
+        E_faf = folded_eval_tensor_rigid(
+            p, 0, 1, probe_site_coeffs, probe_z_params,
+            probe_tensor_meta.x, probe_tensor_meta.y, probe_tensor_meta.z,
+            invLvec2d).w;
+    }
+    E_out[gid] = (float4)(E_pair + E_faf, E_pair, E_faf, 0.0f);
+}
+
+// ==================================================================
 //  Kernel: rigid_body_folded_kernel  — MD / FIRE, one body per workgroup
 // ==================================================================
 //
@@ -2491,34 +2546,11 @@ void rigid_body_pairff_unified_kernel(
 
             for (int j = 0; j < n_static; j++) {
                 float3 dp = p_world - Lstatic_pos[j].xyz;
-                float r2 = dot(dp, dp);
                 float4 REQ_j = Lstatic_REQ[j];
-                float gj = Lstatic_g[j];
-                float gij = gi * gj;
-                float R0 = gij * (REQ_i.x + REQ_j.x);
-                float w  = REQ_i.w + REQ_j.w;
-                float alpha = gij;
-                float rho_c = R0 + inv_beta_n;
-                float rc2 = rho_c * (rho_c + 2.0f * w);
-                float attr = -fmin(0.0f, REQ_i.z * REQ_j.z);
-                float both_dummy = 1.0f - fmin(gi + gj, 1.0f);
-                float E0 = mix(attr, REQ_i.y * REQ_j.y, gij) * (1.0f - both_dummy);
-                if (E0 != 0.0f && r2 <= rc2) {
-                    float2 ev = compact_exp_pair_EF(dp, R0, E0, alpha, w, beta);
-                    E += ev.x;
-                    f += dp * ev.y;
-                }
-                if (gij > 0.5f) {
-                    float Q = REQ_i.z * REQ_j.z;
-                    float r2d = r2 + R2SAFE;
-                    float ir2d = 1.0f / r2d;
-                    float sqr_ir2d = sqrt(ir2d);
-                    float E_coul = COULOMB_CONST * Q * sqr_ir2d;
-                    // F = +kQ/(r2+eps)^{1.5} * dp  (repulsive for Q>0)
-                    float f_coul_over_r = COULOMB_CONST * Q * ir2d * sqr_ir2d;
-                    E += E_coul;
-                    f += dp * f_coul_over_r;
-                }
+                float4 ev = pairff_unified_site_EF(dp, REQ_i, dyn_type[ia], REQ_j,
+                                                   (Lstatic_g[j] > 0.5f) ? 0 : 1, beta);
+                f += ev.xyz;
+                E += ev.w;
             }
 
             float4 anchor = anchors[ia];
@@ -3518,31 +3550,11 @@ void rigid_body_pairff_unified_allmol_kernel(
                 float E = E_acc[i];
                 for (int t = 0; t < Ln_tile; t++) {
                     float3 dp = p_world - Lenv_pos[t].xyz;
-                    float r2 = dot(dp, dp);
                     float4 REQ_j = Lenv_REQ[t];
-                    float gj = Lenv_g[t];
-                    float gij = gi * gj;
-                    float R0 = gij * (REQ_i.x + REQ_j.x);
-                    float w  = REQ_i.w + REQ_j.w;
-                    float alpha = gij;
-                    float rho_c = R0 + inv_beta_n;
-                    float rc2 = rho_c * (rho_c + 2.0f * w);
-                    float attr = -fmin(0.0f, REQ_i.z * REQ_j.z);
-                    float both_dummy = 1.0f - fmin(gi + gj, 1.0f);
-                    float E0 = mix(attr, REQ_i.y * REQ_j.y, gij) * (1.0f - both_dummy);
-                    if (E0 != 0.0f && r2 <= rc2) {
-                        float2 ev = compact_exp_pair_EF(dp, R0, E0, alpha, w, beta);
-                        E += ev.x;
-                        f += dp * ev.y;
-                    }
-                    if (gij > 0.5f) {
-                        float Q = REQ_i.z * REQ_j.z;
-                        float r2d = r2 + R2SAFE;
-                        float ir2d = 1.0f / r2d;
-                        float sqr_ir2d = sqrt(ir2d);
-                        E += COULOMB_CONST * Q * sqr_ir2d;
-                        f += dp * (COULOMB_CONST * Q * ir2d * sqr_ir2d);
-                    }
+                    float4 ev = pairff_unified_site_EF(dp, REQ_i, dyn_type[ia_store[i]],
+                                                       REQ_j, (Lenv_g[t] > 0.5f) ? 0 : 1, beta);
+                    f += ev.xyz;
+                    E += ev.w;
                 }
                 f_acc[i] = f;
                 E_acc[i] = E;

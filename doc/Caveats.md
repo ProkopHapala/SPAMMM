@@ -272,27 +272,50 @@ See [Takeways.md](Takeways.md) → "processEvents re-entrancy in vispy mouse cal
 
 ---
 
-## 12. Rigid Assembly — diagnostic map parameters ≠ simulation parameters
+## 12. Rigid Assembly — probe map parameters (SUPERSEDED — see §12b)
 
-**Context:** The combined PairFF+FAF probe map in `RigidAssemblyExtension` uses
-`He=-1.0, Hs=0.0, w=0.7` for visualization, while the assembly's PairFF dynamics use
-`He=-0.1, Hs=1.0`.
+> **Superseded 2026-08-03** by [RigidAssembly_Demo_MapMode_Consolidation.md](Tasks/RigidAssembly_Demo_MapMode_Consolidation.md)
+> §0: the map now uses the exact PairFF parameters from `rbd.pairff_params_host` — no
+> display-only He/Hs substitution. The contrast issue is solved by the nuclear exclusion
+> mask (§12b) and the symmetric `|Emin|` color scale rule. This entry is retained for
+> provenance.
 
-**Trap (2026-08-03):** "Fixing" the map's He/Hs to match the assembly's PairFF values
-(review finding F2) made the H+ probe map lose its attractive blue minima at electron
-pairs — the diagnostic visualization became flat and useless.
-
-**Rule:** The combined probe map is a **diagnostic tool**, not a physical energy
-calculation. `He=-1.0` gives full negative charge to lone pairs (attractive to H+);
-`Hs=0.0` disables sigma-hole contribution for cleaner H-bond visualization. These are
-display-only amplification parameters. The assembly's PairFF dynamics use the correct
-`He=-0.1, Hs=1.0` independently.
-
-Do not "fix" display-only constants to match physics parameters without checking the
-visual result.
+**Original context (F2, pre-consolidation):** The combined PairFF+FAF probe map in
+`RigidAssemblyExtension` used `He=-1.0, Hs=0.0, w=0.7` for visualization, while the
+assembly's PairFF dynamics used `He=-0.1, Hs=1.0`. "Fixing" the map's He/Hs to match the
+assembly's PairFF values (review finding F2) made the H+ probe map lose its attractive
+blue minima at electron pairs. The temporary fix was to revert to display-only
+`He=-1.0, Hs=0.0`. The permanent fix (consolidation) uses honest parameters + nuclear
+exclusion mask + symmetric `|Emin|` color scale.
 
 See [Takeways.md](Takeways.md) → "Diagnostic visualization parameters ≠ simulation
-parameters".
+parameters (SUPERSEDED)".
+
+---
+
+## 12b. Rigid Assembly — probe map color scale and nuclear exclusion (USER MANDATED)
+
+**Context:** The combined PairFF+FAF probe map has infinitely deep attractive wells at
+real-atom nuclei (compact-exp + damped Coulomb). These dominate `|Emin|` and wash out
+the chemically meaningful attractive basins and FAF corrugation.
+
+**Rule 1 — Color scale:** `vmin = Emin`, `vmax = |Emin|` (symmetric), where
+`Emin = min(E_for_lim)` and `E_for_lim = E[~exclude_mask]`. The color-limit spin resets
+to 0 (Auto) on every recompute so the scale is always freshly derived from the current
+data. Never use `np.percentile` — use the actual minimum. See
+`.devin/skills/centralized-plotting/SKILL.md` §"Color Scale Rule".
+
+**Rule 2 — Nuclear exclusion:** `nuclear_exclusion_mask(xs, ys, z_probe, static_apos,
+static_types, r=1.0)` returns a boolean mask True within 1 Å of any real atom. The mask
+is used **only** for `vmin/vmax` estimation. The map itself is fully finite and displayed
+everywhere — **no NaN holes**. NaN holes were tried and rejected ("disturbing white
+areas"). See `.devin/skills/centralized-plotting/SKILL.md` §"Nuclear exclusion".
+
+**Trap:** Do not set pixels near nuclei to NaN in the GPU kernel or CPU reference. The
+map must be physically complete everywhere. Only the color scale derivation excludes the
+singularities.
+
+See [Takeways.md](Takeways.md) → "Nuclear exclusion: mask for color scale, not NaN holes".
 
 ---
 

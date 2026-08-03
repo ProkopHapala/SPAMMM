@@ -38,7 +38,7 @@ from spammm.GUI.BaseGUI import BaseGUI
 from spammm.GUI.VispyUtils import AtomScene
 from spammm.GUI.EditModeHandlers import (
     EditModeHandler, UnifiedMode, AtomMode, PiMode, BondMode,
-    RingMode, Hex1Mode, Hex2Mode, SelectMode,
+    RingMode, Hex1Mode, Hex2Mode, SelectMode, ManipulateMode,
 )
 from spammm.topology.MoleculeEditorBackend import MoleculeEditorBackend
 import spammm.topology.MoleculeEditorBackend as MEB
@@ -105,6 +105,8 @@ class SPAMMMWindow(BaseGUI):
         # Sync fdata_path into ExtensionManager config so FireCore/Grid can find it
         self.extensions.set_config('firecore', 'fdata_dir', self.fdata_path)
         self.mode_handlers = {}
+        self.active_manipulation_context = None
+        self._manipulation_adapters = {}
         self._init_mode_handlers()
         self.initUI()
         # Scene drag signal: update AtomicGraph and sys.apos after drag end
@@ -600,13 +602,20 @@ class SPAMMMWindow(BaseGUI):
                 sec.set_status(False)
             side_layout.addWidget(sec)
 
+            hidden_extension_modes = {'RA Drag', 'FR Pin', 'FR COM', 'FR Manip', 'Pin/Unpin', 'RC pin'}
             for label, cb in ui.edit_modes:
                 self._ext_edit_modes[label] = cb
+                if label in hidden_extension_modes:
+                    continue
                 self.mode_combo.addItem(label)
                 # Register a minimal handler — extension uses its own callback via _ext_edit_modes
                 self.register_mode_handler(label, EditModeHandler(self))
             for label, cb in ui.view_modes:
                 self._ext_view_modes[label] = cb
+
+        if 'Manipulate' not in self._ext_edit_modes:
+            self.mode_combo.addItem('Manipulate')
+            self.register_mode_handler('Manipulate', ManipulateMode(self))
 
     def _show_extension_help(self, name, help_text):
         """Open a dialog with extension help text."""
@@ -908,6 +917,34 @@ class SPAMMMWindow(BaseGUI):
         """Register an EditModeHandler instance for an extension-defined edit mode."""
         self.mode_handlers[name] = handler
 
+    def register_manipulation_adapter(self, context, handler):
+        """Register the extension handler behind the canonical Manipulate mode."""
+        self._manipulation_adapters[str(context)] = handler
+
+    def set_manipulation_context(self, context):
+        """Select the explicit rigid manipulation target; ``None`` disables it."""
+        valid = {None, 'rigid_assembly', 'folded_rigid'}
+        context = None if context is None else str(context)
+        if context not in valid:
+            raise ValueError(f'unknown manipulation context {context!r}')
+        self.active_manipulation_context = context
+        if context is not None:
+            self.statusBar().showMessage(f'Manipulate target: {context}')
+
+    def toggle_spatial_constraint(self, atom_id):
+        """Toggle backend constraint SSOT and synchronize scene/FF consumers."""
+        atom_id = int(atom_id)
+        pinned = self.backend.toggle_constraint(atom_id)
+        mask = self.backend.constraint_mask()
+        if hasattr(self.scene, 'set_fixed_mask'):
+            self.scene.set_fixed_mask(mask)
+        ctrl = getattr(self, 'ff_controller', None)
+        if ctrl is not None and getattr(ctrl, 'is_built', False):
+            if int(getattr(ctrl, 'natoms', len(mask))) != len(mask):
+                raise RuntimeError('FF controller is stale: atom count differs from backend constraint mask')
+            ctrl.set_pinned(mask, self.scene._pos.copy())
+        self.statusBar().showMessage(f'Atom {atom_id} {"pinned" if pinned else "unpinned"}')
+
     # ── Common helpers (used by on_mouse_move preamble) ─────────────────────
 
     def _clear_hover(self):
@@ -936,6 +973,12 @@ class SPAMMMWindow(BaseGUI):
         self.sig_geometry_changed.emit()
 
     def set_edit_mode(self, mode):
+        if hasattr(self, 'mode_combo'):
+            idx = self.mode_combo.findText(str(mode))
+            if idx >= 0 and self.mode_combo.currentIndex() != idx:
+                self.mode_combo.blockSignals(True)
+                self.mode_combo.setCurrentIndex(idx)
+                self.mode_combo.blockSignals(False)
         # Dispatch to extension edit mode callbacks first
         if hasattr(self, '_ext_edit_modes') and mode in self._ext_edit_modes:
             try:
@@ -1418,6 +1461,9 @@ class SPAMMMWindow(BaseGUI):
         try:
             p_world, r0, rd = self._mouse_world_and_ray(event)
             if p_world is None: return
+            hover_fn = getattr(self, 'ra_map_hover_fn', None)
+            if hover_fn is not None:
+                hover_fn(p_world)
             self.cursor_markers.set_data(pos=np.array([p_world]), symbol='cross', edge_width=2, edge_color='red', face_color='transparent', size=10)
             self.scene.update_view_debug(event.pos, hit=p_world)
             self.backend.detect_geometry_rings()

@@ -205,6 +205,26 @@ which is naturally compatible with the geometric-mean convention used in most fo
 
 ## Summary Table
 
+## Rigid-body unified PairFF working defaults
+
+The unified rigid-body PairFF path currently uses `He=-0.1`, `Hs=1.0`, `w=0.7`,
+`beta=1.7`, `epair_dist=1.4 Å`, and `sigma_dist=1.0 Å` as **unfitted working defaults**.
+They are retained for dynamics/map parity and are not a calibration claim. `REQ.z` is the
+charge/pseudo-charge slot; real-real Coulomb uses the damped distance
+`sqrt(r² + 1e-4 Å²)`, while dummy sites contribute only through the directional mixed
+term. `beta` controls the compact-exponential cutoff width; `rc` is a separate GUI/legacy
+parameter and must not be treated as that cutoff. A future calibration task should fit
+energies and forces to versioned donor/acceptor distance-orientation scans, with held-out
+chemistries and dissociation/no-spurious-well checks.
+
+**Probe map parity (2026-08-03):** The combined PairFF+FAF probe map
+(`compute_combined_probe_map` in `RigidBodyUtils.py`) now reads `beta` from
+`rbd.pairff_params_host` and uses the same inline `pairff_unified_site_EF` primitive as
+the dynamics kernels (kernel 15) via the new GPU kernel `rigid_body_pairff_probe_grid`
+(kernel 18). No display-only `He`/`Hs` substitution. Color-scale contrast is handled by
+the nuclear exclusion mask + symmetric `|Emin|` rule (see
+`.devin/skills/centralized-plotting/SKILL.md`).
+
 | Method | Complexity | Range | GPU | Status |
 |--------|-----------|-------|-----|--------|
 | **NBFF (brute)** | O(N²) | All | OpenCL | Production |

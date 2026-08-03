@@ -462,6 +462,10 @@ def build_ui(window):
     layout.addLayout(g_pace.layout())
 
     # --- Run / Continue / Stop + state ---
+    # State label is on its OWN row below the buttons: its text changes during
+    # simulation (state: IDLE -> RUNNING [script] -> COMPLETED [script]) and would
+    # otherwise grow its grid column, shrinking the button columns and clipping
+    # button labels. Own row keeps button column widths static.
     g_btn = AutoGridPlacer(cols=4)
     window.sr_run_btn = tight_button('Run')
     window.sr_continue_btn = tight_button('Continue')
@@ -469,9 +473,10 @@ def build_ui(window):
     g_btn.add(window.sr_run_btn)
     g_btn.add(window.sr_continue_btn)
     g_btn.add(window.sr_stop_btn)
+    g_btn.newrow()
     window.sr_state_label = QtWidgets.QLabel('state: IDLE')
     window.sr_state_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-    g_btn.add(window.sr_state_label)
+    g_btn.add(window.sr_state_label, span=g_btn._cols)
     layout.addLayout(g_btn.layout())
 
     # --- wire signals ---

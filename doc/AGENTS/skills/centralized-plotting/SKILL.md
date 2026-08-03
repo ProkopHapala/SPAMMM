@@ -102,6 +102,33 @@ Before committing plotting code, verify:
 - [ ] Atom overlay uses `overlay_atoms` or `plot_2d_scalar(..., apos=...)`
 - [ ] `extent` passed to `imshow` matches the grid that produced `data_2d`
 
+## Color Scale Rule (USER MANDATED — DO NOT DEVIATE)
+
+For 2D potential/energy maps (PairFF, FAF, combined), the color scale MUST be:
+- `vmin = Emin` (the actual data minimum, which is negative)
+- `vmax = -vmin = |Emin|` (symmetric around 0)
+- Floor: `vmax = max(|Emin|, 0.01)` to avoid zero-range
+
+This is `vmax = |Emin|`, `vmin = -|Emin|`. Repulsive Pauli cores (positive, much larger
+than `|Emin|`) are intentionally clipped — this shows the attractive basins and FAF
+corrugation clearly. **Never** use `max(|Emin|, |Emax|)`, percentile-based limits, or
+asymmetric `[Emin, Emax]` ranges for these maps. The SSOT function is
+`spammm.GUI.RigidBodyVispy.potential_to_rgba` — always delegate to it.
+
+For GUI map overlays that cache and recolor: reset the color-limit spin to 0 (Auto)
+on every recompute so `|Emin|` is freshly evaluated from the new data. A stale positive
+spin value will use the old limit and oversaturate the new map.
+
+**Nuclear exclusion:** The probe-map kernels (GPU `rigid_body_pairff_probe_grid` and
+CPU `_compute_unified_probe_pair_map`) compute the physical energy at every pixel —
+no NaN holes in the display. A separate boolean `exclude_mask` (True within 1 Å of any
+real atom) is returned by `compute_combined_probe_map` and
+`RigidBodyUtils.nuclear_exclusion_mask`. The mask is used only to exclude nuclear
+singularities from `vmin`/`vmax` estimation (`E_for_lim = E[~exclude_mask]`), so the
+color scale reflects the chemically meaningful attractive basins and FAF corrugation
+rather than the infinitely deep wells at nuclei. The map itself remains fully finite
+and is displayed everywhere.
+
 ## Related Skills
 - `code-reuse` — general inventory-first rule for all code
 - `visual-debugging` — diagnostic plots for debugging

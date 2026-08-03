@@ -337,14 +337,15 @@ def test_combined_map_decomposition_and_invalidation():
     _, atom_types = get_atom_types()
     probe_R0, probe_E0, probe_q = float(atom_types['O'].RvdW), float(atom_types['O'].EvdW), -0.4
 
-    E_sum, E_pairff, E_faf, xs, ys, extent = compute_combined_probe_map(
+    E_sum, E_pairff, E_faf, xs, ys, extent, exclude_mask = compute_combined_probe_map(
         rbd, fit, frozen_mask, probe_R0, probe_E0, probe_q, z_probe, beta=1.7)
 
+    # Map is fully finite (no NaN holes); exclude_mask is for vmin/vmax only
+    assert np.isfinite(E_sum).all(), "map has non-finite values"
     # Decomposition: E_sum ≈ E_pairff + E_faf
     if E_faf is not None:
         np.testing.assert_allclose(E_sum, E_pairff + E_faf, rtol=1e-10, atol=1e-10,
                                    err_msg="map decomposition: E_sum != E_pairff + E_faf")
-    assert np.isfinite(E_sum).all(), "map has non-finite values"
 
     # Invalidation: dynamic-only pose change (body 1 moves) must NOT change the
     # static PairFF contribution. With F12, the grid extent includes all live atoms,
@@ -354,7 +355,7 @@ def test_combined_map_decomposition_and_invalidation():
     pos_moved[1, 0] += 2.0  # move dynamic body 1
     rbd.toGPU('poss', np.concatenate([pos_moved, np.ones((2, 1), dtype=np.float32)], axis=1).astype(np.float32))
     rbd._mb_pos = pos_moved.copy()
-    E_sum2, E_pairff2, _, xs2, ys2, _ = compute_combined_probe_map(
+    E_sum2, E_pairff2, _, xs2, ys2, _, _ = compute_combined_probe_map(
         rbd, fit, frozen_mask, probe_R0, probe_E0, probe_q, z_probe, beta=1.7)
     # Find overlapping x/y region between the two grids
     x_lo = max(float(xs[0]), float(xs2[0]))
@@ -382,7 +383,7 @@ def test_combined_map_decomposition_and_invalidation():
     print(f"[map] E_sum range=[{E_sum.min():.3f},{E_sum.max():.3f}]  "
           f"E_pairff range=[{E_pairff.min():.3f},{E_pairff.max():.3f}]  "
           f"E_faf range=[{E_faf.min():.3f},{E_faf.max():.3f}]  "
-          f"grid={len(xs)}x{len(ys)}")
+          f"grid={len(xs)}x{len(ys)}  excluded={int(exclude_mask.sum())} px")
 
 
 # ─── L0-9: Mixed-species nmol=2 interleaved ordering ──────────────────────

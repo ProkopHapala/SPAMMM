@@ -22,7 +22,7 @@ from vispy import scene as vscene
 
 from .ExtensionManager import UIComponents
 from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, AutoGridPlacer
-from .EditModeHandlers import EditModeHandler
+from .EditModeHandlers import EditModeHandler, closest_point_on_ray
 from .CollapsibleSection import CollapsibleSection
 from .VispyUtils import make_grid_mesh_data, colormap_rgba, update_faf_map_overlay
 from spammm.surfaces import FoldedRigid
@@ -319,6 +319,8 @@ def _on_setup(window):
             mass_trans=1.0,
         )
         window.fr_rbd = rbd
+        if hasattr(window, 'set_manipulation_context'):
+            window.set_manipulation_context('folded_rigid')
         _status(window, f"Setup complete: {rbd.num_atoms} atoms")
     except Exception as e:
         _status(window, f"Setup failed: {e}")
@@ -741,18 +743,16 @@ def _build_edit_mode_handlers(window):
                 anchors[idx, 3] = float(window.fr_k_spring_spin.value())
             rbd.update_anchors(anchors)
 
-        def _closest_point_on_ray(self, atom_pos, r0, rd):
-            rd = np.asarray(rd, dtype=np.float64)
-            rd2 = float(np.dot(rd, rd))
-            if rd2 < 1e-12:
-                return np.asarray(r0, dtype=np.float64)
-            t = float(np.dot(atom_pos - r0, rd) / rd2)
-            return r0 + t * rd
-
         def on_press(self, event, p_world, ctrl):
             if event.button != 1:
                 return
             idx = self._pick_idx(event)
+            alt = bool(getattr(window.scene, '_last_alt', False))
+            if alt and idx < 0:
+                window.fr_x_spin.setValue(float(p_world[0]))
+                window.fr_y_spin.setValue(float(p_world[1]))
+                _status(window, f"Next Folded Setup COM=({p_world[0]:.2f},{p_world[1]:.2f}); press Setup")
+                return
             if idx < 0:
                 return
             self._pin = idx
@@ -760,7 +760,7 @@ def _build_edit_mode_handlers(window):
             window._fr_pin_atom_id = window.scene._idx_to_id(idx)
             atom_pos = window.scene._pos[idx].astype(np.float64)
             r0, rd = window.scene._ray_from_mouse(event.pos)
-            target = self._closest_point_on_ray(atom_pos, r0, rd).astype(np.float32)
+            target = closest_point_on_ray(atom_pos, r0, rd).astype(np.float32)
             self._set_anchors(idx, target)
             _status(window, f"Pinned atom {window._fr_pin_atom_id} (idx={idx}); drag to pull")
 
@@ -772,7 +772,7 @@ def _build_edit_mode_handlers(window):
                 return
             atom_pos = window.scene._pos[self._pin].astype(np.float64)
             if r0 is not None and rd is not None:
-                target = self._closest_point_on_ray(atom_pos, r0, rd)
+                target = closest_point_on_ray(atom_pos, r0, rd)
             else:
                 target = np.array([p_world[0], p_world[1], atom_pos[2]], dtype=np.float64)
             self._set_anchors(self._pin, target.astype(np.float32))
@@ -784,17 +784,27 @@ def _build_edit_mode_handlers(window):
                 return
             self._set_anchors(-1, np.zeros(3, dtype=np.float32))
             self._pin = -1
-            window._fr_pin_idx = -1
-            window._fr_pin_atom_id = -1
             window.scene._pick_active = False
-            _status(window, "Pin released")
+            _status(window, f"Pin released; scan pin retained (atom {window._fr_pin_atom_id})")
 
         def on_rmb_atom(self, atom_id, ctrl):
             pass
 
+        def on_atom_click(self, atom_id, shift=False):
+            if shift:
+                return
+            idx = window.scene._id_to_idx_safe(atom_id)
+            if idx >= 0:
+                window._fr_pin_idx = idx
+                window._fr_pin_atom_id = atom_id
+                _status(window, f"Folded scan pin selected: {atom_id} (idx={idx})")
+
     window.register_mode_handler('fr_pin', FRPinMode(window))
     window.register_mode_handler('fr_com', FRComMode(window))
-    window.register_mode_handler('fr_manip', FRManipMode(window))
+    fr_handler = FRManipMode(window)
+    window.register_mode_handler('fr_manip', fr_handler)
+    if hasattr(window, 'register_manipulation_adapter'):
+        window.register_manipulation_adapter('folded_rigid', fr_handler)
 
 
 # ---------------------------------------------------------------------------

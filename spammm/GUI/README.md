@@ -18,6 +18,9 @@ PyQt5 GUI for molecular editing and AFM simulation. Main window combines VisPy 3
 - **ExtensionManager.py** — Lazy-loading extensions (AFM, FF, QEq, Vibrations, Kekule, ASCII, **reaction_coord**, …)
 - **VispyUtils.py** — VisPy ortho scene (`AtomScene`): atoms/bonds, picking, drag, camera presets, **2D/3D view** (`lock_top` / depth test / RMB orbit)
 - **EditModeHandlers.py** — Per-mode mouse dispatch; Ring mode 3D ray pick (atom/bond/COG)
+- **Manipulate mode** — canonical context-dispatched rigid interaction mode; Build/Setup
+  selects the explicit `rigid_assembly` or `folded_rigid` adapter. Shift+LMB owns the
+  backend spatial-constraint toggle.
 - **plotutils.py** — Qt 2D plot dialog; re-exports `spammm.plotUtils` grid/ESP helpers
 
 **View mode:** default top-down planar edit (`b2Dview=True`). `Enter` toggles ortho 3D (hex/empty disabled; Ring/atom/bond OK). See `doc/GUI_CHEATSHEET.md`, `doc/Tasks/GUI_Editor_3D_ViewMode.md`.
@@ -29,7 +32,12 @@ PyQt5 GUI for molecular editing and AFM simulation. Main window combines VisPy 3
 - **KekuleExtension.py** — Kekulé π-bond-order solver panel
 - **FoldedRigidExtension.py** — Folded-basis rigid-body manipulation panel (load molecule, fit/load substrate potential, drag atoms)
 - **ChargeRingsExtension.py** — PME charge-ring STM: JSON params, Calc XY/xV/1D, cut-line overlay, many-body state probs (`doc/TopicalAudit/ChargeRings_PME.md`); sites still abstract until pose SSOT (`RigidMoleculePose_SSOT.md`)
-- **RigidAssemblyExtension.py** — Unified rigid-body panel: **Drag** maps scene atoms through PairFF dummy sites and relaxes all molecules concurrently with FAF, **MC/GA** reproduces the deterministic testplot initialization, **PME** uses ensemble CoM + R(q). `RigidEnsemble` is the pose authority; GPU and `_mb_*` mirrors are checked/synchronized. L0 tests: `tests/GUI/test_rigid_assembly_extension.py`.
+- **RigidAssemblyExtension.py** — Unified rigid-body panel: **Manipulate** maps scene atoms
+  through PairFF dummy sites and relaxes all molecules concurrently with FAF; its probe map
+  is the explicit `Probe E: static bodies + substrate` diagnostic with cached Total/PairFF/FAF
+  layers. **MC/GA** reproduces the deterministic testplot initialization, **PME** uses
+  ensemble CoM + R(q). `RigidEnsemble` is the pose authority; GPU and `_mb_*` mirrors are
+  checked/synchronized. L0 tests: `tests/GUI/test_rigid_assembly_extension.py`.
 - **RigidBodyVispy.py** — Standalone Vispy+Qt viewer for **PairFF** (FIRE, click-to-select active, map = PairFF[+FAF]); used by `demos/demo_pairff.py` — superseded for main-GUI use by `RigidAssemblyExtension` (`PairFF_GUI_Integration.md`)
 - **AsciiArtExtension.py** — ASCII art → molecule; must match `build_ascii_hbond_system` pipeline for DFTB scans
 - **ReactionCoordinateExtension.py** — H-bond RC scan: import graph, DFTB methods, slider, bond viz, ESP animation

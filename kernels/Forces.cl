@@ -271,3 +271,40 @@ inline float2 compact_exp_pair_EF( float3 dr, float R0, float E0, float alpha, f
     float f_over_r = E0 * beta * (2.0f*alpha*y - (1.0f + alpha)) * u7 / fmax(rw, eps);
     return (float2)(E, f_over_r);
 }
+
+// Unified PairFF site-pair primitive used by rigid dynamics and probe maps.
+// REQ.x/y/z/w = radius, sqrt(E), charge/pseudo-charge, blunt width;
+// type 0 is a real atom, types 1/2 are directional dummy sites.
+// Returns (Fx,Fy,Fz,E) with the same operation order as the unified kernels.
+inline float4 pairff_unified_site_EF(float3 dp, float4 REQ_i, int type_i,
+                                     float4 REQ_j, int type_j, float beta){
+    const float gi = (type_i == 0) ? 1.0f : 0.0f;
+    const float gj = (type_j == 0) ? 1.0f : 0.0f;
+    const float gij = gi * gj;
+    const float R0 = gij * (REQ_i.x + REQ_j.x);
+    const float w = REQ_i.w + REQ_j.w;
+    const float alpha = gij;
+    const float inv_beta_n = 8.0f / fmax(beta, 1e-6f);
+    const float rho_c = R0 + inv_beta_n;
+    const float rc2 = rho_c * (rho_c + 2.0f * w);
+    const float attr = -fmin(0.0f, REQ_i.z * REQ_j.z);
+    const float both_dummy = 1.0f - fmin(gi + gj, 1.0f);
+    const float E0 = mix(attr, REQ_i.y * REQ_j.y, gij) * (1.0f - both_dummy);
+    const float r2 = dot(dp, dp);
+    float3 f = (float3)(0.0f);
+    float E = 0.0f;
+    if (E0 != 0.0f && r2 <= rc2){
+        const float2 ev = compact_exp_pair_EF(dp, R0, E0, alpha, w, beta);
+        E += ev.x;
+        f += dp * ev.y;
+    }
+    if (gij > 0.5f){
+        const float Q = REQ_i.z * REQ_j.z;
+        const float r2d = r2 + R2SAFE;
+        const float ir2d = 1.0f / r2d;
+        const float sqr_ir2d = sqrt(ir2d);
+        E += COULOMB_CONST * Q * sqr_ir2d;
+        f += dp * (COULOMB_CONST * Q * ir2d * sqr_ir2d);
+    }
+    return (float4)(f.x, f.y, f.z, E);
+}

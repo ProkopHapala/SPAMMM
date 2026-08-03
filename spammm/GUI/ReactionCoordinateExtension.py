@@ -388,9 +388,14 @@ def load_npz(window):
 
 
 def handle_rc_pin_click(window, atom_idx):
-    pinned = window.backend.toggle_constraint_by_index(atom_idx)
-    mask = window.backend.constraint_mask()
-    if hasattr(window, 'scene'):
-        window.scene.set_fixed_mask(mask)
+    if hasattr(window, 'toggle_spatial_constraint'):
+        atom_id = int(window.scene._idx_to_id(atom_idx))
+        window.toggle_spatial_constraint(atom_id)
+        pinned = atom_id in window.backend.constraint_set
+    else:
+        pinned = window.backend.toggle_constraint_by_index(atom_idx)
+        mask = window.backend.constraint_mask()
+        if hasattr(window, 'scene'):
+            window.scene.set_fixed_mask(mask)
     state = "pinned" if pinned else "unpinned"
     window.rc_status.setText(f"Atom {atom_idx} {state}")

@@ -1,11 +1,12 @@
 ---
 type: Report
 title: Static-obstacle drag demo — dimer split, frozen molecules, combined PairFF+FAF probe map (session 2026-08-03)
-status: corrected — 16 review findings addressed; 3 USER-reported regressions fixed; EventEmitter loop resolved; 23 L0 tests pass
-tags: [PairFF, FAF, drag, static-obstacle, body-state, mixed-species, NaCl, GUI-script, visualization, VisPy, benzoic-acid-dimer, connected-components, EventEmitter, re-entrancy]
+status: corrected + consolidated — 16 review findings addressed; 3 USER-reported regressions fixed; EventEmitter loop resolved; 3 post-consolidation corrections (C1–C3); 26 L0 tests pass; alt variant added
+tags: [PairFF, FAF, drag, static-obstacle, body-state, mixed-species, NaCl, GUI-script, visualization, VisPy, benzoic-acid-dimer, connected-components, EventEmitter, re-entrancy, probe-map, GPU, edit-modes, consolidation]
 timestamp: 2026-08-03
 related:
   - doc/Tasks/RigidAssembly_StaticMols_PotentialMap.md
+  - doc/Tasks/RigidAssembly_Demo_MapMode_Consolidation.md
   - doc/Reports/PTCDA_DragDemo_StickSlip_2026-08-01.md
   - doc/Tasks/PairFF_MultiBody_Kernel.md
   - doc/Tasks/RigidMoleculePose_SSOT.md
@@ -15,10 +16,16 @@ skills: [code-reuse, doc-read-navigate, molecular-structure-sync, numerical-pari
 
 # Static-obstacle drag demo — dimer split, frozen molecules, combined PairFF+FAF probe map
 
-**Status:** delivered — USER confirmed the final GIF shows correct bonds, FAF substrate, Pauli repulsion, and static/dynamic toggle.
-**Artifacts:** `debug/static_obstacle_drag_demo/static_obstacle_drag_demo.gif`, `.mp4`, `frame_first.png`, `frame_last.png`
-**Script:** `demos/gui_scripts/static_obstacle_drag_demo.py`
-**Run:** `./run_gui.sh --script demos/gui_scripts/static_obstacle_drag_demo.py`
+**Status:** delivered + consolidated — USER confirmed the original GIF; the demo was then
+refactored per [RigidAssembly_Demo_MapMode_Consolidation.md](../Tasks/RigidAssembly_Demo_MapMode_Consolidation.md)
+into two menu-loaded macros with honest PairFF parameters, a GPU probe-map kernel, a
+consolidated `Manipulate` edit mode, and three post-implementation corrections (C1–C3).
+L2 visual review of the consolidated version is in progress.
+**Artifacts:**
+- Static: `debug/static_obstacle_drag_demo/static/{static_obstacle_drag_demo.gif,.mp4,frame_first.png,frame_last.png}`
+- Alternate: `debug/static_obstacle_drag_demo/alternate/{static_obstacle_drag_demo_alt.gif,.mp4,frame_first.png,frame_last.png}`
+**Scripts:** `demos/gui_scripts/static_obstacle_drag_demo.py`, `demos/gui_scripts/static_obstacle_drag_demo_alt.py`
+**Run:** `./run_gui.sh --script demos/gui_scripts/static_obstacle_drag_demo.py` (or select from Scripts → Bundled)
 
 ---
 
@@ -29,9 +36,20 @@ Demonstrate dragging a dynamic molecule through a field of static (frozen) obsta
 1. Load a **benzoic acid dimer** from XYZ and split it into two rigid bodies via **connected components** of the molecular graph.
 2. Freeze one body as a **static obstacle** — it keeps its pose exactly but remains a PairFF partner.
 3. Drag the other body **toward** the static obstacle so they interact (not away).
-4. Show the **combined PairFF(static) + FAF(NaCl) probe map** as a background overlay.
-5. Mid-drag, **toggle the static molecule to dynamic and back** to demonstrate the static↔dynamic switching.
-6. Produce a GIF/MP4 from captured VisPy canvas frames.
+4. Show the **combined PairFF(static) + FAF(NaCl) probe map** as a background overlay, using the **exact PairFF parameters from dynamics** (no display-only `He`/`Hs` substitution).
+5. Produce a GIF/MP4 from captured VisPy canvas frames.
+
+**Two variants** (consolidated 2026-08-03, see [RigidAssembly_Demo_MapMode_Consolidation.md](../Tasks/RigidAssembly_Demo_MapMode_Consolidation.md)):
+
+- **`static_obstacle_drag_demo.py`** — one static, one dynamic, no mid-drag toggle. The
+  original mid-drag static↔dynamic toggle was removed per §0 of the consolidation task.
+- **`static_obstacle_drag_demo_alt.py`** — continuous role hand-off: drag body 1 toward
+  static body 0, swap roles at closest approach (body 1 becomes static, body 0 dynamic),
+  then pull body 0 **away** without resetting poses.
+
+Both scripts are menu-loaded macros with fixed animation settings and no CLI parameters.
+They switch to canonical `Manipulate` mode with `rigid_assembly` context before the final
+frame so the GUI is immediately interactive.
 
 ---
 
@@ -59,7 +77,27 @@ The demo loads `benzoicacid_dimer.xyz` (30 atoms) into the editor graph, then us
 ```
 E_map(x,y; z_probe) = E_PairFF(static molecules) + E_FAF(NaCl)
 ```
-Dynamic molecules are excluded — only frozen (static) bodies contribute to the PairFF part. The map is cached and only recomputed on build/toggle/delete/probe-change/explicit recompute.
+Dynamic molecules are excluded — only frozen (static) bodies contribute to the PairFF
+part. The map is cached and only recomputed on build/toggle/delete/probe-change/explicit
+recompute.
+
+**Consolidated (2026-08-03):** The map now uses the **exact PairFF parameters** from
+`rbd.pairff_params_host` (the same values used by dynamics) — no display-only `He=-1.0,
+Hs=0.0` substitution. A new GPU kernel `rigid_body_pairff_probe_grid` in `kernels/rigid.cl`
+evaluates the PairFF part on the 2D grid using the same inline `pairff_unified_site_EF`
+primitive as the dynamics kernels (kernel 15), giving codepath parity. The CPU reference
+in `RigidBodyUtils._compute_unified_probe_pair_map` remains for tests and headless use.
+
+**Nuclear exclusion (correction C3):** `compute_combined_probe_map` returns a 7th value,
+`exclude_mask` — a boolean array True within 1 Å of any real atom. The map itself is fully
+finite (no NaN holes); the mask is used **only** for `vmin/vmax` estimation so the color
+scale reflects the chemically meaningful attractive basins rather than the infinitely
+deep wells at nuclei. See `.devin/skills/centralized-plotting/SKILL.md` §"Nuclear exclusion".
+
+**Color scale rule (correction C1):** `vmin = Emin`, `vmax = |Emin|` (symmetric), where
+`Emin = min(E_for_lim)` and `E_for_lim = E[~exclude_mask]`. The color-limit spin resets to
+0 (Auto) on every recompute so the scale is always freshly derived from the current data.
+See `.devin/skills/centralized-plotting/SKILL.md` §"Color Scale Rule".
 
 ### 2.5 GUI controls
 
@@ -138,6 +176,8 @@ All 23 tests pass (1 slow deselected). Run: `pytest tests/test_body_state.py tes
 
 ## 5. Files changed
 
+### 5.1 Initial delivery (F1–F16)
+
 | File | Change |
 |---|---|
 | `kernels/rigid.cl` | `body_state` gate in kernels 14 + 15; kernel 15 early-exit for static/deleted workgroups (F9) |
@@ -150,24 +190,53 @@ All 23 tests pass (1 slow deselected). Run: `pytest tests/test_body_state.py tes
 | `tests/test_body_state.py` | 10 tests (2 new: nmol=2 ordering, static force=0) |
 | `tests/GUI/test_rigid_assembly_extension.py` | 13 tests (2 new: gesture toggle/delete, mixed-species build) |
 
+### 5.2 Consolidation + corrections (2026-08-03)
+
+| File | Change |
+|---|---|
+| `kernels/rigid.cl` | New `rigid_body_pairff_probe_grid` kernel + shared `pairff_unified_site_EF` inline primitive (used by both grid and dynamics kernels); computes physical energy at every pixel (no NaN) |
+| `spammm/forcefields/RigidBodyDynamics.py` | `eval_probe_grid_gpu` method — GPU grid evaluation via the new kernel |
+| `spammm/forcefields/RigidBodyUtils.py` | `compute_combined_probe_map` reads `beta` from `rbd.pairff_params_host`; `plan_probe_grid` uses RA margin (10 Å) + view aspect; new `nuclear_exclusion_mask` function; 7-tuple return with `exclude_mask`; CPU path computes normally everywhere (no NaN) |
+| `spammm/GUI/RigidAssemblyExtension.py` | Map UI controls (layer combo, limit spin, margin spin); `_recompute_ra_combined_map` resets spin to Auto + stores `exclude_mask`; `_update_ra_combined_map_visual` and `_on_ra_map_auto` use `E[~exclude_mask]` for `vmin/vmax`; consolidated `Manipulate` mode dispatch with `set_manipulation_context` |
+| `spammm/GUI/RigidBodyVispy.py` | `potential_to_rgba` honors explicit `vmin`/`vmax`; docstring documents `vmin=Emin, vmax=\|Emin\|` rule |
+| `spammm/GUI/FoldedRigidExtension.py` | `fr_manip` registered as manipulation adapter; `set_manipulation_context` called |
+| `spammm/GUI/FFExtension.py` | Pin/unpin delegates to `window.toggle_spatial_constraint` |
+| `spammm/GUI/ReactionCoordinateExtension.py` | RC pin delegates to `window.toggle_spatial_constraint` |
+| `spammm/GUI/SPAMMM_GUI.py` | `toggle_spatial_constraint` SSOT; consolidated `Manipulate` mode handler |
+| `spammm/GUI/EditModeHandlers.py` | Manipulation adapter base class |
+| `demos/gui_scripts/static_obstacle_drag_demo.py` | Removed mid-drag toggle; retains frames; switches to `Manipulate` mode at end; no CLI parameters |
+| `demos/gui_scripts/static_obstacle_drag_demo_alt.py` | New: continuous role hand-off variant; layer set to `'Total'` (C2 fix); switches to `Manipulate` mode at end |
+| `tests/test_body_state.py` | `test_combined_map_decomposition_and_invalidation` updated for 7-tuple return + finite-only assertions |
+| `.devin/skills/centralized-plotting/SKILL.md` | New "Color Scale Rule" and "Nuclear exclusion" sections |
+| `doc/nonbonding_forcefields.md` | "Unfitted working defaults" section documenting `He`/`Hs` provenance |
+
 ---
 
 ## 6. Reproduction
 
 ```bash
-# Run the demo (produces GIF + MP4 + first/last PNG)
+# Static variant (produces GIF + MP4 + first/last PNG in static/)
 ./run_gui.sh --script demos/gui_scripts/static_obstacle_drag_demo.py
 
-# Custom drag distance and relaxation
-./run_gui.sh --script demos/gui_scripts/static_obstacle_drag_demo.py -- --drag-x 10 --n-relax 300
+# Alternate variant (role hand-off; produces GIF + MP4 + first/last PNG in alternate/)
+./run_gui.sh --script demos/gui_scripts/static_obstacle_drag_demo_alt.py
+
+# Or select from Scripts → Bundled menu in the GUI
 
 # Run tests
-pytest tests/test_body_state.py tests/GUI/test_rigid_assembly_extension.py -m "not slow"
+pytest tests/test_body_state.py tests/GUI/test_rigid_assembly_extension.py tests/GUI/test_gui_script_utils.py -m "not slow"
 ```
 
-**Output:** `debug/static_obstacle_drag_demo/static_obstacle_drag_demo.gif` (682×709, ~3.4 MB), `.mp4` (~94 KB)
+**Output:**
+- `debug/static_obstacle_drag_demo/static/static_obstacle_drag_demo.gif` (~6.5 MB), `.mp4` (~86 KB), 55 frames
+- `debug/static_obstacle_drag_demo/alternate/static_obstacle_drag_demo_alt.gif` (~8.7 MB), `.mp4` (~125 KB), 109 frames
 
-**Energy trace:** E starts at -1.62 eV (relaxed), rises as the dynamic molecule approaches the static obstacle (Pauli repulsion), drops to -1.68 eV when the static molecule is toggled to dynamic (both relax), then rises again as the drag continues past the obstacle.
+**Energy trace (static variant):** E starts at -0.93 eV (relaxed), rises monotonically as
+the dynamic molecule approaches the static obstacle (Pauli repulsion), peaks at +1.52 eV
+near closest approach, then relaxes as the drag continues past the obstacle.
+
+**Energy trace (alt variant):** Same initial rise, then a role swap at closest approach
+(body 1 becomes static, body 0 dynamic) and a second drag phase pulling body 0 away.
 
 ---
 
@@ -248,3 +317,73 @@ This was a **pre-existing** latent bug — `processEvents()` was in `refresh_vie
 **Verification:** Demo script runs 54 drag steps with 0 EventEmitter errors and 0 Tracebacks. Interactive GUI drag also works (USER confirmed).
 
 **Key insight:** `processEvents()` must never be called from within a Qt/vispy event callback. It processes pending events synchronously, causing re-entrant emission on the same EventEmitter. See [Takeways.md](../Takeways.md) → "processEvents re-entrancy in vispy mouse callbacks".
+
+---
+
+## 9. Post-consolidation corrections (C1–C3, 2026-08-03)
+
+After the consolidation task ([RigidAssembly_Demo_MapMode_Consolidation.md](../Tasks/RigidAssembly_Demo_MapMode_Consolidation.md))
+was implemented, L2 USER visual review found three issues. These are distinct from the
+F1–F16 findings (§7) and the §8 regressions — they are new issues in the consolidated code.
+
+### 9.1 C1 — Map color scale oversaturated after recompute
+
+**Symptom:** After toggling a body's state (Shift+LMB), the combined map's color scale
+became oversaturated — the attractive basins and FAF corrugation were no longer visible.
+
+**Root cause:** `_recompute_ra_combined_map` set the color-limit spin to the computed
+`|Emin|` on the first call. On subsequent recomputes (after body-state toggle), the spin
+held a stale positive value, so `_update_ra_combined_map_visual` used it as a fixed limit
+instead of recomputing from the new data. Additionally, `_on_ra_map_auto` used
+`np.percentile(attractive, 5)` instead of the user-mandated `|Emin|`.
+
+**Fix:** `_recompute_ra_combined_map` now resets the spin to 0 (Auto) before
+`_update_ra_combined_map_visual`, so `vmin=Emin, vmax=|Emin|` is freshly computed every
+time. `_on_ra_map_auto` uses `max(|Emin|, 0.01)`. This rule is documented as permanent in
+`.devin/skills/centralized-plotting/SKILL.md` §"Color Scale Rule".
+
+### 9.2 C2 — Alt demo missing FAF component
+
+**Symptom:** The alternate demo's background map showed only PairFF — no NaCl substrate
+corrugation.
+
+**Root cause:** `static_obstacle_drag_demo_alt.py` set `ra_map_layer_combo` to `'PairFF'`,
+excluding FAF from the display.
+
+**Fix:** Changed to `'Total'` so the combined PairFF+FAF map is shown, matching the static
+variant.
+
+### 9.3 C3 — Nuclear singularities dominate |Emin|
+
+**Symptom:** The color scale was dominated by the infinitely deep attractive wells at
+real-atom nuclei (compact-exp + damped Coulomb), washing out the chemically meaningful
+attractive basins and FAF corrugation.
+
+**Investigation:** Two approaches were tried:
+1. **NaN holes (rejected):** Set pixels within 1 Å of any real atom to NaN in both the GPU
+   kernel and CPU reference; render NaN pixels transparent. This produced "disturbing
+   white areas" per USER feedback and made the map discontinuous.
+2. **Mask for vmin/vmax only (accepted):** Compute the physical energy at every pixel
+   (no NaN holes); return a separate boolean `exclude_mask` (True within 1 Å of any real
+   atom); use the mask only to exclude nuclear singularities from `vmin/vmax` estimation.
+
+**Fix (approach 2):**
+- New `nuclear_exclusion_mask(xs, ys, z_probe, static_apos, static_types, r=1.0)` in
+  `RigidBodyUtils.py`.
+- `compute_combined_probe_map` returns a 7-tuple with `exclude_mask` as the 7th value.
+- GPU kernel `rigid_body_pairff_probe_grid` computes normally everywhere (no NaN
+  early-return); the kernel header comment notes the host-side mask.
+- CPU `_compute_unified_probe_pair_map` computes normally everywhere; returns the mask.
+- GUI uses `E_for_lim = E[~exclude_mask]` for `vmin/vmax` estimation only; the map itself
+  is fully finite and displayed everywhere.
+- `potential_to_rgba` no longer has NaN transparency logic.
+- `test_combined_map_decomposition_and_invalidation` updated for 7-tuple return +
+  finite-only assertions.
+
+**Lesson:** Display continuity matters more than hiding nuclear singularities. The map
+should be physically complete everywhere; only the color scale derivation should exclude
+the singularities. See `.devin/skills/centralized-plotting/SKILL.md` §"Nuclear exclusion".
+
+**Verification after C1–C3:** 17 focused tests pass; `pytest -m "not slow"` reaches 450
+passed (1 unrelated failure). Both demos re-run successfully (55 + 109 frames). Artifacts
+regenerated at `debug/static_obstacle_drag_demo/{static,alternate}/`.

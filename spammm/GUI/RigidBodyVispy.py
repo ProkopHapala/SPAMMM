@@ -29,8 +29,8 @@ Features:
   - LMB click+drag on dynamic atoms for anchor spring picking
   - Multi-body: LMB click on any molecule (dyn or static) selects it as active —
     that body becomes mobile; others become frozen env; potential map recomputed
-  - Potential map background: Morse + epair Hbond + sigma-hole (no Coulomb),
-    matching ff_map.py's morseH_only mode. Presets H+(q=+0.4) / O−(q=-0.4);
+  - Potential map background: unified compact-exp + damped Coulomb PairFF,
+    matching the diagnostic map contract. Presets H+(q=+0.4) / O−(q=-0.4);
     when ``rbd.faf_mode`` + ``rbd.faf_fit``, map is **PairFF + FAF** at active CoM z.
     **Display SSOT:** ``potential_to_rgba`` uses ``vmax=max(|Emin|,0.01)`` so Pauli
     cores clip and FAF corrugation stays visible — offline plots must reuse this
@@ -43,9 +43,8 @@ Features:
   - SPACE = run/stop, R = reset, F = FIRE (default ON), ESC = quit
 
 Caveats:
-  - Potential map does NOT include Coulomb (matches ff_map.py 'morseH_only' mode).
-    The GPU kernel does include Coulomb, so the map is an approximation of the
-    actual forces for visualization purposes only.
+  - The CPU map is a reference path; Rigid Assembly production maps may use the
+    GPU grid evaluator. Both consume packed REQ values and include damped Coulomb.
   - Bond computation uses a fixed 1.8 Å cutoff — may miss long bonds or include
     spurious ones for non-standard geometries.
   - Map plane z = active CoM (or ``rbd.map_z``); with ``faf_mode`` the map is
@@ -183,67 +182,46 @@ def compute_potential_map_unified(static_apos, static_REQ, static_enames, static
                                   probe_R0, probe_E0, probe_q, z_height=0.0, margin=4.0, step=0.1,
                                   He=-1.0, Hs=0.0, w=0.7, beta=1.7, atom_types=None,
                                   xs=None, ys=None):
-    """2D map for unified compact-exp PairFF (no Coulomb), matching GPU mixing.
+    """2D reference map for unified compact-exp + damped Coulomb PairFF.
 
-    If xs/ys are provided, uses them as the grid axes (extent comes from caller).
-    Otherwise derives extent from static_apos + margin.
+    ``static_REQ`` is already the packed production REQ array.  The legacy ``He``,
+    ``Hs`` and ``w`` arguments are retained for call compatibility but are not used;
+    display code must not override physics parameters.
     """
-    compact_EF, _ = _load_compact_exp()
-    apos = np.asarray(static_apos, dtype=np.float64)
-    REQs = np.asarray(static_REQ, dtype=np.float64).copy()
-    types = np.asarray(static_types, dtype=np.int32)
-    for i, t in enumerate(types):
-        if t == 1:
-            REQs[i, 2] = He
-            REQs[i, 3] = w
-        elif t == 2:
-            REQs[i, 2] = Hs
-            REQs[i, 3] = w
-        else:
-            REQs[i, 3] = 0.0
-
+    from spammm.forcefields.RigidBodyUtils import _compute_unified_probe_pair_map, plan_probe_grid
+    apos = np.asarray(static_apos, dtype=np.float64).reshape(-1, 3)
     if xs is None or ys is None:
-        xmin, ymin = apos[:, 0].min() - margin, apos[:, 1].min() - margin
-        xmax, ymax = apos[:, 0].max() + margin, apos[:, 1].max() + margin
-        xs = np.arange(xmin, xmax + step, step)
-        ys = np.arange(ymin, ymax + step, step)
+        xy = apos[:, :2] if len(apos) else np.zeros((0, 2), dtype=np.float64)
+        xs, ys, extent = plan_probe_grid(xy, margin=margin, step=step)
     else:
-        xmin, xmax, ymin, ymax = float(xs[0]), float(xs[-1]), float(ys[0]), float(ys[-1])
-    X, Y = np.meshgrid(xs, ys)
-    Emap = np.zeros_like(X, dtype=np.float64)
-
-    probe_R = float(probe_R0)
-    probe_e = float(np.sqrt(max(float(probe_E0), 0.0)))
-    gi, wi, Qi = 1.0, 0.0, float(probe_q)
-
-    for j in range(len(types)):
-        gj = 1.0 if types[j] == 0 else 0.0
-        gij = gi * gj
-        R0 = gij * (probe_R + REQs[j, 0])
-        wij = wi + REQs[j, 3]
-        alpha = gij
-        attr = -min(0.0, Qi * REQs[j, 2])
-        both_dummy = 1.0 - min(gi + gj, 1.0)
-        E0 = (attr if gij < 0.5 else probe_e * REQs[j, 1]) * (1.0 - both_dummy)
-        if E0 == 0.0:
-            continue
-        dx = X - apos[j, 0]
-        dy = Y - apos[j, 1]
-        dz = z_height - apos[j, 2]
-        r = np.sqrt(dx * dx + dy * dy + dz * dz)
-        V, _ = compact_EF(r, R0, E0, beta, power=8, alpha=alpha, w=wij, soft_kind='sqrt')
-        Emap += V
-
-    return Emap, xs, ys, [xmin, xmax, ymin, ymax]
+        xs = np.asarray(xs, dtype=np.float64)
+        ys = np.asarray(ys, dtype=np.float64)
+        extent = [float(xs[0]), float(xs[-1]), float(ys[0]), float(ys[-1])]
+    probe_REQ = np.array([probe_R0, np.sqrt(max(float(probe_E0), 0.0)), probe_q, 0.0], dtype=np.float64)
+    Emap = _compute_unified_probe_pair_map(static_apos, static_REQ, static_types,
+                                           probe_REQ, z_height, xs, ys, beta)
+    return Emap, xs, ys, extent
 
 
 def potential_to_rgba(Emap, vmin=None, vmax=None):
     """Convert energy map to RGBA using RdBu_r colormap (same as ff_map.py).
-    Symmetric scale: vmax = max(|Emin|, 0.01), vmin = -vmax.
+    Symmetric scale: vmin = Emin, vmax = |Emin| (i.e. vmax = -vmin).
     Repulsion in atom centers is oversaturated (clipped) — that's OK."""
     import matplotlib.cm as cm
-    vmax = max(abs(Emap.min()), 0.01)
-    vmin = -vmax
+    Emap = np.asarray(Emap)
+    if vmin is None and vmax is None:
+        vmax = max(abs(float(np.nanmin(Emap))), 0.01)
+        vmin = -vmax
+    elif vmin is None:
+        vmax = float(vmax)
+        vmin = -abs(vmax)
+    elif vmax is None:
+        vmin = float(vmin)
+        vmax = abs(vmin)
+    else:
+        vmin, vmax = float(vmin), float(vmax)
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        raise ValueError(f'potential color limits must be finite with vmax>vmin, got {vmin}, {vmax}')
     Enorm = np.clip((Emap - vmin) / (vmax - vmin + 1e-12), 0, 1)
     rgba = cm.get_cmap('RdBu_r')(Enorm).astype(np.float32)
     rgba[..., 3] = 0.6  # semi-transparent

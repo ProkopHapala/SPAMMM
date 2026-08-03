@@ -15,7 +15,8 @@ Key functions:
 - **`build_mixed_species_assembly`** — round-robin body ordering for multi-species
   assemblies. Deterministic, interleaved by copy.
 - **`compute_combined_probe_map`** — E_map = E_PairFF(static) + E_FAF(NaCl).
-  Dynamic molecules excluded. Headless (no Qt/Vispy). Warm recompute ~254ms (CPU).
+  Dynamic molecules excluded. Headless (no Qt/Vispy); the CPU path is an independent
+  reference for the production GPU evaluator.
 
 Used by: GUI extensions (RigidAssemblyExtension, FoldedRigidExtension),
 demos (demo_pairff, static_obstacle_drag_demo), tests (test_body_state,
@@ -24,8 +25,8 @@ testplot_pairff_energy_mc, test_forcefield).
 Caveats:
 - `graph_to_rigid_fragments` returns atoms in BFS order — the display graph must
   be rebuilt to match (see `RigidAssemblyExtension._ensure_backend_matched`).
-- `compute_combined_probe_map` is CPU-only; warm recompute exceeds 0.2s budget
-  for large assemblies. GPU map kernel deferred.
+- `compute_combined_probe_map` remains available as a parity/reference path; GUI
+  recompute may use `RigidBodyPairFF.eval_probe_grid_gpu` when the device supports it.
 """
 import numpy as np
 
@@ -34,6 +35,9 @@ from spammm.AtomicSystem import AtomicSystem
 from spammm.topology.FFparams import make_REQs_from_enames
 from .QEq import solve_from_elements, get_atom_types, compute_qeq_reqs
 from .RigidBodyDynamics import _body_sites_world
+
+COULOMB_CONST = 14.3996448915
+R2SAFE = 1e-4
 
 
 # =============================================================================
@@ -209,14 +213,122 @@ def build_mixed_species_assembly(mol_names, nmol, mol_paths, no_qeq_set, spacing
 # Headless combined PairFF+FAF probe map (shared by GUI + tests)
 # =============================================================================
 
+def plan_probe_grid(xy, margin=4.0, step=0.1, aspect=None, max_points=2_000_000):
+    """Plan a snapped ``(ny,nx)`` XY grid around real-atom coordinates.
+
+    ``aspect`` is canvas width/height.  Only the shorter world-space axis is
+    expanded, so atom+margin bounds are never cropped.  The point limit fails
+    loudly instead of silently changing scientific sampling.
+    """
+    step = float(step)
+    margin = float(margin)
+    if not np.isfinite(step) or step <= 0.0:
+        raise ValueError(f'grid step must be finite and positive, got {step}')
+    if not np.isfinite(margin) or margin < 0.0:
+        raise ValueError(f'grid margin must be finite and non-negative, got {margin}')
+    xy = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+    if xy.size:
+        lo = xy.min(axis=0) - margin
+        hi = xy.max(axis=0) + margin
+    else:
+        lo = np.array([-margin, -margin], dtype=np.float64)
+        hi = np.array([margin, margin], dtype=np.float64)
+    center = 0.5 * (lo + hi)
+    span = np.maximum(hi - lo, step)
+    if aspect is not None:
+        aspect = float(aspect)
+        if not np.isfinite(aspect) or aspect <= 0.0:
+            raise ValueError(f'grid aspect must be finite and positive, got {aspect}')
+        current = span[0] / span[1]
+        if current < aspect:
+            span[0] = span[1] * aspect
+        elif current > aspect:
+            span[1] = span[0] / aspect
+    lo = np.floor((center - 0.5 * span) / step) * step
+    hi = np.ceil((center + 0.5 * span) / step) * step
+    xs = np.arange(lo[0], hi[0] + 0.5 * step, step, dtype=np.float64)
+    ys = np.arange(lo[1], hi[1] + 0.5 * step, step, dtype=np.float64)
+    n_points = int(xs.size) * int(ys.size)
+    if n_points > int(max_points):
+        raise ValueError(f'probe grid needs {n_points} points ({ys.size}x{xs.size}); '
+                         f'increase step or reduce margin (limit={int(max_points)})')
+    return xs, ys, [float(xs[0]), float(xs[-1]), float(ys[0]), float(ys[-1])]
+
+
+def _compute_unified_probe_pair_map(static_apos, static_REQ, static_types, probe_REQ,
+                                    z_probe, xs, ys, beta):
+    """Independent NumPy reference for the unified GPU site-pair energy."""
+    apos = np.asarray(static_apos, dtype=np.float64).reshape(-1, 3)
+    req = np.asarray(static_REQ, dtype=np.float64).reshape(-1, 4)
+    types = np.asarray(static_types, dtype=np.int32).reshape(-1)
+    if len(apos) != len(req) or len(req) != len(types):
+        raise ValueError('static site positions, REQ, and types must have equal lengths')
+    probe = np.asarray(probe_REQ, dtype=np.float64).reshape(4)
+    X, Y = np.meshgrid(np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64), indexing='xy')
+    Emap = np.zeros_like(X, dtype=np.float64)
+    gi = 1.0
+    beta = float(beta)
+    if not np.isfinite(beta) or beta <= 0.0:
+        raise ValueError(f'PairFF beta must be finite and positive, got {beta}')
+    for j, typ in enumerate(types):
+        gj = 1.0 if int(typ) == 0 else 0.0
+        gij = gi * gj
+        R0 = gij * (probe[0] + req[j, 0])
+        w = probe[3] + req[j, 3]
+        alpha = gij
+        attr = -min(0.0, probe[2] * req[j, 2])
+        both_dummy = 1.0 - min(gi + gj, 1.0)
+        E0 = (attr * (1.0 - gij) + probe[1] * req[j, 1] * gij) * (1.0 - both_dummy)
+        dx = X - apos[j, 0]
+        dy = Y - apos[j, 1]
+        dz = float(z_probe) - apos[j, 2]
+        r2 = dx * dx + dy * dy + dz * dz
+        if E0 != 0.0:
+            rho_c = R0 + 8.0 / beta
+            rc2 = rho_c * (rho_c + 2.0 * w)
+            mask = r2 <= rc2
+            rw = np.sqrt(r2 + w * w)
+            rho = r2 / np.maximum(rw + w, 1e-12)
+            u = np.maximum(0.0, 1.0 - (beta / 8.0) * (rho - R0))
+            u2 = u * u
+            u4 = u2 * u2
+            y = u4 * u4
+            Emap += np.where(mask, E0 * y * (alpha * y - (1.0 + alpha)), 0.0)
+        if gij > 0.5:
+            Emap += COULOMB_CONST * probe[2] * req[j, 2] / np.sqrt(r2 + R2SAFE)
+    return Emap
+
+
+def nuclear_exclusion_mask(xs, ys, z_probe, static_apos, static_types, r=1.0):
+    """Boolean mask (ny, nx): True where pixel is within r Å of any real atom.
+
+    Used to exclude nuclear singularities from vmin/vmax estimation without
+    punching NaN holes in the displayed map.
+    """
+    xs = np.asarray(xs, dtype=np.float64).reshape(-1)
+    ys = np.asarray(ys, dtype=np.float64).reshape(-1)
+    apos = np.asarray(static_apos, dtype=np.float64).reshape(-1, 3)
+    types = np.asarray(static_types, dtype=np.int32).reshape(-1)
+    X, Y = np.meshgrid(xs, ys, indexing='xy')
+    excluded = np.zeros_like(X, dtype=bool)
+    r2 = float(r) * float(r)
+    for j, typ in enumerate(types):
+        if int(typ) != 0:
+            continue
+        dx = X - apos[j, 0]
+        dy = Y - apos[j, 1]
+        dz = float(z_probe) - apos[j, 2]
+        excluded |= (dx * dx + dy * dy + dz * dz) < r2
+    return excluded
+
 def compute_combined_probe_map(rbd, fit, frozen_mask, probe_R0, probe_E0, probe_q,
-                               z_probe, margin=4.0, step=0.1, beta=1.7,
-                               He=-1.0, Hs=0.0, w=0.7):
+                               z_probe, margin=4.0, step=0.1, beta=None, aspect=None):
     """Compute E_map = E_PairFF(static mols) + E_FAF(NaCl) on a 2D grid at z_probe.
 
-    Headless (no Qt/VisPy). Reuses compute_potential_map_unified from RigidBodyVispy
-    and eval_folded_potential_grid from FoldedRigid.  Dynamic molecules are excluded
-    — only frozen (static) bodies contribute to the PairFF part.
+    Headless (no Qt/VisPy).  Dynamic molecules are excluded — only frozen (static)
+    bodies contribute to the PairFF part.  The CPU PairFF calculation consumes the
+    packed ``REQ_ext`` values and includes the same compact-exp + damped Coulomb terms
+    as unified dynamics.
 
     Args:
         rbd: RigidBodyPairFF with _mb_packs populated
@@ -225,7 +337,7 @@ def compute_combined_probe_map(rbd, fit, frozen_mask, probe_R0, probe_E0, probe_
         probe_R0, probe_E0, probe_q: probe parameters
         z_probe: absolute z height for map evaluation
         margin, step: grid extent margin and step in Angstrom
-        beta, He, Hs, w: PairFF parameters
+        beta: optional parity assertion; production beta comes from ``rbd``.
 
     Returns:
         E_sum: (ny, nx) float64 — combined PairFF + FAF potential
@@ -234,9 +346,17 @@ def compute_combined_probe_map(rbd, fit, frozen_mask, probe_R0, probe_E0, probe_
         xs: (nx,) float64 — x axis
         ys: (ny,) float64 — y axis
         extent: [xmin, xmax, ymin, ymax]
+        exclude_mask: (ny, nx) bool — True within 1 Å of a real atom (for vmin/vmax)
     """
-    from spammm.GUI.RigidBodyVispy import compute_potential_map_unified
     from spammm.surfaces.FoldedRigid import eval_folded_potential_grid, faf_type_idx_for_probe, faf_fit_mode, FAF_MODE_FACTOR
+
+    params = getattr(rbd, 'pairff_params_host', None)
+    if params is None or params.get('beta') is None:
+        raise RuntimeError('RigidBodyPairFF map requires packed pairff_params_host[beta]')
+    beta_live = float(params['beta'])
+    if beta is not None and not np.isclose(float(beta), beta_live, rtol=0.0, atol=1e-7):
+        raise ValueError(f'caller beta={beta} disagrees with live PairFF beta={beta_live}')
+    beta = beta_live
 
     # Gather world sites from frozen (static) bodies only (for PairFF energy)
     # but compute grid extent from ALL live real atoms (so dynamic bodies stay in view)
@@ -260,32 +380,31 @@ def compute_combined_probe_map(rbd, fit, frozen_mask, probe_R0, probe_E0, probe_
         sites_types.append(pack['types'])
 
     # Grid extent from all live real atoms (not just static)
-    margin_f, step_f = float(margin), float(step)
-    if all_live_xy:
-        all_xy = np.vstack(all_live_xy).astype(np.float64)
-        xmin, ymin = float(all_xy[:, 0].min() - margin_f), float(all_xy[:, 1].min() - margin_f)
-        xmax, ymax = float(all_xy[:, 0].max() + margin_f), float(all_xy[:, 1].max() + margin_f)
-    else:
-        xmin, ymin = -margin_f, -margin_f
-        xmax, ymax = margin_f, margin_f
-    xs = np.arange(xmin, xmax + step_f, step_f)
-    ys = np.arange(ymin, ymax + step_f, step_f)
-    extent = [xmin, xmax, ymin, ymax]
+    all_xy = np.vstack(all_live_xy).astype(np.float64) if all_live_xy else np.zeros((0, 2), dtype=np.float64)
+    xs, ys, extent = plan_probe_grid(all_xy, margin=margin, step=step, aspect=aspect)
 
     if sites_pos:
         static_apos = np.vstack(sites_pos).astype(np.float64)
         static_REQ = np.vstack(sites_REQ).astype(np.float64)
         static_types = np.concatenate(sites_types).astype(np.int32)
-        E_pairff, _, _, _ = compute_potential_map_unified(
-            static_apos, static_REQ, sites_enames, static_types,
-            probe_R0, probe_E0, probe_q, z_height=z_probe, margin=margin, step=step,
-            He=He, Hs=Hs, w=w, beta=beta, xs=xs, ys=ys)
+        probe_REQ = np.array([probe_R0, np.sqrt(max(float(probe_E0), 0.0)), probe_q, 0.0], dtype=np.float64)
+        if getattr(rbd, 'ctx', None) is not None and hasattr(rbd, 'eval_probe_grid_gpu'):
+            gpu_map = rbd.eval_probe_grid_gpu(
+                static_apos, static_REQ, static_types, probe_REQ, xs, ys, z_probe,
+                beta=beta, probe_faf=fit is not None)
+            E_pairff = np.asarray(gpu_map[..., 1], dtype=np.float64)
+            E_faf_gpu = np.asarray(gpu_map[..., 2], dtype=np.float64)
+        else:
+            E_pairff = _compute_unified_probe_pair_map(
+                static_apos, static_REQ, static_types, probe_REQ, z_probe, xs, ys, beta)
+            E_faf_gpu = None
     else:
         E_pairff = np.zeros((len(ys), len(xs)), dtype=np.float64)
+        E_faf_gpu = None
 
     # FAF contribution
     E_faf = None
-    if fit is not None:
+    if fit is not None and E_faf_gpu is None:
         mode = faf_fit_mode(fit)
         if mode == FAF_MODE_FACTOR:
             probe_REQH = np.array([float(probe_R0), float(np.sqrt(max(float(probe_E0), 0.0))),
@@ -295,8 +414,15 @@ def compute_combined_probe_map(rbd, fit, frozen_mask, probe_R0, probe_E0, probe_
             ityp = faf_type_idx_for_probe(fit, probe_R0, probe_E0, probe_q)
             E_faf = eval_folded_potential_grid(fit, ityp, xs, ys, z_probe)
 
+    if E_faf_gpu is not None:
+        E_faf = E_faf_gpu
     E_sum = E_pairff + (E_faf if E_faf is not None else 0.0)
-    return E_sum, E_pairff, E_faf, xs, ys, extent
+    # Nuclear exclusion mask: pixels within 1 Å of any real atom (for vmin/vmax only)
+    if sites_pos:
+        exclude_mask = nuclear_exclusion_mask(xs, ys, z_probe, static_apos, static_types, r=1.0)
+    else:
+        exclude_mask = np.zeros((len(ys), len(xs)), dtype=bool)
+    return E_sum, E_pairff, E_faf, xs, ys, extent, exclude_mask
 
 
 # =============================================================================

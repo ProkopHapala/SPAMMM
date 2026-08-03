@@ -43,16 +43,13 @@ The panel remembers these per script in QSettings.
   - Custom: `-- --drag-x 20 --n-relax 300 --anchor-atom 29 --opposite-atom 27`
   - Format: `--format gif|mp4|both` (default: `both` — MP4 is ~10x smaller than GIF)
   - Report: [`doc/Reports/PTCDA_DragDemo_StickSlip_2026-08-01.md`](../../../doc/Reports/PTCDA_DragDemo_StickSlip_2026-08-01.md)
-- **static_obstacle_drag_demo.py** — Paced generator: load benzoic acid dimer
-  from XYZ → split into 2 rigid bodies via connected components (From editor) →
-  freeze body 0 as static obstacle → compute combined PairFF(static)+FAF O−
-  probe map → drag body 1 TOWARD static obstacle (FIRE relaxation per step) →
-  mid-drag toggle static→dynamic→static → capture VisPy canvas frames →
-  GIF/MP4. Shows probe map overlay, anchor spring line, trajectory lines.
-  - Example: `./run_gui.sh --script demos/gui_scripts/static_obstacle_drag_demo.py`
-  - Custom: `-- --drag-x 10 --n-relax 300 --drag-step 0.15`
-  - Format: `--format gif|mp4|both` (default: `both`)
-  - Report: [`doc/Reports/StaticObstacle_DragDemo_2026-08-03.md`](../../../doc/Reports/StaticObstacle_DragDemo_2026-08-03.md)
+- **static_obstacle_drag_demo.py** — Menu-loaded paced macro: load benzoic acid dimer
+  → split into two rigid bodies → freeze body 0 → show the honest PairFF(static)+FAF
+  probe map → drag body 1 toward the obstacle → retain PNG/GIF/MP4 review artifacts.
+  It has fixed animation settings and no CLI parameters.
+- **static_obstacle_drag_demo_alt.py** — Menu-loaded paced macro with the same initial
+  setup, then a continuous role hand-off: body 1 becomes the static obstacle and body 0
+  is pulled away without resetting poses. It also has no CLI parameters.
 - **folded_rigid_setup.py** — Load a molecule, fit or load a folded substrate
   potential, and start the `FoldedRigid` extension in run or manip (drag) mode.
   - Arguments: `--mol`, `--substrate`, `--fit`, `--fit-fit`, `--run`, `--step`,

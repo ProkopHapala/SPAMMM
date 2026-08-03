@@ -37,8 +37,8 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `LFFSolver.py` — linearized projective Jacobi (K₁₂/K₁₃/K₁₄ from UFF; soft FAF)
 - `SPFFbuilder.py` — SPFF topology/buffer builder
 - `UFFbuilder.py` — UFF topology/buffer builder
-- `RigidBodyDynamics.py` — rigid body dynamics integrator; `RigidBodyPairFF` with per-body state (dynamic/static/deleted), mixed-species packs, factorized PLQH, `body_state` GPU buffer
-- `RigidBodyUtils.py` — shared helpers: `build_mixed_species_assembly` (round-robin body order), `compute_combined_probe_map` (PairFF static + FAF), `graph_to_rigid_fragments` (connected-components split)
+- `RigidBodyDynamics.py` — rigid body dynamics integrator; `RigidBodyPairFF` with per-body state (dynamic/static/deleted), mixed-species packs, factorized PLQH, `body_state` GPU buffer, `eval_probe_grid_gpu` (GPU grid map via kernel 18)
+- `RigidBodyUtils.py` — shared helpers: `build_mixed_species_assembly` (round-robin body order), `compute_combined_probe_map` (PairFF static + FAF, honest params from `rbd.pairff_params_host`, returns `exclude_mask`), `nuclear_exclusion_mask` (1 Å around real atoms, for vmin/vmax only), `plan_probe_grid` (RA margin + view aspect), `graph_to_rigid_fragments` (connected-components split)
 - `RigidBodyAFM.py` — rigid body AFM tip dynamics
 - `Assembly.py` — hexagonal SAM rigid-body packing search (orchestration + `AssemblyOCL`)
 - `AssemblyPlot.py` — assembly top views, clash/strain diagnostics, XYZ export
@@ -133,7 +133,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `gridFF.cl` — grid force field kernels
 - `surface.cl` — surface interaction kernels
 - `contact_surface.cl` — quasi-2D contact field: brute reference, separable Av/Atv/eval, PIC fit/eval, `relaxStrokesTiltedContact` / `relaxStrokesTiltedPIC`
-- `rigid.cl` — rigid body dynamics kernels
+- `rigid.cl` — rigid body dynamics kernels (14: energy replica, 15: multimol MD, 16: persistent, 17: single-WG, 18: `rigid_body_pairff_probe_grid` — 2D grid PairFF energy via shared `pairff_unified_site_EF` inline primitive)
 - `assembly.cl` — rigid-body SAM packing: `emit_configuration_xyz`, `evaluate_packing_3d`
 - `nonbonded.cl` — non-bonded interaction kernels
 - `nonbonded_grid.cl` — grid-based non-bonded kernels

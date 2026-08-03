@@ -58,7 +58,7 @@ from PyQt5 import QtWidgets, QtCore
 
 from .ExtensionManager import UIComponents
 from spammm.GUI.LayoutPolicy import apply_tight, SPACING, ROW_SPACING, make_flow, BUTTON_MAX_WIDTH, SPIN_MAX_WIDTH, COMBO_MAX_WIDTH, AutoGridPlacer
-from .EditModeHandlers import EditModeHandler
+from .EditModeHandlers import EditModeHandler, closest_point_on_ray
 from .CollapsibleSection import CollapsibleSection
 
 from spammm.forcefields.RigidEnsemble import RigidEnsemble
@@ -264,6 +264,8 @@ def _update_ra_substrate_overlay(window):
     fit = getattr(window, 'ra_fit', None)
     if fit is None:
         return
+    if not hasattr(window.scene, 'view'):
+        return
     from spammm.surfaces.FoldedRigid import Z_SURF_TOP
     from .VispyUtils import update_faf_map_overlay
     apos, _ = _assembly_world_atoms(window)
@@ -331,6 +333,77 @@ def _recompute_ra_combined_map_if_visible(window):
         _recompute_ra_combined_map(window)
 
 
+def _update_ra_combined_map_visual(window):
+    """Recolor/reposition the cached map without rerunning the physics kernel."""
+    cache = getattr(window, 'ra_combined_map', None)
+    if cache is None:
+        return
+    from spammm.GUI.RigidBodyVispy import potential_to_rgba
+    import vispy.scene as vscene
+    from vispy.visuals.transforms import STTransform
+    layer = getattr(window, 'ra_map_layer_combo', None)
+    layer_name = layer.currentText() if layer is not None else 'Total'
+    E_sum, E_pairff, E_faf = cache['E_sum'], cache['E_pairff'], cache['E_faf']
+    E_display = {'Total': E_sum, 'PairFF': E_pairff,
+                 'FAF': E_faf if E_faf is not None else np.zeros_like(E_sum)}.get(layer_name, E_sum)
+    exclude_mask = cache.get('exclude_mask')
+    lim_spin = getattr(window, 'ra_map_limit_spin', None)
+    if lim_spin is not None and lim_spin.value() > 0.0:
+        color_lim = float(lim_spin.value())
+    else:
+        # vmin=Emin, vmax=|Emin| — excluding nuclear singularities (1 Å around real atoms)
+        E_for_lim = E_display[~exclude_mask] if exclude_mask is not None and exclude_mask.any() else E_display
+        color_lim = max(abs(float(np.nanmin(E_for_lim))), 0.01)
+        if lim_spin is not None:
+            lim_spin.blockSignals(True)
+            lim_spin.setValue(color_lim)
+            lim_spin.blockSignals(False)
+    rgba = potential_to_rgba(E_display, vmin=-color_lim, vmax=color_lim)
+    chk = getattr(window, 'ra_show_map_chk', None)
+    visible = chk.isChecked() if chk is not None else True
+    if visible:
+        sub_img = getattr(window.scene, 'ra_substrate_map', None)
+        if sub_img is not None:
+            sub_img.visible = False
+    if hasattr(window.scene, 'view'):
+        parent = window.scene.view.scene
+        img = getattr(window.scene, 'ra_combined_map_img', None)
+        if img is None:
+            img = vscene.visuals.Image(parent=parent)
+            img.set_gl_state('translucent', depth_test=False)
+            img.order = -1
+            setattr(window.scene, 'ra_combined_map_img', img)
+        img.set_data(rgba)
+        xmin, xmax, ymin, ymax = cache['extent']
+        xs, ys = cache['xs'], cache['ys']
+        dx = (float(xmax) - float(xmin)) / max(len(xs) - 1, 1)
+        dy = (float(ymax) - float(ymin)) / max(len(ys) - 1, 1)
+        img.transform = STTransform(translate=(float(xmin), float(ymin), -0.1), scale=(dx, dy, 1))
+        img.visible = visible
+        window.ra_combined_map_img = img
+    _status(window, f"Probe E: static bodies + substrate | raw=[{E_sum.min():.3f},{E_sum.max():.3f}] "
+                    f"layer={layer_name} limit=±{color_lim:.3f} grid={len(cache['xs'])}x{len(cache['ys'])}")
+
+
+def update_ra_map_hover(window, p_world):
+    """Update the readout for the nearest cached probe-map pixel."""
+    cache = getattr(window, 'ra_combined_map', None)
+    label = getattr(window, 'ra_map_readout_label', None)
+    if cache is None or label is None:
+        return
+    x, y = float(p_world[0]), float(p_world[1])
+    xmin, xmax, ymin, ymax = cache['extent']
+    if not (xmin <= x <= xmax and ymin <= y <= ymax):
+        label.setText('Map readout: move over the cached map')
+        return
+    ix = int(np.clip(np.rint((x - xmin) / max(xmax - xmin, 1e-12) * (len(cache['xs']) - 1)), 0, len(cache['xs']) - 1))
+    iy = int(np.clip(np.rint((y - ymin) / max(ymax - ymin, 1e-12) * (len(cache['ys']) - 1)), 0, len(cache['ys']) - 1))
+    E_faf = cache['E_faf']
+    ef = 0.0 if E_faf is None else float(E_faf[iy, ix])
+    label.setText(f"Map ({cache['xs'][ix]:.2f}, {cache['ys'][iy]:.2f}, {cache['z_probe']:.2f}) Å: "
+                  f"Total={cache['E_sum'][iy, ix]:.5f} eV  PairFF={cache['E_pairff'][iy, ix]:.5f} eV  FAF={ef:.5f} eV")
+
+
 def _recompute_ra_combined_map(window):
     """Recompute the combined PairFF(static) + FAF probe map and update the overlay.
 
@@ -342,53 +415,38 @@ def _recompute_ra_combined_map(window):
         return
     from spammm.forcefields.RigidBodyUtils import compute_combined_probe_map
     from spammm.surfaces.FoldedRigid import Z_SURF_TOP
-    from spammm.GUI.RigidBodyVispy import potential_to_rgba
-    import vispy.scene as vscene
-    from vispy.visuals.transforms import STTransform
     fit = getattr(window, 'ra_fit', None)
     frozen_mask = _ra_frozen_mask(window)
     probe_R0, probe_E0, probe_q = _ra_probe_params(window)
     z_probe = Z_SURF_TOP + float(window.ra_probe_z_spin.value())
-    # Probe map visualization parameters: use strong He/Hs for clear H-bond visualization.
-    # These are visualization-only values (not the assembly's PairFF He/Hs) — the probe
-    # map shows where a test particle would form H-bonds, requiring strong electron-pair
-    # contrast. He=-1.0 gives full negative charge to lone pairs (attractive to H+);
-    # Hs=0.0 disables sigma-hole contribution for cleaner H-bond visualization.
-    He = -1.0
-    Hs = 0.0
-    w = 0.7
-    beta = 1.7
-    E_sum, E_pairff, E_faf, xs, ys, extent = compute_combined_probe_map(
+    margin = float(getattr(window, 'ra_map_margin_spin', None).value()) if getattr(window, 'ra_map_margin_spin', None) is not None else 10.0
+    canvas = getattr(getattr(window, 'scene', None), 'canvas', None)
+    size = getattr(canvas, 'size', None)
+    aspect = None
+    if size is not None and len(size) >= 2 and float(size[1]) > 0.0:
+        aspect = float(size[0]) / float(size[1])
+    beta = None
+    E_sum, E_pairff, E_faf, xs, ys, extent, exclude_mask = compute_combined_probe_map(
         rbd, fit, frozen_mask, probe_R0, probe_E0, probe_q, z_probe,
-        beta=beta, He=He, Hs=Hs, w=w)
+        margin=margin, beta=beta, aspect=aspect)
     # Cache for e-pair/sigma-hole overlay
     window.ra_combined_map = {'E_sum': E_sum, 'E_pairff': E_pairff, 'E_faf': E_faf,
-                              'xs': xs, 'ys': ys, 'extent': extent, 'z_probe': z_probe}
-    rgba = potential_to_rgba(E_sum)
-    chk = getattr(window, 'ra_show_map_chk', None)
-    visible = chk.isChecked() if chk is not None else True
-    # Hide the FAF substrate overlay when the combined map is shown (avoids double-overlay white box)
-    if visible:
-        sub_img = getattr(window.scene, 'ra_substrate_map', None)
-        if sub_img is not None:
-            sub_img.visible = False
-    # Only create/update Vispy visual if scene has a real Vispy view (not a test mock)
-    if hasattr(window.scene, 'view'):
-        parent = window.scene.view.scene
-        img = getattr(window.scene, 'ra_combined_map_img', None)
-        if img is None:
-            img = vscene.visuals.Image(parent=parent)
-            img.set_gl_state('translucent', depth_test=False)
-            img.order = -1  # same z-order as FAF substrate overlay
-            setattr(window.scene, 'ra_combined_map_img', img)
-        img.set_data(rgba)
-        xmin, xmax, ymin, ymax = extent
-        dx = (float(xmax) - float(xmin)) / max(len(xs) - 1, 1)
-        dy = (float(ymax) - float(ymin)) / max(len(ys) - 1, 1)
-        img.transform = STTransform(translate=(float(xmin), float(ymin), -0.1), scale=(dx, dy, 1))
-        img.visible = visible
-        window.ra_combined_map_img = img
-    _status(window, f"Map recomputed: range=[{E_sum.min():.3f},{E_sum.max():.3f}]  grid={len(xs)}x{len(ys)}")
+                              'xs': xs, 'ys': ys, 'extent': extent, 'z_probe': z_probe,
+                              'exclude_mask': exclude_mask,
+                              'param_snapshot': {
+                                  'pairff': dict(rbd.pairff_params_host or {}),
+                                  'probe_REQ': (float(probe_R0), float(np.sqrt(max(probe_E0, 0.0))), float(probe_q), 0.0),
+                                  'z_probe': float(z_probe), 'margin': float(margin), 'step': 0.1,
+                                  'aspect': aspect, 'frozen_mask': frozen_mask.copy(),
+                                  'body_state': None if getattr(rbd, '_body_state_host', None) is None else rbd._body_state_host.copy(),
+                              }}
+    # Reset color-limit spin to Auto so vmin=Emin, vmax=|Emin| is recomputed from the new data
+    lim_spin = getattr(window, 'ra_map_limit_spin', None)
+    if lim_spin is not None:
+        lim_spin.blockSignals(True)
+        lim_spin.setValue(0.0)
+        lim_spin.blockSignals(False)
+    _update_ra_combined_map_visual(window)
 
 
 def _on_show_map_toggled(window, checked):
@@ -412,8 +470,36 @@ def _on_show_map_toggled(window, checked):
 
 
 def _on_epairs_toggled(window, checked):
-    """Placeholder — e-pairs are rendered as atoms in the scene, no overlay needed."""
-    pass
+    """Compatibility hook; dummy-site display is intentionally not a no-op control."""
+    _status(window, 'Electron-pair/sigma-hole overlay is not available in the RA real-atom scene')
+
+
+def _on_ra_map_layer_changed(window, _index=None):
+    """Recolor the cached map without recomputing physics."""
+    if getattr(window, 'ra_combined_map', None) is not None:
+        _update_ra_combined_map_visual(window)
+
+
+def _on_ra_map_auto(window):
+    """Set a robust, signed-energy display limit for the selected cached layer."""
+    cache = getattr(window, 'ra_combined_map', None)
+    if cache is None:
+        _recompute_ra_combined_map(window)
+        cache = getattr(window, 'ra_combined_map', None)
+    if cache is None:
+        return
+    layer = getattr(window, 'ra_map_layer_combo', None)
+    name = layer.currentText() if layer is not None else 'Total'
+    E = {'Total': cache['E_sum'], 'PairFF': cache['E_pairff'],
+         'FAF': cache['E_faf'] if cache['E_faf'] is not None else np.zeros_like(cache['E_sum'])}[name]
+    # User rule: vmin=Emin, vmax=|Emin| — excluding nuclear singularities (1 Å around real atoms)
+    exclude_mask = cache.get('exclude_mask')
+    E_for_lim = E[~exclude_mask] if exclude_mask is not None and exclude_mask.any() else E
+    lim = max(abs(float(np.nanmin(E_for_lim))), 0.01)
+    spin = getattr(window, 'ra_map_limit_spin', None)
+    if spin is not None:
+        spin.setValue(lim)
+    _update_ra_combined_map_visual(window)
 
 
 def _upload_poses_to_gpu(window):
@@ -585,6 +671,8 @@ def _on_build(window):
             raise RuntimeError(f'Rigid pose synchronization failed after build: max error {err:.3e}')
         window.ra_E_last = window.ra_rbd.eval_energy_system(pos, quat, k_pack=float(window.ra_kpack_spin.value()))
         window.ra_kpack_last = float(window.ra_kpack_spin.value())
+        if hasattr(window, 'set_manipulation_context'):
+            window.set_manipulation_context('rigid_assembly')
         _status(window, f'Built: {window.ra_ensemble.summary()}  device={window.ra_rbd.ctx.devices[0].name}')
         _sync_display(window)
         # Show substrate overlay when FAF is enabled (shared VispyUtils)
@@ -725,17 +813,12 @@ def _update_anchor_visuals(window, atom_world_pos, anchor_target):
 
 
 def _closest_point_on_ray(atom_pos, r0, rd):
-    rd = np.asarray(rd, dtype=np.float64)
-    rd2 = float(np.dot(rd, rd))
-    if rd2 < 1e-12:
-        return np.asarray(r0, dtype=np.float64)
-    t = float(np.dot(atom_pos - r0, rd) / rd2)
-    return r0 + t * rd
+    return closest_point_on_ray(atom_pos, r0, rd)
 
 
 def _make_ramdrag_mode(window):
     class RAManipMode(EditModeHandler):
-        status_msg = "RA Drag: LMB drag dynamic mol; Shift+LMB toggle static; RMB delete"
+        status_msg = "Manipulate (RA): LMB drag; RMB state; Ctrl+RMB soft-delete; Shift+LMB constraint"
         lock_drag = True
         capture_move = True
 
@@ -760,9 +843,8 @@ def _make_ramdrag_mode(window):
             if idx < 0:
                 return
             body, site = _display_index_to_body_site(window, idx)
-            # Shift+LMB: toggle dynamic ↔ static (per spec §1.2)
+            # Shift+LMB is reserved for the backend spatial-constraint SSOT.
             if shift:
-                _toggle_body_state(window, body)
                 return
             # Plain LMB on static body: do not attach anchor
             rbd = window.ra_rbd
@@ -783,12 +865,27 @@ def _make_ramdrag_mode(window):
             _status(window, f"Pinned atom {idx} on molecule {body}; dragging")
 
         def on_rmb_atom(self, atom_id, ctrl):
-            """RMB on atom → soft-delete the body (per spec §1.2)."""
+            """RMB toggles dynamic/static; Ctrl+RMB soft-deletes the body."""
             idx = window.scene._id_to_idx_safe(atom_id)
             if idx < 0:
                 return
             body, _ = _display_index_to_body_site(window, idx)
-            _soft_delete_body(window, body)
+            if ctrl:
+                _soft_delete_body(window, body)
+            else:
+                _toggle_body_state(window, body)
+
+        def on_atom_click(self, atom_id, shift=False):
+            if shift:
+                return
+            idx = window.scene._id_to_idx_safe(atom_id)
+            if idx < 0:
+                return
+            body, _ = _display_index_to_body_site(window, idx)
+            if window.ra_rbd is not None:
+                window.ra_rbd.set_active_body(body)
+            state = int(window.ra_rbd._body_state_host[body])
+            _status(window, f"Selected body {body} ({'dynamic' if state == 1 else 'static'})")
 
         def on_move(self, p_world, r0=None, rd=None):
             if self._pin_display < 0:
@@ -1155,7 +1252,7 @@ def build_ui(window):
     window.ra_drag_dt_spin = QtWidgets.QDoubleSpinBox(); window.ra_drag_dt_spin.setRange(0.0001, 0.5); window.ra_drag_dt_spin.setSingleStep(0.005); window.ra_drag_dt_spin.setValue(0.02); window.ra_drag_dt_spin.setMaximumWidth(SPIN_MAX_WIDTH)
     g_drag.add_pair("dt:", window.ra_drag_dt_spin)
     drag_l.addLayout(g_drag.layout())
-    drag_hint = QtWidgets.QLabel('Activate "RA Drag" edit mode (toolbar), then LMB drag atoms in the scene.')
+    drag_hint = QtWidgets.QLabel('Activate "Manipulate" mode, then LMB drag dynamic atoms. RMB toggles state; Ctrl+RMB soft-deletes.')
     drag_hint.setWordWrap(True)
     drag_l.addWidget(drag_hint)
     drag_sec.setContent(drag_host)
@@ -1263,14 +1360,36 @@ def build_ui(window):
     window.ra_show_map_chk.setChecked(True)
     window.ra_show_map_chk.toggled.connect(lambda checked: _on_show_map_toggled(window, checked))
     g_map.add(window.ra_show_map_chk)
-    window.ra_epairs_chk = QtWidgets.QCheckBox("e-pairs")
-    window.ra_epairs_chk.setChecked(True)
-    window.ra_epairs_chk.toggled.connect(lambda checked: _on_epairs_toggled(window, checked))
-    g_map.add(window.ra_epairs_chk)
+    window.ra_map_layer_combo = QtWidgets.QComboBox()
+    window.ra_map_layer_combo.addItems(['Total', 'PairFF', 'FAF'])
+    window.ra_map_layer_combo.setMaximumWidth(COMBO_MAX_WIDTH)
+    window.ra_map_layer_combo.currentIndexChanged.connect(lambda idx: _on_ra_map_layer_changed(window, idx))
+    g_map.add_pair('Layer:', window.ra_map_layer_combo)
+    window.ra_map_limit_spin = QtWidgets.QDoubleSpinBox()
+    window.ra_map_limit_spin.setRange(0.0, 1e6); window.ra_map_limit_spin.setDecimals(5)
+    window.ra_map_limit_spin.setSingleStep(0.01); window.ra_map_limit_spin.setValue(0.0)
+    window.ra_map_limit_spin.setToolTip('Symmetric displayed energy limit; 0 = Auto')
+    window.ra_map_limit_spin.editingFinished.connect(lambda: _on_ra_map_layer_changed(window))
+    g_map.add_pair('Color ±:', window.ra_map_limit_spin)
+    window.ra_map_auto_btn = QtWidgets.QPushButton('Auto')
+    window.ra_map_auto_btn.clicked.connect(lambda: _on_ra_map_auto(window))
+    g_map.add(window.ra_map_auto_btn)
+    g_map.newrow()
+    window.ra_map_margin_spin = QtWidgets.QDoubleSpinBox()
+    window.ra_map_margin_spin.setRange(0.0, 50.0); window.ra_map_margin_spin.setDecimals(1)
+    window.ra_map_margin_spin.setSingleStep(1.0); window.ra_map_margin_spin.setValue(10.0)
+    window.ra_map_margin_spin.editingFinished.connect(lambda: _recompute_ra_combined_map(window))
+    g_map.add_pair('Margin Å:', window.ra_map_margin_spin)
     window.ra_recompute_map_btn = QtWidgets.QPushButton('Recompute')
     window.ra_recompute_map_btn.clicked.connect(lambda: _recompute_ra_combined_map(window))
     g_map.add(window.ra_recompute_map_btn)
     map_l.addLayout(g_map.layout())
+    window.ra_map_legend_label = QtWidgets.QLabel('RdBu_r: blue −limit · white 0 · red +limit (eV)')
+    window.ra_map_legend_label.setToolTip('Raw signed energies are unchanged; only the display saturates at Color ±.')
+    map_l.addWidget(window.ra_map_legend_label)
+    window.ra_map_readout_label = QtWidgets.QLabel('Map readout: move over the cached map')
+    map_l.addWidget(window.ra_map_readout_label)
+    window.ra_map_hover_fn = lambda p: update_ra_map_hover(window, p)
     map_sec.setContent(map_host)
     layout.addWidget(map_sec)
 
@@ -1282,7 +1401,10 @@ def build_ui(window):
     layout.addStretch()
 
     # ─── Edit modes ───────────────────────────────────────────────────────
-    window.register_mode_handler('ra_drag', _make_ramdrag_mode(window))
+    ra_handler = _make_ramdrag_mode(window)
+    window.register_mode_handler('ra_drag', ra_handler)
+    if hasattr(window, 'register_manipulation_adapter'):
+        window.register_manipulation_adapter('rigid_assembly', ra_handler)
 
     edit_modes = [
         ('RA Drag', lambda: window.set_edit_mode('ra_drag')),
@@ -1291,7 +1413,7 @@ def build_ui(window):
     help_text = {
         'Build': 'Select molecule + count, set spacing/z, press Build. Creates RigidEnsemble + RigidBodyPairFF.',
         'MC/GA': 'Greedy best-of-batch planar moves. Step = one molecule; Run = N steps. Accepted poses → ensemble.',
-        'Drag': 'Activate "RA Drag" edit mode in the toolbar, then LMB drag atoms in the scene to pull the active molecule.',
+        'Drag': 'Activate "Manipulate" mode, then LMB drag dynamic atoms in the scene to pull the active molecule.',
         'PME': 'Sites = rigid-molecule CoMs (first ≤4). Scan XY runs pauli_scan.scan_xy over the assembly.',
     }
     return UIComponents(panel=panel, edit_modes=edit_modes, view_modes=view_modes, help_text=help_text)

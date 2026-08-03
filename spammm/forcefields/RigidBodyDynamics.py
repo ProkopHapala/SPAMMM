@@ -1872,6 +1872,27 @@ void rigid_body_pairff_energy_replica_kernel(
     __global float4*        E_out,
     __global const int*     body_state
 )"""
+        self.kernelheaders["rigid_body_pairff_probe_grid"] = """__kernel
+void rigid_body_pairff_probe_grid(
+    __global const float4* static_apos,
+    __global const float4* static_REQ,
+    __global const int*    static_type,
+    const int              n_static,
+    const float4           probe_REQ,
+    const float             beta,
+    const int               nx,
+    const int               ny,
+    const float             x0,
+    const float             y0,
+    const float             step,
+    const float             z_probe,
+    __global const float*   probe_site_coeffs,
+    __global const float4*  probe_z_params,
+    const int4              probe_tensor_meta,
+    const float4            invLvec2d,
+    const int               do_faf,
+    __global float4*        E_out
+)"""
         self.n_env_mols = 0
         self.n_env_sites = 0
         self.env_mols_host = None
@@ -2440,6 +2461,104 @@ void rigid_body_pairff_energy_replica_kernel(
         self.kernel_params['folded_lvec2d'] = np.asarray(fp['lvec2d'], dtype=np.float32)
         self._multimol_launchers.clear()  # invalidate cached launchers
         return site_coeffs, z_params, (nu, nv, nz, total_sites)
+
+    def eval_probe_grid_gpu(self, static_apos, static_REQ, static_type, probe_REQ,
+                            xs, ys, z_probe, beta=None, probe_faf=True):
+        """Evaluate a fused PairFF(+FAF) probe grid with one GPU launch.
+
+        The PairFF input is already-packed site data.  Factorized FAF fits use
+        the explicit probe REQ to materialize one coefficient site; typed fits
+        fail loudly until a typed probe mapping is supplied.
+        """
+        xs = np.asarray(xs, dtype=np.float32).reshape(-1)
+        ys = np.asarray(ys, dtype=np.float32).reshape(-1)
+        if xs.size == 0 or ys.size == 0:
+            raise ValueError('probe grid axes must be non-empty')
+        params = self.pairff_params_host or {}
+        beta_live = params.get('beta')
+        if beta_live is None:
+            raise RuntimeError('GPU probe map requires pairff_params_host[beta]')
+        beta = float(beta_live if beta is None else beta)
+        if not np.isclose(beta, float(beta_live), rtol=0.0, atol=1e-7):
+            raise ValueError(f'caller beta={beta} disagrees with live PairFF beta={beta_live}')
+        apos = np.asarray(static_apos, dtype=np.float32).reshape(-1, 3)
+        req = np.asarray(static_REQ, dtype=np.float32).reshape(-1, 4)
+        typ = np.asarray(static_type, dtype=np.int32).reshape(-1)
+        if not (len(apos) == len(req) == len(typ)):
+            raise ValueError('static probe-map positions, REQ, and types must have equal lengths')
+        p_req = np.asarray(probe_REQ, dtype=np.float32).reshape(4)
+        apos4 = np.zeros((max(len(apos), 1), 4), dtype=np.float32)
+        req4 = np.zeros((max(len(req), 1), 4), dtype=np.float32)
+        typ4 = np.zeros(max(len(typ), 1), dtype=np.int32)
+        if len(apos):
+            apos4[:len(apos), :3] = apos
+            req4[:len(req)] = req
+            typ4[:len(typ)] = typ
+
+        do_faf = 0
+        probe_coeffs = np.zeros(1, dtype=np.float32)
+        probe_z = np.zeros((1, 4), dtype=np.float32)
+        probe_meta = np.array([0, 0, 0, 1], dtype=np.int32)
+        invL = np.array([1.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        fp = getattr(self, 'folded_params', None)
+        if probe_faf and fp is not None:
+            meta = np.asarray(fp['meta'], dtype=np.int32).reshape(4)
+            if int(meta[1]) >= 0:
+                raise RuntimeError('GPU probe map requires a factorized FAF fit for a custom probe')
+            kxyz = np.asarray(fp['kxyz'], dtype=np.float32).reshape(-1, 4)
+            coeffs4 = np.asarray(fp['coeffs'], dtype=np.float32).reshape(-1, 4)[:len(kxyz)]
+            plqh = _reqs_to_plq(p_req.reshape(1, 4), alpha=float(fp.get('alpha_morse', 1.8)))[0]
+            probe_coeffs = np.ascontiguousarray(coeffs4 @ plqh, dtype=np.float32)
+            kus = np.unique(kxyz[:, 0]).astype(np.int32)
+            kvs = np.unique(kxyz[:, 1]).astype(np.int32)
+            alphas = np.unique(kxyz[:, 2])
+            z0s = np.unique(kxyz[:, 3])
+            nbasis = len(kxyz)
+            if len(z0s) != 1 or len(kus) * len(kvs) * len(alphas) != nbasis:
+                raise ValueError('FAF tensor basis is irregular; GPU probe map cannot represent it')
+            for iu in range(len(kus)):
+                for iv in range(len(kvs)):
+                    for iz in range(len(alphas)):
+                        b = (iu * len(kvs) + iv) * len(alphas) + iz
+                        row = kxyz[b]
+                        if int(row[0]) != int(kus[iu]) or int(row[1]) != int(kvs[iv]) or abs(float(row[2] - alphas[iz])) > 1e-6:
+                            raise ValueError(f'FAF tensor basis ordering mismatch at b={b}')
+            probe_z = np.zeros((max(len(alphas), 1), 4), dtype=np.float32)
+            probe_z[:len(alphas), 0] = alphas
+            probe_z[:len(alphas), 1] = z0s[0]
+            probe_meta = np.array([len(kus), len(kvs), len(alphas), 1], dtype=np.int32)
+            lvec = np.asarray(fp['lvec2d'], dtype=np.float32).reshape(4)
+            det = float(lvec[0] * lvec[3] - lvec[1] * lvec[2])
+            if abs(det) < 1e-12:
+                raise ValueError('FAF lattice vectors are singular')
+            invL = np.array([lvec[3] / det, -lvec[1] / det, -lvec[2] / det, lvec[0] / det], dtype=np.float32)
+            do_faf = 1
+
+        npx = int(xs.size) * int(ys.size)
+        out = np.empty((npx, 4), dtype=np.float32)
+        self.check_buf('probe_map_static_apos', apos4.nbytes)
+        self.check_buf('probe_map_static_REQ', req4.nbytes)
+        self.check_buf('probe_map_static_type', typ4.nbytes)
+        self.check_buf('probe_map_coeffs', probe_coeffs.nbytes)
+        self.check_buf('probe_map_z', probe_z.nbytes)
+        self.check_buf('probe_map_out', out.nbytes)
+        self.toGPU('probe_map_static_apos', apos4)
+        self.toGPU('probe_map_static_REQ', req4)
+        self.toGPU('probe_map_static_type', typ4)
+        self.toGPU('probe_map_coeffs', probe_coeffs)
+        self.toGPU('probe_map_z', probe_z)
+        krnl = cl.Kernel(self.prg, 'rigid_body_pairff_probe_grid')
+        args = [self.buffer_dict['probe_map_static_apos'], self.buffer_dict['probe_map_static_REQ'],
+                self.buffer_dict['probe_map_static_type'], np.int32(len(apos)),
+                p_req, np.float32(beta), np.int32(xs.size), np.int32(ys.size),
+                np.float32(xs[0]), np.float32(ys[0]),
+                np.float32(xs[1] - xs[0] if xs.size > 1 else 1.0), np.float32(z_probe),
+                self.buffer_dict['probe_map_coeffs'], self.buffer_dict['probe_map_z'],
+                probe_meta, invL, np.int32(do_faf), self.buffer_dict['probe_map_out']]
+        krnl(self.queue, (npx,), None, *args)
+        self.fromGPU('probe_map_out', out)
+        self.queue.finish()
+        return out.reshape(len(ys), len(xs), 4)
 
     def attach_pairff_faf(self, fit_result, z_init=3.5, k_z=0.0, enable=True):
         """Bind FAF substrate to this PairFF instance (dynamics + Vispy map).
