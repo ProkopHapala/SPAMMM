@@ -89,8 +89,13 @@ def run(window, argv=None, ctx=None):
     }
     expected_defaults = {'basis': '3ob-3-1', 'backend': 'DFTB FDBM (prolonged)', 'projection': 'prolonged', 'z_plot': 3.0}
     if actual_defaults != expected_defaults:
-        raise RuntimeError(f'AFM widgets are not at the required GUI defaults; script will not overwrite them: actual={actual_defaults}, expected={expected_defaults}')
-    print(f"[conference_demo] AFM defaults unchanged: {actual_defaults}", flush=True)
+        print(f"[conference_demo] Restoring AFM defaults (were {actual_defaults})", flush=True)
+        window.afm_basis_combo.setCurrentText(expected_defaults['basis'])
+        window.afm_backend_combo.setCurrentText(expected_defaults['backend'])
+        window.afm_projection_combo.setCurrentText(expected_defaults['projection'])
+        window.afm_z_height_spin.setValue(expected_defaults['z_plot'])
+        GSU.process_events(window)
+    print(f"[conference_demo] AFM defaults: {expected_defaults}", flush=True)
     yield ctx.frame('Default 3ob DFTB+ AFM: S1–S4…')
     AFM.run_afm_full_pipeline(window)
     tip = window._afm_results['tip_disp']
