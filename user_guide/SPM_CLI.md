@@ -147,7 +147,20 @@ Probe heights on the CLI are **df probe heights** above the molecule plane (`mol
 
 so morphologies match closest-approach physics. Use `--no-amp-align` only if you want Fz and df at the **same** labeled \(h\) (expect ~1 Å visual mismatch).
 
-PP scan always covers `[h_min − amp, h_max + amp]` so df at the window edges is valid.
+For vertical oscillation, the PP scan covers `[h_min − amp, h_max + amp]` so df at the window edges is valid.
+
+For lateral/arbitrary oscillation, `--osc-dir nx,ny,nz` changes the force projection and
+directional derivative, not the approach axis:
+
+```bash
+python run_spm.py afm --xyz data/xyz/PTCDA.xyz --projection prolonged --osc-dir 1,0,0
+```
+
+- The scan volume and displayed columns remain `(x,y,z)` with `--h-min/--h-max` as z heights.
+- Pure x/y oscillation samples the finite-amplitude path on a padded lateral grid, then crops
+  back to the requested XY image; Fz is shown at the same z.
+- For arbitrary `n`, only `amp*abs(nz)` pads z and shifts the amp-aligned Fz comparison.
+- `--base-pos` is only a constant world-coordinate scan offset; it does not set a lateral-AFM height.
 
 **Which PNGs to write** (`--plots` CSV):
 

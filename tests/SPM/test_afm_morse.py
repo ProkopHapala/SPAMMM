@@ -5,12 +5,13 @@ Tests the AFMulator GPU pipeline: load molecule → assign params → setup grid
 make_forcefield → raw scan → relaxed scan (PP) → df conversion.
 
 Hierarchy:
-  1. test_afm_grid_finite      — force field grid is finite & physically reasonable
-  2. test_afm_raw_scan          — raw FE scan (no PP relax): Fz finite, correct sign
-  3. test_afm_relaxed_scan      — PP-relaxed scan: Fz finite, differs from raw
-  4. test_afm_df_finite         — compute_df produces finite frequency shift
-  5. test_afm_morse_vs_lj       — Morse and LJ produce different but correlated results
-  6. test_visual_afm_morse_images — 2D AFM image slices at multiple z heights (visual)
+  1. test_df_direction_*        — arbitrary oscillation uses xyz derivatives but retains z slices
+  2. test_afm_grid_finite       — force field grid is finite & physically reasonable
+  3. test_afm_raw_scan           — raw FE scan (no PP relax): Fz finite, correct sign
+  4. test_afm_relaxed_scan       — PP-relaxed scan: Fz finite, differs from raw
+  5. test_afm_df_finite          — compute_df produces finite frequency shift
+  6. test_afm_morse_vs_lj        — Morse and LJ produce different but correlated results
+  7. test_visual_afm_morse_images — 2D AFM image slices at multiple z heights (visual)
 
 All tests use AFMulator from spammm.SPM.AFM with Morse or LJ potential +
 point-charge Coulomb (tipQs/tipQZs). No electron density required.
@@ -51,6 +52,98 @@ def _ensure_finite(name, arr, abs_max=1e6):
     assert np.isfinite(arr).all(), f"{name}: non-finite values at {np.where(~np.isfinite(arr))}"
     m = float(np.max(np.abs(arr))) if arr.size else 0.0
     assert m < abs_max, f"{name}: abs_max={m:.3e} exceeds threshold {abs_max:.3e}"
+
+
+# =============================================================================
+# Directional df: oscillation direction is independent of z approach/slices
+# =============================================================================
+
+def test_df_direction_keeps_z_as_slice_axis():
+    """For Fx=x*z and x oscillation, df=-dFx/dx=-z on every retained z slice."""
+    from spammm.SPM.AFM import compute_df_dir, compute_df_amp_dir
+    dx, dy, dz = 0.4, 0.3, 0.2
+    x = (np.arange(7, dtype=np.float64)*dx)[:, None, None]
+    z = (np.arange(9, dtype=np.float64)*dz)[None, None, :]
+    FEs = np.zeros((7, 5, 9, 4), dtype=np.float64)
+    FEs[..., 0] = x*z
+    expected = -np.broadcast_to(z, FEs.shape[:3])
+
+    df = compute_df_dir(FEs, (dx, dy, dz), osc_dir=(1., 0., 0.))
+    assert np.allclose(df, expected, atol=1e-12)
+    assert np.ptp(df.mean(axis=(0, 1))) > 1.0, "lateral df z slices were collapsed into one constant-contrast stroke"
+
+    df_amp = compute_df_amp_dir(FEs, (dx, dy, dz), osc_dir=(1., 0., 0.), amp=dx)
+    assert np.allclose(df_amp[2:-2], expected[2:-2], atol=1e-6)
+
+
+def test_df_direction_does_not_treat_z_as_lateral_stroke():
+    """Fx varying only with z has zero x derivative even though its z derivative is non-zero."""
+    from spammm.SPM.AFM import compute_df_dir
+    z = np.arange(7, dtype=np.float64)[None, None, :]
+    FEs = np.zeros((5, 3, 7, 4), dtype=np.float64)
+    FEs[..., 0] = z*z
+    df = compute_df_dir(FEs, (0.5, 0.5, 0.2), osc_dir=(1., 0., 0.))
+    assert np.max(np.abs(df)) < 1e-12
+
+
+def test_df_arbitrary_direction_contracts_xyz_gradient():
+    """For F=n*(n·r), the directional stiffness is one for any unit n."""
+    from spammm.SPM.AFM import compute_df_dir
+    dx, dy, dz = 0.4, 0.3, 0.2
+    x = (np.arange(6)*dx)[:, None, None]
+    y = (np.arange(5)*dy)[None, :, None]
+    z = (np.arange(7)*dz)[None, None, :]
+    n = np.array([1., 2., 3.]); n /= np.linalg.norm(n)
+    s = n[0]*x + n[1]*y + n[2]*z
+    FEs = np.zeros((6, 5, 7, 4), dtype=np.float64)
+    FEs[..., :3] = s[..., None]*n
+    df = compute_df_dir(FEs, (dx, dy, dz), osc_dir=n)
+    assert np.allclose(df, -1.0, atol=1e-12)
+    assert np.allclose(compute_df_dir(FEs, (dx, dy, dz), osc_dir=-n), df, atol=1e-12)
+
+
+def test_df_direction_vertical_backward_parity():
+    """The generalized xyz implementation reproduces established vertical df exactly."""
+    from spammm.SPM.AFM import compute_df, compute_df_amp, compute_df_dir, compute_df_amp_dir
+    rng = np.random.default_rng(42)
+    Fz = rng.normal(size=(4, 5, 21)).astype(np.float32)
+    FEs = np.zeros(Fz.shape + (4,), dtype=np.float32)
+    FEs[..., 2] = Fz
+    dz, amp = 0.1, 0.4
+    assert np.allclose(compute_df_dir(FEs, (0.3, 0.2, dz), (0., 0., 1.)), compute_df(Fz, dz), atol=1e-6)
+    assert np.allclose(compute_df_amp_dir(FEs, (0.3, 0.2, dz), (0., 0., 1.), amp), compute_df_amp(Fz, dz, amp), atol=1e-6)
+
+
+def test_lateral_amplitude_does_not_shift_z_heights():
+    """Pure x/y amplitude pads lateral sampling, not the z approach or displayed heights."""
+    from spammm.SPM.AFM_utils import afm_df_height_stacks
+    h_df, h_Fz, h_scan = afm_df_height_stacks(3.7, 4.7, 0.1, amp=1.0, osc_dir=(1., 0., 0.))
+    assert np.array_equal(h_df, h_Fz)
+    assert np.array_equal(h_df, h_scan)
+    h_df_z, h_Fz_z, h_scan_z = afm_df_height_stacks(3.7, 4.7, 0.1, amp=1.0, osc_dir=(0., 0., 1.))
+    assert np.allclose(h_Fz_z, h_df_z - 1.0)
+    assert h_scan_z[0] == pytest.approx(h_df_z[0] - 1.0)
+    assert h_scan_z[-1] == pytest.approx(h_df_z[-1] + 1.0)
+
+
+@pytest.mark.gpu
+def test_scan_fdbm_oscillation_direction_does_not_replace_z_approach():
+    """Changing df direction must leave the acquired (x,y,z) force volume unchanged."""
+    from spammm.SPM.AFM import AFMulator
+    step = 0.25
+    origin = np.array([-2., -2., 0.], dtype=np.float32)
+    F_total = np.zeros((16, 16, 20, 4), dtype=np.float32)
+    F_total[..., 3] = origin[2] + step*np.arange(F_total.shape[2], dtype=np.float32)[None, None, :]
+    afmulator = AFMulator(use_morse=False, nloc=32)
+    afmulator.setup_fdbm_grid(F_total, origin, step)
+    scan_xs = np.array([-1., 0., 1.], dtype=np.float32)
+    scan_ys = np.array([-1., 0., 1.], dtype=np.float32)
+    heights = np.array([1., 2., 3.], dtype=np.float32)
+    kwargs = dict(mol_z=0., ppm_mode=False, K_LAT=0., K_RAD=0., bond_length=0.)
+    F_z, _ = afmulator.scan_fdbm(scan_xs, scan_ys, heights, osc_dir=(0., 0., 1.), **kwargs)
+    F_x, _ = afmulator.scan_fdbm(scan_xs, scan_ys, heights, osc_dir=(1., 0., 0.), **kwargs)
+    assert np.array_equal(F_x, F_z)
+    assert np.ptp(F_x[..., 3].mean(axis=(0, 1))) > 1.0, "scan axis 2 no longer represents z height"
 
 
 # =============================================================================

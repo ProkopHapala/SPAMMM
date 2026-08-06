@@ -31,6 +31,8 @@ Product FDBM path is **ModularAFMPipeline** (FAST_S3 GPU Stage-3 + FIRE PP scan)
 | FAST_S3 Pauli+ES vs legacy FFT (synthetic) | corr > 0.999, RMSE < 1e-5 | `test_afm_fdbm.py::test_fdbm_fast_s3_parity_pauli_es` |
 | **CLI legacy Stage3–4 vs Modular FAST_S3** (shared ρ/tip/scan/FIRE) | corr ≥ 0.9996 on df; fields ~1.000; **~5.5×** S3+S4 speedup | `testplot_cli_vs_modular_parity.py` → `debug/cli_vs_modular_parity/` — **USER confirmed plots 2026-07-28** |
 | GUI defaults vs CLI SSOT | **not yet identical** — see Open Issues (wrong Pauli spins were primary) | — |
+| Directional df, vertical compatibility | `compute_df*_dir(n=z)` matches established vertical functions; analytical x derivative retains z slices | `test_afm_morse.py::test_df_direction_*` |
+| Lateral scan geometry | `scan_fdbm(n=x)` and `scan_fdbm(n=z)` acquire identical `(x,y,z)` volumes on NVIDIA; only df projection changes | `test_afm_morse.py::test_scan_fdbm_oscillation_direction_does_not_replace_z_approach` |
 
 ### CLI legacy vs FAST (RTX 3090, warm S3+S4 only)
 
@@ -55,6 +57,7 @@ Full report: [`doc/Tasks/PerfBenchmark_FDBM.md`](../Tasks/PerfBenchmark_FDBM.md)
 - **Pauli separate:** overlap FFT then `A·overlap^β` — never `1/k²`.
 - **Pauli A,β SSOT:** `AFM.PAULI_FITTED_DEFAULTS['3ob-3-1']` = **A=124.84, β=1.4330** (evaluation). Old single-atom fits (509.28 / 1.0586) are obsolete.
 - **Height SSOT:** df window 3.7–4.7 Å, amp=1.0 → `afm_df_height_stacks` + `compute_df_amp`.
+- **Lateral/arbitrary AFM:** acquisition remains an `(x,y,z)` volume approached along z. For unit oscillation vector `n`, df is `-n·∇(F·n)`; finite amplitude samples along `n`. Only `amp*abs(n_z)` pads/aligns z, while x/y amplitude pads the lateral scan before cropping.
 - **Legacy restore only for debug:** `SPAMMM_AFM_FAST_S3=0` or `SPAMMM_AFM_CPU_FFT=1` — not product path.
 
 ## Open Issues
@@ -65,3 +68,4 @@ Full report: [`doc/Tasks/PerfBenchmark_FDBM.md`](../Tasks/PerfBenchmark_FDBM.md)
 - [ ] Optional skip F host download when `NO_IO` (S4 device-only)
 - [ ] Site-resolved Pauli \(A,\beta\) vs Kriging — `doc/Tasks/Pauli_A_beta_KrigingTransferability.md`
 - [~] All-electron Δρ / NA multipoles — awaiting USER visual confirmation on cube ES reports
+- [~] Lateral-AFM coordinate correction — analytical and NVIDIA tests pass; PTCDA x-oscillation review artifact at `debug/lateral_afm/lat_x_zslices_corrected/compare_per_image.png`; awaiting USER visual confirmation

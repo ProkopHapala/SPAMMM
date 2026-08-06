@@ -49,6 +49,16 @@ def _parse_plots(s: str | None) -> set[str]:
     return set(parts)
 
 
+def _parse_vec3(s: str, default=(0., 0., 1.)):
+    """Parse "x,y,z" string into (3,) float tuple."""
+    if s is None:
+        return tuple(float(x) for x in default)
+    parts = [float(x.strip()) for x in str(s).split(',')]
+    if len(parts) != 3:
+        raise ValueError(f"Expected 'x,y,z' (3 components), got {len(parts)}: {s!r}")
+    return tuple(parts)
+
+
 def _add_common_afm_args(p: argparse.ArgumentParser) -> None:
     g = p.add_argument_group('geometry / density')
     g.add_argument('--xyz',      default=None,  help='Sample geometry (.xyz); default benzene if no SMILES')
@@ -79,20 +89,25 @@ def _add_common_afm_args(p: argparse.ArgumentParser) -> None:
                       help='Deprecated no-op (GPU FAST_S3 is already the default).')
 
     scan = p.add_argument_group('PP scan / df')
-    # Display window = df probe heights; Fz panels use h−amp (amp-align) by default
+    # Display window is always z; Fz alignment uses only amp*abs(n_z).
     scan.add_argument('--h-min', '--zmin', type=float, default=3.7, dest='h_min',
-                      help='df probe z_min [Å] (column labels; Fz shown at h−amp)')
+                      help='df z_min [Å] (column labels; vertical Fz at h−amp, pure lateral Fz at same z)')
     scan.add_argument('--h-max', '--zmax', type=float, default=4.7, dest='h_max',
                       help='df probe z_max [Å]')
     scan.add_argument('--h-step', '--dz',  type=float, default=0.1, dest='h_step',
                       help='Height step dz [Å]')
     scan.add_argument('--amp',         type=float, default=1.0)
     scan.add_argument('--no-amp-align', action='store_true', dest='no_amp_align',
-                      help='Plot Fz at same h as df (default: Fz at h−amp for fair morph. match)')
+                      help='Disable vertical-component Fz closest-approach alignment (pure lateral already uses same z)')
     scan.add_argument('--K-LAT',       type=float, default=0.5,  dest='K_LAT')
     scan.add_argument('--K-RAD',       type=float, default=20.0,   dest='K_RAD')
     scan.add_argument('--bond-length', type=float, default=3.0)
     scan.add_argument('--scan-margin', type=float, default=2.0)
+    scan.add_argument('--osc-dir', default='0,0,1', dest='osc_dir',
+                      help='Oscillation direction n for df=-d(F.n)/ds as "x,y,z"; z approach/slices stay unchanged. '
+                           'E.g. "1,0,0" = lateral x, "0,1,0" = lateral y, "1,1,0" = diagonal.')
+    scan.add_argument('--base-pos', default='0,0,0', dest='base_pos',
+                      help='Optional constant world-coordinate offset of the (x,y,z) scan; does not set oscillation height.')
 
     out = p.add_argument_group('output / plotting')
     out.add_argument('--outdir',             default='debug/spm_afm')
@@ -210,6 +225,17 @@ def cmd_afm(args: argparse.Namespace) -> int:
 
     plot_diag = plots & {'tip', 'stage', 'df', 'fz'}
 
+    osc_dir = _parse_vec3(getattr(args, 'osc_dir', '0,0,1'), default=(0., 0., 1.))
+    base_pos = _parse_vec3(getattr(args, 'base_pos', '0,0,0'), default=(0., 0., 0.))
+    osc_n = np.array(osc_dir, dtype=np.float64)
+    osc_norm = float(np.linalg.norm(osc_n))
+    if not np.isfinite(osc_norm) or osc_norm <= 0.0:
+        raise ValueError(f'--osc-dir must be a finite non-zero vector, got {osc_dir!r}')
+    osc_n = osc_n / osc_norm
+    is_vertical = np.allclose(osc_n, (0., 0., 1.))
+    if not is_vertical:
+        print(f"Lateral/arbitrary oscillation n=({osc_n[0]:.3f},{osc_n[1]:.3f},{osc_n[2]:.3f}); approach and slices remain along z; base_pos={base_pos}")
+
     def _pp(tag, rho_scf, rho_diff, V_ES=None):
         return afm_utils.run_fdbm_pp_from_density(
             tag, rho_scf, atomPos, atomTypes, origin, step, ngrid,
@@ -222,6 +248,7 @@ def cmd_afm(args: argparse.Namespace) -> int:
             scan_margin=args.scan_margin, plots=plot_diag,
             df_cmap=args.df_cmap, cmap=args.cmap, stage_height=args.height,
             use_fast_s3=use_fast,
+            osc_dir=osc_dir, base_pos=base_pos,
         )
 
     V_ES_stock = None
@@ -267,13 +294,15 @@ def cmd_afm(args: argparse.Namespace) -> int:
         return 1
 
     order = [k for k in ('cube', 'prolonged', 'stock') if k in variants]
-    amp_align = not getattr(args, 'no_amp_align', False)
+    amp_align_requested = not getattr(args, 'no_amp_align', False)
     amp = float(args.amp)
+    amp_z = amp*abs(float(osc_n[2]))
+    amp_align = amp_align_requested and amp_z > 1e-12
     row_specs = []
     for k in order:
         row_specs.append(('df', k, f'df {k}\nA={A_pauli:.1f} β={beta_pauli:.2f}', args.df_cmap))
     for k in order:
-        fz_lab = f'Fz {k}\n@h−{amp:.1f}Å' if amp_align else f'Fz {k}'
+        fz_lab = f'Fz {k}\n@h−{amp_z:.1f}Å' if amp_align else f'Fz {k}\n@same z'
         row_specs.append(('Fz', k, fz_lab, args.cmap))
 
     heights = next(iter(variants.values()))['heights']
@@ -281,7 +310,7 @@ def cmd_afm(args: argparse.Namespace) -> int:
     extent = None
     if 'scan_xs' in v0 and 'scan_ys' in v0:
         extent = afm_utils.scan_extent(v0['scan_xs'], v0['scan_ys'])
-    title = f'FDBM AFM  {mol_name}  tip={args.tip_mode}  basis={args.basis}  projection={args.projection}'
+    title = f'FDBM AFM  {mol_name}  tip={args.tip_mode}  basis={args.basis}  projection={args.projection}  n=({osc_n[0]:.2f},{osc_n[1]:.2f},{osc_n[2]:.2f})'
     show_atoms = bool(getattr(args, 'show_atoms', False))
     out_png = None
     if 'compare' in plots:
@@ -290,7 +319,7 @@ def cmd_afm(args: argparse.Namespace) -> int:
         afm_utils.plot_afm_variant_height_strip(
             variants, row_specs, heights, out_png, scale=scale, title=title, dpi=140,
             apos=atomPos if show_atoms else None, show_atoms=show_atoms, extent=extent,
-            amp=args.amp, amp_align=amp_align, long_axis_vertical=True, tight=True)
+            amp=args.amp, amp_align=amp_align, amp_z=amp_z, long_axis_vertical=True, tight=True)
         print(f'REVIEW: {out_png}')
     if 'per_image' in plots and getattr(args, 'scale', 'per_image') != 'per_image':
         per = os.path.join(args.outdir, 'per_image')
@@ -299,7 +328,7 @@ def cmd_afm(args: argparse.Namespace) -> int:
         afm_utils.plot_afm_variant_height_strip(
             variants, row_specs, heights, pi, scale='per_image', title=title, dpi=140,
             apos=atomPos if show_atoms else None, show_atoms=show_atoms, extent=extent,
-            amp=args.amp, amp_align=amp_align, long_axis_vertical=True, tight=True)
+            amp=args.amp, amp_align=amp_align, amp_z=amp_z, long_axis_vertical=True, tight=True)
         print(f'REVIEW: {pi}')
 
     summary = os.path.join(args.outdir, 'SUMMARY.out')
@@ -309,7 +338,9 @@ def cmd_afm(args: argparse.Namespace) -> int:
         f.write(f'smiles={smi}\n')
         f.write(f'cube={args.cube}\n')
         f.write(f'grid={nx}x{ny}x{nz} step={step} Stage3={"FAST_S3" if use_fast else "LEGACY"}\n')
-        f.write(f'plots={sorted(plots)} h=[{args.h_min},{args.h_max}] dz={args.h_step}\n')
+        f.write(f'plots={sorted(plots)} z=[{args.h_min},{args.h_max}] dz={args.h_step} osc_n=({osc_n[0]:.6f},{osc_n[1]:.6f},{osc_n[2]:.6f}) amp={amp}\n')
+        for k, v in variants.items():
+            f.write(f'{k} df_z_first_last: RMS_delta={v["df_z_slice_rms"]:.8e} relative={v["df_z_slice_relative"]:.8e} corr={v["df_z_slice_corr"]:.8f}\n')
         if out_png:
             f.write(f'REVIEW: {out_png}\n')
         for k, v in variants.items():

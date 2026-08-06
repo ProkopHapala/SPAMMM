@@ -115,7 +115,8 @@ def _sync_pipe_heights_amp(pipe, params):
     from spammm.SPM.AFM_utils import afm_df_height_stacks
     amp = float(params.get('amp', 1.0))
     h_df, h_Fz, h_scan = afm_df_height_stacks(
-        params['hmin'], params['hmax'], params['hstep'], amp=amp, amp_align=True)
+        params['hmin'], params['hmax'], params['hstep'], amp=amp, amp_align=True,
+        osc_dir=params.get('osc_dir', (0., 0., 1.)))
     new_h = np.asarray(h_scan, dtype=np.float64)
     changed = (
         pipe.heights is None
@@ -284,14 +285,14 @@ def _ensure_height_covers(window, z_want, margin=1.0):
             else:
                 from spammm.SPM import AFM as afm_mod
                 _update_afm_status(window, f"Stage 4: PP relax on amp-aware heights [{float(h_scan[0]):.2f},{float(h_scan[-1]):.2f}]...")
+                osc_dir = params.get('osc_dir', (0., 0., 1.))
                 _df_legacy, tip_disp, FEs_relax = pipe.stage4_relax(
                     window._afm_potentials['F_total'], force_recompute=True,
                     relax_params={'K_LAT': params['klat'], 'bond_length': params.get('bond_length', 3.0)},
-                    ppm_mode=True,
+                    ppm_mode=True, osc_dir=osc_dir,
                 )
-                Fz = np.asarray(FEs_relax[:, :, :, 2], dtype=np.float32)
-                dz = float(pipe.heights[1] - pipe.heights[0])
-                df = afm_mod.compute_df_amp(Fz, dz, amp=float(amp))
+                spacing = (float(pipe.scan_xs[1] - pipe.scan_xs[0]), float(pipe.scan_ys[1] - pipe.scan_ys[0]), float(pipe.heights[1] - pipe.heights[0]))
+                df = afm_mod.compute_df_amp_dir(FEs_relax, spacing, osc_dir=osc_dir, amp=float(amp))
                 window._afm_dirty.clean('s4')
                 prev = dict(window._afm_results or {})
                 window._afm_results = {
@@ -341,6 +342,18 @@ def _ensure_height_covers(window, z_want, margin=1.0):
         window._afm_height_expanding = False
 
 
+def _osc_dir_from_angles(window):
+    """Convert GUI θ (tilt from z) and φ (azimuth in xy) to osc_dir unit vector.
+
+    θ=0° → (0,0,1) vertical; θ=90°,φ=0° → (1,0,0) lateral x; θ=90°,φ=90° → (0,1,0) lateral y.
+    """
+    theta = float(window.afm_osc_theta_spin.value()) if hasattr(window, 'afm_osc_theta_spin') else 0.0
+    phi   = float(window.afm_osc_phi_spin.value())   if hasattr(window, 'afm_osc_phi_spin')   else 0.0
+    th = np.radians(theta)
+    ph = np.radians(phi)
+    return (np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th))
+
+
 def _get_pipeline_params(window):
     """Snapshot current UI parameter values - used for dirty detection.
 
@@ -379,6 +392,7 @@ def _get_pipeline_params(window):
         'backend':    backend,
         'bond_length': float(window.afm_bond_length_spin.value()) if hasattr(window, 'afm_bond_length_spin') else 3.0,
         'amp': float(window.afm_amp_spin.value()) if hasattr(window, 'afm_amp_spin') else 1.0,
+        'osc_dir': _osc_dir_from_angles(window),
     }
 
 
@@ -713,15 +727,15 @@ def _run_afm_s1_to_s4(window, *, plot=False):
         cached_nz = int(np.load(pipe.cache_stage4)['FEs_relax'].shape[2])
         if cached_nz != int(len(pipe.heights)):
             force_s4 = True
+    osc_dir = params.get('osc_dir', (0., 0., 1.))
     _df_legacy, tip_disp, FEs_relax = pipe.stage4_relax(
         F_total, force_recompute=force_s4,
         relax_params={'K_LAT': params['klat'], 'bond_length': params.get('bond_length', 3.0)},
-        ppm_mode=True,
+        ppm_mode=True, osc_dir=osc_dir,
     )
     del _df_legacy
-    Fz = np.asarray(FEs_relax[:, :, :, 2], dtype=np.float32)
-    dz = float(pipe.heights[1] - pipe.heights[0])
-    df = afm_mod.compute_df_amp(Fz, dz, amp=float(amp))
+    spacing = (float(pipe.scan_xs[1] - pipe.scan_xs[0]), float(pipe.scan_ys[1] - pipe.scan_ys[0]), float(pipe.heights[1] - pipe.heights[0]))
+    df = afm_mod.compute_df_amp_dir(FEs_relax, spacing, osc_dir=osc_dir, amp=float(amp))
     dirty.clean('s4')
     # Preserve any existing STM grids if present
     prev = window._afm_results or {}
@@ -1540,6 +1554,23 @@ def build_ui(window):
         "Oscillation amplitude for compute_df_amp (CLI SSOT = 1.0 Å peak).\n"
         "PP scan covers [Hmin−amp, Hmax+amp]. df(h) samples Fz around h±amp.")
     g_scan.add_pair("Amp [Å]:", window.afm_amp_spin)
+    # Oscillation direction: theta (tilt from z) + phi (azimuth in xy)
+    window.afm_osc_theta_spin = QtWidgets.QDoubleSpinBox()
+    window.afm_osc_theta_spin.setRange(0.0, 90.0); window.afm_osc_theta_spin.setValue(0.0)
+    window.afm_osc_theta_spin.setSingleStep(5.0)
+    window.afm_osc_theta_spin.setSuffix("°")
+    window.afm_osc_theta_spin.setToolTip(
+        "Oscillation tilt angle θ from vertical z-axis (0°=vertical AFM, 90°=lateral).\n"
+        "φ (azimuth) selects the lateral direction in the xy-plane.")
+    g_scan.add_pair("θ tilt:", window.afm_osc_theta_spin)
+    window.afm_osc_phi_spin = QtWidgets.QDoubleSpinBox()
+    window.afm_osc_phi_spin.setRange(0.0, 360.0); window.afm_osc_phi_spin.setValue(0.0)
+    window.afm_osc_phi_spin.setSingleStep(15.0)
+    window.afm_osc_phi_spin.setSuffix("°")
+    window.afm_osc_phi_spin.setToolTip(
+        "Oscillation azimuth φ in xy-plane (0°=x, 90°=y).\n"
+        "Only matters when θ>0° (non-vertical oscillation).")
+    g_scan.add_pair("φ azimuth:", window.afm_osc_phi_spin)
     scan_group.setLayout(g_scan.layout())
     param_layout.addWidget(scan_group)
 
@@ -1629,6 +1660,8 @@ def build_ui(window):
     window.afm_hmax_spin.valueChanged.connect(_mark_s4)
     window.afm_hstep_spin.valueChanged.connect(_mark_s4)
     window.afm_amp_spin.valueChanged.connect(_mark_s4)
+    window.afm_osc_theta_spin.valueChanged.connect(_mark_s4)
+    window.afm_osc_phi_spin.valueChanged.connect(_mark_s4)
 
     param_sec.setContent(param_widget)
     layout.addWidget(param_sec)

@@ -699,24 +699,29 @@ Hamiltonian = DFTB {{
         _bench_stage_end('Stage 3 FDBM potentials')
         return V_ES, E_pauli_field, E_ES_field, E_vdw, F_total
 
-    def stage4_relax(self, F_total, force_recompute=False, relax_params=None, ppm_mode=True):
-        """Stage 4: Probe-particle MD relaxation (yielding AFM signal and tip displacements)."""
+    def stage4_relax(self, F_total, force_recompute=False, relax_params=None, ppm_mode=True, osc_dir=(0.,0.,1.), base_pos=(0.,0.,0.)):
+        """Stage 4: Probe-particle MD relaxation (yielding AFM signal and tip displacements).
+
+        The relaxed volume remains (x,y,z); osc_dir only selects n in -∂(F·n)/∂s.
+        base_pos: (3,) constant world-coordinate scan offset.
+        """
+        from spammm.SPM import AFM as afm_mod
         if relax_params is None:
-            from spammm.SPM import AFM as afm_mod
             relax_params = {'K_LAT': afm_mod.K_LAT_HAPALA_EV_A2}  # 0.5 N/m → eV/Å²
-        if not force_recompute and os.path.exists(self.cache_stage4):
+        if not force_recompute and np.allclose(base_pos, (0., 0., 0.)) and os.path.exists(self.cache_stage4):
             debug_print(1, f"\n[ModularPipeline] Loading Stage 4 (relaxation) from cache...")
             _bench().begin('S4.cache_load', 'IO')
             data = np.load(self.cache_stage4)
             tip_disp = {'dx': data['tip_disp_dx'], 'dy': data['tip_disp_dy'], 'dz': data['tip_disp_dz']}
-            out = data['df'], tip_disp, data['FEs_relax']
+            FEs_relax = data['FEs_relax']
+            spacing = (float(self.scan_xs[1] - self.scan_xs[0]), float(self.scan_ys[1] - self.scan_ys[0]), float(self.heights[1] - self.heights[0]))
+            out = afm_mod.compute_df_dir(FEs_relax, spacing, osc_dir=osc_dir), tip_disp, FEs_relax
             _bench().end('S4.cache_load')
             return out
             
         k_ev = relax_params['K_LAT']
         K_RAD = float(relax_params.get('K_RAD', 20.0))
         bond_length = float(relax_params.get('bond_length', 3.0))  # AFM CLI SSOT (was 4.0 compose default)
-        from spammm.SPM import AFM as afm_mod
         k_nm = afm_mod.stiffness_eVA2_to_Nm(k_ev)
         debug_print(1, f"\n[ModularPipeline] Running Stage 4 (probe relaxation) "
               f"K_LAT={k_ev:.4f} eV/Å² (= {k_nm:.2f} N/m) L={bond_length:.2f}Å...")
@@ -731,6 +736,7 @@ Hamiltonian = DFTB {{
             K_RAD=K_RAD, bond_length=bond_length,
             use_gpu_relax=True, ppm_mode=ppm_mode, afmulator=afmulator,
             reuse_fdbm_grid=bool(getattr(self, '_fdbm_grid_ready', False)),
+            osc_dir=osc_dir, base_pos=base_pos,
         )
         afmulator.queue.finish()
         _bench().end('S4.compose_and_relax_total')

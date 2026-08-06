@@ -8,7 +8,7 @@ See `doc/TEST_DESIGN.md` for L0/L1/L2 review levels.
 
 | Script | Class | Purpose |
 |--------|-------|---------|
-| `test_afm_morse.py` | pytest | Morse/LJ + Coulomb AFM: force field grid, scans, frequency shift |
+| `test_afm_morse.py` | pytest | Morse/LJ + Coulomb AFM plus directional-df invariants: lateral oscillation retains z approach/slices |
 | `test_afm_fdbm.py` | pytest | FDBM pipeline: DFTB SCF, density projection, relaxed scan |
 | `testplot_density_projection.py` | visual | DFTB+ density projection, 2D slices + `.cub` |
 | `testplot_lcao_tile_partition.py` | visual | LCAO 8³ block tiling vs atom Rcut (denmap pairs) → `debug/lcao_tile_partition/` |

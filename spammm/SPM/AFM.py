@@ -32,6 +32,7 @@ Major Functionality:
    - relaxStrokesTilted(): GPU kernel for tip relaxation with tilt
    - get_raw_FE(): Get raw force/energy without relaxation
    - Supports CO-functionalized tip with quadrupole charge distribution
+   - Scan volumes remain (x,y,z); compute_df_dir() applies an independent oscillation direction n
 
 3. Molecule Loading
    - load_molecule(): Load molecular structure from XYZ file
@@ -430,7 +431,8 @@ class AFMulator(OpenCLBase):
     def scan_fdbm(self, scan_xs, scan_ys, probe_heights, mol_z=0.0,
                   ppm_mode=True, use_fire=True,
                   K_LAT=0.03, K_RAD=20.0, bond_length=3.0,
-                  stiffness=None, dpos0=None, relax_pars=None):
+                  stiffness=None, dpos0=None, relax_pars=None,
+                  osc_dir=(0., 0., 1.), base_pos=(0., 0., 0.)):
         """
         GPU probe-particle relaxation over a 2D scan using relaxStrokes kernel.
         Requires setup_fdbm_grid() to be called first.
@@ -457,10 +459,16 @@ class AFMulator(OpenCLBase):
             CPU uses: v = 0.8*v + 0.3*f, pos += v*0.3
             GPU equivalent: damp=0.2, dt=0.3 (for 50 steps N_RELAX_STEP_MAX)
 
+        Scan direction vs oscillation direction:
+          The scan volume is always approached along world z, so axis 2 remains probe height.
+          osc_dir is accepted for API compatibility but does not alter this acquisition geometry;
+          lateral/arbitrary df is computed afterward from the 3D (x,y,z) force volume.
+          base_pos is an optional constant world-coordinate offset of the whole scan.
+
         Args:
             scan_xs:       (nx_s,) x scan positions [Ang, world coords]
             scan_ys:       (ny_s,) y scan positions [Ang]
-            probe_heights: (nz_s,) probe (O) heights above mol_z [Ang]
+            probe_heights: (nz_s,) probe z heights above mol_z [Ang]
             mol_z:         float  z of molecule top [Ang]
             ppm_mode:      bool  True=PPM radial bond, False=simple harmonic
             use_fire:      bool  True=FIRE integrator, False=damped velocity
@@ -470,6 +478,8 @@ class AFMulator(OpenCLBase):
             stiffness:     (4,) float4 override; None -> auto from mode
             dpos0:         (4,) float4 override; None -> auto from mode
             relax_pars:    (4,) float4 (dt,damp,tmin,tmax); None -> auto from mode/use_fire
+            osc_dir:       (3,) df oscillation direction; scan approach remains along z
+            base_pos:      (3,) constant world-coordinate scan offset
 
         Returns:
             FEs_relax: (nx_s, ny_s, nz_s, 4) float32  relaxed (Fx,Fy,Fz,E) at probe pos
@@ -480,12 +490,20 @@ class AFMulator(OpenCLBase):
         n_scan = nx_s * ny_s
         origin = self.fdbm_origin
 
-        # Physical PPM: probe hangs bond_length below tip-apex.
-        # probe_heights are the desired probe positions above mol_z.
-        # Tip-apex must be bond_length higher so probe lands at probe_heights.
+        # Validate the requested df direction here, but do not confuse it with z approach.
+        osc_n = np.asarray(osc_dir, dtype=np.float32)
+        osc_norm = float(np.linalg.norm(osc_n))
+        if osc_n.shape != (3,) or not np.isfinite(osc_norm) or osc_norm <= 0.0:
+            raise ValueError(f"osc_dir must be a finite non-zero vector, got {osc_dir!r}")
+        base = np.asarray(base_pos, dtype=np.float32)
+        if base.shape != (3,) or not np.isfinite(base).all():
+            raise ValueError(f"base_pos must contain three finite coordinates, got {base_pos!r}")
+
+        # Physical PPM: probe hangs bond_length below tip-apex along z.
+        # probe_heights remain z positions independently of the df oscillation direction.
         stiffness_v  = np.array([-K_LAT, -K_LAT, -K_LAT, -K_RAD], dtype=np.float32) if stiffness is None else np.array(stiffness, dtype=np.float32)
         dpos0_v      = np.array([0., 0., -bond_length, bond_length], dtype=np.float32) if dpos0 is None else np.array(dpos0, dtype=np.float32)
-        z_start = float(np.max(probe_heights)) + mol_z + bond_length  # tip-apex = probe_z + L
+        z_start = float(np.max(probe_heights)) + mol_z + bond_length + float(base[2])
 
         # --- integrator parameters ---
         if relax_pars is not None:
@@ -498,7 +516,7 @@ class AFMulator(OpenCLBase):
             relax_pars_v = np.array([0.3, 0.2, 0.03, 0.3], dtype=np.float32)
 
         # --- build scan point buffer (grid-local coordinates) ---
-        # Tip starts at highest z, steps down
+        # Tip starts at highest z and approaches the sample along z.
         heights_desc = np.sort(probe_heights)[::-1]   # descending
         dh = float(heights_desc[0] - heights_desc[-1]) / max(nz_s - 1, 1) if nz_s > 1 else 0.
         dTip = np.array([0., 0., -dh, 0.], dtype=np.float32)
@@ -507,8 +525,8 @@ class AFMulator(OpenCLBase):
         # pts must be world coordinates (Ang); interpFE applies the full dinv transform internally
         gx, gy = np.meshgrid(scan_xs, scan_ys, indexing='ij')
         pts = np.zeros((n_scan, 4), dtype=np.float32)
-        pts[:, 0] = gx.ravel()
-        pts[:, 1] = gy.ravel()
+        pts[:, 0] = gx.ravel() + base[0]
+        pts[:, 1] = gy.ravel() + base[1]
         pts[:, 2] = z_start
 
         # --- allocate/reuse GPU scan buffers ---
@@ -860,11 +878,13 @@ class AFMulator(OpenCLBase):
     # ── scan ──────────────────────────────────────────────────────────────────
 
     def run_scan(self, nxy=(50,50), nz=60, dtip=-0.1,
-                 scan_p0=None, scan_da=None, scan_db=None, bAlloc=True):
+                 scan_p0=None, scan_da=None, scan_db=None, bAlloc=True,
+                 osc_dir=(0., 0., 1.)):
         """
         Run relaxStrokesTilted for (nx_scan × ny_scan) scan points.
         Returns FEs (nx_scan, ny_scan, nz, 4) and pts (nx_scan, ny_scan, 3).
         scan_p0/da/db: scan grid in kernel-space (post mol_shift); None = auto from bounding box.
+        osc_dir: (3,) df direction metadata; acquisition still approaches along world z.
         """
         assert self.img_FF is not None, "call make_forcefield() first"
         nx_s, ny_s = nxy
@@ -895,6 +915,12 @@ class AFMulator(OpenCLBase):
             self.realloc_scan_buffers(n_scan, nz)
         self.toGPU_(self.scan_pts_cl, pts)
         FEs_h  = np.zeros((n_scan*nz, 4), dtype=np.float32)
+        osc_n = np.asarray(osc_dir, dtype=np.float32)
+        osc_norm = float(np.linalg.norm(osc_n))
+        if osc_n.shape != (3,) or not np.isfinite(osc_norm) or osc_norm <= 0.0:
+            raise ValueError(f"osc_dir must be a finite non-zero vector, got {osc_dir!r}")
+        # tipC.xyz defines the physical tip frame as well as the kernel stroke direction.
+        # Keep that frame unchanged: lateral df is derived from the completed xyz scan volume.
         tipC = self.tipC.copy(); tipC[3] = np.float32(dtip)
         gs = (self._roundup(n_scan, 1),)
         ls = (1,)
@@ -1303,11 +1329,13 @@ class AFMulator(OpenCLBase):
     # ── raw FF (no PP relaxation) ─────────────────────────────────────────────
 
     def get_raw_FE(self, nxy=(60,60), nz=21, dtip=-0.2,
-                   scan_p0=None, scan_da=None, scan_db=None, bAlloc=True):
+                   scan_p0=None, scan_da=None, scan_db=None, bAlloc=True,
+                   osc_dir=(0., 0., 1.)):
         """
         Sample force field WITHOUT probe-particle relaxation using getFEinStrokesTilted.
         Probe moves at fixed offset dpos0 below tip, no spring/FIRE minimisation.
         Returns raw_FEs (nx,ny,nz,4) and pts (nx,ny,3).  Same scan grid as run_scan.
+        osc_dir: (3,) df direction metadata; acquisition still approaches along world z.
         """
         assert self.img_FF is not None, "call make_forcefield() first"
         nx_s, ny_s = nxy
@@ -1337,6 +1365,10 @@ class AFMulator(OpenCLBase):
             self.realloc_scan_buffers(n_scan, nz)
         self.toGPU_(self.scan_pts_cl, pts)
         FEs_h  = np.zeros((n_scan*nz, 4), dtype=np.float32)
+        osc_n = np.asarray(osc_dir, dtype=np.float32)
+        osc_norm = float(np.linalg.norm(osc_n))
+        if osc_n.shape != (3,) or not np.isfinite(osc_norm) or osc_norm <= 0.0:
+            raise ValueError(f"osc_dir must be a finite non-zero vector, got {osc_dir!r}")
         dTip = np.array([0., 0., dtip, 0.], dtype=np.float32)
         gs = (self._roundup(n_scan, 1),)
         ls = (1,)
@@ -1862,6 +1894,75 @@ def compute_df_amp(Fz, dz, amp=1.0):
         Fz_shifted = map_coordinates(Fz.astype(np.float64), coords, order=1, mode='nearest')
         df_z = np.gradient(Fz_shifted, dz_abs, axis=2)
         df -= wk * df_z
+    return df.astype(np.float32)
+
+def _df_direction_spacing(spacing, osc_dir):
+    """Normalize df direction and xyz grid spacing; fail loud on degenerate input."""
+    n = np.asarray(osc_dir, dtype=np.float64)
+    if n.shape != (3,) or not np.isfinite(n).all():
+        raise ValueError(f"osc_dir must contain three finite components, got {osc_dir!r}")
+    norm = float(np.linalg.norm(n))
+    if norm <= 0.0:
+        raise ValueError(f"osc_dir must be non-zero, got {osc_dir!r}")
+    n /= norm
+    dr = np.full(3, abs(float(spacing)), dtype=np.float64) if np.ndim(spacing) == 0 else np.abs(np.asarray(spacing, dtype=np.float64))
+    if dr.shape != (3,) or not np.isfinite(dr).all() or np.any(dr <= 0.0):
+        raise ValueError(f"spacing must be a positive scalar or (dx,dy,dz), got {spacing!r}")
+    return n, dr
+
+def compute_df_dir(FEs, spacing, osc_dir=(0., 0., 1.)):
+    """df = -∂(F·n)/∂s on an xyz force volume for arbitrary oscillation direction.
+
+    ``FEs`` has shape ``(nx,ny,nz,4)`` and axis 2 always remains z height.
+    ``spacing`` is a scalar for an isotropic grid or ``(dx,dy,dz)``.  The
+    directional derivative is ``n·∇(F·n)``; lateral oscillation therefore
+    differentiates along x/y while preserving every z slice.
+    """
+    FEs = np.asarray(FEs)
+    if FEs.ndim != 4 or FEs.shape[-1] < 3:
+        raise ValueError(f"FEs must have shape (nx,ny,nz,>=3), got {FEs.shape}")
+    n, dr = _df_direction_spacing(spacing, osc_dir)
+    F_n = FEs[..., 0]*n[0] + FEs[..., 1]*n[1] + FEs[..., 2]*n[2]
+    df = np.zeros_like(F_n, dtype=np.result_type(F_n.dtype, np.float64))
+    for ia in np.flatnonzero(np.abs(n) > 1e-15):
+        if F_n.shape[ia] < 2:
+            raise ValueError(f"FEs axis {ia} needs at least 2 samples for osc_dir={tuple(n)}")
+        df -= n[ia] * np.gradient(F_n, dr[ia], axis=ia)
+    return df
+
+def compute_df_amp_dir(FEs, spacing, osc_dir=(0., 0., 1.), amp=1.0):
+    """Frequency shift with finite amplitude for arbitrary oscillation direction.
+
+    Projects force onto osc_dir: F_n = F · n, then computes
+    df(s) = -<d(F_n)/ds>_amp  (Gauss-Chebyshev quadrature, 9 points).
+
+    FEs:      (nx, ny, nz, 4) force volume (Fx, Fy, Fz, E); axis 2 is z.
+    spacing:  positive scalar or (dx,dy,dz) [Å].
+    osc_dir:  (3,) oscillation direction unit vector.
+    amp:      oscillation amplitude [Å] (peak, not p2p).
+    Returns df (nx, ny, nz), retaining z as the slice direction.
+    """
+    from scipy.ndimage import map_coordinates
+    FEs = np.asarray(FEs)
+    if FEs.ndim != 4 or FEs.shape[-1] < 3:
+        raise ValueError(f"FEs must have shape (nx,ny,nz,>=3), got {FEs.shape}")
+    n, dr = _df_direction_spacing(spacing, osc_dir)
+    F_n = FEs[..., 0]*n[0] + FEs[..., 1]*n[1] + FEs[..., 2]*n[2]
+    active = np.flatnonzero(np.abs(n) > 1e-15)
+    for ia in active:
+        if F_n.shape[ia] < 2:
+            raise ValueError(f"FEs axis {ia} needs at least 2 samples for osc_dir={tuple(n)}")
+    n_quad = 9
+    k = np.arange(n_quad)
+    u_k = np.cos((2*k + 1) / (2*n_quad) * np.pi)
+    w_k = np.full(n_quad, 1.0 / n_quad)
+    df = np.zeros_like(F_n, dtype=np.float64)
+    coords0 = np.indices(F_n.shape, dtype=np.float64)
+    shift = (float(amp) * n / dr).reshape(3, 1, 1, 1)
+    for uk, wk in zip(u_k, w_k):
+        F_n_shifted = map_coordinates(F_n.astype(np.float64), coords0 + uk*shift, order=1, mode='nearest')
+        for ia in active:
+            df -= wk * n[ia] * np.gradient(F_n_shifted, dr[ia], axis=ia)
     return df.astype(np.float32)
 
 def fft_poisson_cpu(rho, step):
@@ -2956,4 +3057,3 @@ def compute_dispersion_grid(atomPos, atomTypes, origin, step, ngrid, C6_atom_dic
         grads_E_vdw = np.stack([np.gradient(E_vdw, step, axis=i) for i in range(3)], axis=-1)
         return E_vdw, grads_E_vdw
     return E_vdw
-

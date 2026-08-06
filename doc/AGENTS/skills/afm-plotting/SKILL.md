@@ -139,6 +139,12 @@ closest approach during df oscillation = h_df - amp = h_Fz
 - df: extracted at h_df = h_Fz + amp, labeled as `df (amp=1.0)` — contrast dominated by closest approach at h_Fz
 - df and Fz at the same column show **consistent** contrast features (df is a convolved/smoothed Fz)
 
+**Lateral/arbitrary oscillation:** the rules above use the z component of amplitude.
+For unit direction `n`, acquisition and plot columns remain `(x,y,z)`; align/pad z by
+`amp*abs(n_z)`. Pure x/y oscillation shows Fz at the same z, pads x/y for the finite
+amplitude path, and crops back to the requested image. Never reinterpret the z stack as
+samples along `n`.
+
 **Do NOT** label columns by h_df (oscillation center) — this was the old convention and caused
 confusion (df sharpening at h_df~4.0 vs Fz at h_Fz~3.0 in the same column looked inconsistent).
 

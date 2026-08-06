@@ -12,6 +12,7 @@ Key functionality:
   - FDBM runners: run_fdbm_pp_from_density() (FAST_S3 Stage3–4), run_fukui_panel() / run_fukui_one()
     (cube|stock|prolonged strips), run_morse_coulomb_afm()
   - Plotting SSOT: plot_afm_variant_height_strip(), plot_afm_tip_debug(), plot_afm_fdbm_stages()
+  - Lateral AFM: z-approach stacks plus amplitude-padded directional df on the xyz force volume
   - Density providers: get_density_from_dftb(), get_density_from_pyscf(), get_density_from_cube()
   - CO tip: _co_tip_cache_dir(), _compute_co_tip_subprocess()
   - FDBM helpers: fft_poisson(), compute_pauli_field(), compute_es_conv_field()
@@ -28,6 +29,8 @@ Design principle: AFM.py contains pure physics (no matplotlib, no QM).
 This module depends on AFM.py and adds plotting, I/O, and orchestration.
 
 Open issues / caveats:
+  - Oscillation direction never replaces the z stack: only amp*abs(n_z) pads/aligns z;
+    x/y amplitude is sampled on padded lateral grids and cropped to the requested image.
   - STM basis compare must use use_exp_basis=False so projector STO (stock vs prolonged)
     is the imaging object; exp(β,r0) bypasses WFC and hides the prolonged-tail effect.
   - Dual-basis AFM rule (prolonged Pauli only) does NOT apply to STM ψ — prolonged radial
@@ -502,7 +505,7 @@ def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
                                   scale='per_image', title='', dpi=140, pct=99.0,
                                   colorbar=None, figsize_col=None, figsize_row=None,
                                   amp=None, apos=None, show_atoms=False, extent=None,
-                                  atom_ms=2.0, atom_alpha=0.55, amp_align=False,
+                                  atom_ms=2.0, atom_alpha=0.55, amp_align=False, amp_z=None,
                                   long_axis_vertical=True, tight=True):
     """Multi-row × multi-height AFM compare strip (df/Fz/STM/BR-STM × methods).
 
@@ -628,7 +631,8 @@ def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
     }.get(scale, scale)
     amp_note = ''
     if amp is not None and amp_align:
-        amp_note = f' | amp={float(amp):.2f}Å Fz@h−amp'
+        dz_align = float(amp) if amp_z is None else float(amp_z)
+        amp_note = f' | amp={float(amp):.2f}Å Fz@h−{dz_align:.2f}Å'
     elif amp is not None:
         amp_note = f' | amp={float(amp):.2f}Å'
     rot_note = ' | long→vertical' if rot90_long else ''
@@ -641,24 +645,32 @@ def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
     return out_path
 
 
-def afm_df_height_stacks(h_min, h_max, h_step, amp=1.0, amp_align=True):
+def afm_df_height_stacks(h_min, h_max, h_step, amp=1.0, amp_align=True, osc_dir=(0., 0., 1.)):
     """SSOT AFM height ladders (skill:`afm-plotting` / CLI afm).
 
     z-reference = h_Fz = probe atom (O) center position above molecule plane (z=0).
     See doc/figures/z_reference_geometry.svg. Contact at h_Fz = R_O + R_C ≈ 3.56 Å.
+    Only the z component of the oscillation changes the closest-approach height.
+    Pure lateral oscillation therefore keeps h_df, h_Fz, and all displayed slices on z.
 
     Returns:
-        h_df:   oscillation center heights = h_Fz + amp (df is extracted here)
+        h_df:   oscillation-center z heights (df is extracted here)
         h_Fz:   probe atom (O) center heights = physical z (Fz/dXY/BR-STM here)
-        h_scan: dense PP scan covering [h_df−amp, h_df+amp] for compute_df_amp
+        h_scan: dense z approach covering h_df ± amp*abs(n_z) for compute_df_amp_dir
     """
     def _h_stack(h0, h1, dz):
         n = int(round((float(h1) - float(h0)) / float(dz))) + 1
         return (float(h0) + np.arange(n, dtype=np.float64) * float(dz)).astype(np.float32)
     h_df = _h_stack(h_min, h_max, h_step)
     amp = float(amp)
-    h_Fz = (h_df.astype(np.float64) - amp).astype(np.float32) if amp_align else h_df.copy()
-    h_scan = _h_stack(float(h_df[0]) - amp, float(h_df[-1]) + amp, h_step)
+    osc_n = np.asarray(osc_dir, dtype=np.float64)
+    osc_norm = float(np.linalg.norm(osc_n))
+    if osc_n.shape != (3,) or not np.isfinite(osc_norm) or osc_norm <= 0.0:
+        raise ValueError(f'afm_df_height_stacks: osc_dir must be a finite non-zero vector, got {osc_dir!r}')
+    osc_n /= osc_norm
+    amp_z = amp*abs(float(osc_n[2]))
+    h_Fz = (h_df.astype(np.float64) - amp_z).astype(np.float32) if amp_align else h_df.copy()
+    h_scan = _h_stack(float(h_df[0]) - amp_z, float(h_df[-1]) + amp_z, h_step)
     if len(h_scan) < 3:
         raise ValueError(f'afm_df_height_stacks: need denser heights for amp={amp}: n_scan={len(h_scan)}')
     return h_df, h_Fz, h_scan
@@ -3086,7 +3098,7 @@ def compose_and_relax(grads_pauli, grads_es, grads_vdw, scan_xs, scan_ys, height
     return df, tip_disp
 
 
-def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, atomPos, K_LAT=None,  K_RAD=20.0, bond_length=4.0,  use_gpu_relax=True, ppm_mode=False, afmulator=None, reuse_fdbm_grid=False):
+def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, atomPos, K_LAT=None,  K_RAD=20.0, bond_length=4.0,  use_gpu_relax=True, ppm_mode=False, afmulator=None, reuse_fdbm_grid=False, osc_dir=(0.,0.,1.), base_pos=(0.,0.,0.)):
     """
     Compose force field from total force field and run probe particle relaxation.
 
@@ -3094,7 +3106,7 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
         F_total:       (nx, ny, nz, 4) total force field (Fx, Fy, Fz, E) where F = -grad(E)
         scan_xs:       (nx_s,) scan x coordinates
         scan_ys:       (ny_s,) scan y coordinates
-        heights:       (nz_s,) probe/tip-apex heights above mol_z
+        heights:       (nz_s,) probe/tip-apex z heights above mol_z
         origin:        (3,) grid origin
         step:          grid spacing
         atomPos:       (natoms, 3) atom positions (for mol_z)
@@ -3105,10 +3117,12 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
                        True = spherical PPM radial bond (CO-tip, L=bond_length, Kr=K_RAD)
         afmulator:     AFMulator instance; created if None
         reuse_fdbm_grid: if True, skip setup_fdbm_grid (fast-S3 already uploaded img_FF_fdbm)
+        osc_dir:       (3,) force-projection/oscillation direction; independent of z approach
+        base_pos:      (3,) constant world-coordinate scan offset
 
     Returns:
         df:        (nx_s, ny_s, nz_s) frequency shift array
-        tip_disp:  dict with 'dx','dy' (nx_s, ny_s, nz_s) tip displacement
+        tip_disp:  dict with 'dx','dy','dz' (nx_s, ny_s, nz_s) tip displacement
         FEs_relax: (nx_s, ny_s, nz_s, 4) forces at relaxed positions
     """
     if K_LAT is None:
@@ -3131,6 +3145,7 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
                 scan_xs, scan_ys, heights, mol_z=mol_z,
                 K_LAT=K_LAT, K_RAD=K_RAD, bond_length=bond_length,
                 ppm_mode=True, use_fire=True,
+                osc_dir=osc_dir, base_pos=base_pos,
             )
             # Diagnostic: report maximum displacement for each z-height
             from spammm.globals import DEBUG_PRINT_LEVEL
@@ -3171,7 +3186,8 @@ def compose_and_relax_total(F_total, scan_xs, scan_ys, heights, origin, step, at
             return np.stack([fx, fy, fz], axis=-1)
         FEs_relax, tip_disp = afm.pp_relax_2d(force_func, scan_xs, scan_ys, heights, mol_z=mol_z, K_LAT=K_LAT, N_RELAX=50, step=step)
 
-    df = afm.compute_df(FEs_relax[:,:,:,2], heights[1]-heights[0])
+    spacing = (float(scan_xs[1] - scan_xs[0]), float(scan_ys[1] - scan_ys[0]), float(heights[1] - heights[0]))
+    df = afm.compute_df_dir(FEs_relax, spacing, osc_dir=osc_dir)
     return df, tip_disp, FEs_relax
 
 
@@ -3281,7 +3297,8 @@ def run_fdbm_pp_from_density(tag, rho_scf, atomPos, atomTypes, origin, step, ngr
                              h_min=3.7, h_max=4.7, h_step=0.1, amp=1.0, amp_align=True,
                              K_LAT_Nm=0.5, K_RAD=20.0, bond_length=3.0, scan_margin=2.0,
                              plots=None, df_cmap='gray', cmap='seismic', stage_height=4.2,
-                             use_fast_s3=True, C6_CO=30.0):
+                             use_fast_s3=True, C6_CO=30.0,
+                             osc_dir=(0., 0., 1.), base_pos=(0., 0., 0.)):
     """Shared CLI/GUI FDBM Stage3–4 from precomputed ρ (FAST_S3 by default).
 
     Product path (default ``use_fast_s3=True``): ``stage3_fdbm_fields_fast`` + FIRE ``scan_fdbm``
@@ -3359,51 +3376,81 @@ def run_fdbm_pp_from_density(tag, rho_scf, atomPos, atomTypes, origin, step, ngr
         }
         stage_path = plot_afm_fdbm_stages(fields, origin, step, atomPos, outdir, tag, z_above=float(stage_height))
 
-    h_df, h_Fz, h_scan = afm_df_height_stacks(h_min, h_max, h_step, amp=amp, amp_align=amp_align)
+    h_df, h_Fz, h_scan = afm_df_height_stacks(h_min, h_max, h_step, amp=amp, amp_align=amp_align, osc_dir=osc_dir)
+    # The scan grid and stack stay (x,y,z) for every oscillation direction.
+    osc_n = np.asarray(osc_dir, dtype=np.float64)
+    osc_norm = float(np.linalg.norm(osc_n))
+    if not np.isfinite(osc_norm) or osc_norm <= 0.0:
+        raise ValueError(f"osc_dir must be a finite non-zero vector, got {osc_dir!r}")
+    osc_n /= osc_norm
     scan_xs = np.arange(float(atomPos[:, 0].min() - scan_margin),
                         float(atomPos[:, 0].max() + scan_margin), step, dtype=np.float32)
     scan_ys = np.arange(float(atomPos[:, 1].min() - scan_margin),
                         float(atomPos[:, 1].max() + scan_margin), step, dtype=np.float32)
+    # Sample the complete finite-amplitude path, then crop back to the requested XY image.
+    # This is the lateral analogue of h_scan padding for vertical oscillation.
+    pad_x = int(np.ceil(abs(float(amp)*osc_n[0])/step - 1e-12))
+    pad_y = int(np.ceil(abs(float(amp)*osc_n[1])/step - 1e-12))
+    base = np.asarray(base_pos, dtype=np.float64)
+    if base.shape != (3,) or not np.isfinite(base).all():
+        raise ValueError(f"base_pos must contain three finite coordinates, got {base_pos!r}")
+    required_margin_xy = np.array([scan_margin + pad_x*step + abs(float(base[0])), scan_margin + pad_y*step + abs(float(base[1]))])
+    if np.any(required_margin_xy > float(margin) + 1e-9):
+        raise ValueError(f"lateral amplitude leaves the force-field grid: required xy margins={required_margin_xy} Å exceed density margin={margin} Å")
+    scan_xs_full = (float(scan_xs[0]) + (np.arange(len(scan_xs) + 2*pad_x, dtype=np.float64) - pad_x)*step).astype(np.float32)
+    scan_ys_full = (float(scan_ys[0]) + (np.arange(len(scan_ys) + 2*pad_y, dtype=np.float64) - pad_y)*step).astype(np.float32)
     mol_z = float(atomPos[:, 2].max())
     K_LAT = afm.stiffness_Nm_to_eVA2(float(K_LAT_Nm))
     print(f"  K_LAT={K_LAT_Nm:.3f} N/m → {K_LAT:.4f} eV/Å²  K_RAD={K_RAD}  L={bond_length} Å")
     print(f"  df h=[{float(h_df[0]):.2f},{float(h_df[-1]):.2f}]  "
           f"Fz h=[{float(h_Fz[0]):.2f},{float(h_Fz[-1]):.2f}]  "
-          f"scan=[{float(h_scan[0]):.2f},{float(h_scan[-1]):.2f}] amp={amp} align={amp_align}")
+          f"z-scan=[{float(h_scan[0]):.2f},{float(h_scan[-1]):.2f}] amp={amp} align={amp_align} "
+          f"osc_n=({osc_n[0]:.3f},{osc_n[1]:.3f},{osc_n[2]:.3f})")
 
     if not reuse_grid:
         afmulator.setup_fdbm_grid(F_total, origin, step)
-    FEs, tip_disp = afmulator.scan_fdbm(
-        scan_xs, scan_ys, h_scan, mol_z=mol_z,
+    FEs_full, tip_disp_full = afmulator.scan_fdbm(
+        scan_xs_full, scan_ys_full, h_scan, mol_z=mol_z,
         K_LAT=K_LAT, K_RAD=float(K_RAD), bond_length=float(bond_length),
         ppm_mode=True, use_fire=True,
+        osc_dir=osc_dir, base_pos=base_pos,
     )
     afmulator.queue.finish()
-    Fz_full = FEs[:, :, :, 2]
-    dz = float(h_scan[1] - h_scan[0])
-    df_full = afm.compute_df_amp(Fz_full, dz, amp=float(amp))
+    spacing = (float(scan_xs_full[1] - scan_xs_full[0]), float(scan_ys_full[1] - scan_ys_full[0]), float(h_scan[1] - h_scan[0]))
+    df_full = afm.compute_df_amp_dir(FEs_full, spacing, osc_dir=osc_n, amp=float(amp))
     idx_df = [int(np.argmin(np.abs(h_scan - h))) for h in h_df]
     idx_Fz = [int(np.argmin(np.abs(h_scan - h))) for h in h_Fz]
-    Fz = Fz_full[:, :, idx_Fz]
-    df = df_full[:, :, idx_df]
+    sx = slice(pad_x, pad_x + len(scan_xs))
+    sy = slice(pad_y, pad_y + len(scan_ys))
+    FEs = FEs_full[sx, sy]
+    tip_disp = {key: val[sx, sy] for key, val in tip_disp_full.items()}
+    Fz = FEs[..., 2][:, :, idx_Fz]
+    df = df_full[sx, sy][:, :, idx_df]
     heights = h_df
     x_ext = [float(scan_xs[0]), float(scan_xs[-1])]
     y_ext = [float(scan_ys[0]), float(scan_ys[-1])]
     if 'df' in plots:
-        plot_grid_Fz(df, heights, f'df {tag} A={A:.2f} β={beta:.3f}', f'df_{tag}.png',
+        plot_grid_Fz(df, heights, f'df n=({osc_n[0]:.2f},{osc_n[1]:.2f},{osc_n[2]:.2f}) {tag} A={A:.2f} β={beta:.3f}', f'df_{tag}.png',
                      x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap=df_cmap)
     if 'fz' in plots:
         plot_grid_Fz(Fz, h_Fz, f'Fz {tag} A={A:.2f} β={beta:.3f}', f'Fz_{tag}.png',
                      x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap=cmap)
     ih = len(heights) // 2
+    df_lo, df_hi = df[:, :, 0], df[:, :, -1]
+    df_slice_rms = float(np.sqrt(np.mean((df_hi - df_lo)**2)))
+    df_slice_scale = max(float(np.sqrt(np.mean(df_lo**2))), float(np.sqrt(np.mean(df_hi**2))), 1e-30)
+    df_slice_corr = float(np.corrcoef(df_lo.ravel(), df_hi.ravel())[0, 1]) if np.std(df_lo) > 0.0 and np.std(df_hi) > 0.0 else np.nan
     print(f"  df @h={heights[ih]:.2f} / Fz @h={float(h_Fz[ih]):.2f}: "
           f"df=[{df.min():.3e},{df.max():.3e}] Fz=[{Fz.min():.3e},{Fz.max():.3e}]")
+    print(f"  df z-slice first→last: RMSΔ={df_slice_rms:.3e} relative={df_slice_rms/df_slice_scale:.3f} corr={df_slice_corr:.6f}")
     return {
         'tip': tip_info, 'stage_path': stage_path, 'df': df, 'Fz': Fz, 'heights': heights,
-        'heights_Fz': h_Fz, 'amp_align': bool(amp_align),
+        'heights_Fz': h_Fz, 'amp_align': bool(amp_align and abs(float(osc_n[2])) > 1e-12),
         'scan_xs': scan_xs, 'scan_ys': scan_ys, 'atomPos': atomPos, 'origin': origin, 'step': step,
         'A': A, 'beta': beta, 'tag': tag, 'h_scan': h_scan, 'tip_disp': tip_disp,
-        'FEs': FEs, 'path': 'FAST_S3' if use_fast_s3 else 'LEGACY',
+        'FEs': FEs, 'osc_dir': osc_n.copy(), 'df_z_slice_rms': df_slice_rms,
+        'df_z_slice_relative': df_slice_rms/df_slice_scale, 'df_z_slice_corr': df_slice_corr,
+        'path': 'FAST_S3' if use_fast_s3 else 'LEGACY',
     }
 
 
