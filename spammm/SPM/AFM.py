@@ -432,7 +432,8 @@ class AFMulator(OpenCLBase):
                   ppm_mode=True, use_fire=True,
                   K_LAT=0.03, K_RAD=20.0, bond_length=3.0,
                   stiffness=None, dpos0=None, relax_pars=None,
-                  osc_dir=(0., 0., 1.), base_pos=(0., 0., 0.)):
+                  osc_dir=(0., 0., 1.), base_pos=(0., 0., 0.),
+                  reverse=False):
         """
         GPU probe-particle relaxation over a 2D scan using relaxStrokes kernel.
         Requires setup_fdbm_grid() to be called first.
@@ -480,6 +481,7 @@ class AFMulator(OpenCLBase):
             relax_pars:    (4,) float4 (dt,damp,tmin,tmax); None -> auto from mode/use_fire
             osc_dir:       (3,) df oscillation direction; scan approach remains along z
             base_pos:      (3,) constant world-coordinate scan offset
+            reverse:       bool  True=scan z ascending (backward stroke for dissipation)
 
         Returns:
             FEs_relax: (nx_s, ny_s, nz_s, 4) float32  relaxed (Fx,Fy,Fz,E) at probe pos
@@ -516,10 +518,16 @@ class AFMulator(OpenCLBase):
             relax_pars_v = np.array([0.3, 0.2, 0.03, 0.3], dtype=np.float32)
 
         # --- build scan point buffer (grid-local coordinates) ---
-        # Tip starts at highest z and approaches the sample along z.
-        heights_desc = np.sort(probe_heights)[::-1]   # descending
-        dh = float(heights_desc[0] - heights_desc[-1]) / max(nz_s - 1, 1) if nz_s > 1 else 0.
-        dTip = np.array([0., 0., -dh, 0.], dtype=np.float32)
+        # Tip starts at highest z and approaches the sample along z (forward).
+        # reverse=True: start at lowest z, step upward (backward stroke for dissipation).
+        heights_sorted = np.sort(probe_heights)
+        dh = float(heights_sorted[-1] - heights_sorted[0]) / max(nz_s - 1, 1) if nz_s > 1 else 0.
+        if reverse:
+            dTip = np.array([0., 0., +dh, 0.], dtype=np.float32)
+            z_start = float(heights_sorted[0]) + mol_z + bond_length + float(base[2])
+        else:
+            dTip = np.array([0., 0., -dh, 0.], dtype=np.float32)
+            z_start = float(heights_sorted[-1]) + mol_z + bond_length + float(base[2])
 
         # vectorised: outer product of scan_xs, scan_ys -> (nx_s*ny_s, 4)
         # pts must be world coordinates (Ang); interpFE applies the full dinv transform internally
@@ -554,9 +562,13 @@ class AFMulator(OpenCLBase):
         self.fromGPU_(self.scan_disps_cl, disps_h)
         self.queue.finish()
 
-        # relaxStrokes: FEs[gid*nz+iz] where iz=0=highest z; flip to iz=0=lowest
-        FEs_relax = FEs_h.reshape(nx_s, ny_s, nz_s, 4)[:, :, ::-1, :]
-        disps_relax = disps_h.reshape(nx_s, ny_s, nz_s, 4)[:, :, ::-1, :]
+        # relaxStrokes: iz=0=highest z (forward) or iz=0=lowest z (reverse); flip forward to iz=0=lowest
+        if reverse:
+            FEs_relax = FEs_h.reshape(nx_s, ny_s, nz_s, 4)
+            disps_relax = disps_h.reshape(nx_s, ny_s, nz_s, 4)
+        else:
+            FEs_relax = FEs_h.reshape(nx_s, ny_s, nz_s, 4)[:, :, ::-1, :]
+            disps_relax = disps_h.reshape(nx_s, ny_s, nz_s, 4)[:, :, ::-1, :]
         Fz = FEs_relax[:,:,:,2]
         debug_print(1, f"  AFMulator.scan_fdbm: Fz min={Fz.min():.4f}  max={Fz.max():.4f}  mean={Fz.mean():.4f} eV/Ang  ppm_mode={ppm_mode}")
         
@@ -1964,6 +1976,48 @@ def compute_df_amp_dir(FEs, spacing, osc_dir=(0., 0., 1.), amp=1.0):
         for ia in active:
             df -= wk * n[ia] * np.gradient(F_n_shifted, dr[ia], axis=ia)
     return df.astype(np.float32)
+
+def compute_dissipation(FEs_fwd, FEs_bwd, h_scan, h_df, amp, osc_dir=(0., 0., 1.)):
+    """Energy dissipation per oscillation cycle from forward/backward hysteresis.
+
+    E_diss(x,y,h) = |∮ F·n ds| = |∫_{h-A_z}^{h+A_z} (F_n_fwd - F_n_bwd) dz|
+
+    where F_n = F · n (force projected onto oscillation direction) and A_z = amp*|n_z|.
+    The absolute value ensures E_diss ≥ 0 (energy lost, never driving).
+    The integral is evaluated by trapezoidal rule over the z-scan samples covering
+    [h - A_z, h + A_z].
+
+    Args:
+        FEs_fwd: (nx, ny, nz_scan, 4) forward-stroke forces (z descending)
+        FEs_bwd: (nx, ny, nz_scan, 4) backward-stroke forces (z ascending)
+        h_scan:  (nz_scan,) z positions of the scan [Å]
+        h_df:    (nz_df,) display heights to extract dissipation at [Å]
+        amp:     oscillation amplitude [Å] (peak)
+        osc_dir: (3,) oscillation direction unit vector
+    Returns:
+        E_diss: (nx, ny, nz_df) dissipated energy [eV] per cycle at each display height
+    """
+    FEs_fwd = np.asarray(FEs_fwd, dtype=np.float64)
+    FEs_bwd = np.asarray(FEs_bwd, dtype=np.float64)
+    h_scan = np.asarray(h_scan, dtype=np.float64)
+    h_df = np.asarray(h_df, dtype=np.float64)
+    n = np.asarray(osc_dir, dtype=np.float64)
+    n = n / np.linalg.norm(n)
+    amp_z = float(amp) * abs(n[2])
+    F_n_fwd = FEs_fwd[..., 0]*n[0] + FEs_fwd[..., 1]*n[1] + FEs_fwd[..., 2]*n[2]
+    F_n_bwd = FEs_bwd[..., 0]*n[0] + FEs_bwd[..., 1]*n[1] + FEs_bwd[..., 2]*n[2]
+    dF = F_n_fwd - F_n_bwd
+    nx, ny, nz_scan = dF.shape
+    nz_df = len(h_df)
+    E_diss = np.zeros((nx, ny, nz_df), dtype=np.float32)
+    for i, h in enumerate(h_df):
+        lo, hi = h - amp_z, h + amp_z
+        mask = (h_scan >= lo) & (h_scan <= hi)
+        if mask.sum() < 2:
+            mask = np.ones(nz_scan, dtype=bool)
+        E_diss[:, :, i] = np.abs(np.trapz(dF[:, :, mask], x=h_scan[mask], axis=2)).astype(np.float32)
+    return E_diss
+
 
 def fft_poisson_cpu(rho, step):
     """CPU NumPy FFT Poisson (parity / backup). V(r) from charge density rho(r).

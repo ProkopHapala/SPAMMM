@@ -227,6 +227,96 @@ class PackedMolecule:
         )
 
 
+class EditorSnapshot:
+    """Lossless undo snapshot of an AtomicGraph + editor backend state.
+
+    Unlike PackedMolecule (which is lossy: float32, no pins/parents/charges/
+    bond-orders/IDs), EditorSnapshot preserves every authoritative graph field
+    needed for exact restoration:
+      - Atom: _id, ename, atype, pos (float64), pin, parent (by _id), npi, charge
+      - Bond: _id, endpoint _ids, order
+      - backend.hex_tiles: set of (q,r) tuples
+
+    Only alive atoms/bonds are serialized. On restore, a fresh AtomicGraph is
+    built with exact IDs, pins, parents, charges, and bond orders. The pin cache
+    is rebuilt from stored pins (with duplicate-pin assertion). hex_tiles is
+    returned to the caller for exact restoration.
+
+    H caps are NOT regenerated during restore — they are restored exactly as
+    they were in the snapshot, preserving parent links and positions.
+    """
+    __slots__ = ('atom_ids', 'etypes', 'apos', 'pins', 'parent_ids', 'npis', 'charges',
+                 'bond_ids', 'bond_a_ids', 'bond_b_ids', 'bond_orders', 'hex_tiles')
+
+    def __init__(self, atom_ids, etypes, apos, pins, parent_ids, npis, charges,
+                 bond_ids, bond_a_ids, bond_b_ids, bond_orders, hex_tiles):
+        self.atom_ids    = atom_ids
+        self.etypes      = etypes
+        self.apos        = apos
+        self.pins        = pins
+        self.parent_ids  = parent_ids
+        self.npis        = npis
+        self.charges     = charges
+        self.bond_ids    = bond_ids
+        self.bond_a_ids  = bond_a_ids
+        self.bond_b_ids  = bond_b_ids
+        self.bond_orders = bond_orders
+        self.hex_tiles   = hex_tiles
+
+    def __repr__(self):
+        return f"EditorSnapshot(natoms={len(self.atom_ids)}, nbonds={len(self.bond_ids)}, ntiles={len(self.hex_tiles)})"
+
+    @classmethod
+    def from_graph(cls, graph, hex_tiles):
+        """Build a lossless snapshot from an AtomicGraph + backend.hex_tiles."""
+        atom_list, enames, apos, atypes, bonds_idx, bond_list, ring_list = graph.to_arrays()
+        n = len(atom_list)
+        atom_ids   = [a._id for a in atom_list]
+        etypes     = [a.atype for a in atom_list]
+        apos_arr   = np.array([a.pos for a in atom_list], dtype=np.float64)
+        pins       = [a.pin for a in atom_list]
+        parent_ids = [a.parent._id if a.parent is not None else -1 for a in atom_list]
+        npis       = [a.npi for a in atom_list]
+        charges    = [a.charge for a in atom_list]
+        id_to_idx  = {a._id: i for i, a in enumerate(atom_list)}
+        bond_ids    = [b._id for b in bond_list]
+        bond_a_ids  = [id_to_idx[b.a._id] for b in bond_list]
+        bond_b_ids  = [id_to_idx[b.b._id] for b in bond_list]
+        bond_orders = [b.order for b in bond_list]
+        return cls(atom_ids, etypes, apos_arr, pins, parent_ids, npis, charges,
+                   bond_ids, bond_a_ids, bond_b_ids, bond_orders, set(hex_tiles))
+
+    def to_graph(self):
+        """Rebuild a fresh AtomicGraph with exact IDs, pins, parents, charges, bond orders.
+        Returns (graph, hex_tiles_copy)."""
+        graph = AtomicGraph()
+        atoms = [None] * len(self.atom_ids)
+        for i in range(len(self.atom_ids)):
+            z = int(self.etypes[i])
+            ename = _z_to_ename(z)
+            pos = np.array(self.apos[i], dtype=np.float64)
+            pin = self.pins[i]
+            npi_i = int(self.npis[i])
+            a = graph.add_atom(pos, ename, z, pin=pin, parent=None, npi=npi_i, _id=int(self.atom_ids[i]))
+            a.charge = float(self.charges[i])
+            atoms[i] = a
+        # Restore parent links by stored parent _id
+        id_to_atom = {a._id: a for a in atoms}
+        for i in range(len(atoms)):
+            pid = int(self.parent_ids[i])
+            if pid >= 0 and pid in id_to_atom:
+                atoms[i].parent = id_to_atom[pid]
+        # Restore bonds with exact IDs and orders
+        for k in range(len(self.bond_ids)):
+            ia = int(self.bond_a_ids[k])
+            ib = int(self.bond_b_ids[k])
+            if 0 <= ia < len(atoms) and 0 <= ib < len(atoms):
+                graph.add_bond(atoms[ia], atoms[ib], order=float(self.bond_orders[k]), _id=int(self.bond_ids[k]))
+        graph.sync_neighbor_lists()
+        graph.rebuild_pin_cache_from_atoms()
+        return graph, set(self.hex_tiles)
+
+
 class UndoStack:
     """Rolling buffer of PackedMolecule snapshots. O(1) push/pop."""
     def __init__(self, maxlen=100):

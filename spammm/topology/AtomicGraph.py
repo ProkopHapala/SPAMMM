@@ -42,9 +42,13 @@ class Atom:
     __slots__ = ('pos', 'ename', 'atype', 'pin', 'parent', 'npi', 'bonds', 'neighbors', '_id', 'alive', 'charge')
     _counter = 0
 
-    def __init__(self, pos, ename, atype, pin=None, parent=None, npi=1):
-        Atom._counter += 1
-        self._id = Atom._counter
+    def __init__(self, pos, ename, atype, pin=None, parent=None, npi=1, _id=None):
+        if _id is not None:
+            self._id = _id
+            Atom._counter = max(Atom._counter, _id)
+        else:
+            Atom._counter += 1
+            self._id = Atom._counter
         self.alive   = True         # False = marked for deletion, will be cleaned up
         self.pos     = np.asarray(pos, dtype=np.float64)   # (3,)
         self.ename   = ename        # element symbol string
@@ -68,9 +72,13 @@ class Bond:
     __slots__ = ('a', 'b', 'order', '_id', 'alive')
     _counter = 0
 
-    def __init__(self, a: Atom, b: Atom, order=1.0):
-        Bond._counter += 1
-        self._id   = Bond._counter
+    def __init__(self, a: Atom, b: Atom, order=1.0, _id=None):
+        if _id is not None:
+            self._id = _id
+            Bond._counter = max(Bond._counter, _id)
+        else:
+            Bond._counter += 1
+            self._id = Bond._counter
         self.alive = True           # False = marked for deletion, will be cleaned up
         self.a     = a
         self.b     = b
@@ -172,10 +180,67 @@ class AtomicGraph:
         Kept for API symmetry with future lazy-cache designs."""
         pass
 
+    def rebuild_pin_cache_from_atoms(self):
+        """Rebuild _pin_to_atom from alive atoms' stored .pin values.
+        Asserts no two alive atoms share the same pin. Use after restoring
+        a graph from a snapshot where pins were stored on atoms but the
+        cache was not populated."""
+        self._pin_to_atom.clear()
+        for a in self.atoms.values():
+            if not a.alive or a.pin is None:
+                continue
+            if a.pin in self._pin_to_atom:
+                raise RuntimeError(f"rebuild_pin_cache_from_atoms: duplicate pin {a.pin} "
+                                   f"(atoms {self._pin_to_atom[a.pin]._id} and {a._id})")
+            self._pin_to_atom[a.pin] = a
+
+    def validate(self, overlap_tol=0.3):
+        """Validate graph invariants. Raises RuntimeError on any violation.
+        Checks: pin uniqueness, pin-cache parity, no overlapping heavy atoms,
+        bond validity (distinct alive endpoints, finite length), H-cap parent alive."""
+        # Pin uniqueness + cache parity
+        seen_pins = {}
+        for a in self.atoms.values():
+            if not a.alive: continue
+            if a.pin is not None:
+                if a.pin in seen_pins:
+                    raise RuntimeError(f"validate: duplicate pin {a.pin} (atoms {seen_pins[a.pin]._id} and {a._id})")
+                seen_pins[a.pin] = a
+        for pin, a in self._pin_to_atom.items():
+            if not a.alive:
+                raise RuntimeError(f"validate: pin cache contains dead atom {a._id} for pin {pin}")
+            if a.pin != pin:
+                raise RuntimeError(f"validate: pin cache pin {pin} → atom {a._id} has pin={a.pin}")
+        # No overlapping heavy atoms
+        alive_heavy = [a for a in self.atoms.values() if a.alive and a.npi != -1]
+        for i in range(len(alive_heavy)):
+            for j in range(i + 1, len(alive_heavy)):
+                d = np.linalg.norm(alive_heavy[i].pos - alive_heavy[j].pos)
+                if d < overlap_tol:
+                    raise RuntimeError(f"validate: heavy atoms {alive_heavy[i]._id} and {alive_heavy[j]._id} "
+                                       f"overlap at d={d:.4f} Å (tol={overlap_tol})")
+        # Bond validity
+        for b in self.bonds.values():
+            if not b.alive: continue
+            if b.a is b.b:
+                raise RuntimeError(f"validate: bond {b._id} connects atom to itself ({b.a._id})")
+            if not b.a.alive or not b.b.alive:
+                raise RuntimeError(f"validate: bond {b._id} has dead endpoint(s)")
+            d = np.linalg.norm(b.a.pos - b.b.pos)
+            if not np.isfinite(d) or d < 1e-6:
+                raise RuntimeError(f"validate: bond {b._id} has zero/inf length ({d})")
+        # H-cap parent alive
+        for a in self.atoms.values():
+            if a.alive and a.npi == -1 and a.parent is not None:
+                if not a.parent.alive:
+                    raise RuntimeError(f"validate: H cap {a._id} has dead parent {a.parent._id}")
+
     # ── Atom operations ──────────────────────────────────────────────────────
 
-    def add_atom(self, pos, ename, atype, pin=None, parent=None, npi=1) -> Atom:
-        a = Atom(pos, ename, atype, pin=pin, parent=parent, npi=npi)
+    def add_atom(self, pos, ename, atype, pin=None, parent=None, npi=1, _id=None) -> Atom:
+        a = Atom(pos, ename, atype, pin=pin, parent=parent, npi=npi, _id=_id)
+        if a._id in self.atoms:
+            raise RuntimeError(f"add_atom: Atom _id={a._id} already exists in graph")
         self.atoms[a._id] = a
         if pin is not None:
             assert pin not in self._pin_to_atom, f"Duplicate pin {pin} (existing={self._pin_to_atom[pin]}, new={a})"
@@ -256,18 +321,21 @@ class AtomicGraph:
 
     # ── Bond operations ──────────────────────────────────────────────────────
 
-    def add_bond(self, a: Atom, b: Atom, order=None) -> Bond:
+    def add_bond(self, a: Atom, b: Atom, order=None, _id=None) -> Bond:
         for bond in a.bonds:
             if bond.other(a) is b:
                 if not bond.alive:
                     bond.alive = True  # revive dead bond
+                    if order is not None: bond.order = order
                     a.neighbors.append(b)
                     b.neighbors.append(a)
                 return bond   # already exists (now alive)
         if order is None:
             # Default single; aromatic/double come from Kekule or Bond-mode cycle — not a silent 1.5 token
             order = 1.0
-        bond = Bond(a, b, order)
+        bond = Bond(a, b, order, _id=_id)
+        if bond._id in self.bonds:
+            raise RuntimeError(f"add_bond: Bond _id={bond._id} already exists in graph")
         self.bonds[bond._id] = bond
         a.bonds.append(bond)
         b.bonds.append(bond)

@@ -38,14 +38,14 @@ def _abs_path(p: str | None) -> str | None:
 
 
 def _parse_plots(s: str | None) -> set[str]:
-    """Parse --plots CSV: compare,stage (default) | tip,df,fz,per_image | all | none."""
+    """Parse --plots CSV: compare,stage (default) | tip,df,fz,ediss,per_image | all | none."""
     if s is None:
         s = 'compare,stage'
     parts = [p.strip().lower() for p in str(s).replace(';', ',').split(',') if p.strip()]
     if not parts or 'none' in parts or 'off' in parts:
         return set()
     if 'all' in parts or 'debug' in parts:
-        return {'compare', 'stage', 'tip', 'df', 'fz', 'per_image'}
+        return {'compare', 'stage', 'tip', 'df', 'fz', 'ediss', 'per_image'}
     return set(parts)
 
 
@@ -118,7 +118,7 @@ def _add_common_afm_args(p: argparse.ArgumentParser) -> None:
     out.add_argument('--scale',    default='per_image', choices=['per_image', 'per_column', 'common'],
                      help='Color scale (default per_image; df always per-panel clim)')
     out.add_argument('--plots', default='compare,stage',
-                     help='CSV: compare,stage (default); tip,df,fz,per_image; all; none')
+                     help='CSV: compare,stage (default); tip,df,fz,ediss,per_image; all; none')
     out.add_argument('--show-atoms', action='store_true', dest='show_atoms',
                      help='Overlay atom positions as small dots on AFM panels')
 
@@ -223,7 +223,7 @@ def cmd_afm(args: argparse.Namespace) -> int:
     A_pauli, beta_pauli = float(pa['A']), float(pa['beta'])
     print(f'Pauli EVAL defaults ({args.basis}): A={A_pauli:.3f} β={beta_pauli:.4f}')
 
-    plot_diag = plots & {'tip', 'stage', 'df', 'fz'}
+    plot_diag = plots & {'tip', 'stage', 'df', 'fz', 'ediss'}
 
     osc_dir = _parse_vec3(getattr(args, 'osc_dir', '0,0,1'), default=(0., 0., 1.))
     base_pos = _parse_vec3(getattr(args, 'base_pos', '0,0,0'), default=(0., 0., 0.))
@@ -304,6 +304,9 @@ def cmd_afm(args: argparse.Namespace) -> int:
     for k in order:
         fz_lab = f'Fz {k}\n@h−{amp_z:.1f}Å' if amp_align else f'Fz {k}\n@same z'
         row_specs.append(('Fz', k, fz_lab, args.cmap))
+    if 'ediss' in plots:
+        for k in order:
+            row_specs.append(('E_diss', k, f'E_diss {k}\namp={amp:.1f}Å', 'hot'))
 
     heights = next(iter(variants.values()))['heights']
     v0 = next(iter(variants.values()))

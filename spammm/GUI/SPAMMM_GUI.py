@@ -62,7 +62,7 @@ from spammm.GUI import VispyUtils as vu
 from spammm import elements
 from spammm import atomicUtils as au
 from spammm import elements
-from spammm.topology.PackedMolecule import PackedMolecule, UndoStack, _z_to_ename
+from spammm.topology.PackedMolecule import PackedMolecule, UndoStack, EditorSnapshot, _z_to_ename
 from spammm.GUI.BaseGUI import BaseGUI
 from spammm.GUI.VispyUtils import compute_bond_colors_by_length, generate_atom_labels
 
@@ -1378,20 +1378,29 @@ class SPAMMMWindow(BaseGUI):
         self.scene.hide_xform_overlays()
 
     def _push_undo(self):
-        """Push current graph state to undo stack before a mutation."""
+        """Push current graph state to undo stack before a mutation.
+        Uses EditorSnapshot for lossless restoration (pins, parents, charges,
+        bond orders, stable IDs, float64 positions, hex_tiles)."""
         if not self.undo_enabled: return
-        self.undo_stack.push(PackedMolecule.from_graph(self.backend.graph))
+        self.undo_stack.push(EditorSnapshot.from_graph(self.backend.graph, self.backend.hex_tiles))
 
     def undo(self):
-        """Undo last graph mutation by restoring from UndoStack."""
-        packed = self.undo_stack.pop()
-        if packed is None:
+        """Undo last graph mutation by restoring from UndoStack.
+        Restores exact graph state (IDs, pins, parents, charges, bond orders,
+        float64 positions) + backend.hex_tiles, then rebuilds derived caches
+        (pin cache, _rings_dirty). Does NOT call reassign_pins/_guess_rings/
+        adjust_h — those would silently alter the restored molecule."""
+        snap = self.undo_stack.pop()
+        if snap is None:
             debug_print(2, "Nothing to undo")
             return
-        self.backend.graph = packed.to_graph()
+        graph, hex_tiles = snap.to_graph()
+        self.backend.graph = graph
+        self.backend.hex_tiles = hex_tiles
+        self.backend._rings_dirty = True
         self.backend._sync_sys()
         self.refresh_view()
-        debug_print(2, f"Undo: restored {len(packed.etype)} atoms")
+        debug_print(2, f"Undo: restored {len(snap.atom_ids)} atoms, {len(snap.bond_ids)} bonds, {len(hex_tiles)} tiles")
 
     def on_drag_state(self, state, atom_id, pos):
         """Handle drag state changes from scene.

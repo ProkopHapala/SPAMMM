@@ -120,6 +120,7 @@ def parse_passivation_string(s):
     return result
 
 bond_length_cutoff = 2.0  # Slightly larger than typical C-C bond (1.42)
+OVERLAP_TOL = 0.3  # Å — two alive heavy atoms closer than this is a corruption error
 class MoleculeEditorBackend:
     """Manages molecular editing state on a hexagonal grid.
 
@@ -383,7 +384,17 @@ class MoleculeEditorBackend:
         for node in self.grid.ring_nodes(q, r):
             nk = snap_to_grid(node)
             if nk not in n2a:
-                a = self.graph.add_atom(np.array([nk[0], nk[1], 0.0]),
+                # Fail-fast overlap guard: if pin cache is stale but an alive
+                # heavy atom already sits at this node position, refuse to add
+                # a duplicate instead of silently corrupting the topology.
+                node_pos = np.array([nk[0], nk[1], 0.0])
+                for a in self.graph.atoms.values():
+                    if not a.alive or a.npi == -1: continue
+                    if np.linalg.norm(a.pos - node_pos) < OVERLAP_TOL:
+                        raise RuntimeError(f"add_ring({q},{r}): node {nk} overlaps existing "
+                                           f"Atom({a._id}) at {a.pos[:2]} — pin cache is stale; "
+                                           f"this indicates a bug in undo/restore or tile tracking")
+                a = self.graph.add_atom(node_pos,
                                         'C', elements.ELEMENT_DICT['C'][0],
                                         pin=nk, parent=None, npi=1)
                 new_atoms.append(a)

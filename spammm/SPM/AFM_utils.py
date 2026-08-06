@@ -498,6 +498,8 @@ def afm_panel_clim(arr, *, scale='per_image', pct=99.0, symmetric=False):
 def _afm_strip_symmetric(qty):
     """Symmetric color scale only for signed force/energy-like quantities."""
     q = str(qty)
+    if q == 'E_diss':
+        return False  # dissipation is always ≥ 0
     return q == 'Fz' or q.startswith('E') or q.startswith('F')
 
 
@@ -622,6 +624,8 @@ def plot_afm_variant_height_strip(variants, row_specs, heights, out_path, *,
             if ih == 0:
                 ax.set_ylabel(ylab, fontsize=6)
             if colorbar and ih == n_h - 1:
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+            elif qty == 'E_diss' and ih == n_h - 1:
                 fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
 
     scale_note = {
@@ -1493,19 +1497,24 @@ def plot_slices(data, title, fname, sym=False, cmap='magma', save_dir='.'):
     print(f"Saved {fname}")
 
 
-def plot_grid_Fz(Fz, heights, label, fname, x_ext=None, y_ext=None, ncols=7, save_dir='.', cmap='seismic'):
+def plot_grid_Fz(Fz, heights, label, fname, x_ext=None, y_ext=None, ncols=7, save_dir='.', cmap='seismic', symmetric=True):
     """SSOT: full grid of 2D Fz/df/E images at all heights with per-slice colorbars."""
     nz_p = len(heights)
     nrows = int(np.ceil(nz_p / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(4*ncols, 4*nrows), squeeze=False,
                              gridspec_kw={'wspace': 0.05, 'hspace': 0.15})
     axes = np.array(axes).reshape(nrows, ncols)
-    fig.suptitle(f"{label} (eV/Å) [per-slice]", fontsize=10)
+    unit = 'eV/Å' if 'Fz' in label or 'df' in label else 'eV/cycle' if 'E_diss' in label else 'eV/Å'
+    fig.suptitle(f"{label} ({unit}) [per-slice]", fontsize=10)
     ext = [x_ext[0], x_ext[1], y_ext[0], y_ext[1]] if x_ext is not None and y_ext is not None else None
     for k in range(nz_p):
         r, c = divmod(k, ncols); ax = axes[r, c]
-        vabs = max(float(np.percentile(np.abs(Fz[:,:,k]), 99)), 1e-6)
-        imshow_afm(ax, Fz[:,:,k], extent=ext, cmap=cmap, title=f"h={heights[k]:.1f}Å ±{vabs:.2g}")
+        if symmetric:
+            vabs = max(float(np.percentile(np.abs(Fz[:,:,k]), 99)), 1e-6)
+            imshow_afm(ax, Fz[:,:,k], extent=ext, cmap=cmap, symmetric=True, title=f"h={heights[k]:.1f}Å ±{vabs:.2g}")
+        else:
+            vmax = max(float(np.percentile(Fz[:,:,k], 99)), 1e-6)
+            imshow_afm(ax, Fz[:,:,k], extent=ext, cmap=cmap, symmetric=False, title=f"h={heights[k]:.1f}Å max={vmax:.2g}")
         ax.tick_params(labelsize=5)
         ax.title.set_fontsize(7)
     for k in range(nz_p, nrows*ncols):
@@ -3416,6 +3425,15 @@ def run_fdbm_pp_from_density(tag, rho_scf, atomPos, atomTypes, origin, step, ngr
         osc_dir=osc_dir, base_pos=base_pos,
     )
     afmulator.queue.finish()
+    # Backward stroke (z ascending) for dissipation computation
+    FEs_bwd_full, _ = afmulator.scan_fdbm(
+        scan_xs_full, scan_ys_full, h_scan, mol_z=mol_z,
+        K_LAT=K_LAT, K_RAD=float(K_RAD), bond_length=float(bond_length),
+        ppm_mode=True, use_fire=True,
+        osc_dir=osc_dir, base_pos=base_pos,
+        reverse=True,
+    )
+    afmulator.queue.finish()
     spacing = (float(scan_xs_full[1] - scan_xs_full[0]), float(scan_ys_full[1] - scan_ys_full[0]), float(h_scan[1] - h_scan[0]))
     df_full = afm.compute_df_amp_dir(FEs_full, spacing, osc_dir=osc_n, amp=float(amp))
     idx_df = [int(np.argmin(np.abs(h_scan - h))) for h in h_df]
@@ -3435,7 +3453,14 @@ def run_fdbm_pp_from_density(tag, rho_scf, atomPos, atomTypes, origin, step, ngr
     if 'fz' in plots:
         plot_grid_Fz(Fz, h_Fz, f'Fz {tag} A={A:.2f} β={beta:.3f}', f'Fz_{tag}.png',
                      x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap=cmap)
+    # Energy dissipation from forward/backward hysteresis
     ih = len(heights) // 2
+    E_diss_full = afm.compute_dissipation(FEs_full, FEs_bwd_full, h_scan, h_df, amp=float(amp), osc_dir=osc_n)
+    E_diss = E_diss_full[sx, sy]
+    if 'ediss' in plots:
+        plot_grid_Fz(E_diss, heights, f'E_diss {tag} A={A:.2f} β={beta:.3f} amp={amp:.2f}', f'Ediss_{tag}.png',
+                     x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap='hot', symmetric=False)
+    print(f"  E_diss @h={heights[ih]:.2f}: [{E_diss.min():.3e},{E_diss.max():.3e}] eV/cycle")
     df_lo, df_hi = df[:, :, 0], df[:, :, -1]
     df_slice_rms = float(np.sqrt(np.mean((df_hi - df_lo)**2)))
     df_slice_scale = max(float(np.sqrt(np.mean(df_lo**2))), float(np.sqrt(np.mean(df_hi**2))), 1e-30)
@@ -3450,7 +3475,7 @@ def run_fdbm_pp_from_density(tag, rho_scf, atomPos, atomTypes, origin, step, ngr
         'A': A, 'beta': beta, 'tag': tag, 'h_scan': h_scan, 'tip_disp': tip_disp,
         'FEs': FEs, 'osc_dir': osc_n.copy(), 'df_z_slice_rms': df_slice_rms,
         'df_z_slice_relative': df_slice_rms/df_slice_scale, 'df_z_slice_corr': df_slice_corr,
-        'path': 'FAST_S3' if use_fast_s3 else 'LEGACY',
+        'E_diss': E_diss, 'path': 'FAST_S3' if use_fast_s3 else 'LEGACY',
     }
 
 

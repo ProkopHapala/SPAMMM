@@ -166,8 +166,9 @@ uses the oscillation vector.
 - [~] Phase 3: pipeline threads `osc_dir` only into df and preserves z heights
 - [~] Phase 4: `run_scan` / `get_raw_FE` keep the physical tip frame and z approach
 - [~] Phase 5: CLI exposes `--osc-dir`; `--base-pos` is only a constant scan offset
-- [ ] Phase 5b: GUI integration — NOT done (AFMExtension.py does not yet expose osc_dir selector)
+- [~] Phase 5b: GUI integration — θ/φ spin boxes added to AFMExtension.py Scan group; angles converted to osc_dir vector; threaded through pipeline stages and dirty flags
 - [~] Phase 6: analytical, vertical-parity, NVIDIA acquisition, and PTCDA end-to-end checks pass
+- [~] Phase 7: Energy dissipation from forward/backward hysteresis — `compute_dissipation()`, `--plots ediss`, compare strip row
 - [ ] **BUG: Lateral images all look identical across heights** — see Known Bugs below
 
 ---
@@ -403,3 +404,72 @@ print('All df computation tests PASSED')
 
 Review artifact: `debug/lateral_afm/lat_x_zslices_corrected/compare_per_image.png`.
 Status remains **unverified pending USER confirmation**.
+
+---
+
+## Energy Dissipation (Phase 7, 2026-08-07)
+
+### Physics
+
+During AFM oscillation, the probe-particle (PP) relaxation is history-dependent:
+the PP position at a given (x,y,z) depends on the direction from which the tip
+approached (z-descending = forward stroke, z-ascending = backward stroke).
+This creates a hysteresis loop in the force–distance curve. The area of this
+loop is the **energy dissipated per oscillation cycle**:
+
+```
+E_diss(x,y,h) = |∮ F·n ds| = |∫_{h-A_z}^{h+A_z} (F_n_fwd - F_n_bwd) dz|
+```
+
+where:
+- `F_n = F · n` (force projected onto oscillation direction)
+- `A_z = amp * |n_z|` (z-component of oscillation amplitude)
+- The absolute value ensures E_diss ≥ 0 (energy is always **lost**, never driving)
+
+### Implementation
+
+| Component | File | Description |
+|-----------|------|-------------|
+| `scan_fdbm(reverse=True)` | `AFM.py:~525` | Backward stroke: tip starts at lowest z, steps upward with `dTip=(0,0,+dh)` |
+| `compute_dissipation()` | `AFM.py:~1980` | Integrates `|F_n_fwd - F_n_bwd|` over `[h-A_z, h+A_z]` via trapezoidal rule |
+| `run_fdbm_pp_from_density` | `AFM_utils.py:~3419` | Runs forward + backward scan, computes E_diss, adds to return dict |
+| CLI `--plots ediss` | `run_spm.py:~226,307` | Adds E_diss row to compare strip + standalone `Ediss_*.png` grid |
+| Compare strip colorbar | `AFM_utils.py:~628` | E_diss rows always get colorbars (even in tight mode) |
+
+### Key design decisions
+
+1. **Always positive**: `|∫ ...|` — physically, dissipation is energy lost to
+   hysteresis, never negative (driving). The absolute value enforces this.
+
+2. **No kernel changes**: The backward scan reuses `relaxStrokes` with
+   `dTip=(0,0,+dh)` and a different `z_start`. The kernel is direction-agnostic.
+
+3. **Per-pixel colorbar**: E_diss uses `'hot'` colormap (sequential, not
+   diverging) since values are ≥ 0. `_afm_strip_symmetric` returns `False`
+   for `E_diss` to avoid symmetric color scaling.
+
+4. **Works for any osc_dir**: The force projection `F·n` and amplitude `A_z`
+   generalize to lateral and tilted oscillation. For pure lateral (n_z=0),
+   `A_z=0` so the integral collapses to a single z-slice — the hysteresis
+   is captured in the lateral force components at that z.
+
+### Verification (PTCDA, NVIDIA GTX 1650)
+
+| Mode | amp [Å] | E_diss range [eV/cycle] | Artifact |
+|------|---------|------------------------|----------|
+| Vertical (n=z) | 1.0 | [5.5e-9, 0.020] | `debug/lateral_afm/ediss_vertical/` |
+| Lateral x (n=x) | 0.4 | [0, 0.016] | `debug/lateral_afm/ediss_lat_x/` |
+
+### CLI usage
+
+```bash
+# Vertical with dissipation
+python3 run_spm.py afm --xyz data/xyz/PTCDA.xyz --basis 3ob-3-1 --projection prolonged \
+  --plots compare,ediss --h-min 3.7 --h-max 4.7 --h-step 0.1 --amp 1.0
+
+# Lateral x with dissipation
+python3 run_spm.py afm --xyz data/xyz/PTCDA.xyz --basis 3ob-3-1 --projection prolonged \
+  --plots compare,ediss --h-min 2.5 --h-max 3.5 --h-step 0.1 --amp 0.4 --osc-dir 1,0,0
+```
+
+Status: **unverified pending USER confirmation**.
