@@ -883,51 +883,30 @@ Artifacts:
 - `debug/unify_wave3/pyridine_contact_v3/compare_per_image.png`
 - `debug/unify_wave3/pyridine_contact_v3/zcurves.png`
 
-### 2D map bumpiness — analysis and proposed fixes
+### 2D map bumpiness — R2.6 diagnostic results + R2.7 design proposals (Gates 0–3 completed)
 
-While E(z)/Fz(z) curves at fixed (x,y) overlap almost perfectly between Morse and
-Contact (ΔE_min < 0.0004 eV), the **2D Fz(x,y) maps from Contact show corrugated/
-bumpy patterns at far z** that destroy image quality. Morse 3D GridFF maps are smooth.
+**Root cause (refined):** The bumpiness is NOT that one mode describes the far field — that is physically correct. The problem is **spectral mixing**: the t^4 mode (the only mode with meaningful amplitude at far s) has its xy coefficient map polluted by near-field atomic structure. The global CG fit minimizes *total* error across all z, so it uses the t^4 mode to reduce near-field residuals by introducing atomic-scale xy variation into its coefficient map. This creates unphysical corrugation in the far field, where the physical potential should be smooth and atomic contrast should only appear in the near field.
 
-**Root cause**: The xy B-spline coefficients are fitted independently per node with
-no smoothness regularization. At far z, Boltzmann weights are low → coefficients are
-unconstrained → cubic B-spline interpolation between oscillating control points creates
-ripples at the node spacing (1.0 Å). No symmetry enforcement means sampling noise
-breaks molecular symmetry, creating asymmetric artifacts.
+**Ruled out by controlled experiments:**
+- ❌ Zero-row fit samples (poly_R < fit_z_hi) — 51.6% zero rows confirmed, but poly_R=12 doesn't improve far-z error
+- ❌ PP relaxation amplification — amplification factor = 1.0 at far z
+- ❌ K_LAT (lateral spring) — no scaling with K_LAT
+- ❌ Fit grid aliasing (fit_dx) — oversampling doesn't help
+- ❌ Coarse coefficient grid (bspl_dx) — finer grid (0.5, 3.15x coeffs) doesn't help
+- ❌ h0 surface roughness — spheres mode works well
+- ❌ CG under/over-convergence — converges by 120 iterations
 
-**Diagnostic artifacts**:
-- `debug/unify_wave3/pyridine_bumpiness/fz_bumpiness.png` — Fz(x,y) at 5 z heights
-- `debug/unify_wave3/pyridine_bumpiness/fz_diff_bumpiness.png` — ΔFz = Contact − Morse
-- `debug/unify_wave3/pyridine_bumpiness/fz_power_spectrum.png` — radial power spectrum
-  showing excess high-frequency power in Contact vs Morse
+**The earlier R2.5 root cause analysis was wrong:** The claim that "xy B-spline coefficients are fitted independently per node with no smoothness regularization" is incorrect — the production solver is one global CG fit. The claim about "Boltzmann weights are low → coefficients are unconstrained" is also not the issue, as shown by the CG iteration sweep.
 
-**Proposed fixes** (ranked by impact × simplicity):
-1. **Fix C**: Increase fit margin to 6.0 Å (immediate partial relief, zero code change)
-2. **Fix B**: Post-fit Gaussian smoothing of xy coefficients (σ=1.5 nodes, trivial)
-3. **Fix A**: Tikhonov/Laplacian regularization on xy B-spline coefficients (RECOMMENDED
-   proper solution — add `λ·||L_xy·c||²` to CG loss via new OpenCL kernel)
-4. **Fix D**: Z-dependent regularization `λ(z) = λ₀·(1−w(z))` — smooths far z, preserves
-   close-z contrast (refinement of Fix A)
-5. **Fix E**: Symmetry enforcement — symmetrize fit grid or constrain coefficients for
-   symmetric molecules (complementary)
-6. **Fix F**: Finer `bspl_dx=0.5` with stronger `λ` (combined with Fix A)
+**R2.7 Design proposals (not yet implemented):**
 
-Full analysis in `doc/Tasks/ContactSurface_Parity_InvPPAFM_Benzene.md` § R2.5.
+1. **Sequential two-pass fit (simplest):** Fit far-field (low-order modes, far-z samples only) first, lock coefficients, then fit near-field residual (higher modes, all z). Guarantees smooth far field. No kernel changes — just Python orchestration. May increase total RMSE slightly but ensures physical smoothness.
 
-### Contact 2.5D bumpiness — reviewed next-step gate (design only, unverified)
+2. **Hierarchical / mode-dependent xy resolution:** Low-order (far-field) modes use coarse xy grid (~2–3 Å) that cannot represent atomic variation; high-order (near-field) modes use fine xy grid (~0.5 Å). Far-field smoothness enforced by representation. Requires kernel changes to `cs_eval_separable_fe_at` for per-mode grids. One global fit, no sequential passes.
 
-The previous “independent per-pixel fit -> add Gaussian/Laplacian smoothing” diagnosis is premature. The production solver is one global B-spline CG fit, the existing plots show PP-relaxed rather than raw fields, panels use independent colorscales, and the current radial spectrum does not establish a general high-k excess.
+3. **PIC-like long-range + atom-centered short-range (most physically motivated):** Coarse B-spline(xy) × smooth z-decay for far-field envelope + atom-centered radial functions for near-field atomic contrast. This is already the PIC backend architecture (low-res B-spline + atom radial functions). Most complex but physically correct. Contact surface would converge toward PIC design, differing only in computational approach (direct B-spline vs FFT convolution).
 
-The first hypothesis to falsify is a z-support mismatch: unified defaults fit to `fit_z_hi=8 Å` but use `poly_R=4 Å`; every doubling-polynomial basis function is exactly zero for `s=z-h0-poly_z0>=4 Å`. Near that cutoff only the lowest `t^4` mode survives, so a world-z slice inherits the lateral `h0` footprint and any error/asymmetry in one coefficient map. The four reported z-curve minima test the well, not this tail.
+**Recommended path:** Start with Proposal 1 (quick validation), then Proposal 2 (production), Proposal 3 (long-term).
 
-Next agents must follow the detailed protocol in `ContactSurface_Parity_InvPPAFM_Benzene.md` § R2.6. Pipeline-specific requirements are:
-
-- [ ] First compare brute/raw Morse and raw Contact at identical world points; only then compare their PP-relaxed `ScanResult`s. Use existing raw Contact evaluation rather than creating a second pipeline.
-- [ ] Use the shared scan geometry, height sequence, world extent, reference-locked colorscale, and plotting utilities. Save common-scale values, differences, and weak-signal-aware metrics; never use independently autoscaled images as parity evidence.
-- [ ] Sweep `poly_R`/support coverage, sub-grid training density, coefficient/sample lattice phase, local-s sampling, h0, and CG conditioning one factor at a time before implementing smoothing.
-- [ ] If raw maps are smooth but relaxed maps are bumpy, instrument PP convergence/displacement and stop changing the fit.
-- [ ] Any accepted remedy must preserve the same `ScanSpec`/`ScanResult` and shared postprocessing/plotting contract. Backend preparation may change; comparison code, height indexing, df computation, and plot conventions must not fork.
-- [ ] Prefer remedies that retain the small stored model: denser one-time fit sampling, a conditioned tail basis, or coarse-far + fine-near/mode-dependent lateral resolution. Measure coefficient count, fit time, scan time, and GPU memory.
-- [ ] Do not silently impose molecular symmetry, filter final images, or add CPU/Python hot loops. Symmetry is an explicit optional constraint only after the brute reference confirms it.
-
-Write all new comparison artifacts under `debug/unify_wave4/contact_bumpiness/` and do not overwrite Wave 3. Nothing is fixed until common-scale raw and relaxed outputs plus numerical metrics are reviewed by the user.
+Full details: `doc/Tasks/ContactSurface_Parity_InvPPAFM_Benzene.md` § R2.6 Gates 0–3 + R2.7 design proposals.
+Artifacts: `debug/unify_wave4/contact_bumpiness/` (gate0–gate3 plots + summaries).

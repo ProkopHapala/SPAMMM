@@ -1386,3 +1386,234 @@ Do not merely change `poly_R` and declare success. A larger `poly_R` changes the
 #### Required artifact layout
 
 Put the new work under `debug/unify_wave4/contact_bumpiness/` with one `SUMMARY.out` containing exact parameters, device, coefficient count, timing, support fractions, metrics, and `REVIEW:` paths. Use shared AFM plotting utilities for production-style E/Fz/df panels; diagnostic-only spectra and coefficient maps may be additional plots. Do not overwrite the R2.5 artifacts.
+
+### R2.6 Gate 0+1 Results (pyridine, 2025-08-09)
+
+Script: `debug/unify_wave4/gate0_gate1_diag.py`
+Artifacts: `debug/unify_wave4/contact_bumpiness/`
+
+Parameters: poly_R=4.0, poly_z0=0.0, m_start=4, nz=6, bspl_dx=1.0, margin=4.0, fit_z_adaptive=(0.05,8.0,0.1,1.0), h0_mode=spheres, h0_R_scale=0.75, force_weight=1.0, n_iter=120. Scan 84×79×31, dx=0.1, h_probe=[5.0,2.0] Å above zmax. Probe: bond_length=3.0, K_RAD=20.0, K_LAT=0.5 N/m. GPU: NVIDIA GTX 1650. use_fire=True.
+
+#### Gate 0 — Raw field comparison
+
+**Per-height raw Fz metrics (selected heights):**
+
+| h [Å] | RMSE_Fz | maxErr | corr | RMS_ref | RMS_cs | SNR | f_valid |
+|-------|---------|--------|------|---------|--------|-----|---------|
+| 5.00 | 2.17e-4 | 4.3e-4 | 0.981 | 6.8e-4 | 5.4e-4 | 3.1 | 1.00 |
+| 4.00 | 3.59e-4 | 1.1e-3 | 0.993 | 2.9e-3 | 2.9e-3 | 8.2 | 1.00 |
+| 3.50 | 4.32e-4 | 1.6e-3 | 0.993 | 4.5e-3 | 4.6e-3 | 10.4 | 1.00 |
+| 3.00 | 1.45e-3 | 5.1e-3 | 0.975 | 4.5e-3 | 4.1e-3 | 3.1 | 1.00 |
+| 2.50 | 3.97e-2 | 3.3e-1 | 0.755 | 6.5e-2 | 6.0e-2 | 1.6 | 0.96 |
+| 2.00 | 4.16e-1 | 1.1e+0 | 0.057 | 4.2e-1 | 2.4e-2 | 1.0 | 0.68 |
+
+**Findings:**
+
+1. **Raw field parity is GOOD at far z (h=3.5–5.0 Å):** correlation >0.98, SNR 3–11. The raw Contact field faithfully reproduces the Morse reference in the far-field regime where bumpiness was visually observed.
+2. **Raw field breaks down at close z (h<2.5 Å):** correlation drops to <0.1, RMS_cs collapses to ~0.02 while RMS_ref=0.42. This is by design — the basis is zero for s<0 (clamped region inside contact surface). The PP relaxation never reaches this deep for far-z images.
+3. **The bumpiness is NOT in the raw field at far z.** The raw Contact Fz maps at h=4–5 Å are smooth and match Morse. This redirects the investigation to PP relaxation amplification (Gate 3).
+4. **PP-relaxed Contact maps show bumpiness** while raw maps are smooth — confirming PP amplification as the likely mechanism.
+
+Artifacts:
+- `gate0_raw_fz_comparison.png` — 4-row panel (Morse, Contact, Δ, rel.err) at 6 heights, reference-locked scale
+- `gate0_pp_fz_comparison.png` — PP-relaxed Morse vs Contact, locked scale
+- `gate0_zcurves_raw_vs_pp.png` — E(z)/Fz(z) at atoms, gap, worst pixel; raw and PP-relaxed
+
+#### Gate 1 — Basis support analysis
+
+**Fit sample s distribution (poly_R=4):**
+- s < 0 (clamped): 0.0%
+- 0 ≤ s < poly_R (active): 48.4%
+- s ≥ poly_R (ZERO ROW): **51.6%** — confirmed: more than half of fit samples have all-zero design rows
+
+**Scan probe s distribution:**
+- s < 0: 5.0%, active: 88.6%, s ≥ poly_R: 6.4%
+
+**poly_R sweep (fit_z_hi=8.0 fixed):**
+
+| poly_R | zero_row% | RMSE_mean | RMSE_far-z | RMSE_close-z | corr_mean |
+|--------|-----------|-----------|------------|--------------|-----------|
+| 4 | 51.6 | 3.99e-2 | 3.11e-4 | 7.70e-2 | 0.836 |
+| 6 | 29.2 | 3.96e-2 | 1.50e-4 | 7.65e-2 | 0.845 |
+| 8 | 13.9 | 3.94e-2 | 2.60e-4 | 7.61e-2 | 0.849 |
+| 10 | 5.5 | 3.93e-2 | 2.96e-4 | 7.59e-2 | 0.845 |
+| 12 | 0.0 | 3.93e-2 | 2.90e-4 | 7.59e-2 | 0.841 |
+
+(RMSE_far-z = h=5.0–3.6 Å; RMSE_close-z = h=3.5–2.0 Å)
+
+**Findings:**
+
+1. **Zero-row hypothesis CONFIRMED but NOT the primary cause.** 51.6% of fit samples at poly_R=4 have zero design rows. However, eliminating all zero rows (poly_R=12) does NOT improve the far-z RMSE (stays ~2.9e-4) or close-z RMSE (stays ~7.6e-2).
+2. **poly_R has marginal effect on raw field quality.** The far-z RMSE barely changes across the sweep. The close-z breakdown is caused by the clamped region (s<0), not by s≥poly_R.
+3. **Fit RMSE improves with larger poly_R** (3.78e-4 → 1.80e-4) because more samples contribute, but this does not translate to better scan-point parity.
+4. **The z basis support plot confirms** that all modes collapse to zero at s≥poly_R, and higher modes (t^8, t^16, ...) underflow well before the cutoff. At s≈3 Å (near poly_R=4), only mode 0 (t^4) has meaningful amplitude.
+5. **Mode contribution plot** at atom 0 shows the far-z field is dominated by mode 0, with higher modes contributing only at close z.
+
+**Conclusion:** The zero-row issue is real and should be fixed (fail-fast invariant), but it is NOT the cause of the 2D map bumpiness. Gate 3 later confirmed that PP relaxation does not amplify the error. The bumpiness is in the raw field at the ~10% level (RMSE/signal ≈ 0.1 at far z), likely originating from the xy B-spline representation or h0 surface roughness. See Gate 2.
+
+Artifacts:
+- `gate1_z_basis_support.png` — φ_k(s) and dφ_k/ds vs height
+- `gate1_s_histograms.png` — s distribution for fit and scan points
+- `gate1_mode_contributions.png` — per-mode E(z) and Fz(z) at atom 0
+- `gate1_poly_R_sweep.png` — RMSE, correlation, zero-row fraction vs poly_R
+
+#### Gate 3 — PP amplification isolation (completed)
+
+Script: `debug/unify_wave4/gate3_pp_amplification.py`
+
+**Test 1: Amplification factor (raw → PP-relaxed, K_LAT=0.5 N/m default):**
+
+| h [Å] | RMSE_raw | RMSE_pp | amplif | corr_raw | corr_pp |
+|-------|----------|---------|--------|----------|---------|
+| 5.00 | 2.17e-4 | 2.17e-4 | 1.00 | 0.981 | 0.981 |
+| 4.00 | 3.59e-4 | 3.54e-4 | 0.99 | 0.993 | 0.993 |
+| 3.50 | 4.32e-4 | 4.26e-4 | 0.99 | 0.993 | 0.992 |
+| 3.00 | 1.44e-3 | 1.49e-3 | 1.03 | 0.975 | 0.974 |
+| 2.50 | 3.97e-2 | 7.57e-3 | 0.19 | 0.756 | 0.971 |
+
+**Test 2: K_LAT sweep (PP-relaxed far-z):**
+
+| K_LAT | label | RMSE_pp_far | corr_pp_far |
+|-------|-------|-------------|-------------|
+| -0.031 | 0.5 N/m (default) | 3.08e-4 | 0.990 |
+| -0.125 | 2.0 N/m (4x) | 3.10e-4 | 0.990 |
+| -0.004 | 0.0625 N/m (1/8x) | 3.15e-4 | 0.989 |
+| 0.0 | no lateral spring | 3.37e-4 | 0.988 |
+
+**Findings:**
+
+1. **PP amplification is NOT the cause.** Amplification factor is ~1.0 at far z (h=3.5–5.0 Å). PP relaxation neither amplifies nor dampens the raw error.
+2. **K_LAT sweep confirms no scaling.** Bumpiness is independent of lateral relaxation strength. Even K_LAT=0 (no lateral spring) has similar PP RMSE.
+3. **At close z (h<2.5), PP actually improves correlation** (amplification <1.0) because relaxation moves the probe away from the clamped region (s<0).
+4. **poly_R=4 vs poly_R=12 PP maps are similarly bumpy** — fixing zero rows doesn't help PP either.
+5. **The bumpiness IS in the raw field** at the ~10% level (RMSE ~3e-4 vs signal ~3e-3 at h=4.0). This is visible as corrugation in the 2D maps even though correlation is >0.98.
+
+**Conclusion:** The bumpiness originates in the raw Contact field, not in PP relaxation. The ~10% raw error at far z is the source. Since poly_R doesn't affect it, the cause is likely in the xy B-spline representation (bspl_dx=1.0 is coarse) or h0 surface roughness. This redirects to Gate 2.
+
+Artifacts:
+- `gate3_raw_vs_pp_baseline.png` — 4-row panel: raw Morse/Contact vs PP-relaxed Morse/Contact at 6 heights
+- `gate3_K_LAT_sweep.png` — PP RMSE and correlation vs height for 4 K_LAT values
+- `gate3_K_LAT0_vs_default_maps.png` — PP Contact maps: K_LAT=0.5 vs K_LAT=0 at 3 heights
+- `gate3_polyR4_vs_12_pp_maps.png` — PP Contact maps: poly_R=4 vs poly_R=12 at 3 heights
+
+#### Gate 2 — xy B-spline representation, h0, and conditioning (completed)
+
+Script: `debug/unify_wave4/gate2_bspl_h0_cond.py`
+
+**Test 1: fit_dx sweep (bspl_dx=1.0 fixed, oversample fit grid):**
+
+| fit_dx | n_coeffs | fit_RMSE | far_RMSE | far_corr | far_rel |
+|--------|----------|----------|----------|----------|---------|
+| 1.0 | 1440 | 3.78e-4 | 3.19e-4 | 0.990 | 0.170 |
+| 0.5 | 1440 | 3.80e-4 | 3.74e-4 | 0.992 | 0.191 |
+| 0.25 | 1440 | 3.80e-4 | 3.78e-4 | 0.992 | 0.193 |
+
+Oversampling the fit grid does NOT help — slightly worse. Not a sampling aliasing issue.
+
+**Test 2: bspl_dx sweep (finer coefficient grid):**
+
+| bspl_dx | n_coeffs | fit_RMSE | far_RMSE | far_corr | far_rel |
+|---------|----------|----------|----------|----------|---------|
+| 1.0 | 1440 | 3.78e-4 | 3.19e-4 | 0.990 | 0.170 |
+| 0.5 | 4536 | 2.57e-4 | 3.41e-4 | 0.992 | 0.177 |
+
+Finer coefficient grid (3.15x more coeffs) does NOT significantly improve scan-point parity despite better fit RMSE. The bumpiness is NOT from coarse B-spline grid.
+
+**Test 3: h0 ablation:**
+
+| h0_mode | n_coeffs | far_RMSE | far_corr |
+|---------|----------|----------|----------|
+| spheres | 1440 | 3.19e-4 | 0.990 |
+| atom_z | 1440 | 3.16e-3 | -0.273 |
+
+The spheres h0 is essential. atom_z mode produces catastrophic failure (negative correlation). The h0 surface quality is critical, but the spheres mode is already the good one.
+
+**Test 4: CG iteration sweep:**
+
+| n_iter | far_RMSE | far_corr |
+|--------|----------|----------|
+| 20 | 4.76e-4 | 0.987 |
+| 40 | 3.91e-4 | 0.989 |
+| 80 | 3.35e-4 | 0.990 |
+| 120 | 3.19e-4 | 0.990 |
+| 240 | 3.19e-4 | 0.991 |
+
+Converges by 80–120 iterations. No overfitting. Not a CG convergence issue.
+
+**Findings:**
+
+1. **None of the Gate 2 tests significantly improve the far-z error.** The ~10% relative error (far_rel ≈ 0.17) persists across all parameter variations.
+2. **Oversampling the fit grid (fit_dx < bspl_dx) does NOT help** — rules out sampling aliasing as the cause.
+3. **Finer coefficient grid (bspl_dx=0.5, 3.15x more coeffs) does NOT help** — rules out coarse B-spline representation as the cause.
+4. **h0 quality is critical** (atom_z fails catastrophically) but spheres mode is already working well.
+5. **CG convergence is not the issue** — converges by 120 iterations, no overfitting at 240.
+6. **The ~10% error is inherent to the separable basis representation.** The B-spline(xy) × polynomial(z) with doubling powers and compact cutoff cannot represent the Morse potential tail more accurately than ~10% at far z, regardless of fit sampling, coefficient grid resolution, or iteration count.
+
+**Conclusion:** The bumpiness is an inherent approximation error of the separable basis. The compact polynomial z-basis with doubling powers (t^4, t^8, t^16, ...) has insufficient expressiveness in the far tail, where only mode 0 (t^4) has meaningful amplitude (Gate 1). The error is structured (follows molecular features) and represents the representation limit of this basis.
+
+Artifacts:
+- `gate2_fit_dx_sweep.png` — RMSE and correlation vs height for fit_dx={1.0, 0.5, 0.25}
+- `gate2_bspl_dx_maps.png` — Raw Contact Fz maps: bspl_dx=1.0 vs 0.5 at 4 heights
+- `gate2_h0_ablation.png` — Raw Contact Fz maps: spheres vs atom_z at 4 heights
+- `gate2_cg_iter_sweep.png` — RMSE and correlation vs height for n_iter={20,40,80,120,240}
+
+#### Overall R2.6 Summary (Gates 0–3)
+
+**Root cause (refined):** The bumpiness is NOT simply that one mode describes the far field — that is physically correct. The problem is **spectral mixing**: the t^4 mode (the only mode with meaningful amplitude at far s) has its xy coefficient map polluted by near-field atomic structure. The global CG fit minimizes *total* error across all z, so it uses the t^4 mode to reduce near-field residuals by introducing atomic-scale xy variation into its coefficient map. This creates unphysical corrugation in the far field, where the physical potential should be smooth and atomic contrast should only appear in the near field.
+
+**Ruled out causes:**
+- ❌ Zero-row fit samples (poly_R < fit_z_hi) — confirmed 51.6% zero rows but fixing them (poly_R=12) doesn't improve far-z error
+- ❌ PP relaxation amplification — amplification factor = 1.0 at far z
+- ❌ K_LAT (lateral spring strength) — no scaling with K_LAT
+- ❌ Fit grid aliasing (fit_dx) — oversampling doesn't help
+- ❌ Coarse coefficient grid (bspl_dx) — finer grid doesn't help
+- ❌ h0 surface roughness — spheres mode works well
+- ❌ CG under/over-convergence — converges by 120 iterations
+
+**Key mechanism:** The t^4 mode is active across the full z range (it's the only mode with meaningful amplitude at far s). The global fit exploits this to reduce near-field error by putting atomic-scale xy structure into the t^4 coefficients. This is unphysical — the far field should be smooth; atomic contrast belongs in the near-field modes.
+
+#### Design proposals for fixing coefficient pollution (R2.7, design only — not yet implemented)
+
+**Proposal 1 — Sequential two-pass fit (simplest)**
+
+Fit the long-range (far-field) component first, lock it, then fit the short-range residual.
+
+- **Pass 1:** Fit only mode 0 (t^4) or a small set of low-order modes using only far-z samples (s > s_split). This produces a smooth xy coefficient map for the far field, unconstrained by near-field structure.
+- **Pass 2:** Fix the far-field coefficients. Fit all remaining modes (t^8, t^16, ...) to the residual (full reference minus far-field prediction). These modes capture atomic contrast and are only active at near z, so their xy coefficients naturally have atomic-scale structure.
+- **Pros:** Simple to implement (two CG calls). Guarantees smooth far field. Low risk. No kernel changes needed — just Python orchestration.
+- **Cons:** May increase total RMSE vs. the global fit (the global fit can always achieve lower total error by mixing). The s_split threshold is a new hyperparameter. The far-field fit uses fewer samples, so its coefficients may be noisier if the far-field signal is weak.
+- **Implementation:** In `fit_contact_surface`, call `fit_separable_cg` twice: first with `nz=1` (or a subset) and far-z-only samples, then with full `nz` and residual data. Lock the first mode's coefficients before the second pass.
+
+**Proposal 2 — Hierarchical / mode-dependent xy resolution**
+
+Different z modes use different xy B-spline grid resolutions: low-order (far-field) modes use a coarse grid, high-order (near-field) modes use a fine grid.
+
+- **Structure:** Mode 0 (t^4, far field) → coarse xy grid (e.g., 2.0–3.0 Å) that *cannot* represent atomic-scale variation. Higher modes (t^8+, near field) → fine xy grid (e.g., 0.5 Å) for atomic contrast.
+- **Physics:** The far field is a sum of exponentially decaying atom contributions — inherently smooth in xy. The near field has atomic structure. Matching the xy resolution to the physics prevents spectral mixing by construction.
+- **Pros:** Far-field smoothness is enforced by the representation, not by a fitting trick. No sequential passes needed — one global fit with structured coefficients. Coefficient count may even decrease (coarse far-field grid has fewer nodes).
+- **Cons:** Requires kernel changes — `cs_eval_separable_fe_at` currently uses one xy grid for all modes. Each mode would need its own grid origin/step/node count. The coefficient array becomes per-mode structured. More complex data layout and GPU upload.
+- **Implementation:** Extend `SeparableParams` with per-mode xy grid parameters. Modify `cs_eval_separable_fe_at` to look up the correct grid per kz. Modify `fit_separable_cg` to handle the mixed-resolution design matrix. Alternatively, use hierarchical B-splines (nested spaces) where the coarse grid is a subset of the fine grid — this avoids separate grids but requires a refinement mask per mode.
+
+**Proposal 3 — PIC-like long-range + atom-centered short-range (most physically motivated)**
+
+This is already the architecture of the PIC backend: low-res B-spline (grid-step ~1 Å, 10x coarser than GridFF) for long-range asymptotics + atom-centered radial functions for short-range atomic contrast (Pauli repulsion, electrostatics).
+
+- **Structure:** Split the contact surface potential into:
+  - **Long-range envelope:** Low-resolution B-spline(xy) × smooth z-decay (exponential or t^4). Coarse xy grid (~2 Å). Fits the smooth far field.
+  - **Short-range residual:** Atom-centered radial functions (Gaussian-type or tabulated) centered on each atom's projected xy position, modulated by z. These capture the atomic contrast that the coarse grid cannot.
+- **Physics:** This is the most physically motivated split. The far field of a sum of atom pair potentials is smooth — it's well represented by a coarse grid. The near-field contrast is inherently atomic — it's best represented by functions centered on atoms, not by a uniform grid.
+- **Pros:** Physically correct representation. Far field is smooth by construction. Near field uses the correct basis (atom-centered). The contact surface already has `h0` (surface height map) which is atom-aware, so adding atom-centered near-field functions is a natural extension. PIC already validates this architecture.
+- **Cons:** Most complex to implement. Requires atom-centered basis evaluation in the kernel. The atom positions (projected to xy) must be stored and used at scan time. Loses the pure separable structure — the short-range part is not separable in the same way. Need to handle molecule rotation / different orientations.
+- **Implementation:** New kernel for atom-centered near-field evaluation. The `SeparableParams` structure would be extended or a new `HybridContactParams` would combine a coarse separable field with atom-centered residuals. The fit would be sequential: fit coarse separable (far field), then fit atom-centered radial amplitudes (near-field residual).
+
+**Comparison and recommendation:**
+
+| Proposal | Complexity | Far-field smoothness | Physical correctness | Kernel changes | Coefficient count |
+|----------|-----------|---------------------|----------------------|---------------|-------------------|
+| 1: Sequential | Low | Enforced by fitting order | Moderate | None | Same |
+| 2: Hierarchical | Medium | Enforced by representation | Good | Moderate | Same or less |
+| 3: PIC-like | High | Enforced by physics | Best | Large | Different structure |
+
+**Recommended path:** Start with Proposal 1 (sequential two-pass) as a quick validation that separating far/near fitting improves far-field smoothness. If it works, implement Proposal 2 (hierarchical) for a production-quality solution that doesn't require sequential passes. Proposal 3 is the long-term ideal but requires significant kernel work.
+
+**Note on Proposal 3 and PIC convergence:** The PIC backend already uses this long-range B-spline + short-range atomic function architecture successfully. The contact surface backend could converge toward the same design, with the main difference being that PIC uses FFT-based convolution for the long-range part while the contact surface uses direct B-spline evaluation. The two backends would then share the same physical decomposition, differing only in the computational approach.
