@@ -124,13 +124,17 @@ Hamiltonian = DFTB {{
 
 
 def pauli_overlay_log(rho_dict, origin, step, atom_pos, atom_names, targets, ez_method,
-                      out_png, tip_mode='co', sigma=0.7, A=40.0, beta=1.15):
+                      out_png, tip_mode='co', sigma=0.7, A=40.0, beta=1.15, cpu_fft=True):
     """Log-scale FDBM Pauli (several ρ) vs pySCF Ez refs."""
     from spammm.SPM import AFM as afm
     from spammm.SPM.AFM_utils import get_tip_densities
     from tests.SPM.extract_pauli_zscan import load_ez_reference, extract_z_line
 
-    os.environ.setdefault('SPAMMM_AFM_CPU_FFT', '1')  # PTCDA ny=176 not clFFT-friendly
+    # CPU FFT only when explicitly requested (default True for PTCDA ny=176 compatibility)
+    if cpu_fft:
+        os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
+    else:
+        os.environ.pop('SPAMMM_AFM_CPU_FFT', None)
     nx, ny, nz = next(iter(rho_dict.values())).shape
     rho_tip, _ = get_tip_densities(tip_mode, (nx, ny, nz), step, sigma=sigma)
     # CO tip: use rho_tip_total; already rolled to (0,0,0)
@@ -187,10 +191,16 @@ def main():
                         help='Log Pauli overlay: stock vs SA vs Ez (pySCF GPU)')
     parser.add_argument('--tip-mode', default='co', choices=['co', 'gaussian'])
     parser.add_argument('--ez-method', default='pyscf_gpu_pbe')
+    parser.add_argument('--cpu-fft', action='store_true', default=True, dest='cpu_fft',
+                        help='Force NumPy FFT (default True for PTCDA grids with prime ny). '
+                             'Pass --no-cpu-fft for GPU.')
     args = parser.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
-    # PTCDA grids often have ny with factor 11 → clFFT rejects; NumPy FFT is fine for z-scans
-    os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
+    # CPU FFT: explicit opt-in (default True for PTCDA ny with prime factors; was silent env mutation)
+    if getattr(args, 'cpu_fft', True):
+        os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
+    else:
+        os.environ.pop('SPAMMM_AFM_CPU_FFT', None)
 
     from spammm.SPM import AFM_utils as afm_utils
     from spammm.config_utils import get_dftb_basis_path

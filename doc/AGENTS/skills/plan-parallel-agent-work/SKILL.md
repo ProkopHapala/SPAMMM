@@ -23,22 +23,76 @@ adapt only the templates required by the selected layout:
 - Long: `assets/long-task-master-template.md` and
   `assets/long-agent-task-template.md`
 
-## Require a dispatch checklist
+## Require a dispatch checklist — MANDATORY, near the top
 
-Place one clearly separated section named
-`Agent dispatch checklist — copy/paste assignments` near the top of every shared
-plan/master. It must be a numbered checkbox list using stable IDs:
+**This is mandatory.** Every shared plan/master `.md` file MUST contain a section named
+`Agent dispatch checklist — copy/paste assignments` placed **near the top** of the document
+(immediately after the Problem/Summary section, BEFORE any detailed analysis or packet
+sections). If the checklist is missing or buried deep in the document, the plan is incomplete.
+
+The checklist must be a numbered checkbox list using stable IDs and must cover **ALL agents
+across ALL waves** (not just the first wave). **When work is split into waves, each wave
+must be a separate sub-heading** so the wave structure is visually clear at a glance:
 
 ```text
-1. [ ] Agent_1 — <role>: Read <plan>. Execute only <packet/stages>. Write only
-   <owned files/artifacts>. Do not <neighbor work or shared edits>.
-2. [ ] Agent_2 — <role>: ...
+## Agent dispatch checklist — copy/paste assignments
+
+**Standard instructions for every agent (do not remove):**
+- Read this document completely before starting. You are assigned the agent ID in your checkbox.
+- Execute only your assigned packet in your assigned wave. Do not interfere with other agents' work.
+- Write only to your owned files. Do not edit files listed as read-only or forbidden.
+- When finished: (1) check your checkbox `[ ]` → `[x]`, (2) write a brief report (what you did,
+  test results, artifact paths, open questions) at the bottom of this file under `## Agent reports`,
+  (3) list any contract changes that downstream agents need to know.
+- Do not mark the overall task as done. Only the coordinator accepts handoffs and marks waves complete.
+
+### Wave 1 — Parallel (launch simultaneously)
+
+1. [ ] Agent_1 — <role>: <owned files>. Do not <neighbor work>.
+2. [ ] Agent_2 — <role>: <owned files>. Do not <neighbor work>.
+
+### Wave 2 — Parallel (after Wave 1 handoff accepted)
+
+3. [ ] Agent_1 — <role>: Depends on Wave 1 handoff. <owned files>.
+4. [ ] Agent_2 — <role>: Depends on Wave 1 handoff. <owned files>.
+
+### Wave 3 — Serial, coordinator-only (after Wave 2 accepted)
+
+5. [ ] Coordinator — <role>: After Wave 2 accepted. <steps>.
 ```
 
-Make every line self-contained enough to copy as a manual launch prompt. Link the
-worker file in long layout. The coordinator checks a box only after accepting the
-handoff; workers must not check their own box. Use `Agent_1`, `Agent_2`, ... in the
-checklist, packet headings, ownership tables, artifact paths, and dispatch prompts.
+The user's per-agent launch prompt then reduces to a one-liner:
+
+```
+you are Agent_1 in @[doc/Tasks/<TaskFile>.md] do your part of WAVE 1
+```
+
+The standard instructions in the document handle the rest (read, don't interfere, check box,
+write report). The user does not need to repeat these instructions per agent.
+
+If there is only one wave, a single flat list is fine (no wave sub-headings needed).
+
+Every plan/master must also contain an `## Agent reports` section near the bottom where
+agents write their completion reports:
+
+```text
+## Agent reports
+
+<!-- Agents: write your report here after finishing your work. Format:
+### Agent_N (Wave M) — <role>
+- **What I did**: ...
+- **Files changed**: ...
+- **Test results**: ...
+- **Artifacts**: ...
+- **Open questions / contract changes**: ...
+-->
+```
+
+Make every line self-contained enough to copy as a manual launch prompt. Include the wave
+number and dependency note for downstream agents. Link the worker file in long layout. The
+coordinator checks a box only after accepting the handoff; workers must not check their own
+box. Use `Agent_1`, `Agent_2`, ... in the checklist, packet headings, ownership tables,
+artifact paths, and dispatch prompts.
 
 ## Plan before splitting
 

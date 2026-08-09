@@ -105,6 +105,9 @@ Quasi-2D contact-sep is meant to **approximate** Morse(+Coulomb), not invent sha
 | **`tip_R=0.0, tip_E=1.0`** (non-physical point tip) | Morse minimum at sample atom vdW radius (~1.9 Å for C) instead of correct tip-atom contact (~3.4 Å); fit RMSE 24× worse; E(z) curves show attraction at unphysical distances | **ALWAYS use real tip params**: `assign_params(params_path=PARAMS)` → default `tip_R=1.452, tip_E=6.8e-4` (CO tip). R0 = tip_R + RvdW ≈ 3.2–3.4 Å. Never override with `tip_R=0` unless explicitly testing point-tip physics. |
 | **Fit z-range too narrow** | Contact surface = 0 above fit range → hard cutoff in E(z)/Fz(z) | Fit z-range must cover full scan: `fit_z_adaptive=(0.05, 8.0, 0.1, 1.0)` for real tip |
 | **E(z) ylim not normalized** | Can't see well + repulsion onset together | `ylim=(E_min*1.2, -2*E_min)` — see skill `afm-plotting-alignment` |
+| **`tip_R=0.0, tip_E=1.0`** (non-physical point tip) | Morse minimum at sample atom vdW radius (~1.9 Å for C) instead of correct tip-atom contact (~3.4 Å); fit RMSE 24× worse; E(z) curves show attraction at unphysical distances | **ALWAYS use real tip params**: `assign_params(params_path=PARAMS)` → default `tip_R=1.452, tip_E=6.8e-4` (CO tip). R0 = tip_R + RvdW ≈ 3.2–3.4 Å. Never override with `tip_R=0` unless explicitly testing point-tip physics. |
+| **Fit z-range too narrow** | Contact surface = 0 above fit range → hard cutoff in E(z)/Fz(z) | Fit z-range must cover full scan: `fit_z_adaptive=(0.05, 8.0, 0.1, 1.0)` for real tip |
+| **E(z) ylim not normalized** | Can't see well + repulsion onset together | `ylim=(E_min*1.2, -2*E_min)` — see skill `afm-plotting-alignment` |
 
 **Report:** [Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md](Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md) · helicene session [Reports/Assembly_ContactSurface_AFM_helicene_2026-07-24.md](Reports/Assembly_ContactSurface_AFM_helicene_2026-07-24.md)
 
@@ -355,6 +358,160 @@ cache name also collided across different editor fragments.
 `REQ_base`. Verify molecular identity for cache loads (not just cache name).
 
 See [Takeways.md](Takeways.md) → "Per-pack PLQH by molecular identity, not atom count".
+
+---
+
+## 15. Gaussian `.cube` format — units, strides, and mol_shift z-component
+
+**Recurring trap (invPPAFM cube export, 2026-08-14).** Writing `.cube` files for
+V_PP / rho_atom / Δρ and finding the data is scrambled, atoms are misaligned, or
+volumetric features float above the molecule. There are **three** independent
+gotchas that each produce subtly wrong visualizations.
+
+### 15a. Units — Bohr, not Angstrom
+
+The Gaussian cube spec requires **all lengths in Bohr** (1 Bohr = 0.529177 Å).
+Writing Angstrom values makes every standard reader (VMD, Avogadro, ASE, Ovito)
+interpret the grid as ~1.89× too small — bonds look compressed, density appears
+contracted.
+
+```
+BOHR_PER_ANG = 1.0 / 0.529177210903
+origin_bohr  = origin_ang  * BOHR_PER_ANG
+step_bohr    = step_ang    * BOHR_PER_ANG
+atoms_bohr   = atoms_ang   * BOHR_PER_ANG
+```
+
+**Do not** rely on ASE's `write_cube` to handle this — its unit handling has
+changed across versions and can silently write Angstroms. The custom `save_cube`
+in `invPPAFM/tests/testplot_ml_maps.py` converts explicitly.
+
+### 15b. Data ordering — z-fastest (C-order of `(nx, ny, nz)`)
+
+The cube spec stores data with **z varying fastest, then y, then x**. This is
+exactly the C-order flattening of a `(nx, ny, nz)` array:
+
+```python
+data_xyz = data_zyx.transpose(2, 1, 0)   # (Nz,Ny,Nx) -> (Nx,Ny,Nz)
+data_flat = data_xyz.reshape(-1)          # C-order: z varies fastest
+```
+
+**Common mistakes:**
+- `data_zyx.reshape(-1)` directly → x varies fastest → **scrambled** data.
+- `np.flatten(order='F')` → x varies fastest → **scrambled** data.
+- Transposing to `(nx,ny,nz)` but then using `order='F'` → **scrambled** data.
+
+The correct chain is: **transpose to `(nx,ny,nz)`, then C-order flatten**.
+
+### 15c. mol_shift — all 3 components, including z
+
+**This was the root cause of V_PP appearing ~2 Å above the molecule.**
+
+`AFMulator.setup_grid(shift_atoms=True)` shifts atoms to kernel-space:
+```python
+p0_raw    = [mn_x - margin, mn_y - margin, mn_z - margin/2]
+mol_shift = -p0_raw = [margin - mn_x, margin - mn_y, margin/2 - mn_z]
+atoms_kernel = atoms_world + mol_shift   # ALL 3 components
+```
+
+After the shift, the grid origin `p0 = (0,0,0)` and atoms sit inside the grid.
+The FF data (V_PP, F_total) lives on this kernel-space grid.
+
+**The trap:** when writing atoms to the cube, it is tempting to apply only the
+`(x, y)` shift (because the scan grid is described in xy terms) and forget the
+z-component. For a flat molecule (mn_z ≈ 0), `mol_shift[2] = margin/2 ≈ 2.0 Å`.
+Omitting it places atoms **2 Å too low** relative to the grid, so V_PP peaks
+(which are correctly placed on the kernel-space grid) appear to float ~2 Å
+above the atoms.
+
+**Fix:** Always apply all 3 components:
+```python
+atoms_kernel = atoms_world.copy()
+atoms_kernel[:, 0] += mol_shift[0]   # x
+atoms_kernel[:, 1] += mol_shift[1]   # y
+atoms_kernel[:, 2] += mol_shift[2]   # z  ← THIS WAS MISSING
+```
+
+`generate_from_xyz` now returns `mol_shift` (3-component) and `mol_z` in the
+sample dict so callers don't have to recompute it.
+
+### 15d. Anisotropic step — keep `(dx, dy, dz)` separate
+
+rho_atom grids use a different z-step than xy (e.g. `dx=dy=0.1 Å, dz=0.2 Å`).
+The cube header supports anisotropic strides via the diagonal vectors:
+```
+nx  dx  0   0
+ny  0   dy  0
+nz  0   0   dz
+```
+**Do not** collapse to a scalar `step = mean(dx,dy,dz)` — this warps the z-axis
+and misplaces features (same class of bug as §1 for DFT cubes).
+
+### 15e. Verification recipe
+
+After writing a cube, verify alignment with an independent reader:
+```python
+# 1. Bond lengths should be ~1.4 Å for C-C aromatic, ~1.1 Å for C-H
+# 2. V_PP max should be <0.3 Å from nearest atom (was 1.8 Å before z-fix)
+# 3. rho_atom should be positive at every atom position
+# 4. Atom z-range should match the grid z-range (not offset by ~2 Å)
+```
+
+**Code:** `save_cube` in `invPPAFM/tests/testplot_ml_maps.py`  
+**Verification:** independent `read_cube` reader (same file, inline in `main()`)
+
+---
+
+## 16. OpenCL `read_imagef` normalized coordinates — half-texel offset
+
+**Root cause of GridFF lateral registration error (R2.1, 2026-08-09).**
+
+OpenCL `read_imagef` with `CLK_NORMALIZED_COORDS_TRUE` maps normalized coordinate `u∈[0,1]` to texel **edges**, not centers. For an image of size `n`, texel center `i` is at `u = (i+0.5)/n`, not `u = i/n`.
+
+The `dinvA/B/C` inverse transform matrices in `AFM.py` compute `coord = i/n` at voxel `i`, which is the **edge** between texels `i-1` and `i`. This causes a systematic **half-voxel shift** in every GridFF interpolation, scaling with grid spacing (`0.5·dx_grid ≈ 0.1 Å` for benzene).
+
+| Variant | Synthetic RMSE | Real benzene Fz RMSE | Registration shift |
+|---------|---------------|---------------------|--------------------|
+| `current` (`i/n`) | 0.5 per axis | 1.17e-01 | ~0.5·dx_grid |
+| `plus_05` (`(i+0.5)/n`) | **0** | **6.9e-03** (17× better) | **0** |
+
+**Fix (NOT yet applied to production):** Add `+0.5/n` to each diagonal element of `dinvA/B/C`. Five constructors in `AFM.py` are affected. Contact-surface kernels do **not** use `interpFE` and are unaffected.
+
+**Rule:** When converting voxel index to OpenCL normalized coordinate, use `(i + 0.5) / n`, never `i / n`. This is the same class of bug as §3 (corner/node vs center voxel sampling) but for the GPU sampler path.
+
+See [ContactSurface_Parity_InvPPAFM_Benzene.md](Tasks/ContactSurface_Parity_InvPPAFM_Benzene.md) §R2.1.
+
+---
+
+## 17. Contact-surface clamp at s=0 — constant E/Fz below contact height
+
+**Primary source of contact model error (R2.2, 2026-08-09).**
+
+The separable contact-surface model clamps the local height coordinate `s = z − h₀(x,y) − poly_z0` to `s ≥ 0` before evaluating the polynomial basis. When `s < 0` (probe below contact height), the basis evaluates at `s = 0`, producing **one constant E and Fz per (x,y) site** — regardless of how far below contact the probe is.
+
+Brute-force Morse continues to vary strongly in this region (Fz ranges 0.07–2.92 eV/Å for benzene). The clamp therefore produces:
+
+| Metric | s<0 (clamp) | s∈[0.05,0.25) (fit region) |
+|--------|-------------|---------------------------|
+| Fz RMSE | 0.54 eV/Å | 0.025 eV/Å |
+| Fz Pearson | 0.18 | 0.73 |
+| Sign disagreements | 32 | 0 |
+| % of total Fz² error | **99.15%** | 0.23% |
+
+**Secondary effect — h0 interpolation error:** B-spline h₀ with 1.0 Å spacing has RMSE=0.117 Å vs analytic sphere formula, with **systematic negative bias** (interp lower than analytic). This pushes 12.5% of points that should be at s≥0 into false s<0 clamp, where they receive constant (wrong) E/Fz. Error is concentrated at sphere seams where curvature changes sharply.
+
+| h0 error source | RMSE | Max | Effect |
+|----------------|------|-----|--------|
+| B-spline vs analytic (all points) | 0.117 Å | 0.316 Å | 278/2223 clamp crossings |
+| At seam dist [0.1,0.2) | 0.135 Å | 0.316 Å | 15% false clamp rate |
+| At seam dist [0.2,0.5) | 0.165 Å | 0.305 Å | 13% false clamp rate |
+
+**Rules:**
+1. The clamp at s=0 is a **design limitation**, not a bug — the model has no basis for sub-contact physics. But its impact on PP relaxation must be understood: any probe trajectory that dips below h₀ receives a constant force plateau, which can trap or deflect the probe.
+2. h₀ B-spline spacing (`bspl_dx`) must be fine enough to resolve sphere seam curvature. At 1.0 Å, seam errors dominate. Consider finer spacing (0.5 Å) or analytic h₀ evaluation for seam-adjacent points.
+3. Always stratify contact-vs-brute error by local s before declaring model quality. Aggregate RMSE hides the fact that 99% of error is in the clamp region.
+
+See [ContactSurface_Parity_InvPPAFM_Benzene.md](Tasks/ContactSurface_Parity_InvPPAFM_Benzene.md) §R2.2.
 
 ---
 

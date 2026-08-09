@@ -32,6 +32,7 @@ import os
 import time
 import numpy as np
 import pyopencl as cl
+from scipy.linalg import solve_banded
 
 from spammm.utils.OpenCLBase import OpenCLBase
 from spammm.utils import clUtils as clu
@@ -40,48 +41,63 @@ from spammm.topology.FFparams import load_xyz_with_REQs
 COULOMB_CONST = 14.3996448915
 _KERNEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'kernels')
 
-# Cubic B-spline prefilter: solves for control points that exactly reproduce nodal values.
-# z1 = -2 + sqrt(3) ≈ -0.26794919
-# Scale = -6*z1 = 6*(2-sqrt(3)) ≈ 1.60769515
-# Ref: Unser et al., "B-Spline Signal Processing" — causal/anti-causal recursive filter.
-_BSPLINE_Z1 = -2.0 + np.sqrt(3.0)
-_BSPLINE_SCALE = -6.0 * _BSPLINE_Z1
+# Cubic B-spline prefilter: solves for control coefficients that exactly reproduce
+# nodal values when interpolated with the cardinal cubic B-spline stencil used by
+# cs_interp_h0 (kernel) / interp_h0 (Python), which ZERO-PADS out-of-bounds indices.
+#
+# The interpolation at node i is  d[i] = (1/6)c[i-1] + (4/6)c[i] + (1/6)c[i+1]
+# with c[-1] = c[n] = 0. This is a symmetric tridiagonal system  A c = d  with
+# diag = 4/6 and off-diags = 1/6. Solving it directly (batched tridiagonal solve)
+# reproduces nodal values EXACTLY at every node — including the boundaries — which
+# the previous causal/anti-causal IIR (Unser infinite-signal filter) could not: it
+# gave ~1e-16 interior error but O(1e-2) error at the first node because the IIR
+# inverts the infinite Toeplitz convolution, not the finite zero-padded system that
+# the kernel actually evaluates. The tridiagonal solve is the mathematically exact
+# inverse for the kernel's zero-padding boundary convention.
+# Ref: Unser et al., "B-Spline Signal Processing" (pole z1 = -2+sqrt(3) ≈ -0.2679).
+_BSPLINE_Z1 = -2.0 + np.sqrt(3.0)      # kept for reference / downstream use
+_BSPLINE_SCALE = -6.0 * _BSPLINE_Z1    # kept for reference (IIR scale, unused by tridiagonal path)
+
+def _bspline_tridiag_ab(n):
+    """Banded representation of the n×n zero-padded cubic B-spline interpolation matrix.
+
+    A[i,i]=4/6, A[i,i-1]=A[i,i+1]=1/6, with no wrap-around (zero-padding boundary).
+    Returns ab in scipy.linalg.solve_banded((1,1), ab, b) layout: row0=super, row1=diag, row2=sub.
+    """
+    ab = np.zeros((3, n), dtype=np.float64)
+    ab[0, 1:] = 1.0 / 6.0
+    ab[1, :] = 4.0 / 6.0
+    ab[2, :-1] = 1.0 / 6.0
+    return ab
 
 def _bspline_prefilter_1d(data):
-    """Apply cubic B-spline prefilter to a 1D array.
+    """Apply cubic B-spline prefilter to a 1D array (zero-padding boundary convention).
 
-    Converts sampled values → B-spline control coefficients so that
-    the cubic B-spline interpolates the original data at node positions.
+    Converts sampled/nodal values → B-spline control coefficients so that the cubic
+    B-spline (with out-of-bounds stencil terms dropped, matching cs_interp_h0) exactly
+    reproduces the input at every node, including the first and last.
     """
     n = len(data)
     if n < 3:
-        return data.copy()
+        return np.asarray(data, dtype=np.float64).copy()
     d = np.asarray(data, dtype=np.float64)
-    # Causal pass: c+[i] = d[i] + z1 * c+[i-1]
-    c_plus = np.zeros(n, dtype=np.float64)
-    c_plus[0] = d[0]
-    for i in range(1, n):
-        c_plus[i] = d[i] + _BSPLINE_Z1 * c_plus[i-1]
-    # Anti-causal pass: c-[i] = c+[i] + z1 * c-[i+1]
-    c_minus = np.zeros(n, dtype=np.float64)
-    c_minus[-1] = c_plus[-1]
-    for i in range(n-2, -1, -1):
-        c_minus[i] = c_plus[i] + _BSPLINE_Z1 * c_minus[i+1]
-    # Scale by -6*z1
-    return c_minus * _BSPLINE_SCALE
+    return solve_banded((1, 1), _bspline_tridiag_ab(n), d)
 
 def _bspline_prefilter_2d(h0_2d):
-    """Apply separable cubic B-spline prefilter to a 2D array (rows=ncx, cols=ncy or vice versa).
+    """Apply separable cubic B-spline prefilter to a 2D array (zero-padding boundary).
 
-    h0_2d: (ncx, ncy) array of nodal values → control coefficients.
+    h0_2d: (rows, cols) array of nodal values → control coefficients. Solves the
+    tridiagonal system along each axis in a single batched call (all rows / all cols
+    at once). Exact at every node including boundaries.
     """
     out = np.array(h0_2d, dtype=np.float64)
-    # Prefilter along axis 0
-    for j in range(out.shape[1]):
-        out[:, j] = _bspline_prefilter_1d(out[:, j])
-    # Prefilter along axis 1
-    for i in range(out.shape[0]):
-        out[i, :] = _bspline_prefilter_1d(out[i, :])
+    nrows, ncols = out.shape
+    # Along axis 1 (cols): transpose so leading dim = ncols (multiple RHS = nrows)
+    if ncols >= 3:
+        out = solve_banded((1, 1), _bspline_tridiag_ab(ncols), out.T).T
+    # Along axis 0 (rows): leading dim = nrows (multiple RHS = ncols)
+    if nrows >= 3:
+        out = solve_banded((1, 1), _bspline_tridiag_ab(nrows), out)
     return out
 
 
@@ -191,6 +207,14 @@ def build_contact_height_map(apos, x0, y0, dx, dy, ncx, ncy, r_xy=8.0, Rs=None):
                     h = max_i [ z_i + sqrt(R_i² − ρ_i²) ] for ρ_i < R_i,
                     else fallback to max nearby atom z.
                     R_i should be Morse R0 (= tip_R + R_vdW) so the apex is tip–atom contact.
+
+    Returns a dict with two keys (h0_samples / h0_coeffs separation):
+      'h0_samples': (ncx*ncy,) float32 — raw nodal heights (physical/contact values).
+                    Use for min/max/extent queries (z_ref, h0_min, h0_max).
+      'h0_coeffs':  (ncx*ncy,) float32 — B-spline control coefficients (prefiltered
+                    with the zero-padding-boundary tridiagonal solve so that
+                    cs_interp_h0 / interp_h0 exactly reproduces h0_samples at nodes).
+                    Upload this to the OpenCL cs_h0 buffer; pass to SeparableParams.h0_map.
     """
     apos = np.asarray(apos, dtype=np.float64)
     zmin = float(np.min(apos[:, 2]))
@@ -205,41 +229,43 @@ def build_contact_height_map(apos, x0, y0, dx, dy, ncx, ncy, r_xy=8.0, Rs=None):
                 mask = d2 < r2
                 if np.any(mask):
                     h0[iy * ncx + ix] = float(np.max(apos[mask, 2]))
-        return h0
-    Rs = np.asarray(Rs, dtype=np.float64).reshape(-1)
-    assert len(Rs) == len(apos), f'Rs length {len(Rs)} != natoms {len(apos)}'
-    Rmax = float(np.max(Rs)) if len(Rs) else 0.0
-    r_search = max(float(r_xy), Rmax + 0.5)
-    r2_search = r_search ** 2
-    for iy in range(ncy):
-        cy = y0 + iy * dy
-        for ix in range(ncx):
-            cx = x0 + ix * dx
-            d2 = (apos[:, 0] - cx) ** 2 + (apos[:, 1] - cy) ** 2
-            near = d2 < r2_search
-            if not np.any(near):
-                continue
-            best = zmin
-            hit = False
-            for ia in np.where(near)[0]:
-                rho2 = float(d2[ia])
-                R = float(Rs[ia])
-                if R <= 0.0:
+    else:
+        Rs = np.asarray(Rs, dtype=np.float64).reshape(-1)
+        assert len(Rs) == len(apos), f'Rs length {len(Rs)} != natoms {len(apos)}'
+        Rmax = float(np.max(Rs)) if len(Rs) else 0.0
+        r_search = max(float(r_xy), Rmax + 0.5)
+        r2_search = r_search ** 2
+        for iy in range(ncy):
+            cy = y0 + iy * dy
+            for ix in range(ncx):
+                cx = x0 + ix * dx
+                d2 = (apos[:, 0] - cx) ** 2 + (apos[:, 1] - cy) ** 2
+                near = d2 < r2_search
+                if not np.any(near):
                     continue
-                if rho2 < R * R:
-                    h = float(apos[ia, 2]) + float(np.sqrt(R * R - rho2))
-                    if h > best:
-                        best = h
-                    hit = True
-            if hit:
-                h0[iy * ncx + ix] = best
-            else:
-                h0[iy * ncx + ix] = float(np.max(apos[near, 2]))
-    # Apply cubic B-spline prefilter: convert nodal values → control coefficients
-    # so that B-spline interpolation exactly reproduces the sampled heights at nodes.
+                best = zmin
+                hit = False
+                for ia in np.where(near)[0]:
+                    rho2 = float(d2[ia])
+                    R = float(Rs[ia])
+                    if R <= 0.0:
+                        continue
+                    if rho2 < R * R:
+                        h = float(apos[ia, 2]) + float(np.sqrt(R * R - rho2))
+                        if h > best:
+                            best = h
+                        hit = True
+                if hit:
+                    h0[iy * ncx + ix] = best
+                else:
+                    h0[iy * ncx + ix] = float(np.max(apos[near, 2]))
+    # h0_samples = raw nodal heights (physical values); h0_coeffs = prefiltered B-spline
+    # control coefficients so cs_interp_h0 exactly reproduces h0_samples at every node
+    # (including boundaries, via the zero-padding tridiagonal solve).
+    h0_samples = h0.copy()
     h0_2d = h0.reshape(ncy, ncx)
-    h0_2d = _bspline_prefilter_2d(h0_2d).astype(np.float32)
-    return h0_2d.reshape(-1)
+    h0_coeffs = _bspline_prefilter_2d(h0_2d).astype(np.float32).reshape(-1)
+    return {'h0_samples': h0_samples, 'h0_coeffs': h0_coeffs}
 
 
 def bspline_n_intervals(length_ang, dx):
@@ -260,10 +286,19 @@ class SeparableParams:
         self.nz = int(nz)
         self.poly_powers = np.array([m_start * (2 ** k) for k in range(nz)], dtype=np.float32)
         self.h0_Rs = None if Rs is None else np.asarray(Rs, dtype=np.float64).reshape(-1)
+        # h0_map accepts: dict from build_contact_height_map ({'h0_samples','h0_coeffs'}),
+        # a raw flat array (legacy: treated as h0_coeffs), or None (built from apos).
+        self.h0_samples = None
         if h0_map is not None:
-            self.h0_map = np.ascontiguousarray(h0_map, dtype=np.float32).reshape(-1)
+            if isinstance(h0_map, dict):
+                self.h0_map = np.ascontiguousarray(h0_map['h0_coeffs'], dtype=np.float32).reshape(-1)
+                self.h0_samples = np.ascontiguousarray(h0_map['h0_samples'], dtype=np.float32).reshape(-1)
+            else:
+                self.h0_map = np.ascontiguousarray(h0_map, dtype=np.float32).reshape(-1)
         elif apos is not None:
-            self.h0_map = build_contact_height_map(apos, self.x0, self.y0, self.dx, self.dy, self.ncx, self.ncy, r_xy=h0_r_xy, Rs=self.h0_Rs)
+            h0d = build_contact_height_map(apos, self.x0, self.y0, self.dx, self.dy, self.ncx, self.ncy, r_xy=h0_r_xy, Rs=self.h0_Rs)
+            self.h0_map = np.ascontiguousarray(h0d['h0_coeffs'], dtype=np.float32).reshape(-1)
+            self.h0_samples = np.ascontiguousarray(h0d['h0_samples'], dtype=np.float32).reshape(-1)
         else:
             self.h0_map = None
         self.coeffs = None
@@ -343,7 +378,9 @@ class ContactSurfaceCL(OpenCLBase):
         self.sep = sep
         if sep.h0_map is None:
             assert apos is not None, 'SeparableParams needs h0_map or apos for build_contact_height_map'
-            sep.h0_map = build_contact_height_map(apos, sep.x0, sep.y0, sep.dx, sep.dy, sep.ncx, sep.ncy)
+            h0d = build_contact_height_map(apos, sep.x0, sep.y0, sep.dx, sep.dy, sep.ncx, sep.ncy)
+            sep.h0_map = np.ascontiguousarray(h0d['h0_coeffs'], dtype=np.float32).reshape(-1)
+            sep.h0_samples = np.ascontiguousarray(h0d['h0_samples'], dtype=np.float32).reshape(-1)
         n_h0 = sep.ncx * sep.ncy
         self.try_make_buffers({'cs_h0': n_h0 * 4}, suffix='_buff')
         self.toGPU_(self.cs_h0_buff, np.ascontiguousarray(sep.h0_map, dtype=np.float32))

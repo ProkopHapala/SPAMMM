@@ -79,6 +79,31 @@ def stiffness_eVA2_to_Nm(k_eVA2):
     return float(k_eVA2) * N_M_PER_EV_A2
 
 
+def build_scan_points_vectorized(scan_xs, scan_ys, h_scan):
+    """Build the shared 3D scan-point grid (nx*ny*nz, 4) float32 via meshgrid.
+
+    Replaces the per-axis Python nested loops in ``run_scan`` (AFM.py:935) and
+    ``run_scan_contact`` (AFM.py:1263). Each row is ``(x, y, z, 0.0)`` in
+    C-order over ``(nx, ny, nz)`` with ``indexing='ij'`` (ix-major, then iy,
+    then iz) — the same ordering the old ``for ix: for iy:`` loops produced
+    when extended over the z stack.
+
+    Args:
+        scan_xs: (nx,) x scan positions [Å, world coords]
+        scan_ys: (ny,) y scan positions [Å, world coords]
+        h_scan:  (nz,) probe z heights [Å] — the dense z-approach stack
+    Returns:
+        pts: (nx*ny*nz, 4) float32, contiguous — (x, y, z, 0.0) per row
+    """
+    scan_xs = np.asarray(scan_xs, dtype=np.float32)
+    scan_ys = np.asarray(scan_ys, dtype=np.float32)
+    h_scan = np.asarray(h_scan, dtype=np.float32)
+    gx, gy, gz = np.meshgrid(scan_xs, scan_ys, h_scan, indexing='ij')
+    pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel(),
+                    np.zeros(gx.size, dtype=np.float32)], axis=1)
+    return np.ascontiguousarray(pts, dtype=np.float32)
+
+
 def _bytes_to_gb(nbytes):
     return nbytes / (1024.0**3)
 
@@ -1067,9 +1092,13 @@ class AFMulator(OpenCLBase):
             Rs = np.asarray(self.cLJs_arr[:, 0], dtype=np.float64) * float(h0_R_scale)  # Morse R0
         elif h0_mode != 'atom_z':
             raise ValueError(f"unknown h0_mode={h0_mode!r}; use 'spheres' or 'atom_z'")
-        h0_map = build_contact_height_map(apos, x0f, y0f, bspl_dx, bspl_dx, bspl_nx, bspl_ny, r_xy=h0_r_xy, Rs=Rs)
-        h0_max = float(np.max(h0_map))
-        h0_min = float(np.min(h0_map))
+        h0_dict = build_contact_height_map(apos, x0f, y0f, bspl_dx, bspl_dx, bspl_nx, bspl_ny, r_xy=h0_r_xy, Rs=Rs)
+        h0_map = h0_dict['h0_coeffs']       # B-spline control coefficients (for kernel upload / interp)
+        h0_samples = h0_dict['h0_samples']  # raw nodal heights (physical contact values)
+        # h0_min/h0_max from SAMPLES (physical extent), not from prefiltered coefficients
+        # (coefficients can overshoot/undershoot nodal range due to B-spline control-point nature).
+        h0_max = float(np.max(h0_samples))
+        h0_min = float(np.min(h0_samples))
         # Fit offsets are above CONTACT (h0_max), not bare atom zmax — otherwise samples sit inside the spheres
         z_ref = h0_max if h0_mode == 'spheres' else zmax
         if s_min is not None and s_max is not None:
@@ -1114,7 +1143,7 @@ class AFMulator(OpenCLBase):
             sample_weights, T, E_shift = boltzmann_fit_weights(E_ref, T=fit_boltzmann_T)
             if bPrint:
                 print(f"AFMulator.fit_contact_surface: Boltzmann weights T={T:.4f} eV  E_shift={E_shift:.4f} eV  w∈[{float(sample_weights.min()):.3e},{float(sample_weights.max()):.3e}]")
-        sep = SeparableParams(x0f, y0f, bspl_dx, bspl_dx, bspl_nx, bspl_ny, poly_R=poly_R, poly_z0=poly_z0, m_start=m_start, nz=nz, apos=apos, h0_map=h0_map, h0_r_xy=h0_r_xy, Rs=Rs)
+        sep = SeparableParams(x0f, y0f, bspl_dx, bspl_dx, bspl_nx, bspl_ny, poly_R=poly_R, poly_z0=poly_z0, m_start=m_start, nz=nz, apos=apos, h0_map=h0_dict, h0_r_xy=h0_r_xy, Rs=Rs)
         F_ref_pass = F_ref if fit_force_weight > 0.0 else None
         rmse = self._cs_fit_helper().fit_separable_cg(sep, fit_pts, E_ref, F_ref=F_ref_pass, apos=apos, n_iter=n_iter, sample_weights=sample_weights, force_weight=fit_force_weight, bPrint=bPrint)
         if fit_z_adaptive is not None or fit_z_stack is not None:
@@ -2359,6 +2388,68 @@ def fft_poisson(rho, step):
     if afm_use_cpu_fft():
         return fft_poisson_cpu(rho, step)
     return _get_fdbm_fft().poisson(rho, step)
+
+
+def _prime_factorization(n):
+    """Return prime factorization of n as a dict {prime: exponent}."""
+    n = int(n)
+    factors = {}
+    for p in range(2, n + 1):
+        while n % p == 0:
+            factors[p] = factors.get(p, 0) + 1
+            n //= p
+        if n == 1:
+            break
+    return factors
+
+
+def plan_fft_friendly_grid(atomPos, step, margin, z_vac):
+    """Explicit FFT-friendly grid planner for FFT-consuming paths (FDBM Poisson/convolution).
+
+    Builds a COM-centered XY, z-symmetric (about molecular plane) grid with FFT-friendly
+    dimensions (multiples of 8, prime factors 2/3/5/7 only via ``round_fft_friendly``).
+    Verifies friendliness explicitly and raises ``ValueError`` with the prime factorization
+    if any dimension is not clFFT-friendly — never silently falls back to CPU FFT.
+
+    Args:
+        atomPos: (natoms, 3+) atom positions [Å]
+        step: isotropic grid spacing [Å]
+        margin: xy margin around molecule bbox [Å]
+        z_vac: half-vacuum extent above/below molecular plane [Å]
+    Returns:
+        (grid_spec, origin, ngrid, step) where grid_spec is a dict with
+        'origin', 'ngrid', 'dA', 'dB', 'dC'; ngrid is (nx, ny, nz) int tuple.
+    Raises:
+        ValueError: if any rounded dimension is not FFT-friendly (with prime factorization).
+    """
+    atomPos = np.asarray(atomPos, dtype=np.float64)
+    step = float(step); margin = float(margin); z_vac = float(z_vac)
+    com = atomPos.mean(axis=0)
+    mol_z = float(atomPos[:, 2].mean())
+    x0 = float(atomPos[:, 0].min()) - margin
+    x1 = float(atomPos[:, 0].max()) + margin
+    y0 = float(atomPos[:, 1].min()) - margin
+    y1 = float(atomPos[:, 1].max()) + margin
+    z0, z1 = mol_z - z_vac, mol_z + z_vac
+    nx = _FDBMGpyFFT.round_fft_friendly(int(np.ceil((x1 - x0) / step)) + 1)
+    ny = _FDBMGpyFFT.round_fft_friendly(int(np.ceil((y1 - y0) / step)) + 1)
+    nz = _FDBMGpyFFT.round_fft_friendly(int(np.ceil((z1 - z0) / step)) + 1)
+    # Verify friendliness — fail fast with prime factorization, never silently fall back
+    for dim, name in zip((nx, ny, nz), ('nx', 'ny', 'nz')):
+        if not _FDBMGpyFFT.is_fft_friendly(dim):
+            factors = _prime_factorization(dim)
+            raise ValueError(
+                f"plan_fft_friendly_grid: {name}={dim} is not clFFT-friendly "
+                f"(prime factors must be 2,3,5,7 only). Factorization: {factors}"
+            )
+    origin = np.array([com[0] - 0.5 * nx * step, com[1] - 0.5 * ny * step, mol_z - 0.5 * nz * step],
+                      dtype=np.float64)
+    ngrid = (int(nx), int(ny), int(nz))
+    grid_spec = {
+        'origin': origin, 'ngrid': ngrid,
+        'dA': [step, 0.0, 0.0], 'dB': [0.0, step, 0.0], 'dC': [0.0, 0.0, step],
+    }
+    return grid_spec, origin, ngrid, step
 
 def build_gaussian_tip(grid_shape, step, sigma):
     """Build normalized Gaussian tip density kernel with FFT wrap-around. Returns (nx,ny,nz) float64."""

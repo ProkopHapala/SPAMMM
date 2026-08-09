@@ -1183,3 +1183,206 @@ Three Python-loop constructs were introduced that violate the AGENTS.md rule: "P
 - `_make_dinv_axis_aligned` / `_make_dinv_lvec` (`AFM.py:233-253`): 0.093 ms per `setup_grid` call, identical cost to old inline code (3 `np.array` constructions with different constant). Not a loop, not hot.
 - `fmax` removal in `contact_surface.cl`: one fewer GPU op, slightly faster. Not used by Morse/FDBM.
 - Standard Morse pipeline: setup_grid 0.09 ms + make_forcefield 4.0 ms + run_scan 9.9 ms = 13.9 ms total. No change.
+
+### R2.5 — 2D map bumpiness/corrugation at far z (diagnostic + proposed fixes)
+
+#### Observation
+E(z)/Fz(z) curves at fixed (x,y) points overlap almost perfectly between Contact 2.5D
+and Morse 3D GridFF (ΔE_min < 0.0004 eV, Δz_Emin ≤ 0.1 Å). However, 2D Fz(x,y) maps
+from the contact surface show **corrugated/bumpy patterns at far z** that completely
+destroy the image quality, while Morse maps are smooth.
+
+Diagnostic plots (`debug/unify_wave3/pyridine_bumpiness/`):
+- `fz_bumpiness.png`: Fz(x,y) at 5 z heights — Morse smooth, Contact bumpy at far z
+- `fz_diff_bumpiness.png`: ΔFz = Contact − Morse — shows spatially periodic ripples
+- `fz_power_spectrum.png`: Radial power spectrum — Contact has excess high-frequency
+  power vs Morse at all |k| > 0.3 1/Å
+
+#### Root cause analysis
+
+The bumpiness originates from the **xy B-spline coefficient structure**, not the z-basis:
+
+1. **Independent per-node fitting with coarse grid**: The fit minimizes E/Fz error at
+   sample points. With `bspl_dx=1.0`, the B-spline grid has only ~16×15 nodes for
+   pyridine. Each node's coefficient is determined by local fit residuals. Where the
+   reference field is weak (far z, low Boltzmann weight), the coefficients are poorly
+   constrained and can take arbitrary values — creating ripples when interpolated by
+   the cubic B-spline between nodes.
+
+2. **No smoothness regularization**: The CG fit solves `min ||A·c − b||²` with no
+   penalty on coefficient roughness. The normal equations `AᵀA·c = Aᵀb` have no
+   Tikhonov/Laplacian term, so high-frequency oscillations in `c` are unconstrained
+   when the data doesn't constrain them (far z, low weight).
+
+3. **Boltzmann weighting de-emphasizes far z**: The Boltzmann weights
+   `w = exp(-(E-E_min)/T)` with T=0.05 eV strongly downweight high-energy (far z)
+   samples. This is intentional for the vdW well region but means the fit is
+   essentially unconstrained at far z — the coefficients there are free to oscillate.
+
+4. **Cubic B-spline interpolation amplifies control-point oscillation**: The cubic
+   B-spline basis has 4-node support (±1 node). If adjacent control coefficients
+   alternate sign or magnitude, the interpolated field shows ripples at the node
+   spacing (1.0 Å period), which is exactly what we see in the power spectrum.
+
+5. **No symmetry enforcement**: The fit treats each (ix, iy) node independently.
+   Molecules like pyridine have C2v symmetry, but the B-spline coefficients don't
+   respect it — sampling noise breaks symmetry, creating asymmetric ripples.
+
+#### Proposed fixes (ranked by impact × simplicity)
+
+**Fix A: Tikhonov/Laplacian regularization on xy coefficients** (RECOMMENDED)
+- Add `λ · ||L_xy · c||²` to the CG loss, where `L_xy` is the discrete Laplacian on
+  the (ncx × ncy) B-spline grid for each z-mode k.
+- Implementation: modify the CG operator to `(AᵀA + λ·LᵀL)·c = Aᵀb`. Since the CG
+  uses matrix-free `Av`/`Atv`, add a `LᵀL·c` kernel that computes the Laplacian
+  penalty contribution. This is a 5-point stencil per (ix, iy, kz) — trivial in OpenCL.
+- `λ` should be small enough to not affect the well-region fit (where data constrains
+  well) but large enough to suppress unconstrained oscillations at far z.
+- **Pros**: Principled, preserves fit quality where data is strong, suppresses noise
+  where data is weak. One hyperparameter (`λ`).
+- **Cons**: Requires new OpenCL kernel + modified CG loop. Need to tune `λ`.
+
+**Fix B: Post-fit Gaussian smoothing of xy coefficients** (SIMPLEST)
+- After CG convergence, apply a 2D Gaussian filter (σ = 1-2 nodes) to the
+  `(ncx, ncy, nz)` coefficient array for each z-mode.
+- Implementation: `scipy.ndimage.gaussian_filter1d` along x and y axes, per z-mode.
+- **Pros**: Trivial to implement, no kernel changes, immediate result.
+- **Cons**: Non-adaptive (smooths everywhere, including where sharp features exist).
+  May blur atom-scale contrast at close z. Not principled — just hides the symptom.
+
+**Fix C: Increase fit margin beyond scan region** (EASIEST, PARTIAL)
+- Currently `margin=4.0` for fit, `scan_margin=2.0` for scan. The scan region is
+  2 Å inside the fit boundary. B-spline open-end boundary conditions cause ripples
+  near the edges that can propagate inward.
+- Increasing `margin=6.0` or `8.0` pushes boundary ripples further from the scan area.
+- **Pros**: No code change, just parameter adjustment.
+- **Cons**: More B-spline nodes = more coefficients = slower fit. Doesn't fix the
+  fundamental unconstrained-far-z issue. Only helps with boundary ripples, not
+  interior oscillations.
+
+**Fix D: Z-dependent regularization weight** (PRINCIPLED, COMBINED WITH A)
+- Instead of constant `λ`, use `λ(z) = λ_0 · (1 - w(z))` where `w(z)` is the mean
+  Boltzmann weight at height z. This regularizes strongly where data is weak (far z)
+  and weakly where data is strong (near contact).
+- Implementation: per-z-mode `λ_k` in the Laplacian penalty, scaled by
+  `1 - median(w[iz])`.
+- **Pros**: Adaptive — preserves sharp features at close z, smooths at far z.
+- **Cons**: More complex implementation. Requires tracking per-z-mode weights.
+
+**Fix E: Symmetry enforcement** (COMPLEMENTARY)
+- If molecule has known symmetry (detected from atom positions), symmetrize the
+  fit grid: average `E_ref` and `F_ref` over symmetry-equivalent points before
+  fitting. Or constrain coefficients: `c[sym(ix,iy)] = c[ix,iy]`.
+- **Pros**: Reduces effective noise by N_sym-fold. Eliminates symmetry-breaking
+  ripples. No hyperparameters.
+- **Cons**: Only works for symmetric molecules. Need symmetry detection logic.
+  Doesn't help for asymmetric molecules.
+
+**Fix F: Finer B-spline grid with stronger regularization** (COMBINED WITH A)
+- Use `bspl_dx=0.5` (finer) with stronger `λ`. More nodes = better spatial
+  resolution, but regularization prevents overfitting.
+- **Pros**: Better atom-scale contrast at close z + smooth at far z.
+- **Cons**: 4× more coefficients (slower fit). Need to tune both `bspl_dx` and `λ`.
+
+#### Recommended implementation order
+1. **Fix C** (increase margin to 6.0) — immediate partial relief, zero code change
+2. **Fix B** (post-fit Gaussian smoothing, σ=1.5) — quick test of concept
+3. **Fix A** (Tikhonov regularization) — proper solution, implement after B validates
+4. **Fix D** (z-dependent λ) — refinement of A for optimal close/far balance
+5. **Fix E** (symmetry) — complementary, implement if molecules are symmetric
+
+#### Artifacts
+- `debug/unify_wave3/pyridine_bumpiness/fz_bumpiness.png`
+- `debug/unify_wave3/pyridine_bumpiness/fz_diff_bumpiness.png`
+- `debug/unify_wave3/pyridine_bumpiness/fz_power_spectrum.png`
+
+### R2.6 — Review of the bumpiness diagnosis and next coding protocol (design only, unverified)
+
+This review **supersedes the implementation order in R2.5**. Do not implement Gaussian smoothing, a Laplacian kernel, a larger margin, or symmetry constraints until the isolation tests below identify the layer that creates the error.
+
+#### Corrections to R2.5
+
+- The production separable fit is **not an independent fit at every pixel/node**. `fit_separable_cg()` solves one global matrix-free least-squares problem; every sample couples a 4x4 lateral B-spline stencil for every active z mode. The experimental tiled solver is separate.
+- The current global fit has no regularizer, so poor conditioning remains plausible, but it has not yet been shown that lateral coefficient roughness is the cause.
+- Boltzmann weighting suppresses high-energy samples, not automatically far-z samples. Measure mean/min/max weight by local-s and absolute-z bin before claiming that the tail is underweighted.
+- `fz_bumpiness.png` independently autoscales each Morse and Contact panel. A numerically tiny Contact remainder can therefore look like a strong image. `fz_power_spectrum.png` has no spatial window, uses only one relaxed height, and its radial average discards direction; the plotted curves do not establish a general Contact high-k excess.
+- `res.FEs` is the **PP-relaxed scan result**, not the raw Contact fit. PP relaxation can amplify a small force-field defect or introduce branch/convergence artifacts. Raw-field parity must precede relaxed-image parity.
+- The reported z-curve numbers compare well positions/minima at four points, not the full tail or the worst lateral pixels. The existing z-curve plot already shows increasing tail disagreement.
+
+#### Leading hypothesis: the z-domain contract is internally inconsistent
+
+Current unified defaults use `fit_z_hi=8.0 Å` but `poly_R=4.0 Å`. In `poly_z_doubling_modes`, all basis functions and their z derivatives are exactly zero for
+
+`s = z - h0(x,y) - poly_z0 >= poly_R`.
+
+Consequences to test first:
+
+1. A large fraction of the advertised fit samples have an all-zero design row and cannot constrain any coefficient.
+2. Near the upper end of the support, the modes `t^(4,8,16,32,64,128)` collapse to effectively only `t^4`; higher modes are tiny or underflow in float32. The entire far field is then controlled by one lateral coefficient map.
+3. Because the cutoff is applied in local `s`, a constant world-z slice crosses the cutoff at different places according to `h0(x,y)`. This produces a molecule-shaped footprint even if the coefficients themselves are smooth.
+4. At `h≈6 Å`, the Contact panel is independently autoscaled while the difference is dominated by a smooth missing Morse tail. This is more consistent with cutoff/weak-signal amplification than with the presently claimed universal high-k noise.
+
+Do not merely change `poly_R` and declare success. A larger `poly_R` changes the conditioning and shape of every z mode, so it needs the controlled sweep below.
+
+#### Round R2.6 diagnostic gates for the next agents
+
+##### Gate 0 — repair the diagnostic, not the model
+
+- [ ] Use identical world-coordinate query points and compare: brute Morse+Q reference, raw separable Contact evaluation, Morse PP-relaxed scan, and Contact PP-relaxed scan. Reuse `eval_separable()` / `_brute_afm_morse_c_queries()` or the existing `get_raw_FE_contact()`; do not infer raw fit quality from `ScanResult.FEs`.
+- [ ] Plot Morse and Contact with one reference-locked absolute colorscale at every height; also plot absolute error, relative error only where `|F_ref|` exceeds a declared floor, and signal-to-error ratio. Keep a separate autoscaled panel only as a visibility aid and label it as such.
+- [ ] Use a common interior ROI. For spectra subtract a constant/low-order background, apply the same Hann/Tukey window, verify Parseval normalization, and save the full 2D spectrum plus radial and angular summaries. Mark `1/bspl_dx` and harmonics.
+- [ ] Report per height: absolute RMSE, max error, correlation, Contact/reference RMS, high-k power fraction, and the valid relative-error coverage. A weak far field must not be judged only by a normalized image.
+- [ ] Evaluate full E(z) and Fz(z) residual curves at atoms, gaps, and the worst map-error pixels; minima alone are insufficient.
+
+##### Gate 1 — prove or reject the cutoff/support hypothesis
+
+- [ ] For every fit row and every scan/relaxed probe point, histogram local `s`, basis-stencil norm, and distance to `poly_R`. Report the exact fraction with `s<0`, `0<=s<poly_R`, and `s>=poly_R`; zero-stencil fit rows are a fail-loud configuration error.
+- [ ] Save `phi_k(s)`, `dphi_k/ds`, and each mode's signed contribution to E and Fz versus height. Confirm whether the far map is almost entirely mode 0.
+- [ ] Sweep `poly_R={4,6,8,10,12}` while holding the physical training/query domain fixed. Separately sweep `fit_z_hi` so that one experiment keeps `fit_z_hi<=poly_R` and another intentionally violates it. Do not change two other parameters in the same run.
+- [ ] Add a proposed production invariant to the report: the fitted support must cover the maximum local-s used by the complete oscillation stroke and expected PP displacement, with an explicit guard band. The eventual code should fail fast when this contract is violated.
+- [ ] Compare compact polynomial modes with a small exponential/Chebyshev/B-spline-in-s prototype on the same stored reference samples. The aim is to determine whether the hard compact cutoff and doubling powers are the wrong tail basis before adding xy smoothing.
+
+##### Gate 2 — isolate sampling phase, h0, and numerical conditioning
+
+- [ ] The current fit uses `fit_dx=fit_dy=bspl_dx=1 Å`, phase-aligned with the coefficient lattice, while the scan queries 0.1 Å sub-pixel positions. First oversample the **same coefficient model** with `fit_dx=fit_dy={0.5,0.25}`. This increases fit work but does not increase stored coefficients or scan cost. Validate on a held-out lattice shifted by half a fit step.
+- [ ] Independently phase-shift the coefficient lattice and the fit-sample lattice by `{0,0.25,0.5,0.75}*bspl_dx` while keeping the molecule and world query grid fixed. Register results in world coordinates. Artifacts following the coefficient phase indicate representation/grid error; artifacts following sample phase indicate aliasing/quadrature error.
+- [ ] Compare absolute-z planes and surface-following `z=h0+s` samples with the same local-s range, row count, and weights. The global z planes currently give different local-s coverage at different xy sites.
+- [ ] Run a flat/constant `h0` ablation and the normal interpolated `h0`. Map `h0`, its gradient/Laplacian, and distance to sphere-envelope seams; correlate them with raw residuals. Test E-only, E+Fz, and E+Fx+Fy+Fz fits separately, because lateral force rows contain `grad(h0)` terms and may force the coefficients to compensate for h0 roughness.
+- [ ] Form the small weighted z-mode Gram matrix over the actual local-s samples and report its singular values/condition estimate. The full CG uses normal equations in float32, which squares conditioning; its `Atv` uses atomic float additions.
+- [ ] Repeat identical fits several times and sweep CG iterations `{20,40,80,120,240}` with a fixed held-out set. Save residual history, coefficient/map spread, and symmetry residual. Run-to-run changes implicate atomic reduction/numerical noise; validation error or bumpiness growing with iteration implicates ill-conditioning/overfit.
+- [ ] Compare `nz`, `m_start`, and normalized/orthogonalized z modes only after the above diagnostics. Scale modes by their weighted E/F contribution so a regularization parameter has comparable meaning across modes.
+
+##### Gate 3 — separate field error from PP amplification
+
+- [ ] If the raw Contact field is smooth but the relaxed image is not, stop modifying the fit. Save PP displacement, final force residual/iteration count, and convergence/branch maps for both backends.
+- [ ] Test rigid probe/no lateral relaxation, reduced/increased `K_LAT`, independent initialization at each height, and forward/reverse z strokes. Corrugation that appears only after relaxation is a PP stability/bistability problem.
+- [ ] If the raw field is already wrong, PP experiments are secondary and must not be used to tune the field fit.
+
+##### Gate 4 — symmetry and boundaries are diagnostics, not default fixes
+
+- [ ] Define the molecule's actual symmetry from geometry **and interaction parameters**. Pyridine is not sixfold symmetric; only compare the valid molecule-aligned C2v operations. Measure brute-reference symmetry first, then raw Contact and coefficient symmetry.
+- [ ] Repeat on one deliberately asymmetric molecule. A generic backend must not depend on symmetry projection to look correct.
+- [ ] Bin residuals by distance from the fit boundary before increasing the margin. Increase margin only if error is boundary-localized; otherwise it wastes coefficients and fit time.
+
+#### Candidate remedies, chosen only after the gates
+
+1. **Correct support and choose a conditioned z basis.** Make fit range, oscillation range, PP excursion, `poly_z0`, and `poly_R` one explicit contract. Prefer a basis with the correct smooth far tail and no accidental zero-support rows. Weighted orthogonalization or a better z basis may remove the need for aggressive xy filtering.
+2. **Oversample training without increasing representation memory.** `fit_dx<bspl_dx` is the cheapest likely aliasing fix: more one-time fit samples, unchanged coefficient count and production scan speed.
+3. **Use regularization as a controlled model choice.** First compare diagonal ridge (already supported internally by `_cg_step_sep`) against first-difference/membrane and Laplacian/thin-plate penalties. Scale the operator with grid spacing and mode normalization; specify boundary conditions. Select lambda on held-out world-coordinate maps, not training RMSE.
+4. **Exploit mode-dependent lateral resolution.** The lowest/slow z mode controls the far tail and should be very smooth/coarse; rapidly decaying near-contact modes need fine xy detail. A coarse far component plus fine short-range residual can use fewer coefficients than one uniform grid while improving smoothness.
+5. **Split long- and short-range physics.** Preserve a smooth analytic, coarse-grid, or low-k far field and fit only the short-range contact residual with 2.5D splines. This is preferable if no compact polynomial basis represents both the well and tail robustly. Benchmark memory and kernel cost against the current six-mode field.
+6. **Post-fit coefficient smoothing is an ablation, not a production fix.** If tested, smooth complete coefficient maps before deriving both E and F so `F=-grad(E)` remains consistent. Reject it if it removes valid near-contact contrast or only hides PP instability. Never filter the final image.
+7. **Symmetry projection is optional validation/metadata-driven optimization.** It may reduce noise for a known symmetric system, but must never be silently applied to arbitrary molecules and must not substitute for translation/phase robustness.
+
+#### Acceptance contract
+
+- Use at least pyridine plus one asymmetric molecule and at least two coefficient-grid phases.
+- Validate raw E and all force components against brute reference on held-out sub-grid points, then validate relaxed Fz/df maps through the shared pipeline.
+- Preserve `F=-grad(E)` with finite-difference checks, including near h0 seams and the far-support boundary.
+- Report close-, well-, and far-z errors separately; include worst-pixel z curves and valid symmetry residuals.
+- Report fit time, scan time, coefficient count, GPU memory, and phase-to-phase spread. The desired solution keeps the small coefficient count and fast OpenCL scan; extra fit samples are acceptable if the one-time fit remains practical.
+- No item may be marked fixed/resolved until the user reviews the common-scale images and numerical table.
+
+#### Required artifact layout
+
+Put the new work under `debug/unify_wave4/contact_bumpiness/` with one `SUMMARY.out` containing exact parameters, device, coefficient count, timing, support fractions, metrics, and `REVIEW:` paths. Use shared AFM plotting utilities for production-style E/Fz/df panels; diagnostic-only spectra and coefficient maps may be additional plots. Do not overwrite the R2.5 artifacts.

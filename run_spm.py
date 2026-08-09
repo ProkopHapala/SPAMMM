@@ -121,6 +121,10 @@ def _add_common_afm_args(p: argparse.ArgumentParser) -> None:
                      help='CSV: compare,stage (default); tip,df,fz,ediss,per_image; all; none')
     out.add_argument('--show-atoms', action='store_true', dest='show_atoms',
                      help='Overlay atom positions as small dots on AFM panels')
+    out.add_argument('--zcurves', default=None, dest='zcurves',
+                     help='Plot E(z)/Fz(z) curves at selected points. '
+                          'Format: "atoms:0,1,5" (atom indices) or "xy:3.5,2.0;1.0,1.0" (semicolon-separated x,y pairs). '
+                          'Curves are extracted from the FEs volume at nearest scan grid points.')
 
 
 def _resolve_geometry(args):
@@ -162,10 +166,201 @@ def _resolve_geometry(args):
     return name, atomPos, atomTypes, enames, None, None
 
 
-def cmd_afm(args: argparse.Namespace) -> int:
-    """Single-molecule FDBM AFM (xyz and/or cube / SMILES).
+def _cmd_afm_morse_routed(args, atomPos, atomTypes, origin, step, ngrid,
+                          mol_name, xyz, plots, osc_dir, base_pos, osc_n) -> int:
+    """Morse+Q backend routed through the shared ScanSpec/ScanResult contract.
 
-    Physics: ``AFM_utils.run_fdbm_pp_from_density`` (FAST_S3 GPU = ModularPipeline Stage3–4).
+    Called by ``cmd_afm`` when ``args.model == 'morse'``. Builds a ScanSpec from
+    the common CLI args, calls ``run_morse_pp_afm``, and plots with
+    ``plot_afm_variant_height_strip`` — same layout as the FDBM path.
+    """
+    import numpy as np
+    from spammm.SPM import AFM as afm
+    from spammm.SPM import AFM_utils as afm_utils
+
+    h_df, h_Fz, h_scan = afm_utils.afm_df_height_stacks(
+        args.h_min, args.h_max, args.h_step,
+        amp=args.amp, amp_align=not getattr(args, 'no_amp_align', False), osc_dir=osc_dir)
+    scan_xs = np.arange(float(atomPos[:, 0].min() - args.scan_margin),
+                        float(atomPos[:, 0].max() + args.scan_margin), step, dtype=np.float32)
+    scan_ys = np.arange(float(atomPos[:, 1].min() - args.scan_margin),
+                        float(atomPos[:, 1].max() + args.scan_margin), step, dtype=np.float32)
+    K_LAT = afm.stiffness_Nm_to_eVA2(float(args.K_LAT))
+    scan_spec = afm_utils.ScanSpec(
+        scan_xs=scan_xs, scan_ys=scan_ys, h_df=h_df, h_Fz=h_Fz, h_scan=h_scan,
+        amplitude=float(args.amp), osc_dir=osc_dir,
+        K_LAT=K_LAT, K_RAD=float(args.K_RAD), bond_length=float(args.bond_length),
+        scan_margin=float(args.scan_margin),
+    )
+    params_path = _abs_path(getattr(args, 'params_path', None)) or os.path.join(_ROOT, 'data', 'ElementTypes.dat')
+    plot_diag = plots & {'stage', 'df', 'fz', 'ediss'}
+    variants = {'morse': afm_utils.run_morse_pp_afm(
+        'morse', atomPos, atomTypes, origin, step, ngrid, args.outdir,
+        scan_spec=scan_spec, params_path=params_path,
+        margin=args.margin, plots=plot_diag, df_cmap=args.df_cmap, cmap=args.cmap,
+        stage_height=args.height,
+    )}
+
+    order = ['morse']
+    amp = float(args.amp)
+    amp_z = amp * abs(float(osc_n[2]))
+    amp_align = (not getattr(args, 'no_amp_align', False)) and amp_z > 1e-12
+    row_specs = [('df', 'morse', f'df morse\nK_LAT={args.K_LAT} N/m', args.df_cmap)]
+    row_specs.append(('Fz', 'morse',
+                      f'Fz morse\n@h−{amp_z:.1f}Å' if amp_align else 'Fz morse\n@same z', args.cmap))
+    if 'ediss' in plots:
+        row_specs.append(('E_diss', 'morse', f'E_diss morse\namp={amp:.1f}Å', 'hot'))
+
+    heights = variants['morse'].heights
+    extent = afm_utils.scan_extent(variants['morse'].scan_xs, variants['morse'].scan_ys)
+    title = f'Morse+Q AFM  {mol_name}  K_LAT={args.K_LAT} N/m  K_RAD={args.K_RAD}  L={args.bond_length}Å  n=({osc_n[0]:.2f},{osc_n[1]:.2f},{osc_n[2]:.2f})'
+    show_atoms = bool(getattr(args, 'show_atoms', False))
+    out_png = None
+    if 'compare' in plots:
+        scale = getattr(args, 'scale', 'per_image') or 'per_image'
+        out_png = os.path.join(args.outdir, f'compare_{scale}.png')
+        afm_utils.plot_afm_variant_height_strip(
+            variants, row_specs, heights, out_png, scale=scale, title=title, dpi=140,
+            apos=atomPos if show_atoms else None, show_atoms=show_atoms, extent=extent,
+            amp=args.amp, amp_align=amp_align, amp_z=amp_z, long_axis_vertical=True, tight=True)
+        print(f'REVIEW: {out_png}')
+    if 'per_image' in plots and getattr(args, 'scale', 'per_image') != 'per_image':
+        per = os.path.join(args.outdir, 'per_image')
+        os.makedirs(per, exist_ok=True)
+        pi = os.path.join(per, 'compare_per_image.png')
+        afm_utils.plot_afm_variant_height_strip(
+            variants, row_specs, heights, pi, scale='per_image', title=title, dpi=140,
+            apos=atomPos if show_atoms else None, show_atoms=show_atoms, extent=extent,
+            amp=args.amp, amp_align=amp_align, amp_z=amp_z, long_axis_vertical=True, tight=True)
+        print(f'REVIEW: {pi}')
+
+    summary = os.path.join(args.outdir, 'SUMMARY.out')
+    with open(summary, 'w') as f:
+        f.write(title + '\n')
+        f.write(f'xyz={xyz}\n')
+        f.write(f'model=morse  grid={ngrid[0]}x{ngrid[1]}x{ngrid[2]} step={step}\n')
+        f.write(f'plots={sorted(plots)} z=[{args.h_min},{args.h_max}] dz={args.h_step} osc_n=({osc_n[0]:.6f},{osc_n[1]:.6f},{osc_n[2]:.6f}) amp={amp}\n')
+        if out_png:
+            f.write(f'REVIEW: {out_png}\n')
+
+    # E(z)/Fz(z) curves at selected atoms or x,y points
+    zcurves_str = getattr(args, 'zcurves', None)
+    if zcurves_str:
+        v0 = next(iter(variants.values()))
+        sample_pts = afm_utils._parse_zcurves_arg(zcurves_str, atomPos, v0.scan_xs, v0.scan_ys)
+        zc_path = os.path.join(args.outdir, 'zcurves.png')
+        afm_utils.plot_zcurves(variants, sample_pts, zc_path, atomPos=atomPos,
+                               title=f'Morse+Q E(z)/Fz(z)  {mol_name}')
+        print(f'REVIEW: {zc_path}')
+    print(f'REVIEW: {summary}')
+    print(f'REVIEW: {os.path.abspath(args.outdir)}/')
+    return 0
+
+
+def _cmd_afm_contact_routed(args, atomPos, atomTypes, origin, step, ngrid,
+                            mol_name, xyz, plots, osc_dir, base_pos, osc_n) -> int:
+    """Contact-surface 2.5D backend routed through the shared ScanSpec/ScanResult contract.
+
+    Called by ``cmd_afm`` when ``args.model == 'contact'``. Builds a ScanSpec from
+    the common CLI args, calls ``run_contact_pp_afm``, and plots with
+    ``plot_afm_variant_height_strip`` — same layout as FDBM and Morse paths.
+    """
+    import numpy as np
+    from spammm.SPM import AFM as afm
+    from spammm.SPM import AFM_utils as afm_utils
+
+    h_df, h_Fz, h_scan = afm_utils.afm_df_height_stacks(
+        args.h_min, args.h_max, args.h_step,
+        amp=args.amp, amp_align=not getattr(args, 'no_amp_align', False), osc_dir=osc_dir)
+    scan_xs = np.arange(float(atomPos[:, 0].min() - args.scan_margin),
+                        float(atomPos[:, 0].max() + args.scan_margin), step, dtype=np.float32)
+    scan_ys = np.arange(float(atomPos[:, 1].min() - args.scan_margin),
+                        float(atomPos[:, 1].max() + args.scan_margin), step, dtype=np.float32)
+    K_LAT = afm.stiffness_Nm_to_eVA2(float(args.K_LAT))
+    scan_spec = afm_utils.ScanSpec(
+        scan_xs=scan_xs, scan_ys=scan_ys, h_df=h_df, h_Fz=h_Fz, h_scan=h_scan,
+        amplitude=float(args.amp), osc_dir=osc_dir,
+        K_LAT=K_LAT, K_RAD=float(args.K_RAD), bond_length=float(args.bond_length),
+        scan_margin=float(args.scan_margin),
+    )
+    params_path = _abs_path(getattr(args, 'params_path', None)) or os.path.join(_ROOT, 'data', 'ElementTypes.dat')
+    plot_diag = plots & {'stage', 'df', 'fz', 'ediss'}
+    variants = {'contact': afm_utils.run_contact_pp_afm(
+        'contact', atomPos, atomTypes, origin, step, ngrid, args.outdir,
+        scan_spec=scan_spec, params_path=params_path,
+        margin=args.margin, plots=plot_diag, df_cmap=args.df_cmap, cmap=args.cmap,
+        cs_margin=getattr(args, 'cs_margin', 4.0),
+        bspl_dx=getattr(args, 'bspl_dx', 1.0),
+        h0_R_scale=getattr(args, 'h0_r_scale', 0.75),
+        fit_z_lo=getattr(args, 'fit_z_lo', 0.05),
+        fit_z_hi=getattr(args, 'fit_z_hi', 8.0),
+        poly_R=getattr(args, 'poly_R', 4.0),
+        n_iter=getattr(args, 'n_iter_cs', 120),
+        nz_cs=getattr(args, 'nz_cs', 6),
+    )}
+
+    order = ['contact']
+    amp = float(args.amp)
+    amp_z = amp * abs(float(osc_n[2]))
+    amp_align = (not getattr(args, 'no_amp_align', False)) and amp_z > 1e-12
+    row_specs = [('df', 'contact', f'df contact\nK_LAT={args.K_LAT} N/m', args.df_cmap)]
+    row_specs.append(('Fz', 'contact',
+                      f'Fz contact\n@h−{amp_z:.1f}Å' if amp_align else 'Fz contact\n@same z', args.cmap))
+
+    heights = variants['contact'].heights
+    extent = afm_utils.scan_extent(variants['contact'].scan_xs, variants['contact'].scan_ys)
+    clamp_occ = getattr(variants['contact'], 'clamp_occupancy', float('nan'))
+    title = f'Contact-2.5D AFM  {mol_name}  K_LAT={args.K_LAT} N/m  K_RAD={args.K_RAD}  L={args.bond_length}Å  clamp={clamp_occ:.3f}'
+    show_atoms = bool(getattr(args, 'show_atoms', False))
+    out_png = None
+    if 'compare' in plots:
+        scale = getattr(args, 'scale', 'per_image') or 'per_image'
+        out_png = os.path.join(args.outdir, f'compare_{scale}.png')
+        afm_utils.plot_afm_variant_height_strip(
+            variants, row_specs, heights, out_png, scale=scale, title=title, dpi=140,
+            apos=atomPos if show_atoms else None, show_atoms=show_atoms, extent=extent,
+            amp=args.amp, amp_align=amp_align, amp_z=amp_z, long_axis_vertical=True, tight=True)
+        print(f'REVIEW: {out_png}')
+    if 'per_image' in plots and getattr(args, 'scale', 'per_image') != 'per_image':
+        per = os.path.join(args.outdir, 'per_image')
+        os.makedirs(per, exist_ok=True)
+        pi = os.path.join(per, 'compare_per_image.png')
+        afm_utils.plot_afm_variant_height_strip(
+            variants, row_specs, heights, pi, scale='per_image', title=title, dpi=140,
+            apos=atomPos if show_atoms else None, show_atoms=show_atoms, extent=extent,
+            amp=args.amp, amp_align=amp_align, amp_z=amp_z, long_axis_vertical=True, tight=True)
+        print(f'REVIEW: {pi}')
+
+    summary = os.path.join(args.outdir, 'SUMMARY.out')
+    with open(summary, 'w') as f:
+        f.write(title + '\n')
+        f.write(f'xyz={xyz}\n')
+        f.write(f'model=contact  grid={ngrid[0]}x{ngrid[1]}x{ngrid[2]} step={step}\n')
+        f.write(f'plots={sorted(plots)} z=[{args.h_min},{args.h_max}] dz={args.h_step} osc_n=({osc_n[0]:.6f},{osc_n[1]:.6f},{osc_n[2]:.6f}) amp={amp}\n')
+        f.write(f'clamp_occupancy={clamp_occ:.6f}\n')
+        if out_png:
+            f.write(f'REVIEW: {out_png}\n')
+
+    # E(z)/Fz(z) curves at selected atoms or x,y points
+    zcurves_str = getattr(args, 'zcurves', None)
+    if zcurves_str:
+        v0 = next(iter(variants.values()))
+        sample_pts = afm_utils._parse_zcurves_arg(zcurves_str, atomPos, v0.scan_xs, v0.scan_ys)
+        zc_path = os.path.join(args.outdir, 'zcurves.png')
+        afm_utils.plot_zcurves(variants, sample_pts, zc_path, atomPos=atomPos,
+                               title=f'Contact E(z)/Fz(z)  {mol_name}')
+        print(f'REVIEW: {zc_path}')
+
+    print(f'REVIEW: {summary}')
+    print(f'REVIEW: {os.path.abspath(args.outdir)}/')
+    return 0
+
+
+def cmd_afm(args: argparse.Namespace) -> int:
+    """Single-molecule AFM (FDBM density or Morse+Q via --model).
+
+    Physics: ``AFM_utils.run_fdbm_pp_from_density`` (FAST_S3 GPU = ModularPipeline Stage3–4)
+    or ``AFM_utils.run_morse_pp_afm`` (Morse+Coulomb, shared ScanSpec/ScanResult contract).
     Plotting: ``plot_afm_variant_height_strip`` (skill:`afm-plotting` SSOT).
     No dependency on ``tests/SPM/testplot_fdbm_relax``.
     """
@@ -217,14 +412,6 @@ def cmd_afm(args: argparse.Namespace) -> int:
     print(f'grid={nx}x{ny}x{nz} step={step} origin={origin} mol={mol_name}  '
           f'Stage3={"FAST_S3" if use_fast else "LEGACY_CPU_FFT"}')
 
-    variants = {}
-    basis_hsd = get_dftb_basis_path(args.basis)
-    pa = afm.PAULI_FITTED_DEFAULTS.get(args.basis, afm.PAULI_FITTED_DEFAULTS['3ob-3-1'])
-    A_pauli, beta_pauli = float(pa['A']), float(pa['beta'])
-    print(f'Pauli EVAL defaults ({args.basis}): A={A_pauli:.3f} β={beta_pauli:.4f}')
-
-    plot_diag = plots & {'tip', 'stage', 'df', 'fz', 'ediss'}
-
     osc_dir = _parse_vec3(getattr(args, 'osc_dir', '0,0,1'), default=(0., 0., 1.))
     base_pos = _parse_vec3(getattr(args, 'base_pos', '0,0,0'), default=(0., 0., 0.))
     osc_n = np.array(osc_dir, dtype=np.float64)
@@ -235,6 +422,22 @@ def cmd_afm(args: argparse.Namespace) -> int:
     is_vertical = np.allclose(osc_n, (0., 0., 1.))
     if not is_vertical:
         print(f"Lateral/arbitrary oscillation n=({osc_n[0]:.3f},{osc_n[1]:.3f},{osc_n[2]:.3f}); approach and slices remain along z; base_pos={base_pos}")
+
+    model = getattr(args, 'model', 'fdbm')
+    if model == 'morse':
+        return _cmd_afm_morse_routed(args, atomPos, atomTypes, origin, step, ngrid,
+                                     mol_name, xyz, plots, osc_dir, base_pos, osc_n)
+    if model == 'contact':
+        return _cmd_afm_contact_routed(args, atomPos, atomTypes, origin, step, ngrid,
+                                       mol_name, xyz, plots, osc_dir, base_pos, osc_n)
+
+    variants = {}
+    basis_hsd = get_dftb_basis_path(args.basis)
+    pa = afm.PAULI_FITTED_DEFAULTS.get(args.basis, afm.PAULI_FITTED_DEFAULTS['3ob-3-1'])
+    A_pauli, beta_pauli = float(pa['A']), float(pa['beta'])
+    print(f'Pauli EVAL defaults ({args.basis}): A={A_pauli:.3f} β={beta_pauli:.4f}')
+
+    plot_diag = plots & {'tip', 'stage', 'df', 'fz', 'ediss'}
 
     def _pp(tag, rho_scf, rho_diff, V_ES=None):
         return afm_utils.run_fdbm_pp_from_density(
@@ -349,6 +552,17 @@ def cmd_afm(args: argparse.Namespace) -> int:
         for k, v in variants.items():
             if v.get('stage_path'):
                 f.write(f'REVIEW: {v["stage_path"]}\n')
+
+    # E(z)/Fz(z) curves at selected atoms or x,y points
+    zcurves_str = getattr(args, 'zcurves', None)
+    if zcurves_str:
+        v0 = next(iter(variants.values()))
+        sample_pts = afm_utils._parse_zcurves_arg(zcurves_str, atomPos, v0['scan_xs'], v0['scan_ys'])
+        zc_path = os.path.join(args.outdir, 'zcurves.png')
+        afm_utils.plot_zcurves(variants, sample_pts, zc_path, atomPos=atomPos,
+                               title=f'FDBM E(z)/Fz(z)  {mol_name}')
+        print(f'REVIEW: {zc_path}')
+
     print(f'REVIEW: {summary}')
     print(f'REVIEW: {os.path.abspath(args.outdir)}/')
     return 0
@@ -441,23 +655,15 @@ def cmd_smiles_afm(args: argparse.Namespace) -> int:
 
 
 def cmd_afm_morse(args: argparse.Namespace) -> int:
-    """Morse + point-charge Coulomb AFM (no electron density).
+    """Morse + point-charge Coulomb AFM — thin alias for ``afm --model morse``.
 
-    Shared backend with GUI: ``AFM_utils.run_morse_coulomb_afm`` (no fork).
+    Routes through the unified ``cmd_afm`` with ``args.model='morse'`` so FDBM and
+    Morse share the same ScanSpec/ScanResult contract, scan geometry, and plotting.
+    Legacy morse-specific args (--nx/--ny/--nz/--scan-nx/--scan-ny/--nz-scan/--dtip)
+    are accepted for backward compat but ignored in favor of the common args.
     """
-    from spammm.SPM import AFM_utils as afm_utils
-
-    os.makedirs(args.outdir, exist_ok=True)
-    xyz = _abs_path(args.xyz)
-    params = _abs_path(args.params) or os.path.join(_ROOT, 'data', 'ElementTypes.dat')
-    afm_utils.run_morse_coulomb_afm(
-        xyz, args.outdir,
-        params_path=params, use_morse=not args.lj,
-        n=(args.nx, args.ny, args.nz), margin=args.margin, z_top=args.z_top,
-        nxy=(args.scan_nx, args.scan_ny), nz_scan=args.nz_scan, dtip=args.dtip,
-        slice_indices=list(args.slice_indices), save_png=True,
-    )
-    return 0
+    args.model = 'morse'
+    return cmd_afm(args)
 
 
 def cmd_afm_kriging(args: argparse.Namespace) -> int:
@@ -521,7 +727,11 @@ def cmd_replot_panel(args: argparse.Namespace) -> int:
 def cmd_es_diag(args: argparse.Namespace) -> int:
     """Cube ES chain diagnostics: ρ, Δρ, V_ES=Poisson(Δρ), E_ES, tip + mirror metrics."""
     from tests.SPM import testplot_fdbm_relax as diag
-    os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
+    # CPU FFT only when explicitly requested via --cpu-fft (no silent env mutation)
+    if getattr(args, 'cpu_fft', False):
+        os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
+    else:
+        os.environ.pop('SPAMMM_AFM_CPU_FFT', None)
     ns = argparse.Namespace(
         step=args.step, margin=args.margin, outdir=args.outdir, basis=args.basis,
         molecule=args.molecule, z_above=tuple(args.z_above),
@@ -627,7 +837,11 @@ def cmd_stm_br(args: argparse.Namespace) -> int:
         mo_rel = [0, 1]  # HOMO + LUMO
     stm_heights = tuple(float(x) for x in str(args.stm_heights).replace(',', ' ').split() if x.strip())
     amp_align = not bool(getattr(args, 'no_amp_align', False))
-    os.environ.setdefault('SPAMMM_AFM_CPU_FFT', '1')
+    # CPU FFT only when explicitly requested via --cpu-fft (no silent env mutation)
+    if getattr(args, 'cpu_fft', False):
+        os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
+    else:
+        os.environ.pop('SPAMMM_AFM_CPU_FFT', None)
 
     res = afm_utils.run_br_stm_afm_panel(
         atomPos, enames, outdir,
@@ -687,8 +901,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest='cmd', required=True)
 
-    p_afm = sub.add_parser('afm', help='FDBM AFM from .xyz and/or density .cube')
+    p_afm = sub.add_parser('afm', help='AFM imaging: FDBM (density) or Morse+Q (classical) via --model')
     _add_common_afm_args(p_afm)
+    p_afm.add_argument('--model', default='fdbm', choices=['fdbm', 'morse', 'contact'],
+                       help='Force-field backend: fdbm (density-based, default), morse (classical Morse+Coulomb), or contact (quasi-2D contact surface)')
+    p_afm.add_argument('--params', default=None, dest='params_path',
+                       help='ElementTypes.dat path (morse/contact models)')
+    cs = p_afm.add_argument_group('contact-surface (--model contact)')
+    cs.add_argument('--cs-margin', type=float, default=4.0, dest='cs_margin',
+                    help='Contact-surface fit margin [Å] (testplot default=4.0)')
+    cs.add_argument('--bspl-dx', type=float, default=1.0, dest='bspl_dx',
+                    help='B-spline grid spacing for contact fit [Å] (testplot default=1.0)')
+    cs.add_argument('--h0-r-scale', type=float, default=0.75, dest='h0_r_scale',
+                    help='Scale Morse R0 for sphere radii (must be <1)')
+    cs.add_argument('--fit-z-lo', type=float, default=0.05, dest='fit_z_lo',
+                    help='Fit z-range lower offset above contact [Å]')
+    cs.add_argument('--fit-z-hi', type=float, default=8.0, dest='fit_z_hi',
+                    help='Fit z-range upper offset above contact [Å]')
+    cs.add_argument('--poly-r', type=float, default=4.0, dest='poly_R',
+                    help='Polynomial z-basis range [Å]')
+    cs.add_argument('--n-iter-cs', type=int, default=120, dest='n_iter_cs',
+                    help='CG iterations for contact fit')
+    cs.add_argument('--nz-cs', type=int, default=6, dest='nz_cs',
+                    help='Number of z-basis modes in the separable fit')
     p_afm.set_defaults(func=cmd_afm)
 
     p_opt = sub.add_parser('opt', help='Vacuum geometry opt (UFF/SPFF/LFF/DFTB); keep planar')
@@ -715,22 +950,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_safm.set_defaults(func=cmd_smiles_afm, outdir='debug/spm_smiles_afm',
                         projection='prolonged', show_atoms=True, xyz=None)
 
-    p_morse = sub.add_parser('afm-morse', help='Classical Morse/LJ + Coulomb AFM (no density)')
-    p_morse.add_argument('--xyz', default='data/xyz/benzene.xyz')
-    p_morse.add_argument('--params', default=None, help='ElementTypes.dat path')
-    p_morse.add_argument('--lj', action='store_true', help='Use LJ instead of Morse')
-    p_morse.add_argument('--margin', type=float, default=4.0)
-    p_morse.add_argument('--z-top', type=float, default=14.0)
-    p_morse.add_argument('--nx', type=int, default=60, help='FF grid nx')
-    p_morse.add_argument('--ny', type=int, default=60, help='FF grid ny')
-    p_morse.add_argument('--nz', type=int, default=40, help='FF grid nz')
-    p_morse.add_argument('--scan-nx', type=int, default=40)
-    p_morse.add_argument('--scan-ny', type=int, default=40)
-    p_morse.add_argument('--nz-scan', type=int, default=25, dest='nz_scan', help='Approach steps')
-    p_morse.add_argument('--dtip', type=float, default=-0.15)
-    p_morse.add_argument('--slice-indices', nargs='+', type=int, default=[0, 5, 10, 15, 20])
-    p_morse.add_argument('--outdir', default='debug/spm_afm_morse')
-    p_morse.set_defaults(func=cmd_afm_morse)
+    p_morse = sub.add_parser('afm-morse', help='Classical Morse/LJ + Coulomb AFM — alias for: afm --model morse')
+    _add_common_afm_args(p_morse)
+    p_morse.add_argument('--params', default=None, dest='params_path',
+                         help='ElementTypes.dat path (default: data/ElementTypes.dat)')
+    p_morse.add_argument('--lj', action='store_true', help='Use LJ instead of Morse (legacy, ignored)')
+    # Legacy args accepted for backward compat but ignored in favor of common args
+    p_morse.add_argument('--z-top', type=float, default=14.0, help='(legacy, ignored)')
+    p_morse.add_argument('--nx', type=int, default=60, help='(legacy, ignored)')
+    p_morse.add_argument('--ny', type=int, default=60, help='(legacy, ignored)')
+    p_morse.add_argument('--nz', type=int, default=40, help='(legacy, ignored)')
+    p_morse.add_argument('--scan-nx', type=int, default=40, help='(legacy, ignored)')
+    p_morse.add_argument('--scan-ny', type=int, default=40, help='(legacy, ignored)')
+    p_morse.add_argument('--nz-scan', type=int, default=25, dest='nz_scan', help='(legacy, ignored)')
+    p_morse.add_argument('--dtip', type=float, default=-0.15, help='(legacy, ignored)')
+    p_morse.add_argument('--slice-indices', nargs='+', type=int, default=[0, 5, 10, 15, 20], help='(legacy, ignored)')
+    p_morse.set_defaults(func=cmd_afm_morse, model='morse')
 
     p_krig = sub.add_parser('afm-kriging', help='DFT Kriging GridFF → PP-AFM (Mithun data)')
     p_krig.add_argument('--endgroup', default='HHO-h-p_1')
@@ -766,6 +1001,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_es.add_argument('--basis', default='3ob-3-1', choices=['3ob-3-1', 'mio-1-1'])
     p_es.add_argument('--z-above', nargs=2, type=float, default=[1.0, 5.0],
                       help='Slice heights above molecule plane [Å]')
+    p_es.add_argument('--cpu-fft', action='store_true', dest='cpu_fft',
+                      help='Force NumPy FFT (explicit; default GPU).')
     p_es.set_defaults(func=cmd_es_diag)
 
     p_stm = sub.add_parser('stm', help='STM / orbital imaging (DFTB vs pySCF)')
@@ -856,6 +1093,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help='Every Nth pixel for PP xy red-dot overlay (ppafm plotDistortions)')
     p_br.add_argument('--no-orient', action='store_true', dest='no_orient')
     p_br.add_argument('--force', action='store_true')
+    p_br.add_argument('--cpu-fft', action='store_true', dest='cpu_fft',
+                      help='Force NumPy FFT (explicit; default GPU).')
     # FGR transfer STM mode (Stage 3): 'overlap' (legacy) or 'fgr' (H−E·S kernel)
     p_br.add_argument('--stm-mode', default='overlap', choices=['overlap', 'fgr'], dest='stm_mode',
                       help="Stage 3 STM kernel: 'overlap' (legacy exp) or 'fgr' (H−E·S transfer)")

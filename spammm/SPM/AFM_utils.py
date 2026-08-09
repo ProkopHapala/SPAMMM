@@ -42,6 +42,7 @@ Open issues / caveats:
 
 import numpy as np
 import os
+from dataclasses import dataclass, field
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -3299,6 +3300,120 @@ def plot_afm_fdbm_stages(fields, origin, step, atomPos, outdir, tag, z_above=2.5
     return path
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shared scan/result contract — Unify_Morse_FDBM_Pipeline (Agent_1 Wave 1)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ScanSpec:
+    """Frozen scan/grid contract shared by FDBM, Morse+Q, and contact 2.5D backends.
+
+    All backends receive the same ScanSpec and return a ScanResult via
+    ``shared_postprocess``. Fields are frozen once the Wave 1 handoff is accepted
+    (see doc/Tasks/Unify_Morse_FDBM_Pipeline.md § Orchestration Contract).
+    """
+    scan_xs: np.ndarray        # (nx,) x scan axis [Å, world coords]
+    scan_ys: np.ndarray        # (ny,) y scan axis [Å, world coords]
+    h_df: np.ndarray           # (nz_df,) df display heights [Å]
+    h_Fz: np.ndarray           # (nz_Fz,) Fz extraction heights [Å]
+    h_scan: np.ndarray         # (nz_scan,) dense z-approach stack [Å]
+    amplitude: float           # oscillation amplitude [Å, peak]
+    osc_dir: tuple             # (3,) oscillation direction (need not be unit)
+    K_LAT: float               # lateral stiffness [eV/Å²]
+    K_RAD: float               # radial bond stiffness [eV/Å²]
+    bond_length: float         # PP bond length [Å]
+    scan_margin: float = 2.0   # xy margin around molecule bbox [Å]
+
+
+@dataclass
+class ScanResult:
+    """Backend-independent scan result, produced by ``shared_postprocess``.
+
+    Mirrors the dict returned by ``run_fdbm_pp_from_density`` so existing
+    plotters (``plot_afm_variant_height_strip``) consume it with minimal glue.
+    """
+    df: np.ndarray             # (nx, ny, nz_df) frequency shift
+    Fz: np.ndarray             # (nx, ny, nz_Fz) vertical force
+    heights: np.ndarray        # (nz_df,) df heights
+    heights_Fz: np.ndarray     # (nz_Fz,) Fz heights
+    scan_xs: np.ndarray        # (nx,)
+    scan_ys: np.ndarray        # (ny,)
+    amp_align: bool            # whether h_Fz was amp-aligned
+    FEs: np.ndarray            # (nx, ny, nz_scan, 4) force volume
+    tip_disp: dict             # {'dx','dy','dz'} each (nx,ny,nz_scan)
+    E_diss: np.ndarray         # (nx, ny, nz_df) dissipation per cycle [eV]
+    backend_name: str = 'unknown'  # 'fdbm'|'morse'|'contact'
+    fft_path: str = 'none'     # 'GPU'|'CPU'|'none'
+
+    def __getitem__(self, key):
+        """Dict-style access for backward compat with plot_afm_variant_height_strip
+        and existing CLI code that does ``variant['df']`` / ``variant['Fz']``.
+        Falls back to dynamic attributes attached by backends (e.g. df_z_slice_rms)."""
+        return getattr(self, key)
+
+    def __contains__(self, key):
+        """Dict-style ``in`` for backward compat (``'df' in variant``)."""
+        return hasattr(self, key)
+
+    def get(self, key, default=None):
+        """Dict-style .get() for backward compat."""
+        return getattr(self, key, default)
+
+
+def shared_postprocess(FEs_full, scan_spec, *, FEs_bwd=None, tip_disp=None,
+                       backend_name='unknown', fft_path='none'):
+    """Backend-agnostic df / Fz / E_diss extraction from a relaxed force volume.
+
+    Replicates the postprocessing in ``run_fdbm_pp_from_density`` (AFM_utils.py
+    :3437-3478) so FDBM, Morse+Q, and contact 2.5D share one df/Fz/dissipation
+    path. The backend is responsible for any lateral amplitude padding/cropping
+    — ``FEs_full`` must already be the final ``(nx, ny, nz_scan, 4)`` volume over
+    ``scan_spec.scan_xs × scan_spec.scan_ys × scan_spec.h_scan``.
+
+    Args:
+        FEs_full: (nx, ny, nz_scan, 4) relaxed force volume (Fx, Fy, Fz, E)
+        scan_spec: ScanSpec (h_df, h_Fz, h_scan, amplitude, osc_dir)
+        FEs_bwd: optional (nx, ny, nz_scan, 4) backward stroke for E_diss;
+                 None → E_diss is zeros
+        tip_disp: optional {'dx','dy','dz'} dict; None → zeros
+        backend_name: 'fdbm' | 'morse' | 'contact'
+        fft_path: 'GPU' | 'CPU' | 'none'
+    Returns:
+        ScanResult
+    """
+    FEs_full = np.asarray(FEs_full, dtype=np.float32)
+    nx, ny, nz_scan = FEs_full.shape[:3]
+    sx = float(scan_spec.scan_xs[1] - scan_spec.scan_xs[0]) if len(scan_spec.scan_xs) > 1 else 0.0
+    sy = float(scan_spec.scan_ys[1] - scan_spec.scan_ys[0]) if len(scan_spec.scan_ys) > 1 else 0.0
+    sz = float(scan_spec.h_scan[1] - scan_spec.h_scan[0]) if len(scan_spec.h_scan) > 1 else 0.0
+    spacing = (sx, sy, sz)
+    osc_n = np.asarray(scan_spec.osc_dir, dtype=np.float64)
+    osc_n = osc_n / np.linalg.norm(osc_n)
+    df_full = afm.compute_df_amp_dir(FEs_full, spacing, osc_dir=osc_n, amp=float(scan_spec.amplitude))
+    idx_df = [int(np.argmin(np.abs(scan_spec.h_scan - h))) for h in scan_spec.h_df]
+    idx_Fz = [int(np.argmin(np.abs(scan_spec.h_scan - h))) for h in scan_spec.h_Fz]
+    Fz = FEs_full[..., 2][:, :, idx_Fz]
+    df = df_full[:, :, idx_df]
+    if FEs_bwd is not None:
+        E_diss = afm.compute_dissipation(FEs_full, FEs_bwd, scan_spec.h_scan, scan_spec.h_df,
+                                         float(scan_spec.amplitude), osc_dir=osc_n)
+    else:
+        E_diss = np.zeros((nx, ny, len(scan_spec.h_df)), dtype=np.float32)
+    if tip_disp is None:
+        tip_disp = {'dx': np.zeros((nx, ny, nz_scan), dtype=np.float32),
+                    'dy': np.zeros((nx, ny, nz_scan), dtype=np.float32),
+                    'dz': np.zeros((nx, ny, nz_scan), dtype=np.float32)}
+    amp_align = bool(abs(float(osc_n[2])) > 1e-12)
+    return ScanResult(
+        df=df, Fz=Fz, heights=np.asarray(scan_spec.h_df, dtype=np.float32),
+        heights_Fz=np.asarray(scan_spec.h_Fz, dtype=np.float32),
+        scan_xs=np.asarray(scan_spec.scan_xs, dtype=np.float32),
+        scan_ys=np.asarray(scan_spec.scan_ys, dtype=np.float32),
+        amp_align=amp_align, FEs=FEs_full, tip_disp=tip_disp, E_diss=E_diss,
+        backend_name=backend_name, fft_path=fft_path,
+    )
+
+
 def run_fdbm_pp_from_density(tag, rho_scf, atomPos, atomTypes, origin, step, ngrid,
                              A, beta, tip_mode, outdir, *,
                              rho_diff=None, V_ES=None,
@@ -3316,7 +3431,9 @@ def run_fdbm_pp_from_density(tag, rho_scf, atomPos, atomTypes, origin, step, ngr
     Dual-basis: pass prolonged ``rho_scf`` for Pauli and **stock** ``rho_diff`` for ES.
 
     ``plots``: set/list of {'tip','stage','df','fz'} — optional diagnostic PNGs (SSOT helpers).
-    Returns dict with df, Fz, heights, scan_xs/ys, tip_disp, … for ``plot_afm_variant_height_strip``.
+    Returns ``ScanResult`` (shared contract) with diagnostic extras attached as dynamic
+    attributes (``df_z_slice_rms``, ``stage_path``, ``tip``, ``A``, ``beta``, ``tag``,
+    ``path``, ``atomPos``, ``origin``, ``step``, ``h_scan``, ``osc_dir``) for CLI/GUI compat.
     """
     rho_scf = np.asarray(rho_scf, dtype=np.float32)
     atomPos = np.asarray(atomPos, dtype=np.float64)
@@ -3468,15 +3585,36 @@ def run_fdbm_pp_from_density(tag, rho_scf, atomPos, atomTypes, origin, step, ngr
     print(f"  df @h={heights[ih]:.2f} / Fz @h={float(h_Fz[ih]):.2f}: "
           f"df=[{df.min():.3e},{df.max():.3e}] Fz=[{Fz.min():.3e},{Fz.max():.3e}]")
     print(f"  df z-slice first→last: RMSΔ={df_slice_rms:.3e} relative={df_slice_rms/df_slice_scale:.3f} corr={df_slice_corr:.6f}")
-    return {
-        'tip': tip_info, 'stage_path': stage_path, 'df': df, 'Fz': Fz, 'heights': heights,
-        'heights_Fz': h_Fz, 'amp_align': bool(amp_align and abs(float(osc_n[2])) > 1e-12),
-        'scan_xs': scan_xs, 'scan_ys': scan_ys, 'atomPos': atomPos, 'origin': origin, 'step': step,
-        'A': A, 'beta': beta, 'tag': tag, 'h_scan': h_scan, 'tip_disp': tip_disp,
-        'FEs': FEs, 'osc_dir': osc_n.copy(), 'df_z_slice_rms': df_slice_rms,
-        'df_z_slice_relative': df_slice_rms/df_slice_scale, 'df_z_slice_corr': df_slice_corr,
-        'E_diss': E_diss, 'path': 'FAST_S3' if use_fast_s3 else 'LEGACY',
-    }
+    # Build shared ScanSpec/ScanResult contract (Unify_Morse_FDBM_Pipeline Wave 2)
+    scan_spec = ScanSpec(
+        scan_xs=scan_xs, scan_ys=scan_ys, h_df=h_df, h_Fz=h_Fz, h_scan=h_scan,
+        amplitude=float(amp), osc_dir=tuple(osc_dir),
+        K_LAT=K_LAT, K_RAD=float(K_RAD), bond_length=float(bond_length),
+        scan_margin=float(scan_margin),
+    )
+    result = ScanResult(
+        df=df, Fz=Fz, heights=heights, heights_Fz=h_Fz,
+        scan_xs=scan_xs, scan_ys=scan_ys,
+        amp_align=bool(amp_align and abs(float(osc_n[2])) > 1e-12),
+        FEs=FEs, tip_disp=tip_disp, E_diss=E_diss,
+        backend_name='fdbm', fft_path='GPU' if use_fast_s3 else 'CPU',
+    )
+    # Diagnostic extras (not part of frozen contract; attached for CLI/GUI backward compat)
+    result.tip = tip_info
+    result.stage_path = stage_path
+    result.atomPos = atomPos
+    result.origin = origin
+    result.step = step
+    result.A = A
+    result.beta = beta
+    result.tag = tag
+    result.h_scan = h_scan
+    result.osc_dir = osc_n.copy()
+    result.df_z_slice_rms = df_slice_rms
+    result.df_z_slice_relative = df_slice_rms / df_slice_scale
+    result.df_z_slice_corr = df_slice_corr
+    result.path = 'FAST_S3' if use_fast_s3 else 'LEGACY'
+    return result
 
 
 # ── Fukui panel: cube | prolonged | stock (product CLI + gallery) ─────────────
@@ -3850,6 +3988,474 @@ def run_morse_coulomb_afm(xyz_path, outdir, *,
         'pngs': pngs, 'npz': npz, 'summary': summary,
         'afmulator': afmulator,
     }
+
+
+def _morse_atoms_from_Z(atomPos, atomTypes, params_path=None,
+                        tip_R=1.452, tip_E=0.0006808, tip_alpha=-1.8):
+    """Build (atoms_arr, cLJs_arr) for Morse from atomPos/atomTypes (Z) + ElementTypes.dat.
+
+    Same combination rules as ``AFMulator.assign_params``: R0_ij = tip_R + R_sample,
+    E0_ij = sqrt(tip_E * E_sample). Returns (atoms_arr (na,4), cLJs_arr (na,4)).
+    """
+    from ..topology.FFparams import read_element_types
+    if params_path is None:
+        _ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+        params_path = os.path.join(_ROOT, 'data', 'ElementTypes.dat')
+    et = read_element_types(params_path)
+    z_map = {int(e.iZ): e for e in et.values() if hasattr(e, 'iZ')}
+    na = len(atomPos)
+    atoms = np.zeros((na, 4), dtype=np.float32)
+    atoms[:, :3] = np.asarray(atomPos, dtype=np.float32)
+    cMs = np.zeros((na, 4), dtype=np.float32)
+    for ia in range(na):
+        z = int(atomTypes[ia])
+        e = z_map.get(z)
+        assert e is not None, f"_morse_atoms_from_Z: no ElementTypes entry for Z={z}"
+        R0 = tip_R + e.RvdW
+        E0 = np.sqrt(abs(tip_E * e.EvdW))
+        cMs[ia] = [R0, E0, tip_alpha, 0.]
+    return atoms, cMs
+
+
+def run_morse_pp_afm(tag, atomPos, atomTypes, origin, step, ngrid, outdir, *,
+                     scan_spec, params_path=None,
+                     margin=4.0, plots=None, df_cmap='gray', cmap='seismic',
+                     stage_height=4.2):
+    """Morse+Q PP-AFM via the shared ScanSpec/ScanResult contract (Unify_Morse_FDBM_Pipeline).
+
+    Builds a Morse+point-charge force field on the same grid as FDBM, then routes
+    through ``scan_fdbm`` (PPM relaxStrokes + FIRE) and ``shared_postprocess`` —
+    the same scan/postprocessing path as ``run_fdbm_pp_from_density``. This gives
+    identical scan geometry, df amplitude convolution, and Fz extraction across
+    backends, differing only in the force-field preparation.
+
+    Args:
+        tag:         label for diagnostic prints/plots
+        atomPos:     (na, 3+) atom positions [Å, world coords]
+        atomTypes:   (na,) atomic numbers Z
+        origin:      (3,) grid origin [Å]
+        step:        grid spacing [Å]
+        ngrid:       (nx, ny, nz) grid dimensions
+        outdir:      output directory for diagnostic PNGs
+        scan_spec:   ScanSpec (scan_xs, scan_ys, h_df, h_Fz, h_scan, amplitude,
+                     osc_dir, K_LAT, K_RAD, bond_length, scan_margin)
+        params_path: ElementTypes.dat path (default: repo data/)
+        margin:      xy margin [Å] (for validation vs scan_spec)
+        plots:       set/list of {'stage','df','fz','ediss'} diagnostic PNGs
+    Returns:
+        ScanResult with backend_name='morse', fft_path='none'
+    """
+    atomPos = np.asarray(atomPos, dtype=np.float64)
+    atomTypes = np.asarray(atomTypes, dtype=np.int32)
+    origin = np.asarray(origin, dtype=np.float64).ravel()[:3]
+    step = float(step)
+    ngrid = tuple(int(x) for x in ngrid[:3])
+    plots = set(plots or ())
+    os.makedirs(outdir, exist_ok=True)
+
+    print(f"\n=== {tag}  Morse+Q  grid={ngrid}  step={step} ===")
+
+    afmulator = afm.AFMulator(use_morse=True, nloc=32, use_fire=True)
+    atoms_arr, cLJs_arr = _morse_atoms_from_Z(atomPos, atomTypes, params_path=params_path)
+    afmulator.atoms_arr = atoms_arr
+    afmulator.cLJs_arr = cLJs_arr
+    afmulator.use_morse = True
+
+    # Grid setup: world frame (no atom shift) so scan_fdbm world coords match
+    nx, ny, nz = ngrid
+    L = np.array([nx * step, ny * step, nz * step], dtype=np.float32)
+    afmulator.setup_grid_world(origin, L, ngrid)
+    afmulator.make_forcefield()
+    # Copy Morse img_FF → img_FF_fdbm so scan_fdbm (relaxStrokes) can use it
+    afmulator.setup_fdbm_grid_from_img(afmulator.img_FF, ngrid, origin, step)
+    afmulator.queue.finish()
+
+    # Lateral amplitude padding (same as run_fdbm_pp_from_density)
+    osc_n = np.asarray(scan_spec.osc_dir, dtype=np.float64)
+    osc_n = osc_n / np.linalg.norm(osc_n)
+    amp = float(scan_spec.amplitude)
+    pad_x = int(np.ceil(abs(amp * osc_n[0]) / step - 1e-12))
+    pad_y = int(np.ceil(abs(amp * osc_n[1]) / step - 1e-12))
+    scan_xs = np.asarray(scan_spec.scan_xs, dtype=np.float32)
+    scan_ys = np.asarray(scan_spec.scan_ys, dtype=np.float32)
+    scan_xs_full = (float(scan_xs[0]) + (np.arange(len(scan_xs) + 2 * pad_x, dtype=np.float64) - pad_x) * step).astype(np.float32)
+    scan_ys_full = (float(scan_ys[0]) + (np.arange(len(scan_ys) + 2 * pad_y, dtype=np.float64) - pad_y) * step).astype(np.float32)
+    required_margin_xy = np.array([scan_spec.scan_margin + pad_x * step, scan_spec.scan_margin + pad_y * step])
+    if np.any(required_margin_xy > float(margin) + 1e-9):
+        raise ValueError(f"lateral amplitude leaves the force-field grid: required xy margins={required_margin_xy} Å exceed margin={margin} Å")
+
+    mol_z = float(atomPos[:, 2].max())
+    h_scan = np.asarray(scan_spec.h_scan, dtype=np.float32)
+    print(f"  K_LAT={scan_spec.K_LAT:.4f} eV/Å²  K_RAD={scan_spec.K_RAD}  L={scan_spec.bond_length} Å")
+    print(f"  scan=({len(scan_xs)}×{len(scan_ys)})  pad=({pad_x},{pad_y})  z-scan=[{float(h_scan[0]):.2f},{float(h_scan[-1]):.2f}]")
+
+    FEs_full, tip_disp_full = afmulator.scan_fdbm(
+        scan_xs_full, scan_ys_full, h_scan, mol_z=mol_z,
+        K_LAT=float(scan_spec.K_LAT), K_RAD=float(scan_spec.K_RAD),
+        bond_length=float(scan_spec.bond_length),
+        ppm_mode=True, use_fire=True,
+        osc_dir=scan_spec.osc_dir, base_pos=(0., 0., 0.),
+    )
+    afmulator.queue.finish()
+    FEs_bwd_full, _ = afmulator.scan_fdbm(
+        scan_xs_full, scan_ys_full, h_scan, mol_z=mol_z,
+        K_LAT=float(scan_spec.K_LAT), K_RAD=float(scan_spec.K_RAD),
+        bond_length=float(scan_spec.bond_length),
+        ppm_mode=True, use_fire=True,
+        osc_dir=scan_spec.osc_dir, base_pos=(0., 0., 0.),
+        reverse=True,
+    )
+    afmulator.queue.finish()
+
+    # Crop to requested image
+    sx = slice(pad_x, pad_x + len(scan_xs))
+    sy = slice(pad_y, pad_y + len(scan_ys))
+    FEs = FEs_full[sx, sy]
+    FEs_bwd = FEs_bwd_full[sx, sy]
+    tip_disp = {key: val[sx, sy] for key, val in tip_disp_full.items()}
+
+    # Shared postprocessing → ScanResult
+    result = shared_postprocess(FEs, scan_spec, FEs_bwd=FEs_bwd, tip_disp=tip_disp,
+                                backend_name='morse', fft_path='none')
+
+    # Diagnostic extras (same as run_fdbm_pp_from_density for CLI compat)
+    result.tag = tag
+    result.atomPos = atomPos
+    result.origin = origin
+    result.step = step
+    result.h_scan = h_scan
+    result.osc_dir = osc_n.copy()
+    result.path = 'Morse'
+    result.stage_path = None
+    result.tip = {'peak': None, 'q': 0.0, 'dq': 0.0, 'mirrorX': None, 'mirrorY': None, 'path': None}
+    ih = len(result.heights) // 2
+    df_lo, df_hi = result.df[:, :, 0], result.df[:, :, -1]
+    result.df_z_slice_rms = float(np.sqrt(np.mean((df_hi - df_lo) ** 2)))
+    df_slice_scale = max(float(np.sqrt(np.mean(df_lo ** 2))), float(np.sqrt(np.mean(df_hi ** 2))), 1e-30)
+    result.df_z_slice_relative = result.df_z_slice_rms / df_slice_scale
+    result.df_z_slice_corr = float(np.corrcoef(df_lo.ravel(), df_hi.ravel())[0, 1]) if np.std(df_lo) > 0.0 and np.std(df_hi) > 0.0 else np.nan
+    print(f"  E_diss @h={result.heights[ih]:.2f}: [{result.E_diss.min():.3e},{result.E_diss.max():.3e}] eV/cycle")
+    print(f"  df @h={result.heights[ih]:.2f} / Fz @h={float(result.heights_Fz[ih]):.2f}: "
+          f"df=[{result.df.min():.3e},{result.df.max():.3e}] Fz=[{result.Fz.min():.3e},{result.Fz.max():.3e}]")
+
+    # Optional diagnostic PNGs
+    x_ext = [float(scan_xs[0]), float(scan_xs[-1])]
+    y_ext = [float(scan_ys[0]), float(scan_ys[-1])]
+    if 'df' in plots:
+        plot_grid_Fz(result.df, result.heights, f'df Morse {tag}', f'df_{tag}.png',
+                     x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap=df_cmap)
+    if 'fz' in plots:
+        plot_grid_Fz(result.Fz, result.heights_Fz, f'Fz Morse {tag}', f'Fz_{tag}.png',
+                     x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap=cmap)
+    if 'ediss' in plots:
+        plot_grid_Fz(result.E_diss, result.heights, f'E_diss Morse {tag}', f'Ediss_{tag}.png',
+                     x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap='hot', symmetric=False)
+    return result
+
+
+def run_contact_pp_afm(tag, atomPos, atomTypes, origin, step, ngrid, outdir, *,
+                       scan_spec, params_path=None,
+                       margin=2.0, plots=None, df_cmap='gray', cmap='seismic',
+                       cs_margin=4.0, bspl_dx=1.0, h0_R_scale=0.75,
+                       fit_z_lo=0.05, fit_z_hi=8.0, fit_dz_lo=0.1, fit_dz_hi=1.0,
+                       poly_R=4.0, poly_z0=0.0,
+                       n_iter=120, nz_cs=6, fit_force_weight=1.0,
+                       scan_margin_cs=4.0, dx_scan=0.1):
+    """Contact-surface 2.5D PP-AFM via the shared ScanSpec/ScanResult contract.
+
+    Fits a quasi-2D separable field to the Morse+Q potential (no 3D img_FF),
+    then scans with ``run_scan_contact`` (relaxStrokesTiltedContact kernel).
+    Routes through ``shared_postprocess`` for df/Fz/E_diss — same path as FDBM
+    and Morse. Memory-efficient: no 3D force-field image is allocated.
+
+    Uses the SAME fit parameters as ``tests/testplot_contact_surface.py`` which
+    produced good parity vs Morse+Q brute reference:
+      - bspl_dx=1.0, margin=4.0, fit_z_adaptive=[0.05,8.0] with dz 0.1→1.0
+      - poly_R=4.0, poly_z0=0.0, nz=6, n_iter=120, force_weight=1.0
+      - h0_mode='spheres', h0_R_scale=0.75
+
+    Args:
+        tag:         label for diagnostic prints/plots
+        atomPos:     (na, 3+) atom positions [Å, world coords]
+        atomTypes:   (na,) atomic numbers Z
+        origin:      (3,) grid origin [Å] (unused for contact — fit uses its own margin)
+        step:        grid spacing [Å] (unused for contact — fit uses bspl_dx)
+        ngrid:       (nx, ny, nz) grid dimensions (unused for contact)
+        outdir:      output directory for diagnostic PNGs
+        scan_spec:   ScanSpec (scan_xs, scan_ys, h_df, h_Fz, h_scan, amplitude,
+                     osc_dir, K_LAT, K_RAD, bond_length, scan_margin)
+        params_path: ElementTypes.dat path (default: repo data/)
+        margin:      xy margin for scan validation [Å]
+        cs_margin:   contact-surface fit margin [Å] (testplot default=4.0)
+        bspl_dx:     B-spline grid spacing for contact fit [Å] (testplot default=1.0)
+        h0_R_scale:  scale Morse R0 for sphere radii (must be <1)
+        fit_z_lo:    fit z-range lower offset above contact [Å]
+        fit_z_hi:    fit z-range upper offset above contact [Å]
+        fit_dz_lo:   adaptive dz at bottom of fit range [Å]
+        fit_dz_hi:   adaptive dz at top of fit range [Å]
+        poly_R:      polynomial z-basis range [Å]
+        poly_z0:     polynomial z-basis offset [Å]
+        n_iter:      CG iterations for contact fit
+        nz_cs:       number of z-basis modes in the separable fit
+        fit_force_weight: weight for Fx,Fy,Fz rows in fit loss
+        scan_margin_cs: scan margin for scan_bbox [Å]
+        dx_scan:     scan pixel size [Å]
+    Returns:
+        ScanResult with backend_name='contact', fft_path='none',
+        clamp_occupancy attached as dynamic attribute
+    """
+    from spammm.surfaces.ContactSurface import make_fit_z_planes_adaptive
+    atomPos = np.asarray(atomPos, dtype=np.float64)
+    atomTypes = np.asarray(atomTypes, dtype=np.int32)
+    plots = set(plots or ())
+    os.makedirs(outdir, exist_ok=True)
+
+    fit_z_planes = make_fit_z_planes_adaptive(fit_z_lo, fit_z_hi, fit_dz_lo, fit_dz_hi)
+    print(f"\n=== {tag}  Contact-2.5D  fit_z=[{fit_z_lo},{fit_z_hi}]  bspl_dx={bspl_dx}  margin={cs_margin} ===")
+
+    afmulator = afm.AFMulator(use_morse=True, nloc=32, use_fire=True)
+    atoms_arr, cLJs_arr = _morse_atoms_from_Z(atomPos, atomTypes, params_path=params_path)
+    afmulator.atoms_arr = atoms_arr
+    afmulator.cLJs_arr = cLJs_arr
+    afmulator.use_morse = True
+    afmulator.tipQs[:] = 0.0
+
+    # CRITICAL: Set dpos0/stiffness from scan_spec to match scan_fdbm convention.
+    # run_scan_contact uses self.dpos0/self.stiffness (not passed as args like scan_fdbm).
+    # Defaults are bond_length=4.0, K_RAD=1.0 — WRONG for our scan_spec.
+    bond_length = float(scan_spec.bond_length)
+    K_LAT = float(scan_spec.K_LAT)
+    K_RAD = float(scan_spec.K_RAD)
+    afmulator.dpos0 = np.array([0., 0., -bond_length, bond_length], dtype=np.float32)
+    afmulator.stiffness = np.array([-K_LAT, -K_LAT, -K_LAT, -K_RAD], dtype=np.float32)
+    print(f"  dpos0={afmulator.dpos0}  stiffness={afmulator.stiffness}")
+
+    # Fit contact surface using testplot-tested parameters (fit_z_adaptive mode, NOT s_min/s_max)
+    sep = afmulator.fit_contact_surface(
+        margin=cs_margin, bspl_dx=bspl_dx,
+        poly_R=poly_R, poly_z0=poly_z0,
+        m_start=4, nz=nz_cs,
+        fit_z_adaptive=(fit_z_lo, fit_z_hi, fit_dz_lo, fit_dz_hi),
+        fit_dx=bspl_dx, fit_dy=bspl_dx,
+        fit_boltzmann=True, fit_boltzmann_T=None,
+        fit_force_weight=fit_force_weight, n_iter=n_iter,
+        brute_ref='afm', bPrint=True,
+        h0_mode='spheres', h0_R_scale=float(h0_R_scale),
+    )
+    afmulator.queue.finish()
+
+    # Use scan_spec scan_xs/ys directly (same grid as FDBM/Morse) — NOT scan_bbox.
+    # This ensures identical lateral grid and correct ScanResult.scan_xs/ys.
+    scan_xs = np.asarray(scan_spec.scan_xs, dtype=np.float32)
+    scan_ys = np.asarray(scan_spec.scan_ys, dtype=np.float32)
+    h_scan = np.asarray(scan_spec.h_scan, dtype=np.float32)
+    nx_s, ny_s, nz_s = len(scan_xs), len(scan_ys), len(h_scan)
+    dx = float(scan_xs[1] - scan_xs[0]) if nx_s > 1 else float(step)
+    dy = float(scan_ys[1] - scan_ys[0]) if ny_s > 1 else float(step)
+    dz = float(h_scan[1] - h_scan[0]) if nz_s > 1 else 0.1
+    mol_z = float(atomPos[:, 2].max())
+    # Tip apex starts at highest probe height + mol_z + bond_length (same as scan_fdbm)
+    z_start = mol_z + float(np.max(h_scan)) + bond_length
+    scan_p0 = np.array([float(scan_xs[0]), float(scan_ys[0]), z_start], dtype=np.float32)
+    scan_da = np.array([dx, 0., 0.], dtype=np.float32)
+    scan_db = np.array([0., dy, 0.], dtype=np.float32)
+    dtip = -abs(dz)
+
+    print(f"  K_LAT={K_LAT:.4f} eV/Å²  K_RAD={K_RAD}  L={bond_length} Å")
+    print(f"  scan=({nx_s}×{ny_s})  nz={nz_s}  z_start={z_start:.2f}  dtip={dtip:.3f}")
+
+    FEs, pts = afmulator.run_scan_contact(
+        nxy=(nx_s, ny_s), nz=nz_s, dtip=dtip,
+        scan_p0=scan_p0, scan_da=scan_da, scan_db=scan_db,
+    )
+    afmulator.queue.finish()
+
+    # run_scan_contact: iz=0 = highest z (first step). Flip to iz=0 = lowest z
+    # (matching scan_fdbm convention used by shared_postprocess)
+    FEs = FEs[:, :, ::-1, :]
+
+    # Clamp occupancy: fraction of scan points where s = z_probe - h0 - poly_z0 < 0
+    clamp_occupancy = float('nan')
+    if sep.h0_samples is not None and sep.poly_z0 is not None:
+        h0_samples_2d = sep.h0_samples.reshape(sep.ncy, sep.ncx)
+        ix = np.clip(np.round((scan_xs - sep.x0) / sep.dx).astype(int), 0, sep.ncx - 1)
+        iy = np.clip(np.round((scan_ys - sep.y0) / sep.dx).astype(int), 0, sep.ncy - 1)
+        h0_at_scan = h0_samples_2d[np.ix_(iy, ix)].T  # (nx, ny)
+        z_probe = mol_z + h_scan[None, None, :]  # (1, 1, nz)
+        s = z_probe - h0_at_scan[:, :, None] - float(sep.poly_z0)
+        clamp_occupancy = float(np.mean(s < 0))
+        print(f"  clamp_occupancy={clamp_occupancy:.4f}  (s<0 fraction)")
+
+    # No backward stroke for contact → E_diss = zeros
+    result = shared_postprocess(FEs, scan_spec, FEs_bwd=None, tip_disp=None,
+                                backend_name='contact', fft_path='none')
+
+    # Diagnostic extras
+    result.tag = tag
+    result.atomPos = atomPos
+    result.origin = origin
+    result.step = step
+    result.h_scan = h_scan
+    osc_n = np.asarray(scan_spec.osc_dir, dtype=np.float64)
+    osc_n = osc_n / np.linalg.norm(osc_n)
+    result.osc_dir = osc_n.copy()
+    result.path = 'Contact2.5D'
+    result.stage_path = None
+    result.tip = {'peak': None, 'q': 0.0, 'dq': 0.0, 'mirrorX': None, 'mirrorY': None, 'path': None}
+    result.clamp_occupancy = clamp_occupancy
+    result.sep = sep
+    ih = len(result.heights) // 2
+    df_lo, df_hi = result.df[:, :, 0], result.df[:, :, -1]
+    result.df_z_slice_rms = float(np.sqrt(np.mean((df_hi - df_lo) ** 2)))
+    df_slice_scale = max(float(np.sqrt(np.mean(df_lo ** 2))), float(np.sqrt(np.mean(df_hi ** 2))), 1e-30)
+    result.df_z_slice_relative = result.df_z_slice_rms / df_slice_scale
+    result.df_z_slice_corr = float(np.corrcoef(df_lo.ravel(), df_hi.ravel())[0, 1]) if np.std(df_lo) > 0.0 and np.std(df_hi) > 0.0 else np.nan
+    print(f"  df @h={result.heights[ih]:.2f} / Fz @h={float(result.heights_Fz[ih]):.2f}: "
+          f"df=[{result.df.min():.3e},{result.df.max():.3e}] Fz=[{result.Fz.min():.3e},{result.Fz.max():.3e}]")
+
+    # Optional diagnostic PNGs
+    x_ext = [float(scan_xs[0]), float(scan_xs[-1])]
+    y_ext = [float(scan_ys[0]), float(scan_ys[-1])]
+    if 'df' in plots:
+        plot_grid_Fz(result.df, result.heights, f'df Contact {tag}', f'df_{tag}.png',
+                     x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap=df_cmap)
+    if 'fz' in plots:
+        plot_grid_Fz(result.Fz, result.heights_Fz, f'Fz Contact {tag}', f'Fz_{tag}.png',
+                     x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap=cmap)
+    return result
+
+
+def plot_zcurves(variants, sample_points, out_path, *, atomPos=None,
+                 title='', dpi=140, bond_length=3.0):
+    """Plot E(z) and Fz(z) curves at selected scan points for multiple backends.
+
+    Each variant is a ScanResult with .FEs (nx, ny, nz, 4), .scan_xs, .scan_ys,
+    .h_scan, and .heights. Curves are extracted at the nearest scan grid point
+    to each requested (x, y) position.
+
+    Args:
+        variants:     dict {backend_name: ScanResult}
+        sample_points: list of (ix, iy, label, color) tuples (pre-resolved indices)
+        out_path:     output PNG path
+        atomPos:      (na, 3) atom positions for annotation (optional)
+        title:        plot title
+        dpi:          output DPI
+        bond_length:  for converting probe height → tip height in labels
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    axE, axFz = axes
+
+    for bname, res in variants.items():
+        FEs = res.FEs
+        h_scan = np.asarray(res.h_scan, dtype=np.float64)
+        ls = '-' if bname == 'fdbm' else ('--' if bname == 'morse' else ':')
+        lw = 1.5 if bname == 'fdbm' else 1.0
+        for ix, iy, label, col in sample_points:
+            E = FEs[ix, iy, :, 3].astype(np.float64)
+            Fz = FEs[ix, iy, :, 2].astype(np.float64)
+            axE.plot(h_scan, E, ls=ls, lw=lw, color=col,
+                     label=f'{label} {bname}')
+            axFz.plot(h_scan, Fz, ls=ls, lw=lw, color=col,
+                      label=f'{label} {bname}')
+
+    axE.axhline(0.0, c='k', lw=0.5, alpha=0.4)
+    axFz.axhline(0.0, c='k', lw=0.5, alpha=0.4)
+    axE.set_xlabel('h_probe [Å above mol plane]')
+    axE.set_ylabel('E [eV]')
+    axFz.set_xlabel('h_probe [Å above mol plane]')
+    axFz.set_ylabel('Fz [eV/Å]')
+    axE.set_title('E(z) — per backend, per sample point')
+    axFz.set_title('Fz(z) — per backend, per sample point')
+    axE.legend(fontsize=7, loc='best', ncol=2)
+    axFz.legend(fontsize=7, loc='best', ncol=2)
+    axE.grid(alpha=0.25)
+    axFz.grid(alpha=0.25)
+    if title:
+        fig.suptitle(title, fontsize=11)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print(f'REVIEW: {out_path}')
+
+
+def _parse_zcurves_arg(zcurves_str, atomPos, scan_xs, scan_ys):
+    """Parse --zcurves CLI string into list of (ix, iy, label, color) tuples.
+
+    Format: "atoms:0,1,5" (atom indices) or "xy:3.5,2.0;1.0,1.0" (x,y pairs).
+    Returns list of (ix, iy, label, color) ready for plot_zcurves.
+    """
+    if zcurves_str is None:
+        return None
+    colors = ['C0', 'C1', 'C2', 'C3', 'C4', 'C5']
+    pts = []
+    if zcurves_str.startswith('atoms:'):
+        indices = [int(x) for x in zcurves_str[6:].split(',')]
+        for i, ia in enumerate(indices):
+            x, y = float(atomPos[ia, 0]), float(atomPos[ia, 1])
+            ix = int(np.argmin(np.abs(scan_xs - x)))
+            iy = int(np.argmin(np.abs(scan_ys - y)))
+            col = colors[i % len(colors)]
+            pts.append((ix, iy, f'atom {ia}', col))
+    elif zcurves_str.startswith('xy:'):
+        pairs = zcurves_str[3:].split(';')
+        for i, pair in enumerate(pairs):
+            x, y = [float(v) for v in pair.split(',')]
+            ix = int(np.argmin(np.abs(scan_xs - x)))
+            iy = int(np.argmin(np.abs(scan_ys - y)))
+            col = colors[i % len(colors)]
+            pts.append((ix, iy, f'({x:.1f},{y:.1f})', col))
+    else:
+        raise ValueError(f'--zcurves: expected "atoms:..." or "xy:...", got {zcurves_str!r}')
+    return pts
+
+
+def plot_backend_comparison(variants_dict, out_path, *, reference_key=None,
+                            qty='df', cmap='gray', diff_cmap='seismic',
+                            title='', dpi=140, extent=None, apos=None,
+                            show_atoms=False, long_axis_vertical=True, tight=True):
+    """Compare multiple backend ScanResults side-by-side with common colorscale + difference rows.
+
+    Args:
+        variants_dict: {name: ScanResult} — each must have the ``qty`` field (e.g. 'df')
+        out_path: output PNG path
+        reference_key: which backend is the reference for difference rows (default: first)
+        qty: quantity to compare ('df' or 'Fz')
+        cmap: colorscale for backend rows
+        diff_cmap: colorscale for difference rows (symmetric)
+    """
+    keys = list(variants_dict.keys())
+    if reference_key is None:
+        reference_key = keys[0]
+    ref = variants_dict[reference_key]
+    heights = ref.heights
+
+    plot_variants = {}
+    row_specs = []
+    for k in keys:
+        plot_variants[k] = variants_dict[k]
+        row_specs.append((qty, k, k, cmap))
+    for k in keys:
+        if k == reference_key:
+            continue
+        diff_key = f'{reference_key}−{k}'
+        plot_variants[diff_key] = type('Diff', (), {
+            '__getitem__': lambda self, key, _r=ref, _o=variants_dict[k]: getattr(_r, key) - getattr(_o, key),
+            '__contains__': lambda self, key: hasattr(ref, key),
+            'get': lambda self, key, default=None, _r=ref: getattr(_r, key, default),
+        })()
+        row_specs.append((qty, diff_key, f'Δ({reference_key}−{k})', diff_cmap))
+
+    plot_afm_variant_height_strip(
+        plot_variants, row_specs, heights, out_path,
+        scale='common', title=title, dpi=dpi,
+        extent=extent, apos=apos, show_atoms=show_atoms,
+        long_axis_vertical=long_axis_vertical, tight=tight,
+    )
+    print(f'REVIEW: {out_path}')
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
