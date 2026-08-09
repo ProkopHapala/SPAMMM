@@ -229,6 +229,28 @@ class AFMulator(OpenCLBase):
     Coordinate convention: molecule is shifted so grid occupies [0,L] in all dims,
     making dot(pos, dinv) in [0,1] for normalized image sampling.
     """
+
+    @staticmethod
+    def _make_dinv_axis_aligned(L, origin, n):
+        """Build (dinvA, dinvB, dinvC) for axis-aligned grid with half-texel correction.
+
+        OpenCL read_imagef with normalized coords maps u=(i+0.5)/n to texel center i.
+        Without the +0.5/n offset, u=i/n lands on texel edges → half-voxel shift.
+        """
+        nx, ny, nz = n
+        dinvA = np.array([1./L[0], 0., 0., -origin[0]/L[0] + 0.5/nx], dtype=np.float32)
+        dinvB = np.array([0., 1./L[1], 0., -origin[1]/L[1] + 0.5/ny], dtype=np.float32)
+        dinvC = np.array([0., 0., 1./L[2], -origin[2]/L[2] + 0.5/nz], dtype=np.float32)
+        return dinvA, dinvB, dinvC
+
+    @staticmethod
+    def _make_dinv_lvec(invMT, n):
+        """Add half-texel offset to .w component of lvec-based inverse transform."""
+        nx, ny, nz = n
+        dinvA = np.array([invMT[0,0], invMT[0,1], invMT[0,2], 0.5/nx], dtype=np.float32)
+        dinvB = np.array([invMT[1,0], invMT[1,1], invMT[1,2], 0.5/ny], dtype=np.float32)
+        dinvC = np.array([invMT[2,0], invMT[2,1], invMT[2,2], 0.5/nz], dtype=np.float32)
+        return dinvA, dinvB, dinvC
     # Default CO-tip parameters (from OCL_PP.h)
     DEFAULT_tipA       = np.array([ 1., 0., 0., 0.], dtype=np.float32)
     DEFAULT_tipB       = np.array([ 0., 1., 0., 0.], dtype=np.float32)
@@ -339,9 +361,8 @@ class AFMulator(OpenCLBase):
         self.img_FF_fdbm = cl.Image(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, fmt, shape=(nx, ny, nz), hostbuf=F_img)
         # Coordinate transform: coord = (pos - origin) / L = pos/L - origin/L
         # dinvA/B/C dot pos gives normalized coord 0..1 within grid
-        self.fdbm_dinvA  = np.array([1./Lx, 0.,    0.,    -origin[0]/Lx], dtype=np.float32)
-        self.fdbm_dinvB  = np.array([0.,    1./Ly, 0.,    -origin[1]/Ly], dtype=np.float32)
-        self.fdbm_dinvC  = np.array([0.,    0.,    1./Lz, -origin[2]/Lz], dtype=np.float32)
+        self.fdbm_dinvA, self.fdbm_dinvB, self.fdbm_dinvC = self._make_dinv_axis_aligned(
+            np.array([Lx, Ly, Lz]), np.asarray(origin, dtype=np.float32), (nx, ny, nz))
         self.fdbm_origin = np.asarray(origin, dtype=np.float32)
         self.fdbm_step = float(step)
         self.fdbm_shape = (nx, ny, nz)
@@ -359,9 +380,8 @@ class AFMulator(OpenCLBase):
         cl.enqueue_copy(self.queue, self.img_FF_fdbm, img_F,
                         src_origin=(0, 0, 0), dest_origin=(0, 0, 0), region=(nx, ny, nz))
         self.queue.finish()
-        self.fdbm_dinvA = np.array([1. / Lx, 0., 0., -origin[0] / Lx], dtype=np.float32)
-        self.fdbm_dinvB = np.array([0., 1. / Ly, 0., -origin[1] / Ly], dtype=np.float32)
-        self.fdbm_dinvC = np.array([0., 0., 1. / Lz, -origin[2] / Lz], dtype=np.float32)
+        self.fdbm_dinvA, self.fdbm_dinvB, self.fdbm_dinvC = self._make_dinv_axis_aligned(
+            np.array([Lx, Ly, Lz]), np.asarray(origin, dtype=np.float32), (nx, ny, nz))
         self.fdbm_origin = np.asarray(origin, dtype=np.float32)
         self.fdbm_step = float(step)
         self.fdbm_shape = (nx, ny, nz)
@@ -738,9 +758,8 @@ class AFMulator(OpenCLBase):
         self.dA    = np.array([L[0]/nx, 0., 0., 0.], dtype=np.float32)
         self.dB    = np.array([0., L[1]/ny, 0., 0.], dtype=np.float32)
         self.dC    = np.array([0., 0., L[2]/nz, 0.], dtype=np.float32)
-        self.dinvA = np.array([1./L[0], 0., 0., -ox/L[0]], dtype=np.float32)
-        self.dinvB = np.array([0., 1./L[1], 0., -oy/L[1]], dtype=np.float32)
-        self.dinvC = np.array([0., 0., 1./L[2], -oz/L[2]], dtype=np.float32)
+        self.dinvA, self.dinvB, self.dinvC = self._make_dinv_axis_aligned(
+            L, np.array([ox, oy, oz], dtype=np.float32), (nx, ny, nz))
         self.L = L
         grid_bytes = int(nx*ny*nz*4*4)  # float4 image
         if not hasattr(self, '_vram_bytes'): self._vram_bytes = 0
@@ -766,9 +785,8 @@ class AFMulator(OpenCLBase):
         self.dA = np.array([L[0] / nx, 0., 0., 0.], dtype=np.float32)
         self.dB = np.array([0., L[1] / ny, 0., 0.], dtype=np.float32)
         self.dC = np.array([0., 0., L[2] / nz, 0.], dtype=np.float32)
-        self.dinvA = np.array([1. / L[0], 0., 0., -p0[0] / L[0]], dtype=np.float32)
-        self.dinvB = np.array([0., 1. / L[1], 0., -p0[1] / L[1]], dtype=np.float32)
-        self.dinvC = np.array([0., 0., 1. / L[2], -p0[2] / L[2]], dtype=np.float32)
+        self.dinvA, self.dinvB, self.dinvC = self._make_dinv_axis_aligned(
+            L, p0, (nx, ny, nz))
         self.L = L
         grid_bytes = int(nx * ny * nz * 4 * 4)
         warn = "" if grid_bytes <= getattr(self, '_max_alloc', grid_bytes + 1) else " [exceeds device max_alloc!]"
@@ -823,9 +841,7 @@ class AFMulator(OpenCLBase):
         if abs(det) < 1e-12:
             raise ValueError(f"setup_grid_lvec: singular cell matrix det={det} for a={a} b={b} Lz={Lz}")
         invMT = np.linalg.inv(M).T.astype(np.float32)
-        self.dinvA = np.array([invMT[0, 0], invMT[0, 1], invMT[0, 2], 0.], dtype=np.float32)
-        self.dinvB = np.array([invMT[1, 0], invMT[1, 1], invMT[1, 2], 0.], dtype=np.float32)
-        self.dinvC = np.array([invMT[2, 0], invMT[2, 1], invMT[2, 2], 0.], dtype=np.float32)
+        self.dinvA, self.dinvB, self.dinvC = self._make_dinv_lvec(invMT, (nx, ny, nz))
 
         self.L = np.array([np.linalg.norm(a), np.linalg.norm(b), Lz], dtype=np.float32)
         grid_bytes = int(nx * ny * nz * 4 * 4)
@@ -1008,12 +1024,17 @@ class AFMulator(OpenCLBase):
         cl.enqueue_copy(self.queue, out, self.cs_out_fe_cl)
         return out[:, 3], out[:, :3]
 
-    def fit_contact_surface(self, margin=2.0, bspl_dx=0.4, poly_R=10.0, poly_z0=0.0, m_start=4, nz=5, z_offset=1.2, fit_z_half=0.4, fit_z_stack=None, fit_z_adaptive=None, fit_dx=None, fit_dy=None, fit_dz=0.15, fit_boltzmann=True, fit_boltzmann_T=None, fit_force_weight=0.0, n_iter=80, plqh=(1.0, 1.0, 0.0, 0.0), brute_ref='afm', sep=None, bPrint=True, h0_mode='spheres', h0_R_scale=0.75, h0_r_xy=8.0):
+    def fit_contact_surface(self, margin=2.0, bspl_dx=0.4, poly_R=10.0, poly_z0=0.0, m_start=4, nz=5, z_offset=1.2, fit_z_half=0.4, fit_z_stack=None, fit_z_adaptive=None, fit_dx=None, fit_dy=None, fit_dz=0.15, fit_boltzmann=True, fit_boltzmann_T=None, fit_force_weight=0.0, n_iter=80, plqh=(1.0, 1.0, 0.0, 0.0), brute_ref='afm', sep=None, bPrint=True, h0_mode='spheres', h0_R_scale=0.75, h0_r_xy=8.0, s_min=None, s_max=None):
         """
         Fit quasi-2D separable field to replace img_FF for PP relaxation.
         Default reference matches evalMorseC_QZs_toImg (same cMs, tip charges, and force convention).
         fit_z_adaptive=(z_lo,z_hi,dz_lo,dz_hi): offsets above contact reference z_ref
           (h0_max for spheres, atom zmax for atom_z), dz ramps linearly dz_lo→dz_hi.
+        s_min/s_max: surface-following fit domain in local-s coordinates.
+          When both are given, fit samples are placed at z=h0(x,y)+s_k for each (x,y),
+          ensuring every lateral site gets samples at the same local-s values.
+          Internally sets poly_z0=s_min, poly_R=s_max-s_min.
+          Overrides fit_z_adaptive/fit_z_stack/z_offset when used.
         poly_z0/poly_R: basis coordinate is (z - h0 - poly_z0) / poly_R.
         h0_mode: 'spheres' = ray vs Morse-R0 spheres (true contact surface); 'atom_z' = legacy max atom z.
         h0_R_scale: multiply Morse R0 for sphere radii. MUST be <1 so clamp sits in hard repulsion
@@ -1024,7 +1045,7 @@ class AFMulator(OpenCLBase):
         """
         assert self.use_morse, "fit_contact_surface requires use_morse=True"
         assert self.atoms_arr is not None, "call assign_params() first"
-        from spammm.surfaces.ContactSurface import SeparableParams, make_fit_grid, make_fit_grid_zstack, make_fit_z_planes_adaptive, boltzmann_fit_weights, bspline_n_intervals, build_contact_height_map
+        from spammm.surfaces.ContactSurface import SeparableParams, make_fit_grid, make_fit_grid_zstack, make_fit_z_planes_adaptive, make_fit_grid_surface_following, boltzmann_fit_weights, bspline_n_intervals, build_contact_height_map
         apos = self.atoms_arr[:, :3]
         if sep is not None and sep.coeffs is not None:
             self.sep = sep
@@ -1051,7 +1072,18 @@ class AFMulator(OpenCLBase):
         h0_min = float(np.min(h0_map))
         # Fit offsets are above CONTACT (h0_max), not bare atom zmax — otherwise samples sit inside the spheres
         z_ref = h0_max if h0_mode == 'spheres' else zmax
-        if fit_z_adaptive is not None:
+        if s_min is not None and s_max is not None:
+            # Surface-following: z = h0(x,y) + s_k; poly_z0/poly_R from s-domain
+            poly_z0 = float(s_min)
+            poly_R = float(s_max) - float(s_min)
+            s_offsets = make_fit_z_planes_adaptive(float(s_min), float(s_max), dz_lo=fit_dz, dz_hi=max(fit_dz, 0.5))
+            fit_pts = make_fit_grid_surface_following(x0f, x1f, y0f, y1f, s_offsets, fit_dx, fit_dy, h0_map, bspl_dx, x0f, y0f, bspl_nx, bspl_ny)
+            z_fit_lo = float(np.min(fit_pts[:, 2]))
+            z_fit_hi = float(np.max(fit_pts[:, 2]))
+            z_planes = z_ref + s_offsets  # for metadata
+            if bPrint:
+                print(f"AFMulator.fit_contact_surface: surface-following s=[{s_min:.2f},{s_max:.2f}] ns={len(s_offsets)} poly_z0={poly_z0:.3f} poly_R={poly_R:.3f}")
+        elif fit_z_adaptive is not None:
             z_lo, z_hi, dz_lo, dz_hi = fit_z_adaptive
             z_planes = z_ref + make_fit_z_planes_adaptive(z_lo, z_hi, dz_lo, dz_hi)
             fit_pts = make_fit_grid_zstack(x0f, x1f, y0f, y1f, z_planes, fit_dx, fit_dy)

@@ -40,6 +40,86 @@ from spammm.topology.FFparams import load_xyz_with_REQs
 COULOMB_CONST = 14.3996448915
 _KERNEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'kernels')
 
+# Cubic B-spline prefilter: solves for control points that exactly reproduce nodal values.
+# z1 = -2 + sqrt(3) ≈ -0.26794919
+# Scale = -6*z1 = 6*(2-sqrt(3)) ≈ 1.60769515
+# Ref: Unser et al., "B-Spline Signal Processing" — causal/anti-causal recursive filter.
+_BSPLINE_Z1 = -2.0 + np.sqrt(3.0)
+_BSPLINE_SCALE = -6.0 * _BSPLINE_Z1
+
+def _bspline_prefilter_1d(data):
+    """Apply cubic B-spline prefilter to a 1D array.
+
+    Converts sampled values → B-spline control coefficients so that
+    the cubic B-spline interpolates the original data at node positions.
+    """
+    n = len(data)
+    if n < 3:
+        return data.copy()
+    d = np.asarray(data, dtype=np.float64)
+    # Causal pass: c+[i] = d[i] + z1 * c+[i-1]
+    c_plus = np.zeros(n, dtype=np.float64)
+    c_plus[0] = d[0]
+    for i in range(1, n):
+        c_plus[i] = d[i] + _BSPLINE_Z1 * c_plus[i-1]
+    # Anti-causal pass: c-[i] = c+[i] + z1 * c-[i+1]
+    c_minus = np.zeros(n, dtype=np.float64)
+    c_minus[-1] = c_plus[-1]
+    for i in range(n-2, -1, -1):
+        c_minus[i] = c_plus[i] + _BSPLINE_Z1 * c_minus[i+1]
+    # Scale by -6*z1
+    return c_minus * _BSPLINE_SCALE
+
+def _bspline_prefilter_2d(h0_2d):
+    """Apply separable cubic B-spline prefilter to a 2D array (rows=ncx, cols=ncy or vice versa).
+
+    h0_2d: (ncx, ncy) array of nodal values → control coefficients.
+    """
+    out = np.array(h0_2d, dtype=np.float64)
+    # Prefilter along axis 0
+    for j in range(out.shape[1]):
+        out[:, j] = _bspline_prefilter_1d(out[:, j])
+    # Prefilter along axis 1
+    for i in range(out.shape[0]):
+        out[i, :] = _bspline_prefilter_1d(out[i, :])
+    return out
+
+
+def _bspline4(t):
+    """Cubic B-spline basis and derivative at parameter t in [0,1)."""
+    t2 = t*t; t3 = t2*t; om = 1-t; om2 = om*om; om3 = om2*om
+    B = np.array([om3/6, (3*t3-6*t2+4)/6, (-3*t3+3*t2+3*t+1)/6, t3/6])
+    dB = np.array([-0.5*om2, 1.5*t2-2*t, -1.5*t2+t+0.5, 0.5*t2])
+    return B, dB
+
+
+def interp_h0(x, y, h0_flat, dx, x0, y0, ncx, ncy):
+    """Python B-spline interpolation of h0(x,y) — matches kernel cs_interp_h0.
+
+    Args:
+        x, y: query position [Ang]
+        h0_flat: (ncx*ncy,) B-spline control coefficients (prefiltered)
+        dx: B-spline grid spacing [Ang]
+        x0, y0: grid origin [Ang]
+        ncx, ncy: grid dimensions
+
+    Returns:
+        h0(x,y) interpolated value
+    """
+    ux = (x - x0) / dx; uy = (y - y0) / dx  # dx=dy for contact surface
+    ix = int(np.floor(ux)); tx = ux - ix
+    iy = int(np.floor(uy)); ty = uy - iy
+    Bx, _ = _bspline4(tx); By, _ = _bspline4(ty)
+    z0 = 0.0
+    for j in range(4):
+        jy = iy - 1 + j
+        if jy < 0 or jy >= ncy: continue
+        for ii in range(4):
+            ixk = ix - 1 + ii
+            if ixk < 0 or ixk >= ncx: continue
+            z0 += Bx[ii] * By[j] * h0_flat[jy * ncx + ixk]
+    return z0
+
 
 def select_contact_atoms(atom_pos, z_slab=5.0, z_quantile=None, xy_radius=12.0, z_local=1.0):
     """Keep atoms near local contact height (top of each molecular patch)."""
@@ -155,7 +235,11 @@ def build_contact_height_map(apos, x0, y0, dx, dy, ncx, ncy, r_xy=8.0, Rs=None):
                 h0[iy * ncx + ix] = best
             else:
                 h0[iy * ncx + ix] = float(np.max(apos[near, 2]))
-    return h0
+    # Apply cubic B-spline prefilter: convert nodal values → control coefficients
+    # so that B-spline interpolation exactly reproduces the sampled heights at nodes.
+    h0_2d = h0.reshape(ncy, ncx)
+    h0_2d = _bspline_prefilter_2d(h0_2d).astype(np.float32)
+    return h0_2d.reshape(-1)
 
 
 def bspline_n_intervals(length_ang, dx):
@@ -757,6 +841,40 @@ def make_fit_z_planes_adaptive(z_lo, z_hi, dz_lo=0.1, dz_hi=1.0):
     if planes[-1] < z_hi - 1e-9:
         planes.append(z_hi)
     return np.asarray(planes, dtype=np.float64)
+
+
+def make_fit_grid_surface_following(x0, x1, y0, y1, s_offsets, dx, dy, h0_map, bspl_dx, x0_h0, y0_h0, ncx, ncy):
+    """Surface-following fit grid: z = h0(x,y) + s_k for each (x,y) and each s offset.
+
+    This ensures every lateral site gets fit samples at the same local-s values,
+    unlike global z-planes which only sample near-contact at the highest h0 sites.
+
+    Args:
+        x0, x1, y0, y1: fit grid bounds [Ang]
+        s_offsets: (ns,) array of local-s values to sample at
+        dx, dy: fit grid spacing [Ang]
+        h0_map: (ncx*ncy,) B-spline control coefficients for h0 interpolation
+        bspl_dx: B-spline grid spacing [Ang]
+        x0_h0, y0_h0: h0 grid origin [Ang]
+        ncx, ncy: h0 grid dimensions
+
+    Returns:
+        fit_pts: (nxy * ns, 3) array of (x, y, z) fit points
+    """
+    xs = np.arange(x0, x1 + 1e-9, dx)
+    ys = np.arange(y0, y1 + 1e-9, dy)
+    gx, gy = np.meshgrid(xs, ys, indexing='ij')
+    nxy = gx.size
+    ns = len(s_offsets)
+    pts = np.zeros((nxy * ns, 3), dtype=np.float32)
+    # Interpolate h0 at each (x,y) fit point using the same B-spline as the kernel
+    h0_xy = np.array([interp_h0(float(gx.flat[i]), float(gy.flat[i]), h0_map, bspl_dx, x0_h0, y0_h0, ncx, ncy) for i in range(nxy)])
+    for k, s in enumerate(s_offsets):
+        sl = slice(k * nxy, (k + 1) * nxy)
+        pts[sl, 0] = gx.ravel()
+        pts[sl, 1] = gy.ravel()
+        pts[sl, 2] = h0_xy + float(s)
+    return pts
 
 
 def poly_z_doubling_modes(dz, poly_R=10.0, m_start=4, nz=6, poly_z0=0.0):

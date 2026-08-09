@@ -44,6 +44,9 @@ Finish and document the **memory-efficient 2.5D AFM** approach that avoids a ful
    - [x] Sphere `h₀` + `h0_R_scale=0.75`  
    - [x] Atom-scale `bspl_dx` / `scan_dx` defaults  
    - [x] Toys + PTCDA + helicene regenerate  
+   - [x] Fix `tip_R=0` → real CO tip (`tip_R=1.452`) — was root cause of bad parity (2026-08-08)
+   - [x] Fix fit z-range `[0.05, 8.0]` for real tip R0≈3.3
+   - [ ] **Fz z-stack asymmetry** — 2.5D Fz maps shifted in x vs 3D GridFF → see subtask `ContactSurface_Parity_InvPPAFM_Benzene.md`
    - [ ] USER visual confirmation  
    - [ ] Re-check PP-relaxed PTCDA with new knobs  
 3. Pipeline flag `{separable, pic, grid3d}`.  

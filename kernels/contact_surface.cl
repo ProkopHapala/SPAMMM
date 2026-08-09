@@ -198,7 +198,7 @@ inline void cs_sep_stencil(float x, float y, float z,
     bspline4(tx, &Bx, &dBx);
     bspline4(ty, &By, &dBy);
     float z0b = cs_interp_h0(Bx, By, ix, iy, ncx, ncy, h0);
-    float dz = fmax(z - z0b - z_start, 0.0f);
+    float dz = z - z0b - z_start;  // raw s; poly_z_doubling_modes handles s<0 (active=false → dphi=0)
     float bx[4] = {Bx.x, Bx.y, Bx.z, Bx.w};
     float by[4] = {By.x, By.y, By.z, By.w};
     float phi[8];
@@ -240,7 +240,7 @@ inline void cs_sep_stencil_f(float x, float y, float z,
     float dz0_dx = 0.0f;
     float dz0_dy = 0.0f;
     cs_interp_h0_grad(Bx, dBx, By, dBy, ix, iy, ncx, ncy, dx, dy, h0, &dz0_dx, &dz0_dy);
-    float dz = fmax(z - z0b - z_start, 0.0f);
+    float dz = z - z0b - z_start;  // raw s; poly_z_doubling_modes handles s<0 (active=false → dphi=0)
     float bx[4] = {Bx.x, Bx.y, Bx.z, Bx.w};
     float by[4] = {By.x, By.y, By.z, By.w};
     float dbx[4] = {dBx.x, dBx.y, dBx.z, dBx.w};
@@ -362,7 +362,7 @@ inline float4 cs_eval_separable_fe_at(
     float dz0_dx = 0.0f;
     float dz0_dy = 0.0f;
     cs_interp_h0_grad(Bx, dBx, By, dBy, ix, iy, ncx, ncy, dx, dy, h0, &dz0_dx, &dz0_dy);
-    float dz = fmax(z - z0b - z_start, 0.0f);
+    float dz = z - z0b - z_start;  // raw s; poly_z_doubling_modes handles s<0 (active=false → dphi=0)
     float phi[8];
     float dphi[8];
     poly_z_doubling_modes(dz, invRc, m_start, nz, phi, dphi);

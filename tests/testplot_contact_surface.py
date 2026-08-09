@@ -36,8 +36,8 @@ SCAN_MARGIN = 4.0
 # Spherical Morse-R0 contact h₀; fit offsets are above h0_max (not bare atom zmax)
 H0_MODE = 'spheres'
 H0_R_SCALE = 0.75  # <1 so z0 clamp sits in hard repulsion (1.0 = Morse well → no wall)
-FIT_Z_LO, FIT_Z_HI = 0.05, 4.0
-FIT_DZ_LO, FIT_DZ_HI = 0.1, 0.8
+FIT_Z_LO, FIT_Z_HI = 0.05, 8.0   # above contact h0; real tip R0≈3.3 → need wider range
+FIT_DZ_LO, FIT_DZ_HI = 0.1, 1.0
 FIT_BOLTZMANN_T = None
 FIT_FORCE_WEIGHT = 1.0
 FIT_Z_PLANES = make_fit_z_planes_adaptive(FIT_Z_LO, FIT_Z_HI, FIT_DZ_LO, FIT_DZ_HI)
@@ -53,20 +53,20 @@ PIC_NZ = 5
 PIC_Z_LOCAL = 1.2
 PIC_XY_RADIUS = 14.0
 PIC_REG = 1e-2
-BSPL_DX = 0.2
+BSPL_DX = 1.0   # atom-scale nodes (corrected default per Report 2026-07-24)
 FIT_DX, FIT_DY = BSPL_DX, BSPL_DX
-# Absolute h = z−zmax; tip_R=0 → R0≈1.7–2.0 Å, so these sit at/above contact
-CLOSE_Z_OFFS = (2.0, 2.5, 3.0)
-PROFILE_Z_OFFS = np.arange(1.5, 7.01, 0.05)
-ZSTACK_Z_OFFS = tuple(np.arange(2.0, 6.01, 0.5))
-FAR_Z_OFF = 3.5
+# Absolute h = z−zmax; real tip (tip_R=1.452) → R0≈3.2–3.4 Å, scan above contact
+CLOSE_Z_OFFS = (3.0, 4.0, 5.0)
+PROFILE_Z_OFFS = np.arange(2.0, 9.01, 0.05)
+ZSTACK_Z_OFFS = tuple(np.arange(3.0, 8.01, 0.5))
+FAR_Z_OFF = 5.0
 PLOT_DX = 0.05
 ZSTACK_PLOT_DX = 0.15
 FZ_ACTIVE_THRESH = 0.01
-DX_SCAN = 0.2
+DX_SCAN = 0.1   # high-res scan pixels for parity plots
 DX_GRID = 0.2
-Z_TOP = 12.0
-NZ_SCAN = 25
+Z_TOP = 16.0   # cover real tip R0≈3.3 + scan range + relaxation
+NZ_SCAN = 30
 DTIP = -0.15
 
 
@@ -514,7 +514,7 @@ def phase2_pp_afm_parity(sep, apos):
     print('  Phase2: PP-AFM relaxed scan parity (reuse Phase1 sep, no refit)')
     afm = AFMulator(use_morse=True, use_fire=False)
     afm.load_molecule(PTCDA)
-    afm.assign_params(params_path=PARAMS, tip_R=0.0, tip_E=1.0)
+    afm.assign_params(params_path=PARAMS)  # real CO tip: tip_R=1.452, tip_E=6.8e-4
     afm.tipQs[:] = 0.0
     n_grid = _grid_n(apos, MARGIN, Z_TOP, DX_GRID)
     afm.setup_grid(n=n_grid, margin=MARGIN, z_top=Z_TOP, shift_atoms=False)
@@ -535,28 +535,198 @@ def phase2_pp_afm_parity(sep, apos):
     FEs_rawcs, _ = afm.get_raw_FE_contact(**scan_kw)
     Fz_3d, Fz_cs = FEs_3d[:, :, :, 2], FEs_cs[:, :, :, 2]
     Fz_raw3d, Fz_rawcs = FEs_raw3d[:, :, :, 2], FEs_rawcs[:, :, :, 2]
+    E_raw3d, E_rawcs = FEs_raw3d[:, :, :, 3], FEs_rawcs[:, :, :, 3]  # energy channel
+    E_3d, E_cs = FEs_3d[:, :, :, 3], FEs_cs[:, :, :, 3]
     df_3d, df_cs = compute_df(Fz_3d, abs(DTIP)), compute_df(Fz_cs, abs(DTIP))
 
-    # centre pixel z-alignment: Fz vs probe height (not tip height)
-    i0 = int(np.argmin(np.abs(np.arange(nxy[0]) * scan_da[0] + scan_p0[0] - apos[:, 0].mean())))
-    j0 = int(np.argmin(np.abs(np.arange(nxy[1]) * scan_db[1] + scan_p0[1] - apos[:, 1].mean())))
-    figz, axz = plt.subplots(1, 1, figsize=(8, 5))
-    axz.plot(h_probe, Fz_raw3d[i0, j0, :], 'o-', ms=3, label='3D raw')
-    axz.plot(h_probe, Fz_rawcs[i0, j0, :], 's-', ms=3, label='quasi-2D raw')
-    axz.plot(h_probe, Fz_3d[i0, j0, :], 'o--', ms=3, label='3D PP')
-    axz.plot(h_probe, Fz_cs[i0, j0, :], 's--', ms=3, label='quasi-2D PP')
-    axz.axhline(0.0, c='k', lw=0.7, alpha=0.4)
-    axz.axvspan(FIT_Z_LO, FIT_Z_HI, color='0.9', alpha=0.4, label='fit z interval')
-    axz.set_xlabel('probe height h_probe = h_tip + dpos0_z  [Å above zmax]')
-    axz.set_ylabel('Fz [eV/Å]')
-    axz.legend(loc='best', fontsize=8)
-    axz.grid(alpha=0.25)
-    figz.suptitle(f'Scan z-alignment at molecule centre — dpos0_z={afm.dpos0[2]:.1f}Å', fontsize=11)
+    # ── Combined 2D map + 1D E(z)/Fz(z) curves with bijection ──
+    # Pick 3 sample points: 2 atom tops + 1 gap (centroid)
+    scan_xs = scan_p0[0] + np.arange(nxy[0]) * scan_da[0]
+    scan_ys = scan_p0[1] + np.arange(nxy[1]) * scan_db[1]
+    z_order = np.argsort(-apos[:, 2])  # highest z first
+    sample_pts = []
+    colors_pts = ['C0', 'C1', 'C2']
+    for idx, ia in enumerate(z_order[:2]):
+        ix = int(np.argmin(np.abs(scan_xs - apos[ia, 0])))
+        iy = int(np.argmin(np.abs(scan_ys - apos[ia, 1])))
+        sample_pts.append((ix, iy, f'atom {ia}', colors_pts[idx]))
+    cx, cy = float(apos[:, 0].mean()), float(apos[:, 1].mean())
+    ix_c = int(np.argmin(np.abs(scan_xs - cx)))
+    iy_c = int(np.argmin(np.abs(scan_ys - cy)))
+    sample_pts.append((ix_c, iy_c, 'gap', colors_pts[2]))
+
+    # Reference z-slice for the 2D map: pick mid-scan where contrast is strong
+    iz_map = NZ_SCAN // 2
+    # Layout: left column = 2D Fz map with marked points; right = E(z) and Fz(z) curves
+    fig_bij, axes_bij = plt.subplots(1, 3, figsize=(18, 6),
+                                      gridspec_kw={'width_ratios': [1, 1.2, 1.2]})
+    ax_map, axE, axFz = axes_bij
+
+    # 2D Fz map (3D GridFF reference) with sample points marked
+    Fz_map = Fz_3d[:, :, iz_map].T  # [ny, nx]
+    vabs = float(np.percentile(np.abs(Fz_map), 99)) or 1e-6
+    im_map = ax_map.imshow(Fz_map, origin='lower', extent=extent, cmap='RdBu_r',
+                           vmin=-vabs, vmax=vabs, aspect='equal')
+    ax_map.set_title(f'Fz 3D GridFF @ h_probe={h_probe[iz_map]:.2f}Å', fontsize=10)
+    ax_map.set_xlabel('x [Å]'); ax_map.set_ylabel('y [Å]')
+    # Mark sample points with colored crosses + labels
+    for ix, iy, label, col in sample_pts:
+        px = scan_xs[ix]; py = scan_ys[iy]
+        ax_map.plot(px, py, '+', color=col, ms=12, mew=2, zorder=10)
+        ax_map.annotate(label, (px, py), textcoords='offset points',
+                        xytext=(8, 4), fontsize=8, color=col, fontweight='bold')
+    plt.colorbar(im_map, ax=ax_map, shrink=0.7, label='Fz [eV/Å]')
+
+    # E(z) curves: reference (3D) thick dotted, model (2.5D) thin full, same color per point
+    for ix, iy, label, col in sample_pts:
+        axE.plot(h_probe, E_raw3d[ix, iy, :], ls=':', lw=1.5, color=col, label=f'{label} 3D ref')
+        axE.plot(h_probe, E_rawcs[ix, iy, :], ls='-', lw=0.5, color=col, label=f'{label} 2.5D')
+    axE.axhline(0.0, c='k', lw=0.5, alpha=0.4)
+    axE.axvspan(FIT_Z_LO, FIT_Z_HI, color='0.9', alpha=0.4, label='fit z range')
+    # Mark the 2D map z-height with vertical line
+    axE.axvline(h_probe[iz_map], c='gray', lw=1, ls='--', alpha=0.6, label=f'map h={h_probe[iz_map]:.2f}Å')
+    axE.set_xlabel('h_probe [Å above zmax]')
+    axE.set_ylabel('E [eV]')
+    axE.set_title('E(z) — ref(3D) thick dotted vs model(2.5D) thin full', fontsize=10)
+    axE.legend(fontsize=7, loc='best', ncol=2)
+    axE.grid(alpha=0.25)
+    # E(z) ylim: USER-mandated vmin=E_min, vmax=-2*E_min (see skill afm-plotting-alignment)
+    E_min_bij = min(float(E_raw3d[ix, iy, :].min()) for ix, iy, _, _ in sample_pts)
+    axE.set_ylim(E_min_bij * 1.2, -2 * E_min_bij)
+
+    # Fz(z) curves: same style
+    for ix, iy, label, col in sample_pts:
+        axFz.plot(h_probe, Fz_raw3d[ix, iy, :], ls=':', lw=1.5, color=col, label=f'{label} 3D ref')
+        axFz.plot(h_probe, Fz_rawcs[ix, iy, :], ls='-', lw=0.5, color=col, label=f'{label} 2.5D')
+    axFz.axhline(0.0, c='k', lw=0.5, alpha=0.4)
+    axFz.axvspan(FIT_Z_LO, FIT_Z_HI, color='0.9', alpha=0.4)
+    axFz.axvline(h_probe[iz_map], c='gray', lw=1, ls='--', alpha=0.6, label=f'map h={h_probe[iz_map]:.2f}Å')
+    axFz.set_xlabel('h_probe [Å above zmax]')
+    axFz.set_ylabel('Fz [eV/Å]')
+    axFz.set_title('Fz(z) — ref(3D) thick dotted vs model(2.5D) thin full', fontsize=10)
+    axFz.legend(fontsize=7, loc='best', ncol=2)
+    axFz.grid(alpha=0.25)
+    # Fz(z) ylim: symmetric around 0, scaled by |Fz_min| (attractive well depth)
+    Fz_min_bij = min(float(Fz_raw3d[ix, iy, :].min()) for ix, iy, _, _ in sample_pts)
+    axFz.set_ylim(Fz_min_bij * 1.2, -2 * Fz_min_bij)
+
+    fig_bij.suptitle(f'E(z)/Fz(z) bijection: 2D map @ h={h_probe[iz_map]:.2f}Å + curves at marked points\n'
+                     f'PTCDA — fit z=[{FIT_Z_LO},{FIT_Z_HI}]Å  bspl_dx={BSPL_DX}  poly_R={POLY_R}  dpos0_z={afm.dpos0[2]:.1f}Å',
+                     fontsize=11)
     plt.tight_layout()
     out_z = os.path.join(PLOT_DIR, 'contact_surface_scan_z_alignment.png')
-    figz.savefig(out_z, dpi=150)
-    plt.close(figz)
+    fig_bij.savefig(out_z, dpi=150, bbox_inches='tight')
+    plt.close(fig_bij)
     print(f'REVIEW: {out_z}')
+
+    # ── Morse pair potential reference: V(r) for C-tip and O-tip ──
+    # Combination rule: R0_ij = tip_R + RvdW_sample, E0_ij = sqrt(tip_E * EvdW_sample)
+    # Show BOTH: real tip (tip_R=1.452, tip_E=0.00068) and testplot tip (tip_R=0, tip_E=1)
+    r = np.linspace(0.5, 8.0, 751)
+    fig_m, ax_m = plt.subplots(1, 2, figsize=(14, 5))
+    tip_configs = [
+        ('real tip (tip_R=1.452, tip_E=6.8e-4)', 1.452, 0.0006808, '-'),
+        ('testplot tip (tip_R=0, tip_E=1.0)', 0.0, 1.0, '--'),
+    ]
+    for ename, RvdW, EvdW, col in [('C', 1.9255, 0.00455323095, 'C0'),
+                                    ('O', 1.7500, 0.00260184625, 'C1')]:
+        for tip_label, tip_R, tip_E, ls_tip in tip_configs:
+            R0 = tip_R + RvdW
+            E0 = np.sqrt(abs(tip_E * EvdW))
+            alpha = 1.8
+            V = E0 * (np.exp(-2 * alpha * (r - R0)) - 2 * np.exp(-alpha * (r - R0)))
+            F = -2 * E0 * alpha * (-np.exp(-2 * alpha * (r - R0)) + np.exp(-alpha * (r - R0)))
+            lw = 1.5 if 'real' in tip_label else 0.5
+            ax_m[0].plot(r, V, ls=ls_tip, lw=lw, color=col,
+                        label=f'{ename} {tip_label}: R0={R0:.2f}Å, E0={E0:.4f}eV')
+            ax_m[1].plot(r, F, ls=ls_tip, lw=lw, color=col,
+                        label=f'{ename} R0={R0:.2f}Å')
+            ax_m[0].axvline(R0, ls=':', lw=0.6, color=col, alpha=0.4)
+            ax_m[1].axvline(R0, ls=':', lw=0.6, color=col, alpha=0.4)
+    for ax, ylabel, title in [(ax_m[0], 'V(r) [eV]', 'Morse V(r) = E0·[exp(-2α(r-R0)) - 2·exp(-α(r-R0))]'),
+                               (ax_m[1], 'Fz(r) [eV/Å]', 'Morse Fz(r) = -dV/dr')]:
+        ax.axhline(0.0, c='k', lw=0.5, alpha=0.4)
+        ax.set_xlabel('r (tip-atom distance) [Å]')
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontsize=10)
+        ax.legend(fontsize=7, loc='best')
+        ax.grid(alpha=0.25)
+        ax.set_xlim(0.5, 8.0)
+    ax_m[0].axvspan(FIT_Z_LO, FIT_Z_HI, color='0.9', alpha=0.3, label='fit z range')
+    fig_m.suptitle(f'Morse pair potentials — real tip (thick) vs testplot tip (thin dashed)\n'
+                   f'R0 = tip_R + RvdW: real C→3.38Å O→3.20Å | testplot C→1.93Å O→1.75Å\n'
+                   f'WARNING: testplot uses tip_R=0 (non-physical point tip) → minimum at wrong distance!',
+                   fontsize=10)
+    plt.tight_layout()
+    out_morse = os.path.join(PLOT_DIR, 'morse_pair_potentials.png')
+    fig_m.savefig(out_morse, dpi=150, bbox_inches='tight')
+    plt.close(fig_m)
+    print(f'REVIEW: {out_morse}')
+
+    # ── E(z) and Fz(z) curves at multiple atom positions ──
+    # Pick 3 atoms: top-z atom, edge atom, and a gap point between atoms
+    scan_xs = scan_p0[0] + np.arange(nxy[0]) * scan_da[0]
+    scan_ys = scan_p0[1] + np.arange(nxy[1]) * scan_db[1]
+    # Find pixel closest to each of the 3 top-z atoms
+    z_order = np.argsort(-apos[:, 2])  # highest z first
+    atom_pts = []
+    for ia in z_order[:3]:
+        ax_, ay_ = apos[ia, 0], apos[ia, 1]
+        ix = int(np.argmin(np.abs(scan_xs - ax_)))
+        iy = int(np.argmin(np.abs(scan_ys - ay_)))
+        atom_pts.append((ia, ix, iy, f'atom {ia} (z={apos[ia,2]:.2f})'))
+    # Also a gap point: centroid of all atoms
+    cx, cy = float(apos[:, 0].mean()), float(apos[:, 1].mean())
+    ix_c = int(np.argmin(np.abs(scan_xs - cx)))
+    iy_c = int(np.argmin(np.abs(scan_ys - cy)))
+    atom_pts.append((-1, ix_c, iy_c, 'centroid (gap)'))
+
+    # E(z) and Fz(z) at multiple atom positions — ref thick dotted, model thin full
+    fig_ef, axes_ef = plt.subplots(2, len(atom_pts), figsize=(4 * len(atom_pts), 9))
+    for col, (ia, ix, iy, label) in enumerate(atom_pts):
+        # E(z) — reference (3D) thick dotted, model (2.5D) thin full; PP-relaxed as thinner overlay
+        axE = axes_ef[0, col]
+        axE.plot(h_probe, E_raw3d[ix, iy, :], ls=':', lw=1.5, color='C0', label='3D GridFF ref (raw)')
+        axE.plot(h_probe, E_rawcs[ix, iy, :], ls='-', lw=0.5, color='C0', label='2.5D contact (raw)')
+        axE.plot(h_probe, E_3d[ix, iy, :], ls=':', lw=1.0, color='C1', alpha=0.6, label='3D GridFF ref (PP)')
+        axE.plot(h_probe, E_cs[ix, iy, :], ls='-', lw=0.3, color='C1', alpha=0.6, label='2.5D contact (PP)')
+        axE.axhline(0.0, c='k', lw=0.5, alpha=0.4)
+        axE.axvspan(FIT_Z_LO, FIT_Z_HI, color='0.9', alpha=0.4, label='fit z range')
+        axE.set_xlabel('h_probe [Å above zmax]')
+        axE.set_ylabel('E [eV]')
+        axE.set_title(label, fontsize=9)
+        axE.legend(fontsize=7, loc='best')
+        axE.grid(alpha=0.25)
+        # E(z) ylim: USER-mandated vmin=E_min, vmax=-2*E_min (see skill afm-plotting-alignment)
+        E_min_pt = float(E_raw3d[ix, iy, :].min())
+        axE.set_ylim(E_min_pt * 1.2, -2 * E_min_pt)
+
+        # Fz(z) — same style: ref thick dotted, model thin full
+        axFz = axes_ef[1, col]
+        axFz.plot(h_probe, Fz_raw3d[ix, iy, :], ls=':', lw=1.5, color='C0', label='3D GridFF ref (raw)')
+        axFz.plot(h_probe, Fz_rawcs[ix, iy, :], ls='-', lw=0.5, color='C0', label='2.5D contact (raw)')
+        axFz.plot(h_probe, Fz_3d[ix, iy, :], ls=':', lw=1.0, color='C1', alpha=0.6, label='3D GridFF ref (PP)')
+        axFz.plot(h_probe, Fz_cs[ix, iy, :], ls='-', lw=0.3, color='C1', alpha=0.6, label='2.5D contact (PP)')
+        axFz.axhline(0.0, c='k', lw=0.5, alpha=0.4)
+        axFz.axvspan(FIT_Z_LO, FIT_Z_HI, color='0.9', alpha=0.4)
+        axFz.set_xlabel('h_probe [Å above zmax]')
+        axFz.set_ylabel('Fz [eV/Å]')
+        axFz.set_title(label, fontsize=9)
+        axFz.legend(fontsize=7, loc='best')
+        axFz.grid(alpha=0.25)
+        # Fz(z) ylim: symmetric around 0, scaled by |Fz_min| (attractive well depth)
+        Fz_min_pt = float(Fz_raw3d[ix, iy, :].min())
+        axFz.set_ylim(Fz_min_pt * 1.2, -2 * Fz_min_pt)
+
+    fig_ef.suptitle(f'E(z) and Fz(z): 3D GridFF vs 2.5D contact surface — PTCDA\n'
+                     f'ref=thick dotted(ls=":")  model=thin full(ls="-")  same color=same point\n'
+                     f'fit z=[{FIT_Z_LO},{FIT_Z_HI}]Å  bspl_dx={BSPL_DX}  poly_R={POLY_R}  h0_R_scale={H0_R_SCALE}',
+                     fontsize=10)
+    plt.tight_layout()
+    out_ef = os.path.join(PLOT_DIR, 'pp_afm_parity_EFz_curves.png')
+    fig_ef.savefig(out_ef, dpi=150)
+    plt.close(fig_ef)
+    print(f'REVIEW: {out_ef}')
 
     sel = [i for i in [0, 4, 8, 12, 16, 20, 24] if i < NZ_SCAN]
     fig, axes = plt.subplots(3, len(sel), figsize=(2.6 * len(sel), 7.8))
@@ -603,6 +773,43 @@ def phase2_pp_afm_parity(sep, apos):
     plt.close(fig)
     print(f'REVIEW: {out_df}')
 
+    # ── Full z-stack: V (potential) 3D vs 2.5D at all scan heights ──
+    # V from raw FE channel 3 (unrelaxed PP potential the probe sees)
+    n_cols = min(NZ_SCAN, 10)
+    iz_sel = np.linspace(0, NZ_SCAN - 1, n_cols, dtype=int)
+    def _compact_zstack(data3d, datacs, heights, label, fname, suptitle):
+        fig, axes = plt.subplots(3, n_cols, figsize=(1.7 * n_cols, 5.2))
+        for col, iz in enumerate(iz_sel):
+            d3 = data3d[:, :, iz].T; dcs = datacs[:, :, iz].T
+            vabs = max(float(np.percentile(np.abs(d3), 99)), float(np.percentile(np.abs(dcs), 99)), 1e-6)
+            for row, (d, t) in enumerate([(d3, '3D'), (dcs, '2.5D'), ((dcs - d3), 'Δ')]):
+                ax = axes[row, col]
+                if row < 2:
+                    im = ax.imshow(d, origin='lower', extent=extent, cmap='RdBu_r', vmin=-vabs, vmax=vabs, aspect='equal')
+                else:
+                    ev = max(vabs, float(np.max(np.abs(dcs - d3))), 1e-6)
+                    im = ax.imshow(d, origin='lower', extent=extent, cmap='RdBu_r', vmin=-ev, vmax=ev, aspect='equal')
+                if row == 0: ax.set_title(f'h={heights[iz]:.2f}Å', fontsize=6, pad=2)
+                if col == 0: ax.set_ylabel(t, fontsize=7)
+                ax.tick_params(labelsize=4, length=2, pad=1)
+                ax.set_xlabel('')
+                plt.colorbar(im, ax=ax, fraction=0.04, pad=0.01)
+        fig.suptitle(suptitle, fontsize=9, y=0.98)
+        fig.subplots_adjust(left=0.04, right=0.96, bottom=0.02, top=0.93, wspace=0.25, hspace=0.15)
+        fig.savefig(fname, dpi=150)
+        plt.close(fig)
+        print(f'REVIEW: {fname}')
+
+    _compact_zstack(E_raw3d, E_rawcs, h_probe, 'V',
+        os.path.join(PLOT_DIR, 'pp_afm_parity_V_zstack.png'),
+        f'V(x,y) z-stack: 3D vs 2.5D — PTCDA (raw PP potential)  h_probe [Å above zmax]')
+    _compact_zstack(Fz_3d, Fz_cs, h_probe, 'Fz',
+        os.path.join(PLOT_DIR, 'pp_afm_parity_Fz_zstack.png'),
+        f'Fz(x,y) z-stack: 3D vs 2.5D — PTCDA (PP-relaxed)  h_probe [Å above zmax]')
+    _compact_zstack(df_3d, df_cs, h_probe, 'df',
+        os.path.join(PLOT_DIR, 'pp_afm_parity_df_zstack.png'),
+        f'df(x,y) z-stack: 3D vs 2.5D — PTCDA (PP-relaxed df)  h_probe [Å above zmax]')
+
     rmse_fz = [_rmse(Fz_cs[:, :, iz], Fz_3d[:, :, iz]) for iz in range(NZ_SCAN)]
     out_pp = os.path.join(PLOT_DIR, 'pp_afm_parity_summary.out')
     with open(out_pp, 'w') as f:
@@ -611,8 +818,9 @@ def phase2_pp_afm_parity(sep, apos):
         f.write(f'dpos0={afm.dpos0.tolist()}  h_tip range [{h_tip[0]:.2f},{h_tip[-1]:.2f}]  h_probe range [{h_probe[0]:.2f},{h_probe[-1]:.2f}]\n')
         f.write(f'mean RMSE Fz={np.mean(rmse_fz):.6e}  max={np.max(rmse_fz):.6e}\n')
         f.write('iz  h_tip  h_probe  rmse_Fz  center_Fz_3d  center_Fz_cs\n')
+        ix0, iy0 = sample_pts[0][0], sample_pts[0][1]
         for iz, r in enumerate(rmse_fz):
-            f.write(f'  iz={iz:2d} h_tip={h_tip[iz]:5.2f} h_probe={h_probe[iz]:5.2f} rmse_Fz={r:.6e}  Fz3d={Fz_3d[i0,j0,iz]: .6e} Fzcs={Fz_cs[i0,j0,iz]: .6e}\n')
+            f.write(f'  iz={iz:2d} h_tip={h_tip[iz]:5.2f} h_probe={h_probe[iz]:5.2f} rmse_Fz={r:.6e}  Fz3d={Fz_3d[ix0,iy0,iz]: .6e} Fzcs={Fz_cs[ix0,iy0,iz]: .6e}\n')
     print(f'REVIEW: {out_pp}')
     print(f'  Phase2 mean RMSE Fz={np.mean(rmse_fz):.4e}')
     return rmse_fz
@@ -754,7 +962,7 @@ def phase3_pp_afm_pic(pic, apos):
     print('  Phase3 PIC: PP-AFM relaxed scan parity (reuse PIC fit, no refit)')
     afm = AFMulator(use_morse=True, use_fire=False)
     afm.load_molecule(PTCDA)
-    afm.assign_params(params_path=PARAMS, tip_R=0.0, tip_E=1.0)
+    afm.assign_params(params_path=PARAMS)  # real CO tip
     afm.tipQs[:] = 0.0
     n_grid = _grid_n(apos, MARGIN, Z_TOP, DX_GRID)
     afm.setup_grid(n=n_grid, margin=MARGIN, z_top=Z_TOP, shift_atoms=False)
@@ -1109,7 +1317,7 @@ def main_ptcda():
     from spammm.SPM.AFM import AFMulator
     afm = AFMulator(use_morse=True, use_fire=False)
     afm.load_molecule(PTCDA)
-    afm.assign_params(params_path=PARAMS, tip_R=0.0, tip_E=1.0)
+    afm.assign_params(params_path=PARAMS)  # real CO tip: tip_R=1.452, tip_E=6.8e-4
     afm.tipQs[:] = 0.0
 
     sep, zmax, bbox = phase1_fit_close(afm, apos)

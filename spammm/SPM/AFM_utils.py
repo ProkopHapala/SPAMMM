@@ -3814,23 +3814,28 @@ def run_morse_coulomb_afm(xyz_path, outdir, *,
     if not sel:
         sel = [nz_scan // 2]
 
+    # Scan axes for extent (physical coordinates, not pixel indices)
+    # Reproduce run_scan auto geometry: 90% of molecule span, 5% margin
+    nx_s, ny_s = int(nxy[0]), int(nxy[1])
+    apos = afmulator.atoms_arr[:, :3]
+    mn, mx = apos.min(axis=0), apos.max(axis=0)
+    x0 = mn[0] + (mx[0] - mn[0]) * 0.05
+    y0 = mn[1] + (mx[1] - mn[1]) * 0.05
+    dx_scan = (mx[0] - mn[0]) * 0.9 / max(nx_s - 1, 1)
+    dy_scan = (mx[1] - mn[1]) * 0.9 / max(ny_s - 1, 1)
+    scan_xs = x0 + np.arange(nx_s) * dx_scan
+    scan_ys = y0 + np.arange(ny_s) * dy_scan
+    extent = scan_extent(scan_xs, scan_ys)
+
     pngs = []
     if save_png:
         for kind, data, cmap in (('Fz', Fz, 'bwr'), ('df', df, 'bwr')):
-            fig, axes = plt.subplots(1, len(sel), figsize=(3 * len(sel), 3))
-            if len(sel) == 1:
-                axes = [axes]
-            for ax, iz in zip(axes, sel):
-                arr = data[:, :, int(iz)].T
-                vabs = max(float(np.percentile(np.abs(arr), 99)), 1e-6)
-                im = ax.imshow(arr, origin='lower', cmap=cmap, aspect='equal', vmin=-vabs, vmax=vabs)
-                ax.set_title(f'{kind} h={heights[int(iz)]:.2f}Å', fontsize=8)
-                plt.colorbar(im, ax=ax, shrink=0.8)
-            fig.suptitle(f'AFM {kind} ({pot}+Coulomb) — {mol_tag}', fontsize=10)
-            fig.tight_layout()
             out_png = os.path.join(outdir, f'afm_{kind}_{mol_tag}.png')
-            fig.savefig(out_png, dpi=140)
-            plt.close(fig)
+            plot_afm_height_panel(
+                data, heights, iz=sel, extent=extent, label=kind, cmap=cmap,
+                fname=os.path.basename(out_png), save_dir=outdir, dpi=150,
+                transpose=True,
+            )
             print(f'REVIEW: {out_png}')
             pngs.append(out_png)
 

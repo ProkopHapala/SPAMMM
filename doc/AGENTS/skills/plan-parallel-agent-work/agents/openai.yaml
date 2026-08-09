@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan Parallel Agent Work"
+  short_description: "Manual multi-agent task planning"
+  default_prompt: "Use $plan-parallel-agent-work to create a non-interfering manual agent plan with a copy/paste Agent_N checklist."
