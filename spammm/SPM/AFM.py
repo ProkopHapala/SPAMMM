@@ -341,6 +341,7 @@ class AFMulator(OpenCLBase):
         # Contact-surface state (fit_contact_surface / run_scan_contact; no 3D img_FF)
         self.sep = None
         self.pic = None
+        self.cpm = None  # contact_pme (Wave 2 host/API)
         self._cs_fit = None
         self.cs_meta = self.cs_origin_step = self.cs_dy_rc = self.cs_invRc_mstart = None
         self.cs_pic_meta = self.cs_pic_bmeta = None
@@ -1372,6 +1373,507 @@ class AFMulator(OpenCLBase):
         print(f"AFMulator.run_scan_pic: done FEs.shape={FEs.shape}")
         return FEs, pts[:, :3].reshape(nx_s, ny_s, 3)
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # contact_pme backend — Wave 2 host/API (doc/Tasks/ContactSurface_PME_ParallelPlan.md)
+    # Orchestrates PMESplit → CoarseMesh → PICCore; GPU eval falls back to Python.
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _pme_preflight(self, p, query_bounds, *, max_resident_bytes=None):
+        """Host preflight checks (fail-loud). Rejects unsupported/bad configurations.
+
+        - Rejects unsupported multi-site tip charges (MVP oracle is radial only).
+        - Rejects bad mesh bounds (NaN, inverted, or zero-extent query envelope).
+        - Rejects cell_size < r_cut (bucket completeness requires >= r_cut).
+        - Rejects metadata/layout mismatch (na mismatch, non-finite atoms).
+        - Rejects estimated device allocation overflow (resident > device global).
+        """
+        # Multi-site tip charges: MVP oracle is radial (PLQH=(1,1,q_tip,0)).
+        # tipQs/tipQZs electrostatics is not radial → out of scope.
+        if np.any(np.abs(self.tipQs) > 1e-12):
+            raise ValueError(f"contact_pme MVP does not support multi-site tip charges "
+                             f"(tipQs={self.tipQs} nonzero); set tipQs[:]=0 and use q_tip in SplitParams")
+        # Mesh bounds
+        qb = np.asarray(query_bounds, dtype=np.float64)
+        if qb.shape != (3, 2):
+            raise ValueError(f"query_bounds must be (3,2), got {qb.shape}")
+        if not np.all(np.isfinite(qb)):
+            raise ValueError(f"query_bounds contains non-finite values: {qb}")
+        if np.any(qb[:, 1] <= qb[:, 0]):
+            raise ValueError(f"query_bounds has zero or inverted extent: {qb}")
+        # cell_size >= r_cut (bucket completeness)
+        r_cut = float(p.r_cut)
+        r_lo_max = float(np.max(p.r_lo))
+        if r_cut <= r_lo_max:
+            raise ValueError(f"r_cut={r_cut} <= max(r_lo)={r_lo_max:.4f}; split domain invalid")
+        # Atom count + finiteness
+        na = p.na
+        if na < 1:
+            raise ValueError(f"SplitParams has na={na} < 1")
+        if not np.all(np.isfinite(p.R0)) or not np.all(np.isfinite(p.E0)):
+            raise ValueError("SplitParams R0/E0 contains non-finite values")
+        # Resident-byte overflow estimate (uses ContactPMEParams accounting if available)
+        if max_resident_bytes is not None:
+            est = self._pme_estimate_resident_bytes(p, qb)
+            if est > max_resident_bytes:
+                raise MemoryError(f"contact_pme estimated resident {est} bytes "
+                                  f"({_bytes_to_gb(est):.3f} GB) > device limit "
+                                  f"{max_resident_bytes} ({_bytes_to_gb(max_resident_bytes):.3f} GB)")
+
+    def _pme_estimate_resident_bytes(self, p, query_bounds, h_mesh=1.0, halo_nodes=6):
+        """Estimate device-resident bytes for a contact_pme fit without building it."""
+        qb = np.asarray(query_bounds, dtype=np.float64)
+        lo = qb[:, 0] - halo_nodes * h_mesh
+        hi = qb[:, 1] + halo_nodes * h_mesh
+        nx = int(np.round((hi[0] - lo[0]) / h_mesh)) + 1
+        ny = int(np.round((hi[1] - lo[1]) / h_mesh)) + 1
+        nz = int(np.round((hi[2] - lo[2]) / h_mesh)) + 1
+        na = p.na
+        n_modes = 5  # CORE_POWERS = [4,8,16,32,64]
+        b = 0
+        b += nx * ny * nz * 4           # mesh coeffs float32
+        b += na * 4 * 4                  # atoms float4
+        b += na * n_modes * 4            # core coeffs float32
+        b += na * 4                      # r_lo float32
+        # Buckets: rough estimate — na atom indices + (nbx*nby+1) offsets
+        cell_size = float(p.r_cut)
+        x0 = float(np.atleast_1d(p.R0).min()) - cell_size  # conservative; real uses atom_pos
+        nbx = max(1, int(np.ceil((qb[0, 1] - qb[0, 0] + 2 * cell_size) / cell_size)))
+        nby = max(1, int(np.ceil((qb[1, 1] - qb[1, 0] + 2 * cell_size) / cell_size)))
+        b += na * 4                      # bucket_atoms (<= na entries, conservative)
+        b += (nbx * nby + 1) * 4         # offsets
+        return b
+
+    def fit_contact_pme(self, *, r_cut=6.0, h_mesh=1.0, halo_nodes=6, query_bounds=None,
+                        margin=2.0, z_above_lo=3.0, z_above_hi=8.0,
+                        n_shells=300, n_endpoint=30, n_holdout=80, seed=42, bPrint=True):
+        """Orchestrate contact_pme fit: split → coarse mesh → compact core.
+
+        Builds SplitParams from assigned Morse params (R0/E0 from cLJs_arr, q from
+        atoms_arr, alpha/r_damp from tip), calls build_coarse_mesh() (CoarseMesh.py)
+        and fit_core_1d() (PICCore.py), and stores results in ContactPMEParams.
+        Does NOT duplicate the mathematics — just orchestrates.
+
+        Args:
+            r_cut: outer split/core cutoff [Å] (MVP default 6.0)
+            h_mesh: mesh spacing [Å] (MVP default 1.0)
+            halo_nodes: halo padding per side (contract: >= 6)
+            query_bounds: (3,2) [[xmin,xmax],[ymin,ymax],[zmin,zmax]] query envelope.
+                          If None, derived from atom bbox + margin + z_above range.
+            margin: xy margin [Å] when query_bounds is None
+            z_above_lo, z_above_hi: z range above zmax when query_bounds is None [Å]
+            n_shells, n_endpoint, n_holdout, seed: core fit sampling params
+        Returns:
+            ContactPMEParams
+        """
+        from spammm.surfaces.PMESplit import SplitParams
+        from spammm.surfaces.CoarseMesh import build_coarse_mesh
+        from spammm.surfaces.PICCore import fit_core_1d
+        from spammm.surfaces.ContactSurface import ContactPMEParams, build_pic_buckets
+        assert self.use_morse, "fit_contact_pme requires use_morse=True"
+        assert self.atoms_arr is not None and self.cLJs_arr is not None, "call assign_params() first"
+        apos = self.atoms_arr[:, :3].astype(np.float64)
+        cMs = self.cLJs_arr
+        qs = self.atoms_arr[:, 3].astype(np.float64) if self.atoms_arr.shape[1] > 3 else np.zeros(len(apos))
+        na = len(apos)
+        # alpha: tip Morse stiffness (positive scalar; K=-alpha in oracle).
+        # cLJs_arr[:,2] holds tip_alpha (negative, e.g. -1.8). PMESplit expects alpha>0.
+        alpha = float(abs(cMs[0, 2]))
+        r_damp = 0.1  # GFFParams convention (matches cs_brute_plqh_points default)
+        q_tip = 0.0   # MVP: zero tip charge (radial Morse only); charged case via SplitParams.q
+        p = SplitParams(R0=cMs[:, 0].astype(np.float64), E0=cMs[:, 1].astype(np.float64),
+                        q=qs, alpha=alpha, q_tip=q_tip, r_damp=r_damp, r_cut=float(r_cut))
+        # Query envelope
+        if query_bounds is None:
+            zmax = float(apos[:, 2].max())
+            query_bounds = np.array([[apos[:, 0].min() - margin, apos[:, 0].max() + margin],
+                                     [apos[:, 1].min() - margin, apos[:, 1].max() + margin],
+                                     [zmax + z_above_lo, zmax + z_above_hi]], dtype=np.float64)
+        query_bounds = np.asarray(query_bounds, dtype=np.float64)
+        # Preflight (fail-loud)
+        self._pme_preflight(p, query_bounds, max_resident_bytes=self._global_mem)
+        if bPrint:
+            print(f"AFMulator.fit_contact_pme: na={na} r_cut={r_cut} h_mesh={h_mesh} halo={halo_nodes}")
+            print(f"  query_bounds={query_bounds.tolist()} alpha={alpha} r_damp={r_damp} q_tip={q_tip}")
+        # Build coarse mesh (V_L = Σ v_i^L)
+        mesh = build_coarse_mesh(apos, p, query_bounds, h_mesh=h_mesh, halo_nodes=halo_nodes)
+        if bPrint:
+            print(f"  mesh: shape={mesh.coeffs.shape} origin={mesh.origin.tolist()} resident={mesh.coeffs.nbytes} bytes")
+        # Fit compact core (v_S per atom)
+        core_fit = fit_core_1d(p, n_shells=n_shells, n_endpoint=n_endpoint, n_holdout=n_holdout, seed=seed)
+        if bPrint:
+            print(f"  core: na={core_fit.coeffs.shape[0]} n_modes={core_fit.coeffs.shape[1]} "
+                  f"basis={core_fit.basis} cond_raw=[{float(core_fit.cond_raw.min()):.1f},{float(core_fit.cond_raw.max()):.1f}]")
+        # PIC buckets for core evaluation (cell_size >= r_cut)
+        cell_size = float(r_cut)
+        x0 = float(apos[:, 0].min()) - cell_size
+        y0 = float(apos[:, 1].min()) - cell_size
+        x1 = float(apos[:, 0].max()) + cell_size
+        y1 = float(apos[:, 1].max()) + cell_size
+        bucket_atoms, bucket_offsets, nbx, nby = build_pic_buckets(apos, x0, y0, x1, y1, cell_size)
+        params = ContactPMEParams(
+            mesh_coeffs=mesh.coeffs, mesh_origin=mesh.origin, mesh_h=mesh.h, mesh_halo=mesh.halo,
+            query_interior=mesh.query_interior, core_fit=core_fit, split_params=p,
+            atom_pos=apos, bucket_atoms=bucket_atoms, bucket_offsets=bucket_offsets,
+            bucket_nbx=nbx, bucket_nby=nby, bucket_cell_size=cell_size, bucket_bounds=(x0, y0, x1, y1))
+        self.cpm = params
+        if bPrint:
+            print(f"  ContactPMEParams: resident={params.resident_bytes} bytes ({params.resident_kb:.1f} KB) "
+                  f"buckets={nbx}x{nby} cell={cell_size:.1f}Å")
+        return params
+
+    def _pme_eval_python(self, params, queries):
+        """Python fallback evaluator: eval_mesh + eval_core (CPU, float64).
+
+        Used when the OpenCL contact_pme kernels are not present (Agent_1 W2 not
+        integrated yet) or for CPU-only parity testing.
+        """
+        from spammm.surfaces.CoarseMesh import CoarseMesh, eval_mesh
+        from spammm.surfaces.PICCore import eval_core
+        mesh = CoarseMesh(coeffs=params.mesh_coeffs, origin=params.mesh_origin,
+                          h=params.mesh_h, halo=params.mesh_halo, query_interior=params.query_interior)
+        E_m, F_m = eval_mesh(mesh, queries)
+        E_c, F_c = eval_core(queries, params.atom_pos, params.core_fit, r_cut=params.r_cut)
+        return E_m + E_c, F_m + F_c
+
+    def _pme_gpu_kernel_available(self):
+        """Check if Agent_1's Wave 2 OpenCL contact_pme kernels are present."""
+        return hasattr(self.prg, 'evalContactPME')
+
+    def eval_contact_pme(self, queries, params=None, *, use_gpu=None):
+        """Evaluate contact_pme (E, F) at query points. F = -∇E.
+
+        Uses the OpenCL kernels (Agent_1 W2: evalContactPME) when available and
+        use_gpu is True; falls back to Python eval_mesh + eval_core for CPU-only
+        testing. Returns (E, F) with E shape (nq,) and F shape (nq, 3).
+
+        Args:
+            queries: (nq, 3) float64/float32 world coordinates
+            params: ContactPMEParams (default: self.cpm from fit_contact_pme)
+            use_gpu: force GPU (True) or Python (False); default auto-detect
+        Returns:
+            (E, F) tuple — E (nq,) float64, F (nq, 3) float64
+        """
+        from spammm.surfaces.ContactSurface import ContactPMEParams
+        params = params or getattr(self, 'cpm', None)
+        assert params is not None and isinstance(params, ContactPMEParams), "call fit_contact_pme() first"
+        queries = np.asarray(queries, dtype=np.float64).reshape(-1, 3)
+        nq = len(queries)
+        if nq == 0:
+            return np.zeros(0, dtype=np.float64), np.zeros((0, 3), dtype=np.float64)
+        # Preflight: query stencil guard (reject queries outside declared interior)
+        lo, hi = params.query_interior
+        origin = params.mesh_origin
+        h = params.mesh_h
+        fx = (queries[:, 0] - origin[0]) / h
+        fy = (queries[:, 1] - origin[1]) / h
+        fz = (queries[:, 2] - origin[2]) / h
+        ix = np.floor(fx).astype(np.int64); iy = np.floor(fy).astype(np.int64); iz = np.floor(fz).astype(np.int64)
+        i0x = ix - 1; i0y = iy - 1; i0z = iz - 1
+        nx, ny, nz = params.mesh_shape
+        oob = (i0x < 0) | (i0y < 0) | (i0z < 0) | (i0x + 3 >= nx) | (i0y + 3 >= ny) | (i0z + 3 >= nz)
+        if np.any(oob):
+            bad_idx = int(np.where(oob)[0][0])
+            raise ValueError(f"eval_contact_pme: query {bad_idx} at {queries[bad_idx]} stencil out of bounds "
+                             f"i0=({i0x[bad_idx]},{i0y[bad_idx]},{i0z[bad_idx]}) mesh={params.mesh_shape}")
+        # Choose path
+        if use_gpu is None:
+            use_gpu = self._pme_gpu_kernel_available()
+        if use_gpu and self._pme_gpu_kernel_available():
+            E, F = self._pme_eval_gpu(params, queries)
+        else:
+            E, F = self._pme_eval_python(params, queries)
+        return E, F
+
+    def _pme_eval_gpu(self, params, queries):
+        """GPU evaluation via Agent_1's evalContactPME kernel (Wave 2 ABI).
+
+        Kernel signature (16 args):
+          evalContactPME(queries, out_fe, out_status, out_min_r, out_offender, out_overflow,
+                         mesh_coeffs, mesh_meta(int4), mesh_origin_h(float4),
+                         atoms(float4*), atom_coeffs(float*), bucket_atoms, bucket_offsets,
+                         core_meta(int4), core_bucket_meta(float4), nq)
+        atoms float4 = (x, y, z, r_lo_i) — NOT charge (kernel uses ap.w as r_lo).
+        atom_coeffs is flat float* (nat * N_MODES, row-major).
+        mesh_coeffs is flat float* (nx*ny*nz, C-order z-fastest).
+        """
+        na = params.na
+        n_modes = int(params.core_fit.coeffs.shape[1])
+        nc_mesh = int(params.mesh_coeffs.size)
+        nc_core = int(params.core_fit.coeffs.size)
+        n_buck = max(int(params.bucket_atoms.size), 1)
+        n_off = max(int(params.bucket_offsets.size), 1)
+        self.try_make_buffers({
+            'cpm_mesh': nc_mesh * 4, 'cpm_atoms': na * 16, 'cpm_core_coeffs': nc_core * 4,
+            'cpm_buckets': n_buck * 4, 'cpm_offsets': n_off * 4,
+        }, suffix='_cl')
+        # atoms4 = (x, y, z, r_lo_i) — kernel uses ap.w as r_lo (NOT charge)
+        atoms4 = np.zeros((na, 4), dtype=np.float32)
+        atoms4[:, :3] = params.atom_pos.astype(np.float32)
+        atoms4[:, 3] = np.ascontiguousarray(params.core_fit.r_lo, dtype=np.float32)
+        # Flat mesh coeffs (C-order z-fastest) and flat core coeffs (nat * N_MODES)
+        mesh_flat = np.ascontiguousarray(params.mesh_coeffs, dtype=np.float32).ravel()
+        core_flat = np.ascontiguousarray(params.core_fit.coeffs, dtype=np.float32).ravel()
+        self.toGPU_(self.cpm_mesh_cl, mesh_flat)
+        self.toGPU_(self.cpm_atoms_cl, atoms4)
+        self.toGPU_(self.cpm_core_coeffs_cl, core_flat)
+        self.toGPU_(self.cpm_buckets_cl, np.ascontiguousarray(params.bucket_atoms, dtype=np.int32))
+        self.toGPU_(self.cpm_offsets_cl, np.ascontiguousarray(params.bucket_offsets, dtype=np.int32))
+        nq = len(queries)
+        self.try_make_buffers({
+            'cpm_queries': nq * 3 * 4, 'cpm_out_fe': nq * 16, 'cpm_status': nq * 4,
+            'cpm_min_r': nq * 4, 'cpm_offender': nq * 4, 'cpm_overflow': nq * 4,
+        }, suffix='_cl')
+        self.toGPU_(self.cpm_queries_cl, np.ascontiguousarray(queries, dtype=np.float32))
+        nx, ny, nz = params.mesh_shape
+        nbuckets = int(params.bucket_nbx) * int(params.bucket_nby)
+        mesh_meta = np.array([nx, ny, nz, 0], dtype=np.int32)
+        mesh_origin_h = np.array([params.mesh_origin[0], params.mesh_origin[1],
+                                  params.mesh_origin[2], params.mesh_h], dtype=np.float32)
+        core_meta = np.array([na, params.bucket_nbx, params.bucket_nby, nbuckets], dtype=np.int32)
+        x0, y0, _, _ = params.bucket_bounds
+        core_bucket_meta = np.array([x0, y0, params.bucket_cell_size, params.r_cut], dtype=np.float32)
+        nG = self._roundup(nq, 32)
+        self.prg.evalContactPME(self.queue, (nG,), (32,),
+                                self.cpm_queries_cl, self.cpm_out_fe_cl, self.cpm_status_cl,
+                                self.cpm_min_r_cl, self.cpm_offender_cl, self.cpm_overflow_cl,
+                                self.cpm_mesh_cl, mesh_meta, mesh_origin_h,
+                                self.cpm_atoms_cl, self.cpm_core_coeffs_cl,
+                                self.cpm_buckets_cl, self.cpm_offsets_cl,
+                                core_meta, core_bucket_meta, np.int32(nq))
+        self.queue.finish()
+        out = np.zeros((nq, 4), dtype=np.float32)
+        status = np.zeros(nq, dtype=np.int32)
+        min_r = np.zeros(nq, dtype=np.float32)
+        offender = np.zeros(nq, dtype=np.int32)
+        overflow = np.zeros(nq, dtype=np.int32)
+        cl.enqueue_copy(self.queue, out, self.cpm_out_fe_cl)
+        cl.enqueue_copy(self.queue, status, self.cpm_status_cl)
+        cl.enqueue_copy(self.queue, min_r, self.cpm_min_r_cl)
+        cl.enqueue_copy(self.queue, offender, self.cpm_offender_cl)
+        cl.enqueue_copy(self.queue, overflow, self.cpm_overflow_cl)
+        self.queue.finish()
+        # Postflight: raise on any status flag (trajectory-domain, stencil-bound, bucket-overflow)
+        self._pme_postflight_status(status, queries, min_r=min_r, offender=offender, overflow=overflow)
+        E = out[:, 3].astype(np.float64)
+        F = out[:, :3].astype(np.float64)
+        return E, F
+
+    def _pme_postflight_status(self, status, queries, *, min_r=None, offender=None, overflow=None):
+        """Host postflight: raise on any trajectory-domain, stencil-bound, or bucket-overflow flag.
+
+        status: (nq,) int32 — 0 = OK, bit 0 (1)=mesh stencil OOB, bit 1 (2)=core domain
+                violation, bit 2 (4)=bucket overflow. Reports worst coordinates.
+        """
+        bad = np.where(status != 0)[0]
+        if len(bad) == 0:
+            return
+        worst = int(bad[0])
+        code = int(status[worst])
+        coord = queries[worst] if worst < len(queries) else None
+        flags = []
+        if code & 1: flags.append('stencil_out_of_bounds')
+        if code & 2: flags.append('trajectory_domain_violation')
+        if code & 4: flags.append('bucket_overflow')
+        extra = ""
+        if min_r is not None and worst < len(min_r):
+            extra += f" min_r={float(min_r[worst]):.6f}"
+        if offender is not None and worst < len(offender):
+            extra += f" offender={int(offender[worst])}"
+        if overflow is not None and worst < len(overflow):
+            extra += f" overflow={int(overflow[worst])}"
+        raise RuntimeError(f"contact_pme GPU postflight: {len(bad)} queries flagged. "
+                           f"worst={worst} code={code} ({'|'.join(flags)}) coord={coord}{extra}")
+
+    def run_scan_contact_pme(self, nxy=(50, 50), nz=60, dtip=-0.1, scan_p0=None,
+                             scan_da=None, scan_db=None, bAlloc=True, use_gpu=None):
+        """PP-AFM scan using the contact_pme backend.
+
+        Same scan geometry and outputs as run_scan_contact(), but the field
+        evaluator is the contact_pme PME backend (mesh + core). Uses the OpenCL
+        relaxation kernel (Agent_1 W2: relaxStrokesTiltedContactPME) when
+        available; falls back to a Python per-pixel relaxation otherwise.
+
+        Args:
+            nxy: (nx_s, ny_s) scan grid
+            nz: number of z steps
+            dtip: z step per stroke [Å] (negative = approaching)
+            scan_p0, scan_da, scan_db: scan geometry (auto if None)
+            bAlloc: allocate scan buffers
+            use_gpu: force GPU/Python; default auto-detect
+        Returns:
+            FEs (nx_s, ny_s, nz, 4), pts (nx_s, ny_s, 3)
+        """
+        from spammm.surfaces.ContactSurface import ContactPMEParams
+        params = getattr(self, 'cpm', None)
+        assert params is not None and isinstance(params, ContactPMEParams), "call fit_contact_pme() first"
+        nx_s, ny_s = nxy
+        n_scan = nx_s * ny_s
+        if scan_p0 is None:
+            scan_p0, scan_da, scan_db = self._scan_grid_auto(nxy)
+        print(f"AFMulator.run_scan_contact_pme: nxy={nxy} nz={nz} dtip={dtip} use_gpu={use_gpu}")
+        print(f"  scan_p0={scan_p0}  da={scan_da}  db={scan_db}")
+        pts = np.zeros((n_scan, 4), dtype=np.float32)
+        k = 0
+        for ix in range(nx_s):
+            for iy in range(ny_s):
+                pts[k, :3] = scan_p0 + scan_da * ix + scan_db * iy
+                k += 1
+        FEs_bytes = n_scan * nz * 4 * 4
+        if FEs_bytes > self._max_alloc:
+            raise MemoryError(f"run_scan_contact_pme: FEs buffer needs {FEs_bytes} bytes "
+                              f"({_bytes_to_gb(FEs_bytes):.3f} GB) > device max_alloc "
+                              f"{_bytes_to_gb(self._max_alloc):.3f} GB")
+        if use_gpu is None:
+            use_gpu = hasattr(self.prg, 'relaxStrokesTiltedContactPME')
+        if use_gpu and hasattr(self.prg, 'relaxStrokesTiltedContactPME'):
+            FEs = self._pme_scan_gpu(params, pts, nxy, nz, dtip, bAlloc)
+        else:
+            FEs = self._pme_scan_python(params, pts, nxy, nz, dtip)
+        print(f"AFMulator.run_scan_contact_pme: done FEs.shape={FEs.shape}")
+        return FEs, pts[:, :3].reshape(nx_s, ny_s, 3)
+
+    def _pme_scan_gpu(self, params, pts, nxy, nz, dtip, bAlloc):
+        """GPU PP relaxation scan via relaxStrokesTiltedContactPME (Agent_1 W2).
+
+        Kernel signature (23 args):
+          relaxStrokesTiltedContactPME(mesh_coeffs, mesh_meta(int4), mesh_origin_h(float4),
+            atoms(float4*), atom_coeffs(float*), bucket_atoms, bucket_offsets,
+            core_meta(int4), core_bucket_meta(float4),
+            out_status, out_min_r, out_offender, out_overflow,
+            points(float4*), FEs(float4*),
+            tipA, tipB, tipC, stiffness, dpos0, relax_params, surfFF, nz)
+        atoms float4 = (x, y, z, r_lo_i). atom_coeffs flat (nat * N_MODES).
+        """
+        nx_s, ny_s = nxy
+        n_scan = nx_s * ny_s
+        if bAlloc:
+            self.realloc_scan_buffers(n_scan, nz)
+        na = params.na
+        nc_mesh = int(params.mesh_coeffs.size)
+        nc_core = int(params.core_fit.coeffs.size)
+        n_buck = max(int(params.bucket_atoms.size), 1)
+        n_off = max(int(params.bucket_offsets.size), 1)
+        self.try_make_buffers({
+            'cpm_mesh': nc_mesh * 4, 'cpm_atoms': na * 16, 'cpm_core_coeffs': nc_core * 4,
+            'cpm_buckets': n_buck * 4, 'cpm_offsets': n_off * 4,
+        }, suffix='_cl')
+        # atoms4 = (x, y, z, r_lo_i) — kernel uses ap.w as r_lo (NOT charge)
+        atoms4 = np.zeros((na, 4), dtype=np.float32)
+        atoms4[:, :3] = params.atom_pos.astype(np.float32)
+        atoms4[:, 3] = np.ascontiguousarray(params.core_fit.r_lo, dtype=np.float32)
+        mesh_flat = np.ascontiguousarray(params.mesh_coeffs, dtype=np.float32).ravel()
+        core_flat = np.ascontiguousarray(params.core_fit.coeffs, dtype=np.float32).ravel()
+        self.toGPU_(self.cpm_mesh_cl, mesh_flat)
+        self.toGPU_(self.cpm_atoms_cl, atoms4)
+        self.toGPU_(self.cpm_core_coeffs_cl, core_flat)
+        self.toGPU_(self.cpm_buckets_cl, np.ascontiguousarray(params.bucket_atoms, dtype=np.int32))
+        self.toGPU_(self.cpm_offsets_cl, np.ascontiguousarray(params.bucket_offsets, dtype=np.int32))
+        self.toGPU_(self.scan_pts_cl, pts)
+        FEs_h = np.zeros((n_scan * nz, 4), dtype=np.float32)
+        tipC = self.tipC.copy(); tipC[3] = np.float32(dtip)
+        nx, ny, nz_m = params.mesh_shape
+        nbuckets = int(params.bucket_nbx) * int(params.bucket_nby)
+        mesh_meta = np.array([nx, ny, nz_m, 0], dtype=np.int32)
+        mesh_origin_h = np.array([params.mesh_origin[0], params.mesh_origin[1],
+                                  params.mesh_origin[2], params.mesh_h], dtype=np.float32)
+        core_meta = np.array([na, params.bucket_nbx, params.bucket_nby, nbuckets], dtype=np.int32)
+        x0, y0, _, _ = params.bucket_bounds
+        core_bucket_meta = np.array([x0, y0, params.bucket_cell_size, params.r_cut], dtype=np.float32)
+        # Telemetry buffers (per scan point, accumulated over z steps)
+        self.try_make_buffers({
+            'cpm_scan_status': n_scan * 4, 'cpm_scan_min_r': n_scan * 4,
+            'cpm_scan_offender': n_scan * 4, 'cpm_scan_overflow': n_scan * 4,
+        }, suffix='_cl')
+        gs = (self._roundup(n_scan, 1),)
+        self.prg.relaxStrokesTiltedContactPME(self.queue, gs, (1,),
+                                              self.cpm_mesh_cl, mesh_meta, mesh_origin_h,
+                                              self.cpm_atoms_cl, self.cpm_core_coeffs_cl,
+                                              self.cpm_buckets_cl, self.cpm_offsets_cl,
+                                              core_meta, core_bucket_meta,
+                                              self.cpm_scan_status_cl, self.cpm_scan_min_r_cl,
+                                              self.cpm_scan_offender_cl, self.cpm_scan_overflow_cl,
+                                              self.scan_pts_cl, self.scan_FEs_cl,
+                                              self.tipA, self.tipB, tipC, self.stiffness,
+                                              self.dpos0, self.relax_pars, self.surfFF, np.int32(nz))
+        self.queue.finish()
+        self.fromGPU_(self.scan_FEs_cl, FEs_h)
+        # Read telemetry + postflight
+        status = np.zeros(n_scan, dtype=np.int32)
+        min_r = np.zeros(n_scan, dtype=np.float32)
+        offender = np.zeros(n_scan, dtype=np.int32)
+        overflow = np.zeros(n_scan, dtype=np.int32)
+        cl.enqueue_copy(self.queue, status, self.cpm_scan_status_cl)
+        cl.enqueue_copy(self.queue, min_r, self.cpm_scan_min_r_cl)
+        cl.enqueue_copy(self.queue, offender, self.cpm_scan_offender_cl)
+        cl.enqueue_copy(self.queue, overflow, self.cpm_scan_overflow_cl)
+        self.queue.finish()
+        FEs = FEs_h.reshape(nx_s, ny_s, nz, 4)
+        # Postflight: raise on any status flag or non-finite FEs
+        scan_pts_xy = pts[:, :3].reshape(nx_s, ny_s, 3)
+        self._pme_postflight_status(status, scan_pts_xy.reshape(-1, 3), min_r=min_r, offender=offender, overflow=overflow)
+        if not np.isfinite(FEs).all():
+            bad = np.argwhere(~np.isfinite(FEs).all(axis=-1))
+            worst = tuple(bad[0]) if len(bad) else None
+            raise RuntimeError(f"contact_pme GPU scan: non-finite FEs at {len(bad)} pixels, worst={worst}")
+        return FEs
+
+    def _pme_scan_python(self, params, pts, nxy, nz, dtip):
+        """Python fallback PP relaxation scan (CPU, slow — for parity testing only).
+
+        Simple damped relaxation: at each z step, relax the probe position laterally
+        against F = -∇E from eval_contact_pme. This is NOT the full FIRE/PPM kernel;
+        it produces finite FEs for shape/correctness checks when GPU kernels absent.
+        """
+        nx_s, ny_s = nxy
+        n_scan = nx_s * ny_s
+        # Tip apex starts at scan_p0; dpos0[2] = -bond_length, dpos0[3] = bond_length
+        bond_length = float(self.dpos0[3])
+        K_LAT = float(abs(self.stiffness[0]))
+        K_RAD = float(abs(self.stiffness[3]))
+        damp = float(self.relax_pars[0])
+        n_relax = 50
+        FEs = np.zeros((nx_s, ny_s, nz, 4), dtype=np.float32)
+        print(f"  Python PME scan: n_scan={n_scan} nz={nz} bond={bond_length} K_LAT={K_LAT} K_RAD={K_RAD} n_relax={n_relax}")
+        for iz in range(nz):
+            z_offset = iz * dtip  # dtip < 0 → approaching
+            if iz % max(1, nz // 10) == 0:
+                print(f"    iz={iz}/{nz} z_offset={z_offset:.3f}", flush=True)
+            # Probe apex positions for this z step
+            apex = pts[:, :3].copy()
+            apex[:, 2] += z_offset
+            # PP displacement (lateral relaxation): start at apex + dpos0[:3]
+            disp = np.zeros((n_scan, 3), dtype=np.float64)
+            disp[:, 2] = float(self.dpos0[2])  # -bond_length
+            vel = np.zeros((n_scan, 3), dtype=np.float64)
+            for _ in range(n_relax):
+                pp_pos = apex + disp
+                E, F = self.eval_contact_pme(pp_pos, params, use_gpu=False)
+                # Spring force: -K_LAT * disp_xy - K_RAD * (disp_z - dpos0_z_target)
+                # dpos0 = [0,0,-bond_length, bond_length]; target disp_z = -bond_length
+                F_spring = np.zeros_like(F)
+                F_spring[:, 0] = -K_LAT * disp[:, 0]
+                F_spring[:, 1] = -K_LAT * disp[:, 1]
+                F_spring[:, 2] = -K_RAD * (disp[:, 2] - float(self.dpos0[2]))
+                F_total = F + F_spring
+                # Damped velocity update
+                vel = damp * vel - F_total * 0.01
+                disp += vel * 0.1
+            # Final E, F at relaxed position
+            pp_pos = apex + disp
+            E, F = self.eval_contact_pme(pp_pos, params, use_gpu=False)
+            for k in range(n_scan):
+                ix, iy = k % nx_s, k // nx_s
+                FEs[ix, iy, iz, 0] = F[k, 0]
+                FEs[ix, iy, iz, 1] = F[k, 1]
+                FEs[ix, iy, iz, 2] = F[k, 2]
+                FEs[ix, iy, iz, 3] = E[k]
+        # Postflight: finiteness
+        if not np.isfinite(FEs).all():
+            bad = np.argwhere(~np.isfinite(FEs).all(axis=-1))
+            worst = tuple(bad[0]) if len(bad) else None
+            raise RuntimeError(f"contact_pme Python scan: non-finite FEs at {len(bad)} pixels, worst={worst}")
+        return FEs
+
     def get_raw_FE_pic(self, nxy=(60, 60), nz=21, dtip=-0.2, scan_p0=None, scan_da=None, scan_db=None, bAlloc=True):
         """Sample PIC field without PP relaxation."""
         assert self.pic is not None, "call fit_pic_contact_surface() first"
@@ -1398,6 +1900,471 @@ class AFMulator(OpenCLBase):
         FEs = FEs_h.reshape(nx_s, ny_s, nz, 4)
         print(f"AFMulator.get_raw_FE_pic: done FEs.shape={FEs.shape}")
         return FEs, pts[:, :3].reshape(nx_s, ny_s, 3)
+
+    # ── direct Morse+Coulomb PP-AFM (DifferentiableAFM_ParallelPlan, Wave 1) ──
+    # Backend='morse_direct': evaluates the uncapped Morse+Coulomb pair law
+    # directly during PP relaxation (no interpolated grid). Aperiodic, nAtoms<=128.
+    # Reuses scan_pts_cl / scan_FEs_cl; scan_disps_cl holds PP telemetry for this
+    # backend (same (n_scan*nz,4) float32 layout/lifetime — no new buffer added).
+    # See kernels/AFM.cl::relaxStrokesTiltedMorseDirect for the frozen contract.
+
+    def run_scan_morse_direct(self, nxy=(50,50), nz=60, dtip=-0.1,
+                              scan_p0=None, scan_da=None, scan_db=None,
+                              *, workgroup_size=64, bAlloc=True, return_pp=True):
+        """
+        Direct Morse+Coulomb PP-AFM scan (aperiodic, no grid).
+
+        Evaluates the uncapped getMorse + getCoulombAFM pair law directly during
+        FIRE relaxation, one work-item per scan lane, with all atoms preloaded
+        once into local memory. Returns sample FEs, the explicit scan raster
+        (for VJP reconstruction), and PP telemetry.
+
+        Args:
+            nxy: (nx, ny) scan lattice sizes (positive ints).
+            nz:  number of z slices (positive int).
+            dtip: per-z tip step [Å]; MUST be <0 for the MVP (approach downward).
+            scan_p0: (3,) scan origin [Å, world] — MANDATORY (no bbox auto-derive).
+            scan_da: (3,) scan a-axis step [Å] — MANDATORY.
+            scan_db: (3,) scan b-axis step [Å] — MANDATORY.
+            workgroup_size: OpenCL local size (positive int; 32/64/128 typical).
+            bAlloc: (re)allocate persistent scan buffers if True.
+            return_pp: if True, return PPs telemetry; else return (FEs, points_xyz).
+
+        Returns:
+            FEs:       (nx, ny, nz, 4) float32, kernel stroke order, iz=0 = highest
+                       tip position (no z flip). Channels (Fx,Fy,Fz,E) are SAMPLE FE
+                       after force rotation, uncapped.
+            points_xyz:(nx, ny, 3) float32 — scan start positions (iz=0). Pass back
+                       to vjp_scan_morse_direct() to reconstruct per-z support.
+            PPs:       (nx, ny, nz, 4) float32 — only if return_pp=True.
+                       .xyz = final world PP position; .w = +iter on convergence,
+                       -iter on non-convergence/nonfinite.
+
+        Raises:
+            AssertionError/ValueError on any contract violation (nAtoms out of
+            range, missing scan geometry, dtip>=0, non-Morse mode, stale state).
+            RuntimeError on any non-converged or nonfinite PP state, reporting the
+            first failing (ix,iy,iz) and diagnostic values. No silent fallback.
+        """
+        # ---- fail-loud input contract (G0) ----
+        assert self.use_morse, "run_scan_morse_direct requires use_morse=True (call AFMulator(use_morse=True))"
+        assert self.atoms_arr is not None and self.cLJs_arr is not None, "run_scan_morse_direct: call assign_params() first"
+        nAtoms = int(len(self.atoms_arr))
+        if not (1 <= nAtoms <= 128):
+            raise ValueError(f"run_scan_morse_direct: nAtoms={nAtoms} out of range [1,128]; limit is 128 (no silent grid fallback)")
+        assert self.atoms_arr.shape == (nAtoms, 4) and self.atoms_arr.dtype == np.float32, \
+            f"atoms_arr must be (nAtoms,4) float32, got {self.atoms_arr.shape} {self.atoms_arr.dtype}"
+        assert self.cLJs_arr.shape == (nAtoms, 4) and self.cLJs_arr.dtype == np.float32, \
+            f"cLJs_arr (Morse) must be (nAtoms,4) float32, got {self.cLJs_arr.shape} {self.cLJs_arr.dtype}"
+        # scan geometry: mandatory explicit three-vectors
+        if scan_p0 is None or scan_da is None or scan_db is None:
+            raise ValueError("run_scan_morse_direct: scan_p0, scan_da, scan_db are MANDATORY (no bbox auto-derive during fitting)")
+        scan_p0 = np.asarray(scan_p0, dtype=np.float32).reshape(3)
+        scan_da = np.asarray(scan_da, dtype=np.float32).reshape(3)
+        scan_db = np.asarray(scan_db, dtype=np.float32).reshape(3)
+        assert np.isfinite(scan_p0).all() and np.isfinite(scan_da).all() and np.isfinite(scan_db).all(), \
+            "run_scan_morse_direct: scan_p0/da/db must be finite"
+        # dtip<0 for the MVP (downward approach)
+        if not (float(dtip) < 0.0):
+            raise ValueError(f"run_scan_morse_direct: dtip must be <0 for the MVP, got dtip={dtip}")
+        # lattice sizes
+        try:
+            nx_s, ny_s = (int(nxy[0]), int(nxy[1]))
+        except Exception as e:
+            raise ValueError(f"run_scan_morse_direct: nxy must be a 2-tuple of positive ints, got {nxy!r}") from e
+        nz = int(nz)
+        assert nx_s > 0 and ny_s > 0 and nz > 0, f"run_scan_morse_direct: nx,ny,nz must be positive, got {nxy} nz={nz}"
+        workgroup_size = int(workgroup_size)
+        assert workgroup_size > 0, f"run_scan_morse_direct: workgroup_size must be positive, got {workgroup_size}"
+        n_scan = nx_s * ny_s
+
+        print(f"AFMulator.run_scan_morse_direct: nAtoms={nAtoms} nxy=({nx_s},{ny_s}) nz={nz} dtip={dtip} wg={workgroup_size}")
+        print(f"  scan_p0={scan_p0}  da={scan_da}  db={scan_db}")
+
+        # ---- build scan-points raster (ix outer, iy inner) — matches run_scan ----
+        pts = np.zeros((n_scan, 4), dtype=np.float32)
+        k = 0
+        for ix in range(nx_s):
+            for iy in range(ny_s):
+                pts[k, :3] = scan_p0 + scan_da * ix + scan_db * iy
+                k += 1
+
+        # ---- buffer size guards ----
+        FEs_bytes = n_scan * nz * 4 * 4
+        if FEs_bytes > self._max_alloc:
+            raise MemoryError(f"run_scan_morse_direct: FEs buffer needs {FEs_bytes} bytes ({_bytes_to_gb(FEs_bytes):.3f} GB) > device max_alloc {_bytes_to_gb(self._max_alloc):.3f} GB")
+        # local memory: LATOMS + LCMS, each nAtoms*16 bytes (dynamic __local args)
+        local_bytes = 2 * nAtoms * 16
+        max_local = self.ctx.devices[0].get_info(cl.device_info.LOCAL_MEM_SIZE)
+        if local_bytes > max_local:
+            raise MemoryError(f"run_scan_morse_direct: local mem {local_bytes} B > device LOCAL_MEM_SIZE {max_local} B for nAtoms={nAtoms}")
+
+        # ---- (re)allocate persistent buffers and upload atom/Morse data ----
+        if bAlloc:
+            self.realloc_forcefield_buffers(nAtoms)
+            self.realloc_scan_buffers(n_scan, nz)
+        # morse_direct does NOT use img_FF; upload atoms/cMs directly (no grid needed)
+        self.toGPU_(self.atoms_cl, self.atoms_arr)
+        self.toGPU_(self.cLJs_cl,  self.cLJs_arr)
+        self.toGPU_(self.scan_pts_cl, pts)
+
+        # ---- launch relaxStrokesTiltedMorseDirect ----
+        # Padded nScan launch so all padded lanes participate in preload+barrier.
+        # scan_disps_cl is reused as the PPs telemetry buffer (same (n_scan*nz,4) layout).
+        tipC = self.tipC.copy(); tipC[3] = np.float32(dtip)
+        gs = (self._roundup(n_scan, workgroup_size),)
+        ls = (workgroup_size,)
+        LATOMS = cl.LocalMemory(nAtoms * 16)
+        LCMS   = cl.LocalMemory(nAtoms * 16)
+        self.prg.relaxStrokesTiltedMorseDirect(
+            self.queue, gs, ls,
+            np.int32(nAtoms), self.atoms_cl, self.cLJs_cl,
+            self.scan_pts_cl, self.scan_FEs_cl, self.scan_disps_cl,
+            self.tipA, self.tipB, tipC, self.stiffness, self.dpos0,
+            self.relax_pars, self.surfFF, self.tipQs, self.tipQZs,
+            np.int32(n_scan), np.int32(nz), LATOMS, LCMS
+        )
+        self.queue.finish()
+
+        # ---- download FEs and PPs ----
+        FEs_h = np.zeros((n_scan * nz, 4), dtype=np.float32)
+        PPs_h = np.zeros((n_scan * nz, 4), dtype=np.float32)
+        self.fromGPU_(self.scan_FEs_cl, FEs_h)
+        self.fromGPU_(self.scan_disps_cl, PPs_h)
+        self.queue.finish()
+        FEs = FEs_h.reshape(nx_s, ny_s, nz, 4)
+        PPs = PPs_h.reshape(nx_s, ny_s, nz, 4)
+        points_xyz = pts[:, :3].reshape(nx_s, ny_s, 3)
+
+        # ---- fail-loud PP telemetry check (G2) ----
+        # .w = +iter on convergence; -iter on non-convergence/nonfinite.
+        # Host raises on any negative/nonfinite entry and reports first (ix,iy,iz).
+        finite_mask = np.isfinite(PPs).all(axis=-1)  # (nx,ny,nz)
+        neg_mask = PPs[..., 3] < 0.0
+        bad_mask = (~finite_mask) | neg_mask
+        if bad_mask.any():
+            ix, iy, iz = np.unravel_index(np.argmax(bad_mask), bad_mask.shape)
+            pp = PPs[ix, iy, iz]
+            iters = int(abs(pp[3]))
+            reason = "nonfinite" if not finite_mask[ix, iy, iz] else f"non-converged (iters={iters})"
+            raise RuntimeError(
+                f"run_scan_morse_direct: PP telemetry failed at (ix={ix},iy={iy},iz={iz}): "
+                f"{reason}  PP.xyz=({pp[0]:.6f},{pp[1]:.6f},{pp[2]:.6f}) PP.w={pp[3]:.1f}  "
+                f"FE=({FEs[ix,iy,iz,0]:.6f},{FEs[ix,iy,iz,1]:.6f},{FEs[ix,iy,iz,2]:.6f},{FEs[ix,iy,iz,3]:.6f})"
+            )
+        # report iteration stats (telemetry, not a gate)
+        iters_all = PPs[..., 3].astype(np.int64)
+        print(f"AFMulator.run_scan_morse_direct: converged all {n_scan*nz} states; "
+              f"iters min={iters_all.min()} max={iters_all.max()} mean={iters_all.mean():.1f}")
+        print(f"AFMulator.run_scan_morse_direct: done FEs.shape={FEs.shape} PPs.shape={PPs.shape}")
+
+        # ---- record forward-generation state for VJP stale-state guard ----
+        # vjp_scan_morse_direct compares its inputs/current self state against this
+        # snapshot and raises if anything changed between forward and VJP (contract:
+        # "validates that PPs, atom/Morse buffers, tip settings, and scan geometry
+        # belong to the same forward generation. It raises on a stale or mismatched
+        # forward state.").  Cheap content hashes (nAtoms<=128 -> <=2 KB) detect
+        # silent atom/parameter mutation.
+        self._morse_direct_fwd_state = {
+            'nAtoms': nAtoms, 'nx': nx_s, 'ny': ny_s, 'nz': nz, 'dtip': float(dtip),
+            'scan_p0': scan_p0.copy(), 'scan_da': scan_da.copy(), 'scan_db': scan_db.copy(),
+            'atoms_hash': hash(self.atoms_arr.tobytes()),
+            'cLJs_hash':  hash(self.cLJs_arr.tobytes()),
+            'tipA': self.tipA.copy(), 'tipB': self.tipB.copy(),
+            'stiffness': self.stiffness.copy(), 'dpos0': self.dpos0.copy(),
+            'tipQs': self.tipQs.copy(), 'tipQZs': self.tipQZs.copy(),
+            'surfFF': self.surfFF.copy(),
+        }
+
+        if return_pp:
+            return FEs, points_xyz, PPs
+        return FEs, points_xyz
+
+    # ── direct Morse+Coulomb VJP (DifferentiableAFM_ParallelPlan, Wave 2) ──────
+    # Implicit-equilibrium VJP: given converged PPs + upstream dL/dFEs, solve the
+    # 3×3 adjoint system per state and reduce per-atom partials into (nAtoms,6).
+    # Three kernel passes: morseDirectStateAdjoint → morseDirectParamPartials →
+    # reduceMorseDirectParamPartials.  See kernels/AFM.cl for the frozen contract.
+
+    def vjp_scan_morse_direct(self, PPs, points_xyz, dtip, dL_dFEs,
+                              *, workgroup_size=64, bAlloc=True):
+        """
+        Implicit-equilibrium VJP for the direct Morse+Coulomb PP-AFM backend.
+
+        Given the converged PP telemetry (from run_scan_morse_direct), the scan
+        raster, and an upstream derivative dL/dFEs, compute the VJP
+        dL/d(theta) with respect to per-atom (x,y,z,R0,E0,Q).
+
+        Args:
+            PPs:          (nx, ny, nz, 4) float32 — converged PP telemetry from
+                          run_scan_morse_direct.  .xyz = final world PP position;
+                          .w = +iter (must be >0, i.e. converged).
+            points_xyz:   (nx, ny, 3) float32 — scan start positions (iz=0).
+                          Must match the forward-returned array.
+            dtip:         float < 0 — per-z tip step [Å] (same as forward).
+            dL_dFEs:      (nx, ny, nz, 4) float32 — upstream gradient w.r.t. FEs.
+            workgroup_size: OpenCL local size for the adjoint + reduction passes.
+            bAlloc:       (re)allocate VJP persistent buffers if True.
+
+        Returns:
+            grad_theta:   (nAtoms, 6) float64 — per-atom (dx,dy,dz,dR0,dE0,dQ).
+            diagnostics:  dict with keys:
+                          'residual_norms'   (nx,ny,nz) float64,
+                          'lambda_mins'      (nx,ny,nz) float64,
+                          'condition_estimates' (nx,ny,nz) float64,
+                          'status_codes'     (nx,ny,nz) int.
+
+        Raises:
+            AssertionError/ValueError on any contract violation.
+            RuntimeError if any adjoint state fails (status_code != 0), reporting
+            the first failing (ix,iy,iz) and diagnostic values.
+        """
+        # ---- fail-loud input validation (G0) ----
+        assert self.use_morse, "vjp_scan_morse_direct requires use_morse=True"
+        assert self.atoms_arr is not None and self.cLJs_arr is not None, \
+            "vjp_scan_morse_direct: call assign_params() first"
+        nAtoms = int(len(self.atoms_arr))
+        if not (1 <= nAtoms <= 128):
+            raise ValueError(f"vjp_scan_morse_direct: nAtoms={nAtoms} out of range [1,128]")
+        PPs = np.asarray(PPs)
+        points_xyz = np.asarray(points_xyz)
+        dL_dFEs = np.asarray(dL_dFEs)
+        if PPs.ndim != 4 or PPs.shape[3] != 4:
+            raise ValueError(f"vjp_scan_morse_direct: PPs must be (nx,ny,nz,4), got {PPs.shape}")
+        if PPs.dtype != np.float32:
+            raise ValueError(f"vjp_scan_morse_direct: PPs must be float32, got {PPs.dtype}")
+        if points_xyz.ndim != 3 or points_xyz.shape[2] != 3:
+            raise ValueError(f"vjp_scan_morse_direct: points_xyz must be (nx,ny,3), got {points_xyz.shape}")
+        if points_xyz.dtype != np.float32:
+            raise ValueError(f"vjp_scan_morse_direct: points_xyz must be float32, got {points_xyz.dtype}")
+        if dL_dFEs.shape != PPs.shape:
+            raise ValueError(f"vjp_scan_morse_direct: dL_dFEs shape {dL_dFEs.shape} != PPs shape {PPs.shape}")
+        if dL_dFEs.dtype != np.float32:
+            raise ValueError(f"vjp_scan_morse_direct: dL_dFEs must be float32, got {dL_dFEs.dtype}")
+        nx, ny, nz = PPs.shape[:3]
+        if points_xyz.shape[:2] != (nx, ny):
+            raise ValueError(f"vjp_scan_morse_direct: points_xyz ({points_xyz.shape[:2]}) != PPs ({nx},{ny})")
+        if not np.isfinite(PPs).all():
+            raise ValueError("vjp_scan_morse_direct: PPs contains nonfinite values")
+        if not np.isfinite(dL_dFEs).all():
+            raise ValueError("vjp_scan_morse_direct: dL_dFEs contains nonfinite values")
+        if (PPs[..., 3] <= 0.0).any():
+            bad = np.argmax(PPs[..., 3] <= 0.0)
+            ix, iy, iz = np.unravel_index(bad, (nx, ny, nz))
+            raise ValueError(
+                f"vjp_scan_morse_direct: PPs[{ix},{iy},{iz}].w={PPs[ix,iy,iz,3]:.1f} <= 0 "
+                f"(non-converged); VJP requires all converged states")
+        dtip = float(dtip)
+        if dtip >= 0.0:
+            raise ValueError(f"vjp_scan_morse_direct: dtip must be <0, got dtip={dtip}")
+        workgroup_size = int(workgroup_size)
+        assert workgroup_size > 0, f"vjp_scan_morse_direct: workgroup_size must be positive, got {workgroup_size}"
+        n_scan = nx * ny
+        n_state = n_scan * nz
+        n_sa = n_scan * nAtoms
+        print(f"AFMulator.vjp_scan_morse_direct: nAtoms={nAtoms} nxy=({nx},{ny}) nz={nz} dtip={dtip} wg={workgroup_size}")
+
+        # ---- stale-forward-state guard (contract: "raises on a stale or mismatched
+        # forward state") ----  Compares the current self state against the snapshot
+        # recorded by the most recent run_scan_morse_direct.  Detects: missing
+        # forward, atom/Morse mutation, tip/stiffness/scan-geometry change, nAtoms
+        # mismatch, dtip mismatch.  Cheap content hashes (nAtoms<=128 -> <=2 KB).
+        fwd = getattr(self, '_morse_direct_fwd_state', None)
+        if fwd is None:
+            raise RuntimeError("vjp_scan_morse_direct: no prior run_scan_morse_direct forward state recorded "
+                               "(call run_scan_morse_direct first); cannot validate VJP inputs")
+        mismatches = []
+        if fwd['nAtoms'] != nAtoms:
+            mismatches.append(f"nAtoms fwd={fwd['nAtoms']} vs vjp={nAtoms}")
+        if fwd['nx'] != nx or fwd['ny'] != ny or fwd['nz'] != nz:
+            mismatches.append(f"scan shape fwd=({fwd['nx']},{fwd['ny']},{fwd['nz']}) vs vjp=({nx},{ny},{nz})")
+        if abs(fwd['dtip'] - dtip) > 1e-12:
+            mismatches.append(f"dtip fwd={fwd['dtip']!r} vs vjp={dtip!r}")
+        # scan geometry: the VJP does not receive scan_p0/da/db directly, but
+        # points_xyz must match the forward raster; compare against the recorded
+        # raster reconstructed from scan_p0/da/db and (nx,ny).
+        fwd_pts = np.zeros((fwd['nx'] * fwd['ny'], 3), dtype=np.float32)
+        k = 0
+        for ix in range(fwd['nx']):
+            for iy in range(fwd['ny']):
+                fwd_pts[k] = fwd['scan_p0'] + fwd['scan_da'] * ix + fwd['scan_db'] * iy
+                k += 1
+        fwd_pts = fwd_pts.reshape(fwd['nx'], fwd['ny'], 3)
+        if not np.allclose(fwd_pts, points_xyz, atol=0.0, rtol=0.0):
+            mismatches.append("points_xyz does not match the forward scan raster "
+                              f"(max|diff|={np.abs(fwd_pts - points_xyz).max():.6e})")
+        # atom/Morse content hashes — detect silent mutation between fwd and vjp
+        if hash(self.atoms_arr.tobytes()) != fwd['atoms_hash']:
+            mismatches.append("atoms_arr content changed since forward (atoms_hash mismatch)")
+        if hash(self.cLJs_arr.tobytes()) != fwd['cLJs_hash']:
+            mismatches.append("cLJs_arr content changed since forward (cLJs_hash mismatch)")
+        # tip/stiffness/surfFF — must be byte-identical (no silent tip change)
+        for nm in ('tipA', 'tipB', 'stiffness', 'dpos0', 'tipQs', 'tipQZs', 'surfFF'):
+            cur = getattr(self, nm)
+            if not np.array_equal(cur, fwd[nm]):
+                mismatches.append(f"{nm} changed since forward (fwd={fwd[nm]} vs cur={cur})")
+        if mismatches:
+            raise RuntimeError("vjp_scan_morse_direct: stale or mismatched forward state:\n  - " +
+                               "\n  - ".join(mismatches))
+
+        # ---- buffer size guards ----
+        state_bytes = n_state * 16  # float4 per state
+        sa_bytes = n_sa * 16        # float4 per (scan,atom)
+        atom_bytes = nAtoms * 16
+        for name, b in [("lambdas", state_bytes), ("adjoint_diag", state_bytes),
+                        ("partial_xR", sa_bytes), ("partial_EQ", sa_bytes),
+                        ("grad_xR", atom_bytes), ("grad_EQ", atom_bytes)]:
+            if b > self._max_alloc:
+                raise MemoryError(f"vjp_scan_morse_direct: {name} buffer needs {b} bytes "
+                                  f"({_bytes_to_gb(b):.3f} GB) > device max_alloc "
+                                  f"{_bytes_to_gb(self._max_alloc):.3f} GB")
+        # local memory for adjoint pass: LATOMS + LCMS
+        local_bytes = 2 * nAtoms * 16
+        max_local = self.ctx.devices[0].get_info(cl.device_info.LOCAL_MEM_SIZE)
+        if local_bytes > max_local:
+            raise MemoryError(f"vjp_scan_morse_direct: local mem {local_bytes} B > "
+                              f"device LOCAL_MEM_SIZE {max_local} B for nAtoms={nAtoms}")
+        # local memory for reduction pass: L_xR + L_EQ, each wg*16 bytes
+        local_bytes_red = 2 * workgroup_size * 16
+        if local_bytes_red > max_local:
+            raise MemoryError(f"vjp_scan_morse_direct: reduction local mem {local_bytes_red} B > "
+                              f"device LOCAL_MEM_SIZE {max_local} B for wg={workgroup_size}")
+
+        # ---- (re)allocate persistent VJP buffers ----
+        if bAlloc:
+            # reuse scan buffers for points, dL_dFEs, PPs (same layout/lifetime)
+            self.realloc_scan_buffers(n_scan, nz)
+            self.realloc_forcefield_buffers(nAtoms)
+            # VJP-specific persistent buffers
+            self.try_make_buffers({
+                "vjp_lambdas":     state_bytes,
+                "vjp_adjoint_diag": state_bytes,
+                "vjp_partial_xR":  sa_bytes,
+                "vjp_partial_EQ":  sa_bytes,
+                "vjp_grad_xR":     atom_bytes,
+                "vjp_grad_EQ":     atom_bytes,
+            }, suffix="_cl")
+        # upload atoms/cMs (must match the forward generation)
+        self.toGPU_(self.atoms_cl, self.atoms_arr)
+        self.toGPU_(self.cLJs_cl,  self.cLJs_arr)
+        # upload points (pad .w=0), dL_dFEs, PPs — reuse scan_*_cl buffers
+        pts_flat = np.zeros((n_scan, 4), dtype=np.float32)
+        pts_flat[:, :3] = points_xyz.reshape(n_scan, 3)
+        self.toGPU_(self.scan_pts_cl, pts_flat)
+        self.toGPU_(self.scan_FEs_cl, dL_dFEs.reshape(n_state, 4))
+        self.toGPU_(self.scan_disps_cl, PPs.reshape(n_state, 4))
+
+        # ---- kernel 1: morseDirectStateAdjoint ----
+        # one work-item per (scan,z) state; local mem for atom preload
+        tipC = self.tipC.copy(); tipC[3] = np.float32(dtip)
+        gs1 = (self._roundup(n_state, workgroup_size),)
+        ls1 = (workgroup_size,)
+        LATOMS = cl.LocalMemory(nAtoms * 16)
+        LCMS   = cl.LocalMemory(nAtoms * 16)
+        self.prg.morseDirectStateAdjoint(
+            self.queue, gs1, ls1,
+            np.int32(nAtoms), self.atoms_cl, self.cLJs_cl,
+            self.scan_pts_cl, self.scan_disps_cl,
+            self.scan_FEs_cl, self.vjp_lambdas_cl,
+            self.vjp_adjoint_diag_cl,
+            self.tipA, self.tipB, tipC, self.stiffness, self.dpos0,
+            self.surfFF, self.tipQs, self.tipQZs,
+            np.int32(n_scan), np.int32(nz), LATOMS, LCMS
+        )
+        self.queue.finish()
+
+        # ---- download adjoint_diag and check status (fail-loud) ----
+        adjoint_diag_h = np.zeros((n_state, 4), dtype=np.float32)
+        self.fromGPU_(self.vjp_adjoint_diag_cl, adjoint_diag_h)
+        self.queue.finish()
+        adjoint_diag = adjoint_diag_h.reshape(nx, ny, nz, 4)
+        # host-side nonfinite guard: a kernel that wrote NaN/Inf into the diag
+        # channels (residual/lambda_min/cond) before setting a non-zero status
+        # must still be caught here, not propagated downstream.
+        if not np.isfinite(adjoint_diag).all():
+            flat_idx = int(np.argmax(~np.isfinite(adjoint_diag).all(axis=-1)))
+            ix, iy, iz = np.unravel_index(flat_idx, (nx, ny, nz))
+            raise RuntimeError(
+                f"vjp_scan_morse_direct: adjoint_diag nonfinite at (ix={ix},iy={iy},iz={iz}): "
+                f"diag={adjoint_diag[ix,iy,iz]}")
+        residual_norms   = adjoint_diag[..., 0].astype(np.float64)
+        lambda_mins      = adjoint_diag[..., 1].astype(np.float64)
+        condition_estimates = adjoint_diag[..., 2].astype(np.float64)
+        status_codes     = adjoint_diag[..., 3].astype(np.int64)
+        bad_mask = status_codes != 0
+        if bad_mask.any():
+            flat_idx = int(np.argmax(bad_mask))
+            ix, iy, iz = np.unravel_index(flat_idx, (nx, ny, nz))
+            raise RuntimeError(
+                f"vjp_scan_morse_direct: adjoint failed at (ix={ix},iy={iy},iz={iz}): "
+                f"status_code={int(status_codes[ix,iy,iz])} "
+                f"residual_norm={residual_norms[ix,iy,iz]:.6e} "
+                f"lambda_min={lambda_mins[ix,iy,iz]:.6e} "
+                f"condition_estimate={condition_estimates[ix,iy,iz]:.6e}"
+            )
+        print(f"AFMulator.vjp_scan_morse_direct: adjoint OK; "
+              f"residual worst={residual_norms.max():.6e} "
+              f"lambda_min worst={lambda_mins.min():.6e} "
+              f"cond worst={condition_estimates.max():.6e}")
+
+        # ---- kernel 2: morseDirectParamPartials ----
+        # one work-item per (scan,atom); no local memory needed
+        gs2 = (n_sa,)
+        ls2 = (1,)
+        self.prg.morseDirectParamPartials(
+            self.queue, gs2, ls2,
+            np.int32(nAtoms), self.atoms_cl, self.cLJs_cl,
+            self.scan_pts_cl, self.scan_disps_cl,
+            self.scan_FEs_cl, self.vjp_lambdas_cl,
+            self.vjp_partial_xR_cl, self.vjp_partial_EQ_cl,
+            self.tipA, self.tipB, tipC, self.tipQs, self.tipQZs,
+            np.int32(n_scan), np.int32(nz)
+        )
+        self.queue.finish()
+
+        # ---- kernel 3: reduceMorseDirectParamPartials ----
+        # one workgroup per atom, reduce over scan dimension
+        gs3 = (nAtoms * workgroup_size,)
+        ls3 = (workgroup_size,)
+        L_xR = cl.LocalMemory(workgroup_size * 16)
+        L_EQ = cl.LocalMemory(workgroup_size * 16)
+        self.prg.reduceMorseDirectParamPartials(
+            self.queue, gs3, ls3,
+            np.int32(nAtoms), np.int32(n_scan),
+            self.vjp_partial_xR_cl, self.vjp_partial_EQ_cl,
+            self.vjp_grad_xR_cl, self.vjp_grad_EQ_cl,
+            L_xR, L_EQ
+        )
+        self.queue.finish()
+
+        # ---- download and pack grad_theta ----
+        grad_xR_h = np.zeros((nAtoms, 4), dtype=np.float32)
+        grad_EQ_h = np.zeros((nAtoms, 4), dtype=np.float32)
+        self.fromGPU_(self.vjp_grad_xR_cl, grad_xR_h)
+        self.fromGPU_(self.vjp_grad_EQ_cl, grad_EQ_h)
+        self.queue.finish()
+        # grad_xR = (dx, dy, dz, dR0); grad_EQ = (dE0, dQ, 0, 0)
+        grad_theta = np.zeros((nAtoms, 6), dtype=np.float64)
+        grad_theta[:, 0:3] = grad_xR_h[:, 0:3].astype(np.float64)
+        grad_theta[:, 3]   = grad_xR_h[:, 3].astype(np.float64)   # dR0
+        grad_theta[:, 4]   = grad_EQ_h[:, 0].astype(np.float64)   # dE0
+        grad_theta[:, 5]   = grad_EQ_h[:, 1].astype(np.float64)   # dQ
+        # fail-loud: a nonfinite gradient indicates a kernel bug (e.g. a NaN partial
+        # that slipped past the adjoint status gate); never return silently.
+        if not np.isfinite(grad_theta).all():
+            bad = np.argmax(~np.isfinite(grad_theta).all(axis=-1))
+            raise RuntimeError(
+                f"vjp_scan_morse_direct: grad_theta nonfinite at atom {bad}: "
+                f"grad_xR={grad_xR_h[bad]} grad_EQ={grad_EQ_h[bad]}")
+        diagnostics = {
+            'residual_norms':      residual_norms,
+            'lambda_mins':         lambda_mins,
+            'condition_estimates': condition_estimates,
+            'status_codes':        status_codes,
+        }
+        print(f"AFMulator.vjp_scan_morse_direct: done grad_theta.shape={grad_theta.shape} "
+              f"|grad|_max={np.abs(grad_theta).max():.6e}")
+        return grad_theta, diagnostics
 
     # ── raw FF (no PP relaxation) ─────────────────────────────────────────────
 
@@ -2002,6 +2969,84 @@ def compute_df_dir(FEs, spacing, osc_dir=(0., 0., 1.)):
             raise ValueError(f"FEs axis {ia} needs at least 2 samples for osc_dir={tuple(n)}")
         df -= n[ia] * np.gradient(F_n, dr[ia], axis=ia)
     return df
+
+def df_loss_seed(FEs, target_df, dtip, weights=None):
+    """Exact discrete central-difference df loss and its adjoint (VJP seed).
+
+    Implements the frozen SSOT loss (DifferentiableAFM_ParallelPlan, contract v1):
+
+        df[:,:,iz] = -(Fz[:,:,iz+1] - Fz[:,:,iz-1]) / (2*|dtip|),  iz=1..nz-2
+        L = 0.5 * sum(w * (df - target_df)^2) / sum(w)
+
+    Boundary z slices (iz=0, iz=nz-1) have zero weight.  ``dL_dFEs`` is the exact
+    transpose (adjoint) of the discrete df operator applied to ``(df - target_df)``,
+    with the same shape as ``FEs``; only the ``.z`` channel (index 2) is nonzero.
+
+    Fully vectorized with NumPy — no Python loops over z.
+
+    Args:
+        FEs:        (nx, ny, nz, 4) float32 or float64 — force/energy volume.
+        target_df:  (nx, ny, nz)    — target df image.
+        dtip:       float < 0       — per-z tip step [Å].
+        weights:    (nx, ny, nz) or None — per-pixel weights; None ⇒ 1 for
+                    interior slices (1..nz-2), 0 for boundaries.
+
+    Returns:
+        loss:     float — scalar loss L.
+        df:       (nx, ny, nz) float64 — central-difference df (0 at boundaries).
+        dL_dFEs:  (nx, ny, nz, 4) float64 — adjoint w.r.t. FEs; only .z nonzero.
+    """
+    FEs = np.asarray(FEs)
+    target_df = np.asarray(target_df, dtype=np.float64)
+    nx, ny, nz = FEs.shape[:3]
+    if FEs.ndim != 4 or FEs.shape[3] < 3:
+        raise ValueError(f"df_loss_seed: FEs must be (nx,ny,nz,>=4), got {FEs.shape}")
+    if target_df.shape != (nx, ny, nz):
+        raise ValueError(f"df_loss_seed: target_df must be ({nx},{ny},{nz}), got {target_df.shape}")
+    dtip = float(dtip)
+    if dtip >= 0.0:
+        raise ValueError(f"df_loss_seed: dtip must be <0, got dtip={dtip}")
+    if nz < 3:
+        raise ValueError(f"df_loss_seed: need nz>=3 for central difference, got nz={nz}")
+    # weights: default 1 for interior, 0 for boundaries
+    if weights is None:
+        w = np.ones((nx, ny, nz), dtype=np.float64)
+        w[:, :, 0] = 0.0; w[:, :, -1] = 0.0
+    else:
+        w = np.asarray(weights, dtype=np.float64)
+        if w.shape != (nx, ny, nz):
+            raise ValueError(f"df_loss_seed: weights must be ({nx},{ny},{nz}), got {w.shape}")
+    Fz = FEs[:, :, :, 2].astype(np.float64)  # (nx,ny,nz) — only z channel matters
+    dz_abs = abs(dtip)
+    # ---- forward: central difference df ----
+    df = np.zeros((nx, ny, nz), dtype=np.float64)
+    df[:, :, 1:nz-1] = -(Fz[:, :, 2:nz] - Fz[:, :, 0:nz-2]) / (2.0 * dz_abs)
+    # ---- loss ----
+    diff = df - target_df  # (nx,ny,nz)
+    wsum = float(w.sum())
+    if wsum <= 0.0:
+        raise ValueError("df_loss_seed: sum(weights) must be > 0")
+    loss = 0.5 * float(np.sum(w * diff**2)) / wsum
+    # ---- adjoint: dL/dFz via transpose of the central-difference stencil ----
+    # dL/d(df[j]) = w[j] * (df[j] - tgt[j]) / wsum
+    dL_ddf = w * diff / wsum  # (nx,ny,nz)
+    # df[j] = -(Fz[j+1] - Fz[j-1]) / (2*dz)
+    # d(df[j])/dFz[iz] = -1/(2dz) if iz=j+1, +1/(2dz) if iz=j-1, 0 otherwise
+    # dL/dFz[iz] = sum_j dL/ddf[j] * d(df[j])/dFz[iz]
+    #            = dL/ddf[iz-1]*(+1/(2dz)) + dL/ddf[iz+1]*(-1/(2dz))
+    dL_dFz = np.zeros((nx, ny, nz), dtype=np.float64)
+    coeff = 1.0 / (2.0 * dz_abs)
+    # interior iz=1..nz-2: j=iz-1 gives -1/(2dz), j=iz+1 gives +1/(2dz)
+    dL_dFz[:, :, 1:nz-1] = (dL_ddf[:, :, 2:nz] - dL_ddf[:, :, 0:nz-2]) * coeff
+    # boundary iz=0: only j=1 contributes (iz=j-1=0 → +1/(2dz))
+    dL_dFz[:, :, 0] = dL_ddf[:, :, 1] * coeff
+    # boundary iz=nz-1: only j=nz-2 contributes (iz=j+1=nz-1 → -1/(2dz))
+    dL_dFz[:, :, -1] = -dL_ddf[:, :, nz-2] * coeff
+    # ---- pack into dL_dFEs (only .z nonzero) ----
+    dL_dFEs = np.zeros((nx, ny, nz, 4), dtype=np.float64)
+    dL_dFEs[:, :, :, 2] = dL_dFz
+    return loss, df, dL_dFEs
+
 
 def compute_df_amp_dir(FEs, spacing, osc_dir=(0., 0., 1.), amp=1.0):
     """Frequency shift with finite amplitude for arbitrary oscillation direction.

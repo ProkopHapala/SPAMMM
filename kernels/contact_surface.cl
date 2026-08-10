@@ -1025,6 +1025,226 @@ __kernel void evalRadialPIC(
     out_fe[i] = cs_eval_pic_fe_at(x, y, z, atoms, atom_coeffs, bucket_atoms, bucket_offsets, meta, bucket_meta, m_start);
 }
 
+// ===================== contact_pme: particle-mesh contact surface (contract v2) =====================
+// Nonperiodic, zero-padded boundary. NO PBC wrapping. V(r) ≈ V_mesh + Σ_i V_core_i; F = -∇E.
+// Python prototypes: spammm/surfaces/CoarseMesh.py (mesh), PICCore.py (core), PMESplit.py (split).
+// Stencil reference: gridFF.cl:72-93 (basis/dbasis) — copied formulas only, NOT PBC wrapping.
+
+#define CS_PME_NMODES 5           // doubling-power core modes: p_m = 4,8,16,32,64
+#define CS_PME_CORE_MAX_CAND 512  // safety cap on core candidates per query (fail-loud overflow)
+
+// ---- cardinal cubic B-spline basis (matches gridFF.cl:72-93 and CoarseMesh._basis) ----
+inline float4 cs_pme_basis(float u) {
+    const float inv6 = 1.0f / 6.0f;
+    const float u2 = u * u;
+    const float t = 1.0f - u;
+    return (float4)(inv6 * t * t * t,
+                   inv6 * (3.0f * u2 * (u - 2.0f) + 4.0f),
+                   inv6 * (3.0f * u * (1.0f + u - u2) + 1.0f),
+                   inv6 * u2 * u);
+}
+
+inline float4 cs_pme_dbasis(float u) {
+    const float u2 = u * u;
+    const float t = 1.0f - u;
+    return (float4)(-0.5f * t * t,
+                    0.5f * (3.0f * u2 - 4.0f * u),
+                    0.5f * (-3.0f * u2 + 2.0f * u + 1.0f),
+                    0.5f * u2);
+}
+
+// Bounded scalar tricubic B-spline interpolation with analytic gradient.
+// Zero-padding boundary (NO PBC): full 4×4×4 stencil must fit in [0,n-1].
+// Layout: C-order (nx,ny,nz), z fastest → index = (ix*ny + iy)*nz + iz.
+// Returns float4 (Fx,Fy,Fz,E). *out_status: 0=OK, 1=stencil out of bounds (→ NAN).
+inline float4 cs_pme_tricubic_eval(
+    float x, float y, float z,
+    __global const float* coeffs, int nx, int ny, int nz,
+    float ox, float oy, float oz, float h,
+    int* out_status)
+{
+    float inv_h = 1.0f / h;
+    float fx = (x - ox) * inv_h;
+    float fy = (y - oy) * inv_h;
+    float fz = (z - oz) * inv_h;
+    int ix = (int)floor(fx); int iy = (int)floor(fy); int iz = (int)floor(fz);
+    float ux = fx - (float)ix; float uy = fy - (float)iy; float uz = fz - (float)iz;
+    int i0x = ix - 1, i0y = iy - 1, i0z = iz - 1;  // stencil base ix-1..ix+2
+    if (i0x < 0 || i0y < 0 || i0z < 0 || i0x + 3 >= nx || i0y + 3 >= ny || i0z + 3 >= nz) {
+        *out_status = 1;
+        return (float4)(NAN, NAN, NAN, NAN);
+    }
+    float4 bx = cs_pme_basis(ux), by = cs_pme_basis(uy), bz = cs_pme_basis(uz);
+    float4 dbx = cs_pme_dbasis(ux) * inv_h, dby = cs_pme_dbasis(uy) * inv_h, dbz = cs_pme_dbasis(uz) * inv_h;
+    float bxa[4] = {bx.x, bx.y, bx.z, bx.w};
+    float bya[4] = {by.x, by.y, by.z, by.w};
+    float bza[4] = {bz.x, bz.y, bz.z, bz.w};
+    float dbxa[4] = {dbx.x, dbx.y, dbx.z, dbx.w};
+    float dbya[4] = {dby.x, dby.y, dby.z, dby.w};
+    float dbza[4] = {dbz.x, dbz.y, dbz.z, dbz.w};
+    float e = 0.0f, gx = 0.0f, gy = 0.0f, gz = 0.0f;
+    for (int a = 0; a < 4; a++) {
+        int ia = i0x + a; float cx = bxa[a], dx = dbxa[a];
+        for (int b = 0; b < 4; b++) {
+            int ib = i0y + b; float cy = bya[b], dy = dbya[b];
+            float cxy = cx * cy;
+            for (int c = 0; c < 4; c++) {
+                int ic = i0z + c; float cz = bza[c], dz = dbza[c];
+                float v = coeffs[(ia * ny + ib) * nz + ic];
+                float w = cxy * cz;
+                e  += w * v;
+                gx += dx * cy * cz * v;
+                gy += cx * dy * cz * v;
+                gz += cxy * dz * v;
+            }
+        }
+    }
+    *out_status = 0;
+    return (float4)(-gx, -gy, -gz, e);  // F = -∇E
+}
+
+// 5-mode doubling-power core basis: phi_m(r) = t^p_m, p_m = 4,8,16,32,64.
+// t = (r_cut - r)/(r_cut - r_lo_i). Exactly zero for r >= r_cut. Matches PICCore.core_basis.
+// Fills phi[5], dphi[5] (dphi = dphi/dr). Derivatives via chain rule on repeated squaring.
+inline void cs_pme_core_basis(float r, float r_lo_i, float r_cut, float* phi, float* dphi) {
+    float D = r_cut - r_lo_i;
+    float t = (r_cut - r) / D;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    bool active = (r >= r_lo_i) && (r < r_cut);
+    float dt = active ? (-1.0f / D) : 0.0f;  // dt/dr
+    float t2 = t * t, t3 = t2 * t;
+    float t4 = t2 * t2;       float dt4 = 4.0f * t3 * dt;
+    float t8 = t4 * t4;       float dt8 = 2.0f * t4 * dt4;
+    float t16 = t8 * t8;      float dt16 = 2.0f * t8 * dt8;
+    float t32 = t16 * t16;    float dt32 = 2.0f * t16 * dt16;
+    float t64 = t32 * t32;    float dt64 = 2.0f * t32 * dt32;
+    phi[0] = active ? t4  : 0.0f;  dphi[0] = active ? dt4  : 0.0f;
+    phi[1] = active ? t8  : 0.0f;  dphi[1] = active ? dt8  : 0.0f;
+    phi[2] = active ? t16 : 0.0f;  dphi[2] = active ? dt16 : 0.0f;
+    phi[3] = active ? t32 : 0.0f;  dphi[3] = active ? dt32 : 0.0f;
+    phi[4] = active ? t64 : 0.0f;  dphi[4] = active ? dt64 : 0.0f;
+}
+
+// Core field V_core at one point via XY buckets (3×3 lookup, cell_size >= r_cut).
+// atoms[i] = (x, y, z, r_lo_i). atom_coeffs[i*NMODES + m]. Per-atom r_lo_i (not global).
+// Returns float4 (Fx,Fy,Fz,E). Telemetry via pointers.
+// *out_status: 0=OK, bit 1 (2)=domain violation r<r_lo_i (→ NAN, first violator recorded),
+//              bit 2 (4)=bucket overflow (candidates > CS_PME_CORE_MAX_CAND, fail-loud).
+inline float4 cs_pme_core_eval_at(
+    float x, float y, float z,
+    __global const float4* atoms, __global const float* atom_coeffs,
+    __global const int* bucket_atoms, __global const int* bucket_offsets,
+    int nat, int nbx, int nby, int nbuckets,
+    float x0, float y0, float cell, float r_cut,
+    int* out_status, float* out_min_r, int* out_offender, int* out_overflow)
+{
+    float E = 0.0f, Fx = 0.0f, Fy = 0.0f, Fz = 0.0f;
+    int status = 0;
+    float min_r = 1e30f;
+    int offender = -1;
+    int n_cand = 0;
+    int bx = (int)floor((x - x0) / cell);
+    int by = (int)floor((y - y0) / cell);
+    for (int dyb = -1; dyb <= 1; dyb++) {
+        int biy = by + dyb;
+        if (biy < 0 || biy >= nby) continue;
+        for (int dxb = -1; dxb <= 1; dxb++) {
+            int bix = bx + dxb;
+            if (bix < 0 || bix >= nbx) continue;
+            int bid = biy * nbx + bix;
+            if (bid < 0 || bid >= nbuckets) continue;
+            int i0 = bucket_offsets[bid];
+            int i1 = bucket_offsets[bid + 1];
+            for (int ia = i0; ia < i1; ia++) {
+                int at = bucket_atoms[ia];
+                if (at < 0 || at >= nat) continue;
+                n_cand++;
+                float4 ap = atoms[at];
+                float r_lo_i = ap.w;
+                float dxp = x - ap.x, dyp = y - ap.y, dzp = z - ap.z;
+                float r = sqrt(dxp * dxp + dyp * dyp + dzp * dzp + 1e-20f);
+                if (r < min_r) { min_r = r; offender = at; }
+                if (r < r_lo_i) {  // domain violation → terminate pixel (fail-loud, non-finite)
+                    *out_status = 2; *out_min_r = r; *out_offender = at; *out_overflow = 0;
+                    return (float4)(NAN, NAN, NAN, NAN);
+                }
+                if (r >= r_cut) continue;
+                float phi[CS_PME_NMODES], dphi[CS_PME_NMODES];
+                cs_pme_core_basis(r, r_lo_i, r_cut, phi, dphi);
+                for (int m = 0; m < CS_PME_NMODES; m++) {
+                    float c = atom_coeffs[at * CS_PME_NMODES + m];
+                    E += c * phi[m];
+                    if (r > 1e-8f) {
+                        float dE_dr = c * dphi[m];
+                        float inv_r = 1.0f / r;
+                        Fx -= dE_dr * dxp * inv_r;
+                        Fy -= dE_dr * dyp * inv_r;
+                        Fz -= dE_dr * dzp * inv_r;
+                    }
+                }
+            }
+        }
+    }
+    int overflow = n_cand > CS_PME_CORE_MAX_CAND ? (n_cand - CS_PME_CORE_MAX_CAND) : 0;
+    if (overflow > 0) status |= 4;
+    *out_status = status; *out_min_r = min_r; *out_offender = offender; *out_overflow = overflow;
+    return (float4)(Fx, Fy, Fz, E);
+}
+
+// Combined PME eval at one point: V_mesh + V_core. F = -∇E. Shared by evalContactPME and relaxation.
+// Returns float4 (Fx,Fy,Fz,E). Telemetry via pointers.
+// *out_status: 0=OK, bit 0 (1)=mesh stencil OOB, bit 1 (2)=core domain violation, bit 2 (4)=overflow.
+// Invalid (mesh OOB or domain violation) → non-finite (NAN) outputs.
+inline float4 cs_eval_contact_pme_at(
+    float x, float y, float z,
+    __global const float* mesh_coeffs, int nx, int ny, int nz,
+    float ox, float oy, float oz, float h,
+    __global const float4* atoms, __global const float* atom_coeffs,
+    __global const int* bucket_atoms, __global const int* bucket_offsets,
+    int nat, int nbx, int nby, int nbuckets,
+    float bx0, float by0, float cell, float r_cut,
+    int* out_status, float* out_min_r, int* out_offender, int* out_overflow)
+{
+    int mesh_status = 0;
+    float4 fm = cs_pme_tricubic_eval(x, y, z, mesh_coeffs, nx, ny, nz, ox, oy, oz, h, &mesh_status);
+    int core_status = 0; float min_r = 1e30f; int offender = -1; int overflow = 0;
+    float4 fc = cs_pme_core_eval_at(x, y, z, atoms, atom_coeffs, bucket_atoms, bucket_offsets,
+                                    nat, nbx, nby, nbuckets, bx0, by0, cell, r_cut,
+                                    &core_status, &min_r, &offender, &overflow);
+    int status = mesh_status | core_status;
+    *out_status = status; *out_min_r = min_r; *out_offender = offender; *out_overflow = overflow;
+    if (status & 1 || status & 2) return (float4)(NAN, NAN, NAN, NAN);
+    float E = fm.w + fc.w;
+    float3 F = fm.xyz + fc.xyz;
+    return (float4)(F.x, F.y, F.z, E);
+}
+
+// Batch evaluation of V_mesh + V_core at query points. Returns (E,F) per query + telemetry.
+// Invalid queries (mesh OOB or domain violation) produce non-finite outputs.
+__kernel void evalContactPME(
+    __global const float* queries, __global float4* out_fe,
+    __global int* out_status, __global float* out_min_r, __global int* out_offender, __global int* out_overflow,
+    __global const float* mesh_coeffs, const int4 mesh_meta, const float4 mesh_origin_h,
+    __global const float4* atoms, __global const float* atom_coeffs,
+    __global const int* bucket_atoms, __global const int* bucket_offsets,
+    const int4 core_meta, const float4 core_bucket_meta,
+    const int nq)
+{
+    int i = get_global_id(0);
+    if (i >= nq) return;
+    float x = queries[i * 3 + 0], y = queries[i * 3 + 1], z = queries[i * 3 + 2];
+    int status = 0; float min_r = 1e30f; int offender = -1; int overflow = 0;
+    float4 fe = cs_eval_contact_pme_at(x, y, z,
+        mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+        mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+        atoms, atom_coeffs, bucket_atoms, bucket_offsets,
+        core_meta.x, core_meta.y, core_meta.z, core_meta.w,
+        core_bucket_meta.x, core_bucket_meta.y, core_bucket_meta.z, core_bucket_meta.w,
+        &status, &min_r, &offender, &overflow);
+    out_fe[i] = fe; out_status[i] = status; out_min_r[i] = min_r; out_offender[i] = offender; out_overflow[i] = overflow;
+}
+
 // ===================== AFMulator integration (requires AFM.cl before this file) =====================
 #ifndef AFM_STANDALONE
 
@@ -1254,6 +1474,84 @@ __kernel void relaxStrokesTiltedPIC(
         fe_.xyz = rotMat(fe.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
         fe_.w = fe.w;
         FEs[get_global_id(0) * nz + iz] = fe_;
+        tipPos += dTip.xyz;
+        pos += dTip.xyz;
+    }
+}
+
+// PP relaxation using the contact_pme inline evaluator (mesh + core). Same pattern as
+// relaxStrokesTiltedContact but with cs_eval_contact_pme_at instead of the separable surface.
+// Telemetry (status/min_r/offender/overflow) accumulated per (pixel,z) across all relax steps.
+__kernel void relaxStrokesTiltedContactPME(
+    __global const float* mesh_coeffs, const int4 mesh_meta, const float4 mesh_origin_h,
+    __global const float4* atoms, __global const float* atom_coeffs,
+    __global const int* bucket_atoms, __global const int* bucket_offsets,
+    const int4 core_meta, const float4 core_bucket_meta,
+    __global int* out_status, __global float* out_min_r, __global int* out_offender, __global int* out_overflow,
+    __global float4* points, __global float4* FEs,
+    float4 tipA, float4 tipB, float4 tipC,
+    float4 stiffness, float4 dpos0, float4 relax_params, float4 surfFF,
+    int nz)
+{
+    const float3 dTip = tipC.xyz * tipC.w;
+    float4 dpos0_ = dpos0;
+    dpos0_.xyz = rotMatT(dpos0_.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+    float3 tipPos = points[get_global_id(0)].xyz;
+    float3 pos = tipPos.xyz + dpos0_.xyz;
+    float dt = relax_params.x;
+    float damp = relax_params.y;
+    float dtmax = dt;
+    float dtmin = dtmax * 0.1f;
+    float damp0 = damp;
+    for (int iz = 0; iz < nz; iz++) {
+        float4 fe;
+        float3 v = (float3)(0.0f, 0.0f, 0.0f);
+        int status_acc = 0; float min_r_acc = 1e30f; int offender_acc = -1; int overflow_acc = 0;
+        for (int i = 0; i < N_RELAX_STEP_MAX; i++) {
+            int status = 0; float min_r = 1e30f; int offender = -1; int overflow = 0;
+            fe = cs_eval_contact_pme_at(pos.x, pos.y, pos.z,
+                mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+                mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+                atoms, atom_coeffs, bucket_atoms, bucket_offsets,
+                core_meta.x, core_meta.y, core_meta.z, core_meta.w,
+                core_bucket_meta.x, core_bucket_meta.y, core_bucket_meta.z, core_bucket_meta.w,
+                &status, &min_r, &offender, &overflow);
+            status_acc |= status;
+            if (min_r < min_r_acc) { min_r_acc = min_r; offender_acc = offender; }
+            overflow_acc += overflow;
+            if (status & 1 || status & 2) break;  // invalid → cannot relax with NaN force
+            float3 f = fe.xyz;
+            float3 dpos = pos - tipPos;
+            float3 dpos_ = rotMat(dpos, tipA.xyz, tipB.xyz, tipC.xyz);
+            float3 ftip = tipForce(dpos_, stiffness, dpos0);
+            f += rotMatT(ftip, tipA.xyz, tipB.xyz, tipC.xyz);
+            f += tipC.xyz * surfFF.x;
+            #if OPT_FIRE
+            v = update_FIRE(f, v, &dt, &damp, dtmin, dtmax, damp0);
+            #else
+            v *= (1.0f - damp);
+            #endif
+            v += f * dt;
+            pos.xyz += v * dt;
+            if (dot(f, f) < F2CONV) break;
+        }
+        int status = 0; float min_r = 1e30f; int offender = -1; int overflow = 0;
+        fe = cs_eval_contact_pme_at(pos.x, pos.y, pos.z,
+            mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+            mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+            atoms, atom_coeffs, bucket_atoms, bucket_offsets,
+            core_meta.x, core_meta.y, core_meta.z, core_meta.w,
+            core_bucket_meta.x, core_bucket_meta.y, core_bucket_meta.z, core_bucket_meta.w,
+            &status, &min_r, &offender, &overflow);
+        status_acc |= status;
+        if (min_r < min_r_acc) { min_r_acc = min_r; offender_acc = offender; }
+        overflow_acc += overflow;
+        float4 fe_;
+        fe_.xyz = rotMat(fe.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+        fe_.w = fe.w;
+        int idx = get_global_id(0) * nz + iz;
+        FEs[idx] = fe_;
+        out_status[idx] = status_acc; out_min_r[idx] = min_r_acc; out_offender[idx] = offender_acc; out_overflow[idx] = overflow_acc;
         tipPos += dTip.xyz;
         pos += dTip.xyz;
     }

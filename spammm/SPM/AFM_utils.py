@@ -4325,6 +4325,145 @@ def run_contact_pp_afm(tag, atomPos, atomTypes, origin, step, ngrid, outdir, *,
     return result
 
 
+def run_contact_pme_pp_afm(tag, atomPos, atomTypes, origin, step, ngrid, outdir, *,
+                           scan_spec, params_path=None,
+                           margin=2.0, plots=None, df_cmap='gray', cmap='seismic',
+                           r_cut=6.0, h_mesh=1.0, halo_nodes=6,
+                           z_above_lo=3.0, z_above_hi=8.0,
+                           n_shells=300, n_endpoint=30, n_holdout=80, seed=42):
+    """Contact-PME PP-AFM via the shared ScanSpec/ScanResult contract (Wave 2 host/API).
+
+    Fits a contact_pme particle-mesh field (coarse 3D B-spline mesh + compact PIC
+    cores) to the Morse+Q potential, then scans with ``run_scan_contact_pme``.
+    Routes through ``shared_postprocess`` for df/Fz/E_diss — same path as FDBM,
+    Morse, and contact 2.5D. Memory-efficient: no 3D force-field image is allocated.
+
+    Does NOT rebuild scan geometry with scan_bbox() when ScanSpec is supplied —
+    uses scan_spec.scan_xs/scan_ys/h_scan directly (same grid as FDBM/Morse/contact).
+
+    Args:
+        tag:         label for diagnostic prints/plots
+        atomPos:     (na, 3+) atom positions [Å, world coords]
+        atomTypes:   (na,) atomic numbers Z (unused for PME fit — uses cLJs from assign_params)
+        origin:      (3,) grid origin [Å] (unused for contact_pme — fit derives its own bounds)
+        step:        grid spacing [Å] (unused for contact_pme — fit uses h_mesh)
+        ngrid:       (nx, ny, nz) grid dimensions (unused for contact_pme)
+        outdir:      output directory for diagnostic PNGs
+        scan_spec:   ScanSpec (scan_xs, scan_ys, h_df, h_Fz, h_scan, amplitude,
+                     osc_dir, K_LAT, K_RAD, bond_length, scan_margin)
+        params_path: ElementTypes.dat path (default: repo data/)
+        margin:      xy margin [Å] for query envelope derivation
+        r_cut:       outer split/core cutoff [Å] (MVP default 6.0)
+        h_mesh:      mesh spacing [Å] (MVP default 1.0)
+        halo_nodes:  halo padding per side (contract: >= 6)
+        z_above_lo, z_above_hi: z range above zmax for query envelope [Å]
+        n_shells, n_endpoint, n_holdout, seed: core fit sampling params
+    Returns:
+        ScanResult with backend_name='contact_pme', fft_path='none',
+        ContactPMEParams attached as .cpm
+    """
+    atomPos = np.asarray(atomPos, dtype=np.float64)
+    atomTypes = np.asarray(atomTypes, dtype=np.int32)
+    plots = set(plots or ())
+    os.makedirs(outdir, exist_ok=True)
+
+    print(f"\n=== {tag}  Contact-PME  r_cut={r_cut}  h_mesh={h_mesh}  halo={halo_nodes} ===")
+
+    afmulator = afm.AFMulator(use_morse=True, nloc=32, use_fire=True)
+    atoms_arr, cLJs_arr = _morse_atoms_from_Z(atomPos, atomTypes, params_path=params_path)
+    afmulator.atoms_arr = atoms_arr
+    afmulator.cLJs_arr = cLJs_arr
+    afmulator.use_morse = True
+    afmulator.tipQs[:] = 0.0  # MVP: zero multi-site tip charges (radial oracle only)
+
+    # CRITICAL: Set dpos0/stiffness from scan_spec to match scan_fdbm convention.
+    # run_scan_contact_pme uses self.dpos0/self.stiffness (not passed as args).
+    bond_length = float(scan_spec.bond_length)
+    K_LAT = float(scan_spec.K_LAT)
+    K_RAD = float(scan_spec.K_RAD)
+    afmulator.dpos0 = np.array([0., 0., -bond_length, bond_length], dtype=np.float32)
+    afmulator.stiffness = np.array([-K_LAT, -K_LAT, -K_LAT, -K_RAD], dtype=np.float32)
+    print(f"  dpos0={afmulator.dpos0}  stiffness={afmulator.stiffness}")
+
+    # Fit contact_pme (split → mesh → core); does NOT duplicate mathematics
+    cpm = afmulator.fit_contact_pme(
+        r_cut=r_cut, h_mesh=h_mesh, halo_nodes=halo_nodes,
+        margin=margin, z_above_lo=z_above_lo, z_above_hi=z_above_hi,
+        n_shells=n_shells, n_endpoint=n_endpoint, n_holdout=n_holdout, seed=seed,
+        bPrint=True)
+    afmulator.queue.finish()
+
+    # Use scan_spec scan_xs/ys/h_scan directly (same grid as FDBM/Morse/contact)
+    # — NOT scan_bbox. This ensures identical lateral grid and correct ScanResult.
+    scan_xs = np.asarray(scan_spec.scan_xs, dtype=np.float32)
+    scan_ys = np.asarray(scan_spec.scan_ys, dtype=np.float32)
+    h_scan = np.asarray(scan_spec.h_scan, dtype=np.float32)
+    nx_s, ny_s, nz_s = len(scan_xs), len(scan_ys), len(h_scan)
+    dx = float(scan_xs[1] - scan_xs[0]) if nx_s > 1 else float(step)
+    dy = float(scan_ys[1] - scan_ys[0]) if ny_s > 1 else float(step)
+    dz = float(h_scan[1] - h_scan[0]) if nz_s > 1 else 0.1
+    mol_z = float(atomPos[:, 2].max())
+    # Tip apex starts at highest probe height + mol_z + bond_length (same as scan_fdbm)
+    z_start = mol_z + float(np.max(h_scan)) + bond_length
+    scan_p0 = np.array([float(scan_xs[0]), float(scan_ys[0]), z_start], dtype=np.float32)
+    scan_da = np.array([dx, 0., 0.], dtype=np.float32)
+    scan_db = np.array([0., dy, 0.], dtype=np.float32)
+    dtip = -abs(dz)
+
+    print(f"  K_LAT={K_LAT:.4f} eV/Å²  K_RAD={K_RAD}  L={bond_length} Å")
+    print(f"  scan=({nx_s}×{ny_s})  nz={nz_s}  z_start={z_start:.2f}  dtip={dtip:.3f}")
+
+    FEs, pts = afmulator.run_scan_contact_pme(
+        nxy=(nx_s, ny_s), nz=nz_s, dtip=dtip,
+        scan_p0=scan_p0, scan_da=scan_da, scan_db=scan_db,
+    )
+    afmulator.queue.finish()
+
+    # run_scan_contact_pme: iz=0 = highest z (first step). Flip to iz=0 = lowest z
+    # (matching scan_fdbm convention used by shared_postprocess)
+    FEs = FEs[:, :, ::-1, :]
+
+    # No backward stroke for contact_pme → E_diss = zeros
+    result = shared_postprocess(FEs, scan_spec, FEs_bwd=None, tip_disp=None,
+                                backend_name='contact_pme', fft_path='none')
+
+    # Diagnostic extras
+    result.tag = tag
+    result.atomPos = atomPos
+    result.origin = origin
+    result.step = step
+    result.h_scan = h_scan
+    osc_n = np.asarray(scan_spec.osc_dir, dtype=np.float64)
+    osc_n = osc_n / np.linalg.norm(osc_n)
+    result.osc_dir = osc_n.copy()
+    result.path = 'ContactPME'
+    result.stage_path = None
+    result.tip = {'peak': None, 'q': 0.0, 'dq': 0.0, 'mirrorX': None, 'mirrorY': None, 'path': None}
+    result.cpm = cpm
+    result.resident_bytes = int(cpm.resident_bytes)
+    result.resident_kb = float(cpm.resident_kb)
+    ih = len(result.heights) // 2
+    df_lo, df_hi = result.df[:, :, 0], result.df[:, :, -1]
+    result.df_z_slice_rms = float(np.sqrt(np.mean((df_hi - df_lo) ** 2)))
+    df_slice_scale = max(float(np.sqrt(np.mean(df_lo ** 2))), float(np.sqrt(np.mean(df_hi ** 2))), 1e-30)
+    result.df_z_slice_relative = result.df_z_slice_rms / df_slice_scale
+    result.df_z_slice_corr = float(np.corrcoef(df_lo.ravel(), df_hi.ravel())[0, 1]) if np.std(df_lo) > 0.0 and np.std(df_hi) > 0.0 else np.nan
+    print(f"  resident={result.resident_bytes} bytes ({result.resident_kb:.1f} KB)")
+    print(f"  df @h={result.heights[ih]:.2f} / Fz @h={float(result.heights_Fz[ih]):.2f}: "
+          f"df=[{result.df.min():.3e},{result.df.max():.3e}] Fz=[{result.Fz.min():.3e},{result.Fz.max():.3e}]")
+
+    # Optional diagnostic PNGs
+    x_ext = [float(scan_xs[0]), float(scan_xs[-1])]
+    y_ext = [float(scan_ys[0]), float(scan_ys[-1])]
+    if 'df' in plots:
+        plot_grid_Fz(result.df, result.heights, f'df ContactPME {tag}', f'df_{tag}.png',
+                     x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap=df_cmap)
+    if 'fz' in plots:
+        plot_grid_Fz(result.Fz, result.heights_Fz, f'Fz ContactPME {tag}', f'Fz_{tag}.png',
+                     x_ext=x_ext, y_ext=y_ext, save_dir=outdir, cmap=cmap)
+    return result
+
+
 def plot_zcurves(variants, sample_points, out_path, *, atomPos=None,
                  title='', dpi=140, bond_length=3.0):
     """Plot E(z) and Fz(z) curves at selected scan points for multiple backends.

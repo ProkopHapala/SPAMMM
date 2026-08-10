@@ -975,3 +975,93 @@ def eval_slice_map_gpu(ocl, eval_fn, x0, x1, y0, y1, z_scan, dx, dy):
 def pic_grid_to_map(F, nx, ny):
     """PIC tiled kernel uses iq=iy*nx+ix; map to Fz[ix,iy] like eval_slice_map_gpu."""
     return F[:, 2].reshape(ny, nx).T
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ContactPMEParams — Wave 2 host/API container for the contact_pme backend
+# (doc/Tasks/ContactSurface_PME_ParallelPlan.md §Agent_2 Wave 2). Owns the mesh
+# coefficients, core fit, split params, atoms, PIC buckets, declared query
+# interior, and exact resident-byte accounting. Mathematics lives in
+# CoarseMesh.py / PICCore.py / PMESplit.py — this dataclass only aggregates.
+# ═══════════════════════════════════════════════════════════════════════════════
+from dataclasses import dataclass, field
+
+@dataclass
+class ContactPMEParams:
+    """Aggregated state for the contact_pme particle-mesh backend.
+
+    Owns mesh coefficients (CoarseMesh), core fit (CoreFit), split params
+    (SplitParams), atom positions, PIC buckets, the declared safe query
+    interior, and exact resident-byte accounting. Built by
+    AFMulator.fit_contact_pme(); evaluated by AFMulator.eval_contact_pme().
+    """
+    # Mesh (V_L on coarse 3D B-spline grid); coeffs are prefiltered control coefficients
+    mesh_coeffs: np.ndarray            # (nx, ny, nz) float64 B-spline control coefficients
+    mesh_origin: np.ndarray            # (3,) world coords of node (0,0,0)
+    mesh_h: float                      # mesh spacing [Å]
+    mesh_halo: int                     # halo node count per side used at build time
+    query_interior: tuple              # (lo[3], hi[3]) integer node indices defining safe interior
+    # Core (compact atom-centered residual v_S)
+    core_fit: object                   # PICCore.CoreFit (per-atom coeffs, r_lo, r_cut, metrics)
+    # Split (atomwise soft-core split + combined radial oracle)
+    split_params: object               # PMESplit.SplitParams (R0/E0/q/alpha/q_tip/r_damp/r_cut)
+    # Atoms + PIC buckets (XY cell lists for core evaluation)
+    atom_pos: np.ndarray               # (na, 3) float64 atom positions [Å, world coords]
+    bucket_atoms: np.ndarray           # (n_list,) int32 atom indices in bucket order
+    bucket_offsets: np.ndarray         # (nbx*nby+1,) int32 CSR-style offsets
+    bucket_nbx: int                    # number of buckets along x
+    bucket_nby: int                    # number of buckets along y
+    bucket_cell_size: float            # bucket cell size [Å] (>= r_cut)
+    bucket_bounds: tuple               # (x0, y0, x1, y1) bucket domain [Å]
+    # Resident-byte accounting (sum of all device-resident buffers, excluding
+    # temporary build/test buffers). Updated by resident_bytes property.
+    _resident_bytes: int = 0
+
+    def __post_init__(self):
+        self._resident_bytes = self._compute_resident_bytes()
+
+    def _compute_resident_bytes(self) -> int:
+        """Exact sum of device-resident buffer sizes [bytes].
+
+        Counts mesh coefficients, atoms, core coefficients, buckets, offsets,
+        and metadata separately from temporary build/test buffers. Mesh/core
+        data are uploaded as float32 on device; atoms as float4; buckets as int32.
+        """
+        b = 0
+        # Mesh coeffs: (nx, ny, nz) float32 on device
+        b += int(self.mesh_coeffs.size * 4)
+        # Atoms: (na, 4) float32 (pos + charge)
+        b += int(self.atom_pos.shape[0] * 4 * 4)
+        # Core coeffs: (na, N_MODES) float32
+        b += int(self.core_fit.coeffs.size * 4)
+        # Per-atom r_lo: (na,) float32
+        b += int(self.core_fit.r_lo.size * 4)
+        # Buckets: (n_list,) int32
+        b += int(self.bucket_atoms.size * 4)
+        # Offsets: (nbx*nby+1,) int32
+        b += int(self.bucket_offsets.size * 4)
+        # Metadata scalars (mesh origin/h/halo, split globals) — small fixed cost
+        b += 3 * 4 + 4 + 4  # origin(3 float) + h + halo
+        return b
+
+    @property
+    def resident_bytes(self) -> int:
+        """Exact device-resident buffer total [bytes] (excludes temp build/test)."""
+        return self._resident_bytes
+
+    @property
+    def resident_kb(self) -> float:
+        return self._resident_bytes / 1024.0
+
+    @property
+    def na(self) -> int:
+        return int(self.atom_pos.shape[0])
+
+    @property
+    def r_cut(self) -> float:
+        return float(self.split_params.r_cut)
+
+    @property
+    def mesh_shape(self) -> tuple:
+        return tuple(self.mesh_coeffs.shape)
+

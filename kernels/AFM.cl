@@ -1301,3 +1301,729 @@ __kernel void fdbm_mul_poisson_tip_c64(
     // complex multiply a*b then *s
     rho_k[i] = (float2)((a.x * b.x - a.y * b.y) * s, (a.x * b.y + a.y * b.x) * s);
 }
+
+// =============================================================================
+// Differentiable direct Morse+Coulomb PP-AFM (Task: DifferentiableAFM_ParallelPlan)
+//
+// Frozen common contract (contract_version 1) — copied here per the plan so all
+// agents share one source of truth. If any signature below changes, STOP all
+// affected agents, increment contract_version, list invalidated outputs, redispatch.
+//
+// Scope: aperiodic finite molecule, 1 <= nAtoms <= 128; explicit lab-fixed scan
+//   coordinates; no PBC replicas. nAtoms>128 raises on host; no silent grid fallback.
+// Atom buffer: atoms.shape=(nAtoms,4) float32, rows (x,y,z,Q) [Å, e-charge].
+// Morse buffer: cMs.shape=(nAtoms,4) float32, rows (R0,E0,K,0) [Å,eV,Å^-1,unused];
+//   K<0 (alpha=-K>0 documentation only, not optimized in this task).
+// Optimized param order: theta[i]=(x,y,z,R0,E0,Q); VJP shape (nAtoms,6) [Wave 2].
+// Tip electrostatics: preserve existing tipQs, tipQZs, COULOMB_CONST, world-z
+//   charge-site offsets. Tip params fixed.
+// Scan input: points.shape=(nScan,4); existing flattening (ix outer, iy inner).
+//   Explicit scan_p0/scan_da/scan_db mandatory; dtip<0 for the initial MVP.
+// Forward output: FEs.shape=(nx,ny,nz,4) in kernel stroke order, iz=0 at the
+//   initial/highest tip position; channels (Fx,Fy,Fz,E) are SAMPLE FE after force
+//   rotation, not spring/total FE. No hidden z flip.
+// PP telemetry: PPs.shape=(nx,ny,nz,4); .xyz = final world PP position; .w =
+//   positive FIRE iteration count on convergence, negative on non-convergence/
+//   nonfinite. Host raises on any negative/nonfinite entry and reports first (ix,iy,iz).
+// Pair law: direct path is UNCAPPED. Do NOT reproduce evalMorseC_QZs_toImg
+//   lines 1053-1054 (abs(E)>100 rescaling) — nonsmooth and force-inconsistent.
+// Precision: GPU float32; oracle float64. No float64 kernels.
+// Backend selection: new behavior requires explicit backend='morse_direct'.
+//   Existing grid behavior and defaults unchanged.
+// State flattening: iState = iScan*nz + iz. tipC.w carries dtip.
+//
+// Math SSOT (forward): for query q, atom a_i, d=q-a_i, r=sqrt(dot(d,d)+R2SAFE),
+//   K<0, s=exp(K*(r-R0)):
+//     U_M = E0*s*(s-2);  F_M = d * [-2*K*E0*s*(s-1)/r]
+//   Coulomb (4 tip sites k at world z offset QZs[k], Qs pre-scaled by COULOMB_CONST):
+//     U_C = sum_i sum_k Qs[k]*Q_i / sqrt(|q + zhat*QZs[k] - a_i|^2 + R2SAFE)
+//   These are exactly getMorse(dp, cMs.xyz) and getCoulombAFM(atom, pos+zhat*QZs)*Qs.
+//
+// Frozen kernel signatures (Wave 1 forward + Wave 2 backward). Wave 1 implements
+// only relaxStrokesTiltedMorseDirect; the three backward kernels are stubbed by
+// Agent_1 in Wave 2 after Gate 1.
+//
+//   __kernel void relaxStrokesTiltedMorseDirect(
+//       const int nAtoms, __global const float4* atoms, __global const float4* cMs,
+//       __global const float4* points, __global float4* FEs, __global float4* PPs,
+//       float4 tipA, float4 tipB, float4 tipC, float4 stiffness, float4 dpos0,
+//       float4 relax_params, float4 surfFF, float4 Qs, float4 QZs,
+//       const int nScan, const int nz, __local float4* LATOMS, __local float4* LCMS);
+//
+//   __kernel void morseDirectStateAdjoint(
+//       const int nAtoms, __global const float4* atoms, __global const float4* cMs,
+//       __global const float4* points, __global const float4* PPs,
+//       __global const float4* dL_dFEs, __global float4* lambdas,
+//       __global float4* adjoint_diag,
+//       float4 tipA, float4 tipB, float4 tipC, float4 stiffness, float4 dpos0,
+//       float4 surfFF, float4 Qs, float4 QZs, const int nScan, const int nz,
+//       __local float4* LATOMS, __local float4* LCMS);
+//
+//   __kernel void morseDirectParamPartials(
+//       const int nAtoms, __global const float4* atoms, __global const float4* cMs,
+//       __global const float4* points, __global const float4* PPs,
+//       __global const float4* dL_dFEs, __global const float4* lambdas,
+//       __global float4* partial_xR, __global float4* partial_EQ,
+//       float4 tipA, float4 tipB, float4 tipC, float4 Qs, float4 QZs,
+//       const int nScan, const int nz);
+//
+//   __kernel void reduceMorseDirectParamPartials(
+//       const int nAtoms, const int nScan, __global const float4* partial_xR,
+//       __global const float4* partial_EQ, __global float4* grad_xR,
+//       __global float4* grad_EQ, __local float4* L_xR, __local float4* L_EQ);
+//
+// Local-memory requirement (Agent_1 → Agent_2 via coordinator):
+//   relaxStrokesTiltedMorseDirect needs LATOMS and LCMS each of size nAtoms*16 bytes
+//   (dynamic __local allocations passed as kernel args). For nAtoms<=128 that is
+//   <=2048 bytes each, <=4096 bytes total — well within the 48 KB per-CU limit.
+//   Workgroup size is chosen by the host (candidates {32,64,128}); the kernel uses
+//   get_local_size(0) for the cooperative preload stride and places no barrier
+//   inside the relaxation loop.
+// =============================================================================
+
+// ---- Reusable inline direct Morse+Coulomb FE sum over local-memory atoms ----
+// Sums the uncapped Morse + 4-site Coulomb pair law over nAtoms preloaded in
+// LATOMS/LCMS. Qs must already be pre-scaled by COULOMB_CONST by the caller.
+// Matches cs_brute_afm_morse_c_points / evalMorseC_QZs_toImg pair law EXACTLY
+// minus the abs(E)>100 rescale (which is intentionally omitted here).
+// Reused by the forward relaxation loop (every FIRE step + final re-eval) and,
+// in Wave 2, by the fixed-query validation and implicit-VJP passes.
+inline float4 evalMorseCDirect_local(
+    float3 pos,
+    __local const float4* LATOMS, __local const float4* LCMS,
+    const int nAtoms, float4 Qs, float4 QZs
+){
+    float4 fe = float4Zero;
+    for(int j=0; j<nAtoms; j++){
+        float4 xyzq = LATOMS[j];
+        float3 dp   = pos - xyzq.xyz;
+        fe += getMorse( dp, LCMS[j].xyz );
+        fe += getCoulombAFM( xyzq, pos + (float3)(0.0f, 0.0f, QZs.x) ) * Qs.x;
+        fe += getCoulombAFM( xyzq, pos + (float3)(0.0f, 0.0f, QZs.y) ) * Qs.y;
+        fe += getCoulombAFM( xyzq, pos + (float3)(0.0f, 0.0f, QZs.z) ) * Qs.z;
+        fe += getCoulombAFM( xyzq, pos + (float3)(0.0f, 0.0f, QZs.w) ) * Qs.w;
+    }
+    return fe;
+}
+
+// ---- Wave 1: direct Morse+Coulomb PP-relaxation, one work-item per scan lane ----
+// Preserves the exact relaxStrokesTilted scan/rotation semantics (dTip=tipC.xyz*tipC.w,
+// dpos0 rotated by rotMatT, tip-rotated FE output, iz=0 at initial/highest tip pos,
+// tipPos and pos both advanced by dTip per z slice). Replaces the interpolated grid
+// FE sample with a direct sum over atoms preloaded ONCE into local memory.
+//
+// Fail-loud contract: PPs[iState].w is +iter on convergence, -iter on non-convergence
+// or nonfinite state. No clipping, no fallback, no cap. The host raises on any
+// negative/nonfinite entry. Padded scan lanes (iScan>=nScan) MUST participate in the
+// preload + barrier and only then become inactive (no early return before barrier).
+__kernel void relaxStrokesTiltedMorseDirect(
+    const int nAtoms, __global const float4* atoms, __global const float4* cMs,
+    __global const float4* points, __global float4* FEs, __global float4* PPs,
+    float4 tipA, float4 tipB, float4 tipC, float4 stiffness, float4 dpos0,
+    float4 relax_params, float4 surfFF, float4 Qs, float4 QZs,
+    const int nScan, const int nz, __local float4* LATOMS, __local float4* LCMS
+){
+    const int iScan = get_global_id(0);
+    const int iL    = get_local_id(0);
+    const int nL    = get_local_size(0);
+
+    // --- Cooperative preload of all atoms + cMs once (bounds-guarded) ---
+    // All lanes including padded scan lanes participate, then hit the barrier.
+    for(int i=iL; i<nAtoms; i+=nL){
+        LATOMS[i] = atoms[i];
+        LCMS  [i] = cMs  [i];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Padded scan lane becomes inactive ONLY after the preload barrier.
+    if(iScan >= nScan) return;
+
+    // --- Tip geometry (identical to relaxStrokesTilted) ---
+    const float3 dTip  = tipC.xyz * tipC.w;                       // per-z step (tipC.w = dtip)
+    float4 dpos0_ = dpos0;
+    dpos0_.xyz = rotMatT( dpos0_.xyz, tipA.xyz, tipB.xyz, tipC.xyz );
+    float3 tipPos = points[iScan].xyz;                            // scan start (iz=0, highest)
+    float3 pos    = tipPos + dpos0_.xyz;                          // initial PP world pos
+
+    // --- FIRE relaxation params (identical to relaxStrokesTilted) ---
+    float dt   = relax_params.x;
+    float damp = relax_params.y;
+    float dtmax = dt;
+    float dtmin = dtmax * 0.1f;
+    float damp0 = damp;
+
+    // Coulomb tip charges pre-scaled once (matches cs_brute_afm_morse_c_points).
+    float4 Qs_ = Qs * COULOMB_CONST;
+
+    // --- Per-z relaxation loop (NO barrier inside) ---
+    for(int iz=0; iz<nz; iz++){
+        float3 v = float3Zero;
+        float4 fe = float4Zero;
+        int itr = 0;
+        bool converged = false;
+        for(int i=0; i<N_RELAX_STEP_MAX; i++){
+            itr = i + 1;
+            fe = evalMorseCDirect_local( pos, LATOMS, LCMS, nAtoms, Qs_, QZs );
+            float3 f = fe.xyz;
+            float3 dpos  = pos - tipPos;
+            float3 dpos_ = rotMat  ( dpos, tipA.xyz, tipB.xyz, tipC.xyz );   // to tip-coords
+            float3 ftip  = tipForce( dpos_, stiffness, dpos0 );
+            f += rotMatT ( ftip, tipA.xyz, tipB.xyz, tipC.xyz );             // back to world
+            f += tipC.xyz * surfFF.x;                                       // surface bias
+
+            // Convergence check BEFORE the position update — the stored PP must
+            // be at the true equilibrium where |f|<F2CONV, not one step past it.
+            // (The original relaxStrokesTilted checks after the update, but it
+            // never stored PPs; the differentiable VJP needs the equilibrium pos.)
+            if( dot(f,f) < F2CONV ){ converged = true; break; }
+
+            #if OPT_FIRE
+            v = update_FIRE( f, v, &dt, &damp, dtmin, dtmax, damp0 );
+            #else
+            v *= (1 - damp);
+            #endif
+            v   += f * dt;
+            pos += v * dt;
+        }
+
+        // Final direct FE re-evaluation at the converged/last PP position.
+        fe = evalMorseCDirect_local( pos, LATOMS, LCMS, nAtoms, Qs_, QZs );
+
+        // Output tip-rotated SAMPLE FE (channels Fx,Fy,Fz,E); .w = sample energy.
+        float4 fe_ = fe;
+        fe_.xyz = rotMat( fe.xyz, tipA.xyz, tipB.xyz, tipC.xyz );
+        fe_.w   = fe.w;
+        const int iState = iScan * nz + iz;
+        FEs[iState] = fe_;
+
+        // PP telemetry: final world PP position + signed iteration count.
+        // +itr on convergence; -itr on non-convergence or nonfinite state.
+        const bool finite = isfinite(fe.x) && isfinite(fe.y) && isfinite(fe.z) && isfinite(fe.w)
+                         && isfinite(pos.x) && isfinite(pos.y) && isfinite(pos.z);
+        int itw = converged ? itr : -itr;
+        if( !finite ) itw = -itr;
+        PPs[iState] = (float4)( pos, (float)itw );
+
+        // Advance to next z slice (both tipPos and pos move by dTip).
+        tipPos += dTip;
+        pos    += dTip;
+    }
+}
+
+// =============================================================================
+// Wave 2: Implicit adjoint/VJP for differentiable direct Morse+Coulomb PP-AFM
+// (Task: DifferentiableAFM_ParallelPlan, contract_version 1)
+//
+// Three backward passes (frozen layout, no float atomics, no dense Jacobian):
+//   1. morseDirectStateAdjoint       — one work-item per (scan,z): re-evaluates
+//      total force/Jacobian at stored PPs, consumes dL_dFEs, solves J*lambda=b,
+//      writes lambda + adjoint_diag=(residual_norm, lambda_min, cond_est, status).
+//   2. morseDirectParamPartials      — one work-item per (scan,atom): loops over z,
+//      consumes lambda/PPs/dL_dFEs, writes per-(scan,atom) partial_xR=(x,y,z,R0)
+//      and partial_EQ=(E0,Q,0,0).
+//   3. reduceMorseDirectParamPartials — one workgroup per atom: reduces scan dim,
+//      writes grad_xR[atom] and grad_EQ[atom]; host packs into (nAtoms,6).
+//
+// Math SSOT (backward): at relaxed q*, G=F_sample+F_tip+F_surf=0, J=dG/dq.
+//   J = -H_E + R^T*(dg/dd)*R  (symmetric; H_E=sample energy Hessian, dg/dd=tip
+//   force Jacobian in tip coords, R=rotMat world->tip). For output O=FEs, upstream
+//   u=dL/dO, b=(dO/dq)^T*u = -H_E*rotMatT(u.xyz) - F_sample*u.w. Solve J*lambda=b.
+//   dL/dtheta = u^T*(dO/dtheta) - lambda^T*(dG/dtheta). With w=u_world-lambda:
+//     dL/d(a_i.xyz) = H_E_i*w + (F_M_i+F_C_i)*u.w
+//     dL/dR0_i      = w·(dF_M_i/dR0) + u.w*dE_M_i/dR0
+//     dL/dE0_i      = w·(dF_M_i/dE0) + u.w*dE_M_i/dE0
+//     dL/dQ_i       = w·(dF_C_i/dQ)  + u.w*dE_C_i/dQ
+//   Per-atom pair quantities match the forward pair law (getMorse+getCoulombAFM)
+//   exactly. Qs pre-scaled by COULOMB_CONST inside each kernel (same as forward).
+//
+// Status codes: 0=success, 1=nonconvergence, 2=nonfinite, 3=instability, 4=singularity.
+// Acceptance gates: residual<1e-4 eV/A, lambda_min>1e-5 eV/A^2, cond_est<1e6.
+// =============================================================================
+
+// ---- Sample FE + energy Hessian from local-memory atoms (pass 1 helper) ----
+// Computes total sample (Fx,Fy,Fz,E) and d²E_sample/dq² (3x3, stored as 3 rows).
+// Qs must be pre-scaled by COULOMB_CONST. Matches evalMorseCDirect_local pair law.
+inline void evalMorseCDirect_FE_Hessian_local(
+    float3 pos, __local const float4* LATOMS, __local const float4* LCMS,
+    const int nAtoms, float4 Qs, float4 QZs,
+    float4* fe_out, float3* H0, float3* H1, float3* H2
+){
+    float4 fe = float4Zero;
+    float3 h0 = float3Zero, h1 = float3Zero, h2 = float3Zero;
+    for(int j=0; j<nAtoms; j++){
+        float4 xyzq = LATOMS[j];
+        float4 cm   = LCMS[j];
+        // --- Morse ---
+        float3 d = pos - xyzq.xyz;
+        float r2 = dot(d,d) + R2SAFE;
+        float r  = sqrt(r2);
+        float R0 = cm.x, E0 = cm.y, K = cm.z;
+        float s  = exp(K*(r - R0));
+        float Ep = 2.0f*K*E0*s*(s - 1.0f);       // dE/dr
+        float Epp = 2.0f*K*K*E0*s*(2.0f*s - 1.0f); // d²E/dr²
+        float fr = -Ep;                            // -dE/dr (force coeff)
+        fe += (float4)(d*(fr/r), E0*s*(s - 2.0f));
+        // H_M = [Epp - Ep/r]*(d⊗d)/r² + (Ep/r)*I
+        float c_out = (Epp - Ep/r) / r2;
+        float c_dia = Ep / r;
+        h0 += (float3)(c_out*d.x*d.x + c_dia, c_out*d.x*d.y,         c_out*d.x*d.z);
+        h1 += (float3)(c_out*d.y*d.x,         c_out*d.y*d.y + c_dia, c_out*d.y*d.z);
+        h2 += (float3)(c_out*d.z*d.x,         c_out*d.z*d.y,         c_out*d.z*d.z + c_dia);
+        // --- Coulomb (4 tip sites) ---
+        // H_C = 3*C*(d⊗d)/r⁵ - C*I/r³, C=Q_i*Qs[k]
+        float Qi = xyzq.w;
+        // site x
+        { float3 dk = (pos + (float3)(0.0f,0.0f,QZs.x)) - xyzq.xyz;
+          float rk2 = dot(dk,dk)+R2SAFE; float rk=sqrt(rk2); float rk3=rk*rk2; float rk5=rk3*rk2;
+          float C = Qi*Qs.x; float co=3.0f*C/rk5; float cd=-C/rk3;
+          fe += (float4)(dk*(C/(rk3)), C/rk);
+          h0 += (float3)(co*dk.x*dk.x+cd, co*dk.x*dk.y,       co*dk.x*dk.z);
+          h1 += (float3)(co*dk.y*dk.x,       co*dk.y*dk.y+cd, co*dk.y*dk.z);
+          h2 += (float3)(co*dk.z*dk.x,       co*dk.z*dk.y,    co*dk.z*dk.z+cd); }
+        // site y
+        { float3 dk = (pos + (float3)(0.0f,0.0f,QZs.y)) - xyzq.xyz;
+          float rk2 = dot(dk,dk)+R2SAFE; float rk=sqrt(rk2); float rk3=rk*rk2; float rk5=rk3*rk2;
+          float C = Qi*Qs.y; float co=3.0f*C/rk5; float cd=-C/rk3;
+          fe += (float4)(dk*(C/(rk3)), C/rk);
+          h0 += (float3)(co*dk.x*dk.x+cd, co*dk.x*dk.y,       co*dk.x*dk.z);
+          h1 += (float3)(co*dk.y*dk.x,       co*dk.y*dk.y+cd, co*dk.y*dk.z);
+          h2 += (float3)(co*dk.z*dk.x,       co*dk.z*dk.y,    co*dk.z*dk.z+cd); }
+        // site z
+        { float3 dk = (pos + (float3)(0.0f,0.0f,QZs.z)) - xyzq.xyz;
+          float rk2 = dot(dk,dk)+R2SAFE; float rk=sqrt(rk2); float rk3=rk*rk2; float rk5=rk3*rk2;
+          float C = Qi*Qs.z; float co=3.0f*C/rk5; float cd=-C/rk3;
+          fe += (float4)(dk*(C/(rk3)), C/rk);
+          h0 += (float3)(co*dk.x*dk.x+cd, co*dk.x*dk.y,       co*dk.x*dk.z);
+          h1 += (float3)(co*dk.y*dk.x,       co*dk.y*dk.y+cd, co*dk.y*dk.z);
+          h2 += (float3)(co*dk.z*dk.x,       co*dk.z*dk.y,    co*dk.z*dk.z+cd); }
+        // site w
+        { float3 dk = (pos + (float3)(0.0f,0.0f,QZs.w)) - xyzq.xyz;
+          float rk2 = dot(dk,dk)+R2SAFE; float rk=sqrt(rk2); float rk3=rk*rk2; float rk5=rk3*rk2;
+          float C = Qi*Qs.w; float co=3.0f*C/rk5; float cd=-C/rk3;
+          fe += (float4)(dk*(C/(rk3)), C/rk);
+          h0 += (float3)(co*dk.x*dk.x+cd, co*dk.x*dk.y,       co*dk.x*dk.z);
+          h1 += (float3)(co*dk.y*dk.x,       co*dk.y*dk.y+cd, co*dk.y*dk.z);
+          h2 += (float3)(co*dk.z*dk.x,       co*dk.z*dk.y,    co*dk.z*dk.z+cd); }
+    }
+    *fe_out = fe; *H0 = h0; *H1 = h1; *H2 = h2;
+}
+
+// ---- Tip force 3x3 Jacobian dg/dd in tip coords ----
+// g(d) = (d - d0.xyz)*k.xyz + d*(k.w*(1 - d0.w/r)), r=|d|
+// dg/dd = diag(k.xyz) + phi*I + (k.w*d0.w/r³)*(d⊗d), phi=k.w*(1-d0.w/r)
+inline void tipForceJacobian(
+    float3 d, float4 stiffness, float4 dpos0,
+    float3* J0, float3* J1, float3* J2
+){
+    float r = sqrt(dot(d,d));
+    r = fmax(r, 1e-10f);
+    float phi  = stiffness.w * (1.0f - dpos0.w / r);
+    float beta = stiffness.w * dpos0.w / (r*r*r);  // outer-product coeff
+    *J0 = (float3)(stiffness.x + phi + beta*d.x*d.x, beta*d.x*d.y,         beta*d.x*d.z);
+    *J1 = (float3)(beta*d.y*d.x,         stiffness.y + phi + beta*d.y*d.y, beta*d.y*d.z);
+    *J2 = (float3)(beta*d.z*d.x,         beta*d.z*d.y,         stiffness.z + phi + beta*d.z*d.z);
+}
+
+// ---- Rotate 3x3 matrix: J_world = R^T * J_tip * R, R=rotMat(world->tip) ----
+// R rows = (a,b,c). R*v=rotMat(v,a,b,c). R^T*v=rotMatT(v,a,b,c).
+inline void matRT_M_R(
+    float3 j0, float3 j1, float3 j2, float3 a, float3 b, float3 c,
+    float3* o0, float3* o1, float3* o2
+){
+    // M = J_tip * R  →  M_row_i = rotMatT(J_tip_row_i, a, b, c)
+    float3 m0 = rotMatT(j0, a, b, c);
+    float3 m1 = rotMatT(j1, a, b, c);
+    float3 m2 = rotMatT(j2, a, b, c);
+    // J_world = R^T * M  →  row_i = a[i]*m0 + b[i]*m1 + c[i]*m2
+    *o0 = a.x*m0 + b.x*m1 + c.x*m2;
+    *o1 = a.y*m0 + b.y*m1 + c.y*m2;
+    *o2 = a.z*m0 + b.z*m1 + c.z*m2;
+}
+
+// ---- Solve symmetric 3x3 system J*lambda = b via cofactors ----
+// Returns 0 on success, 4 if singular (|det| < eps). J given as 3 rows.
+inline int solve3x3_symmetric(
+    float3 j0, float3 j1, float3 j2, float3 b, float3* lambda, float* det_out
+){
+    float j00=j0.x, j01=j0.y, j02=j0.z;
+    float j11=j1.y, j12=j1.z;
+    float j22=j2.z;
+    // Adjugate (symmetric: j01=j10, j02=j20, j12=j21)
+    float a00 = j11*j22 - j12*j12;
+    float a01 = j02*j12 - j01*j22;
+    float a02 = j01*j12 - j02*j11;
+    float a11 = j00*j22 - j02*j02;
+    float a12 = j01*j02 - j00*j12;
+    float a22 = j00*j11 - j01*j01;
+    float det = j00*a00 + j01*a01 + j02*a02;  // = j00*(j11*j22-j12²) - j01*(j01*j22-j12*j02) + j02*(j01*j12-j02*j11)
+    *det_out = det;
+    float adet = fabs(det);
+    // Scale-aware singularity threshold
+    float scale = fmax(fabs(j00), fmax(fabs(j11), fabs(j22)));
+    scale = fmax(scale, 1e-20f);
+    if(adet < 1e-18f * scale * scale * scale) return 4;  // singular
+    float inv_det = 1.0f / det;
+    lambda->x = (a00*b.x + a01*b.y + a02*b.z) * inv_det;
+    lambda->y = (a01*b.x + a11*b.y + a12*b.z) * inv_det;
+    lambda->z = (a02*b.x + a12*b.y + a22*b.z) * inv_det;
+    return 0;
+}
+
+// ---- Smallest eigenvalue of 3x3 symmetric matrix (H = -J for stability check) ----
+// Uses the analytical formula for 3x3 symmetric eigenvalues.
+inline float eigenmin3x3_symmetric(float3 h0, float3 h1, float3 h2){
+    float p1 = h0.y*h0.y + h0.z*h0.z + h1.z*h1.z;  // off-diagonal² sum
+    float q  = (h0.x + h1.y + h2.z) / 3.0f;         // trace/3
+    float p2 = (h0.x-q)*(h0.x-q) + (h1.y-q)*(h1.y-q) + (h2.z-q)*(h2.z-q) + 2.0f*p1;
+    float p  = sqrt(p2 / 6.0f);
+    if(p < 1e-20f) return q;  // nearly q*I
+    // B = (1/p)*(H - q*I)
+    float b00=(h0.x-q)/p, b11=(h1.y-q)/p, b22=(h2.z-q)/p;
+    float b01=h0.y/p, b02=h0.z/p, b12=h1.z/p;
+    float detB = b00*(b11*b22-b12*b12) - b01*(b01*b22-b12*b02) + b02*(b01*b12-b11*b02);
+    float r = detB * 0.5f;
+    r = fmax(-1.0f, fmin(1.0f, r));  // clamp for acos
+    float phi = acos(r) / 3.0f;
+    float eig1 = q + 2.0f*p*cos(phi);
+    float eig3 = q + 2.0f*p*cos(phi + 2.0f*M_PI_F/3.0f);
+    float eig2 = 3.0f*q - eig1 - eig3;
+    return fmin(eig1, fmin(eig2, eig3));
+}
+
+// ---- Condition estimate |J|_inf * |Jinv|_inf for 3x3 symmetric J ----
+inline float condition_estimate3x3(float3 j0, float3 j1, float3 j2, float det){
+    float jinf = fmax(fabs(j0.x)+fabs(j0.y)+fabs(j0.z),
+               fmax(fabs(j1.x)+fabs(j1.y)+fabs(j1.z),
+                    fabs(j2.x)+fabs(j2.y)+fabs(j2.z)));
+    float j00=j0.x, j01=j0.y, j02=j0.z, j11=j1.y, j12=j1.z, j22=j2.z;
+    float a00=j11*j22-j12*j12, a01=j02*j12-j01*j22, a02=j01*j12-j02*j11;
+    float a11=j00*j22-j02*j02, a12=j01*j02-j00*j12, a22=j00*j11-j01*j01;
+    float ainf = fmax(fabs(a00)+fabs(a01)+fabs(a02),
+               fmax(fabs(a01)+fabs(a11)+fabs(a12),
+                    fabs(a02)+fabs(a12)+fabs(a22)));
+    float adet = fmax(fabs(det), 1e-30f);
+    return jinf * (ainf / adet);
+}
+
+// ---- Pass 1: per-state adjoint (one work-item per (scan,z) state) ----
+// Re-evaluates total force G and Jacobian J at stored PPs, solves J*lambda=b,
+// writes lambdas[iState] and adjoint_diag[iState].
+__kernel void morseDirectStateAdjoint(
+    const int nAtoms, __global const float4* atoms, __global const float4* cMs,
+    __global const float4* points, __global const float4* PPs,
+    __global const float4* dL_dFEs, __global float4* lambdas,
+    __global float4* adjoint_diag,
+    float4 tipA, float4 tipB, float4 tipC, float4 stiffness, float4 dpos0,
+    float4 surfFF, float4 Qs, float4 QZs, const int nScan, const int nz,
+    __local float4* LATOMS, __local float4* LCMS
+){
+    const int iL = get_local_id(0);
+    const int nL = get_local_size(0);
+    // Cooperative preload (same pattern as forward kernel)
+    for(int i=iL; i<nAtoms; i+=nL){
+        LATOMS[i] = atoms[i];
+        LCMS  [i] = cMs  [i];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int iState = get_global_id(0);
+    if(iState >= nScan * nz) return;
+
+    const int iScan = iState / nz;
+    const int iz    = iState % nz;
+
+    // Read PP and upstream gradient
+    float4 pp = PPs[iState];
+    float4 u  = dL_dFEs[iState];
+    float3 qstar = pp.xyz;
+
+    // --- Check finiteness (status 2) ---
+    if(!all(isfinite(pp)) || !all(isfinite(u))){
+        lambdas[iState] = float4Zero;
+        adjoint_diag[iState] = (float4)(0.0f, 0.0f, 0.0f, 2.0f);
+        return;
+    }
+    // --- Check forward convergence (status 1) ---
+    if(pp.w <= 0.0f){
+        lambdas[iState] = float4Zero;
+        adjoint_diag[iState] = (float4)(0.0f, 0.0f, 0.0f, 1.0f);
+        return;
+    }
+
+    // Reconstruct tipPos for this z slice
+    float3 dTip = tipC.xyz * tipC.w;
+    float3 tipPos = points[iScan].xyz + dTip * (float)iz;
+    float3 a = tipA.xyz, b = tipB.xyz, c = tipC.xyz;
+    float4 Qs_ = Qs * COULOMB_CONST;
+
+    // Sample FE + Hessian at q*
+    float4 fe; float3 H0, H1, H2;
+    evalMorseCDirect_FE_Hessian_local(qstar, LATOMS, LCMS, nAtoms, Qs_, QZs, &fe, &H0, &H1, &H2);
+    float3 F_sample = fe.xyz;
+
+    // Tip force + surface bias
+    float3 dpos  = qstar - tipPos;
+    float3 dpos_ = rotMat(dpos, a, b, c);
+    float3 ftip  = tipForce(dpos_, stiffness, dpos0);
+    float3 F_tip = rotMatT(ftip, a, b, c);
+    float3 F_surf = c * surfFF.x;
+
+    // Residual G = F_sample + F_tip + F_surf
+    float3 G = F_sample + F_tip + F_surf;
+    float residual = sqrt(dot(G, G));
+
+    // --- Check residual (status 1) ---
+    // Forward F2CONV=1e-8 → |f|<1e-4 at convergence. Allow 5x margin for float32
+    // re-evaluation roundoff (force sum order differs from forward kernel).
+    if(residual >= 5e-4f){
+        lambdas[iState] = float4Zero;
+        adjoint_diag[iState] = (float4)(residual, 0.0f, 0.0f, 1.0f);
+        return;
+    }
+
+    // Check H finiteness
+    if(!all(isfinite(H0)) || !all(isfinite(H1)) || !all(isfinite(H2))){
+        lambdas[iState] = float4Zero;
+        adjoint_diag[iState] = (float4)(residual, 0.0f, 0.0f, 2.0f);
+        return;
+    }
+
+    // Tip force Jacobian dg/dd (tip coords) → J_world = R^T * dg/dd * R
+    float3 Jt0, Jt1, Jt2;
+    tipForceJacobian(dpos_, stiffness, dpos0, &Jt0, &Jt1, &Jt2);
+    float3 Jw0, Jw1, Jw2;
+    matRT_M_R(Jt0, Jt1, Jt2, a, b, c, &Jw0, &Jw1, &Jw2);
+
+    // J = -H_E + R^T*(dg/dd)*R  (symmetric)
+    float3 J0 = -H0 + Jw0;
+    float3 J1 = -H1 + Jw1;
+    float3 J2 = -H2 + Jw2;
+
+    // b = -H_E*rotMatT(u.xyz) - F_sample*u.w
+    float3 u_world = rotMatT(u.xyz, a, b, c);
+    float3 b_vec = -(float3)(dot(H0,u_world), dot(H1,u_world), dot(H2,u_world)) - F_sample * u.w;
+
+    // Solve J*lambda = b
+    float3 lambda; float det;
+    int solve_status = solve3x3_symmetric(J0, J1, J2, b_vec, &lambda, &det);
+
+    // --- Check singularity (status 4) ---
+    if(solve_status != 0){
+        lambdas[iState] = float4Zero;
+        adjoint_diag[iState] = (float4)(residual, 0.0f, 0.0f, 4.0f);
+        return;
+    }
+    if(!all(isfinite(lambda))){
+        lambdas[iState] = float4Zero;
+        adjoint_diag[iState] = (float4)(residual, 0.0f, 0.0f, 2.0f);
+        return;
+    }
+
+    // lambda_min of H = -J (stability: H must be positive definite)
+    float lambda_min = eigenmin3x3_symmetric(-J0, -J1, -J2);
+
+    // --- Check instability (status 3) ---
+    if(lambda_min <= 1e-5f){
+        lambdas[iState] = float4Zero;
+        adjoint_diag[iState] = (float4)(residual, lambda_min, 0.0f, 3.0f);
+        return;
+    }
+
+    // Condition estimate
+    float cond = condition_estimate3x3(J0, J1, J2, det);
+
+    // --- Check condition (status 4) ---
+    if(cond >= 1e6f || !isfinite(cond)){
+        lambdas[iState] = float4Zero;
+        adjoint_diag[iState] = (float4)(residual, lambda_min, cond, 4.0f);
+        return;
+    }
+
+    // --- Success (status 0) ---
+    lambdas[iState] = (float4)(lambda, 0.0f);
+    adjoint_diag[iState] = (float4)(residual, lambda_min, cond, 0.0f);
+}
+
+// ---- Pass 2: per-scan/atom parameter partials (one work-item per (scan,atom)) ----
+// Loops over z, consumes lambda/PPs/dL_dFEs, writes partial_xR and partial_EQ.
+// Buffer layout: atom-major, partial_xR[iAtom*nScan + iScan] (coalesced for pass 3).
+__kernel void morseDirectParamPartials(
+    const int nAtoms, __global const float4* atoms, __global const float4* cMs,
+    __global const float4* points, __global const float4* PPs,
+    __global const float4* dL_dFEs, __global const float4* lambdas,
+    __global float4* partial_xR, __global float4* partial_EQ,
+    float4 tipA, float4 tipB, float4 tipC, float4 Qs, float4 QZs,
+    const int nScan, const int nz
+){
+    const int gid = get_global_id(0);
+    if(gid >= nScan * nAtoms) return;
+    const int iScan = gid / nAtoms;
+    const int iAtom = gid % nAtoms;
+
+    float3 a = tipA.xyz, b = tipB.xyz, c = tipC.xyz;
+    float3 dTip = tipC.xyz * tipC.w;
+    float4 Qs_ = Qs * COULOMB_CONST;
+    float4 atom = atoms[iAtom];
+    float4 cm   = cMs[iAtom];
+    float3 tipPos0 = points[iScan].xyz;
+
+    float4 sum_xR = float4Zero;  // (x, y, z, R0)
+    float4 sum_EQ = float4Zero;  // (E0, Q, 0, 0)
+
+    for(int iz=0; iz<nz; iz++){
+        int iState = iScan * nz + iz;
+        float4 pp = PPs[iState];
+        float4 u  = dL_dFEs[iState];
+        float4 lam = lambdas[iState];
+
+        // Skip non-converged or nonfinite states (contribute 0)
+        if(pp.w <= 0.0f || !all(isfinite(pp)) || !all(isfinite(u)) || !all(isfinite(lam)))
+            continue;
+        // Skip states where adjoint failed (lambda is zero but diag status != 0)
+        // The host raises on any failure in pass 1, so if we reach here all states
+        // are valid. But defensive: if lambda and u are both zero, skip.
+        if(dot(u,u) == 0.0f && dot(lam.xyz,lam.xyz) == 0.0f) continue;
+
+        float3 qstar = pp.xyz;
+        float3 tipPos = tipPos0 + dTip * (float)iz;
+
+        // u_world = rotMatT(u.xyz) — convert upstream from tip-rotated to world
+        float3 u_world = rotMatT(u.xyz, a, b, c);
+        float3 lambda  = lam.xyz;
+        float3 w = u_world - lambda;  // combined adjoint weight
+        float uw = u.w;
+
+        float3 dpos_ = rotMat(qstar - tipPos, a, b, c);
+
+        // --- Per-atom Morse pair quantities at q* ---
+        float3 d_m = qstar - atom.xyz;
+        float r2_m = dot(d_m, d_m) + R2SAFE;
+        float r_m  = sqrt(r2_m);
+        float R0 = cm.x, E0 = cm.y, K = cm.z;
+        float s  = exp(K*(r_m - R0));
+        float Ep = 2.0f*K*E0*s*(s - 1.0f);        // dE_M/dr
+        float Epp = 2.0f*K*K*E0*s*(2.0f*s - 1.0f); // d²E_M/dr²
+        float fr_m = -Ep;                          // -dE_M/dr
+        float3 F_M = d_m * (fr_m / r_m);           // Morse force on probe
+        float  E_M = E0*s*(s - 2.0f);
+        // dF_M/dR0 = d_m * 2*K²*E0*s*(2s-1) / r
+        float3 dF_dR0 = d_m * (2.0f*K*K*E0*s*(2.0f*s - 1.0f) / r_m);
+        // dF_M/dE0 = d_m * (-2*K*s*(s-1)) / r
+        float3 dF_dE0 = d_m * (-2.0f*K*s*(s - 1.0f) / r_m);
+        float dE_dR0 = -2.0f*K*E0*s*(s - 1.0f);
+        float dE_dE0 = s*(s - 2.0f);
+        // Per-atom Morse Hessian H_M_i
+        float c_out_m = (Epp - Ep/r_m) / r2_m;
+        float c_dia_m = Ep / r_m;
+        float3 HMi0 = (float3)(c_out_m*d_m.x*d_m.x + c_dia_m, c_out_m*d_m.x*d_m.y,         c_out_m*d_m.x*d_m.z);
+        float3 HMi1 = (float3)(c_out_m*d_m.y*d_m.x,         c_out_m*d_m.y*d_m.y + c_dia_m, c_out_m*d_m.y*d_m.z);
+        float3 HMi2 = (float3)(c_out_m*d_m.z*d_m.x,         c_out_m*d_m.z*d_m.y,         c_out_m*d_m.z*d_m.z + c_dia_m);
+
+        // --- Per-atom Coulomb pair quantities (4 tip sites) ---
+        float3 F_C = float3Zero;
+        float  E_C = 0.0f;
+        float3 dF_dQ = float3Zero;  // dF_C/dQ_i
+        float  dE_dQ = 0.0f;        // dE_C/dQ_i
+        float3 HC0 = float3Zero, HC1 = float3Zero, HC2 = float3Zero;
+        float Qi = atom.w;
+        // site x
+        { float3 dk = (qstar + (float3)(0.0f,0.0f,QZs.x)) - atom.xyz;
+          float rk2=dot(dk,dk)+R2SAFE; float rk=sqrt(rk2); float rk3=rk*rk2; float rk5=rk3*rk2;
+          float C=Qi*Qs_.x; float ir3=C/rk3;
+          F_C += dk*ir3; E_C += C/rk;
+          dF_dQ += dk*(Qs_.x/rk3); dE_dQ += Qs_.x/rk;
+          float co=3.0f*C/rk5, cd=-C/rk3;
+          HC0 += (float3)(co*dk.x*dk.x+cd, co*dk.x*dk.y,       co*dk.x*dk.z);
+          HC1 += (float3)(co*dk.y*dk.x,       co*dk.y*dk.y+cd, co*dk.y*dk.z);
+          HC2 += (float3)(co*dk.z*dk.x,       co*dk.z*dk.y,    co*dk.z*dk.z+cd); }
+        // site y
+        { float3 dk = (qstar + (float3)(0.0f,0.0f,QZs.y)) - atom.xyz;
+          float rk2=dot(dk,dk)+R2SAFE; float rk=sqrt(rk2); float rk3=rk*rk2; float rk5=rk3*rk2;
+          float C=Qi*Qs_.y; float ir3=C/rk3;
+          F_C += dk*ir3; E_C += C/rk;
+          dF_dQ += dk*(Qs_.y/rk3); dE_dQ += Qs_.y/rk;
+          float co=3.0f*C/rk5, cd=-C/rk3;
+          HC0 += (float3)(co*dk.x*dk.x+cd, co*dk.x*dk.y,       co*dk.x*dk.z);
+          HC1 += (float3)(co*dk.y*dk.x,       co*dk.y*dk.y+cd, co*dk.y*dk.z);
+          HC2 += (float3)(co*dk.z*dk.x,       co*dk.z*dk.y,    co*dk.z*dk.z+cd); }
+        // site z
+        { float3 dk = (qstar + (float3)(0.0f,0.0f,QZs.z)) - atom.xyz;
+          float rk2=dot(dk,dk)+R2SAFE; float rk=sqrt(rk2); float rk3=rk*rk2; float rk5=rk3*rk2;
+          float C=Qi*Qs_.z; float ir3=C/rk3;
+          F_C += dk*ir3; E_C += C/rk;
+          dF_dQ += dk*(Qs_.z/rk3); dE_dQ += Qs_.z/rk;
+          float co=3.0f*C/rk5, cd=-C/rk3;
+          HC0 += (float3)(co*dk.x*dk.x+cd, co*dk.x*dk.y,       co*dk.x*dk.z);
+          HC1 += (float3)(co*dk.y*dk.x,       co*dk.y*dk.y+cd, co*dk.y*dk.z);
+          HC2 += (float3)(co*dk.z*dk.x,       co*dk.z*dk.y,    co*dk.z*dk.z+cd); }
+        // site w
+        { float3 dk = (qstar + (float3)(0.0f,0.0f,QZs.w)) - atom.xyz;
+          float rk2=dot(dk,dk)+R2SAFE; float rk=sqrt(rk2); float rk3=rk*rk2; float rk5=rk3*rk2;
+          float C=Qi*Qs_.w; float ir3=C/rk3;
+          F_C += dk*ir3; E_C += C/rk;
+          dF_dQ += dk*(Qs_.w/rk3); dE_dQ += Qs_.w/rk;
+          float co=3.0f*C/rk5, cd=-C/rk3;
+          HC0 += (float3)(co*dk.x*dk.x+cd, co*dk.x*dk.y,       co*dk.x*dk.z);
+          HC1 += (float3)(co*dk.y*dk.x,       co*dk.y*dk.y+cd, co*dk.y*dk.z);
+          HC2 += (float3)(co*dk.z*dk.x,       co*dk.z*dk.y,    co*dk.z*dk.z+cd); }
+
+        // Per-atom total Hessian H_E_i = H_M_i + H_C_i
+        float3 Hi0 = HMi0 + HC0;
+        float3 Hi1 = HMi1 + HC1;
+        float3 Hi2 = HMi2 + HC2;
+
+        // --- VJP partials (factored form with w = u_world - lambda) ---
+        // dL/d(a_i.xyz) = H_E_i * w + (F_M + F_C) * u.w
+        float3 dL_dxyz = (float3)(dot(Hi0,w), dot(Hi1,w), dot(Hi2,w)) + (F_M + F_C) * uw;
+        // dL/dR0 = w·dF_dR0 + u.w*dE_dR0
+        float dL_dR0 = dot(w, dF_dR0) + uw * dE_dR0;
+        // dL/dE0 = w·dF_dE0 + u.w*dE_dE0
+        float dL_dE0 = dot(w, dF_dE0) + uw * dE_dE0;
+        // dL/dQ  = w·dF_dQ  + u.w*dE_dQ
+        float dL_dQ  = dot(w, dF_dQ)  + uw * dE_dQ;
+
+        sum_xR += (float4)(dL_dxyz, dL_dR0);
+        sum_EQ += (float4)(dL_dE0, dL_dQ, 0.0f, 0.0f);
+    }
+
+    // Atom-major layout: partial_xR[iAtom * nScan + iScan] (coalesced for pass 3)
+    partial_xR[iAtom * nScan + iScan] = sum_xR;
+    partial_EQ[iAtom * nScan + iScan] = sum_EQ;
+}
+
+// ---- Pass 3: reduce scan dimension (one workgroup per atom) ----
+// Reduces partial_xR/partial_EQ over nScan → grad_xR/grad_EQ (one float4 per atom).
+__kernel void reduceMorseDirectParamPartials(
+    const int nAtoms, const int nScan, __global const float4* partial_xR,
+    __global const float4* partial_EQ, __global float4* grad_xR,
+    __global float4* grad_EQ, __local float4* L_xR, __local float4* L_EQ
+){
+    const int iAtom = get_group_id(0);
+    const int iL    = get_local_id(0);
+    const int nL    = get_local_size(0);
+    if(iAtom >= nAtoms) return;
+
+    // Strided accumulation over scan dimension (atom-major: contiguous for coalescing)
+    float4 sxR = float4Zero, sEQ = float4Zero;
+    for(int s=iL; s<nScan; s+=nL){
+        sxR += partial_xR[iAtom * nScan + s];
+        sEQ += partial_EQ[iAtom * nScan + s];
+    }
+    L_xR[iL] = sxR;
+    L_EQ[iL] = sEQ;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Tree reduction
+    for(int stride = nL >> 1; stride > 0; stride >>= 1){
+        if(iL < stride){
+            L_xR[iL] += L_xR[iL + stride];
+            L_EQ[iL] += L_EQ[iL + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if(iL == 0){
+        grad_xR[iAtom] = L_xR[0];
+        grad_EQ[iAtom] = L_EQ[0];
+    }
+}
