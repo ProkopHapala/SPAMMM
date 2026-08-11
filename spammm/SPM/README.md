@@ -2,8 +2,8 @@
 
 Scanning Probe Microscopy — AFM and STM. GPU-accelerated via PyOpenCL. FDBM path is the GUI engine (not Morse+point-charge).
 
-- **AFM.py** — AFMulator (LJ/Morse + FDBM), PP relax, vertical z-stack acquisition, directional `compute_df_dir` / `compute_df_amp_dir`; **stiffness SSOT** `stiffness_Nm_to_eVA2` / `K_LAT_HAPALA_*` (internal eV/Å², GUI N/m). **Perf:** `AFMBench`, gpyFFT helpers, Round-2 `stage3_fdbm_fields_fast` / `fdbm_*` via shared AFMulator ctx. Switches: `SPAMMM_AFM_FAST_S3` (default 1), `SPAMMM_AFM_CPU_FFT`, `SPAMMM_AFM_CPU_TASKS`, `SPAMMM_AFM_BENCH`, `SPAMMM_AFM_BENCH_NO_IO`.
-- **AFM_utils.py** — Tip densities (`pad_mode='cpu'|'none'`), FDBM orchestration, STM/orbital helpers; lateral oscillation pads x/y while z remains the approach/slice axis; strip plots `plot_afm_variant_height_strip` (**vertical amp_align**: df @ h, Fz @ h−amp); **`run_basis_tails_compare`** (ρ+Pauli log talk plots → `run_spm.py basis-tails`).
+- **AFM.py** — AFMulator (LJ/Morse + FDBM), PP relax; **contact_pme** `fit_contact_pme` / `run_scan_contact_pme` (local WG default); stiffness SSOT; FAST_S3 switches.
+- **AFM_utils.py** — Tip densities, FDBM; strip plots; **`run_contact_pme_pp_afm`** (CLI SSOT for `--model contact_pme`, forces `core_backend='local'`).
 - **stm_compare.py** — DFTB vs pySCF frontier orbitals / STM current / vacuum panels; SSOT for `run_spm.py stm *`.
 - **ModularPipeline.py** — Staged S1–S6 AFM/STM with disk cache; dual Stage-3 (fast vs `FAST_S3=0` legacy).
 - **KrigingGridFF.py** — DFT z-scan → GridFF `(nx,ny,nz,4)=(Fx,Fy,Fz,E)` for `setup_fdbm_grid`; Mithun loaders; deps NumPy/SciPy only
@@ -11,7 +11,7 @@ Scanning Probe Microscopy — AFM and STM. GPU-accelerated via PyOpenCL. FDBM pa
 - **ManipulationPathOpt.py** — AFM tip-path optimization
 - **ScanUtils.py** — Trajectory generators (grid/line/rotational/tilted)
 
-**CLI:** repo-root `run_spm.py` — see [`user_guide/SPM_CLI.md`](../../user_guide/SPM_CLI.md). Defaults (FDBM): df window 3.7–4.7 Å @ dz=0.1, Fz amp-aligned at h−amp; `--plots compare,stage`; `opt` / `smiles-afm` for planar PCA geometries.
+**CLI:** repo-root `run_spm.py` — see [`user_guide/SPM_CLI.md`](../../user_guide/SPM_CLI.md). Models: `fdbm`, `morse`, `contact`, **`contact_pme`**. Report: [`ContactPME_PAW_AFM_MemSpeed_2026-08-11.md`](../../doc/Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md).
 
 **Campaigns / open tasks:** STM mio/3ob/prolonged vs pySCF cubes → `doc/Tasks/STM_ExtendedBasis_OrbitalCompare.md` (`tests/SPM/testplot_stm_basis_compare.py`, artifacts `debug/stm_orbital_compare/`); site Pauli \(A,\beta\) maps → `doc/Tasks/Pauli_A_beta_KrigingTransferability.md`; Kriging import → `doc/Tasks/Import_KrigingGridFF.md`. GPU pySCF notes: `doc/AGENTS/notes/pyscf-gpu-scf.md`.
 

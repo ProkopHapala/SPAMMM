@@ -15,7 +15,7 @@ OpenCL source for SPAMMM GPU compute. Python harnesses concatenate `.cl` snippet
 | `nonbonded_grid.cl` | GridFF-augmented nonbonded + spatial bucketing | SPFF (on demand) |
 | `gridFF.cl` | 3D B-spline grid build, Poisson, sampling | SPFF, GridFF, rigid |
 | `surface.cl` | Ewald2D, folded basis, brute Morse, isosurface | SPFF, SurfaceEwald |
-| `contact_surface.cl` | Quasi-2D contact surface (separable + PIC) | `surfaces/ContactSurface.py` |
+| `contact_surface.cl` | Quasi-2D contact + **contact_pme** (local/bucket FIRE, `fillContactPMEMeshVL`) | `SPM/AFM.py`, `surfaces/ContactSurface.py` |
 | `rigid.cl` | 6-DOF rigid body, PairFF+FAF replica energy, and ping-pong concurrent multi-molecule MD | `forcefields/RigidBodyDynamics.py` |
 | `assembly.cl` | Multi-molecule rigid transforms + clash | `forcefields/Assembly.py` |
 | `AFM.cl` | Probe relaxation + AFM image generation | `SPM/AFM.py` |
@@ -229,6 +229,16 @@ Spec: `doc/Topics/AFM/ContactSurface_Static.md` · pitfalls: `doc/Takeways.md`
 | `cs_pic_Av`, `cs_pic_Atv`, `cs_pic_Atv_w` | Matrix-free PIC fit |
 | `relaxStrokesTiltedPIC` | PP-AFM relaxation using PIC field |
 
+### contact_pme (particle-mesh: coarse mesh + compact cores)
+
+| Kernel | Role |
+|--------|------|
+| `evalContactPME` / `evalContactPMELocal` | Batch E,F (bucket vs WG+local atom preload) |
+| `relaxStrokesTiltedContactPME` / `…Local` | Fused FIRE PP scan (CLI uses **Local**) |
+| `fillContactPMEMeshVL` | FIT: raster PAW V_L on coarse mesh (WG+local) |
+
+Report: `doc/Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md` · plan: `doc/Tasks/ContactSurface_PME_ParallelPlan.md`
+
 ### Reference & helpers
 
 | Kernel | Role |
@@ -241,7 +251,8 @@ Spec: `doc/Topics/AFM/ContactSurface_Static.md` · pitfalls: `doc/Takeways.md`
 AFMulator adds `AFM.cl` for full scan stack.
 
 **Drivers:**
-- `pytest tests/SPM/test_afm_contact_surface.py` — L0
+- `pytest tests/SPM/test_afm_contact_surface.py` — L0 (+ `--develop` for CLI AFM strips)
+- `run_spm.py afm --model contact_pme --xyz data/xyz/pyridine.xyz`
 - `RUN_CONTACT_PP=1 python tests/testplot_contact_surface.py` → `debug/testplot_contact_surface/`
 
 ---

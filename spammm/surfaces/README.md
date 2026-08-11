@@ -12,7 +12,10 @@ Caveats: [doc/Caveats.md](../../doc/Caveats.md) §6 · Debugging: [doc/Takeways.
 
 ## File index
 
-- **ContactSurface.py** — GPU contact field: sphere-envelope `h₀` (`build_contact_height_map` / `eval_sphere_contact_height`); `ContactSurfaceCL` (brute, separable CG, PIC); `SeparableParams`, `PICParams`
+- **ContactSurface.py** — GPU contact field: sphere-envelope `h₀`; separable/PIC; **`ContactPMEParams`** for particle-mesh backend
+- **PMESplit.py** — atomwise PAW soft-replacement long/short split (default `paw`); `precompute_split_cache`, closed-form a0
+- **CoarseMesh.py** — coarse 3D B-spline of V_L; batched prefilter; CPU raster (GPU fill lives in AFMulator / `fillContactPMEMeshVL`)
+- **PICCore.py** — compact residual core fit (`fit_core_1d`, powers 2…32)
 - **GridFF.py** — PyOpenCL B-spline grid force field for periodic substrates (Pauli/London/Coulomb channels)
 - **SurfaceEwald.py** — GPU 2D Ewald summation for electrostatic potentials/fields above periodic surfaces
 - **Ewald2D.py** — NumPy 2D Ewald reference (plane-wave formulation, parity vs GPU)
@@ -21,6 +24,16 @@ Caveats: [doc/Caveats.md](../../doc/Caveats.md) §6 · Debugging: [doc/Takeways.
 - **FoldedRigid.py** — Folded-basis rigid-body simulation; versioned `typed_combined` and substrate-only `factorized_plqh` fits, constrained charge discretization, fit comparison harness, relaxation/manipulation, and CPU map helpers. Architecture/verification: [`FAF_Fit_Architecture.md`](../../doc/Tasks/FAF_Fit_Architecture.md)
 - **surface_plots.py** — Matplotlib: FoldedRigid traj/scans + PairFF tip-pull movies; **map display must reuse Vispy `potential_to_rgba`** (`doc/Tasks/PairFF_MapDisplay_SSOT.md`)
 - **SubstrateBuilder.py** — Crystal slab generation (NaCl, CaF₂): flat slabs and step edges
+
+## contact_pme (particle-mesh)
+
+`V ≈ V_mesh + Σ V_core`. CLI: `run_spm.py afm --model contact_pme`. Plan: [`ContactSurface_PME_ParallelPlan.md`](../../doc/Tasks/ContactSurface_PME_ParallelPlan.md). Report: [`ContactPME_PAW_AFM_MemSpeed_2026-08-11.md`](../../doc/Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md). Audit: [`AFM_ContactSurface.md`](../../doc/TopicalAudit/AFM_ContactSurface.md).
+
+| Stage | Device | Entry |
+|-------|--------|-------|
+| FIT mesh V_L | GPU | `fillContactPMEMeshVL` via `AFMulator.fit_contact_pme` |
+| FIT core LS | host | `PICCore.fit_core_1d` |
+| SCAN FIRE | GPU | `relaxStrokesTiltedContactPMELocal` (`core_backend='local'`) |
 
 ## Contact surface — variants (2.5D)
 

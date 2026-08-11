@@ -15,7 +15,7 @@ from __future__ import annotations
 import numpy as np
 from dataclasses import dataclass
 
-from spammm.surfaces.PMESplit import SplitParams, soft_core_split
+from spammm.surfaces.PMESplit import SplitParams, soft_core_split, precompute_split_cache
 from spammm.surfaces.ContactSurface import build_pic_buckets, boltzmann_fit_weights
 
 # Doubling-power exponents — p0=2 keeps φ=φ'=0 at cutoff and resolves the well better
@@ -143,6 +143,7 @@ def fit_core_1d(p: SplitParams, n_shells=300, n_endpoint=30, n_holdout=80,
         r_lo_i = float(r_lo_arr[i])
         r_b_i = float(r_b_arr[i])
         pi = p.with_atom(i)
+        cache = precompute_split_cache(pi)
         r_all = _sample_radii(r_lo_i, r_b_i, n_shells, n_endpoint, rng)
         if len(r_all) > n_holdout + 10:
             hold_idx = rng.choice(len(r_all), size=n_holdout, replace=False)
@@ -154,7 +155,7 @@ def fit_core_1d(p: SplitParams, n_shells=300, n_endpoint=30, n_holdout=80,
             r_train = r_all
             r_hold = np.array([], dtype=np.float64)
 
-        s_train = soft_core_split(r_train, pi)
+        s_train = soft_core_split(r_train, pi, cache=cache)
         v_S = s_train['v_S']
         dv_S = s_train['dv_S_dr']
         v_tot = s_train['v']
@@ -185,7 +186,7 @@ def fit_core_1d(p: SplitParams, n_shells=300, n_endpoint=30, n_holdout=80,
         c_raw_from_hier = H.T @ c_hier
 
         if len(r_hold) > 0:
-            s_hold = soft_core_split(r_hold, pi)
+            s_hold = soft_core_split(r_hold, pi, cache=cache)
             v_S_hold = s_hold['v_S']
             dv_S_hold = s_hold['dv_S_dr']
             phi_hold, dphi_hold = core_basis(r_hold, r_lo_i, r_b_i, powers)
@@ -206,7 +207,7 @@ def fit_core_1d(p: SplitParams, n_shells=300, n_endpoint=30, n_holdout=80,
         train_rmse_F[i] = float(np.sqrt(np.mean((F_train - dv_S)**2)))
 
         if len(r_hold) > 0:
-            s_hold = soft_core_split(r_hold, pi)
+            s_hold = soft_core_split(r_hold, pi, cache=cache)
             v_S_hold = s_hold['v_S']
             dv_S_hold = s_hold['dv_S_dr']
             phi_hold, dphi_hold = core_basis(r_hold, r_lo_i, r_b_i, powers)

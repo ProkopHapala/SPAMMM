@@ -16,8 +16,9 @@ from __future__ import annotations
 import numpy as np
 from dataclasses import dataclass
 
-from spammm.surfaces.PMESplit import SplitParams, soft_core_split
-from spammm.surfaces.ContactSurface import _bspline_prefilter_1d
+from spammm.surfaces.PMESplit import SplitParams, soft_core_split, precompute_split_cache
+from spammm.surfaces.ContactSurface import _bspline_prefilter_1d, _bspline_tridiag_ab
+from scipy.linalg import solve_banded
 
 
 @dataclass
@@ -53,6 +54,27 @@ def _dbasis(u):
                      0.5 * u2], dtype=np.float64)
 
 
+def _prefilter_3d(samples):
+    """Separable cubic B-spline prefilter with batched solve_banded (no Python line loops)."""
+    coeffs = np.asarray(samples, dtype=np.float64).copy()
+    nx, ny, nz = coeffs.shape
+    # Along z: reshape (nx*ny, nz) → solve with nz rows, nx*ny RHS
+    if nz >= 3:
+        flat = coeffs.reshape(nx * ny, nz).T  # (nz, nxy)
+        coeffs = solve_banded((1, 1), _bspline_tridiag_ab(nz), flat).T.reshape(nx, ny, nz)
+    # Along y: for each x, (ny, nz) like 2D — batch as (nx*nz, ny)
+    if ny >= 3:
+        # coeffs[ix, :, iz] → move y to last: (nx, nz, ny)
+        tmp = np.transpose(coeffs, (0, 2, 1)).reshape(nx * nz, ny).T  # (ny, nx*nz)
+        tmp = solve_banded((1, 1), _bspline_tridiag_ab(ny), tmp).T.reshape(nx, nz, ny)
+        coeffs = np.transpose(tmp, (0, 2, 1))
+    # Along x: (nx, ny*nz)
+    if nx >= 3:
+        flat = coeffs.reshape(nx, ny * nz)  # (nx, nyz) — solve_banded wants (n, nrhs) leading = nx
+        coeffs = solve_banded((1, 1), _bspline_tridiag_ab(nx), flat).reshape(nx, ny, nz)
+    return coeffs
+
+
 # ── build ───────────────────────────────────────────────────────────────────
 
 def build_coarse_mesh(atom_pos, split_params, query_bounds, h_mesh=1.0, halo_nodes=6):
@@ -82,41 +104,24 @@ def build_coarse_mesh(atom_pos, split_params, query_bounds, h_mesh=1.0, halo_nod
     nz = int(np.round((hi[2] - lo[2]) / h)) + 1
     origin = lo.copy()
 
-    # Rasterize V_L = Σ_i v_i^L(|r - R_i|) by direct atom sum (vectorized over grid)
-    # Build coordinate vectors
     xs = origin[0] + np.arange(nx) * h
     ys = origin[1] + np.arange(ny) * h
     zs = origin[2] + np.arange(nz) * h
     samples = np.zeros((nx, ny, nz), dtype=np.float64)
-
     na = len(atom_pos)
 
-    # Slabbed over x to bound memory: each x-slab is (ny, nz)
-    for ix in range(nx):
-        dx_ia = xs[ix] - atom_pos[:, 0]  # (na,)
-        for ia in range(na):
-            ry = ys - atom_pos[ia, 1]  # (ny,)
-            rz = zs - atom_pos[ia, 2]  # (nz,)
-            r2 = dx_ia[ia] ** 2 + ry[:, None] ** 2 + rz[None, :] ** 2  # (ny, nz)
-            r = np.sqrt(r2)
-            pi = split_params.with_atom(ia)
-            s = soft_core_split(r, pi)
-            samples[ix] += s['v_L']
+    # One soft-poly cache + one full-volume soft_core_split per atom (not nx×na).
+    # Coarse meshes are tiny (~10⁴ nodes); full (nx,ny,nz) per atom is fine.
+    for ia in range(na):
+        pi = split_params.with_atom(ia)
+        cache = precompute_split_cache(pi)
+        dx = xs[:, None, None] - atom_pos[ia, 0]
+        dy = ys[None, :, None] - atom_pos[ia, 1]
+        dz = zs[None, None, :] - atom_pos[ia, 2]
+        r = np.sqrt(dx * dx + dy * dy + dz * dz)
+        samples += soft_core_split(r, pi, cache=cache)['v_L']
 
-    # Prefilter: separable along x, y, z (REUSE _bspline_prefilter_1d)
-    coeffs = samples.copy()
-    # Along z (axis 2): batched over (nx, ny)
-    for ix in range(nx):
-        for iy in range(ny):
-            coeffs[ix, iy, :] = _bspline_prefilter_1d(coeffs[ix, iy, :])
-    # Along y (axis 1): batched over (nx, nz)
-    for ix in range(nx):
-        for iz in range(nz):
-            coeffs[ix, :, iz] = _bspline_prefilter_1d(coeffs[ix, :, iz])
-    # Along x (axis 0): batched over (ny, nz)
-    for iy in range(ny):
-        for iz in range(nz):
-            coeffs[:, iy, iz] = _bspline_prefilter_1d(coeffs[:, iy, iz])
+    coeffs = _prefilter_3d(samples)
 
     # Safe interior: queries whose full 4×4×4 stencil stays inside [0, n-1]
     interior_lo = np.array([halo, halo, halo], dtype=np.int64)

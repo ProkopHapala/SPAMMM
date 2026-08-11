@@ -4435,6 +4435,7 @@ def run_contact_pme_pp_afm(tag, atomPos, atomTypes, origin, step, ngrid, outdir,
     FEs, pts = afmulator.run_scan_contact_pme(
         nxy=(nx_s, ny_s), nz=nz_s, dtip=dtip,
         scan_p0=scan_p0, scan_da=scan_da, scan_db=scan_db,
+        core_backend='local',  # Codex WG+local — fastest path for pyridine/PTCDA class
     )
     afmulator.queue.finish()
 

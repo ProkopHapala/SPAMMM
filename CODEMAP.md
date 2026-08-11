@@ -52,7 +52,10 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 
 ### spammm/surfaces/ — Surface Interactions
 - `GridFF.py` — grid force field (B-spline interpolation on periodic substrates)
-- `ContactSurface.py` — **quasi-2D contact field** for aperiodic AFM: separable B-spline×poly + radial PIC; `ContactSurfaceCL`, `SeparableParams`, `PICParams`, CG fit, h₀ map
+- `ContactSurface.py` — **quasi-2D contact field** for aperiodic AFM: separable B-spline×poly + radial PIC; also `ContactPMEParams` for particle-mesh backend
+- `PMESplit.py` — atomwise PAW/hermite/plateau/rho soft long/short split (default `paw`, `Δ_in=1.0`); `precompute_split_cache`
+- `CoarseMesh.py` — coarse 3D cubic B-spline mesh of V_L; batched prefilter; CPU raster oracle
+- `PICCore.py` — compact doubling-power core fit of v_S (`fit_core_1d`, powers 2…32)
 - `GridFFRelaxedScan.py` — relaxed scan over surface grid
 - `FoldedRigid.py` — folded basis rigid body relaxation
 - `Ewald2D.py` — 2D Ewald summation for surfaces
@@ -60,13 +63,13 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `Surface_utils.py` — surface utility functions
 - `SubstrateBuilder.py` — substrate crystal builder
 - `surface_plots.py` — surface visualization (plotting only)
-- `README.md` — module index; contact-surface API summary + fit knobs
+- `README.md` — module index; contact-surface + **contact_pme** API
 
 ### spammm/SPM/ — Scanning Probe Microscopy (AFM/STM)
-- `AFM.py` — AFMulator (Morse/LJ + FDBM); contact surface helpers; **FAST_S3** fused ES + GPU pad/scale (`SPAMMM_AFM_FAST_S3`); `AFMBench`
-- `AFM_utils.py` — tip densities, FDBM orchestration, `compose_and_relax_total`
+- `AFM.py` — AFMulator; **contact_pme**: `fit_contact_pme` (GPU mesh fill), `run_scan_contact_pme` (`core_backend` local/bucket), vectorized scan pts
+- `AFM_utils.py` — tip densities, FDBM; `run_contact_pme_pp_afm` (CLI SSOT, forces `core_backend='local'`)
 - `ModularPipeline.py` — modular AFM/STM pipeline (S1–S6) with dual Stage-3 (fast/legacy)
-- Perf report: `doc/Tasks/PerfBenchmark_FDBM.md`; bench: `tests/SPM/bench_fdbm.py`
+- Perf: `doc/Tasks/PerfBenchmark_FDBM.md`; contact-PME: `doc/Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md`
 - `ManipulationPathOpt.py` — manipulation path optimization
 - `ScanUtils.py` — scan grid utilities
 
@@ -132,7 +135,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `AFM.cl` — AFM PP relax + FDBM Stage-3 `fdbm_*` helpers (FAST_S3)
 - `gridFF.cl` — grid force field kernels
 - `surface.cl` — surface interaction kernels
-- `contact_surface.cl` — quasi-2D contact field: brute reference, separable Av/Atv/eval, PIC fit/eval, `relaxStrokesTiltedContact` / `relaxStrokesTiltedPIC`
+- `contact_surface.cl` — quasi-2D contact + **contact_pme**: bucket/local eval+FIRE (`relaxStrokesTiltedContactPME*`), GPU mesh FIT (`fillContactPMEMeshVL`)
 - `rigid.cl` — rigid body dynamics kernels (14: energy replica, 15: multimol MD, 16: persistent, 17: single-WG, 18: `rigid_body_pairff_probe_grid` — 2D grid PairFF energy via shared `pairff_unified_site_EF` inline primitive)
 - `assembly.cl` — rigid-body SAM packing: `emit_configuration_xyz`, `evaluate_packing_3d`
 - `nonbonded.cl` — non-bonded interaction kernels
@@ -198,6 +201,9 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `TopicalAudit/` — per-topic implementation maps (e.g. `AFM_FDBM.md`)
 - `Topics/AFM/ContactSurface_Static.md` — **quasi-2D AFM field** (separable + PIC): API, tutorial, parity
 - `Topics/AFM/ContactSurface_Elastic.md` — elastic extension (future)
+- `Tasks/ContactSurface_PME_ParallelPlan.md` — **contact_pme** particle-mesh plan (PAW split, mesh+core, harness packet)
+- `Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md` — memory/speed report; local-kernel SCAN + GPU mesh FIT
+- `TopicalAudit/AFM_ContactSurface.md` — contact surface + contact_pme implementation map
 - `Topics/ForceFields/LFF_ProjectiveRelax.md` — LFF projective Jacobi (springs + FAF outer); 3rd relax path
 - `Topics/Vibrations.md` — normal-mode analysis (Hessian, GUI, units, tests)
 - `Topics/ReactionCoordinateScan.md` — H-bond RC scan, pm-NEB, ScanDataset, ESP animation

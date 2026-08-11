@@ -79,6 +79,22 @@ def stiffness_eVA2_to_Nm(k_eVA2):
     return float(k_eVA2) * N_M_PER_EV_A2
 
 
+def build_scan_xy_points_vectorized(scan_p0, scan_da, scan_db, nx, ny):
+    """Build XY scan starts (n_scan, 4) float32 — NO Python ix/iy loops.
+
+    Same ordering as the old ``for ix: for iy: pts[k]=p0+da*ix+db*iy`` (ix-major).
+    """
+    p0 = np.asarray(scan_p0, dtype=np.float32).reshape(3)
+    da = np.asarray(scan_da, dtype=np.float32).reshape(3)
+    db = np.asarray(scan_db, dtype=np.float32).reshape(3)
+    ix = np.arange(int(nx), dtype=np.float32)[:, None]
+    iy = np.arange(int(ny), dtype=np.float32)[None, :]
+    xyz = p0 + da * ix[..., None] + db * iy[..., None]  # (nx, ny, 3)
+    pts = np.zeros((int(nx) * int(ny), 4), dtype=np.float32)
+    pts[:, :3] = xyz.reshape(-1, 3)
+    return pts
+
+
 def build_scan_points_vectorized(scan_xs, scan_ys, h_scan):
     """Build the shared 3D scan-point grid (nx*ny*nz, 4) float32 via meshgrid.
 
@@ -1506,11 +1522,16 @@ class AFMulator(OpenCLBase):
                   f"(legacy r_cut={r_cut}) h_mesh={h_mesh} halo={halo_nodes}")
             print(f"  query_bounds={query_bounds.tolist()} alpha={alpha} r_damp={r_damp} q_tip={q_tip}")
             print(f"  Δ_in={p.delta_in} Δ_a={p.delta_a} Δ_b={p.delta_b}")
-        # Build coarse mesh (V_L = Σ v_i^L)
-        mesh = build_coarse_mesh(apos, p, query_bounds, h_mesh=h_mesh, halo_nodes=halo_nodes)
+        # Build coarse mesh (V_L = Σ v_i^L) — GPU raster when available (PAW)
+        if hasattr(self.prg, 'fillContactPMEMeshVL') and str(p.split_mode) == 'paw':
+            mesh = self._pme_build_coarse_mesh_gpu(apos, p, query_bounds, h_mesh=h_mesh, halo_nodes=halo_nodes)
+            if bPrint:
+                print(f"  mesh: GPU fillContactPMEMeshVL shape={mesh.coeffs.shape}")
+        else:
+            mesh = build_coarse_mesh(apos, p, query_bounds, h_mesh=h_mesh, halo_nodes=halo_nodes)
         if bPrint:
             print(f"  mesh: shape={mesh.coeffs.shape} origin={mesh.origin.tolist()} resident={mesh.coeffs.nbytes} bytes")
-        # Fit compact core (v_S per atom)
+        # Fit compact core (v_S per atom) — still host LS for now; samples use PAW cache
         core_fit = fit_core_1d(p, n_shells=n_shells, n_endpoint=n_endpoint, n_holdout=n_holdout, seed=seed)
         if bPrint:
             print(f"  core: na={core_fit.coeffs.shape[0]} n_modes={core_fit.coeffs.shape[1]} "
@@ -1528,10 +1549,74 @@ class AFMulator(OpenCLBase):
             atom_pos=apos, bucket_atoms=bucket_atoms, bucket_offsets=bucket_offsets,
             bucket_nbx=nbx, bucket_nby=nby, bucket_cell_size=cell_size, bucket_bounds=(x0, y0, x1, y1))
         self.cpm = params
+        self._cpm_upload_id = None  # force re-upload on next GPU eval/scan
         if bPrint:
             print(f"  ContactPMEParams: resident={params.resident_bytes} bytes ({params.resident_kb:.1f} KB) "
                   f"buckets={nbx}x{nby} cell={cell_size:.1f}Å")
         return params
+
+    def _pme_build_coarse_mesh_gpu(self, atom_pos, split_params, query_bounds, h_mesh=1.0, halo_nodes=6):
+        """Raster V_L on coarse mesh via fillContactPMEMeshVL (WG+local), then host prefilter."""
+        from spammm.surfaces.PMESplit import precompute_split_cache
+        from spammm.surfaces.CoarseMesh import CoarseMesh, _prefilter_3d
+        atom_pos = np.asarray(atom_pos, dtype=np.float64).reshape(-1, 3)
+        qb = np.asarray(query_bounds, dtype=np.float64)
+        h = float(h_mesh); halo = int(halo_nodes)
+        lo = qb[:, 0] - halo * h; hi = qb[:, 1] + halo * h
+        nx = int(np.round((hi[0] - lo[0]) / h)) + 1
+        ny = int(np.round((hi[1] - lo[1]) / h)) + 1
+        nz = int(np.round((hi[2] - lo[2]) / h)) + 1
+        origin = lo.copy()
+        na = len(atom_pos)
+        atoms4 = np.zeros((na, 4), dtype=np.float32)
+        atoms4[:, :3] = atom_pos.astype(np.float32)
+        reqs = np.zeros((na, 4), dtype=np.float32)
+        paw = np.zeros((na, 4), dtype=np.float32)
+        paw_rb = np.zeros((na, 4), dtype=np.float32)
+        for ia in range(na):
+            pi = split_params.with_atom(ia)
+            cache = precompute_split_cache(pi)
+            assert cache.get('mode') == 'paw', f"GPU mesh fill requires paw cache, got {cache.get('mode')}"
+            reqs[ia, 0] = float(np.atleast_1d(pi.R0)[0])
+            reqs[ia, 1] = float(np.atleast_1d(pi.E0)[0])
+            reqs[ia, 2] = float(np.atleast_1d(pi.q)[0])
+            paw[ia] = (cache['a0'], cache['a2'], cache['a4'], cache['a6'])
+            paw_rb[ia, 0] = cache['r_b']
+        ntot = nx * ny * nz
+        self.try_make_buffers({
+            'cpm_fill_samples': ntot * 4, 'cpm_fill_atoms': na * 16, 'cpm_fill_reqs': na * 16,
+            'cpm_fill_paw': na * 16, 'cpm_fill_paw_rb': na * 16,
+        }, suffix='_cl')
+        self.toGPU_(self.cpm_fill_atoms_cl, atoms4)
+        self.toGPU_(self.cpm_fill_reqs_cl, reqs)
+        self.toGPU_(self.cpm_fill_paw_cl, paw)
+        self.toGPU_(self.cpm_fill_paw_rb_cl, paw_rb)
+        # zero samples
+        cl.enqueue_fill_buffer(self.queue, self.cpm_fill_samples_cl, np.float32(0), 0, ntot * 4)
+        wg = 64
+        gs = (self._roundup(ntot, wg),)
+        mesh_n = np.array([nx, ny, nz, 0], dtype=np.int32)
+        origin_h = np.array([origin[0], origin[1], origin[2], h], dtype=np.float32)
+        GFFParams = np.array([float(split_params.r_damp), float(split_params.alpha), 0.0, 0.0], dtype=np.float32)
+        PLQH = np.array([1.0, 1.0, float(split_params.q_tip), 0.0], dtype=np.float32)
+        LATOMS = cl.LocalMemory(wg * 16)
+        LREQS = cl.LocalMemory(wg * 16)
+        LPAW = cl.LocalMemory(wg * 16)
+        LRB = cl.LocalMemory(wg * 16)
+        self.prg.fillContactPMEMeshVL(
+            self.queue, gs, (wg,),
+            self.cpm_fill_samples_cl, mesh_n, origin_h,
+            self.cpm_fill_atoms_cl, self.cpm_fill_reqs_cl, self.cpm_fill_paw_cl, self.cpm_fill_paw_rb_cl,
+            np.int32(na), GFFParams, PLQH, LATOMS, LREQS, LPAW, LRB)
+        samples_f32 = np.empty(ntot, dtype=np.float32)
+        cl.enqueue_copy(self.queue, samples_f32, self.cpm_fill_samples_cl)
+        self.queue.finish()
+        samples = samples_f32.astype(np.float64).reshape(nx, ny, nz)
+        coeffs = _prefilter_3d(samples)
+        interior_lo = np.array([halo, halo, halo], dtype=np.int64)
+        interior_hi = np.array([nx - 1 - halo, ny - 1 - halo, nz - 1 - halo], dtype=np.int64)
+        return CoarseMesh(coeffs=coeffs, origin=origin, h=h, halo=halo,
+                          query_interior=(interior_lo, interior_hi))
 
     def _pme_eval_python(self, params, queries):
         """Python fallback evaluator: eval_mesh + eval_core (CPU, float64).
@@ -1551,10 +1636,81 @@ class AFMulator(OpenCLBase):
         """Check if Agent_1's Wave 2 OpenCL contact_pme kernels are present."""
         return hasattr(self.prg, 'evalContactPME')
 
-    def eval_contact_pme(self, queries, params=None, *, use_gpu=None):
+    def _pme_local_kernel_available(self):
+        return hasattr(self.prg, 'evalContactPMELocal') and hasattr(self.prg, 'relaxStrokesTiltedContactPMELocal')
+
+    def _pme_select_core_backend(self, params, core_backend='auto'):
+        """Choose 'local' (WG + local mem, fastest) vs 'bucket' fallback.
+
+        `auto` → `local` when Local kernels compile and atoms fit in device local mem;
+        otherwise `bucket`. Fail loud if `local` is requested but cannot run.
+        """
+        backend = str(core_backend).lower()
+        if backend == 'auto':
+            if self._pme_local_kernel_available():
+                na = int(params.na)
+                n_modes = int(params.core_fit.coeffs.shape[1])
+                need = na * (16 + n_modes * 4)
+                local_avail = int(self.ctx.devices[0].get_info(cl.device_info.LOCAL_MEM_SIZE))
+                backend = 'local' if need <= local_avail else 'bucket'
+            else:
+                backend = 'bucket'
+        if backend == 'local':
+            if not self._pme_local_kernel_available():
+                raise RuntimeError("contact_pme core_backend='local' requested but Local kernels missing")
+            na = int(params.na)
+            n_modes = int(params.core_fit.coeffs.shape[1])
+            need = na * (16 + n_modes * 4)
+            local_avail = int(self.ctx.devices[0].get_info(cl.device_info.LOCAL_MEM_SIZE))
+            if need > local_avail:
+                raise MemoryError(f"contact_pme local-core needs {need} B local mem for na={na} "
+                                  f"> device LOCAL_MEM_SIZE {local_avail} B; use core_backend='bucket'")
+            # Frozen five-mode ABI for Local kernels
+            coeffs = np.asarray(params.core_fit.coeffs)
+            powers = np.asarray(params.core_fit.powers, dtype=np.int64)
+            if coeffs.shape != (na, 5):
+                raise ValueError(f"contact_pme Local ABI requires coeffs.shape=(na,5), got {coeffs.shape}")
+            if not np.array_equal(powers, np.array([2, 4, 8, 16, 32], dtype=np.int64)):
+                raise ValueError(f"contact_pme Local ABI requires powers=[2,4,8,16,32], got {powers}")
+        elif backend != 'bucket':
+            raise ValueError(f"core_backend must be 'auto'|'local'|'bucket', got {core_backend!r}")
+        return backend
+
+    def _pme_upload_resident(self, params, *, force=False):
+        """Upload mesh/atoms/core/buckets once per ContactPMEParams identity."""
+        na = params.na
+        nc_mesh = int(params.mesh_coeffs.size)
+        nc_core = int(params.core_fit.coeffs.size)
+        n_buck = max(int(params.bucket_atoms.size), 1)
+        n_off = max(int(params.bucket_offsets.size), 1)
+        self.try_make_buffers({
+            'cpm_mesh': nc_mesh * 4, 'cpm_atoms': na * 16, 'cpm_core_coeffs': nc_core * 4,
+            'cpm_buckets': n_buck * 4, 'cpm_offsets': n_off * 4,
+        }, suffix='_cl')
+        key = id(params)
+        if (not force) and getattr(self, '_cpm_upload_id', None) == key:
+            return
+        atoms4 = np.zeros((na, 4), dtype=np.float32)
+        atoms4[:, :3] = params.atom_pos.astype(np.float32)
+        atoms4[:, 3] = np.ascontiguousarray(params.core_fit.r_lo, dtype=np.float32)
+        self.toGPU_(self.cpm_mesh_cl, np.ascontiguousarray(params.mesh_coeffs, dtype=np.float32).ravel())
+        self.toGPU_(self.cpm_atoms_cl, atoms4)
+        self.toGPU_(self.cpm_core_coeffs_cl, np.ascontiguousarray(params.core_fit.coeffs, dtype=np.float32).ravel())
+        self.toGPU_(self.cpm_buckets_cl, np.ascontiguousarray(params.bucket_atoms, dtype=np.int32))
+        self.toGPU_(self.cpm_offsets_cl, np.ascontiguousarray(params.bucket_offsets, dtype=np.int32))
+        self._cpm_upload_id = key
+
+    def _pme_workgroup_size(self, workgroup_size=None):
+        wg = int(workgroup_size if workgroup_size is not None else getattr(self, 'cpm_workgroup_size', 32))
+        if wg <= 0:
+            raise ValueError(f"contact_pme workgroup_size must be positive, got {wg}")
+        return wg
+
+    def eval_contact_pme(self, queries, params=None, *, use_gpu=None, core_backend='auto',
+                         workgroup_size=None):
         """Evaluate contact_pme (E, F) at query points. F = -∇E.
 
-        Uses the OpenCL kernels (Agent_1 W2: evalContactPME) when available and
+        Uses the OpenCL kernels (Agent_1 W2: evalContactPME / Local) when available and
         use_gpu is True; falls back to Python eval_mesh + eval_core for CPU-only
         testing. Returns (E, F) with E shape (nq,) and F shape (nq, 3).
 
@@ -1562,6 +1718,8 @@ class AFMulator(OpenCLBase):
             queries: (nq, 3) float64/float32 world coordinates
             params: ContactPMEParams (default: self.cpm from fit_contact_pme)
             use_gpu: force GPU (True) or Python (False); default auto-detect
+            core_backend: 'auto'|'local'|'bucket' — local = WG + local-mem atoms
+            workgroup_size: OpenCL local size for local/bucket launches (default 32)
         Returns:
             (E, F) tuple — E (nq,) float64, F (nq, 3) float64
         """
@@ -1591,51 +1749,24 @@ class AFMulator(OpenCLBase):
         if use_gpu is None:
             use_gpu = self._pme_gpu_kernel_available()
         if use_gpu and self._pme_gpu_kernel_available():
-            E, F = self._pme_eval_gpu(params, queries)
+            E, F = self._pme_eval_gpu(params, queries, core_backend=core_backend,
+                                      workgroup_size=workgroup_size)
         else:
             E, F = self._pme_eval_python(params, queries)
         return E, F
 
-    def _pme_eval_gpu(self, params, queries):
-        """GPU evaluation via Agent_1's evalContactPME kernel (Wave 2 ABI).
-
-        Kernel signature (16 args):
-          evalContactPME(queries, out_fe, out_status, out_min_r, out_offender, out_overflow,
-                         mesh_coeffs, mesh_meta(int4), mesh_origin_h(float4),
-                         atoms(float4*), atom_coeffs(float*), bucket_atoms, bucket_offsets,
-                         core_meta(int4), core_bucket_meta(float4), nq)
-        atoms float4 = (x, y, z, r_lo_i) — NOT charge (kernel uses ap.w as r_lo).
-        atom_coeffs is flat float* (nat * N_MODES, row-major).
-        mesh_coeffs is flat float* (nx*ny*nz, C-order z-fastest).
-        """
-        na = params.na
-        n_modes = int(params.core_fit.coeffs.shape[1])
-        nc_mesh = int(params.mesh_coeffs.size)
-        nc_core = int(params.core_fit.coeffs.size)
-        n_buck = max(int(params.bucket_atoms.size), 1)
-        n_off = max(int(params.bucket_offsets.size), 1)
-        self.try_make_buffers({
-            'cpm_mesh': nc_mesh * 4, 'cpm_atoms': na * 16, 'cpm_core_coeffs': nc_core * 4,
-            'cpm_buckets': n_buck * 4, 'cpm_offsets': n_off * 4,
-        }, suffix='_cl')
-        # atoms4 = (x, y, z, r_lo_i) — kernel uses ap.w as r_lo (NOT charge)
-        atoms4 = np.zeros((na, 4), dtype=np.float32)
-        atoms4[:, :3] = params.atom_pos.astype(np.float32)
-        atoms4[:, 3] = np.ascontiguousarray(params.core_fit.r_lo, dtype=np.float32)
-        # Flat mesh coeffs (C-order z-fastest) and flat core coeffs (nat * N_MODES)
-        mesh_flat = np.ascontiguousarray(params.mesh_coeffs, dtype=np.float32).ravel()
-        core_flat = np.ascontiguousarray(params.core_fit.coeffs, dtype=np.float32).ravel()
-        self.toGPU_(self.cpm_mesh_cl, mesh_flat)
-        self.toGPU_(self.cpm_atoms_cl, atoms4)
-        self.toGPU_(self.cpm_core_coeffs_cl, core_flat)
-        self.toGPU_(self.cpm_buckets_cl, np.ascontiguousarray(params.bucket_atoms, dtype=np.int32))
-        self.toGPU_(self.cpm_offsets_cl, np.ascontiguousarray(params.bucket_offsets, dtype=np.int32))
+    def _pme_eval_gpu(self, params, queries, *, core_backend='auto', workgroup_size=None):
+        """GPU evaluation via evalContactPME or evalContactPMELocal."""
+        backend = self._pme_select_core_backend(params, core_backend)
+        wg = self._pme_workgroup_size(workgroup_size)
+        self._pme_upload_resident(params)
         nq = len(queries)
         self.try_make_buffers({
             'cpm_queries': nq * 3 * 4, 'cpm_out_fe': nq * 16, 'cpm_status': nq * 4,
             'cpm_min_r': nq * 4, 'cpm_offender': nq * 4, 'cpm_overflow': nq * 4,
         }, suffix='_cl')
         self.toGPU_(self.cpm_queries_cl, np.ascontiguousarray(queries, dtype=np.float32))
+        na = params.na
         nx, ny, nz = params.mesh_shape
         nbuckets = int(params.bucket_nbx) * int(params.bucket_nby)
         mesh_meta = np.array([nx, ny, nz, 0], dtype=np.int32)
@@ -1644,15 +1775,24 @@ class AFMulator(OpenCLBase):
         core_meta = np.array([na, params.bucket_nbx, params.bucket_nby, nbuckets], dtype=np.int32)
         x0, y0, _, _ = params.bucket_bounds
         core_bucket_meta = np.array([x0, y0, params.bucket_cell_size, params.core_d_span], dtype=np.float32)
-        nG = self._roundup(nq, 32)
-        self.prg.evalContactPME(self.queue, (nG,), (32,),
-                                self.cpm_queries_cl, self.cpm_out_fe_cl, self.cpm_status_cl,
-                                self.cpm_min_r_cl, self.cpm_offender_cl, self.cpm_overflow_cl,
-                                self.cpm_mesh_cl, mesh_meta, mesh_origin_h,
-                                self.cpm_atoms_cl, self.cpm_core_coeffs_cl,
-                                self.cpm_buckets_cl, self.cpm_offsets_cl,
-                                core_meta, core_bucket_meta, np.int32(nq))
-        self.queue.finish()
+        nG = self._roundup(nq, wg)
+        if backend == 'local':
+            LATOMS = cl.LocalMemory(na * 16)
+            LCOEFFS = cl.LocalMemory(na * 5 * 4)
+            self.prg.evalContactPMELocal(self.queue, (nG,), (wg,),
+                self.cpm_queries_cl, self.cpm_out_fe_cl, self.cpm_status_cl,
+                self.cpm_min_r_cl, self.cpm_offender_cl, self.cpm_overflow_cl,
+                self.cpm_mesh_cl, mesh_meta, mesh_origin_h,
+                self.cpm_atoms_cl, self.cpm_core_coeffs_cl,
+                core_meta, core_bucket_meta, np.int32(nq), LATOMS, LCOEFFS)
+        else:
+            self.prg.evalContactPME(self.queue, (nG,), (wg,),
+                self.cpm_queries_cl, self.cpm_out_fe_cl, self.cpm_status_cl,
+                self.cpm_min_r_cl, self.cpm_offender_cl, self.cpm_overflow_cl,
+                self.cpm_mesh_cl, mesh_meta, mesh_origin_h,
+                self.cpm_atoms_cl, self.cpm_core_coeffs_cl,
+                self.cpm_buckets_cl, self.cpm_offsets_cl,
+                core_meta, core_bucket_meta, np.int32(nq))
         out = np.zeros((nq, 4), dtype=np.float32)
         status = np.zeros(nq, dtype=np.int32)
         min_r = np.zeros(nq, dtype=np.float32)
@@ -1664,7 +1804,6 @@ class AFMulator(OpenCLBase):
         cl.enqueue_copy(self.queue, offender, self.cpm_offender_cl)
         cl.enqueue_copy(self.queue, overflow, self.cpm_overflow_cl)
         self.queue.finish()
-        # Postflight: raise on any status flag (trajectory-domain, stencil-bound, bucket-overflow)
         self._pme_postflight_status(status, queries, min_r=min_r, offender=offender, overflow=overflow)
         E = out[:, 3].astype(np.float64)
         F = out[:, :3].astype(np.float64)
@@ -1697,13 +1836,14 @@ class AFMulator(OpenCLBase):
                            f"worst={worst} code={code} ({'|'.join(flags)}) coord={coord}{extra}")
 
     def run_scan_contact_pme(self, nxy=(50, 50), nz=60, dtip=-0.1, scan_p0=None,
-                             scan_da=None, scan_db=None, bAlloc=True, use_gpu=None):
+                             scan_da=None, scan_db=None, bAlloc=True, use_gpu=None,
+                             core_backend='auto', workgroup_size=None):
         """PP-AFM scan using the contact_pme backend.
 
         Same scan geometry and outputs as run_scan_contact(), but the field
         evaluator is the contact_pme PME backend (mesh + core). Uses the OpenCL
-        relaxation kernel (Agent_1 W2: relaxStrokesTiltedContactPME) when
-        available; falls back to a Python per-pixel relaxation otherwise.
+        relaxation kernel (bucket or Local WG) when available; falls back to a
+        Python per-pixel relaxation otherwise.
 
         Args:
             nxy: (nx_s, ny_s) scan grid
@@ -1712,6 +1852,8 @@ class AFMulator(OpenCLBase):
             scan_p0, scan_da, scan_db: scan geometry (auto if None)
             bAlloc: allocate scan buffers
             use_gpu: force GPU/Python; default auto-detect
+            core_backend: 'auto'|'local'|'bucket'
+            workgroup_size: OpenCL local size (default 32)
         Returns:
             FEs (nx_s, ny_s, nz, 4), pts (nx_s, ny_s, 3)
         """
@@ -1722,14 +1864,11 @@ class AFMulator(OpenCLBase):
         n_scan = nx_s * ny_s
         if scan_p0 is None:
             scan_p0, scan_da, scan_db = self._scan_grid_auto(nxy)
-        print(f"AFMulator.run_scan_contact_pme: nxy={nxy} nz={nz} dtip={dtip} use_gpu={use_gpu}")
-        print(f"  scan_p0={scan_p0}  da={scan_da}  db={scan_db}")
-        pts = np.zeros((n_scan, 4), dtype=np.float32)
-        k = 0
-        for ix in range(nx_s):
-            for iy in range(ny_s):
-                pts[k, :3] = scan_p0 + scan_da * ix + scan_db * iy
-                k += 1
+        if getattr(self, 'verbosity', 0) > 0:
+            print(f"AFMulator.run_scan_contact_pme: nxy={nxy} nz={nz} dtip={dtip} use_gpu={use_gpu} "
+                  f"core_backend={core_backend}")
+            print(f"  scan_p0={scan_p0}  da={scan_da}  db={scan_db}")
+        pts = build_scan_xy_points_vectorized(scan_p0, scan_da, scan_db, nx_s, ny_s)
         FEs_bytes = n_scan * nz * 4 * 4
         if FEs_bytes > self._max_alloc:
             raise MemoryError(f"run_scan_contact_pme: FEs buffer needs {FEs_bytes} bytes "
@@ -1738,51 +1877,28 @@ class AFMulator(OpenCLBase):
         if use_gpu is None:
             use_gpu = hasattr(self.prg, 'relaxStrokesTiltedContactPME')
         if use_gpu and hasattr(self.prg, 'relaxStrokesTiltedContactPME'):
-            FEs = self._pme_scan_gpu(params, pts, nxy, nz, dtip, bAlloc)
+            FEs = self._pme_scan_gpu(params, pts, nxy, nz, dtip, bAlloc,
+                                    core_backend=core_backend, workgroup_size=workgroup_size)
         else:
             FEs = self._pme_scan_python(params, pts, nxy, nz, dtip)
-        print(f"AFMulator.run_scan_contact_pme: done FEs.shape={FEs.shape}")
+        if getattr(self, 'verbosity', 0) > 0:
+            print(f"AFMulator.run_scan_contact_pme: done FEs.shape={FEs.shape}")
         return FEs, pts[:, :3].reshape(nx_s, ny_s, 3)
 
-    def _pme_scan_gpu(self, params, pts, nxy, nz, dtip, bAlloc):
-        """GPU PP relaxation scan via relaxStrokesTiltedContactPME (Agent_1 W2).
-
-        Kernel signature (23 args):
-          relaxStrokesTiltedContactPME(mesh_coeffs, mesh_meta(int4), mesh_origin_h(float4),
-            atoms(float4*), atom_coeffs(float*), bucket_atoms, bucket_offsets,
-            core_meta(int4), core_bucket_meta(float4),
-            out_status, out_min_r, out_offender, out_overflow,
-            points(float4*), FEs(float4*),
-            tipA, tipB, tipC, stiffness, dpos0, relax_params, surfFF, nz)
-        atoms float4 = (x, y, z, r_lo_i). atom_coeffs flat (nat * N_MODES).
-        """
+    def _pme_scan_gpu(self, params, pts, nxy, nz, dtip, bAlloc, *, core_backend='auto',
+                      workgroup_size=None):
+        """GPU PP relaxation via bucket or Local contact-PME kernels."""
+        backend = self._pme_select_core_backend(params, core_backend)
+        wg = self._pme_workgroup_size(workgroup_size)
         nx_s, ny_s = nxy
         n_scan = nx_s * ny_s
         if bAlloc:
             self.realloc_scan_buffers(n_scan, nz)
-        na = params.na
-        nc_mesh = int(params.mesh_coeffs.size)
-        nc_core = int(params.core_fit.coeffs.size)
-        n_buck = max(int(params.bucket_atoms.size), 1)
-        n_off = max(int(params.bucket_offsets.size), 1)
-        self.try_make_buffers({
-            'cpm_mesh': nc_mesh * 4, 'cpm_atoms': na * 16, 'cpm_core_coeffs': nc_core * 4,
-            'cpm_buckets': n_buck * 4, 'cpm_offsets': n_off * 4,
-        }, suffix='_cl')
-        # atoms4 = (x, y, z, r_lo_i) — kernel uses ap.w as r_lo (NOT charge)
-        atoms4 = np.zeros((na, 4), dtype=np.float32)
-        atoms4[:, :3] = params.atom_pos.astype(np.float32)
-        atoms4[:, 3] = np.ascontiguousarray(params.core_fit.r_lo, dtype=np.float32)
-        mesh_flat = np.ascontiguousarray(params.mesh_coeffs, dtype=np.float32).ravel()
-        core_flat = np.ascontiguousarray(params.core_fit.coeffs, dtype=np.float32).ravel()
-        self.toGPU_(self.cpm_mesh_cl, mesh_flat)
-        self.toGPU_(self.cpm_atoms_cl, atoms4)
-        self.toGPU_(self.cpm_core_coeffs_cl, core_flat)
-        self.toGPU_(self.cpm_buckets_cl, np.ascontiguousarray(params.bucket_atoms, dtype=np.int32))
-        self.toGPU_(self.cpm_offsets_cl, np.ascontiguousarray(params.bucket_offsets, dtype=np.int32))
+        self._pme_upload_resident(params)
         self.toGPU_(self.scan_pts_cl, pts)
         FEs_h = np.zeros((n_scan * nz, 4), dtype=np.float32)
         tipC = self.tipC.copy(); tipC[3] = np.float32(dtip)
+        na = params.na
         nx, ny, nz_m = params.mesh_shape
         nbuckets = int(params.bucket_nbx) * int(params.bucket_nby)
         mesh_meta = np.array([nx, ny, nz_m, 0], dtype=np.int32)
@@ -1791,44 +1907,60 @@ class AFMulator(OpenCLBase):
         core_meta = np.array([na, params.bucket_nbx, params.bucket_nby, nbuckets], dtype=np.int32)
         x0, y0, _, _ = params.bucket_bounds
         core_bucket_meta = np.array([x0, y0, params.bucket_cell_size, params.core_d_span], dtype=np.float32)
-        # Telemetry: kernel writes idx = gid*nz + iz → need n_scan*nz (NOT n_scan).
-        # Undersizing these caused GPU buffer overrun → garbage strips in AFM maps.
         n_tele = n_scan * nz
         self.try_make_buffers({
             'cpm_scan_status': n_tele * 4, 'cpm_scan_min_r': n_tele * 4,
             'cpm_scan_offender': n_tele * 4, 'cpm_scan_overflow': n_tele * 4,
         }, suffix='_cl')
-        gs = (self._roundup(n_scan, 1),)
-        self.prg.relaxStrokesTiltedContactPME(self.queue, gs, (1,),
-                                              self.cpm_mesh_cl, mesh_meta, mesh_origin_h,
-                                              self.cpm_atoms_cl, self.cpm_core_coeffs_cl,
-                                              self.cpm_buckets_cl, self.cpm_offsets_cl,
-                                              core_meta, core_bucket_meta,
-                                              self.cpm_scan_status_cl, self.cpm_scan_min_r_cl,
-                                              self.cpm_scan_offender_cl, self.cpm_scan_overflow_cl,
-                                              self.scan_pts_cl, self.scan_FEs_cl,
-                                              self.tipA, self.tipB, tipC, self.stiffness,
-                                              self.dpos0, self.relax_pars, self.surfFF, np.int32(nz))
-        self.queue.finish()
+        gs = (self._roundup(n_scan, wg),)
+        if backend == 'local':
+            LATOMS = cl.LocalMemory(na * 16)
+            LCOEFFS = cl.LocalMemory(na * 5 * 4)
+            self.prg.relaxStrokesTiltedContactPMELocal(
+                self.queue, gs, (wg,),
+                self.cpm_mesh_cl, mesh_meta, mesh_origin_h,
+                self.cpm_atoms_cl, self.cpm_core_coeffs_cl,
+                core_meta, core_bucket_meta,
+                self.cpm_scan_status_cl, self.cpm_scan_min_r_cl,
+                self.cpm_scan_offender_cl, self.cpm_scan_overflow_cl,
+                self.scan_pts_cl, self.scan_FEs_cl,
+                self.tipA, self.tipB, tipC, self.stiffness,
+                self.dpos0, self.relax_pars, self.surfFF,
+                np.int32(n_scan), np.int32(nz), LATOMS, LCOEFFS)
+        else:
+            self.prg.relaxStrokesTiltedContactPME(
+                self.queue, gs, (1,),
+                self.cpm_mesh_cl, mesh_meta, mesh_origin_h,
+                self.cpm_atoms_cl, self.cpm_core_coeffs_cl,
+                self.cpm_buckets_cl, self.cpm_offsets_cl,
+                core_meta, core_bucket_meta,
+                self.cpm_scan_status_cl, self.cpm_scan_min_r_cl,
+                self.cpm_scan_offender_cl, self.cpm_scan_overflow_cl,
+                self.scan_pts_cl, self.scan_FEs_cl,
+                self.tipA, self.tipB, tipC, self.stiffness,
+                self.dpos0, self.relax_pars, self.surfFF, np.int32(nz))
         self.fromGPU_(self.scan_FEs_cl, FEs_h)
-        # Read per-(pixel,z) telemetry; reduce to per-pixel for postflight
-        status_z = np.zeros(n_tele, dtype=np.int32)
-        min_r_z = np.zeros(n_tele, dtype=np.float32)
-        offender_z = np.zeros(n_tele, dtype=np.int32)
-        overflow_z = np.zeros(n_tele, dtype=np.int32)
+        # Telemetry: download status only; pull detail buffers only on failure (fail-loud).
+        status_z = np.empty(n_tele, dtype=np.int32)
         cl.enqueue_copy(self.queue, status_z, self.cpm_scan_status_cl)
-        cl.enqueue_copy(self.queue, min_r_z, self.cpm_scan_min_r_cl)
-        cl.enqueue_copy(self.queue, offender_z, self.cpm_scan_offender_cl)
-        cl.enqueue_copy(self.queue, overflow_z, self.cpm_scan_overflow_cl)
         self.queue.finish()
-        status = np.bitwise_or.reduce(status_z.reshape(n_scan, nz), axis=1)
-        min_r = np.min(min_r_z.reshape(n_scan, nz), axis=1)
-        # offender at the z of min_r
-        iz_min = np.argmin(min_r_z.reshape(n_scan, nz), axis=1)
-        offender = offender_z.reshape(n_scan, nz)[np.arange(n_scan), iz_min]
-        overflow = np.max(overflow_z.reshape(n_scan, nz), axis=1)
+        if np.any(status_z):
+            min_r_z = np.empty(n_tele, dtype=np.float32)
+            offender_z = np.empty(n_tele, dtype=np.int32)
+            overflow_z = np.empty(n_tele, dtype=np.int32)
+            cl.enqueue_copy(self.queue, min_r_z, self.cpm_scan_min_r_cl)
+            cl.enqueue_copy(self.queue, offender_z, self.cpm_scan_offender_cl)
+            cl.enqueue_copy(self.queue, overflow_z, self.cpm_scan_overflow_cl)
+            self.queue.finish()
+            status = np.bitwise_or.reduce(status_z.reshape(n_scan, nz), axis=1)
+            min_r = np.min(min_r_z.reshape(n_scan, nz), axis=1)
+            iz_min = np.argmin(min_r_z.reshape(n_scan, nz), axis=1)
+            offender = offender_z.reshape(n_scan, nz)[np.arange(n_scan), iz_min]
+            overflow = np.max(overflow_z.reshape(n_scan, nz), axis=1)
+        else:
+            status = np.zeros(n_scan, dtype=np.int32)
+            min_r = offender = overflow = None
         FEs = FEs_h.reshape(nx_s, ny_s, nz, 4)
-        # Postflight: raise on any status flag or non-finite FEs
         scan_pts_xy = pts[:, :3].reshape(nx_s, ny_s, 3)
         self._pme_postflight_status(status, scan_pts_xy.reshape(-1, 3), min_r=min_r, offender=offender, overflow=overflow)
         if not np.isfinite(FEs).all():

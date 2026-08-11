@@ -1403,6 +1403,58 @@ Fit (host) ~0.4–1.8 s; Morse build ~2–3 ms. Coarser mesh barely helps scan t
 5. GPU-ize fit if dataset throughput matters.  
 6. Re-bench when dense volumes grow (finer step / FDBM) — speed may flip.
 
+### PyOpenCL harness packet — wire the optimized local-core kernels
+
+**Ownership:** this packet modifies only `spammm/SPM/AFM.py` (and focused tests/benchmark artifacts if needed). Do not edit `kernels/contact_surface.cl`; its optimized entry points and ABI are supplied by the kernel packet. Preserve the existing bucket kernels as an explicit large-system fallback until measurements establish a crossover.
+
+The kernel packet provides:
+
+- `evalContactPMELocal`: batch query evaluator with one cooperative preload of all compact-core atoms and five coefficients per atom;
+- `relaxStrokesTiltedContactPMELocal`: fused PP/FIRE scan with the same preload, padded-lane guard, and no barrier inside FIRE;
+- the existing `evalContactPME` / `relaxStrokesTiltedContactPME` bucket entry points remain valid.
+
+Required harness changes:
+
+1. Add one workgroup-size argument/default for contact-PME, initially `32`. Benchmark `{32,64,128}` on NVIDIA but do not select from timings obtained on PoCL/CPU. The NVIDIA compiler reports preferred multiple 32 and maximum 256 for both new kernels.
+2. Launch `global=(roundup(n, workgroup_size),)`, `local=(workgroup_size,)`. Pass the exact unpadded `nq` or `n_scan`; padded lanes participate in preload/barrier and return afterward.
+3. Allocate dynamic local memory:
+   - `LATOMS = cl.LocalMemory(na * 16)`;
+   - `LCOEFFS = cl.LocalMemory(na * 5 * 4)`.
+   Check `na*(16+5*4)` against `CL_DEVICE_LOCAL_MEM_SIZE` before launch. Fail loudly or use the existing bucket kernel; never silently change physics or truncate atoms.
+4. Validate the frozen five-mode ABI before every local launch:
+   - `core_fit.coeffs.shape == (na,5)`;
+   - `core_fit.powers == [2,4,8,16,32]`;
+   - coefficients are contiguous float32 in atom-major order.
+5. Prefer the local kernels for the current pyridine/PTCDA class after parity passes. Keep an explicit `core_backend='local'|'bucket'` selection during characterization; do not install an unmeasured heuristic.
+6. Upload resident PME buffers once per accepted `ContactPMEParams` rather than on every query/scan call. Invalidate/re-upload only when the params object or its arrays change. Do not alter fitting mathematics.
+7. Remove redundant `queue.finish()` immediately before blocking reads. Retain synchronization only where the host consumes results or event profiling requires it.
+8. Time using OpenCL profiling events as well as end-to-end wall time. Report kernel-only and wall time separately for batch eval and full PP scan.
+
+Frozen kernel signatures:
+
+```c
+evalContactPMELocal(
+    queries, out_fe, out_status, out_min_r, out_offender, out_overflow,
+    mesh_coeffs, mesh_meta, mesh_origin_h,
+    atoms, atom_coeffs, core_meta, core_bucket_meta,
+    nq, LATOMS, LCOEFFS)
+
+relaxStrokesTiltedContactPMELocal(
+    mesh_coeffs, mesh_meta, mesh_origin_h,
+    atoms, atom_coeffs, core_meta, core_bucket_meta,
+    out_status, out_min_r, out_offender, out_overflow,
+    points, FEs,
+    tipA, tipB, tipC, stiffness, dpos0, relax_params, surfFF,
+    n_scan, nz, LATOMS, LCOEFFS)
+```
+
+Verification gates before making the local path a default:
+
+1. `evalContactPMELocal` vs existing bucket `evalContactPME`: identical status and `max|ΔE|, max|ΔF| <= 2e-6` on randomized safe queries for pyridine and PTCDA, including padded query counts.
+2. `relaxStrokesTiltedContactPMELocal` vs existing bucket scan: finite output/status parity and `max|ΔFE| <= 2e-5` for workgroups 32 and 64. Small float32 trajectory divergence must be reported, not hidden with loose tolerances.
+3. Record kernel event time, wall time, and speedup for pyridine/PTCDA using the same ScanSpec and warmup/repetition protocol as `wave2_diag/mem_speed`.
+4. Read every `REVIEW:` artifact under `debug/test_afm_contact_surface/contact_pme/kernel_local/`; show common-scale AFM difference maps to the USER before changing the default backend.
+
 ### Durable report
 
 Full narrative, dead-ends, tables, and kernel analysis:

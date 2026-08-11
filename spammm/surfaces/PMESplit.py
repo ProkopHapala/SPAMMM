@@ -165,7 +165,7 @@ def softened_rho(r, r_lo, r_cut):
 # ── PAW even-polynomial soft replacement (smooth at r=0) ───────────────────
 
 def _minimize_1d(roughness, lo, hi, n_grid=81, n_refine=30):
-    """Coarse grid + golden-section refine for scalar roughness(a0)."""
+    """Coarse grid + golden-section refine for scalar roughness(a0). Kept for non-quadratic cases."""
     grid = np.linspace(lo, hi, n_grid)
     R = np.array([roughness(a) for a in grid])
     i0 = int(np.argmin(R))
@@ -177,6 +177,14 @@ def _minimize_1d(roughness, lo, hi, n_grid=81, n_refine=30):
         else:
             a = m1
     return 0.5 * (a + b)
+
+
+def _quad_a0_min_p2(u, v, ws):
+    """Minimize Σ ws (u + a0 v)² → a0 = -Σ(ws u v)/Σ(ws v²). Exact for PAW/hermite roughness."""
+    denom = float(np.sum(ws * v * v))
+    if denom < 1e-30:
+        return 0.0
+    return float(-np.sum(ws * u * v) / denom)
 
 
 def _paw_even_coeffs(r_b, Vc, Gc, Hc, a0=None):
@@ -198,17 +206,15 @@ def _paw_even_coeffs(r_b, Vc, Gc, Hc, a0=None):
     if a0 is None:
         a_at_0 = coeffs_for_a0(0.0)
         a_hom = np.linalg.solve(A, np.array([-1.0, 0.0, 0.0]))
-        # 3-point Gauss–Legendre on [0, D]
+        # 3-point Gauss–Legendre on [0, D]; P'' is linear in a0 → closed-form min
         xs = 0.5 * D * (1.0 + np.array([-np.sqrt(0.6), 0.0, np.sqrt(0.6)]))
         ws = 0.5 * D * np.array([5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0])
-
-        def roughness(a0_val):
-            a2, a4, a6 = a_at_0 + a0_val * a_hom
-            p2 = 2 * a2 + 12 * a4 * xs**2 + 30 * a6 * xs**4
-            return float(np.sum(ws * p2 * p2))
-
-        span = max(abs(Vc), abs(Hc) * D * D, abs(Gc) * D, 1e-6)
-        a0 = _minimize_1d(roughness, Vc - 20 * span, Vc + 5 * span)
+        a2_0, a4_0, a6_0 = a_at_0
+        a2_h, a4_h, a6_h = a_hom
+        xs2 = xs * xs; xs4 = xs2 * xs2
+        u = 2 * a2_0 + 12 * a4_0 * xs2 + 30 * a6_0 * xs4
+        v = 2 * a2_h + 12 * a4_h * xs2 + 30 * a6_h * xs4
+        a0 = _quad_a0_min_p2(u, v, ws)
     a2, a4, a6 = coeffs_for_a0(a0)
     return float(a0), float(a2), float(a4), float(a6), D
 
@@ -246,14 +252,12 @@ def _hermite_soft_coeffs(r_lo, r_b, Vc, Gc, Hc, a0=None):
         a_hom = np.linalg.solve(A, np.array([-1.0, 0.0, 0.0]))
         xs = 0.5 * D * (1.0 + np.array([-np.sqrt(0.6), 0.0, np.sqrt(0.6)]))
         ws = 0.5 * D * np.array([5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0])
-
-        def roughness(a0_val):
-            a3, a4, a5 = a_at_0 + a0_val * a_hom
-            p2 = 6 * a3 * xs + 12 * a4 * xs**2 + 20 * a5 * xs**3
-            return float(np.sum(ws * p2 * p2))
-
-        span = max(abs(Vc), abs(Hc) * D * D, 1e-6)
-        a0 = _minimize_1d(roughness, Vc - 20 * span, Vc + 5 * span)
+        a3_0, a4_0, a5_0 = a_at_0
+        a3_h, a4_h, a5_h = a_hom
+        xs2 = xs * xs; xs3 = xs2 * xs
+        u = 6 * a3_0 * xs + 12 * a4_0 * xs2 + 20 * a5_0 * xs3
+        v = 6 * a3_h * xs + 12 * a4_h * xs2 + 20 * a5_h * xs3
+        a0 = _quad_a0_min_p2(u, v, ws)
     a3, a4, a5 = coeffs_for_a0(a0)
     return float(a0), float(a3), float(a4), float(a5), D
 
@@ -298,13 +302,50 @@ def _soft_core_split_rho(r, p: SplitParams):
                 d2v_S=d2vdr2 - d2v_L_dr2)
 
 
-def _soft_core_split_paw(r, p: SplitParams, a0=None):
+def precompute_split_cache(p: SplitParams):
+    """Cache per-atom soft-poly coeffs once (avoids re-minimizing a0 on every grid call).
+
+    Mesh rasterization used to call soft_core_split once per (ix, atom), each time
+    re-running _minimize_1d for PAW/hermite — dominant host fit cost. Call this once
+    per atom, then pass cache=... into soft_core_split.
+    """
+    mode = p.split_mode
+    if mode == 'paw':
+        r_b = float(np.asarray(p.r_b).reshape(-1)[0])
+        Vb, Gb, Hb = combined_atom_potential(np.array([r_b]), p)
+        a0, a2, a4, a6, D = _paw_even_coeffs(r_b, float(Vb[0]), float(Gb[0]), float(Hb[0]), a0=None)
+        return dict(mode='paw', r_b=r_b, a0=a0, a2=a2, a4=a4, a6=a6, D=D)
+    if mode in ('hermite', 'softcore'):
+        r_lo = float(np.asarray(p.r_lo).reshape(-1)[0])
+        r_b = float(np.asarray(p.r_b).reshape(-1)[0])
+        a0 = None
+        if mode == 'softcore':
+            a = float(p.softcore_a)
+            rho_lo = np.sqrt(r_lo * r_lo + a * a)
+            C_seed, _, _ = combined_atom_potential(np.array([rho_lo]), p)
+            a0 = float(C_seed[0])
+        Vb, Gb, Hb = combined_atom_potential(np.array([r_b]), p)
+        a0, a3, a4, a5, D = _hermite_soft_coeffs(r_lo, r_b, float(Vb[0]), float(Gb[0]), float(Hb[0]), a0=a0)
+        return dict(mode=mode, r_lo=r_lo, r_b=r_b, a0=a0, a3=a3, a4=a4, a5=a5, D=D)
+    return dict(mode=mode)  # plateau/rho: no poly cache
+
+
+def _soft_core_split_paw(r, p: SplitParams, a0=None, cache=None):
     """Even-poly PAW: P=a0+a2 r²+… smooth at r=0, C² join at r_b, no W-blend."""
     r = np.asarray(r, dtype=np.float64)
-    r_b = float(np.asarray(p.r_b).reshape(-1)[0])
     v, dvdr, d2vdr2 = combined_atom_potential(r, p)
-    Vb, Gb, Hb = combined_atom_potential(np.array([r_b]), p)
-    P, dP, d2P, meta = paw_even_potential(r, r_b, float(Vb[0]), float(Gb[0]), float(Hb[0]), a0=a0)
+    if cache is not None and cache.get('mode') == 'paw':
+        r_b = float(cache['r_b'])
+        a0, a2, a4, a6 = cache['a0'], cache['a2'], cache['a4'], cache['a6']
+        r2 = r * r; r4 = r2 * r2; r6 = r4 * r2
+        P = a0 + a2 * r2 + a4 * r4 + a6 * r6
+        dP = 2 * a2 * r + 4 * a4 * r2 * r + 6 * a6 * r4 * r
+        d2P = 2 * a2 + 12 * a4 * r2 + 30 * a6 * r4
+        meta = dict(a0=a0, a2=a2, a4=a4, a6=a6, D=cache['D'])
+    else:
+        r_b = float(np.asarray(p.r_b).reshape(-1)[0])
+        Vb, Gb, Hb = combined_atom_potential(np.array([r_b]), p)
+        P, dP, d2P, meta = paw_even_potential(r, r_b, float(Vb[0]), float(Gb[0]), float(Hb[0]), a0=a0)
     inside = r < r_b
     v_L = np.where(inside, P, v)
     dv_L = np.where(inside, dP, dvdr)
@@ -313,14 +354,23 @@ def _soft_core_split_paw(r, p: SplitParams, a0=None):
                 d2v=d2vdr2, d2v_L=d2v_L, d2v_S=d2vdr2 - d2v_L, paw_meta=meta)
 
 
-def _soft_core_split_hermite(r, p: SplitParams, a0=None):
+def _soft_core_split_hermite(r, p: SplitParams, a0=None, cache=None):
     """PAW-like soft poly in (r-r_lo): no W-blend, C² join at r_b, flat at r_lo."""
     r = np.asarray(r, dtype=np.float64)
-    r_lo = float(np.asarray(p.r_lo).reshape(-1)[0])
-    r_b = float(np.asarray(p.r_b).reshape(-1)[0])
     v, dvdr, d2vdr2 = combined_atom_potential(r, p)
-    Vb, Gb, Hb = combined_atom_potential(np.array([r_b]), p)
-    P, dP, d2P, meta = hermite_soft_potential(r, r_lo, r_b, float(Vb[0]), float(Gb[0]), float(Hb[0]), a0=a0)
+    if cache is not None and cache.get('mode') in ('hermite', 'softcore'):
+        r_lo, r_b = float(cache['r_lo']), float(cache['r_b'])
+        a0, a3, a4, a5 = cache['a0'], cache['a3'], cache['a4'], cache['a5']
+        s = r - r_lo
+        P = a0 + a3 * s**3 + a4 * s**4 + a5 * s**5
+        dP = 3 * a3 * s**2 + 4 * a4 * s**3 + 5 * a5 * s**4
+        d2P = 6 * a3 * s + 12 * a4 * s**2 + 20 * a5 * s**3
+        meta = dict(a0=a0, a3=a3, a4=a4, a5=a5, D=cache['D'])
+    else:
+        r_lo = float(np.asarray(p.r_lo).reshape(-1)[0])
+        r_b = float(np.asarray(p.r_b).reshape(-1)[0])
+        Vb, Gb, Hb = combined_atom_potential(np.array([r_b]), p)
+        P, dP, d2P, meta = hermite_soft_potential(r, r_lo, r_b, float(Vb[0]), float(Gb[0]), float(Hb[0]), a0=a0)
     inside = r < r_b
     v_L = np.where(inside, P, v)
     dv_L = np.where(inside, dP, dvdr)
@@ -329,8 +379,10 @@ def _soft_core_split_hermite(r, p: SplitParams, a0=None):
                 d2v=d2vdr2, d2v_L=d2v_L, d2v_S=d2vdr2 - d2v_L, hermite_meta=meta)
 
 
-def _soft_core_split_softcore(r, p: SplitParams):
+def _soft_core_split_softcore(r, p: SplitParams, cache=None):
     """Hermite soft poly with a0 seeded by softcore distance at r_lo."""
+    if cache is not None:
+        return _soft_core_split_hermite(r, p, cache=cache)
     r_lo = float(np.asarray(p.r_lo).reshape(-1)[0])
     a = float(p.softcore_a)
     rho_lo = np.sqrt(r_lo * r_lo + a * a)
@@ -338,19 +390,22 @@ def _soft_core_split_softcore(r, p: SplitParams):
     return _soft_core_split_hermite(r, p, a0=float(C_seed[0]))
 
 
-def soft_core_split(r, p: SplitParams):
-    """Compute v, v_L, v_S and radial derivatives. Modes: paw|hermite|plateau|rho|softcore."""
+def soft_core_split(r, p: SplitParams, cache=None):
+    """Compute v, v_L, v_S and radial derivatives. Modes: paw|hermite|plateau|rho|softcore.
+
+    Optional `cache` from precompute_split_cache(p) skips per-call a0 minimization.
+    """
     mode = p.split_mode
     if mode == 'paw':
-        return _soft_core_split_paw(r, p)
+        return _soft_core_split_paw(r, p, cache=cache)
     if mode == 'hermite':
-        return _soft_core_split_hermite(r, p)
+        return _soft_core_split_hermite(r, p, cache=cache)
     if mode == 'plateau':
         return _soft_core_split_plateau(r, p)
     if mode == 'rho':
         return _soft_core_split_rho(r, p)
     if mode == 'softcore':
-        return _soft_core_split_softcore(r, p)
+        return _soft_core_split_softcore(r, p, cache=cache)
     raise ValueError(f"Unknown split_mode={mode!r}; use 'paw'|'hermite'|'plateau'|'rho'|'softcore'")
 
 

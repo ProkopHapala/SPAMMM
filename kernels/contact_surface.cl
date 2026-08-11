@@ -1078,25 +1078,22 @@ inline float4 cs_pme_tricubic_eval(
     float4 dbx = cs_pme_dbasis(ux) * inv_h, dby = cs_pme_dbasis(uy) * inv_h, dbz = cs_pme_dbasis(uz) * inv_h;
     float bxa[4] = {bx.x, bx.y, bx.z, bx.w};
     float bya[4] = {by.x, by.y, by.z, by.w};
-    float bza[4] = {bz.x, bz.y, bz.z, bz.w};
     float dbxa[4] = {dbx.x, dbx.y, dbx.z, dbx.w};
     float dbya[4] = {dby.x, dby.y, dby.z, dby.w};
-    float dbza[4] = {dbz.x, dbz.y, dbz.z, dbz.w};
     float e = 0.0f, gx = 0.0f, gy = 0.0f, gz = 0.0f;
     for (int a = 0; a < 4; a++) {
         int ia = i0x + a; float cx = bxa[a], dx = dbxa[a];
         for (int b = 0; b < 4; b++) {
             int ib = i0y + b; float cy = bya[b], dy = dbya[b];
             float cxy = cx * cy;
-            for (int c = 0; c < 4; c++) {
-                int ic = i0z + c; float cz = bza[c], dz = dbza[c];
-                float v = coeffs[(ia * ny + ib) * nz + ic];
-                float w = cxy * cz;
-                e  += w * v;
-                gx += dx * cy * cz * v;
-                gy += cx * dy * cz * v;
-                gz += cxy * dz * v;
-            }
+            int ixyz = (ia * ny + ib) * nz + i0z;
+            float4 v = vload4(0, coeffs + ixyz);  // z-fastest: one contiguous 4-tap load
+            float ez = dot(v, bz);
+            float dez = dot(v, dbz);
+            e  += cxy * ez;
+            gx += dx * cy * ez;
+            gy += cx * dy * ez;
+            gz += cxy * dez;
         }
     }
     *out_status = 0;
@@ -1128,6 +1125,11 @@ inline void cs_pme_core_basis(float r, float r_lo_i, float r_b, float* phi, floa
     phi[4] = active ? t32 : 0.0f;  dphi[4] = active ? dt32 : 0.0f;
 }
 
+inline float2 cs_pme_core_reduce(const float* phi, const float* dphi, float c0, float c1, float c2, float c3, float c4) {
+    return (float2)(c0 * phi[0] + c1 * phi[1] + c2 * phi[2] + c3 * phi[3] + c4 * phi[4],
+                    c0 * dphi[0] + c1 * dphi[1] + c2 * dphi[2] + c3 * dphi[3] + c4 * dphi[4]);
+}
+
 // Core field V_core at one point via XY buckets (3×3 lookup, cell_size >= r_core_max).
 // atoms[i] = (x, y, z, r_lo_i). atom_coeffs[i*NMODES + m]. Per-atom r_lo_i (not global).
 // d_span = r_b - r_lo (= Δ_in+Δ_b for plateau); r_b_i = r_lo_i + d_span.
@@ -1144,7 +1146,7 @@ inline float4 cs_pme_core_eval_at(
 {
     float E = 0.0f, Fx = 0.0f, Fy = 0.0f, Fz = 0.0f;
     int status = 0;
-    float min_r = 1e30f;
+    float min_r2 = 1e30f;
     int offender = -1;
     int n_cand = 0;
     int bx = (int)floor((x - x0) / cell);
@@ -1167,28 +1169,69 @@ inline float4 cs_pme_core_eval_at(
                 float r_lo_i = ap.w;
                 float r_b_i = r_lo_i + d_span;
                 float dxp = x - ap.x, dyp = y - ap.y, dzp = z - ap.z;
-                float r = sqrt(dxp * dxp + dyp * dyp + dzp * dzp + 1e-20f);
-                if (r < min_r) { min_r = r; offender = at; }
-                if (r >= r_b_i) continue;
+                float r2 = dxp * dxp + dyp * dyp + dzp * dzp + 1e-20f;
+                if (r2 < min_r2) { min_r2 = r2; offender = at; }
+                if (r2 >= r_b_i * r_b_i) continue;
+                float r = sqrt(r2);
                 float phi[CS_PME_NMODES], dphi[CS_PME_NMODES];
                 cs_pme_core_basis(r, r_lo_i, r_b_i, phi, dphi);
-                for (int m = 0; m < CS_PME_NMODES; m++) {
-                    float c = atom_coeffs[at * CS_PME_NMODES + m];
-                    E += c * phi[m];
-                    if (r > 1e-8f) {
-                        float dE_dr = c * dphi[m];
-                        float inv_r = 1.0f / r;
-                        Fx -= dE_dr * dxp * inv_r;
-                        Fy -= dE_dr * dyp * inv_r;
-                        Fz -= dE_dr * dzp * inv_r;
-                    }
+                int ic = at * CS_PME_NMODES;
+                float4 c03 = vload4(0, atom_coeffs + ic);
+                float2 ed = cs_pme_core_reduce(phi, dphi, c03.x, c03.y, c03.z, c03.w, atom_coeffs[ic + 4]);
+                E += ed.x;
+                if (r > 1e-8f) {
+                    float fr = -ed.y / r;
+                    Fx += fr * dxp;
+                    Fy += fr * dyp;
+                    Fz += fr * dzp;
                 }
             }
         }
     }
     int overflow = n_cand > CS_PME_CORE_MAX_CAND ? (n_cand - CS_PME_CORE_MAX_CAND) : 0;
     if (overflow > 0) status |= 4;
-    *out_status = status; *out_min_r = min_r; *out_offender = offender; *out_overflow = overflow;
+    *out_status = status; *out_min_r = offender >= 0 ? sqrt(min_r2) : 1e30f; *out_offender = offender; *out_overflow = overflow;
+    return (float4)(Fx, Fy, Fz, E);
+}
+
+// Direct compact-core sum over atoms/coefficients cooperatively cached once per workgroup.
+// Intended for small/medium molecules where bucket indirection costs more than the skipped atoms.
+// The caller must preload LATOMS/LCOEFFS and synchronize before invoking this function.
+inline float4 cs_pme_core_eval_local_at(
+    float x, float y, float z,
+    __local const float4* LATOMS, __local const float* LCOEFFS,
+    int nat, float d_span,
+    int* out_status, float* out_min_r, int* out_offender, int* out_overflow)
+{
+    float E = 0.0f, Fx = 0.0f, Fy = 0.0f, Fz = 0.0f;
+    float min_r2 = 1e30f;
+    int offender = -1;
+    for (int at = 0; at < nat; at++) {
+        float4 ap = LATOMS[at];
+        float r_b_i = ap.w + d_span;
+        float dxp = x - ap.x, dyp = y - ap.y, dzp = z - ap.z;
+        float r2 = dxp * dxp + dyp * dyp + dzp * dzp + 1e-20f;
+        if (r2 < min_r2) { min_r2 = r2; offender = at; }
+        if (r2 >= r_b_i * r_b_i) continue;
+        float r = sqrt(r2);
+        float phi[CS_PME_NMODES], dphi[CS_PME_NMODES];
+        cs_pme_core_basis(r, ap.w, r_b_i, phi, dphi);
+        int ic = at * CS_PME_NMODES;
+        float4 c03 = vload4(0, LCOEFFS + ic);
+        float2 ed = cs_pme_core_reduce(phi, dphi, c03.x, c03.y, c03.z, c03.w, LCOEFFS[ic + 4]);
+        E += ed.x;
+        if (r > 1e-8f) {
+            float fr = -ed.y / r;
+            Fx += fr * dxp;
+            Fy += fr * dyp;
+            Fz += fr * dzp;
+        }
+    }
+    int overflow = 0;  // Direct all-atom loop has no bucket candidate cap or truncation.
+    *out_status = 0;
+    *out_min_r = offender >= 0 ? sqrt(min_r2) : 1e30f;
+    *out_offender = offender;
+    *out_overflow = overflow;
     return (float4)(Fx, Fy, Fz, E);
 }
 
@@ -1220,6 +1263,24 @@ inline float4 cs_eval_contact_pme_at(
     return (float4)(F.x, F.y, F.z, E);
 }
 
+inline float4 cs_eval_contact_pme_local_at(
+    float x, float y, float z,
+    __global const float* mesh_coeffs, int nx, int ny, int nz,
+    float ox, float oy, float oz, float h,
+    __local const float4* LATOMS, __local const float* LCOEFFS,
+    int nat, float d_span,
+    int* out_status, float* out_min_r, int* out_offender, int* out_overflow)
+{
+    int mesh_status = 0;
+    float4 fm = cs_pme_tricubic_eval(x, y, z, mesh_coeffs, nx, ny, nz, ox, oy, oz, h, &mesh_status);
+    int core_status = 0; float min_r = 1e30f; int offender = -1; int overflow = 0;
+    float4 fc = cs_pme_core_eval_local_at(x, y, z, LATOMS, LCOEFFS, nat, d_span, &core_status, &min_r, &offender, &overflow);
+    int status = mesh_status | core_status;
+    *out_status = status; *out_min_r = min_r; *out_offender = offender; *out_overflow = overflow;
+    if (status & 1 || status & 2) return (float4)(NAN, NAN, NAN, NAN);
+    return (float4)(fm.xyz + fc.xyz, fm.w + fc.w);
+}
+
 // Batch evaluation of V_mesh + V_core at query points. Returns (E,F) per query + telemetry.
 // Invalid queries (mesh OOB or domain violation) produce non-finite outputs.
 __kernel void evalContactPME(
@@ -1243,6 +1304,34 @@ __kernel void evalContactPME(
         core_bucket_meta.x, core_bucket_meta.y, core_bucket_meta.z, core_bucket_meta.w,
         &status, &min_r, &offender, &overflow);
     out_fe[i] = fe; out_status[i] = status; out_min_r[i] = min_r; out_offender[i] = offender; out_overflow[i] = overflow;
+}
+
+// Workgroup/local-memory batch evaluator for small/medium molecules.
+// All work-items, including padded ones, preload and reach the barrier before returning.
+__kernel void evalContactPMELocal(
+    __global const float* queries, __global float4* out_fe,
+    __global int* out_status, __global float* out_min_r, __global int* out_offender, __global int* out_overflow,
+    __global const float* mesh_coeffs, const int4 mesh_meta, const float4 mesh_origin_h,
+    __global const float4* atoms, __global const float* atom_coeffs,
+    const int4 core_meta, const float4 core_bucket_meta,
+    const int nq, __local float4* LATOMS, __local float* LCOEFFS)
+{
+    int lid = get_local_id(0);
+    int lsize = get_local_size(0);
+    int nat = core_meta.x;
+    for (int i = lid; i < nat; i += lsize) LATOMS[i] = atoms[i];
+    for (int i = lid; i < nat * CS_PME_NMODES; i += lsize) LCOEFFS[i] = atom_coeffs[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    int iq = get_global_id(0);
+    if (iq >= nq) return;
+    float x = queries[iq * 3 + 0], y = queries[iq * 3 + 1], z = queries[iq * 3 + 2];
+    int status = 0; float min_r = 1e30f; int offender = -1; int overflow = 0;
+    float4 fe = cs_eval_contact_pme_local_at(x, y, z,
+        mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+        mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+        LATOMS, LCOEFFS, nat, core_bucket_meta.w,
+        &status, &min_r, &offender, &overflow);
+    out_fe[iq] = fe; out_status[iq] = status; out_min_r[iq] = min_r; out_offender[iq] = offender; out_overflow[iq] = overflow;
 }
 
 // ===================== AFMulator integration (requires AFM.cl before this file) =====================
@@ -1555,6 +1644,157 @@ __kernel void relaxStrokesTiltedContactPME(
         tipPos += dTip.xyz;
         pos += dTip.xyz;
     }
+}
+
+// Workgroup/local-memory contact-PME relaxation for small/medium molecules.
+// Host contract: global size padded to local size; n_scan is the unpadded lane count;
+// local allocations are nat*sizeof(float4) and nat*CS_PME_NMODES*sizeof(float).
+// No barrier occurs inside FIRE: divergent convergence cannot deadlock the workgroup.
+__kernel void relaxStrokesTiltedContactPMELocal(
+    __global const float* mesh_coeffs, const int4 mesh_meta, const float4 mesh_origin_h,
+    __global const float4* atoms, __global const float* atom_coeffs,
+    const int4 core_meta, const float4 core_bucket_meta,
+    __global int* out_status, __global float* out_min_r, __global int* out_offender, __global int* out_overflow,
+    __global float4* points, __global float4* FEs,
+    float4 tipA, float4 tipB, float4 tipC,
+    float4 stiffness, float4 dpos0, float4 relax_params, float4 surfFF,
+    int n_scan, int nz, __local float4* LATOMS, __local float* LCOEFFS)
+{
+    int gid = get_global_id(0);
+    int lid = get_local_id(0);
+    int lsize = get_local_size(0);
+    int nat = core_meta.x;
+    for (int i = lid; i < nat; i += lsize) LATOMS[i] = atoms[i];
+    for (int i = lid; i < nat * CS_PME_NMODES; i += lsize) LCOEFFS[i] = atom_coeffs[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (gid >= n_scan) return;
+
+    const float3 dTip = tipC.xyz * tipC.w;
+    float4 dpos0_ = dpos0;
+    dpos0_.xyz = rotMatT(dpos0_.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+    float3 tipPos = points[gid].xyz;
+    float3 pos = tipPos.xyz + dpos0_.xyz;
+    float dt = relax_params.x;
+    float damp = relax_params.y;
+    float dtmax = dt;
+    float dtmin = dtmax * 0.1f;
+    float damp0 = damp;
+    for (int iz = 0; iz < nz; iz++) {
+        float4 fe;
+        float3 v = (float3)(0.0f, 0.0f, 0.0f);
+        int status_acc = 0; float min_r_acc = 1e30f; int offender_acc = -1; int overflow_acc = 0;
+        for (int i = 0; i < N_RELAX_STEP_MAX; i++) {
+            int status = 0; float min_r = 1e30f; int offender = -1; int overflow = 0;
+            fe = cs_eval_contact_pme_local_at(pos.x, pos.y, pos.z,
+                mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+                mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+                LATOMS, LCOEFFS, nat, core_bucket_meta.w,
+                &status, &min_r, &offender, &overflow);
+            status_acc |= status;
+            if (min_r < min_r_acc) { min_r_acc = min_r; offender_acc = offender; }
+            overflow_acc += overflow;
+            if (status & 1 || status & 2) break;
+            float3 f = fe.xyz;
+            float3 dpos = pos - tipPos;
+            float3 dpos_ = rotMat(dpos, tipA.xyz, tipB.xyz, tipC.xyz);
+            float3 ftip = tipForce(dpos_, stiffness, dpos0);
+            f += rotMatT(ftip, tipA.xyz, tipB.xyz, tipC.xyz);
+            f += tipC.xyz * surfFF.x;
+            #if OPT_FIRE
+            v = update_FIRE(f, v, &dt, &damp, dtmin, dtmax, damp0);
+            #else
+            v *= (1.0f - damp);
+            #endif
+            v += f * dt;
+            pos.xyz += v * dt;
+            if (dot(f, f) < F2CONV) break;
+        }
+        int status = 0; float min_r = 1e30f; int offender = -1; int overflow = 0;
+        fe = cs_eval_contact_pme_local_at(pos.x, pos.y, pos.z,
+            mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+            mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+            LATOMS, LCOEFFS, nat, core_bucket_meta.w,
+            &status, &min_r, &offender, &overflow);
+        status_acc |= status;
+        if (min_r < min_r_acc) { min_r_acc = min_r; offender_acc = offender; }
+        overflow_acc += overflow;
+        float4 fe_;
+        fe_.xyz = rotMat(fe.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+        fe_.w = fe.w;
+        int idx = gid * nz + iz;
+        FEs[idx] = fe_;
+        out_status[idx] = status_acc; out_min_r[idx] = min_r_acc; out_offender[idx] = offender_acc; out_overflow[idx] = overflow_acc;
+        tipPos += dTip.xyz;
+        pos += dTip.xyz;
+    }
+}
+
+// ===================== contact_pme FIT — mesh V_L raster (PAW), WG+local atoms =====================
+// One WI per mesh node. Cooperative preload of atoms / REQH / PAW coeffs (Codex-style).
+// paw[i] = (a0, a2, a4, a6); paw_rb[i].x = r_b. Outside r_b: Morse+PLQH energy via getMorsePLQH.
+
+__kernel void fillContactPMEMeshVL(
+    __global float* samples,
+    const int4 mesh_n,
+    const float4 origin_h,
+    __global const float4* atoms,
+    __global const float4* reqs,
+    __global const float4* paw,
+    __global const float4* paw_rb,
+    const int na,
+    const float4 GFFParams,
+    const float4 PLQH,
+    __local float4* LATOMS,
+    __local float4* LREQS,
+    __local float4* LPAW,
+    __local float4* LRB
+) {
+    const int nx = mesh_n.x, ny = mesh_n.y, nz = mesh_n.z;
+    const int ntot = nx * ny * nz;
+    const int gid = get_global_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    const bool active = (gid < ntot);
+    float3 pos = (float3)(0.0f, 0.0f, 0.0f);
+    if (active) {
+        int ix = gid / (ny * nz);
+        int rem = gid - ix * ny * nz;
+        int iy = rem / nz;
+        int iz = rem - iy * nz;
+        pos = (float3)(origin_h.x + ix * origin_h.w,
+                       origin_h.y + iy * origin_h.w,
+                       origin_h.z + iz * origin_h.w);
+    }
+    const float K = -GFFParams.y;
+    const float R2damp = GFFParams.x * GFFParams.x;
+    float vL = 0.0f;
+    for (int j0 = 0; j0 < na; j0 += lsz) {
+        int j = j0 + lid;
+        float4 ap = (float4)(0.0f); float4 rq = (float4)(0.0f);
+        float4 pw = (float4)(0.0f); float4 rb = (float4)(0.0f);
+        if (j < na) { ap = atoms[j]; rq = reqs[j]; pw = paw[j]; rb = paw_rb[j]; }
+        LATOMS[lid] = ap; LREQS[lid] = rq; LPAW[lid] = pw; LRB[lid] = rb;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (active) {
+            int ntile = min(lsz, na - j0);
+            for (int jl = 0; jl < ntile; jl++) {
+                float3 dp = pos - LATOMS[jl].xyz;
+                float r2 = dot(dp, dp);
+                float r = sqrt(r2);
+                float r_b = LRB[jl].x;
+                if (r < r_b) {
+                    float r4 = r2 * r2;
+                    float4 c = LPAW[jl];
+                    vL += c.x + c.y * r2 + c.z * r4 + c.w * (r4 * r2);
+                } else {
+                    float4 fej = getMorsePLQH(dp, LREQS[jl], PLQH, K, R2damp);
+                    vL += fej.w;
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (active) samples[gid] = vL;
 }
 
 #endif // AFM_STANDALONE

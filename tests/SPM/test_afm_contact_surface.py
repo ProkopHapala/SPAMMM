@@ -716,16 +716,16 @@ def test_contact_pme_split_rcut_sweep(make_review):
     assert len(rejected) == 0, 'No rejections expected for C/O/H'
     assert valid == [4.0, 5.0, 6.0], 'All candidates valid for C/O/H'
     assert valid[0] == 4.0, 'Smallest valid candidate should be 4.0'
-    # Case 2: large atom with R0=4.5 → r_lo=4.0 → r_cut=4 rejected (4 <= 4.0)
-    p_large = SplitParams(R0=np.array([4.5]), E0=np.array([0.001]), q=np.array([0.0]),
+    # Case 2: large atom with R0=5.0 → r_lo=R0-Δ_in=4.0 (Δ_in=1.0) → r_cut=4 rejected (4 <= 4.0)
+    p_large = SplitParams(R0=np.array([5.0]), E0=np.array([0.001]), q=np.array([0.0]),
                           alpha=_TIP_ALPHA, q_tip=0.0, r_damp=_R_DAMP)
     valid2, rejected2, r_lo_max2 = r_cut_candidates(p_large)
     rv.out(f'Large atom: r_lo_max={r_lo_max2:.4f} valid={valid2} rejected={rejected2}')
     assert 4.0 in rejected2, 'r_cut=4 should be rejected when r_lo_max=4.0'
     assert valid2 == [5.0, 6.0], 'Only 5 and 6 should be valid for large atom'
     assert valid2[0] == 5.0, 'Smallest valid candidate should be 5.0'
-    # Case 3: very large atom with R0=5.6 → r_lo=5.1 → only r_cut=6 valid
-    p_vlarge = SplitParams(R0=np.array([5.6]), E0=np.array([0.001]), q=np.array([0.0]),
+    # Case 3: very large atom with R0=6.1 → r_lo=5.1 → only r_cut=6 valid
+    p_vlarge = SplitParams(R0=np.array([6.1]), E0=np.array([0.001]), q=np.array([0.0]),
                            alpha=_TIP_ALPHA, q_tip=0.0, r_damp=_R_DAMP)
     valid3, rejected3, r_lo_max3 = r_cut_candidates(p_vlarge)
     rv.out(f'Very large atom: r_lo_max={r_lo_max3:.4f} valid={valid3} rejected={rejected3}')
