@@ -12,6 +12,7 @@ Examples:
   python run_spm.py opt --smiles-example benzene --method uff
   python run_spm.py smiles-afm --method uff          # all SMILES_EXAMPLES → planar opt → prolonged AFM
   python run_spm.py afm-morse --xyz data/xyz/pentacene.xyz
+  python run_spm.py afm --model contact_pme --xyz data/xyz/pyridine.xyz --show-atoms
   python run_spm.py afm-kriging --endgroup HHO-h-p_1 --tip H2O_O
   python run_spm.py stm orbitals --molecule pentacene --n-near 5
   python run_spm.py stm current --molecule pentacene --stm-tips s,pz,py
@@ -356,6 +357,106 @@ def _cmd_afm_contact_routed(args, atomPos, atomTypes, origin, step, ngrid,
     return 0
 
 
+def _cmd_afm_contact_pme_routed(args, atomPos, atomTypes, origin, step, ngrid,
+                                mol_name, xyz, plots, osc_dir, base_pos, osc_n) -> int:
+    """Contact-PME backend routed through the shared ScanSpec/ScanResult contract.
+
+    Called by ``cmd_afm`` when ``args.model == 'contact_pme'``. Same ScanSpec /
+    ``plot_afm_variant_height_strip`` path as Morse and contact 2.5D (skill:`afm-plotting`).
+    """
+    import numpy as np
+    from spammm.SPM import AFM as afm
+    from spammm.SPM import AFM_utils as afm_utils
+
+    h_df, h_Fz, h_scan = afm_utils.afm_df_height_stacks(
+        args.h_min, args.h_max, args.h_step,
+        amp=args.amp, amp_align=not getattr(args, 'no_amp_align', False), osc_dir=osc_dir)
+    scan_xs = np.arange(float(atomPos[:, 0].min() - args.scan_margin),
+                        float(atomPos[:, 0].max() + args.scan_margin), step, dtype=np.float32)
+    scan_ys = np.arange(float(atomPos[:, 1].min() - args.scan_margin),
+                        float(atomPos[:, 1].max() + args.scan_margin), step, dtype=np.float32)
+    K_LAT = afm.stiffness_Nm_to_eVA2(float(args.K_LAT))
+    scan_spec = afm_utils.ScanSpec(
+        scan_xs=scan_xs, scan_ys=scan_ys, h_df=h_df, h_Fz=h_Fz, h_scan=h_scan,
+        amplitude=float(args.amp), osc_dir=osc_dir,
+        K_LAT=K_LAT, K_RAD=float(args.K_RAD), bond_length=float(args.bond_length),
+        scan_margin=float(args.scan_margin),
+    )
+    params_path = _abs_path(getattr(args, 'params_path', None)) or os.path.join(_ROOT, 'data', 'ElementTypes.dat')
+    plot_diag = plots & {'stage', 'df', 'fz', 'ediss'}
+    split_mode = getattr(args, 'pme_split', 'paw')
+    q_tip = float(getattr(args, 'pme_q_tip', 0.0))
+    variants = {'contact_pme': afm_utils.run_contact_pme_pp_afm(
+        'contact_pme', atomPos, atomTypes, origin, step, ngrid, args.outdir,
+        scan_spec=scan_spec, params_path=params_path,
+        margin=args.margin, plots=plot_diag, df_cmap=args.df_cmap, cmap=args.cmap,
+        r_cut=getattr(args, 'pme_r_cut', 6.0),
+        h_mesh=getattr(args, 'pme_h_mesh', 1.0),
+        halo_nodes=getattr(args, 'pme_halo', 6),
+        z_above_lo=getattr(args, 'pme_z_lo', 3.0),
+        z_above_hi=getattr(args, 'pme_z_hi', 8.0),
+        split_mode=split_mode, q_tip=q_tip,
+    )}
+
+    amp = float(args.amp)
+    amp_z = amp * abs(float(osc_n[2]))
+    amp_align = (not getattr(args, 'no_amp_align', False)) and amp_z > 1e-12
+    row_specs = [('df', 'contact_pme', f'df contact_pme\n{split_mode} K_LAT={args.K_LAT} N/m', args.df_cmap)]
+    row_specs.append(('Fz', 'contact_pme',
+                      f'Fz contact_pme\n@h−{amp_z:.1f}Å' if amp_align else 'Fz contact_pme\n@same z', args.cmap))
+
+    heights = variants['contact_pme'].heights
+    extent = afm_utils.scan_extent(variants['contact_pme'].scan_xs, variants['contact_pme'].scan_ys)
+    res_kb = getattr(variants['contact_pme'], 'resident_kb', float('nan'))
+    title = (f'Contact-PME AFM  {mol_name}  split={split_mode}  q_tip={q_tip}  '
+             f'K_LAT={args.K_LAT} N/m  K_RAD={args.K_RAD}  L={args.bond_length}Å  resident={res_kb:.1f}KB')
+    show_atoms = bool(getattr(args, 'show_atoms', False))
+    out_png = None
+    if 'compare' in plots:
+        scale = getattr(args, 'scale', 'per_image') or 'per_image'
+        out_png = os.path.join(args.outdir, f'compare_{scale}.png')
+        afm_utils.plot_afm_variant_height_strip(
+            variants, row_specs, heights, out_png, scale=scale, title=title, dpi=140,
+            apos=atomPos if show_atoms else None, show_atoms=show_atoms, extent=extent,
+            amp=args.amp, amp_align=amp_align, amp_z=amp_z, long_axis_vertical=True, tight=True)
+        print(f'REVIEW: {out_png}')
+    if 'per_image' in plots and getattr(args, 'scale', 'per_image') != 'per_image':
+        per = os.path.join(args.outdir, 'per_image')
+        os.makedirs(per, exist_ok=True)
+        pi = os.path.join(per, 'compare_per_image.png')
+        afm_utils.plot_afm_variant_height_strip(
+            variants, row_specs, heights, pi, scale='per_image', title=title, dpi=140,
+            apos=atomPos if show_atoms else None, show_atoms=show_atoms, extent=extent,
+            amp=args.amp, amp_align=amp_align, amp_z=amp_z, long_axis_vertical=True, tight=True)
+        print(f'REVIEW: {pi}')
+
+    summary = os.path.join(args.outdir, 'SUMMARY.out')
+    with open(summary, 'w') as f:
+        f.write(title + '\n')
+        f.write(f'xyz={xyz}\n')
+        f.write(f'model=contact_pme  split={split_mode}  q_tip={q_tip}  '
+                f'h_mesh={getattr(args, "pme_h_mesh", 1.0)}  '
+                f'scan_step={step}  scan_margin={args.scan_margin}\n')
+        f.write(f'plots={sorted(plots)} z=[{args.h_min},{args.h_max}] dz={args.h_step} '
+                f'osc_n=({osc_n[0]:.6f},{osc_n[1]:.6f},{osc_n[2]:.6f}) amp={amp}\n')
+        f.write(f'resident_kb={res_kb:.3f}\n')
+        if out_png:
+            f.write(f'REVIEW: {out_png}\n')
+
+    zcurves_str = getattr(args, 'zcurves', None)
+    if zcurves_str:
+        v0 = next(iter(variants.values()))
+        sample_pts = afm_utils._parse_zcurves_arg(zcurves_str, atomPos, v0.scan_xs, v0.scan_ys)
+        zc_path = os.path.join(args.outdir, 'zcurves.png')
+        afm_utils.plot_zcurves(variants, sample_pts, zc_path, atomPos=atomPos,
+                               title=f'Contact-PME E(z)/Fz(z)  {mol_name}')
+        print(f'REVIEW: {zc_path}')
+
+    print(f'REVIEW: {summary}')
+    print(f'REVIEW: {os.path.abspath(args.outdir)}/')
+    return 0
+
+
 def cmd_afm(args: argparse.Namespace) -> int:
     """Single-molecule AFM (FDBM density or Morse+Q via --model).
 
@@ -430,6 +531,9 @@ def cmd_afm(args: argparse.Namespace) -> int:
     if model == 'contact':
         return _cmd_afm_contact_routed(args, atomPos, atomTypes, origin, step, ngrid,
                                        mol_name, xyz, plots, osc_dir, base_pos, osc_n)
+    if model == 'contact_pme':
+        return _cmd_afm_contact_pme_routed(args, atomPos, atomTypes, origin, step, ngrid,
+                                           mol_name, xyz, plots, osc_dir, base_pos, osc_n)
 
     variants = {}
     basis_hsd = get_dftb_basis_path(args.basis)
@@ -903,10 +1007,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_afm = sub.add_parser('afm', help='AFM imaging: FDBM (density) or Morse+Q (classical) via --model')
     _add_common_afm_args(p_afm)
-    p_afm.add_argument('--model', default='fdbm', choices=['fdbm', 'morse', 'contact'],
-                       help='Force-field backend: fdbm (density-based, default), morse (classical Morse+Coulomb), or contact (quasi-2D contact surface)')
+    p_afm.add_argument('--model', default='fdbm', choices=['fdbm', 'morse', 'contact', 'contact_pme'],
+                       help='Force-field backend: fdbm (density), morse (classical Morse+Coulomb), '
+                            'contact (quasi-2D contact surface), contact_pme (PAW particle-mesh)')
     p_afm.add_argument('--params', default=None, dest='params_path',
-                       help='ElementTypes.dat path (morse/contact models)')
+                       help='ElementTypes.dat path (morse/contact/contact_pme models)')
     cs = p_afm.add_argument_group('contact-surface (--model contact)')
     cs.add_argument('--cs-margin', type=float, default=4.0, dest='cs_margin',
                     help='Contact-surface fit margin [Å] (testplot default=4.0)')
@@ -924,6 +1029,22 @@ def build_parser() -> argparse.ArgumentParser:
                     help='CG iterations for contact fit')
     cs.add_argument('--nz-cs', type=int, default=6, dest='nz_cs',
                     help='Number of z-basis modes in the separable fit')
+    pme = p_afm.add_argument_group('contact-PME (--model contact_pme)')
+    pme.add_argument('--pme-split', default='paw', dest='pme_split',
+                     choices=['paw', 'hermite', 'plateau', 'rho', 'softcore'],
+                     help='Long/short split mode (default: paw even-poly)')
+    pme.add_argument('--pme-q-tip', type=float, default=0.0, dest='pme_q_tip',
+                     help='Radial tip charge for Morse+Q (tipQs forced to 0)')
+    pme.add_argument('--pme-h-mesh', type=float, default=1.0, dest='pme_h_mesh',
+                     help='Coarse mesh spacing [Å]')
+    pme.add_argument('--pme-halo', type=int, default=6, dest='pme_halo',
+                     help='Mesh halo nodes per side')
+    pme.add_argument('--pme-r-cut', type=float, default=6.0, dest='pme_r_cut',
+                     help='Legacy rho outer cutoff [Å] (compact modes use R0+Δ_b)')
+    pme.add_argument('--pme-z-lo', type=float, default=3.0, dest='pme_z_lo',
+                     help='Query envelope z above zmax (lo) [Å]')
+    pme.add_argument('--pme-z-hi', type=float, default=8.0, dest='pme_z_hi',
+                     help='Query envelope z above zmax (hi) [Å]')
     p_afm.set_defaults(func=cmd_afm)
 
     p_opt = sub.add_parser('opt', help='Vacuum geometry opt (UFF/SPFF/LFF/DFTB); keep planar')

@@ -1059,7 +1059,19 @@ class ContactPMEParams:
 
     @property
     def r_cut(self) -> float:
-        return float(self.split_params.r_cut)
+        """Neighbor / core outer cutoff: r_core_max for compact splits, else legacy r_cut."""
+        sp = self.split_params
+        return float(getattr(sp, 'r_core_max', sp.r_cut))
+
+    @property
+    def core_d_span(self) -> float:
+        """r_b - r_lo (= Δ_in + Δ_b). Passed to OpenCL as basis support span."""
+        from spammm.surfaces.PMESplit import _COMPACT_SPLIT_MODES
+        sp = self.split_params
+        if getattr(sp, 'split_mode', 'paw') in _COMPACT_SPLIT_MODES:
+            return float(sp.delta_in + sp.delta_b)
+        # legacy rho: not constant; host should not use GPU core with mixed spans
+        return float(sp.r_cut - float(np.min(sp.r_lo)))
 
     @property
     def mesh_shape(self) -> tuple:

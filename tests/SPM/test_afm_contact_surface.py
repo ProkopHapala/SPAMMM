@@ -98,10 +98,12 @@ _O_R0 = _TIP_R + 1.7500; _O_E0 = float(np.sqrt(_TIP_E * 0.00260184625))
 _H_R0 = _TIP_R + 1.4430; _H_E0 = float(np.sqrt(_TIP_E * 0.00190802059))
 
 
-def _split_params(R0, E0, q=0.0, q_tip=0.0, r_cut=6.0):
+def _split_params(R0, E0, q=0.0, q_tip=0.0, r_cut=6.0, split_mode='plateau',
+                  delta_in=0.5, delta_a=0.5, delta_b=2.0):
     from spammm.surfaces.PMESplit import SplitParams
     return SplitParams(R0=np.float64(R0), E0=np.float64(E0), q=np.float64(q),
-                       alpha=_TIP_ALPHA, q_tip=q_tip, r_damp=_R_DAMP, r_cut=r_cut)
+                       alpha=_TIP_ALPHA, q_tip=q_tip, r_damp=_R_DAMP, r_cut=r_cut,
+                       split_mode=split_mode, delta_in=delta_in, delta_a=delta_a, delta_b=delta_b)
 
 
 @pytest.mark.gpu
@@ -218,50 +220,51 @@ def test_contact_pme_split_identity(make_review):
 
 
 def test_contact_pme_split_join_continuity(make_review):
-    """C² continuity at r_lo and r_cut joins; v_S and derivatives vanish at r_cut."""
-    from spammm.surfaces.PMESplit import soft_core_split, combined_atom_potential
+    """C² continuity at plateau joins r_a and r_b; v_S and derivatives vanish at r_b."""
+    from spammm.surfaces.PMESplit import soft_core_split
     rv = make_review('test_contact_pme_split_join_continuity')
-    eps = 1e-8  # small eps for one-sided limit comparison
+    eps = 1e-8
     cases = [(_C_R0, _C_E0, 0.0, 0.0, 'C'), (_O_R0, _O_E0, 0.5, 1.0, 'O q+'), (_H_R0, _H_E0, -0.3, 0.5, 'H q-')]
     all_err = 0.0
     for R0, E0, q_i, q_tip, label in cases:
         p = _split_params(R0, E0, q_i, q_tip=q_tip)
-        r_lo = R0 - 0.5; r_cut = 6.0
-        # Test C² at r_lo: compare just below and just above
-        r_below = np.array([r_lo - eps]); r_above = np.array([r_lo + eps])
+        r_a = float(p.r_a); r_b = float(p.r_b)
+        # C² at r_a: plateau (flat) meets smooth switch
+        r_below = np.array([r_a - eps]); r_above = np.array([r_a + eps])
         s_below = soft_core_split(r_below, p); s_above = soft_core_split(r_above, p)
-        err_vL_lo = abs(s_below['v_L'][0] - s_above['v_L'][0])
-        err_dvL_lo = abs(s_below['dv_L_dr'][0] - s_above['dv_L_dr'][0])
-        err_d2vL_lo = abs(s_below['d2v_L'][0] - s_above['d2v_L'][0])
-        # Test C² at r_cut: compare just below and just above
-        r_below_rc = np.array([r_cut - eps]); r_above_rc = np.array([r_cut + eps])
-        s_below_rc = soft_core_split(r_below_rc, p); s_above_rc = soft_core_split(r_above_rc, p)
-        err_vL_rc = abs(s_below_rc['v_L'][0] - s_above_rc['v_L'][0])
-        err_dvL_rc = abs(s_below_rc['dv_L_dr'][0] - s_above_rc['dv_L_dr'][0])
-        err_d2vL_rc = abs(s_below_rc['d2v_L'][0] - s_above_rc['d2v_L'][0])
-        # v_S and derivatives must vanish at r_cut (check from below, where split is defined)
-        err_vS_rc = abs(s_below_rc['v_S'][0])
-        err_dvS_rc = abs(s_below_rc['dv_S_dr'][0])
-        err_d2vS_rc = abs(s_below_rc['d2v_S'][0])
-        mx = max(err_vL_lo, err_dvL_lo, err_d2vL_lo, err_vL_rc, err_dvL_rc, err_d2vL_rc,
-                 err_vS_rc, err_dvS_rc, err_d2vS_rc)
+        err_vL_a = abs(s_below['v_L'][0] - s_above['v_L'][0])
+        err_dvL_a = abs(s_below['dv_L_dr'][0] - s_above['dv_L_dr'][0])
+        err_d2vL_a = abs(s_below['d2v_L'][0] - s_above['d2v_L'][0])
+        # Below r_a: v_L must be flat (dv_L ≈ 0, d2v_L ≈ 0)
+        err_flat = max(abs(s_below['dv_L_dr'][0]), abs(s_below['d2v_L'][0]))
+        # C² at r_b: v_L joins v, v_S vanishes with derivatives
+        r_below_rb = np.array([r_b - eps]); r_above_rb = np.array([r_b + eps])
+        s_below_rb = soft_core_split(r_below_rb, p); s_above_rb = soft_core_split(r_above_rb, p)
+        err_vL_rb = abs(s_below_rb['v_L'][0] - s_above_rb['v_L'][0])
+        err_dvL_rb = abs(s_below_rb['dv_L_dr'][0] - s_above_rb['dv_L_dr'][0])
+        err_d2vL_rb = abs(s_below_rb['d2v_L'][0] - s_above_rb['d2v_L'][0])
+        err_vS_rb = abs(s_below_rb['v_S'][0])
+        err_dvS_rb = abs(s_below_rb['dv_S_dr'][0])
+        err_d2vS_rb = abs(s_below_rb['d2v_S'][0])
+        mx = max(err_vL_a, err_dvL_a, err_d2vL_a, err_flat, err_vL_rb, err_dvL_rb, err_d2vL_rb,
+                 err_vS_rb, err_dvS_rb, err_d2vS_rb)
         all_err = max(all_err, mx)
-        rv.out(f'  {label}: C²@r_lo: |d vL|={err_vL_lo:.4e} |d dvL|={err_dvL_lo:.4e} |d d2vL|={err_d2vL_lo:.4e}')
-        rv.out(f'  {label}: C²@r_cut: |d vL|={err_vL_rc:.4e} |d dvL|={err_dvL_rc:.4e} |d d2vL|={err_d2vL_rc:.4e}')
-        rv.out(f'  {label}: v_S@r_cut: |vS|={err_vS_rc:.4e} |dvS|={err_dvS_rc:.4e} |d2vS|={err_d2vS_rc:.4e}')
-        # Tolerances account for O(eps) one-sided limit error with eps=1e-8
-        assert err_vL_lo < 1e-10 and err_dvL_lo < 1e-10 and err_d2vL_lo < 1e-6, f'{label}: C² fail at r_lo'
-        assert err_vL_rc < 1e-6 and err_dvL_rc < 1e-6 and err_d2vL_rc < 1e-4, f'{label}: C² fail at r_cut'
-        assert err_vS_rc < 1e-10 and err_dvS_rc < 1e-6 and err_d2vS_rc < 1e-4, f'{label}: v_S not zero at r_cut'
+        rv.out(f'  {label}: C²@r_a={r_a:.3f}: |d vL|={err_vL_a:.4e} |d dvL|={err_dvL_a:.4e} |d d2vL|={err_d2vL_a:.4e} flat={err_flat:.4e}')
+        rv.out(f'  {label}: C²@r_b={r_b:.3f}: |d vL|={err_vL_rb:.4e} |d dvL|={err_dvL_rb:.4e} |d d2vL|={err_d2vL_rb:.4e}')
+        rv.out(f'  {label}: v_S@r_b: |vS|={err_vS_rb:.4e} |dvS|={err_dvS_rb:.4e} |d2vS|={err_d2vS_rb:.4e}')
+        assert err_vL_a < 1e-10 and err_dvL_a < 1e-8 and err_d2vL_a < 1e-5, f'{label}: C² fail at r_a'
+        assert err_flat < 1e-10, f'{label}: v_L not flat below r_a'
+        assert err_vL_rb < 1e-6 and err_dvL_rb < 1e-6 and err_d2vL_rb < 1e-4, f'{label}: C² fail at r_b'
+        assert err_vS_rb < 1e-10 and err_dvS_rb < 1e-6 and err_d2vS_rb < 1e-4, f'{label}: v_S not zero at r_b'
     rv.out(f'\nOverall max join error: {all_err:.4e}')
-    rv.checklist('v_L is C² at r_lo (flat inner boundary)',
-                 'v_L is C² at r_cut (matches v exactly)',
-                 'v_S, v_S\', v_S\'\' all vanish at r_cut')
+    rv.checklist('v_L is C² at r_a (plateau end)',
+                 'v_L is flat for r <= r_a (no displaced Morse minimum on mesh)',
+                 'v_S, v_S\', v_S\'\' all vanish at r_b')
     rv.finish()
 
 
 def test_contact_pme_split_rho_monotonic(make_review):
-    """rho(r) must be monotonically non-decreasing; drho/dr >= 0."""
+    """Legacy rho(r) must be monotonically non-decreasing; kept for comparison mode."""
     from spammm.surfaces.PMESplit import softened_rho
     rv = make_review('test_contact_pme_split_rho_monotonic')
     cases = [(_C_R0, 'C'), (_O_R0, 'O'), (_H_R0, 'H')]
@@ -271,24 +274,364 @@ def test_contact_pme_split_rho_monotonic(make_review):
         r_lo = R0 - 0.5
         r = np.linspace(r_lo - 1.0, r_cut + 1.0, 2000)
         rho, drho, d2rho = softened_rho(r, r_lo, r_cut)
-        # Monotonicity: drho/dr >= 0 everywhere
         min_drho = float(np.min(drho))
-        # rho non-decreasing
         drho_diff = np.diff(rho)
         min_drho_diff = float(np.min(drho_diff))
         all_err = max(all_err, -min_drho, -min_drho_diff)
         rv.out(f'  {label}: r_lo={r_lo:.4f} min(drho/dr)={min_drho:.4e} min(diff(rho))={min_drho_diff:.4e}')
-        rv.log(f'  {label}: rho[0]={rho[0]:.6f} rho[-1]={rho[-1]:.6f} (expect {r_lo:.4f} and {r_cut + 1.0:.4f})')
         assert min_drho >= -1e-14, f'{label}: drho/dr < 0 ({min_drho})'
         assert min_drho_diff >= -1e-14, f'{label}: rho not monotonic ({min_drho_diff})'
-        # Check boundary values
         assert abs(rho[0] - r_lo) < 1e-14, f'{label}: rho(r<r_lo) != r_lo'
         assert abs(rho[-1] - (r_cut + 1.0)) < 1e-14, f'{label}: rho(r>r_cut) != r'
     rv.out(f'\nOverall monotonicity violation: {all_err:.4e} (target < 1e-14)')
-    rv.checklist('rho(r) is monotonically non-decreasing for C/O/H',
-                 'rho(r<r_lo) = r_lo (constant), rho(r>r_cut) = r (identity)')
+    rv.checklist('legacy rho(r) is monotonically non-decreasing for C/O/H',
+                 'rho mode kept for comparison; default split is plateau')
     rv.finish()
 
+
+def test_contact_pme_split_plateau_no_displaced_min(make_review):
+    """Plateau v_L must NOT move the Morse minimum; |v_S(R0)| << legacy rho residual."""
+    from spammm.surfaces.PMESplit import soft_core_split
+    rv = make_review('test_contact_pme_split_plateau_no_displaced_min')
+    p_plat = _split_params(_C_R0, _C_E0, 0.0, split_mode='plateau')
+    p_rho = _split_params(_C_R0, _C_E0, 0.0, split_mode='rho', r_cut=6.0)
+    r0 = np.array([_C_R0])
+    s_plat = soft_core_split(r0, p_plat)
+    s_rho = soft_core_split(r0, p_rho)
+    v_well = float(s_plat['v'][0])
+    vS_plat = float(s_plat['v_S'][0])
+    vS_rho = float(s_rho['v_S'][0])
+    # Plateau: at R0 < r_a, v_L = C = v(r_a), so v_S = v(R0) - v(r_a) (compact well correction)
+    # Rho: v_L(R0) = v(rho(R0)) with rho≪R0 → large residual
+    rv.out(f'C at R0={_C_R0:.4f}: v={v_well:.6e}')
+    rv.out(f'  plateau: v_L={float(s_plat["v_L"][0]):.6e} v_S={vS_plat:.6e} |v_S|/|v|={abs(vS_plat/v_well):.3f}')
+    rv.out(f'  rho:     v_L={float(s_rho["v_L"][0]):.6e} v_S={vS_rho:.6e} |v_S|/|v|={abs(vS_rho/v_well):.3f}')
+    assert abs(vS_plat) < abs(vS_rho), 'plateau residual at R0 must be smaller than rho residual'
+    assert abs(vS_plat) < 2.0 * abs(v_well), 'plateau |v_S(R0)| should be O(well), not larger'
+    # Mesh must be flat at R0 (no force from long-range part near well)
+    assert abs(float(s_plat['dv_L_dr'][0])) < 1e-12, 'plateau v_L must be flat at R0 < r_a'
+    rv.checklist('plateau |v_S(R0)| < rho |v_S(R0)|',
+                 'plateau v_L force vanishes at R0 (no displaced minimum on mesh)')
+    rv.finish()
+
+
+def test_contact_pme_split_1d_smoothness_experiment(visual_output_dir, make_review):
+    """1D PAW-goal experiment: compare split modes by smoothness metrics (Python only).
+
+    Goal: v_L must damp high frequency, NOT invent bumps via W'(v-C).
+    Modes: paw (even poly), hermite, plateau (W-blend), softcore, rho.
+    No OpenCL / multi-atom — decide the split here before production.
+    """
+    from spammm.surfaces.PMESplit import soft_core_split, split_smoothness_metrics
+    rv = make_review('test_contact_pme_split_1d_smoothness_experiment')
+    outdir = os.path.join(_WAVE0_DIR, '1d_smoothness')
+    os.makedirs(outdir, exist_ok=True)
+    modes = ['paw', 'hermite', 'plateau', 'softcore', 'rho']
+    atoms = [(_C_R0, _C_E0, 'C'), (_O_R0, _O_E0, 'O'), (_H_R0, _H_E0, 'H')]
+    # Table header
+    hdr = f'{"atom":3s} {"mode":10s} {"hf_ratio":>10s} {"overshoot":>12s} {"max|d2vL|":>12s} {"max|vS|":>12s} {"n_ext_vL":>9s} {"n_ext_vS":>9s}'
+    rv.out(hdr)
+    rv.out('-' * len(hdr))
+    rows = []
+    for R0, E0, label in atoms:
+        for mode in modes:
+            p = _split_params(R0, E0, 0.0, split_mode=mode, r_cut=6.0)
+            r_lo = float(p.r_lo)
+            r_b = float(p.r_b) if mode != 'rho' else float(p.r_cut)
+            # paw is valid at r=0; sample from near 0 for origin smoothness check
+            r0 = 0.02 if mode == 'paw' else r_lo
+            r = np.linspace(r0, r_b + 0.5, 2000)
+            s = soft_core_split(r, p)
+            m = split_smoothness_metrics(r, s, r_lo=r_lo, r_b=r_b)
+            rows.append((label, mode, m, R0, r_lo, r_b, r, s, p))
+            rv.out(f'{label:3s} {mode:10s} {m["hf_ratio"]:10.4f} {m["force_overshoot"]:12.4e} '
+                   f'{m["max_abs_d2_vL"]:12.4e} {m["max_abs_vS"]:12.4e} {m["n_extrema_vL"]:9d} {m["n_extrema_vS"]:9d}')
+    # L0: paw/hermite must not amplify force vs reference; plateau W-blend does
+    for label, mode, m, R0, r_lo, r_b, r, s, p in rows:
+        if mode in ('paw', 'hermite') and label == 'C':
+            plat = [x for x in rows if x[0] == 'C' and x[1] == 'plateau'][0][2]
+            rv.out(f'\nC {mode} overshoot={m["force_overshoot"]:.4e} vs plateau={plat["force_overshoot"]:.4e}')
+            assert m['force_overshoot'] < plat['force_overshoot'], \
+                f'{mode} must have smaller force overshoot than W-blend plateau'
+            assert m['hf_ratio'] < plat['hf_ratio'] or m['force_overshoot'] < 0.5 * plat['force_overshoot'], \
+                f'{mode} must be smoother (hf_ratio or overshoot) than plateau W-blend'
+    # Identity + C² join for paw/hermite
+    for label, mode, m, R0, r_lo, r_b, r, s, p in rows:
+        if mode in ('paw', 'hermite'):
+            assert np.max(np.abs(s['v_L'] + s['v_S'] - s['v'])) < 1e-12
+            i_b = int(np.argmin(np.abs(r - r_b)))
+            assert abs(s['v_S'][i_b]) < 1e-8, f'{label} {mode} v_S(r_b)={s["v_S"][i_b]}'
+            assert abs(s['dv_S_dr'][i_b]) < 1e-6, f'{label} {mode} dv_S(r_b)={s["dv_S_dr"][i_b]}'
+    # paw: dP/dr → 0 as r→0 (even radial field)
+    for label, mode, m, R0, r_lo, r_b, r, s, p in rows:
+        if mode == 'paw' and label == 'C':
+            i0 = int(np.argmin(r))
+            rv.out(f'C paw at r≈{r[i0]:.4f}: dv_L={s["dv_L_dr"][i0]:.4e} (expect ~0)')
+            assert abs(s['dv_L_dr'][i0]) < 1e-3, f'paw force must vanish at origin, got {s["dv_L_dr"][i0]}'
+
+    if visual_output_dir is None:
+        rv.out('L2 plots skipped (no --visual/--develop)')
+        rv.finish()
+        return
+
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    # Figure 1: energy — first 4 modes × C
+    plot_modes = ['paw', 'hermite', 'plateau', 'rho']
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+    for ax, mode in zip(axes.ravel(), plot_modes):
+        R0, E0, label = atoms[0]
+        p = _split_params(R0, E0, 0.0, split_mode=mode, r_cut=6.0)
+        r_lo = float(p.r_lo); r_b = float(p.r_b) if mode != 'rho' else float(p.r_cut)
+        r0 = 0.02 if mode == 'paw' else r_lo
+        r = np.linspace(r0, r_b + 0.8, 1200)
+        s = soft_core_split(r, p)
+        m = split_smoothness_metrics(r, s, r_lo=r_lo, r_b=r_b)
+        ax.plot(r, s['v'], 'k-', lw=1.5, label='v ref')
+        ax.plot(r, s['v_L'], 'b-', lw=1.2, label='v_L smooth/mesh')
+        ax.plot(r, s['v_S'], 'r-', lw=1.2, label='v_S short/core')
+        ax.axhline(0, color='gray', ls=':', alpha=0.4)
+        ax.axvline(R0, color='orange', ls='--', alpha=0.7, label='R0')
+        ax.axvline(r_b, color='magenta', ls=':', alpha=0.6, label='r_b')
+        ax.set_title(f'C energy — {mode}\nhf={m["hf_ratio"]:.3f} overshoot={m["force_overshoot"]:.2e}')
+        ax.set_xlabel('r [Å]'); ax.set_ylabel('V [eV]')
+        ymin = min(float(np.min(s['v'])), float(np.min(s['v_S']))) * 1.15
+        ax.set_ylim(ymin, max(abs(ymin) * 0.35, 1e-4))
+        ax.legend(fontsize=6)
+    fig.suptitle('1D split experiment (energy): black=ref, blue=smooth long-range, red=short residual\n'
+                 'PAW goal: blue must be smoother than black — no new bumps', fontsize=11)
+    p1 = os.path.join(outdir, '01_energy_4modes_C.png')
+    fig.savefig(p1, dpi=150); plt.close(fig)
+    print(f'REVIEW: {p1}', flush=True); rv.out(f'Saved {p1}')
+
+    # Figure 2: FORCE — the smoking gun for W' bumps
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+    for ax, mode in zip(axes.ravel(), plot_modes):
+        R0, E0, label = atoms[0]
+        p = _split_params(R0, E0, 0.0, split_mode=mode, r_cut=6.0)
+        r_lo = float(p.r_lo); r_b = float(p.r_b) if mode != 'rho' else float(p.r_cut)
+        r0 = 0.02 if mode == 'paw' else r_lo
+        r = np.linspace(r0, r_b + 0.8, 1200)
+        s = soft_core_split(r, p)
+        m = split_smoothness_metrics(r, s, r_lo=r_lo, r_b=r_b)
+        ax.plot(r, s['dvdr'], 'k-', lw=1.5, label="v' ref")
+        ax.plot(r, s['dv_L_dr'], 'b-', lw=1.2, label="v_L' smooth")
+        ax.plot(r, s['dv_S_dr'], 'r-', lw=1.2, label="v_S' short")
+        ax.axhline(0, color='gray', ls=':', alpha=0.4)
+        ax.axvline(R0, color='orange', ls='--', alpha=0.7)
+        ax.axvline(r_b, color='magenta', ls=':', alpha=0.6)
+        if mode == 'plateau':
+            ax.axvline(float(p.r_a), color='cyan', ls='-.', alpha=0.7, label='r_a')
+        # clip wall for visibility of transition
+        mask = r > R0 - 0.2
+        yspan = np.percentile(np.abs(s['dvdr'][mask]), 99)
+        ax.set_ylim(-yspan * 1.3, yspan * 1.3)
+        ax.set_title(f'C force — {mode}\novershoot={m["force_overshoot"]:.2e}  n_ext(vL)={m["n_extrema_vL"]}')
+        ax.set_xlabel('r [Å]'); ax.set_ylabel('dV/dr [eV/Å]')
+        ax.legend(fontsize=6)
+    fig.suptitle('1D split experiment (FORCE): plateau W-blend overshoots (blue > black) → red dips\n'
+                 'paw/hermite: blue stays below |ref| — true damping, no invented bumps', fontsize=11)
+    p2 = os.path.join(outdir, '02_force_4modes_C.png')
+    fig.savefig(p2, dpi=150); plt.close(fig)
+    print(f'REVIEW: {p2}', flush=True); rv.out(f'Saved {p2}')
+
+    # Figure 2b: 2 rows × 4 cols — top potentials, bottom forces; twin axis = W, 1-W, W'
+    # User partition: v_S = W·V_ref,  v_L = (1-W)·V_ref,  V_ref = v_S + v_L
+    # ⇒ effective W = v_S / V_ref  (masked where |V_ref| tiny)
+    R0, E0, _ = atoms[0]
+    fig, axes = plt.subplots(2, 4, figsize=(16, 7), constrained_layout=True)
+    V_floor = 1e-6  # mask W near V≈0 crossing
+    for col, mode in enumerate(plot_modes):
+        p = _split_params(R0, E0, 0.0, split_mode=mode, r_cut=6.0)
+        r_lo = float(p.r_lo)
+        r_outer = float(p.r_b) if mode != 'rho' else float(p.r_cut)
+        r0 = 0.02 if mode == 'paw' else r_lo
+        r = np.linspace(r0, r_outer + 0.8, 1600)
+        s = soft_core_split(r, p)
+        V = s['v']; vL = s['v_L']; vS = s['v_S']
+        dV = s['dvdr']; dvL = s['dv_L_dr']; dvS = s['dv_S_dr']
+        # Effective partition weight from additive split (identity V=vL+vS)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            W = np.where(np.abs(V) > V_floor, vS / V, np.nan)
+            OmW = np.where(np.abs(V) > V_floor, vL / V, np.nan)
+        # dW/dr from quotient: W' = (vS' V - vS V') / V²
+        with np.errstate(divide='ignore', invalid='ignore'):
+            dW = np.where(np.abs(V) > V_floor, (dvS * V - vS * dV) / (V * V), np.nan)
+
+        # --- top: potentials ---
+        ax = axes[0, col]
+        ax.plot(r, V, 'k-', lw=1.5, label='V_ref')
+        ax.plot(r, vL, 'b-', lw=1.2, label='v_L=(1−W)V')
+        ax.plot(r, vS, 'r-', lw=1.2, label='v_S=W·V')
+        ax.axhline(0, color='gray', ls=':', alpha=0.4)
+        ax.axvline(R0, color='orange', ls='--', alpha=0.7)
+        ax.axvline(r_outer, color='magenta', ls=':', alpha=0.6)
+        if mode == 'plateau':
+            ax.axvline(float(p.r_a), color='cyan', ls='-.', alpha=0.6)
+        ymin = min(float(np.nanmin(V)), float(np.nanmin(vS))) * 1.15
+        ax.set_ylim(ymin, max(abs(ymin) * 0.35, 1e-4))
+        ax.set_title(f'{mode}')
+        ax.set_ylabel('V [eV]' if col == 0 else '')
+        tax = ax.twinx()
+        tax.plot(r, W, 'r--', lw=1.0, alpha=0.85, label='W=v_S/V')
+        tax.plot(r, OmW, 'b--', lw=1.0, alpha=0.85, label='1−W=v_L/V')
+        tax.set_ylim(-0.5, 1.5)
+        tax.set_ylabel('W' if col == 3 else '')
+        if col == 0:
+            lines1, lab1 = ax.get_legend_handles_labels()
+            lines2, lab2 = tax.get_legend_handles_labels()
+            ax.legend(lines1 + lines2, lab1 + lab2, fontsize=6, loc='best')
+
+        # --- bottom: forces ---
+        ax = axes[1, col]
+        ax.plot(r, dV, 'k-', lw=1.5, label="V'")
+        ax.plot(r, dvL, 'b-', lw=1.2, label="v_L'")
+        ax.plot(r, dvS, 'r-', lw=1.2, label="v_S'")
+        ax.axhline(0, color='gray', ls=':', alpha=0.4)
+        ax.axvline(R0, color='orange', ls='--', alpha=0.7)
+        ax.axvline(r_outer, color='magenta', ls=':', alpha=0.6)
+        if mode == 'plateau':
+            ax.axvline(float(p.r_a), color='cyan', ls='-.', alpha=0.6)
+        mask = r > R0 - 0.2
+        yspan = np.percentile(np.abs(dV[mask]), 99)
+        ax.set_ylim(-yspan * 1.3, yspan * 1.3)
+        ax.set_xlabel('r [Å]')
+        ax.set_ylabel("dV/dr [eV/Å]" if col == 0 else '')
+        tax = ax.twinx()
+        # scale W' for visibility; also plot W again lightly
+        dW_max = np.nanmax(np.abs(dW))
+        dW_n = dW / dW_max if dW_max and np.isfinite(dW_max) and dW_max > 0 else dW
+        tax.plot(r, W, 'g:', lw=1.0, alpha=0.5, label='W')
+        tax.plot(r, dW_n, 'g--', lw=1.2, alpha=0.9, label="W' (norm)")
+        tax.set_ylim(-1.5, 1.5)
+        tax.set_ylabel("W, W'(norm)" if col == 3 else '')
+        if col == 0:
+            lines1, lab1 = ax.get_legend_handles_labels()
+            lines2, lab2 = tax.get_legend_handles_labels()
+            ax.legend(lines1 + lines2, lab1 + lab2, fontsize=6, loc='best')
+
+    fig.suptitle('Partition view:  v_S = W·V_ref ,  v_L = (1−W)·V_ref ,  V_ref = v_S+v_L\n'
+                 'Top: potentials + twin W,1−W   |   Bottom: forces + twin W and W′(normalized)\n'
+                 'W := v_S/V_ref  (masked near V≈0).  Orange=R0, magenta=r_b/r_cut', fontsize=11)
+    p2b = os.path.join(outdir, '02b_V_and_force_with_W_C.png')
+    fig.savefig(p2b, dpi=150); plt.close(fig)
+    print(f'REVIEW: {p2b}', flush=True); rv.out(f'Saved {p2b}')
+    import shutil
+    p2b_old = os.path.join(outdir, '02b_force_and_W_C.png')
+    shutil.copyfile(p2b, p2b_old)
+    print(f'REVIEW: {p2b_old}', flush=True)
+
+    # EQUATIONS.out — partition definition + how each mode builds (v_L,v_S)
+    eq_path = os.path.join(outdir, 'EQUATIONS.out')
+    eq_lines = [
+        '# Partition identity (what W means in the plots):',
+        '#   V_ref = v_S + v_L',
+        '#   v_S   = W     * V_ref',
+        '#   v_L   = (1-W) * V_ref',
+        '#   ⇒  W = v_S / V_ref     (plotted; masked where |V_ref|<1e-6)',
+        '#',
+        '# NOTE: This W is DIAGNOSTIC from the additive split. It is NOT necessarily',
+        '# an input smoothstep. Only plateau uses an input smoothstep W_sw on (v-C):',
+        '#',
+        f'# Geometry (C): R0={R0:.4f}, r_lo=R0-0.5, r_a=R0+0.5, r_b=R0+2, rho r_cut=6',
+        '#',
+        '# paw:      v_L=P(r)=a0+a2 r^2+a4 r^4+a6 r^6 (even; smooth at r=0);',
+        '#           C2-match v at r_b; a0 minimizes int (P\'\')^2; v_S=V-P',
+        '# hermite:  v_L=P(s) soft poly in (r-r_lo) (flat at r_lo, C2 at r_b); v_S=V-P',
+        '# softcore: same as hermite with a0=v(sqrt(r_lo^2+a^2))',
+        '# plateau:  C=v(r_a); W_sw=smoothstep on [r_a,r_b];',
+        '#           v_L=C+W_sw(v-C); v_S=(1-W_sw)(v-C)',
+        '#           diagnostic W = v_S/v  ≠  W_sw  in general (because of C offset)',
+        '# rho:      v_L=v(ρ(r)); v_S=v-v(ρ)',
+        '#',
+    ]
+    with open(eq_path, 'w') as f:
+        f.write('\n'.join(eq_lines) + '\n')
+    print(f'REVIEW: {eq_path}', flush=True); rv.out(f'Saved {eq_path}')
+
+    # Figure 3: curvature d²v — high-frequency content
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
+    R0, E0, _ = atoms[0]
+    r_lo = R0 - 0.5; r_b = R0 + 2.0
+    r = np.linspace(r_lo, r_b + 0.5, 1200)
+    for mode, ls in [('paw', '-'), ('hermite', '-.'), ('plateau', '--'), ('rho', ':')]:
+        p = _split_params(R0, E0, 0.0, split_mode=mode, r_cut=6.0)
+        s = soft_core_split(r, p)
+        axes[0].plot(r, s['d2v_L'], ls=ls, lw=1.2, label=f"d²v_L {mode}")
+        axes[1].plot(r, s['v_S'], ls=ls, lw=1.2, label=f'v_S {mode}')
+    axes[0].plot(r, soft_core_split(r, _split_params(R0, E0, 0.0, split_mode='paw'))['d2v'],
+                 'k-', lw=0.8, alpha=0.5, label='d²v ref')
+    axes[0].axhline(0, color='gray', ls=':', alpha=0.3)
+    axes[0].axvline(R0, color='orange', ls='--', alpha=0.6)
+    axes[0].set_title('Curvature of long-range field (lower |d²| = smoother)')
+    axes[0].set_xlabel('r [Å]'); axes[0].set_ylabel('d²V/dr²')
+    axes[0].legend(fontsize=7)
+    # zoom curvature away from wall
+    mask = r > R0
+    yspan = np.percentile(np.abs(soft_core_split(r, _split_params(R0, E0, split_mode='plateau'))['d2v_L'][mask]), 99)
+    axes[0].set_ylim(-yspan * 2, yspan * 2)
+    axes[1].axhline(0, color='gray', ls=':', alpha=0.3)
+    axes[1].axvline(R0, color='orange', ls='--', alpha=0.6)
+    axes[1].set_title('Short residual v_S (should be compact, not wiggly)')
+    axes[1].set_xlabel('r [Å]'); axes[1].set_ylabel('v_S [eV]')
+    axes[1].legend(fontsize=7)
+    fig.suptitle('C: curvature + residual — paw/hermite should have smaller |d²v_L| than plateau/rho', fontsize=11)
+    p3 = os.path.join(outdir, '03_curvature_and_residual_C.png')
+    fig.savefig(p3, dpi=150); plt.close(fig)
+    print(f'REVIEW: {p3}', flush=True); rv.out(f'Saved {p3}')
+
+    # Figure 4: metric bar chart
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True)
+    x = np.arange(len(modes))
+    for ax, key, title in zip(axes,
+                              ['force_overshoot', 'hf_ratio', 'max_abs_vS'],
+                              ['force overshoot (↓ better)', 'hf_ratio RMS(d²v_L)/RMS(d²v) (↓)', 'max|v_S| (↓)']):
+        for j, (R0, E0, label) in enumerate(atoms):
+            vals = []
+            for mode in modes:
+                m = [x[2] for x in rows if x[0] == label and x[1] == mode][0]
+                vals.append(m[key])
+            ax.bar(x + 0.25 * (j - 1), vals, width=0.25, label=label)
+        ax.set_xticks(x); ax.set_xticklabels(modes, rotation=15)
+        ax.set_title(title); ax.legend(fontsize=7)
+    fig.suptitle('Smoothness scoreboard (C/O/H) — pick mode with low overshoot + low hf_ratio', fontsize=11)
+    p4 = os.path.join(outdir, '04_metrics_bar.png')
+    fig.savefig(p4, dpi=150); plt.close(fig)
+    print(f'REVIEW: {p4}', flush=True); rv.out(f'Saved {p4}')
+
+    # SUMMARY.out
+    lines = [
+        '# 1D split smoothness experiment SUMMARY',
+        '# PAW goal: replace steep high-frequency content by a smooth approx;',
+        '#           residual = high-freq part fitted by short-range basis.',
+        '# CRITICAL: smooth approx must NOT invent new bumps (W\'*(v-C) failure mode).',
+        '#',
+        '# Metrics: force_overshoot = max(0,|v_L\'|-|v\'|); hf_ratio = RMS(d²v_L)/RMS(d²v)',
+        '#',
+        hdr,
+    ]
+    for label, mode, m, *_ in rows:
+        lines.append(f'{label:3s} {mode:10s} {m["hf_ratio"]:10.4f} {m["force_overshoot"]:12.4e} '
+                     f'{m["max_abs_d2_vL"]:12.4e} {m["max_abs_vS"]:12.4e} {m["n_extrema_vL"]:9d} {m["n_extrema_vS"]:9d}')
+    # Recommend
+    c_rows = {mode: m for lab, mode, m, *_ in rows if lab == 'C'}
+    best = min(c_rows.keys(), key=lambda k: (c_rows[k]['force_overshoot'], c_rows[k]['hf_ratio']))
+    lines += ['', f'# Recommended mode by (overshoot, hf_ratio) on C: {best}',
+              f'# plateau overshoot (known bug): {c_rows["plateau"]["force_overshoot"]:.4e}',
+              f'# hermite overshoot: {c_rows["hermite"]["force_overshoot"]:.4e}',
+              f'# paw overshoot: {c_rows["paw"]["force_overshoot"]:.4e}',
+              '# fit_contact_pme default split_mode=paw (even poly, smooth at r=0).']
+    sp = os.path.join(outdir, 'SUMMARY.out')
+    with open(sp, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    print(f'REVIEW: {sp}', flush=True); rv.out(f'Saved {sp}')
+    rv.checklist('Compared paw/hermite/plateau/softcore/rho on force overshoot + hf_ratio',
+                 'paw/hermite has lower force overshoot than plateau W-blend',
+                 'L2 energy/force/curvature/metric plots written under wave0_split/1d_smoothness/',
+                 'fit_contact_pme default is paw')
+    rv.finish()
 
 def test_contact_pme_split_domain_violation(make_review):
     """r < r_lo_i is a model-domain violation; detect and report for r_cut={4,5,6}."""
@@ -396,86 +739,153 @@ def test_contact_pme_split_rcut_sweep(make_review):
 
 
 def test_contact_pme_split_l2_curves(visual_output_dir, make_review):
-    """L2: optional split curves v, v_L, v_S vs r for C/O/H atoms (visual harness)."""
+    """L2: plateau vs legacy rho split — v, v_L, v_S, force; clear short/long labels."""
     from spammm.surfaces.PMESplit import soft_core_split
     rv = make_review('test_contact_pme_split_l2_curves')
     if visual_output_dir is None:
         rv.out('L2 split curves: skipped (no --visual/--develop)')
         rv.finish()
         return
-    rv.out('L2 split curves: generating plots')
+    rv.out('L2 split curves: generating plateau vs rho comparison plots')
     outdir = _WAVE0_DIR
     os.makedirs(outdir, exist_ok=True)
-    cases = [(_C_R0, _C_E0, 0.0, 0.0, 'C'), (_O_R0, _O_E0, 0.5, 1.0, 'O_q+'),
-             (_H_R0, _H_E0, -0.3, 0.5, 'H_q-')]
-    r = np.linspace(0.5, 10.0, 1000)
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4), constrained_layout=True)
-    for ax, (R0, E0, q_i, q_tip, label) in zip(axes, cases):
-        p = _split_params(R0, E0, q_i, q_tip=q_tip)
-        r_lo = R0 - 0.5
-        r_valid = r[r >= r_lo]
-        s = soft_core_split(r_valid, p)
-        ax.plot(r_valid, s['v'], 'k-', label='v (total)', lw=1.5)
-        ax.plot(r_valid, s['v_L'], 'b--', label='v_L (soft/mesh)', lw=1.2)
-        ax.plot(r_valid, s['v_S'], 'r:', label='v_S (core residual)', lw=1.2)
-        ax.axvline(r_lo, color='gray', ls=':', alpha=0.5, label=f'r_lo={r_lo:.2f}')
-        ax.axvline(6.0, color='gray', ls='--', alpha=0.5, label='r_cut=6.0')
-        ax.set_title(f'{label} (R0={R0:.2f}, E0={E0:.4e})')
-        ax.set_xlabel('r [Å]'); ax.set_ylabel('V [eV]')
-        ax.legend(fontsize=7); ax.set_ylim(bottom=min(s['v'].min(), s['v_S'].min()) * 1.1,
-                                           top=max(s['v'].max(), 0.01))
-    fig.suptitle('PMESplit: combined potential and soft-core split (Wave 0)', fontsize=11)
-    plot_path = os.path.join(outdir, 'split_curves.png')
+
+    cases = [(_C_R0, _C_E0, 0.0, 0.0, 'C'), (_O_R0, _O_E0, 0.0, 0.0, 'O'), (_H_R0, _H_E0, 0.0, 0.0, 'H')]
+    # Figure 1: energy split — plateau (top) vs rho (bottom)
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
+    for col, (R0, E0, q_i, q_tip, label) in enumerate(cases):
+        for row, mode in enumerate(['plateau', 'rho']):
+            p = _split_params(R0, E0, q_i, q_tip=q_tip, split_mode=mode)
+            r_lo = float(p.r_lo)
+            r_outer = float(p.r_b) if mode == 'plateau' else float(p.r_cut)
+            r = np.linspace(r_lo, r_outer + 1.0, 800)
+            s = soft_core_split(r, p)
+            ax = axes[row, col]
+            ax.plot(r, s['v'], 'k-', label='v ref (total)', lw=1.5)
+            ax.plot(r, s['v_L'], 'b-', label='v_L long/mesh', lw=1.2)
+            ax.plot(r, s['v_S'], 'r-', label='v_S short/core', lw=1.2)
+            ax.axhline(0, color='gray', ls=':', alpha=0.4)
+            ax.axvline(R0, color='orange', ls='--', alpha=0.7, label=f'R0={R0:.2f}')
+            ax.axvline(r_lo, color='gray', ls=':', alpha=0.5)
+            if mode == 'plateau':
+                ax.axvline(float(p.r_a), color='cyan', ls='-.', alpha=0.7, label=f'r_a={float(p.r_a):.2f}')
+                ax.axvline(float(p.r_b), color='magenta', ls='-.', alpha=0.7, label=f'r_b={float(p.r_b):.2f}')
+            else:
+                ax.axvline(r_outer, color='magenta', ls='-.', alpha=0.7, label=f'r_cut={r_outer:.1f}')
+            ax.set_title(f'{label} — {mode}')
+            ax.set_xlabel('r [Å]'); ax.set_ylabel('V [eV]')
+            # Focus on well scale (clip repulsive wall for readability)
+            ymin = min(float(np.min(s['v'])), float(np.min(s['v_S']))) * 1.15
+            ymax = max(float(np.max(s['v_L'][r > R0 - 0.2])), abs(ymin) * 0.3, 1e-4)
+            ax.set_ylim(ymin, ymax)
+            ax.legend(fontsize=6, loc='best')
+    fig.suptitle('PME split: plateau (correct) vs legacy rho — energy\n'
+                 'black=reference total, blue=long-range/mesh, red=short-range/core residual', fontsize=11)
+    plot_path = os.path.join(outdir, 'split_curves_plateau_vs_rho.png')
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
-    rv.out(f'Saved L2 plot: {plot_path}')
+    rv.out(f'Saved: {plot_path}')
     print(f'REVIEW: {plot_path}', flush=True)
+
+    # Figure 2: force (dv/dr) for plateau only — same legend convention
+    fig2, axes2 = plt.subplots(1, 3, figsize=(15, 4), constrained_layout=True)
+    for ax, (R0, E0, q_i, q_tip, label) in zip(axes2, cases):
+        p = _split_params(R0, E0, q_i, q_tip=q_tip, split_mode='plateau')
+        r_lo = float(p.r_lo); r_a = float(p.r_a); r_b = float(p.r_b)
+        r = np.linspace(r_lo, r_b + 1.0, 800)
+        s = soft_core_split(r, p)
+        ax.plot(r, s['dvdr'], 'k-', label="v' ref", lw=1.5)
+        ax.plot(r, s['dv_L_dr'], 'b-', label="v_L' long", lw=1.2)
+        ax.plot(r, s['dv_S_dr'], 'r-', label="v_S' short", lw=1.2)
+        ax.axhline(0, color='gray', ls=':', alpha=0.4)
+        ax.axvline(R0, color='orange', ls='--', alpha=0.7, label=f'R0')
+        ax.axvline(r_a, color='cyan', ls='-.', alpha=0.7, label='r_a')
+        ax.axvline(r_b, color='magenta', ls='-.', alpha=0.7, label='r_b')
+        ax.set_title(f'{label} force split (plateau)')
+        ax.set_xlabel('r [Å]'); ax.set_ylabel('dV/dr [eV/Å]')
+        # Clip extreme wall for visibility of well/tail
+        mask = r > R0 - 0.3
+        yspan = np.percentile(np.abs(s['dvdr'][mask]), 99)
+        ax.set_ylim(-yspan * 1.2, yspan * 1.2)
+        ax.legend(fontsize=6)
+    fig2.suptitle('PME plateau split — radial force (black=ref, blue=mesh, red=core)', fontsize=11)
+    plot_path2 = os.path.join(outdir, 'split_force_plateau.png')
+    fig2.savefig(plot_path2, dpi=150)
+    plt.close(fig2)
+    rv.out(f'Saved: {plot_path2}')
+    print(f'REVIEW: {plot_path2}', flush=True)
+
+    # Backward-compat name also written (plateau only, C/O/H)
+    fig3, axes3 = plt.subplots(1, 3, figsize=(15, 4), constrained_layout=True)
+    for ax, (R0, E0, q_i, q_tip, label) in zip(axes3, cases):
+        p = _split_params(R0, E0, q_i, q_tip=q_tip)
+        r_lo = float(p.r_lo); r_b = float(p.r_b)
+        r = np.linspace(r_lo, r_b + 1.0, 800)
+        s = soft_core_split(r, p)
+        ax.plot(r, s['v'], 'k-', label='v (total)', lw=1.5)
+        ax.plot(r, s['v_L'], 'b--', label='v_L (mesh)', lw=1.2)
+        ax.plot(r, s['v_S'], 'r:', label='v_S (core)', lw=1.2)
+        ax.axvline(R0, color='orange', ls='--', alpha=0.7)
+        ax.axvline(float(p.r_a), color='cyan', ls=':', alpha=0.6)
+        ax.axvline(r_b, color='magenta', ls=':', alpha=0.6)
+        ax.set_title(f'{label} plateau (R0={R0:.2f})')
+        ax.set_xlabel('r [Å]'); ax.set_ylabel('V [eV]')
+        ymin = min(float(np.min(s['v'])), float(np.min(s['v_S']))) * 1.15
+        ax.set_ylim(ymin, max(abs(ymin) * 0.3, 1e-4))
+        ax.legend(fontsize=7)
+    fig3.suptitle('PMESplit plateau default (Wave 0)', fontsize=11)
+    plot_path3 = os.path.join(outdir, 'split_curves.png')
+    fig3.savefig(plot_path3, dpi=150)
+    plt.close(fig3)
+    rv.out(f'Saved: {plot_path3}')
+    print(f'REVIEW: {plot_path3}', flush=True)
     rv.finish()
 
 
 def test_contact_pme_split_summary(make_review):
-    """Emit SUMMARY.out with accepted parameter map for Wave 0."""
-    from spammm.surfaces.PMESplit import r_cut_candidates, SplitParams, COULOMB_CONST
+    """Emit SUMMARY.out with accepted parameter map for Wave 0 (plateau default)."""
+    from spammm.surfaces.PMESplit import r_cut_candidates, delta_b_candidates, SplitParams, COULOMB_CONST
     rv = make_review('test_contact_pme_split_summary')
     outdir = _WAVE0_DIR
     os.makedirs(outdir, exist_ok=True)
     p = SplitParams(R0=np.array([_C_R0, _O_R0, _H_R0]), E0=np.array([_C_E0, _O_E0, _H_E0]),
-                    q=np.array([0.0, 0.0, 0.0]), alpha=_TIP_ALPHA, q_tip=0.0, r_damp=_R_DAMP, r_cut=6.0)
-    valid, rejected, r_lo_max = r_cut_candidates(p)
+                    q=np.array([0.0, 0.0, 0.0]), alpha=_TIP_ALPHA, q_tip=0.0, r_damp=_R_DAMP,
+                    split_mode='plateau', delta_in=0.5, delta_a=0.5, delta_b=2.0, r_cut=6.0)
+    valid_db, rejected_db = delta_b_candidates(p)
+    valid_rc, rejected_rc, r_lo_max = r_cut_candidates(p)  # legacy rho reference
     lines = [
         '# PMESplit Wave 0 SUMMARY.out — accepted parameter map',
-        f'# Contract version: 2',
+        f'# Contract version: 3 (plateau+W default; rho kept for comparison)',
         f'# COULOMB_CONST = {COULOMB_CONST}',
         f'#',
         f'# Global tip parameters:',
         f'alpha (tip stiffness) = {_TIP_ALPHA}',
         f'K = -alpha = {-_TIP_ALPHA}',
         f'r_damp = {_R_DAMP} Å',
-        f'R2damp = {_R_DAMP**2} Å²',
-        f'r_cut (MVP default) = 6.0 Å',
+        f'split_mode = plateau',
+        f'Δ_in = {p.delta_in} Å  → r_min = R0 - Δ_in',
+        f'Δ_a  = {p.delta_a} Å  → r_a   = R0 + Δ_a  (plateau end)',
+        f'Δ_b  = {p.delta_b} Å  → r_b   = R0 + Δ_b  (core cutoff)',
+        f'r_core_max = {p.r_core_max:.4f} Å',
         f'PLQH convention = (1, 1, q_tip, 0)',
         f'',
-        f'# Per-atom parameters (from assign_params combination rules):',
-        f'# R0 = tip_R + R_vdW_sample, E0 = sqrt(tip_E * E_vdW_sample)',
+        f'# Per-atom (assign_params): R0 = tip_R + R_vdW, E0 = sqrt(tip_E * E_vdW)',
         f'tip_R = {_TIP_R}, tip_E = {_TIP_E}',
         f'',
-        f'# Atom  R0[Å]    E0[eV]       r_lo[Å]  q[e]',
-        f'C      {_C_R0:.4f}  {_C_E0:.6e}  {_C_R0 - 0.5:.4f}  0.0',
-        f'O      {_O_R0:.4f}  {_O_E0:.6e}  {_O_R0 - 0.5:.4f}  0.0',
-        f'H      {_H_R0:.4f}  {_H_E0:.6e}  {_H_R0 - 0.5:.4f}  0.0',
+        f'# Atom  R0[Å]    E0[eV]       r_min    r_a      r_b',
+        f'C      {_C_R0:.4f}  {_C_E0:.6e}  {_C_R0-0.5:.4f}  {_C_R0+0.5:.4f}  {_C_R0+2.0:.4f}',
+        f'O      {_O_R0:.4f}  {_O_E0:.6e}  {_O_R0-0.5:.4f}  {_O_R0+0.5:.4f}  {_O_R0+2.0:.4f}',
+        f'H      {_H_R0:.4f}  {_H_E0:.6e}  {_H_R0-0.5:.4f}  {_H_R0+0.5:.4f}  {_H_R0+2.0:.4f}',
         f'',
-        f'# r_cut sweep (candidates = {{4, 5, 6}} Å, h_mesh = 1 Å):',
-        f'r_lo_max = {r_lo_max:.4f} Å',
-        f'valid candidates = {valid} (ascending, smallest first for gate selection)',
-        f'rejected candidates = {rejected} (r_cut <= r_lo_max)',
-        f'accepted r_cut = {valid[0]} Å (smallest valid; final selection by downstream gates)',
+        f'# Δ_b sweep candidates: valid={valid_db} rejected={rejected_db}',
+        f'# Legacy rho r_cut candidates: valid={valid_rc} rejected={rejected_rc} r_lo_max={r_lo_max:.4f}',
         f'',
-        f'# Oracle: getMorsePLQH / cs_brute_plqh_points (kernels/Forces.cl:235-249)',
-        f'# Split: quintic Hermite rho(r), v_L = v(rho), v_S = v - v_L',
-        f'# Domain violation: r < r_lo_i → ValueError (fail-loud, no extrapolation)',
+        f'# Split: v_L = C + W(v-C), v_S = (1-W)(v-C), C=v(r_a), W=quintic smoothstep on [r_a,r_b]',
+        f'# Legacy rho mode: v_L = v(rho(r)) kept for comparison only',
+        f'# Domain violation: r < r_min → ValueError (fail-loud)',
     ]
     summary_path = os.path.join(outdir, 'SUMMARY.out')
     with open(summary_path, 'w') as f:
@@ -483,8 +893,8 @@ def test_contact_pme_split_summary(make_review):
     rv.out(f'Summary written to {summary_path}')
     rv.out('\n'.join(lines))
     print(f'REVIEW: {summary_path}', flush=True)
-    rv.checklist('SUMMARY.out emitted with accepted parameter map',
-                 'r_cut sweep results recorded',
+    rv.checklist('SUMMARY.out emitted with plateau parameter map',
+                 'Δ_b / legacy r_cut candidates recorded',
                  'Oracle and split conventions documented')
     rv.finish()
 
@@ -497,10 +907,11 @@ def test_contact_pme_split_summary(make_review):
 _WAVE1_CORE_DIR = os.path.join('debug', 'test_afm_contact_surface', 'contact_pme', 'wave1_core')
 
 
-def _core_split_params(R0, E0, q=0.0, q_tip=0.0, r_cut=6.0):
+def _core_split_params(R0, E0, q=0.0, q_tip=0.0, r_cut=6.0, split_mode='plateau'):
     from spammm.surfaces.PMESplit import SplitParams
     return SplitParams(R0=np.float64(R0), E0=np.float64(E0), q=np.float64(q),
-                       alpha=_TIP_ALPHA, q_tip=q_tip, r_damp=_R_DAMP, r_cut=r_cut)
+                       alpha=_TIP_ALPHA, q_tip=q_tip, r_damp=_R_DAMP, r_cut=r_cut,
+                       split_mode=split_mode)
 
 
 def test_contact_pme_core_fit_quality(make_review):
@@ -514,7 +925,7 @@ def test_contact_pme_core_fit_quality(make_review):
         (_C_R0, _C_E0, 0.5, 1.0, 'C q+ tip+'),
         (_O_R0, _O_E0, -0.3, 0.5, 'O q- tip+'),
     ]
-    rv.out(f'N_MODES={N_MODES}, powers={CORE_POWERS.tolist()}')
+    rv.out(f'N_MODES={N_MODES}, powers={CORE_POWERS.tolist()} (plateau split)')
     rv.out(f'{"label":20s} {"cond_raw":>10s} {"cond_hier":>10s} {"train_E":>12s} {"train_F":>12s} {"held_E":>12s} {"held_F":>12s} {"max_E":>12s} {"max_F":>12s} {"worst_r":>8s}')
     for R0, E0, q_i, q_tip, label in cases:
         p = _core_split_params(R0, E0, q_i, q_tip=q_tip)
@@ -526,7 +937,7 @@ def test_contact_pme_core_fit_quality(make_review):
         assert fit.cond_hier[0] > 1.0, f'{label}: cond_hier must be > 1'
         rv.log(f'{label}: cond_hier/cond_raw = {fit.cond_hier[0]/fit.cond_raw[0]:.3f}')
     rv.checklist('fit_core_1d produces N_MODES=5 coefficients per atom',
-                 'Energy AND radial-derivative rows used in least-squares',
+                 'Boltzmann + E/F block normalization used in least-squares',
                  'Condition numbers reported for raw and hierarchical bases',
                  'Held-out energy and force errors reported (NOT training energy alone)',
                  'Worst held-out radius identified per atom',
@@ -535,21 +946,22 @@ def test_contact_pme_core_fit_quality(make_review):
 
 
 def test_contact_pme_core_exact_cutoff(make_review):
-    """Core must be exactly zero at and beyond r_cut (no tail leakage)."""
+    """Core must be exactly zero at and beyond per-atom r_b (no tail leakage)."""
     from spammm.surfaces.PICCore import fit_core_1d, eval_core
     rv = make_review('test_contact_pme_core_exact_cutoff')
     p = _core_split_params(_C_R0, _C_E0)
     fit = fit_core_1d(p)
+    r_b = float(fit.r_b[0])
     atom_pos = np.array([[0.0, 0.0, 0.0]])
-    r_test = np.array([6.0, 6.001, 7.0, 10.0, 100.0])
+    r_test = np.array([r_b, r_b + 0.001, r_b + 1.0, r_b + 4.0, 100.0])
     queries = np.column_stack([r_test, np.zeros(len(r_test)), np.zeros(len(r_test))])
     E, F = eval_core(queries, atom_pos, fit)
-    rv.out(f'E at/above r_cut: {E}')
-    rv.out(f'F at/above r_cut: {F}')
-    assert np.allclose(E, 0.0, atol=0.0), f'Core E must be exactly 0 at r>=r_cut, got {E}'
-    assert np.allclose(F, 0.0, atol=0.0), f'Core F must be exactly 0 at r>=r_cut, got {F}'
-    rv.checklist('Core energy is exactly 0 at r >= r_cut',
-                 'Core force is exactly 0 at r >= r_cut',
+    rv.out(f'r_b={r_b:.4f}; E at/above r_b: {E}')
+    rv.out(f'F at/above r_b: {F}')
+    assert np.allclose(E, 0.0, atol=0.0), f'Core E must be exactly 0 at r>=r_b, got {E}'
+    assert np.allclose(F, 0.0, atol=0.0), f'Core F must be exactly 0 at r>=r_b, got {F}'
+    rv.checklist('Core energy is exactly 0 at r >= r_b',
+                 'Core force is exactly 0 at r >= r_b',
                  'No tail leakage beyond cutoff')
     rv.finish()
 
@@ -563,7 +975,7 @@ def test_contact_pme_core_force_parity(make_review):
     atom_pos = np.array([[0.0, 0.0, 0.0]])
     h = 1e-5
     rng = np.random.default_rng(99)
-    r_vals = rng.uniform(3.5, 5.5, 20)
+    r_vals = rng.uniform(3.2, 5.0, 20)  # inside [r_lo, r_b) for C (~2.88–5.38)
     theta = rng.uniform(0, np.pi, 20)
     phi = rng.uniform(0, 2 * np.pi, 20)
     queries = np.column_stack([r_vals * np.sin(theta) * np.cos(phi),
@@ -696,36 +1108,37 @@ def test_contact_pme_core_ptcda_fit(xyz, make_review):
 
 
 def test_contact_pme_core_domain_violation(make_review):
-    """eval_core must raise ValueError on r < r_lo (fail-loud, no silent extrapolation)."""
-    from spammm.surfaces.PICCore import fit_core_1d, eval_core
+    """r < r_lo clamps to t=1 (finite); needed for PP-AFM close approach."""
+    from spammm.surfaces.PICCore import fit_core_1d, eval_core, core_basis
     rv = make_review('test_contact_pme_core_domain_violation')
     p = _core_split_params(_C_R0, _C_E0)
     fit = fit_core_1d(p)
     atom_pos = np.array([[0.0, 0.0, 0.0]])
-    r_lo = _C_R0 - 0.5
-    q_bad = np.array([[r_lo - 0.1, 0.0, 0.0]])
-    raised = False
-    try:
-        eval_core(q_bad, atom_pos, fit)
-    except ValueError as e:
-        rv.out(f'Domain violation raised: {e}')
-        raised = True
-    assert raised, 'eval_core must raise ValueError on r < r_lo'
+    r_lo = float(fit.r_lo[0])
+    q_inside = np.array([[r_lo - 0.1, 0.0, 0.0]])
+    E_in, F_in = eval_core(q_inside, atom_pos, fit)
+    rv.out(f'Inside r_lo-0.1: E={E_in[0]:.6e} F={F_in[0]} (must be finite; core clamps)')
+    assert np.all(np.isfinite(E_in)) and np.all(np.isfinite(F_in))
+    # Clamp: phi at r_lo-ε equals phi at r_lo (t=1), dphi=0 → F_core≈0 for single atom on axis
+    r_b = float(fit.r_b[0])
+    phi_lo, dphi_lo = core_basis(np.array([r_lo]), r_lo, r_b, fit.powers)
+    phi_in, dphi_in = core_basis(np.array([r_lo - 0.1]), r_lo, r_b, fit.powers)
+    assert np.allclose(phi_lo, phi_in), 'phi must match at/below r_lo (t=1 clamp)'
+    assert np.allclose(dphi_in, 0.0), 'dphi must be 0 below r_lo'
     q_ok = np.array([[r_lo + 0.01, 0.0, 0.0]])
     E_ok, F_ok = eval_core(q_ok, atom_pos, fit)
     rv.out(f'At r_lo+0.01: E={E_ok[0]:.6e} F={F_ok[0]}')
-    assert np.all(np.isfinite(E_ok)), 'E must be finite at r >= r_lo'
-    assert np.all(np.isfinite(F_ok)), 'F must be finite at r >= r_lo'
-    rv.checklist('eval_core raises ValueError on r < r_lo (fail-loud)',
-                 'eval_core works at r >= r_lo (boundary OK)',
-                 'No silent extrapolation or fallback')
+    assert np.all(np.isfinite(E_ok))
+    rv.checklist('eval_core finite for r < r_lo (clamp, AFM close approach)',
+                 'phi(r<=r_lo) matches t=1; dphi=0',
+                 'eval_core works at r >= r_lo')
     rv.finish()
 
 
 def test_contact_pme_core_l2_curves(visual_output_dir, make_review):
-    """L2: residual reference vs fit; combined wall/well/tail plot."""
+    """L2: residual ref vs fit; combined wall/well/tail; plateau vs rho target."""
     from spammm.surfaces.PICCore import fit_core_1d, core_basis, eval_core_and_soft
-    from spammm.surfaces.PMESplit import soft_core_split, combined_atom_potential, SplitParams
+    from spammm.surfaces.PMESplit import soft_core_split, combined_atom_potential
     rv = make_review('test_contact_pme_core_l2_curves')
     if visual_output_dir is None:
         rv.out('L2 core curves: skipped (no --visual/--develop)')
@@ -742,51 +1155,88 @@ def test_contact_pme_core_l2_curves(visual_output_dir, make_review):
     for ax, (R0, E0, q_i, q_tip, label) in zip(axes, cases):
         p = _core_split_params(R0, E0, q_i, q_tip=q_tip)
         fit = fit_core_1d(p)
-        r_lo = R0 - 0.5; r_cut = 6.0
-        r = np.linspace(r_lo, r_cut, 500)
+        r_lo = float(fit.r_lo[0]); r_b = float(fit.r_b[0])
+        r = np.linspace(r_lo, r_b, 500)
         s = soft_core_split(r, p)
-        phi, dphi = core_basis(r, r_lo, r_cut)
+        phi, _ = core_basis(r, r_lo, r_b, fit.powers)
         v_fit = phi @ fit.coeffs[0]
-        ax.plot(r, s['v_S'], 'k-', label='v_S (ref)', lw=1.5)
-        ax.plot(r, v_fit, 'r--', label='v_S (fit)', lw=1.2)
+        ax.plot(r, s['v_S'], 'k-', label='v_S ref (short)', lw=1.5)
+        ax.plot(r, v_fit, 'r--', label='v_S fit', lw=1.2)
+        ax.plot(r, v_fit - s['v_S'], 'g:', label='fit−ref', lw=1.0)
         ax.axhline(0, color='gray', ls=':', alpha=0.3)
-        ax.axvline(r_lo, color='gray', ls=':', alpha=0.5, label=f'r_lo={r_lo:.2f}')
-        ax.axvline(r_cut, color='gray', ls='--', alpha=0.5, label='r_cut=6.0')
-        ax.set_title(f'{label} residual (R0={R0:.2f})')
+        ax.axvline(R0, color='orange', ls='--', alpha=0.7, label='R0')
+        ax.axvline(float(p.r_a), color='cyan', ls=':', alpha=0.6, label='r_a')
+        ax.axvline(r_b, color='magenta', ls='--', alpha=0.5, label='r_b')
+        ax.set_title(f'{label} core residual (held RMSE_E={fit.held_rmse_E[0]:.2e})')
         ax.set_xlabel('r [Å]'); ax.set_ylabel('V_S [eV]')
-        ax.legend(fontsize=7)
-    fig.suptitle('PICCore: residual reference vs fit (Wave 1)', fontsize=11)
+        ax.legend(fontsize=6)
+    fig.suptitle('PICCore: short-range residual ref vs fit (plateau split)', fontsize=11)
     plot_path = os.path.join(outdir, 'core_residual_fit.png')
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
     rv.out(f'Saved: {plot_path}')
     print(f'REVIEW: {plot_path}', flush=True)
-    fig2, axes2 = plt.subplots(1, 3, figsize=(15, 4), constrained_layout=True)
-    for ax, (R0, E0, q_i, q_tip, label) in zip(axes2, cases):
+    fig2, axes2 = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
+    for col, (R0, E0, q_i, q_tip, label) in enumerate(cases):
         p = _core_split_params(R0, E0, q_i, q_tip=q_tip)
         fit = fit_core_1d(p)
-        r_lo = R0 - 0.5; r_cut = 6.0
+        r_lo = float(fit.r_lo[0]); r_b = float(fit.r_b[0])
         atom_pos = np.array([[0.0, 0.0, 0.0]])
-        r = np.linspace(r_lo, 10.0, 500)
+        r = np.linspace(r_lo, r_b + 2.0, 500)
         queries = np.column_stack([r, np.zeros(len(r)), np.zeros(len(r))])
-        E_comb, F_comb = eval_core_and_soft(queries, atom_pos, p, fit)
+        E_comb, _ = eval_core_and_soft(queries, atom_pos, p, fit)
         v_direct, _, _ = combined_atom_potential(r, p)
-        ax.plot(r, v_direct, 'k-', label='v (direct total)', lw=1.5)
-        ax.plot(r, E_comb, 'r--', label='v_L + core (combined)', lw=1.2)
-        ax.axvline(r_lo, color='gray', ls=':', alpha=0.5, label=f'r_lo={r_lo:.2f}')
-        ax.axvline(r_cut, color='gray', ls='--', alpha=0.5, label='r_cut=6.0')
-        ax.set_title(f'{label} wall/well/tail (R0={R0:.2f})')
+        s = soft_core_split(r, p)
+        ax = axes2[0, col]
+        ax.plot(r, v_direct, 'k-', label='v ref', lw=1.5)
+        ax.plot(r, s['v_L'], 'b-', label='v_L long (exact)', lw=1.0)
+        ax.plot(r, E_comb, 'r--', label='v_L + core fit', lw=1.2)
+        ax.axvline(R0, color='orange', ls='--', alpha=0.7)
+        ax.axvline(float(p.r_a), color='cyan', ls=':', alpha=0.6)
+        ax.axvline(r_b, color='magenta', ls=':', alpha=0.6)
+        ax.set_title(f'{label} combined')
         ax.set_xlabel('r [Å]'); ax.set_ylabel('V [eV]')
-        ax.legend(fontsize=7)
-    fig2.suptitle('PICCore: combined v_L(direct) + fitted core (Wave 1)', fontsize=11)
+        ymin = float(np.min(v_direct)) * 1.15
+        ax.set_ylim(ymin, max(abs(ymin) * 0.3, 1e-4))
+        ax.legend(fontsize=6)
+        ax = axes2[1, col]
+        err = E_comb - v_direct
+        ax.plot(r, err, 'g-', label='(v_L+fit) − v_ref', lw=1.2)
+        ax.axhline(0, color='gray', ls=':', alpha=0.4)
+        ax.axvline(R0, color='orange', ls='--', alpha=0.7)
+        ax.axvline(r_b, color='magenta', ls=':', alpha=0.6)
+        ax.set_title(f'{label} discrepancy  max|{float(np.max(np.abs(err))):.2e}|')
+        ax.set_xlabel('r [Å]'); ax.set_ylabel('ΔV [eV]')
+        ax.legend(fontsize=6)
+    fig2.suptitle('PICCore combined: black=ref, blue=long-range exact, red=mesh-target+fit; bottom=discrepancy', fontsize=11)
     plot_path2 = os.path.join(outdir, 'core_combined_wall_well_tail.png')
     fig2.savefig(plot_path2, dpi=150)
     plt.close(fig2)
     rv.out(f'Saved: {plot_path2}')
     print(f'REVIEW: {plot_path2}', flush=True)
+    fig3, axes3 = plt.subplots(1, 3, figsize=(15, 4), constrained_layout=True)
+    for ax, (R0, E0, q_i, q_tip, label) in zip(axes3, cases):
+        for mode, ls, color in [('plateau', '-', 'C0'), ('rho', '--', 'C3')]:
+            p = _core_split_params(R0, E0, q_i, q_tip=q_tip, split_mode=mode)
+            r_lo = float(p.r_lo)
+            r_outer = float(p.r_b) if mode == 'plateau' else float(p.r_cut)
+            r = np.linspace(r_lo, r_outer, 400)
+            s = soft_core_split(r, p)
+            ax.plot(r, s['v_S'], ls=ls, color=color, label=f'v_S {mode}', lw=1.3)
+        ax.axhline(0, color='gray', ls=':', alpha=0.3)
+        ax.axvline(R0, color='orange', ls='--', alpha=0.7, label='R0')
+        ax.set_title(f'{label}: core target difficulty')
+        ax.set_xlabel('r [Å]'); ax.set_ylabel('v_S [eV]')
+        ax.legend(fontsize=7)
+    fig3.suptitle('Why plateau helps: compact core target (solid) vs broad rho residual (dashed)', fontsize=11)
+    plot_path3 = os.path.join(outdir, 'core_target_plateau_vs_rho.png')
+    fig3.savefig(plot_path3, dpi=150)
+    plt.close(fig3)
+    rv.out(f'Saved: {plot_path3}')
+    print(f'REVIEW: {plot_path3}', flush=True)
     rv.checklist('L2 residual reference vs fit plot generated',
-                 'L2 combined wall/well/tail plot generated (v_L direct + core)',
-                 'Plots saved to wave1_core/ directory')
+                 'L2 combined wall/well/tail + discrepancy plot generated',
+                 'L2 plateau vs rho core-target comparison generated')
     rv.finish()
 
 
@@ -799,14 +1249,14 @@ def test_contact_pme_core_summary(make_review):
     os.makedirs(outdir, exist_ok=True)
     lines = [
         '# PICCore Wave 1 SUMMARY.out — compact radial core fit',
-        f'# Contract version: 2',
+        f'# Contract version: 3 (plateau split + Boltzmann/E-F scaled fit)',
         f'#',
-        f'# Basis: phi_m(r) = t^p_m, t = (r_cut - r)/(r_cut - r_lo_i)',
+        f'# Basis: phi_m(r) = t^p_m, t = (r_b - r)/(r_b - r_lo_i)',
         f'# Powers: {CORE_POWERS.tolist()}',
         f'# N_MODES = {N_MODES}',
-        f'# Cutoff: every mode exactly zero for r >= r_cut',
+        f'# Cutoff: every mode exactly zero for r >= r_b (= R0 + Δ_b)',
         f'#',
-        f'# Fit: energy + radial-derivative rows at ALL training radii',
+        f'# Fit: Boltzmann weights on total v + E/F block normalization',
         f'# Sampling: 300+ nonuniform shell points, dense endpoints',
         f'# Selection: raw vs hierarchical by condition + held-out E+F error',
         f'#',
@@ -819,9 +1269,11 @@ def test_contact_pme_core_summary(make_review):
     for R0, E0, q_i, q_tip, label in cases:
         p = _core_split_params(R0, E0, q_i, q_tip=q_tip)
         fit = fit_core_1d(p)
-        lines.append(f'{label:8s}: R0={R0:.4f} r_lo={R0-0.5:.4f} cond_raw={fit.cond_raw[0]:.1f} cond_hier={fit.cond_hier[0]:.1f} held_E={fit.held_rmse_E[0]:.4e} held_F={fit.held_rmse_F[0]:.4e}')
+        lines.append(f'{label:8s}: R0={R0:.4f} r_lo={float(fit.r_lo[0]):.4f} r_b={float(fit.r_b[0]):.4f} '
+                     f'cond_raw={fit.cond_raw[0]:.1f} cond_hier={fit.cond_hier[0]:.1f} '
+                     f'held_E={fit.held_rmse_E[0]:.4e} held_F={fit.held_rmse_F[0]:.4e}')
     lines.append(f'')
-    lines.append(f'# Bucket: build_pic_buckets with cell_size >= r_cut, 3x3 lookup')
+    lines.append(f'# Bucket: build_pic_buckets with cell_size >= r_core_max, 3x3 lookup')
     lines.append(f'# Completeness: eval_core == eval_core_direct (exact, no truncation)')
     lines.append(f'# Domain: r < r_lo → ValueError (fail-loud)')
     lines.append(f'# Force: F = -∇E, finite-difference parity verified')
@@ -837,13 +1289,13 @@ def test_contact_pme_core_summary(make_review):
     rv.finish()
 
 
-def _core_split_params_multi(R0s, E0s, qs=None, q_tip=0.0, r_cut=6.0):
+def _core_split_params_multi(R0s, E0s, qs=None, q_tip=0.0, r_cut=6.0, split_mode='plateau'):
     from spammm.surfaces.PMESplit import SplitParams
     if qs is None:
         qs = np.zeros(len(R0s))
     return SplitParams(R0=np.asarray(R0s, dtype=np.float64), E0=np.asarray(E0s, dtype=np.float64),
                        q=np.asarray(qs, dtype=np.float64), alpha=_TIP_ALPHA, q_tip=q_tip,
-                       r_damp=_R_DAMP, r_cut=r_cut)
+                       r_damp=_R_DAMP, r_cut=r_cut, split_mode=split_mode)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -854,19 +1306,20 @@ def _core_split_params_multi(R0s, E0s, qs=None, q_tip=0.0, r_cut=6.0):
 _WAVE1_MESH_DIR = os.path.join('debug', 'test_afm_contact_surface', 'contact_pme', 'wave1_mesh')
 
 
-def _mesh_split_params(R0, E0, q=0.0, q_tip=0.0, r_cut=6.0):
+def _mesh_split_params(R0, E0, q=0.0, q_tip=0.0, r_cut=6.0, split_mode='plateau'):
     from spammm.surfaces.PMESplit import SplitParams
     return SplitParams(R0=np.float64(R0), E0=np.float64(E0), q=np.float64(q),
-                       alpha=_TIP_ALPHA, q_tip=q_tip, r_damp=_R_DAMP, r_cut=r_cut)
+                       alpha=_TIP_ALPHA, q_tip=q_tip, r_damp=_R_DAMP, r_cut=r_cut,
+                       split_mode=split_mode)
 
 
-def _mesh_split_params_multi(R0s, E0s, qs=None, q_tip=0.0, r_cut=6.0):
+def _mesh_split_params_multi(R0s, E0s, qs=None, q_tip=0.0, r_cut=6.0, split_mode='plateau'):
     from spammm.surfaces.PMESplit import SplitParams
     if qs is None:
         qs = np.zeros(len(R0s))
     return SplitParams(R0=np.asarray(R0s, dtype=np.float64), E0=np.asarray(E0s, dtype=np.float64),
                        q=np.asarray(qs, dtype=np.float64), alpha=_TIP_ALPHA, q_tip=q_tip,
-                       r_damp=_R_DAMP, r_cut=r_cut)
+                       r_damp=_R_DAMP, r_cut=r_cut, split_mode=split_mode)
 
 
 def test_contact_pme_mesh_constant_field(make_review):
@@ -1207,4 +1660,268 @@ def test_contact_pme_mesh_summary(make_review, xyz):
     print(f'REVIEW: {summary_path}', flush=True)
     rv.checklist('SUMMARY.out emitted with mesh build results',
                  'Mesh dimensions, memory, build time, and error reported')
+    rv.finish()
+
+
+_WAVE2_MOL_DIR = os.path.join('debug', 'test_afm_contact_surface', 'contact_pme', 'wave2_paw_mol')
+
+
+def _assign_demo_partial_charges(afm):
+    """Electronegativity-inspired demo qs (neutralized). XYZ files ship with qs=0."""
+    table = {'H': 0.12, 'C': 0.05, 'N': -0.35, 'O': -0.45, 'S': -0.20, 'F': -0.25}
+    enames = list(afm.mol.enames)
+    qs = np.array([table.get(str(e).strip(), 0.0) for e in enames], dtype=np.float64)
+    qs -= qs.mean()
+    afm.atoms_arr[:, 3] = qs.astype(np.float32)
+    if afm.mol.qs is not None:
+        afm.mol.qs[:] = qs
+    return qs
+
+
+def _safe_pme_queries(apos, p, z_above, nq, rng, margin=1.5):
+    """Random queries above molecule that stay outside every atom's r_lo."""
+    z = float(apos[:, 2].max()) + float(z_above)
+    xs = rng.uniform(apos[:, 0].min() - margin, apos[:, 0].max() + margin, nq * 4)
+    ys = rng.uniform(apos[:, 1].min() - margin, apos[:, 1].max() + margin, nq * 4)
+    cand = np.column_stack([xs, ys, np.full(len(xs), z)])
+    r_lo = np.atleast_1d(p.r_lo).astype(np.float64)
+    keep = []
+    for iq, q in enumerate(cand):
+        ok = True
+        for ia in range(len(apos)):
+            if np.linalg.norm(q - apos[ia]) < r_lo[ia] + 0.05:
+                ok = False
+                break
+        if ok:
+            keep.append(iq)
+        if len(keep) >= nq:
+            break
+    assert len(keep) >= max(10, nq // 2), f'only {len(keep)} safe queries at z_above={z_above}'
+    return cand[keep[:nq]]
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_contact_pme_paw_molecule_parity(xyz, visual_output_dir, make_review):
+    """Real-system PAW contact_pme vs Morse+Q (PLQH) oracle: pyridine + PTCDA.
+
+    Reference: cs_brute_plqh_points with PLQH=(1,1,q_tip,0) — same radial Morse+Q
+    as PMESplit.combined_atom_potential. tipQs forced to 0 (MVP radial oracle).
+    """
+    from spammm.SPM.AFM_utils import imshow_afm
+    rv = make_review('test_contact_pme_paw_molecule_parity')
+    outdir = _WAVE2_MOL_DIR
+    os.makedirs(outdir, exist_ok=True)
+    q_tip = -0.1
+    cases = [('pyridine.xyz', 'pyridine'), ('PTCDA.xyz', 'PTCDA')]
+    summary_rows = []
+
+    for xyz_name, tag in cases:
+        print(f'\n=== PAW molecule parity: {tag} ===', flush=True)
+        afm = _make_afm(xyz(xyz_name))
+        afm.tipQs[:] = 0.0
+        qs = _assign_demo_partial_charges(afm)
+        alpha = float(abs(afm.cLJs_arr[0, 2]))
+        rv.out(f'\n{tag}: na={len(afm.atoms_arr)} q_tip={q_tip} qs=[{qs.min():.3f},{qs.max():.3f}] '
+               f'alpha={alpha:.3f} split_mode=paw')
+
+        cpm = afm.fit_contact_pme(split_mode='paw', q_tip=q_tip, h_mesh=1.0, halo_nodes=6,
+                                  margin=2.0, z_above_lo=3.0, z_above_hi=8.0, bPrint=True)
+        p = cpm.split_params
+        apos = cpm.atom_pos
+        assert p.split_mode == 'paw'
+        rv.out(f'  mesh={cpm.mesh_coeffs.shape} r_core_max={p.r_core_max:.3f} '
+               f'core_held_E max={float(np.nanmax(cpm.core_fit.held_rmse_E)):.3e}')
+
+        rng = np.random.default_rng(7)
+        # Pointwise parity at several heights
+        for z_above in (3.5, 4.5, 5.5, 7.0):
+            queries = _safe_pme_queries(apos, p, z_above, nq=80, rng=rng)
+            E_pme, F_pme = afm.eval_contact_pme(queries, cpm, use_gpu=False)
+            E_ref, F_ref = afm._brute_plqh_queries(queries, plqh=(1.0, 1.0, q_tip, 0.0),
+                                                   alpha_morse=alpha, r_damp=0.1)
+            dE = np.abs(E_pme - E_ref)
+            dF = np.abs(F_pme - F_ref)
+            scale_E = max(float(np.max(np.abs(E_ref))), 1e-12)
+            scale_F = max(float(np.max(np.abs(F_ref))), 1e-12)
+            max_dE, max_dF = float(np.max(dE)), float(np.max(dF))
+            rms_dE = float(np.sqrt(np.mean(dE**2)))
+            rms_dF = float(np.sqrt(np.mean(dF**2)))
+            row = dict(tag=tag, z_above=z_above, nq=len(queries), max_dE=max_dE, max_dF=max_dF,
+                       rms_dE=rms_dE, rms_dF=rms_dF, scale_E=scale_E, scale_F=scale_F,
+                       rel_E=max_dE / scale_E, rel_F=max_dF / scale_F)
+            summary_rows.append(row)
+            rv.out(f'  z=+{z_above:.1f}: nq={len(queries)} max|dE|={max_dE:.3e} ({100*row["rel_E"]:.2f}% of max|E|) '
+                   f'max|dF|={max_dF:.3e} ({100*row["rel_F"]:.2f}%) rms_E={rms_dE:.3e} rms_F={rms_dF:.3e}')
+            # Soft L0: mesh@1Å has interpolation error; require finite + not catastrophic
+            assert np.all(np.isfinite(E_pme)) and np.all(np.isfinite(F_pme))
+            assert row['rel_E'] < 0.25 or max_dE < 5e-3, \
+                f'{tag} z=+{z_above}: relative E error {row["rel_E"]:.3f} too large'
+            assert row['rel_F'] < 0.35 or max_dF < 5e-3, \
+                f'{tag} z=+{z_above}: relative F error {row["rel_F"]:.3f} too large'
+
+        if visual_output_dir is not None:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            # 2D Fz maps: PME vs PLQH ref vs difference at h=4.5 Å above zmax
+            margin = 1.5
+            xs = np.linspace(apos[:, 0].min() - margin, apos[:, 0].max() + margin, 64)
+            ys = np.linspace(apos[:, 1].min() - margin, apos[:, 1].max() + margin, 64)
+            X, Y = np.meshgrid(xs, ys, indexing='ij')
+            z = float(apos[:, 2].max()) + 4.5
+            grid_q = np.column_stack([X.ravel(), Y.ravel(), np.full(X.size, z)])
+            # Mask domain violations (r < r_lo)
+            r_lo = np.atleast_1d(p.r_lo)
+            safe = np.ones(len(grid_q), dtype=bool)
+            for ia in range(len(apos)):
+                safe &= (np.linalg.norm(grid_q - apos[ia], axis=1) >= r_lo[ia] + 0.05)
+            E_pme, F_pme = afm.eval_contact_pme(grid_q[safe], cpm, use_gpu=False)
+            E_ref, F_ref = afm._brute_plqh_queries(grid_q[safe], plqh=(1.0, 1.0, q_tip, 0.0),
+                                                   alpha_morse=alpha, r_damp=0.1)
+            Fz_pme = np.full(X.size, np.nan); Fz_ref = np.full(X.size, np.nan); dFz = np.full(X.size, np.nan)
+            E_p = np.full(X.size, np.nan); E_r = np.full(X.size, np.nan); dE = np.full(X.size, np.nan)
+            Fz_pme[safe] = F_pme[:, 2]; Fz_ref[safe] = F_ref[:, 2]; dFz[safe] = F_pme[:, 2] - F_ref[:, 2]
+            E_p[safe] = E_pme; E_r[safe] = E_ref; dE[safe] = E_pme - E_ref
+            Fz_pme = Fz_pme.reshape(X.shape); Fz_ref = Fz_ref.reshape(X.shape); dFz = dFz.reshape(X.shape)
+            E_p = E_p.reshape(X.shape); E_r = E_r.reshape(X.shape); dE = dE.reshape(X.shape)
+            # imshow_afm / percentile: replace domain holes with 0 for display
+            def _fill(a):
+                return np.nan_to_num(a, nan=0.0)
+            extent = [xs[0], xs[-1], ys[0], ys[-1]]
+            fig, axes = plt.subplots(2, 3, figsize=(14, 8), constrained_layout=True)
+            for ax, arr, ttl in zip(axes[0], [_fill(E_r), _fill(E_p), _fill(dE)],
+                                    [f'{tag} E ref Morse+Q', f'{tag} E PAW PME', f'{tag} ΔE']):
+                imshow_afm(ax, arr, extent=extent, cmap='bwr', title=ttl)
+            for ax, arr, ttl in zip(axes[1], [_fill(Fz_ref), _fill(Fz_pme), _fill(dFz)],
+                                    [f'{tag} Fz ref', f'{tag} Fz PAW PME', f'{tag} ΔFz']):
+                imshow_afm(ax, arr, extent=extent, cmap='bwr', title=ttl)
+            fig.suptitle(f'PAW contact_pme vs PLQH Morse+Q  |  {tag}  h=+4.5 Å  q_tip={q_tip}', fontsize=11)
+            plot_path = os.path.join(outdir, f'{tag}_paw_vs_plqh_h4.5.png')
+            fig.savefig(plot_path, dpi=150); plt.close(fig)
+            rv.out(f'Saved {plot_path}')
+            print(f'REVIEW: {plot_path}', flush=True)
+
+    # SUMMARY.out
+    lines = [
+        '# PAW contact_pme molecule parity vs Morse+Q (cs_brute_plqh_points)',
+        f'# split_mode=paw  q_tip={q_tip}  h_mesh=1.0  tipQs=0',
+        '# demo partial charges assigned (XYZ ships qs=0); neutralized',
+        '#',
+        f'{"mol":10s} {"z+":>5s} {"nq":>4s} {"max|dE|":>12s} {"relE%":>8s} {"max|dF|":>12s} {"relF%":>8s} {"rmsE":>12s} {"rmsF":>12s}',
+    ]
+    for r in summary_rows:
+        lines.append(f'{r["tag"]:10s} {r["z_above"]:5.1f} {r["nq"]:4d} {r["max_dE"]:12.4e} '
+                     f'{100*r["rel_E"]:8.2f} {r["max_dF"]:12.4e} {100*r["rel_F"]:8.2f} '
+                     f'{r["rms_dE"]:12.4e} {r["rms_dF"]:12.4e}')
+    summary_path = os.path.join(outdir, 'SUMMARY.out')
+    with open(summary_path, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    rv.out('\n'.join(lines))
+    print(f'REVIEW: {summary_path}', flush=True)
+    rv.checklist('PAW fit_contact_pme succeeds for pyridine and PTCDA',
+                 'Pointwise E/F vs PLQH Morse+Q reported at multiple heights',
+                 'L2 AFM maps (E,Fz,Δ) written under wave2_paw_mol/')
+    rv.finish()
+
+
+_WAVE2_AFM_DIR = os.path.join('debug', 'test_afm_contact_surface', 'contact_pme', 'wave2_afm_cli')
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_contact_pme_afm_cli_ssot(xyz, visual_output_dir, make_review):
+    """Full PP-AFM via AFM_utils.run_contact_pme_pp_afm — same path as run_spm.py afm --model contact_pme.
+
+    SSOT (skill:afm-plotting / CLI defaults):
+      h_min=3.7 … h_max=4.7, h_step=0.1, amp=1.0, amp_align, scan_margin=2.0, margin=4.0
+    Plotting: plot_afm_variant_height_strip only — no ad-hoc imshow.
+    """
+    from spammm.SPM import AFM as afm_mod
+    from spammm.SPM import AFM_utils as afm_utils
+    rv = make_review('test_contact_pme_afm_cli_ssot')
+    if visual_output_dir is None:
+        rv.out('L2 AFM strip skipped (no --visual/--develop); L0 still runs smoke fit+scan on pyridine')
+    H_MIN, H_MAX, H_STEP = 3.7, 4.7, 0.1
+    AMP = 1.0
+    SCAN_MARGIN = 2.0
+    MARGIN = 4.0
+    STEP = 0.1
+    K_LAT_NM, K_RAD, BOND_LENGTH = 0.5, 20.0, 3.0
+    OSC_DIR = (0., 0., 1.)
+    params_path = PARAMS_PATH
+    cases = [('pyridine.xyz', 'pyridine'), ('PTCDA.xyz', 'PTCDA')]
+
+    for xyz_name, tag in cases:
+        print(f'\n=== contact_pme AFM CLI-SSOT: {tag} ===', flush=True)
+        outdir = os.path.join(_WAVE2_AFM_DIR, tag)
+        os.makedirs(outdir, exist_ok=True)
+        afm0 = _make_afm(xyz(xyz_name))
+        atomPos = afm0.atoms_arr[:, :3].astype(np.float64).copy()
+        # Match CLI: planarize + orient long axis → x
+        from spammm.forcefields.FFController import make_planar_xy, orient_long_axis_x
+        atomPos[:] = make_planar_xy(atomPos)
+        orient_long_axis_x(atomPos)
+        atomPos[:, 2] = 0.0
+        atomTypes = np.array([{'H': 1, 'C': 6, 'N': 7, 'O': 8, 'S': 16}.get(str(e).strip(), 6)
+                              for e in afm0.mol.enames], dtype=np.int32)
+        _, origin, ngrid, step = afm_utils.make_fdbm_grid_com_zsym(atomPos, STEP, MARGIN, z_vac=6.0)
+        h_df, h_Fz, h_scan = afm_utils.afm_df_height_stacks(
+            H_MIN, H_MAX, H_STEP, amp=AMP, amp_align=True, osc_dir=OSC_DIR)
+        scan_xs = np.arange(float(atomPos[:, 0].min() - SCAN_MARGIN),
+                            float(atomPos[:, 0].max() + SCAN_MARGIN), step, dtype=np.float32)
+        scan_ys = np.arange(float(atomPos[:, 1].min() - SCAN_MARGIN),
+                            float(atomPos[:, 1].max() + SCAN_MARGIN), step, dtype=np.float32)
+        K_LAT = afm_mod.stiffness_Nm_to_eVA2(K_LAT_NM)
+        scan_spec = afm_utils.ScanSpec(
+            scan_xs=scan_xs, scan_ys=scan_ys, h_df=h_df, h_Fz=h_Fz, h_scan=h_scan,
+            amplitude=AMP, osc_dir=OSC_DIR, K_LAT=K_LAT, K_RAD=K_RAD,
+            bond_length=BOND_LENGTH, scan_margin=SCAN_MARGIN)
+        rv.out(f'{tag}: scan=({len(scan_xs)}×{len(scan_ys)}) nz_scan={len(h_scan)} '
+               f'h_df=[{h_df[0]:.2f},{h_df[-1]:.2f}] h_Fz=[{h_Fz[0]:.2f},{h_Fz[-1]:.2f}]')
+        result = afm_utils.run_contact_pme_pp_afm(
+            tag, atomPos, atomTypes, origin, step, ngrid, outdir,
+            scan_spec=scan_spec, params_path=params_path,
+            margin=MARGIN, plots={'df', 'fz'} if visual_output_dir else set(),
+            split_mode='paw', q_tip=0.0, h_mesh=1.0, halo_nodes=6)
+        assert result.backend_name == 'contact_pme'
+        assert result.split_mode == 'paw'
+        assert np.all(np.isfinite(result.df)) and np.all(np.isfinite(result.Fz))
+        assert result.df.shape[2] == len(result.heights)
+        rv.out(f'  df range=[{result.df.min():.3e},{result.df.max():.3e}] '
+               f'Fz range=[{result.Fz.min():.3e},{result.Fz.max():.3e}] '
+               f'resident={result.resident_kb:.1f} KB')
+        # Soft L0: non-trivial contrast (not blank)
+        assert float(np.std(result.df)) > 1e-8, f'{tag}: blank df map'
+        assert float(np.std(result.Fz)) > 1e-8, f'{tag}: blank Fz map'
+
+        if visual_output_dir is not None:
+            amp_z = AMP
+            row_specs = [
+                ('df', 'contact_pme', f'df contact_pme\npaw K_LAT={K_LAT_NM} N/m', 'gray'),
+                ('Fz', 'contact_pme', f'Fz contact_pme\n@h−{amp_z:.1f}Å', 'seismic'),
+            ]
+            variants = {'contact_pme': result}
+            extent = afm_utils.scan_extent(result.scan_xs, result.scan_ys)
+            out_png = os.path.join(outdir, 'compare_per_image.png')
+            afm_utils.plot_afm_variant_height_strip(
+                variants, row_specs, result.heights, out_png, scale='per_image',
+                title=f'Contact-PME AFM  {tag}  split=paw  (CLI SSOT heights)',
+                dpi=140, apos=atomPos, show_atoms=True, extent=extent,
+                amp=AMP, amp_align=True, amp_z=amp_z, long_axis_vertical=True, tight=True)
+            rv.out(f'Saved {out_png}')
+            print(f'REVIEW: {out_png}', flush=True)
+
+    summary_path = os.path.join(_WAVE2_AFM_DIR, 'SUMMARY.out')
+    os.makedirs(_WAVE2_AFM_DIR, exist_ok=True)
+    with open(summary_path, 'w') as f:
+        f.write('# contact_pme AFM via AFM_utils (= run_spm.py afm --model contact_pme)\n')
+        f.write(f'# h_df={H_MIN}…{H_MAX} step={H_STEP} amp={AMP} scan_margin={SCAN_MARGIN} margin={MARGIN}\n')
+        f.write('# plotting: plot_afm_variant_height_strip (no ad-hoc imshow)\n')
+        f.write(f'REVIEW: {_WAVE2_AFM_DIR}/pyridine/compare_per_image.png\n')
+        f.write(f'REVIEW: {_WAVE2_AFM_DIR}/PTCDA/compare_per_image.png\n')
+    print(f'REVIEW: {summary_path}', flush=True)
+    rv.checklist('run_contact_pme_pp_afm used (same as SPM_CLI contact_pme)',
+                 'CLI height SSOT 3.7–4.7 / amp-align Fz',
+                 'plot_afm_variant_height_strip for overview strip')
     rv.finish()

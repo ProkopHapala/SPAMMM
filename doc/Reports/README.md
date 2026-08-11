@@ -2,6 +2,7 @@
 
 Validated and review-ready scientific results, with exact methods, artifacts, reproduction commands, and unresolved caveats. Task documents may evolve during investigation; reports here are the durable handoff.
 
+- **ContactPME_PAW_AFM_MemSpeed_2026-08-11.md** — contact_pme **PAW** soft-replacement split; CLI AFM USER-confirmed; **~900–1200×** field memory vs Morse@0.1Å; PP-scan still ~12–18× slower; kernel WG/local-mem gaps and speed-up ideas. Task: `ContactSurface_PME_ParallelPlan.md`.
 - **PairFF_TipPull_PTCDI_QEq_2026-07-28.md** — Tip-pull on NaCl with PTCDI + physical QEq; API `tip_pull_scan`; **map display not Vispy SSOT yet** (tomorrow task `PairFF_MapDisplay_SSOT.md`).
 - **ContactSurface_2p5D_vs_GridFF_2026-07-24.md** — **SSOT** coarse 2.5D contact-sep vs Morse+Coulomb GridFF: sphere `h₀`, `h0_R_scale=0.75`, atom-scale `bspl/scan` dx; PTCDA + helicene artifacts; status investigating.
 - **Assembly_ContactSurface_AFM_helicene_2026-07-24.md** — Helicene SAM assembly → contact-sep AFM; PBC/overlay fixes; points at 2.5D vs GridFF report for parity.

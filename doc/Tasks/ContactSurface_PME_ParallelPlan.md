@@ -6,13 +6,14 @@ tags: [afm, contact-surface, morse, opencl, particle-mesh, pic, parallel-agents]
 
 # Task: Contact surface particle-mesh redesign — coarse 3D mesh + compact PIC cores
 
-- **Status:** planning / unverified
+- **Status:** Wave-2 AFM path USER-confirmed (2026-08-11); **memory goal met (~10³×)**; **scan-speed still open** (Morse texture faster on current sizes). Full write-up: [`doc/Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md`](../Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md). See also § “Status update 2026-08-11” at end of this file.
 - **Coordinator:** primary agent / USER
-- **Contract version:** 2
+- **Contract version:** 2 (+ PAW split default; Δ_in=1.0; ScanSpec query bounds)
 - **Frozen baseline:** commit `c5494c3beb9fd78dea0d083333ec80ec5c542887`; at dispatch also record `git status --short`, NVIDIA device/vendor/driver, and OpenCL version because required files may have uncommitted changes
 - **Source discussion:** [`doc/Ideas/ContactSurface.chat.md`](../Ideas/ContactSurface.chat.md), especially the USER rejection of PLQ channel-specific representations and the following “soft-core mesh + compact correction” response
 - **Parent task:** [`doc/Tasks/Fast_2p5D_AFM_ContactSurface.md`](Fast_2p5D_AFM_ContactSurface.md)
 - **Prior diagnostics:** [`doc/Tasks/ContactSurface_Parity_InvPPAFM_Benzene.md`](ContactSurface_Parity_InvPPAFM_Benzene.md) §R2.6 Gates 0–3
+- **Results report:** [`doc/Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md`](../Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md)
 
 This is a **particle-mesh analogy**, not electrostatic PME: there is no Ewald sum, FFT,
 or PBC. The backend name is `contact_pme` to distinguish it from the unrelated existing
@@ -85,6 +86,8 @@ Energy and force are always paired: every evaluator returns `(E,F)` with
 `F=-∇E`. Finite-difference force parity is an L0 invariant.
 
 ### Atomwise soft-core split
+
+> **Amendment (2026-08-11):** MVP default is no longer the `rho(r)` Hermite map below. Default is **`split_mode='paw'`** — even soft polynomial replacement of the interior, C²-matched at `r_b=R0+Δ_b`, with `Δ_in=1.0` so `r_lo` sits below CLI closest approach. See § “Status update 2026-08-11” and [`doc/Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md`](../Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md). The original `rho` contract is retained below as historical Wave-0 text.
 
 Use one outer radius for both the exact split and basis support:
 
@@ -742,3 +745,666 @@ leaving structure that the core can't fit.
 
 ---
 
+# USER
+
+in https\://github.com/ProkopHapala/SPAMMM ( [https://deepwiki.com/ProkopHapala/SPAMMM](https://deepwiki.com/ProkopHapala/SPAMMM)) I have 3 ways to do AFM in SPM\_CLI FDBM, Morse+Q (both of which work with 3D grid with step like 0.1-0.2A or Contact surface 2.5D method) main modication for contact surface is memory efficieny allwoed by small grid and small number of basis functiion. But current implementation is bumpy aspecially at large distance which is unphysical and make it unusable we are thinking about options how to improve it.
+
+More details are in attached documents, plese review it and suggest your ideas, cricial analysis, etc. yourse your deep knowledge of numerical math and function aproximation and experience from related areas.
+
+
+---
+
+# Chat GPT 5.6 sol
+
+Yes. After reading the task document and the pushed code, I think the present implementation should **not be tuned further in its current mathematical form**. The main problem is upstream of the mesh resolution and upstream of the number of radial modes: the present definition of the long/short split is producing exactly the kind of artificial intermediate-range structure that the PME architecture was supposed to eliminate.
+
+The architectural idea itself is still good:
+
+[
+V(\mathbf r)=V_{\rm mesh}(\mathbf r)+\sum_i V_{{\rm core},i}(r_i),
+]
+
+with the combined Morse+Coulomb field split by spatial scale, the mesh deliberately smooth, and the atomic correction identically compact. That principle is stated correctly in the design document. 
+
+But I would change **how (V_L) and (V_S) are constructed**.
+
+## 1. The current `rho(r)` split is the first thing I would remove
+
+Right now you define
+
+[
+v_L(r)=v(\rho(r)),
+\qquad
+v_S(r)=v(r)-v(\rho(r)),
+]
+
+where (\rho) is flattened at (r_{\rm lo}) and only becomes the identity at (r_{\rm cut}=6) Å.  The implementation indeed applies that quintic coordinate deformation across the entire interval (r_{\rm lo}\rightarrow r_{\rm cut}).
+
+This sounds reasonable as a soft-core construction, but for a Morse potential it does something quite pathological.
+
+Using the actual C-like test parameters from the repo,
+
+[
+R_0=1.452+1.9255=3.3775\ {\rm Å},
+]
+
+so
+
+[
+r_{\rm lo}=R_0-0.5=2.8775\ {\rm Å}.
+]
+
+Those are the actual constants used in the new tests.
+
+At the **physical Morse minimum**, (r=R_0=3.3775) Å, the current quintic mapping gives approximately
+
+[
+\rho(R_0)\approx 2.939\ {\rm Å}.
+]
+
+Therefore the long-range field at the physical minimum is not evaluating the smooth tail near (R_0). It is evaluating the Morse potential deep on its repulsive side:
+
+[
+v(R_0)\approx -1.761\times10^{-3}\ {\rm eV},
+]
+
+but
+
+[
+v_L(R_0)=v(2.939)
+\approx +0.783\times10^{-3}\ {\rm eV}.
+]
+
+Hence the short-range residual has to be
+
+[
+v_S(R_0)
+========
+
+v-v_L
+\approx
+-2.543\times10^{-3}\ {\rm eV}.
+]
+
+So **the residual at the Morse minimum is actually larger than the physical well itself**.
+
+That is the opposite of the intended PME decomposition.
+
+Worse, solving approximately for
+
+[
+\rho(r)=R_0
+]
+
+gives
+
+[
+r\approx3.99\ {\rm Å}.
+]
+
+So the *long-range* pseudo-potential has effectively moved the atomic Morse minimum from (3.38) Å to roughly (4.0) Å.
+
+That immediately explains the strange residual noted in your task file: negative around the well, then positive mid-range, eventually going back to zero only near (6) Å. The document observes exactly this broad sign-changing residual and the poor fit around (3.3-3.7) Å. 
+
+This isn't primarily a failure of five polynomial functions.
+
+**We created a difficult and somewhat artificial function for them to fit.**
+
+There is another warning sign in the mapping itself: its derivative reaches about
+
+[
+\max \rho'(r)\approx1.51.
+]
+
+So there are parts of the interval where the supposed "softened" long-range field can actually vary *faster* with (r) than the original potential.
+
+That is fundamentally contrary to what (V_{\rm mesh}) is supposed to mean.
+
+---
+
+# 2. I would replace coordinate softening with a direct potential split
+
+I think the cleanest construction is much simpler.
+
+Introduce a smooth long-range activation function (W_i(r)):
+
+[
+W_i(r)=
+\begin{cases}
+0 & r\le r_{a,i},\
+S(x) & r_{a,i}<r<r_{b,i},\
+1 & r\ge r_{b,i},
+\end{cases}
+]
+
+where
+
+[
+x=\frac{r-r_{a,i}}{r_{b,i}-r_{a,i}}
+]
+
+and for example the usual quintic smoothstep
+
+[
+S(x)=10x^3-15x^4+6x^5.
+]
+
+Then use
+
+[
+\boxed{
+v_L(r)=C_i+W_i(r),[v(r)-C_i]
+}
+]
+
+and
+
+[
+\boxed{
+v_S(r)=v(r)-v_L(r)
+=[1-W_i(r)],[v(r)-C_i].
+}
+]
+
+A natural choice is
+
+[
+C_i=v(r_{a,i}).
+]
+
+This does exactly what we wanted conceptually.
+
+For
+
+[
+r\le r_a,
+]
+
+the mesh sees only a **constant plateau**
+
+[
+v_L=C_i,
+]
+
+so
+
+[
+v_L'=v_L''=0.
+]
+
+The mesh therefore sees absolutely none of the steep atomic wall.
+
+For
+
+[
+r\ge r_b,
+]
+
+we get
+
+[
+v_L=v,
+\qquad
+v_S=0
+]
+
+**exactly**.
+
+And because the quintic switch has zero first and second derivatives at its endpoints,
+
+[
+v_S(r_b)=v_S'(r_b)=v_S''(r_b)=0.
+]
+
+So we retain the desirable finite-support/C² property.
+
+But crucially there is **no radial-coordinate distortion at all**.
+
+The physical minimum remains where the physical minimum belongs.
+
+---
+
+## 3. The constant plateau is actually quite useful
+
+We could use (C_i=0), which gives the very simple split
+
+[
+v_L=Wv,\qquad v_S=(1-W)v.
+]
+
+But I prefer
+
+[
+C_i=v(r_a).
+]
+
+Suppose for C we choose roughly
+
+[
+r_a=R_0+0.5\ {\rm Å}.
+]
+
+For the present Morse parameters,
+
+[
+v(r_a)\approx-1.14\times10^{-3}\ {\rm eV}.
+]
+
+Then at the Morse minimum
+
+[
+v_S(R_0)
+========
+
+v(R_0)-C
+\approx
+-0.62\times10^{-3}\ {\rm eV}.
+]
+
+Compare that with the present split:
+
+[
+v_S(R_0)\approx-2.54\times10^{-3}\ {\rm eV}.
+]
+
+So the core has roughly **four times less amplitude to reproduce around the well**, which is exactly the motivation you stated.
+
+At the same time, the steep force/repulsive wall remains entirely in the core.
+
+This is much closer to the picture:
+
+[
+\underbrace{\text{smooth background/tail}}*{\rm mesh}
++
+\underbrace{\text{wall + detailed well correction}}*{\rm PIC}.
+]
+
+---
+
+# 4. I would parameterize all radii relative to (R_0)
+
+The current choice
+
+[
+r_{\rm lo}=R_0-0.5,\qquad r_{\rm cut}=6.0
+]
+
+mixes an atom-relative inner radius with a global outer radius. That changes the normalized shape of the basis between H, C, O, etc.
+
+Instead I would initially use something like
+
+[
+r_{\min,i}=R_{0,i}-\Delta_{\rm in},
+]
+
+[
+r_{a,i}=R_{0,i}+\Delta_a,
+]
+
+[
+r_{b,i}=R_{0,i}+\Delta_b.
+]
+
+For example, only as starting sweep values,
+
+[
+\Delta_{\rm in}=0.5\ {\rm Å},
+]
+
+[
+\Delta_a=0.3\text{--}0.8\ {\rm Å},
+]
+
+[
+\Delta_b=1.5\text{--}2.5\ {\rm Å}.
+]
+
+Then C/O/H have approximately the same normalized radial geometry.
+
+For example with
+
+[
+\Delta_b=2.0\ {\rm Å},
+]
+
+the physical minimum is always located at
+
+[
+t(R_0)
+======
+
+\frac{r_b-R_0}
+{r_b-r_{\min}}
+==============
+
+# \frac{2.0}{2.5}
+
+0.8.
+]
+
+That is much nicer for a reusable polynomial family.
+
+The cell-list cutoff then only needs
+
+[
+r_{\rm core,max}
+================
+
+\max_i(R_{0,i}+\Delta_b),
+]
+
+rather than blindly using 6 Å.
+
+---
+
+# 5. I would **not abandon the doubling-power basis yet**
+
+Your correction near the bottom of the task document is more reasonable than the earlier "replace it with radial B-splines" conclusion. You explicitly note that the high powers going to zero near the outer boundary is intentional because that is precisely where the mesh should take over. 
+
+In fact, the file currently contains an internal contradiction: an earlier section says the doubling basis has failed and mandates 10–12 radial B-splines,  while the later correction says the doubling basis is good, its parameterization is wrong, and explicitly says **do not replace it**. 
+
+I would freeze a **contract v3** before implementing anything further and remove the obsolete B-spline-core requirement.
+
+But I would absolutely retune the exponent sequence.
+
+The present implementation hardcodes
+
+[
+p=(4,8,16,32,64).
+]
+
+That came from a very different coordinate system in the original contact model. There, (s) was measured relative to the contact surface and `poly_R` was large, so the physically interesting region often had (t\sim0.9).
+
+There is no reason that `m_start=4` must survive translation to a radial atomic shell.
+
+I would sweep at least
+
+[
+(2,4,8,16,32)
+]
+
+against
+
+[
+(4,8,16,32,64).
+]
+
+Maybe also
+
+[
+(1,2,4,8,16)
+]
+
+as a diagnostic, although the (p=1) mode does not have zero force at the cutoff by itself.
+
+The (p=2) sequence is particularly interesting: every mode still has
+
+[
+\phi(r_b)=0,\qquad \phi'(r_b)=0,
+]
+
+so energy and force join continuously.
+
+If you insist on higher-order cutoff smoothness, we can later devise a common cutoff envelope separately from the radial resolution basis. There is no need to force "resolution distribution" and "cutoff differentiability" to be the same mathematical knob.
+
+---
+
+# 6. There is also a fitting problem in `PICCore.py`
+
+The new task says to restore Boltzmann weighting, but the current pushed `fit_core_1d()` does not actually do it. It stacks energy and radial-derivative rows with constant `row_scale` and `deriv_row_scale`, both defaulting to 1.
+
+So it currently minimizes something schematically like
+
+[
+\sum_j(\Delta E_j)^2
++
+\sum_j(\Delta E'_j)^2,
+]
+
+despite these quantities having different units, scales, and physical importance.
+
+I would use two independent ideas:
+
+[
+w_j^{\rm Boltz}
+===============
+
+\exp[-(v(r_j)-v_{\min})/T]
+]
+
+to emphasize the physically sampled well, **and** normalize E/F blocks separately, something like
+
+[
+\lambda_E=\frac{1}{E_{\rm scale}},
+\qquad
+\lambda_F=\frac{1}{F_{\rm scale}}.
+]
+
+Then solve
+
+[
+\min_c
+\sum_j w_j
+\left[
+\lambda_E^2(E_{\rm fit}-E_S)^2+
+\lambda_F^2(F_{\rm fit}-F_S)^2
+\right].
+]
+
+The well should not lose merely because derivative values numerically have larger magnitudes.
+
+---
+
+# 7. The current mesh tests are far too permissive
+
+This is another serious issue.
+
+For example, `test_contact_pme_mesh_vs_direct` currently accepts
+
+[
+\max|\Delta E|<10^{-2}\ {\rm eV}
+]
+
+and
+
+[
+\max|\Delta F|<10^{-2}\ {\rm eV/\AA}.
+]
+
+The lattice-phase test uses the same absolute (10^{-2}) tolerances.
+
+But the interesting Morse energy here is of order
+
+[
+10^{-3}\ {\rm eV},
+]
+
+and the far-field AFM force can be much smaller still.
+
+So a mesh can pass that L0 test while its error is **many times larger than the complete physical signal**.
+
+That gate currently proves interpolation code isn't catastrophically broken. It does **not** prove that a 1 Å mesh is good enough.
+
+This needs to change before making judgments about the architecture.
+
+---
+
+# How I would proceed now
+
+I would stop further GPU/backend work and do one fairly small CPU experiment that gives us a decisive answer:
+
+1. **Delete `rho(r)` from the experimental split** and implement the plateau+smooth-switch split
+   [
+   v_L=C+W(v-C),\qquad v_S=(1-W)(v-C).
+   ]
+   Keep the current implementation available only as a comparison.
+
+2. **Make the geometry relative to (R_0)** and sweep perhaps
+   [
+   \Delta_a={0.3,0.5,0.8}\ {\rm Å},
+   \qquad
+   \Delta_b={1.5,2.0,2.5}\ {\rm Å}.
+   ]
+   Keep (h_{\rm mesh}=1) Å initially.
+
+3. For each C/O/H atom, plot **both energy and radial force**
+   [
+   v,\quad v_L,\quad v_S,\quad v_S^{fit}
+   ]
+   on one common physical scale. The core target must look like a localized correction, not the present broad negative-well/positive-bump function. This extends the diagnostic already requested in your document. 
+
+4. Test mesh interpolation of (v_L) for atom-grid phases. Not just four points: I would do at least a small
+   [
+   4\times4\times4
+   ]
+   set of atom offsets inside one 1 Å voxel. Measure E and force error against direct (v_L). The requirement should be **normalized to the actual signal**, not (10^{-2}) absolute.
+
+5. Fit the short residual with the existing doubling family, but sweep
+   [
+   p_0=2,;4
+   ]
+   and perhaps 4–6 modes, with Boltzmann + E/F block normalization. Do **not** change to radial B-splines unless this properly posed residual still fails.
+
+6. Only after the single-atom decomposition passes, do PTCDA and produce
+   [
+   \Delta F_{\rm total}
+   ====================
+
+   \underbrace{(F_{\rm mesh}-F_L)}*{\text{mesh error}}
+   +
+   \underbrace{(F*{\rm core}^{fit}-F_S)}_{\text{core error}}.
+   ]
+   That decomposition is extremely valuable because it immediately tells us which half is responsible for every artifact.
+
+The acceptance criterion I would make especially simple:
+
+[
+\boxed{\text{near/well accuracy must be at least as good as old ContactSurface}}
+]
+
+while
+
+[
+\boxed{\text{4–6 Å error/corrugation must be substantially smaller.}}
+]
+
+If we do not satisfy both simultaneously, PME has not improved anything.
+
+---
+
+## The conceptual picture I now think is right
+
+The particle-mesh decomposition should **not** be thought of as "distort the true radial function until it becomes smooth."
+
+It should be:
+
+[
+\boxed{
+\text{true potential}
+=====================
+
+\text{smooth plateau-to-tail pseudo-potential}
++
+\text{compact difference}
+}
+]
+
+Visually, for each atom:
+
+```text
+             steep wall
+                /
+V_exact  ------/ \____ well __________ tail ______
+              |        \
+              |         \__________________________
+
+V_mesh   ------ smooth plateau ----\_____ exact tail
+                                  \
+                                   \________________
+
+V_core        wall + well correction
+             /\______
+                    \________ 0 exactly
+```
+
+The mesh contribution must **never contain a displaced atomic minimum or a narrow artificial shell**. The current `v(rho(r))` construction does exactly that, which is why I would abandon that part before doing any more optimization.
+
+Your task document already states the essential criterion correctly: the mesh should carry the long-range field and the residual should become easier, not harder, to fit.  The implementation simply does not yet realize that criterion.
+
+So I think the PME/PIC architecture is still worth pursuing. The next move is **not finer mesh and not more basis functions**. It is to repair the mathematical split first.
+
+---
+
+## Status update 2026-08-11 — PAW split works; memory win; speed open
+
+> Historical note: the sections above through “repair the mathematical split first” captured the diagnosis while `rho` / W-blend splits were still broken. **That repair is done.** Default split is now **`paw`**. Do not treat the closing paragraph of the previous section as current TODO.
+
+### What changed (split)
+
+Soft **replacement** of the atomic interior (not `v(rho)` and not `C+W(v−C)`):
+
+```text
+P(r) = a0 + a2 r² + a4 r⁴ + a6 r⁶     # even → smooth at origin
+C² match to v at r_b = R0 + Δ_b
+v_L = P (r < r_b),  v (r ≥ r_b)
+v_S = v − v_L                         # compact PIC residual
+```
+
+Defaults: `Δ_in=1.0` (`r_lo=R0−Δ_in` below CLI closest approach ~2.7 Å), `Δ_a=0.5`, `Δ_b=2.0`. SSOT: `spammm/surfaces/PMESplit.py`. CLI: `run_spm.py afm --model contact_pme`.
+
+Supporting fixes that made AFM usable: ScanSpec-derived `query_bounds`; core clamp for `r<r_lo`; telemetry buffers `n_scan·nz`; compact `core_d_span` for all compact modes.
+
+### USER confirmation
+
+Pyridine / PTCDA CLI-SSOT height strips look correct (`debug/.../wave2_afm_cli/*/compare_per_image.png`). Known cosmetic: sharp rings near `r_lo`/`r_b` at very close approach (may lower `rmin` later). “No sharp bonds” matches Morse at the same `K_LAT=0.5 N/m` — not a missing PP wiring.
+
+### Dead-ends / takeaways (avoid next time)
+
+| Mistake | Takeaway |
+|---------|----------|
+| `rho` / W-blend “smooth energy” | Force must not invent `W'(v−C)` or `ρ'>1` bumps |
+| Optimize mesh/basis before split | **Split math first** |
+| `r_lo` above closest approach | Domain vs ScanSpec must be checked |
+| Undersized GPU telemetry | Index formula dictates buffer size (`gid*nz+iz`) |
+| Expect FDBM-like contrast from Morse | Compare like-with-like before blaming PP |
+
+### Memory benchmark (RTX 3090, field-resident only)
+
+| Molecule | Dense Morse @0.1 Å | contact_pme `h=1.0` | Reduction |
+|----------|--------------------|---------------------|-----------|
+| pyridine | 30.0 MB | 33.3 KB | ~924× |
+| PTCDA | 62.5 MB | 53.4 KB | ~1200× |
+
+Dataset projection: **1000× PTCDA** dense ~61 GB vs PME ~0.05 GB. Plan “\<500 KB PTCDA” met (~53 KB). Coarser `h_mesh=2` → ~25 KB PTCDA.
+
+Artifacts: `debug/test_afm_contact_surface/contact_pme/wave2_diag/mem_speed/SUMMARY.out`
+
+### Speed benchmark (same ScanSpec PP-scan)
+
+| Molecule | Morse PP-scan | PME PP-scan | Ratio |
+|----------|---------------|-------------|-------|
+| pyridine | ~7 ms | ~84 ms | ~12× slower |
+| PTCDA | ~17 ms | ~303 ms | ~18× slower |
+
+Fit (host) ~0.4–1.8 s; Morse build ~2–3 ms. Coarser mesh barely helps scan time. **Cache-efficiency hypothesis not confirmed** on these sizes (30–62 MB dense still texture-friendly).
+
+### Kernel / overhead diagnosis (no code change yet)
+
+- **PPM relax is one kernel:** `relaxStrokesTiltedContactPME` (FIRE + `cs_eval_contact_pme_at` + tipForce) — not Python FIRE.
+- **Workgroups / local memory: missing on hot path.** Host launches `local_size=(1,)`. Eval uses only `__global` (64-tap mesh + PIC buckets). Older kernels in the same file *do* use `__local` tiles — not wired into contact_pme relax.
+- **Fit path is host/Python-heavy**; scan path is GPU-bound by arithmetic × FIRE iters, not by Python.
+
+### Suggested performance work (next)
+
+1. Workgroup + `__local` PIC (and mesh cell) caching.  
+2. Stop `ls=(1,)`; coalesce neighbors.  
+3. Optional `image3d` / texture for tiny coarse mesh.  
+4. FIRE warm-start / fewer evals for screening.  
+5. GPU-ize fit if dataset throughput matters.  
+6. Re-bench when dense volumes grow (finer step / FDBM) — speed may flip.
+
+### Durable report
+
+Full narrative, dead-ends, tables, and kernel analysis:
+
+[`doc/Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md`](../Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md)

@@ -1030,7 +1030,7 @@ __kernel void evalRadialPIC(
 // Python prototypes: spammm/surfaces/CoarseMesh.py (mesh), PICCore.py (core), PMESplit.py (split).
 // Stencil reference: gridFF.cl:72-93 (basis/dbasis) — copied formulas only, NOT PBC wrapping.
 
-#define CS_PME_NMODES 5           // doubling-power core modes: p_m = 4,8,16,32,64
+#define CS_PME_NMODES 5           // doubling-power core modes: p_m = 2,4,8,16,32
 #define CS_PME_CORE_MAX_CAND 512  // safety cap on core candidates per query (fail-loud overflow)
 
 // ---- cardinal cubic B-spline basis (matches gridFF.cl:72-93 and CoarseMesh._basis) ----
@@ -1103,40 +1103,43 @@ inline float4 cs_pme_tricubic_eval(
     return (float4)(-gx, -gy, -gz, e);  // F = -∇E
 }
 
-// 5-mode doubling-power core basis: phi_m(r) = t^p_m, p_m = 4,8,16,32,64.
-// t = (r_cut - r)/(r_cut - r_lo_i). Exactly zero for r >= r_cut. Matches PICCore.core_basis.
-// Fills phi[5], dphi[5] (dphi = dphi/dr). Derivatives via chain rule on repeated squaring.
-inline void cs_pme_core_basis(float r, float r_lo_i, float r_cut, float* phi, float* dphi) {
-    float D = r_cut - r_lo_i;
-    float t = (r_cut - r) / D;
+// 5-mode doubling-power core basis: phi_m(r) = t^p_m, p_m = 2,4,8,16,32.
+// t = (r_b - r)/(r_b - r_lo_i). Exactly zero for r >= r_b. Matches PICCore.core_basis.
+// r_b is per-atom (plateau: r_lo + Δ_in + Δ_b). Derivatives via chain rule on repeated squaring.
+inline void cs_pme_core_basis(float r, float r_lo_i, float r_b, float* phi, float* dphi) {
+    float D = r_b - r_lo_i;
+    float t = (r_b - r) / D;
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
-    bool active = (r >= r_lo_i) && (r < r_cut);
-    float dt = active ? (-1.0f / D) : 0.0f;  // dt/dr
-    float t2 = t * t, t3 = t2 * t;
-    float t4 = t2 * t2;       float dt4 = 4.0f * t3 * dt;
+    // Active for all r < r_b. Below r_lo, t clips to 1 → constant residual (dphi=0).
+    // Needed for PP-AFM close approach; mesh soft field (PAW) remains valid at r→0.
+    bool active = (r < r_b);
+    float dt = (r > r_lo_i && r < r_b) ? (-1.0f / D) : 0.0f;  // flat for r<=r_lo
+    // powers 2,4,8,16,32 via successive squaring from t^2
+    float t2 = t * t;         float dt2 = 2.0f * t * dt;
+    float t4 = t2 * t2;       float dt4 = 2.0f * t2 * dt2;
     float t8 = t4 * t4;       float dt8 = 2.0f * t4 * dt4;
     float t16 = t8 * t8;      float dt16 = 2.0f * t8 * dt8;
     float t32 = t16 * t16;    float dt32 = 2.0f * t16 * dt16;
-    float t64 = t32 * t32;    float dt64 = 2.0f * t32 * dt32;
-    phi[0] = active ? t4  : 0.0f;  dphi[0] = active ? dt4  : 0.0f;
-    phi[1] = active ? t8  : 0.0f;  dphi[1] = active ? dt8  : 0.0f;
-    phi[2] = active ? t16 : 0.0f;  dphi[2] = active ? dt16 : 0.0f;
-    phi[3] = active ? t32 : 0.0f;  dphi[3] = active ? dt32 : 0.0f;
-    phi[4] = active ? t64 : 0.0f;  dphi[4] = active ? dt64 : 0.0f;
+    phi[0] = active ? t2  : 0.0f;  dphi[0] = active ? dt2  : 0.0f;
+    phi[1] = active ? t4  : 0.0f;  dphi[1] = active ? dt4  : 0.0f;
+    phi[2] = active ? t8  : 0.0f;  dphi[2] = active ? dt8  : 0.0f;
+    phi[3] = active ? t16 : 0.0f;  dphi[3] = active ? dt16 : 0.0f;
+    phi[4] = active ? t32 : 0.0f;  dphi[4] = active ? dt32 : 0.0f;
 }
 
-// Core field V_core at one point via XY buckets (3×3 lookup, cell_size >= r_cut).
+// Core field V_core at one point via XY buckets (3×3 lookup, cell_size >= r_core_max).
 // atoms[i] = (x, y, z, r_lo_i). atom_coeffs[i*NMODES + m]. Per-atom r_lo_i (not global).
+// d_span = r_b - r_lo (= Δ_in+Δ_b for plateau); r_b_i = r_lo_i + d_span.
 // Returns float4 (Fx,Fy,Fz,E). Telemetry via pointers.
-// *out_status: 0=OK, bit 1 (2)=domain violation r<r_lo_i (→ NAN, first violator recorded),
-//              bit 2 (4)=bucket overflow (candidates > CS_PME_CORE_MAX_CAND, fail-loud).
+// *out_status: 0=OK, bit 2 (4)=bucket overflow (candidates > CS_PME_CORE_MAX_CAND, fail-loud).
+// r < r_lo is NOT an error — basis clamps to t=1 (AFM close-approach).
 inline float4 cs_pme_core_eval_at(
     float x, float y, float z,
     __global const float4* atoms, __global const float* atom_coeffs,
     __global const int* bucket_atoms, __global const int* bucket_offsets,
     int nat, int nbx, int nby, int nbuckets,
-    float x0, float y0, float cell, float r_cut,
+    float x0, float y0, float cell, float d_span,
     int* out_status, float* out_min_r, int* out_offender, int* out_overflow)
 {
     float E = 0.0f, Fx = 0.0f, Fy = 0.0f, Fz = 0.0f;
@@ -1162,16 +1165,13 @@ inline float4 cs_pme_core_eval_at(
                 n_cand++;
                 float4 ap = atoms[at];
                 float r_lo_i = ap.w;
+                float r_b_i = r_lo_i + d_span;
                 float dxp = x - ap.x, dyp = y - ap.y, dzp = z - ap.z;
                 float r = sqrt(dxp * dxp + dyp * dyp + dzp * dzp + 1e-20f);
                 if (r < min_r) { min_r = r; offender = at; }
-                if (r < r_lo_i) {  // domain violation → terminate pixel (fail-loud, non-finite)
-                    *out_status = 2; *out_min_r = r; *out_offender = at; *out_overflow = 0;
-                    return (float4)(NAN, NAN, NAN, NAN);
-                }
-                if (r >= r_cut) continue;
+                if (r >= r_b_i) continue;
                 float phi[CS_PME_NMODES], dphi[CS_PME_NMODES];
-                cs_pme_core_basis(r, r_lo_i, r_cut, phi, dphi);
+                cs_pme_core_basis(r, r_lo_i, r_b_i, phi, dphi);
                 for (int m = 0; m < CS_PME_NMODES; m++) {
                     float c = atom_coeffs[at * CS_PME_NMODES + m];
                     E += c * phi[m];

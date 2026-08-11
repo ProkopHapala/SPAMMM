@@ -4330,7 +4330,8 @@ def run_contact_pme_pp_afm(tag, atomPos, atomTypes, origin, step, ngrid, outdir,
                            margin=2.0, plots=None, df_cmap='gray', cmap='seismic',
                            r_cut=6.0, h_mesh=1.0, halo_nodes=6,
                            z_above_lo=3.0, z_above_hi=8.0,
-                           n_shells=300, n_endpoint=30, n_holdout=80, seed=42):
+                           n_shells=300, n_endpoint=30, n_holdout=80, seed=42,
+                           split_mode='paw', q_tip=0.0):
     """Contact-PME PP-AFM via the shared ScanSpec/ScanResult contract (Wave 2 host/API).
 
     Fits a contact_pme particle-mesh field (coarse 3D B-spline mesh + compact PIC
@@ -4358,6 +4359,8 @@ def run_contact_pme_pp_afm(tag, atomPos, atomTypes, origin, step, ngrid, outdir,
         halo_nodes:  halo padding per side (contract: >= 6)
         z_above_lo, z_above_hi: z range above zmax for query envelope [Å]
         n_shells, n_endpoint, n_holdout, seed: core fit sampling params
+        split_mode:  PMESplit mode ('paw' default, 'hermite', 'plateau', 'rho', 'softcore')
+        q_tip:       tip charge for radial damped Coulomb (PLQH H); tipQs forced to 0
     Returns:
         ScanResult with backend_name='contact_pme', fft_path='none',
         ContactPMEParams attached as .cpm
@@ -4367,7 +4370,8 @@ def run_contact_pme_pp_afm(tag, atomPos, atomTypes, origin, step, ngrid, outdir,
     plots = set(plots or ())
     os.makedirs(outdir, exist_ok=True)
 
-    print(f"\n=== {tag}  Contact-PME  r_cut={r_cut}  h_mesh={h_mesh}  halo={halo_nodes} ===")
+    print(f"\n=== {tag}  Contact-PME  mode={split_mode} q_tip={q_tip}  "
+          f"r_cut={r_cut}  h_mesh={h_mesh}  halo={halo_nodes} ===")
 
     afmulator = afm.AFMulator(use_morse=True, nloc=32, use_fire=True)
     atoms_arr, cLJs_arr = _morse_atoms_from_Z(atomPos, atomTypes, params_path=params_path)
@@ -4385,12 +4389,28 @@ def run_contact_pme_pp_afm(tag, atomPos, atomTypes, origin, step, ngrid, outdir,
     afmulator.stiffness = np.array([-K_LAT, -K_LAT, -K_LAT, -K_RAD], dtype=np.float32)
     print(f"  dpos0={afmulator.dpos0}  stiffness={afmulator.stiffness}")
 
+    # Query envelope from ScanSpec (SSOT) — must cover CLI h_Fz (amp-aligned down to h_min−amp)
+    # and lateral scan_xs/ys. Do NOT use fixed z_above_lo=3 which misses closest approach.
+    scan_xs = np.asarray(scan_spec.scan_xs, dtype=np.float64)
+    scan_ys = np.asarray(scan_spec.scan_ys, dtype=np.float64)
+    h_scan = np.asarray(scan_spec.h_scan, dtype=np.float64)
+    mol_z = float(atomPos[:, 2].max())
+    z_pad = 1.5  # PP can dip below tip height during relaxation
+    query_bounds = np.array([
+        [float(scan_xs.min()), float(scan_xs.max())],
+        [float(scan_ys.min()), float(scan_ys.max())],
+        [mol_z + float(h_scan.min()) - z_pad, mol_z + float(h_scan.max()) + z_pad],
+    ], dtype=np.float64)
+    print(f"  query_bounds from ScanSpec: {query_bounds.tolist()}  "
+          f"(h_scan=[{h_scan.min():.2f},{h_scan.max():.2f}])")
+
     # Fit contact_pme (split → mesh → core); does NOT duplicate mathematics
     cpm = afmulator.fit_contact_pme(
         r_cut=r_cut, h_mesh=h_mesh, halo_nodes=halo_nodes,
-        margin=margin, z_above_lo=z_above_lo, z_above_hi=z_above_hi,
+        query_bounds=query_bounds, margin=margin,
+        z_above_lo=z_above_lo, z_above_hi=z_above_hi,
         n_shells=n_shells, n_endpoint=n_endpoint, n_holdout=n_holdout, seed=seed,
-        bPrint=True)
+        split_mode=split_mode, q_tip=float(q_tip), bPrint=True)
     afmulator.queue.finish()
 
     # Use scan_spec scan_xs/ys/h_scan directly (same grid as FDBM/Morse/contact)
@@ -4402,7 +4422,6 @@ def run_contact_pme_pp_afm(tag, atomPos, atomTypes, origin, step, ngrid, outdir,
     dx = float(scan_xs[1] - scan_xs[0]) if nx_s > 1 else float(step)
     dy = float(scan_ys[1] - scan_ys[0]) if ny_s > 1 else float(step)
     dz = float(h_scan[1] - h_scan[0]) if nz_s > 1 else 0.1
-    mol_z = float(atomPos[:, 2].max())
     # Tip apex starts at highest probe height + mol_z + bond_length (same as scan_fdbm)
     z_start = mol_z + float(np.max(h_scan)) + bond_length
     scan_p0 = np.array([float(scan_xs[0]), float(scan_ys[0]), z_start], dtype=np.float32)
@@ -4438,8 +4457,10 @@ def run_contact_pme_pp_afm(tag, atomPos, atomTypes, origin, step, ngrid, outdir,
     result.osc_dir = osc_n.copy()
     result.path = 'ContactPME'
     result.stage_path = None
-    result.tip = {'peak': None, 'q': 0.0, 'dq': 0.0, 'mirrorX': None, 'mirrorY': None, 'path': None}
+    result.tip = {'peak': None, 'q': float(q_tip), 'dq': 0.0, 'mirrorX': None, 'mirrorY': None, 'path': None}
     result.cpm = cpm
+    result.split_mode = str(split_mode)
+    result.q_tip = float(q_tip)
     result.resident_bytes = int(cpm.resident_bytes)
     result.resident_kb = float(cpm.resident_kb)
     ih = len(result.heights) // 2
@@ -4452,7 +4473,7 @@ def run_contact_pme_pp_afm(tag, atomPos, atomTypes, origin, step, ngrid, outdir,
     print(f"  df @h={result.heights[ih]:.2f} / Fz @h={float(result.heights_Fz[ih]):.2f}: "
           f"df=[{result.df.min():.3e},{result.df.max():.3e}] Fz=[{result.Fz.min():.3e},{result.Fz.max():.3e}]")
 
-    # Optional diagnostic PNGs
+    # Optional diagnostic PNGs (SSOT helpers — same as Morse/contact)
     x_ext = [float(scan_xs[0]), float(scan_xs[-1])]
     y_ext = [float(scan_ys[0]), float(scan_ys[-1])]
     if 'df' in plots:

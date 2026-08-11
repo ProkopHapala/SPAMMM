@@ -40,6 +40,7 @@ Awkward FDBM grid sizes: keep **CPU FFT** (`afm` default `--cpu-fft`).
 | `panel-fukui` | Fukui DFT cube vs DFTB stock vs prolonged | **ready** |
 | `replot-panel` | Replot panel NPZ (per-image contrast) | **ready** |
 | `afm-morse` | Morse/LJ + point-charge Coulomb, no density | **ready** |
+| `afm --model contact_pme` | PAW particle-mesh Morse(+Q), no 3D FF image | **ready** |
 | `afm-kriging` | DFT Kriging GridFF → PP relax → Fz/df | **ready** |
 | `stm orbitals` | Frontier MO **ψ** (signed phase), DFTB + pySCF | **ready** |
 | `stm current` | MO-resolved **STM current** I≥0, s/p_z/p_y tips | **ready** |
@@ -215,6 +216,23 @@ No SCF / no cube — Morse (or `--lj`) + tip point charges on a 3D grid, then `r
 python run_spm.py afm-morse --xyz data/xyz/pentacene.xyz
 python run_spm.py afm-morse --xyz data/xyz/benzene.xyz --lj
 ```
+
+### `afm --model contact_pme` — PAW particle-mesh Morse(+Q)
+
+Same ScanSpec / height SSOT / `plot_afm_variant_height_strip` as Morse and contact 2.5D.
+Fits coarse mesh + compact PIC cores (`split_mode=paw` default), then PP-AFM scan.
+
+```bash
+python run_spm.py afm --model contact_pme --xyz data/xyz/pyridine.xyz --show-atoms
+python run_spm.py afm --model contact_pme --xyz data/xyz/PTCDA.xyz --pme-q-tip -0.1 --show-atoms
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--pme-split` | `paw` | Long/short split (`paw`/`hermite`/`plateau`/`rho`/`softcore`) |
+| `--pme-q-tip` | `0` | Radial tip charge (multi-site `tipQs` forced off) |
+| `--pme-h-mesh` | `1.0` | Coarse mesh spacing [Å] |
+| heights / margin | same as `afm` | `--h-min 3.7`…`--h-max 4.7`, `--scan-margin`, `--margin` |
 
 ### `afm-kriging` — DFT GridFF → probe-particle AFM
 

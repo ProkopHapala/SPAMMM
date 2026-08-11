@@ -1400,11 +1400,16 @@ class AFMulator(OpenCLBase):
             raise ValueError(f"query_bounds contains non-finite values: {qb}")
         if np.any(qb[:, 1] <= qb[:, 0]):
             raise ValueError(f"query_bounds has zero or inverted extent: {qb}")
-        # cell_size >= r_cut (bucket completeness)
-        r_cut = float(p.r_cut)
+        # cell_size >= r_core_max (bucket completeness)
+        r_core = float(getattr(p, 'r_core_max', p.r_cut))
         r_lo_max = float(np.max(p.r_lo))
-        if r_cut <= r_lo_max:
-            raise ValueError(f"r_cut={r_cut} <= max(r_lo)={r_lo_max:.4f}; split domain invalid")
+        if r_core <= r_lo_max:
+            raise ValueError(f"r_core_max={r_core} <= max(r_lo)={r_lo_max:.4f}; split domain invalid")
+        mode = getattr(p, 'split_mode', 'paw')
+        if mode == 'plateau' and float(p.delta_b) <= float(p.delta_a):
+            raise ValueError(f"delta_b={p.delta_b} must be > delta_a={p.delta_a}")
+        if mode in ('paw', 'hermite', 'softcore') and float(p.delta_b) <= 0.0:
+            raise ValueError(f"delta_b={p.delta_b} must be > 0 for split_mode={mode!r}")
         # Atom count + finiteness
         na = p.na
         if na < 1:
@@ -1428,14 +1433,14 @@ class AFMulator(OpenCLBase):
         ny = int(np.round((hi[1] - lo[1]) / h_mesh)) + 1
         nz = int(np.round((hi[2] - lo[2]) / h_mesh)) + 1
         na = p.na
-        n_modes = 5  # CORE_POWERS = [4,8,16,32,64]
+        n_modes = 5  # CORE_POWERS = [2,4,8,16,32]
         b = 0
         b += nx * ny * nz * 4           # mesh coeffs float32
         b += na * 4 * 4                  # atoms float4
         b += na * n_modes * 4            # core coeffs float32
         b += na * 4                      # r_lo float32
         # Buckets: rough estimate — na atom indices + (nbx*nby+1) offsets
-        cell_size = float(p.r_cut)
+        cell_size = float(getattr(p, 'r_core_max', p.r_cut))
         x0 = float(np.atleast_1d(p.R0).min()) - cell_size  # conservative; real uses atom_pos
         nbx = max(1, int(np.ceil((qb[0, 1] - qb[0, 0] + 2 * cell_size) / cell_size)))
         nby = max(1, int(np.ceil((qb[1, 1] - qb[1, 0] + 2 * cell_size) / cell_size)))
@@ -1445,7 +1450,8 @@ class AFMulator(OpenCLBase):
 
     def fit_contact_pme(self, *, r_cut=6.0, h_mesh=1.0, halo_nodes=6, query_bounds=None,
                         margin=2.0, z_above_lo=3.0, z_above_hi=8.0,
-                        n_shells=300, n_endpoint=30, n_holdout=80, seed=42, bPrint=True):
+                        n_shells=300, n_endpoint=30, n_holdout=80, seed=42, bPrint=True,
+                        split_mode='paw', q_tip=0.0):
         """Orchestrate contact_pme fit: split → coarse mesh → compact core.
 
         Builds SplitParams from assigned Morse params (R0/E0 from cLJs_arr, q from
@@ -1454,7 +1460,7 @@ class AFMulator(OpenCLBase):
         Does NOT duplicate the mathematics — just orchestrates.
 
         Args:
-            r_cut: outer split/core cutoff [Å] (MVP default 6.0)
+            r_cut: outer split/core cutoff [Å] (legacy rho; compact modes use r_b=R0+Δ_b)
             h_mesh: mesh spacing [Å] (MVP default 1.0)
             halo_nodes: halo padding per side (contract: >= 6)
             query_bounds: (3,2) [[xmin,xmax],[ymin,ymax],[zmin,zmax]] query envelope.
@@ -1462,6 +1468,8 @@ class AFMulator(OpenCLBase):
             margin: xy margin [Å] when query_bounds is None
             z_above_lo, z_above_hi: z range above zmax when query_bounds is None [Å]
             n_shells, n_endpoint, n_holdout, seed: core fit sampling params
+            split_mode: 'paw' (default even-poly), 'hermite', 'plateau', 'rho', 'softcore'
+            q_tip: tip charge for radial damped Coulomb (PLQH H channel); tipQs must be 0
         Returns:
             ContactPMEParams
         """
@@ -1479,9 +1487,10 @@ class AFMulator(OpenCLBase):
         # cLJs_arr[:,2] holds tip_alpha (negative, e.g. -1.8). PMESplit expects alpha>0.
         alpha = float(abs(cMs[0, 2]))
         r_damp = 0.1  # GFFParams convention (matches cs_brute_plqh_points default)
-        q_tip = 0.0   # MVP: zero tip charge (radial Morse only); charged case via SplitParams.q
+        q_tip = float(q_tip)
         p = SplitParams(R0=cMs[:, 0].astype(np.float64), E0=cMs[:, 1].astype(np.float64),
-                        q=qs, alpha=alpha, q_tip=q_tip, r_damp=r_damp, r_cut=float(r_cut))
+                        q=qs, alpha=alpha, q_tip=q_tip, r_damp=r_damp, r_cut=float(r_cut),
+                        split_mode=str(split_mode))
         # Query envelope
         if query_bounds is None:
             zmax = float(apos[:, 2].max())
@@ -1491,9 +1500,12 @@ class AFMulator(OpenCLBase):
         query_bounds = np.asarray(query_bounds, dtype=np.float64)
         # Preflight (fail-loud)
         self._pme_preflight(p, query_bounds, max_resident_bytes=self._global_mem)
+        r_core_max = float(p.r_core_max)
         if bPrint:
-            print(f"AFMulator.fit_contact_pme: na={na} r_cut={r_cut} h_mesh={h_mesh} halo={halo_nodes}")
+            print(f"AFMulator.fit_contact_pme: na={na} mode={p.split_mode} r_core_max={r_core_max:.3f} "
+                  f"(legacy r_cut={r_cut}) h_mesh={h_mesh} halo={halo_nodes}")
             print(f"  query_bounds={query_bounds.tolist()} alpha={alpha} r_damp={r_damp} q_tip={q_tip}")
+            print(f"  Δ_in={p.delta_in} Δ_a={p.delta_a} Δ_b={p.delta_b}")
         # Build coarse mesh (V_L = Σ v_i^L)
         mesh = build_coarse_mesh(apos, p, query_bounds, h_mesh=h_mesh, halo_nodes=halo_nodes)
         if bPrint:
@@ -1503,8 +1515,8 @@ class AFMulator(OpenCLBase):
         if bPrint:
             print(f"  core: na={core_fit.coeffs.shape[0]} n_modes={core_fit.coeffs.shape[1]} "
                   f"basis={core_fit.basis} cond_raw=[{float(core_fit.cond_raw.min()):.1f},{float(core_fit.cond_raw.max()):.1f}]")
-        # PIC buckets for core evaluation (cell_size >= r_cut)
-        cell_size = float(r_cut)
+        # PIC buckets for core evaluation (cell_size >= max r_b)
+        cell_size = r_core_max
         x0 = float(apos[:, 0].min()) - cell_size
         y0 = float(apos[:, 1].min()) - cell_size
         x1 = float(apos[:, 0].max()) + cell_size
@@ -1631,7 +1643,7 @@ class AFMulator(OpenCLBase):
                                   params.mesh_origin[2], params.mesh_h], dtype=np.float32)
         core_meta = np.array([na, params.bucket_nbx, params.bucket_nby, nbuckets], dtype=np.int32)
         x0, y0, _, _ = params.bucket_bounds
-        core_bucket_meta = np.array([x0, y0, params.bucket_cell_size, params.r_cut], dtype=np.float32)
+        core_bucket_meta = np.array([x0, y0, params.bucket_cell_size, params.core_d_span], dtype=np.float32)
         nG = self._roundup(nq, 32)
         self.prg.evalContactPME(self.queue, (nG,), (32,),
                                 self.cpm_queries_cl, self.cpm_out_fe_cl, self.cpm_status_cl,
@@ -1778,11 +1790,13 @@ class AFMulator(OpenCLBase):
                                   params.mesh_origin[2], params.mesh_h], dtype=np.float32)
         core_meta = np.array([na, params.bucket_nbx, params.bucket_nby, nbuckets], dtype=np.int32)
         x0, y0, _, _ = params.bucket_bounds
-        core_bucket_meta = np.array([x0, y0, params.bucket_cell_size, params.r_cut], dtype=np.float32)
-        # Telemetry buffers (per scan point, accumulated over z steps)
+        core_bucket_meta = np.array([x0, y0, params.bucket_cell_size, params.core_d_span], dtype=np.float32)
+        # Telemetry: kernel writes idx = gid*nz + iz → need n_scan*nz (NOT n_scan).
+        # Undersizing these caused GPU buffer overrun → garbage strips in AFM maps.
+        n_tele = n_scan * nz
         self.try_make_buffers({
-            'cpm_scan_status': n_scan * 4, 'cpm_scan_min_r': n_scan * 4,
-            'cpm_scan_offender': n_scan * 4, 'cpm_scan_overflow': n_scan * 4,
+            'cpm_scan_status': n_tele * 4, 'cpm_scan_min_r': n_tele * 4,
+            'cpm_scan_offender': n_tele * 4, 'cpm_scan_overflow': n_tele * 4,
         }, suffix='_cl')
         gs = (self._roundup(n_scan, 1),)
         self.prg.relaxStrokesTiltedContactPME(self.queue, gs, (1,),
@@ -1797,16 +1811,22 @@ class AFMulator(OpenCLBase):
                                               self.dpos0, self.relax_pars, self.surfFF, np.int32(nz))
         self.queue.finish()
         self.fromGPU_(self.scan_FEs_cl, FEs_h)
-        # Read telemetry + postflight
-        status = np.zeros(n_scan, dtype=np.int32)
-        min_r = np.zeros(n_scan, dtype=np.float32)
-        offender = np.zeros(n_scan, dtype=np.int32)
-        overflow = np.zeros(n_scan, dtype=np.int32)
-        cl.enqueue_copy(self.queue, status, self.cpm_scan_status_cl)
-        cl.enqueue_copy(self.queue, min_r, self.cpm_scan_min_r_cl)
-        cl.enqueue_copy(self.queue, offender, self.cpm_scan_offender_cl)
-        cl.enqueue_copy(self.queue, overflow, self.cpm_scan_overflow_cl)
+        # Read per-(pixel,z) telemetry; reduce to per-pixel for postflight
+        status_z = np.zeros(n_tele, dtype=np.int32)
+        min_r_z = np.zeros(n_tele, dtype=np.float32)
+        offender_z = np.zeros(n_tele, dtype=np.int32)
+        overflow_z = np.zeros(n_tele, dtype=np.int32)
+        cl.enqueue_copy(self.queue, status_z, self.cpm_scan_status_cl)
+        cl.enqueue_copy(self.queue, min_r_z, self.cpm_scan_min_r_cl)
+        cl.enqueue_copy(self.queue, offender_z, self.cpm_scan_offender_cl)
+        cl.enqueue_copy(self.queue, overflow_z, self.cpm_scan_overflow_cl)
         self.queue.finish()
+        status = np.bitwise_or.reduce(status_z.reshape(n_scan, nz), axis=1)
+        min_r = np.min(min_r_z.reshape(n_scan, nz), axis=1)
+        # offender at the z of min_r
+        iz_min = np.argmin(min_r_z.reshape(n_scan, nz), axis=1)
+        offender = offender_z.reshape(n_scan, nz)[np.arange(n_scan), iz_min]
+        overflow = np.max(overflow_z.reshape(n_scan, nz), axis=1)
         FEs = FEs_h.reshape(nx_s, ny_s, nz, 4)
         # Postflight: raise on any status flag or non-finite FEs
         scan_pts_xy = pts[:, :3].reshape(nx_s, ny_s, 3)

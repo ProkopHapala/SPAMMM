@@ -89,10 +89,6 @@ def build_coarse_mesh(atom_pos, split_params, query_bounds, h_mesh=1.0, halo_nod
     zs = origin[2] + np.arange(nz) * h
     samples = np.zeros((nx, ny, nz), dtype=np.float64)
 
-    R0_arr = np.atleast_1d(split_params.R0).astype(np.float64)
-    E0_arr = np.atleast_1d(split_params.E0).astype(np.float64)
-    q_arr = np.atleast_1d(split_params.q).astype(np.float64)
-    r_cut = float(split_params.r_cut)
     na = len(atom_pos)
 
     # Slabbed over x to bound memory: each x-slab is (ny, nz)
@@ -103,9 +99,7 @@ def build_coarse_mesh(atom_pos, split_params, query_bounds, h_mesh=1.0, halo_nod
             rz = zs - atom_pos[ia, 2]  # (nz,)
             r2 = dx_ia[ia] ** 2 + ry[:, None] ** 2 + rz[None, :] ** 2  # (ny, nz)
             r = np.sqrt(r2)
-            pi = SplitParams(R0=np.array([R0_arr[ia]]), E0=np.array([E0_arr[ia]]),
-                             q=np.array([q_arr[ia]]), alpha=split_params.alpha,
-                             q_tip=split_params.q_tip, r_damp=split_params.r_damp, r_cut=r_cut)
+            pi = split_params.with_atom(ia)
             s = soft_core_split(r, pi)
             samples[ix] += s['v_L']
 
@@ -196,19 +190,13 @@ def eval_mesh_direct(queries, atom_pos, split_params):
     q = np.asarray(queries, dtype=np.float64).reshape(-1, 3)
     atom_pos = np.asarray(atom_pos, dtype=np.float64).reshape(-1, 3)
     nq = len(q); na = len(atom_pos)
-    r_cut = float(split_params.r_cut)
-    R0_arr = np.atleast_1d(split_params.R0).astype(np.float64)
-    E0_arr = np.atleast_1d(split_params.E0).astype(np.float64)
-    q_arr = np.atleast_1d(split_params.q).astype(np.float64)
     E = np.zeros(nq, dtype=np.float64)
     F = np.zeros((nq, 3), dtype=np.float64)
     for iq in range(nq):
         for ia in range(na):
             dp = q[iq] - atom_pos[ia]
             r = float(np.linalg.norm(dp))
-            pi = SplitParams(R0=np.array([R0_arr[ia]]), E0=np.array([E0_arr[ia]]),
-                             q=np.array([q_arr[ia]]), alpha=split_params.alpha,
-                             q_tip=split_params.q_tip, r_damp=split_params.r_damp, r_cut=r_cut)
+            pi = split_params.with_atom(ia)
             s = soft_core_split(np.array([r]), pi)
             E[iq] += float(s['v_L'][0])
             if r > 1e-30:
