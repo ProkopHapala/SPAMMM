@@ -1253,6 +1253,36 @@ def load_xyz(fname=None, fin=None, bReadN=False, bReadComment=True, nmax=10000 )
     qs   = np.array( qs )
     return xyzs,Zs,enames,qs,comment
 
+def loadPOSCAR(fname=None, fin=None ):
+    """Load VASP POSCAR/CONTCAR file. Returns (apos, Zs, enames, qs, lvec).
+    Handles both Direct (fractional) and Cartesian coordinates. Scale factor applied to lvec."""
+    bClose=False
+    if fin is None:
+        fin=open(fname, 'r'); bClose=True
+    lines = fin.readlines()
+    if bClose: fin.close()
+    comment = lines[0].strip()
+    scale   = float(lines[1].split()[0])
+    lvec    = np.array([ [float(x) for x in lines[i].split()] for i in (2,3,4) ]) * scale
+    esyms   = lines[5].split()
+    counts  = [int(c)   for c in lines[6].split()]
+    coord   = lines[7].strip()[0].lower()   # 'd'irect or 'c'artesian
+    natoms  = sum(counts)
+    i0      = 8
+    frac    = np.array([ [float(x) for x in lines[i0+i].split()[:3]] for i in range(natoms) ])
+    if coord == 'c' or coord == 'k':   # Cartesian — already in Angstrom (scaled)
+        apos = frac * scale
+    else:                               # Direct (fractional) → Cartesian
+        apos = frac @ lvec
+    # expand per-element counts into per-atom lists
+    enames = []; Zs = []
+    for sym, n in zip(esyms, counts):
+        iz = elements.ELEMENT_DICT[sym][0]
+        enames += [sym]*n;  Zs += [iz]*n
+    Zs = np.array(Zs, dtype=np.int32)
+    qs = np.zeros(natoms)
+    return apos, Zs, enames, qs, lvec
+
 def string_to_matrix( s, nx=3,ny=3, bExactSize=False ):
     elements = []
     for item in s.split():

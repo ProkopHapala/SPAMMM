@@ -16,10 +16,14 @@ Many-body **charge-state STM** of molecular sites (quantum dots): tip multipole 
 | Language | Location | Status | Notes |
 |----------|----------|--------|-------|
 | OpenCL | `kernels/PME.cl` | **active** | Identical md5 to FireCore/ppafm; tip interaction + Gauss–Jordan PME |
+| OpenCL | `kernels/PME8.cl` | **active** | 8-site / 256-state; sparse iterative Euler solver; 256 threads/wg; ~13 KB local mem |
 | Python | `spammm/quantum/PauliSolverCL.py` | **active** | FireCore `pauli_ocl.py` on SPAMMM `OpenCLBase` |
+| Python | `spammm/quantum/PauliSolverCL8.py` | **active** | 8-site wrapper for PME8.cl; same API as PauliSolverCL |
 | Python | `spammm/quantum/pauli_scan.py` | **active** | Slim xy/xV API; 2→4 embed; Wij; Ruslan + fig3 trimer params |
 | Data | `data/charge_rings/` | **active** | `Ruslan_{long,short,kite}.txt`, `square_tetramer.txt`, `fig3_trimer.json` |
 | Test L0 | `tests/quantum/test_pme_pauli.py` | **active** | Square mirror symmetry on RTX 3090 |
+| Test L0 | `tests/quantum/test_pme8_smoke.py` | **active** | PME8 vs PME4 parity on 4-site square; max\|dI\|=4.14e-08 |
+| Test L1 | `tests/quantum/test_trimer_pme8_ndr.py` | **active** | PME8 reproduces fig3 trimer NDR; max\|dSTM\|=3.6e-08; NDR min=-5.69e-06 vs PME4 -6.57e-06 |
 | Demo L2 | `tests/quantum/testplot_charge_rings_ruslan.py` | **active** | Ruslan_long xV diamonds + xy V-stack |
 | Demo L2 | `tests/quantum/testplot_charge_rings_trimer.py` | **active** | fig3 / symmetric trimer NDR |
 | Test L0 | `tests/quantum/test_pme_trimer.py` | **active** | Symmetric apex-+y trimer: mirror + NDR |
@@ -38,6 +42,7 @@ Many-body **charge-state STM** of molecular sites (quantum dots): tip multipole 
 | Ruslan_long W=0.05 xy/xV | morphology matches ppafm NTCDA solver_0 | `debug/testplot_charge_rings_ruslan/` |
 | fig3 trimer NDR | reproduced from `fig3_data` / `params.json` | `debug/testplot_charge_rings_trimer/` |
 | PME.cl vs Hubbard dense (FireCore) | max\|dI\| ~ 1e-12 (external) | FireCore `test_pme_parity_*` — not re-run in SPAMMM yet |
+| PME8 vs PME4 (4-site square, 4 spectators) | max\|dI\| = 4.14e-08 | `tests/quantum/test_pme8_smoke.py` — see [`MoleculeExtraction_PME8_2026-08-18.md`](../Reports/MoleculeExtraction_PME8_2026-08-18.md) |
 
 ## Design notes
 

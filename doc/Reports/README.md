@@ -2,6 +2,7 @@
 
 Validated and review-ready scientific results, with exact methods, artifacts, reproduction commands, and unresolved caveats. Task documents may evolve during investigation; reports here are the durable handoff.
 
+- **MoleculeExtraction_PME8_2026-08-18.md** — CONTCAR molecule extraction (PBC bonds, PCA, approximate symmetry P2₁2₁2₁) + **PME8** 8-site/256-state charge-ring kernel (sparse iterative Euler solver, parity vs PME4 = 4.14e-08); 7-molecule cluster STM scan. Caveat: CONTCAR z-coords must be flattened for PME.
 - **ContactPME_PAW_AFM_MemSpeed_2026-08-11.md** — contact_pme **PAW** soft-replacement split; CLI AFM USER-confirmed; **~900–1200×** field memory vs Morse@0.1Å; PP-scan still ~12–18× slower; kernel WG/local-mem gaps and speed-up ideas. Task: `ContactSurface_PME_ParallelPlan.md`.
 - **PairFF_TipPull_PTCDI_QEq_2026-07-28.md** — Tip-pull on NaCl with PTCDI + physical QEq; API `tip_pull_scan`; **map display not Vispy SSOT yet** (tomorrow task `PairFF_MapDisplay_SSOT.md`).
 - **ContactSurface_2p5D_vs_GridFF_2026-07-24.md** — **SSOT** coarse 2.5D contact-sep vs Morse+Coulomb GridFF: sphere `h₀`, `h0_R_scale=0.75`, atom-scale `bspl/scan` dx; PTCDA + helicene artifacts; status investigating.

@@ -23,6 +23,8 @@ OpenCL source for SPAMMM GPU compute. Python harnesses concatenate `.cl` snippet
 | `LCAO_grid.cl` | LCAO density/orbital grid projection + legacy `mo_overlap_points_exp_sk` | `quantum/DFTB/Grid_dftb.py` |
 | `LCAO_STM_FGR.cl` | First-order FGR STM \(M=c^\dagger(H-ES)c\) with tabulated long-tail SK τ | `quantum/DFTB/Grid_dftb.py` |
 | `LCAO_STM.cl` | STM / Dyson equation (GF-dressed; not FGR product path) | `quantum/DFTB/Grid_dftb.py` |
+| `PME.cl` | Pauli Master Equation charge-ring STM (4 sites / 16 states, dense Gauss–Jordan) | `quantum/PauliSolverCL.py` |
+| `PME8.cl` | 8-site / 256-state PME (sparse iterative Euler, 256 threads/wg, ~13 KB local) | `quantum/PauliSolverCL8.py` |
 | `lingebra.cl` | Batched small-matrix Jacobi eigh | `utils/Lingebra_ocl.py` |
 
 ## Composition rules

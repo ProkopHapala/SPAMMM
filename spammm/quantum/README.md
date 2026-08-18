@@ -11,6 +11,7 @@ Quantum chemistry integration: DFTB+ scans, Hessians for vibrations, electron de
 - **pySCF_utils.py** — **legacy** thin RHF/opt (~91 L); do not extend. **Merge plan:** replace with `-new` → single `pySCF_utils.py` (`doc/Tasks/Refactor_LargeModules.md` §12).
 - **DFTB/** — ctypes wrapper, basis parser, GPU density projection (dense NA DM default for FDBM), basis optimizer — see `DFTB/README.md`
 - **PauliSolverCL.py** — OpenCL full PME (`kernels/PME.cl`, hardcoded 4 sites); FireCore `pauli_ocl` on `OpenCLBase`
+- **PauliSolverCL8.py** — OpenCL 8-site PME (`kernels/PME8.cl`, 256 states, sparse iterative Euler solver); same API as PauliSolverCL. Report: [`MoleculeExtraction_PME8_2026-08-18.md`](../../doc/Reports/MoleculeExtraction_PME8_2026-08-18.md)
 - **pauli_scan.py** — slim xy/xV API (2/3→4 embed, Wij); Ruslan dimer + fig3 trimer (Qzz=0 NDR)
 - Fixtures: `data/charge_rings/` (`symmetric_trimer.json`, Ruslan_*, fig3). Tests: `test_pme_pauli.py`, `test_pme_trimer.py`; demos `testplot_charge_rings_{ruslan,trimer}.py`
 - GUI: `spammm/GUI/ChargeRingsExtension.py` (JSON load/save, Calc XY/xV/1D, cut overlay, state probs)

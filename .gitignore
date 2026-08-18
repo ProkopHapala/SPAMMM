@@ -221,6 +221,9 @@ __marimo__/
 #debug/**
 #!debug/README.md
 
+# Private collaborator data (not for public repo)
+data/chao_Li/
+
 # GUI output (screenshots, saved plots)
 output/
 
