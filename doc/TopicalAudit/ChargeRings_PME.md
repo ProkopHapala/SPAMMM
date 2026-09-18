@@ -51,6 +51,7 @@ Many-body **charge-state STM** of molecular sites (quantum dots): tip multipole 
 - **W vs Wij**: scalar `W` couples all 4 embed sites including spectators — always pass **`make_Wij_active`** for n&lt;4.
 - **NDR regime**: fig3 trimer uses **Qzz=0** (monopole), circle R≈5.77, diagonal xV cut — distinct from Ruslan dimer (Qzz=10).
 - **V≈0 numerics**: PME Gauss–Jordan can yield NaN at zero bias / low T; `pauli_scan` maps non-finite \(I\) → 0.
+- **Lever-arm gating**: `PauliSolverCL8.scan_current_tip(Vtips_gate=...)` decouples the site-energy gate voltage from tip `mu1=Vtips` — used for the Chao Li fitted 4-site model (ε_i = Δε_i + α(V_s−V0)·g_i, μ_tip = V_s); see `~/git/SPAMMM_export_for_ChaoLi/NOTES_fitted_PME4_model.md` + `scripts/run_pme4_fit.py`.
 
 ## Open Issues
 

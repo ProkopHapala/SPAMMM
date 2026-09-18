@@ -6,7 +6,8 @@ sites (256 states). Sparse iterative Jacobi solver with normalisation.
 Design: mirrors PauliSolverCL API (scan_current_tip) but uses PME8.cl kernel
 with 256-thread workgroups. Tip μ from Vtips; Gamma convention (Gamma/π)².
 Caveats: Jacobi convergence depends on tol/max_iter; for n<8 sites, pad with
-far high-E spectators (same as PME4 embed).
+far high-E spectators (same as PME4 embed). Optional Vtips_gate decouples
+site-energy gating from tip mu (lever-arm models: gate=alpha*(V_s-V0), mu=V_s).
 # === AUTO-DOC END ===
 """
 import os
@@ -69,16 +70,31 @@ class PauliSolverCL8(OpenCLBase):
 
     def scan_current_tip(self, pTips, Vtips, pSites, params, order, cs,
                          rots=None, Wij=None,
-                         return_probs=False, return_state_energies=False):
+                         return_probs=False, return_state_energies=False,
+                         Vtips_gate=None):
         """Main simulation function (mirrors PauliSolverCL.scan_current_tip).
 
         pTips: (N, 3) tip positions.
-        Vtips: (N,) voltages.
+        Vtips: (N,) voltages — used as tip chemical potential mu1 in solve_pme8.
         pSites: (n_sites, 3) or (n_sites, 4). Padded to 8 by caller.
         params: [Rtip, zV0, zVd, Esite, beta, Gamma, W, bMirror, bRamp]
+        Vtips_gate: optional (N,) gate voltages for compute_tip_interaction
+            (site-energy shifts). Use e.g. alpha*(V_s - V0) for a lever-arm
+            model while mu1 stays V_s. None => same as Vtips (old behaviour).
         """
         n_pixels = len(pTips)
         n_sites = self.nSingle
+
+        Vtips = np.asarray(Vtips, dtype=np.float32)
+        if Vtips.size == 1:
+            Vtips = np.full(n_pixels, float(Vtips), dtype=np.float32)
+        assert Vtips.size == n_pixels, f"Vtips must be scalar or length {n_pixels}, got {Vtips.size}"
+        if Vtips_gate is not None:
+            Vtips_gate = np.asarray(Vtips_gate, dtype=np.float32)
+            if Vtips_gate.size == 1:
+                Vtips_gate = np.full(n_pixels, float(Vtips_gate), dtype=np.float32)
+            assert Vtips_gate.size == n_pixels, \
+                f"Vtips_gate must be scalar or length {n_pixels}, got {Vtips_gate.size}"
 
         p_tips_packed = pack_float4(pTips)
         p_tips_cl = cl_array.to_device(self.queue, p_tips_packed)
@@ -94,6 +110,8 @@ class PauliSolverCL8(OpenCLBase):
         rots_cl = cl_array.to_device(self.queue, rots_host.reshape(n_sites * 3 * 3))
 
         v_tips_cl = cl_array.to_device(self.queue, np.array(Vtips, dtype=np.float32))
+        v_gate_cl = v_tips_cl if Vtips_gate is None else cl_array.to_device(
+            self.queue, np.array(Vtips_gate, dtype=np.float32))
         cs_cl = cl_array.to_device(self.queue, np.array(cs, dtype=np.float32))
         params_cl = cl_array.to_device(self.queue, np.array(params, dtype=np.float32))
 
@@ -108,7 +126,7 @@ class PauliSolverCL8(OpenCLBase):
             p_tips_cl.data,
             p_sites_cl.data,
             rots_cl.data,
-            v_tips_cl.data,
+            v_gate_cl.data,
             cs_cl.data,
             params_cl.data,
             np.int32(order),
