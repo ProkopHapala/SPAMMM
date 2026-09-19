@@ -30,8 +30,9 @@ def run_one(name, pair_idx=0, ds=DEFAULT_DS, sk_set=None, work_root=None):
     e_min_i = int(np.nanargmin(result['energies_ev']))
     s = result['s_axis']
     print(f"  E_min at s={s[e_min_i]:.3f}Å  barrier={np.nanmax(result['rel_ev']):.3f} eV  converged={ok.sum()}/{len(ok)}  npts={len(s)}")
-    png, xyz = save_hbond_scan_artifacts(result, atoms, name, pair_idx=pair_idx, out_dir=DEBUG_DIR)
+    png, xyz, png_geom = save_hbond_scan_artifacts(result, atoms, name, pair_idx=pair_idx, out_dir=DEBUG_DIR)
     print(f"REVIEW: {png}")
+    print(f"REVIEW: {png_geom}")
     print(f"REVIEW: {xyz}")
     return result
 

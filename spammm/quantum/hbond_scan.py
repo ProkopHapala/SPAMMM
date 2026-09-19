@@ -150,8 +150,84 @@ def plot_hbond_scan(result, atoms, title, savepath):
     print(f"Saved: {savepath}")
 
 
+def _draw_geom_frame(ax, atoms, apos_i, result, label, sz=90.):
+    """Draw one geometry snapshot (xy) onto *ax*: molecule + H...acceptor dashed line."""
+    import copy
+    import matplotlib.pyplot as plt
+    from spammm import plotUtils as _pu
+    a = copy.copy(atoms)
+    a.apos = np.asarray(apos_i, dtype=float)
+    plt.sca(ax)
+    _pu.plotSystem(a, axes=(0, 1), bBonds=True, bLabels=False, sz=sz)
+    ih, ido, iac = result['h_idx'], result['donor_idx'], result['acceptor_idx']
+    pH, pA = a.apos[ih], a.apos[iac]
+    ax.plot([pH[0], pA[0]], [pH[1], pA[1]], '--', color=(0.8, 0.2, 0.8), lw=1.2, alpha=0.8, zorder=3)
+    for i, c in ((ido, 'tab:blue'), (iac, 'tab:red'), (ih, 'lime')):
+        p = a.apos[i]
+        ax.scatter([p[0]], [p[1]], s=sz * 2.2, facecolors='none', edgecolors=c, linewidths=1.6, zorder=5)
+    ax.set_title(label, fontsize=10)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    ax.margins(0.15)
+
+
+def plot_hbond_scan_geom(result, atoms, title, savepath, frames=None):
+    """Systematic reaction-path figure: geometry snapshots (start / barrier / end) + E(s) profile.
+
+    *frames*: list of (frame_index, label); default picks first / argmax(rel) / last converged point.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    rel = result['rel_ev']
+    s = result['s_axis']
+    ok = np.isfinite(rel)
+    i_ok = np.where(ok)[0]
+    if frames is None:
+        i0, i1 = i_ok[0], i_ok[-1]
+        i_pk = int(np.nanargmax(rel))
+        fr = result['fractions']
+        if len(i_ok) < 3 or i_pk in (i0, i1):
+            mid = i_ok[len(i_ok) // 2]
+            mid_lab = 'barrier' if mid == i_pk else f'mid (f={fr[mid]:.2f})'
+        else:
+            mid, mid_lab = i_pk, 'barrier'
+        end_lab = 'end: H on acceptor' if fr[i1] > 0.9 else f'last conv. (f={fr[i1]:.2f})'
+        frames = [(i0, 'start: H on donor'), (mid, mid_lab), (i1, end_lab)]
+    nf = len(frames)
+    fig = plt.figure(figsize=(4.6 * nf + 4.5, 4.6))
+    gs = fig.add_gridspec(1, nf + 1, width_ratios=[1.0] * nf + [1.35], wspace=0.08)
+    ax_e = fig.add_subplot(gs[nf])
+    ax_e.plot(s[ok], rel[ok], 'o-', lw=1.2, ms=4, color='tab:blue')
+    marks = ['s', '^', 'D']
+    for k, (i, lab) in enumerate(frames):
+        if not np.isfinite(rel[i]):
+            continue
+        ax_e.plot(s[i], rel[i], marks[min(k, 2)], ms=11, mfc='none', mew=2.0, color=f'C{k}', label=lab)
+        ax_e.axvline(s[i], color=f'C{k}', ls=':', lw=0.9, alpha=0.6)
+    ax_e.set_xlabel('s along D-A axis [Å]')
+    ax_e.set_ylabel('E − E_min [eV]')
+    ax_e.set_title(title)
+    ax_e.grid(True, alpha=0.3)
+    ax_e.legend(fontsize=8, loc='best')
+    apos0 = np.asarray(atoms.apos, dtype=float)
+    ih = result['h_idx']
+    for k, (i, lab) in enumerate(frames):
+        ax_g = fig.add_subplot(gs[k])
+        apos_i = apos0.copy()
+        apos_i[ih] = result['path'][i]
+        tag = f"{lab}\ns={s[i]:.2f}Å  f={result['fractions'][i]:.2f}"
+        if np.isfinite(rel[i]):
+            tag += f"  ΔE={rel[i]:.2f}eV"
+        _draw_geom_frame(ax_g, atoms, apos_i, result, tag)
+    os.makedirs(os.path.dirname(savepath) or '.', exist_ok=True)
+    fig.savefig(savepath, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved: {savepath}")
+
+
 def save_hbond_scan_artifacts(result, atoms, name, pair_idx=0, out_dir=None):
-    """Write PNG profile + XYZ movie to debug/test_hbond_scan/. Returns (png_path, xyz_path)."""
+    """Write PNG profile + geometry-strip PNG + XYZ movie to debug/test_hbond_scan/. Returns (png, xyz, png_geom)."""
     out_dir = out_dir or DEBUG_DIR
     os.makedirs(out_dir, exist_ok=True)
     ido, iac, ih = result['donor_idx'], result['acceptor_idx'], result['h_idx']
@@ -159,9 +235,11 @@ def save_hbond_scan_artifacts(result, atoms, name, pair_idx=0, out_dir=None):
     stem = f'hbond_{name}_p{pair_idx}'
     png = os.path.join(out_dir, f'{stem}.png')
     xyz = os.path.join(out_dir, f'{stem}.xyz')
+    png_geom = os.path.join(out_dir, f'{stem}_geom.png')
     plot_hbond_scan(result, atoms, f'{name}: {label}', png)
+    plot_hbond_scan_geom(result, atoms, f'{name}: {label}', png_geom)
     write_hbond_scan_xyz(atoms.enames, atoms.apos, result, xyz)
-    return png, xyz
+    return png, xyz, png_geom
 
 
 def build_ascii_hbond_system(name, art=None, hbond_length=3.0, relax_bonds=True):

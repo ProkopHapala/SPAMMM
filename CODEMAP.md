@@ -82,6 +82,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `coordinate_scan.py` — reaction-coordinate paths: control grids, pm-NEB (relax + interp), rigid DFTB scan → `ScanDataset`
 - `esp_grid.py` — Coulomb ESP on 2D grids from atomic charges (same KE/r as QEq); stack precompute for animation
 - `hbond_scan.py` — rigid DFTB H-bond proton-transfer scan for ASCII `:` systems (0.1 Å path grid)
+- `pi_bond_order.py` — π bond orders from DFTBcore density matrix: `run_dftbcore_sp` → dense DM+S, `pi_bond_order_matrix` (p⊥ Lowdin), `plot_bond_scalar_map` (bond colormaps); driver `tests/topology/testplot_bond_order.py` → `debug/test_bond_order/`
 - `pySCF_utils.py` — pySCF integration utilities
 
 ### spammm/GUI/ — Graphical User Interface (VisPy)

@@ -7,6 +7,7 @@ Quantum chemistry integration: DFTB+ scans, Hessians for vibrations, electron de
 - **coordinate_scan.py** — Reaction-coordinate engine: control grids, pm-NEB (endpoint relax + all-atom interp), Mulliken charges per frame → `ScanDataset`
 - **esp_grid.py** — Precompute Coulomb ESP stacks `[nframes, ny, nx]` from charges (KE/r, same as QEq)
 - **hbond_scan.py** — Legacy ASCII rigid proton-transfer scan (0.1 Å axis steps); kept for existing tests
+- **pi_bond_order.py** — π bond orders from DFTBcore density matrix: `run_dftbcore_sp` (minimal-HSD SCF → dense DM+S), `ao_layout` ([s,py,pz,px] per sp atom), `pi_bond_order_matrix` (p⊥ sub-block + Löwdin `Sπ^½ Pπ Sπ^½`), `plot_bond_scalar_map` (colored-bond maps). Driver: `tests/topology/testplot_bond_order.py` → `debug/test_bond_order/`
 - **pySCF_utils-new.py** — **SSOT today** (GPU OpenCL / smallDFT / stock CPU; CO z-scan; frontier MO cubes). Notes: `doc/AGENTS/notes/pyscf-gpu-scf.md`. Hyphen → importlib.
 - **pySCF_utils.py** — **legacy** thin RHF/opt (~91 L); do not extend. **Merge plan:** replace with `-new` → single `pySCF_utils.py` (`doc/Tasks/Refactor_LargeModules.md` §12).
 - **DFTB/** — ctypes wrapper, basis parser, GPU density projection (dense NA DM default for FDBM), basis optimizer — see `DFTB/README.md`

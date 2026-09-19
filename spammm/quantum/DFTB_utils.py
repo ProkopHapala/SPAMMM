@@ -536,10 +536,10 @@ def _get_wfc_hsd_paths():
 SK_PATHS = _get_sk_paths()
 WFC_HSD_PATHS = _get_wfc_hsd_paths()
 
-def _write_dftb_input_base(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxscc=200, 
-                           analysis_block="", options_block=""):
+def _write_dftb_input_base(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxscc=200,
+                           analysis_block="", options_block="", filling_temp=None):
     """Base function to write DFTB+ input HSD file.
-    
+
     Args:
         enames: list of element symbols
         xyz_path: path to XYZ geometry file
@@ -549,11 +549,13 @@ def _write_dftb_input_base(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, m
         maxscc: max SCC iterations
         analysis_block: additional Analysis block content
         options_block: additional Options block content
+        filling_temp: if set, write Fermi filling (electronic temperature [K]); rescues SCC oscillations
     """
     species = sorted(set(enames))
     max_ang = {s: '"s"' if s == 'H' else '"p"' for s in species}
     max_ang_str = '\n    '.join([f'{s} = {max_ang[s]}' for s in species])
-    
+    filling_str = f'  Filling = Fermi {{ Temperature [K] = {filling_temp} }}\n' if filling_temp else ''
+
     if not sk_prefix.endswith('/'):
         sk_prefix = sk_prefix + '/'
 
@@ -572,7 +574,7 @@ Hamiltonian = DFTB {{
   }}
   SCCTolerance = {scctol}
   MaxSccIterations = {maxscc}
-}}
+{filling_str}}}
 Analysis {{
 {analysis_block}
 }}
@@ -584,25 +586,34 @@ Options {{
         f.write(hsd)
 
 
-def write_dftb_input_sp(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxscc=200):
+def write_dftb_input_sp(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxscc=200, filling_temp=None):
     """Write minimal DFTB+ input for single-point SCF calculation."""
     # Removed CalculateForces for DFTB+ compatibility with newer versions
-    _write_dftb_input_base(enames, xyz_path, out_path, sk_prefix, scctol, maxscc, analysis_block="")
+    _write_dftb_input_base(enames, xyz_path, out_path, sk_prefix, scctol, maxscc, analysis_block="", filling_temp=filling_temp)
 
 
-def write_dftb_input_relax(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxscc=400, max_steps=1000, grad_elem=1e-4):
-    """Write gas-phase DFTB+ geometry optimization input (same Hamiltonian as SP, no D3)."""
+def write_dftb_input_relax(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxscc=400, max_steps=1000, grad_elem=1e-4, fixed_atoms=None, filling_temp=None):
+    """Write gas-phase DFTB+ geometry optimization input (same Hamiltonian as SP, no D3).
+
+    fixed_atoms: 0-based indices held fixed via MovedAtoms exclusion. filling_temp: Fermi T [K].
+    """
     if not sk_prefix.endswith('/'):
         sk_prefix = sk_prefix + '/'
     species = sorted(set(enames))
     max_ang = {s: '"s"' if s == 'H' else '"p"' for s in species}
     max_ang_str = '\n    '.join([f'{s} = {max_ang[s]}' for s in species])
+    filling_str = f'  Filling = Fermi {{ Temperature [K] = {filling_temp} }}\n' if filling_temp else ''
+    if fixed_atoms:
+        moved = sorted(set(range(len(enames))) - set(fixed_atoms))
+        moved_str = ' '.join(str(i + 1) for i in moved) if moved else '1:-1'
+    else:
+        moved_str = '1:-1'
     hsd = f"""Geometry = xyzFormat {{
   <<< "{os.path.basename(xyz_path)}"
 }}
 Driver = GeometryOptimization {{
   Optimizer = LBFGS {{ Memory = 20 }}
-  MovedAtoms = 1:-1
+  MovedAtoms = {moved_str}
   MaxSteps = {max_steps}
   OutputPrefix = "geom.out"
   Convergence {{ GradElem = {grad_elem} }}
@@ -619,7 +630,7 @@ Hamiltonian = DFTB {{
   }}
   SCCTolerance = {scctol}
   MaxSccIterations = {maxscc}
-}}
+{filling_str}}}
 """
     with open(out_path, 'w') as f:
         f.write(hsd)
@@ -747,7 +758,7 @@ def parse_mulliken_charges(fname='detailed.out', natoms=None):
     return q
 
 
-def run_dftb_sp(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz', maxscc=200, restart_charges_from=None, return_charges=False):
+def run_dftb_sp(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz', maxscc=200, restart_charges_from=None, return_charges=False, filling_temp=None):
     """Run DFTB+ single-point calculation in work_dir.
 
     Returns energy in Ha.  Raises RuntimeError on failure.
@@ -758,7 +769,7 @@ def run_dftb_sp(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz', maxscc=
     xyz_path = os.path.join(work_dir, xyz_fname)
     hsd_path = os.path.join(work_dir, 'dftb_in.hsd')
     au.save_xyz(xyz_path, enames, apos)
-    write_dftb_input_sp(enames, xyz_path, hsd_path, sk_prefix, maxscc=maxscc)
+    write_dftb_input_sp(enames, xyz_path, hsd_path, sk_prefix, maxscc=maxscc, filling_temp=filling_temp)
     if restart_charges_from and os.path.isfile(restart_charges_from):
         shutil.copy(restart_charges_from, os.path.join(work_dir, 'charges.bin'))
     cwd = os.getcwd()
@@ -777,8 +788,12 @@ def run_dftb_sp(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz', maxscc=
         os.chdir(cwd)
 
 
-def run_dftb_relax(work_dir, enames, apos, sk_set=None, xyz_fname='geom.xyz', restart_charges_from=None, verbose=True, on_fail='raise', clean=True, sp_warmup=True, maxscc=400):
-    """Gas-phase DFTB+ geometry optimization. Returns (E_ha, apos_relaxed)."""
+def run_dftb_relax(work_dir, enames, apos, sk_set=None, xyz_fname='geom.xyz', restart_charges_from=None, verbose=True, on_fail='raise', clean=True, sp_warmup=True, maxscc=400, fixed_atoms=None, filling_temp=None):
+    """Gas-phase DFTB+ geometry optimization. Returns (E_ha, apos_relaxed).
+
+    fixed_atoms: 0-based indices held fixed during relax (MovedAtoms exclusion).
+    filling_temp: Fermi electronic temperature [K] for both warmup SP and relax.
+    """
     import shutil
     if clean:
         clean_dftb_workdir(work_dir)
@@ -795,13 +810,13 @@ def run_dftb_relax(work_dir, enames, apos, sk_set=None, xyz_fname='geom.xyz', re
         shutil.copy(restart_charges_from, charges_path)
     elif sp_warmup:
         try:
-            run_dftb_sp(work_dir, enames, apos, sk_prefix, xyz_fname=xyz_fname, maxscc=maxscc, restart_charges_from=restart_charges_from)
+            run_dftb_sp(work_dir, enames, apos, sk_prefix, xyz_fname=xyz_fname, maxscc=maxscc, restart_charges_from=restart_charges_from, filling_temp=filling_temp)
         except RuntimeError as exc:
             if verbose:
                 print(f"    WARN: SP warmup failed ({exc}); continuing relax without charges")
             if os.path.isfile(charges_path):
                 os.remove(charges_path)
-    write_dftb_input_relax(enames, xyz_path, hsd_path, sk_prefix, maxscc=maxscc)
+    write_dftb_input_relax(enames, xyz_path, hsd_path, sk_prefix, maxscc=maxscc, fixed_atoms=fixed_atoms, filling_temp=filling_temp)
     if verbose:
         print(f"  DFTB relax: {work_dir}  ({len(enames)} atoms)")
     cwd = os.getcwd()

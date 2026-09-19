@@ -57,6 +57,7 @@ from spammm.GUI.plotutils import plot_2d_scalar, show_in_plot_window
 - `spammm/GUI/QEqExtension.py` — ESP plotting using these utilities
 """
 
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from   matplotlib import collections  as mc
@@ -1486,3 +1487,170 @@ def imshow_array(data_2d, title='', cmap='viridis', symmetric=None, colorbar=Tru
     fig.tight_layout()
     return fig
 
+
+def draw_mol_junctions(ax, atoms, apos, hbonds, label=None, sz=90., axes=(0, 1), lvs=None, jnames=None):
+    """Draw one molecule geometry on *ax* with its H-bond junctions annotated.
+
+    Reusable panel for proton-transfer / corner-scan figures: renders the molecule via
+    `plotSystem` (bonds on, labels off), then per `HbondRecord` junction adds
+      - dashed H···A line (magenta),
+      - bond-length labels [Å] at the D–H (blue) and H···A (magenta) midpoints,
+      - marker rings: donor = blue, acceptor = red, transferring H = green,
+      - per-junction D_j/H_j/A_j labels if *jnames* given.
+
+    For periodic cells pass `lvs` — junction partners with nonzero
+    HbondRecord.d_shift/a_shift are drawn at their image position
+    (apos[idx] + shift*lvec), so a junction crossing the cell boundary is drawn to
+    the image atom outside the cell.
+
+    Args:
+        ax: matplotlib axes to draw into.
+        atoms: AtomicSystem (only `.apos` is overridden with *apos* — not modified).
+        apos: (n,3) geometry to draw.
+        hbonds: list of HbondRecord (donor_idx, h_idx, acceptor_idx[, d_shift, a_shift]).
+        label: optional axes title (e.g. corner name + ΔE + bond summary).
+        sz: atom marker size passed to plotSystem; junction rings scale with it.
+        axes: projection axes (default xy).
+        lvs: optional (3,3) lattice vectors for periodic image positions.
+        jnames: optional per-junction label prefix (e.g. ['1','2'] -> D1/H1/A1).
+    """
+    from spammm.topology.hbond_utils import hbond_positions
+    import copy
+    a = copy.copy(atoms)
+    a.apos = np.asarray(apos, dtype=float)
+    plt.sca(ax)
+    plotSystem(a, axes=axes, bBonds=True, bLabels=False, sz=sz)
+    ax1, ax2 = axes
+    for jj, hb in enumerate(hbonds):
+        pD, pH, pA = hbond_positions(a.apos, hb, lvs)
+        ax.plot([pH[ax1], pA[ax1]], [pH[ax2], pA[ax2]], '--', color=(0.8, 0.2, 0.8), lw=1.2, alpha=0.8, zorder=3)
+        for (pi, pj, col) in ((pD, pH, 'b'), (pH, pA, (0.8, 0.2, 0.8))):
+            ax.annotate(f"{np.linalg.norm(pi - pj):.2f}", (0.5 * (pi[ax1] + pj[ax1]), 0.5 * (pi[ax2] + pj[ax2])), fontsize=7, color=col, ha='center', va='center', zorder=7,
+                        bbox=dict(boxstyle='round,pad=0.1', fc='white', ec='none', alpha=0.75))
+        for p, c in ((pD, 'tab:blue'), (pA, 'tab:red'), (pH, 'lime')):
+            ax.scatter([p[ax1]], [p[ax2]], s=sz * 2.2, facecolors='none', edgecolors=c, linewidths=1.6, zorder=5)
+        if jnames:
+            jn = jnames[jj]
+            for p, t, c in ((pD, 'D' + jn, 'tab:blue'), (pH, 'H' + jn, 'green'), (pA, 'A' + jn, 'tab:red')):
+                ax.annotate(t, (p[ax1] + 0.35, p[ax2] + 0.25), fontsize=8, color=c, weight='bold', zorder=8)
+    if label:
+        ax.set_title(label, fontsize=10)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    ax.margins(0.15)
+
+
+def plot_geom_overlay(geoms, bonds, labels, ref=0, modes=None, markers=None, savepath=None, title='', figsize_per_panel=(7.0, 7.0)):
+    """Overlay N geometries of the same system as thin bond skeletons, one color each.
+
+    Purpose: visual comparison of related structures (relaxed corners, trajectory frames,
+    before/after relax) either in raw coordinates or after rigid-body alignment — separates
+    internal deformation from overall drift.
+
+    Args:
+        geoms: list of (n,3) arrays — the geometries to overlay.
+        bonds: (nb,2) bond index pairs (e.g. atoms.bonds).
+        labels: list of str, one per geometry (legend + colors).
+        ref: index of the reference geometry for alignment + marker annotation (default 0).
+        modes: list of (mode, idx, title) triples, one panel each:
+               ('absolute', None, ttl) — raw coordinates, no alignment;
+               ('kabsch',   idx,  ttl) — rigid_align onto geoms[ref] on atoms idx
+                                          (idx=None → all atoms).
+               Default: absolute + all-atom Kabsch, two panels.
+        markers: optional list of (atom_idx, text) labels drawn at reference positions
+                 (e.g. junction tags D1/H1/A1).
+        savepath: if given, save figure there and print path.
+        title: figure suptitle.
+    Returns: matplotlib Figure.
+    """
+    import os
+    from spammm.atomicUtils import rigid_align, rmsd
+    if modes is None:
+        modes = [('absolute', None, 'absolute coordinates (no alignment)'), ('kabsch', None, f'Kabsch aligned to {labels[ref]} (all atoms)')]
+    colors = ['C0', 'C3', 'C2', 'C1', 'C4', 'C5', 'C6', 'C7']
+    fig, axs = plt.subplots(1, len(modes), figsize=(figsize_per_panel[0] * len(modes), figsize_per_panel[1]), squeeze=False)
+    axs = axs.ravel()
+    apos_ref = np.asarray(geoms[ref], float)
+    for ax, (mode, idx, ttl) in zip(axs, modes):
+        for g, lab, col in zip(geoms, labels, colors):
+            apos = np.asarray(g, float)
+            if mode == 'kabsch':
+                apos = rigid_align(apos, apos_ref, idx=idx)
+            plt.sca(ax)
+            plotBonds(links=bonds, ps=apos, axes=(0, 1), colors=col, lws=0.8)
+            ax.scatter(apos[:, 0], apos[:, 1], s=4, color=col, alpha=0.5, zorder=2)
+        if markers:
+            for i, tag in markers:
+                p = apos_ref[i]
+                ax.annotate(tag, (p[0], p[1]), fontsize=9, fontweight='bold', color='k', zorder=8)
+        def _rms(g):
+            a = np.asarray(g, float)
+            return rmsd(rigid_align(a, apos_ref, idx=idx), apos_ref) if mode == 'kabsch' else rmsd(a, apos_ref)
+        handles = [plt.Line2D([], [], color=col, lw=1.5, label=f"{lab} rmsd={_rms(g):.2f}") for g, lab, col in zip(geoms, labels, colors)]
+        ax.legend(handles=handles, fontsize=8, loc='best')
+        ax.set_aspect('equal')
+        ax.set_title(ttl)
+        ax.set_xlabel('x [Å]')
+        ax.set_ylabel('y [Å]')
+    if title:
+        fig.suptitle(title)
+    if savepath:
+        os.makedirs(os.path.dirname(savepath) or '.', exist_ok=True)
+        fig.savefig(savepath, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Saved: {savepath}")
+    return fig
+
+
+
+def plot_pbc_chain_cell(atoms, lvs, hbonds, n_cells=3, savepath=None, title=None, sz=160., axes=(0, 1), jnames=None):
+    """Draw a 1D-periodic H-bond chain: n_cells tiled unit cells + cell box + junctions.
+
+    Junction partners with nonzero HbondRecord.d_shift/a_shift are drawn at their
+    image positions (apos + shift*lvec), so a boundary junction's dashed line
+    visibly crosses the cell boundary.
+
+    Args:
+        atoms: AtomicSystem for one cell (bonds used for skeleton).
+        lvs: (3,3) lattice vectors; chain direction = lvs[1].
+        hbonds: list of HbondRecord (junctions; shifts mark image partners).
+        n_cells: number of cells to tile along the chain (odd looks best).
+    """
+    from matplotlib.patches import Rectangle
+    from spammm.topology.hbond_utils import hbond_positions
+    apos = np.asarray(atoms.apos, dtype=float)
+    lvec = np.asarray(lvs)[1]
+    ax1, ax2 = axes
+    fig, ax = plt.subplots(figsize=(7, 2.5 + 3 * n_cells))
+    half = n_cells // 2
+    colmap = {'C': '0.45', 'N': 'tab:blue', 'O': 'tab:red', 'H': '0.75'}
+    for s in range(-half, half + 1):
+        off = s * lvec
+        alpha = 1.0 if s == 0 else 0.45
+        for i, j in atoms.bonds:
+            ax.plot([apos[i, ax1], apos[j, ax1]], [apos[i, ax2] + off[ax2], apos[j, ax2] + off[ax2]], 'k-', lw=1.0, alpha=alpha, zorder=1)
+        for i, e in enumerate(atoms.enames):
+            ax.scatter(apos[i, ax1], apos[i, ax2] + off[ax2], c=colmap.get(e, '0.5'), s=sz if e != 'H' else sz * 0.3, zorder=3, alpha=alpha, edgecolor='k', lw=0.4)
+    for jj, hb in enumerate(hbonds):
+        pD, pH, pA = hbond_positions(apos, hb, lvs)
+        ax.plot([pD[ax1], pA[ax1]], [pD[ax2], pA[ax2]], 'g--', lw=2.0, zorder=2)
+        u = (pA - pD) / np.linalg.norm(pA - pD)
+        pHj = pD + 1.0 * u   # schematic H at covalent distance from donor
+        ax.scatter([pHj[ax1]], [pHj[ax2]], c='lime', s=sz * 0.55, zorder=4, edgecolor='k', lw=0.6)
+        jn = str(jj + 1) if jnames is None else jnames[jj]
+        for p, t, c in ((pD, 'D' + jn, 'tab:blue'), (pHj, 'H' + jn, 'green'), (pA, 'A' + jn, 'tab:red')):
+            ax.annotate(t, (p[ax1] - 0.95, p[ax2] - 0.1), fontsize=10, color=c, weight='bold', zorder=6)
+    x0, x1 = apos[:, ax1].min() - 1.5, apos[:, ax1].max() + 1.5
+    ylo, yhi = apos[:, ax2].min(), apos[:, ax2].max()
+    ax.add_patch(Rectangle((x0, ylo), x1 - x0, yhi - ylo, fill=False, edgecolor='magenta', lw=2.0))
+    ax.annotate('cell', (x1 + 0.3, 0.5 * (ylo + yhi)), fontsize=13, color='magenta', weight='bold')
+    ax.set_aspect('equal')
+    ax.axis('off')
+    ax.set_xlim(x0 - 0.5, x1 + 2.2)
+    ax.set_title(title or f'PBC chain cell, Ly={lvec[1]:.2f} A')
+    if savepath:
+        os.makedirs(os.path.dirname(savepath) or '.', exist_ok=True)
+        fig.savefig(savepath, dpi=140, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Saved: {savepath}")
+    return fig

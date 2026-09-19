@@ -34,8 +34,10 @@ def test_hbond_scan_2quinolone():
     assert ok.sum() >= 3, f"too few converged points: {ok.sum()}"
     assert np.nanmax(result['rel_ev']) < 5.0
     assert np.isfinite(result['rel_ev'][ok]).all()
-    png, xyz = save_hbond_scan_artifacts(result, atoms, name, pair_idx=0, out_dir=DEBUG)
+    png, xyz, png_geom = save_hbond_scan_artifacts(result, atoms, name, pair_idx=0, out_dir=DEBUG)
     assert os.path.isfile(png), png
     assert os.path.isfile(xyz), xyz
+    assert os.path.isfile(png_geom), png_geom
     print(f"REVIEW: {png}")
+    print(f"REVIEW: {png_geom}")
     print(f"REVIEW: {xyz}")

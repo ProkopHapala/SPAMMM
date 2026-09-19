@@ -513,6 +513,34 @@ def rotation_matrix(axis, angle):
     ])
     return rot
 
+
+def kabsch_rotation(P, Q):
+    """Optimal rotation R (3,3) minimizing ||P @ R - Q|| for centered point sets (n,3).
+    Kabsch algorithm via SVD; includes reflection correction (d). Apply as P @ R."""
+    H = P.T @ Q
+    V, _, Wt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(V @ Wt))
+    return V @ np.diag([1.0, 1.0, d]) @ Wt
+
+
+def rigid_align(apos, ref, idx=None):
+    """Best-fit rigid transform of *apos* onto *ref* (rotation + translation) minimizing RMSD
+    on atoms *idx* (default: all). Returns aligned copy of apos (n,3)."""
+    P, Q = np.asarray(apos, dtype=float), np.asarray(ref, dtype=float)
+    idx = np.arange(len(P)) if idx is None else np.asarray(idx)
+    cP, cQ = P[idx].mean(0), Q[idx].mean(0)
+    R = kabsch_rotation(P[idx] - cP, Q[idx] - cQ)
+    return (P - cP) @ R + cQ
+
+
+def rmsd(apos, ref, idx=None):
+    """RMSD [Å] between two (n,3) geometries on atoms idx (no alignment — raw difference)."""
+    P, Q = np.asarray(apos, dtype=float), np.asarray(ref, dtype=float)
+    if idx is not None:
+        P, Q = P[idx], Q[idx]
+    return float(np.sqrt(((P - Q) ** 2).sum(1).mean()))
+
+
 # def rotation_matrix(axis, angle):
 #     axis = axis / np.linalg.norm(axis)
 #     ca, sa = np.cos(angle), np.sin(angle)

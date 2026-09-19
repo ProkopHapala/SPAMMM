@@ -25,6 +25,8 @@ ASCII-only rigid scans remain in `hbond_scan.py` (0.1 Å axis steps) — use `co
 | `spammm/quantum/esp_grid.py` | **active** | Precompute ESP stack `[nframes, ny, nx]` from Mulliken charges |
 | `spammm/quantum/DFTB_utils.py` | **active** | `run_dftb_sp(return_charges)`, `run_dftb_relax`, `parse_mulliken_charges` |
 | `spammm/quantum/hbond_scan.py` | **active** | Legacy ASCII rigid scan; kept for existing tests |
+| `spammm/quantum/pi_bond_order.py` | **active** | π bond orders from DFTBcore dense DM+S (p⊥ Löwdin); bond colormap plots |
+| `tests/topology/testplot_bond_order.py` | **active** | Corner/path DM recomputation → bond maps, response δB, path traces → `debug/test_bond_order/` |
 | `spammm/GUI/ReactionCoordinateExtension.py` | **active** | Panel + slider + bond viz + ESP controls |
 | `spammm/GUI/rc_esp_view.py` | **active** | Blitted ESP animation synced to RC slider |
 | `spammm/GUI/mpl_blit.py` | **active** | Reusable Qt matplotlib blit helper |
@@ -104,6 +106,17 @@ pytest tests/topology/test_scan_dataset.py::test_pm_neb_relaxed_dftb -s
 | Mulliken sum | Neutral molecule | \|Σq\| < 0.05 e |
 | GUI vs offline geometry | `build_ascii_hbond_system('2Quinolone')` | same `natoms` |
 | Endpoints relaxed flag | Both endpoint energies finite | metadata honest |
+
+## π bond-order analysis (DFTBcore DM)
+
+`tests/topology/testplot_bond_order.py` recomputes each stored `corner_*/geom.out.xyz` (and path frames with `--paths`) through **DFTBcore** (`run_dftbcore_sp`, same 600 K Fermi protocol), extracts the dense density matrix `P` and overlap `S`, projects onto the π subspace (one p⊥ AO per sp atom, orbital from the molecular-plane normal), Löwdin-orthogonalizes `P̃π = Sπ^½ Pπ Sπ^½`, and maps per-bond scalars onto the skeleton.
+
+- **Bond maps:** C–C bond length and π bond order as `seismic` colormaps (red = double-like, blue = single-like), 4 corner panels each.
+- **Response maps:** φ_i = B(state_i)−B(LL) and non-additive **δB = B_RR+B_LL−B_RL−B_LR** — the bond-order analogue of J = E_RR+E_LL−E_RL−E_LR.
+- **Path traces:** π-BO vs path fraction for the 5 most responsive bonds, on all 4 edges + 2 diagonals.
+- **Artifacts:** `debug/test_bond_order/{name}_{bondmap,bo_response,bo_paths}.png` + `{name}_bo.npz`; per-frame workdirs under `debug/test_bond_order/{name}/`.
+
+Validation: DFTBcore corner energies reproduce stored `OUT` to **0.0 meV**; `tr(P̃π)` = exact π electron count (2NCI: 32/32); π populations C≈1.0, N≈1.6, O≈1.4. Caveat: BO is a basis-dependent proxy (Löwdin convention), not a unique observable.
 
 ## Open Issues
 

@@ -18,13 +18,17 @@ class HbondRecord:
     acceptor_idx: int
     dist_ha: float = 0.0
     angle: float = 180.0
+    # PBC: integer cell shifts of donor/acceptor partners along the chain
+    # lattice vector (image position = apos[idx] + shift*lvec). 0 = in-cell.
+    d_shift: int = 0
+    a_shift: int = 0
 
     def to_dict(self):
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d):
-        return cls(**d)
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
 def find_hbonds_sys(sys, d_max=2.5, a_min=150.0, bPrint=False):
@@ -55,3 +59,20 @@ def controls_to_fractions(control_row, mapping):
     """Per-H-bond transfer fraction f ∈ [0,1] from control vector and mapping."""
     u = np.asarray(control_row, dtype=float).ravel()
     return np.array([float(u[mapping[i]]) for i in range(len(mapping))], dtype=float)
+
+
+def hbond_positions(apos, hb, lvs=None):
+    """(pD, pH, pA) with periodic image shifts applied (pX = apos[idx] + shift*lvec)."""
+    apos = np.asarray(apos, dtype=float)
+    lvec = np.zeros(3) if lvs is None else np.asarray(lvs)[1]
+    return apos[hb.donor_idx] + hb.d_shift * lvec, apos[hb.h_idx], apos[hb.acceptor_idx] + hb.a_shift * lvec
+
+
+def junction_bond_lengths(apos, hbonds, lvs=None):
+    """Per-junction (D–H, H···A) distances [Å] for each HbondRecord — the state-defining
+    numbers of a proton-transfer corner (2 junctions → 4 lengths)."""
+    out = []
+    for h in hbonds:
+        pD, pH, pA = hbond_positions(apos, h, lvs)
+        out.append((float(np.linalg.norm(pH - pD)), float(np.linalg.norm(pH - pA))))
+    return out

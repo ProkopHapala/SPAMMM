@@ -299,7 +299,8 @@ L0: `tests/SPM/test_afm_contact_surface.py`. L2: `tests/testplot_contact_surface
 ## 5. QM Integration (DFTB+)
 
 - DFTB+ integration: subprocess, C-API, parsers, OpenCL grid projection, constrained scans
-- **Key files:** `spammm/quantum/DFTB/DFTBcore.py`, `spammm/quantum/DFTB/DFTBplusParser.py`, `spammm/quantum/DFTB/Grid_dftb.py`, `spammm/quantum/DFTB/basis_optimizer.py`, `spammm/quantum/DFTB_utils.py`, `spammm/quantum/hbond_scan.py`, `spammm/quantum/pySCF_utils.py`
+- **Key files:** `spammm/quantum/DFTB/DFTBcore.py`, `spammm/quantum/DFTB/DFTBplusParser.py`, `spammm/quantum/DFTB/Grid_dftb.py`, `spammm/quantum/DFTB/basis_optimizer.py`, `spammm/quantum/DFTB_utils.py`, `spammm/quantum/hbond_scan.py`, `spammm/quantum/coordinate_scan.py`, `spammm/quantum/pi_bond_order.py`, `spammm/quantum/pySCF_utils.py`
+- **π bond-order analysis:** `pi_bond_order.py` — DFTBcore dense DM (`get_dm_dense`/`get_s_dense`) → π (p⊥) sub-block → Löwdin `Sπ^½ Pπ Sπ^½` bond orders; bond-length + π-BO colormap maps over corner-scan proton states (LL/RL/LR/RR), response maps φ_i and non-additive δB = B_RR+B_LL−B_RL−B_LR (bond-order analogue of J). Driver: `tests/topology/testplot_bond_order.py` → `debug/test_bond_order/`. Validated: energy parity vs stored OUT = 0.0 meV; tr(P̃π) = exact π e⁻ count (2NCI: 32).
 - **Hessian (vibrations):** `DFTB_utils.write_dftb_input_hessian` — used by `dynamics/Vibrations.py`
 - **Kekulé RI density (planned):** [Tasks/Kekule_ExponentialDensityFit.md](Tasks/Kekule_ExponentialDensityFit.md) — π orders → atom+bond exponentials vs DFT ρ
 - **Audit Document:** [afm_stm_simulation.md](afm_stm_simulation.md) (DFTB sections)

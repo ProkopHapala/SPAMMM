@@ -342,6 +342,8 @@ def _build_dimer(lines, aCC=A_CC, hbond_length=None):
                 continue
             hb_pairs.append((ia, ib))
         atoms._hbonds_pairs = list({tuple(sorted(p)) for p in hb_pairs})
+    atoms._rows = rows                    # per-atom source row (drawn atoms only)
+    atoms._hbond_rows = sorted({r for r, _ in hbond_marks})  # ':' rows delimit molecule blocks
     return atoms
 
 
@@ -470,15 +472,19 @@ def _build_single(lines, aCC=A_CC, hbond_length=None):
     idx_map = {}
     pos = []
     enames = []
+    rows = []
     for i, ((r, c), el) in enumerate(atoms.items()):
         idx_map[(r, c)] = i
         pos.append([c * dx / 2.0, y[r], 0.0])
         enames.append(el)
+        rows.append(r)
 
     atoms = AtomicSystem(apos=np.array(pos), enames=enames)
     atoms.bonds = np.array([(idx_map[a], idx_map[b]) for a, b in bonds], dtype=np.int32)
     atoms.atypes = [_elements.ELEMENT_DICT[e][0] - 1 for e in enames]
     atoms._enames_original = [atoms_original[k] for k in atoms_original.keys()]
+    atoms._rows = rows                                    # per-atom source row (drawn atoms only)
+    atoms._hbond_rows = sorted({r for r, _ in hbond_marks})  # ':' rows delimit molecule blocks
     if hbond_marks:
         hb_pairs = []
         for r, c in hbond_marks:
@@ -733,8 +739,249 @@ O n O
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Periodic 1D H-bond chain cells
 # ---------------------------------------------------------------------------
+# Motif: molecules stacked along +y, separated by ':' junction rows. The LAST
+# molecule in the art is the periodic image of the FIRST (same type) — the unit
+# cell contains all molecules between the first and the last. Each ':' row gives
+# one proton-transfer junction; junctions touching the last block partner atoms in
+# the next cell (recorded via HbondRecord.d_shift/a_shift = +1).
+#
+# Corner states for the 2-junction cell: LL = both H on donors, RR = both
+# transferred, RL/LR = mixed.  J = E_LL + E_RR - E_RL - E_LR < 0 cooperative.
+# See doc/ERC_private/pbc_proton_transfer_chains.md.
+PBC_CHAIN_ARTS = {
+    # quinone/hydroquinone: O-H...O junctions; HQ donates to Q on both ends.
+    'hq2q': """
+  O
+  C
+ C C
+ C C
+  C
+  O
+  :
+  o
+  C
+ C C
+ C C
+  C
+  o
+  :
+  O
+  C
+ C C
+ C C
+  C
+  O
+""",
+    # pyrazine / 1,4-dihydropyrazine: N-H...N junctions (6-ring, N apex atoms).
+    'pyr2hpyr': """
+  N
+ C C
+ C C
+  N
+  :
+  n
+ C C
+ C C
+  n
+  :
+  N
+ C C
+ C C
+  N
+""",
+    # mono-hydrogenated pyrazine homo-chain: self-complementary (N acceptor top,
+    # n-H donor bottom) -> N-H...N junction at every interface.
+    'pyrH2': """
+  N
+ C C
+ C C
+  n
+  :
+  N
+ C C
+ C C
+  n
+  :
+  N
+ C C
+ C C
+  n
+""",
+    # quinoxaline / dihydroquinoxaline (benzopyrazine): same as the QX/HQ chain
+    # already built in dftbplus/rust_dftb/scripts/make_qxhq_chain.py.
+    'qx2hqx': """
+   N C
+  | | |
+   N C
+   :
+ C n
+| | |
+ C n
+   :
+   N C
+  | | |
+   N C
+""",
+    # phenazine / 5,10-dihydrophenazine: 3 fused rings, N at central-ring apexes.
+    'phz2hphz': """
+ C N C
+C C C C
+C C C C
+ C N C
+   :
+ C n C
+C C C C
+C C C C
+ C n C
+   :
+ C N C
+C C C C
+C C C C
+ C N C
+""",
+    # 4-quinolone homo-chain: self-complementary (O acceptor top, n-H donor
+    # bottom) -> N-H...O=C junction at EVERY interface; cell = 2 molecules so the
+    # square has one internal and one boundary-crossing junction.
+    'quinolone4': """
+   O
+ C C
+C C C
+C C C
+ C n
+   :
+   O
+ C C
+C C C
+C C C
+ C n
+   :
+   O
+ C C
+C C C
+C C C
+ C n
+""",
+}
+
+
+def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0, relax_bonds=True, tilt=0.0):
+    """Build a 1D-periodic H-bond chain unit cell from a PBC_CHAIN_ARTS stack.
+
+    The art is a stack of molecule blocks separated by ':' junction rows; the
+    last block is the periodic image of the first and is NOT included in the
+    cell. Junctions between two in-cell blocks are internal; the junction to the
+    last block becomes a boundary junction whose partner gets a cell shift of +1
+    (HbondRecord.d_shift/a_shift).
+
+    Args:
+        tilt : herringbone tilt [deg] — molecule block k is rotated by
+               (-1)^k * tilt around the y-axis through its own center column.
+               Makes consecutive molecular planes mutually ~2*tilt apart (e.g.
+               +/-45 => perpendicular), relieving steric clash of facing H's
+               across the junctions (same trick as make_qxhq_chain.py).
+
+    Returns:
+        atoms  : AtomicSystem for one cell (capping H included, junction H's on donors)
+        lvs    : (3,3) lattice vectors [A], chain along y, vacuum in x/z
+        hbonds : list[HbondRecord] with d_shift/a_shift marking image partners
+    """
+    if art is None:
+        art = PBC_CHAIN_ARTS[name]
+    atoms = parse_ascii_art(art, hbond_length=hbond_length)
+    atoms.neighs()
+    n_pi0 = make_n_pi(atoms)
+    tv = _build_target_valence(atoms, n_pi0)
+    atoms.add_capping_h_sp2(target_valence=tv)
+    atoms.neighs()
+    if relax_bonds:
+        jacobi_relax_bond_lengths(atoms, n_iters=3, bmix=0.3)
+    resolve_hbond_pairs(atoms)
+
+    rows = atoms._rows
+    hb_rows = atoms._hbond_rows
+    ndrawn = len(rows)
+    if len(hb_rows) < 2:
+        raise ValueError("PBC cell art needs >= 2 ':' junction rows (last block is the periodic image)")
+
+    def _block_of(i):
+        if i < ndrawn:
+            return sum(1 for cr in hb_rows if rows[i] > cr)
+        # capping H: same block as its heavy neighbour
+        for j in atoms.ngs[i]:
+            if atoms.enames[j] != 'H':
+                return _block_of(j)
+        raise ValueError(f"atom {i} has no heavy neighbour")
+
+    nblocks = len(hb_rows) + 1
+    blocks = [[] for _ in range(nblocks)]
+    for i in range(atoms.natoms):
+        blocks[_block_of(i)].append(i)
+
+    # last block = periodic image of first: match atoms by (row, col) order and check
+    first, last = blocks[0], blocks[-1]
+    drawn_first = [i for i in first if i < ndrawn]
+    drawn_last = [i for i in last if i < ndrawn]
+    assert len(drawn_first) == len(drawn_last), f"image block mismatch: {len(drawn_first)} vs {len(drawn_last)} atoms"
+    drawn_first.sort(key=lambda i: (rows[i], atoms.apos[i, 0]))
+    drawn_last.sort(key=lambda i: (rows[i], atoms.apos[i, 0]))
+    for i, j in zip(drawn_first, drawn_last):
+        assert atoms.enames[i] == atoms.enames[j], f"image block ename mismatch at {i}/{j}"
+    t = np.median(np.array([atoms.apos[j] - atoms.apos[i] for i, j in zip(drawn_first, drawn_last)]), axis=0)
+    resid = max(np.linalg.norm(atoms.apos[j] - atoms.apos[i] - t) for i, j in zip(drawn_first, drawn_last))
+    assert resid < 0.05, f"image block not a pure translation of first (max resid {resid:.3f} A)"
+    img = {j: i for i, j in zip(drawn_first, drawn_last)}  # last-block atom -> first-block atom
+
+    # cell contents: all blocks except the last
+    cell_atoms = [i for b in blocks[:-1] for i in b]
+    remap = {old: new for new, old in enumerate(cell_atoms)}
+    enames_c = [atoms.enames[i] for i in cell_atoms]
+    apos_c = np.array([atoms.apos[i] for i in cell_atoms], dtype=float)
+    bonds_c = [(remap[i], remap[j]) for i, j in atoms.bonds if i in remap and j in remap]
+
+    # flip y so the cell vector points +y, then wrap into [0, Ly)
+    Ly = abs(t[1])
+    apos_c[:, 1] *= -1.0 if t[1] < 0 else 1.0
+    apos_c[:, 1] -= apos_c[:, 1].min() - 0.5 * hbond_length   # margin so boundary junction sits inside plot range
+
+    # herringbone tilt: rotate block k by (-1)^k*tilt about the y-axis through
+    # the block's own center column (junction axis); image block has the same
+    # parity as block 0, so the boundary junction stays consistent
+    if tilt:
+        th = np.radians(tilt)
+        for k, blk in enumerate(blocks[:-1]):
+            idx = np.array([remap[i] for i in blk])
+            xa = apos_c[idx, 0].mean()
+            dx = apos_c[idx, 0] - xa
+            c, s = np.cos((1.0 if k % 2 == 0 else -1.0) * th), np.sin((1.0 if k % 2 == 0 else -1.0) * th)
+            x_new = dx * c - apos_c[idx, 2] * s
+            apos_c[idx, 2] = dx * s + apos_c[idx, 2] * c
+            apos_c[idx, 0] = xa + x_new
+
+    lvs = np.array([[apos_c[:, 0].ptp() + vac_x, 0.0, 0.0], [0.0, Ly, 0.0], [0.0, 0.0, apos_c[:, 2].ptp() + vac_z]])
+    lvec = np.array([0.0, Ly, 0.0])
+
+    # junctions: hbonds_ascii = (h_idx, acc_idx); donor = heavy neighbour of h;
+    # a partner in the last (image) block is remapped to its first-block atom with shift +1
+    from spammm.topology.hbond_utils import HbondRecord
+    hbonds = []
+    for ih, ia in atoms.hbonds_ascii:
+        ngh = [j for j in atoms.ngs[ih] if atoms.enames[j] != 'H']
+        assert len(ngh) == 1, f"junction H {ih} has {len(ngh)} heavy neighbours"
+        idon = ngh[0]
+        d_sh = +1 if _block_of(idon) == nblocks - 1 else 0
+        a_sh = +1 if _block_of(ia) == nblocks - 1 else 0
+        id_c, ia_c = remap[img.get(idon, idon)], remap[img.get(ia, ia)]
+        dist = np.linalg.norm(apos_c[id_c] + d_sh * lvec - (apos_c[ia_c] + a_sh * lvec))
+        hbonds.append(HbondRecord(id_c, remap[ih], ia_c, float(dist), 180.0, d_shift=d_sh, a_shift=a_sh))
+
+    cell = AtomicSystem(apos=apos_c, enames=enames_c)
+    cell.atypes = [_elements.ELEMENT_DICT[e][0] - 1 for e in enames_c]
+    cell.bonds = np.array(bonds_c, dtype=np.int32)
+    cell._pbc_img = img
+    cell._pbc_remap = remap
+    return cell, lvs, hbonds
 def main():
     parser = argparse.ArgumentParser(description='Generate heterocycle geometry from ASCII art')
     parser.add_argument('--out', '-o', default='/tmp/kekule/heterocycle.svg', help='Output SVG file')
