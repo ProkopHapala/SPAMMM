@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from spammm.quantum.hbond_scan import build_ascii_hbond_system, ascii_examples_with_hbonds
 from spammm.topology.hbond_utils import find_hbonds_sys
-from spammm.quantum.coordinate_scan import run_corner_scan, plot_corner_scan, plot_corner_overlay, write_corner_scan_xyz
+from spammm.quantum.coordinate_scan import run_corner_scan, plot_corner_scan, plot_corner_overlay, plot_corner_diagram, write_corner_scan_xyz
 
 DEBUG_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'debug', 'test_corner_scan')
 
@@ -41,6 +41,7 @@ def run_one(name, dx=0.25, relax_corners=True, sk_set=None, work_root=None, on_f
     xyz = os.path.join(DEBUG_DIR, f'corner_{name}.xyz')
     plot_corner_scan(scan, atoms, f'{name} corner square', png)
     plot_corner_overlay(scan, atoms, png_ov)
+    plot_corner_diagram(scan, atoms, os.path.join(DEBUG_DIR, f'diagram_{name}.svg'))
     write_corner_scan_xyz(scan, atoms, xyz)
     print(f"REVIEW: {png}")
     print(f"REVIEW: {png_ov}")

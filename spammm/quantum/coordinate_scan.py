@@ -29,6 +29,7 @@ __all__ = [
     'build_pm_neb_endpoints', 'interpolate_all_atoms', 'run_rigid_dftb_scan', 'run_pm_neb',
     'run_pm_neb_sp', 'dataset_from_frames', 'make_hbond_transfer_path',
     'CORNER_US', 'CORNER_NAMES', 'SQUARE_PATHS', 'run_corner_scan', 'plot_corner_scan',
+    'run_corner_scan_pbc', 'plot_corner_diagram',
     'plot_corner_overlay', 'write_corner_scan_xyz', 'junction_bond_lengths',
 ]
 
@@ -405,9 +406,13 @@ def run_corner_scan_pbc(enames, apos_ref, lvs, hbonds, mapping, dx=0.25, relax_c
         return apos
 
     def _fixed_for(u):
+        """Pin the whole junction scaffold: all 4 junction heteroatoms + both scan H's.
+        The H's are pinned at their corner position (H + bond partner fixed by the
+        heteroatom pins) — prevents proton hop AND molecule sliding/re-registration
+        along the chain; all internal bonds still relax freely."""
         if not fix_scan_h:
             return None
-        return sorted({i for j, uj in enumerate(u) for i in (hbonds[mapping[j]].h_idx, hbonds[mapping[j]].donor_idx if uj < 0.5 else hbonds[mapping[j]].acceptor_idx)})
+        return sorted({i for j in range(len(mapping)) for i in (hbonds[mapping[j]].donor_idx, hbonds[mapping[j]].h_idx, hbonds[mapping[j]].acceptor_idx)})
 
     def _try_pbc(cdir, apos_in, do_relax, fixed=None, label=''):
         """run_pbc with escalating rescue tiers (T, mixing, MaxScc); returns (E_ha, apos_out)."""
@@ -459,7 +464,23 @@ def run_corner_scan_pbc(enames, apos_ref, lvs, hbonds, mapping, dx=0.25, relax_c
     J = E11 + E00 - E10 - E01 if np.isfinite([E00, E10, E01, E11]).all() else np.nan
     meta = dict(meta or {})
     meta.update(scan_type='corner_square_pbc', dx=dx, relax_corners=relax_corners, fix_scan_h=fix_scan_h, filling_temp=filling_temp, rescue_temp=rescue_temp, nk=list(nk), k_shift=list(k_shift), lvs=[list(v) for v in lvs], mapping=list(mapping), hbond_records=[h.to_dict() for h in hbonds], sk_set=sk_set, J_ev=J)
-    return dict(corners=corners, corner_us=CORNER_US, paths=paths, J_ev=J, hbonds=hbonds, enames=enames, apos_ref=apos_ref, lvs=lvs, meta=meta)
+    scan = dict(corners=corners, corner_us=CORNER_US, paths=paths, J_ev=J, hbonds=hbonds, enames=enames, apos_ref=apos_ref, lvs=lvs, meta=meta)
+    save_scan(scan, os.path.join(work_dir, 'scan.pkl'))
+    return scan
+
+
+def save_scan(scan, path):
+    """Pickle the corner-scan dict so figures can be replotted without rerunning DFTB."""
+    import pickle
+    with open(path, 'wb') as f:
+        pickle.dump(scan, f)
+
+
+def load_scan(path):
+    """Load a scan dict saved by `save_scan` (HbondRecord objects restore as-is)."""
+    import pickle
+    with open(path, 'rb') as f:
+        return pickle.load(f)
 
 
 def plot_corner_overlay(scan, atoms, savepath, sz=30.):
@@ -507,8 +528,13 @@ def plot_corner_scan(scan, atoms, title, savepath):
         dE = c0['e_ev'] - Emin
         bs = '  '.join(f"{d1:.2f}/{d2:.2f}" for d1, d2 in c0.get('bonds', []))
         lab = f"{c0['name']}  u={u}\n" + (f"ΔE={dE:.3f} eV" if np.isfinite(dE) else "relax FAILED") + (f"\nD–H/H···A: {bs}" if bs else "")
-        apos_c = rigid_align(c0['apos'], ref, idx=anchor) if ref is not None else c0['apos']
-        _pu.draw_mol_junctions(ax, atoms, apos_c, scan['hbonds'], label=lab, lvs=scan.get('lvs'), jnames=[str(j + 1) for j in range(len(scan['hbonds']))])
+        # PBC: lattice pins orientation -> plot absolute coords (Kabsch on the
+        # near-collinear junction atoms would leave a free twist about the
+        # junction axis and rotate the tilted molecular planes edge-on)
+        apos_c = c0['apos'] if scan.get('lvs') is not None else (rigid_align(c0['apos'], ref, idx=anchor) if ref is not None else c0['apos'])
+        # PBC scan pins the whole junction scaffold (D,H,A of each junction)
+        fixed = sorted({i for hb in scan['hbonds'] for i in (hb.donor_idx, hb.h_idx, hb.acceptor_idx)}) if scan.get('lvs') is not None and scan.get('meta', {}).get('fix_scan_h') else None
+        _pu.draw_mol_junctions(ax, atoms, apos_c, scan['hbonds'], label=lab, lvs=scan.get('lvs'), jnames=[str(j + 1) for j in range(len(scan['hbonds']))], fixed_idx=fixed)
 
     # --- perimeter loop: edges concatenated LL→RL→RR→LR→LL -------------------
     ax_l = fig.add_subplot(gs[0, 2])
@@ -562,6 +588,88 @@ def plot_corner_scan(scan, atoms, title, savepath):
     ax_d.set_title('diagonals (concerted / swap)')
     ax_d.grid(True, alpha=0.3)
     ax_d.legend(fontsize=7.5, loc='best')
+
+    os.makedirs(os.path.dirname(savepath) or '.', exist_ok=True)
+    fig.savefig(savepath, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved: {savepath}")
+
+
+def plot_corner_diagram(scan, atoms, savepath, sz=18.):
+    """Energy diagram of the LL->RR transition.  TOP half: row of the four
+    corner geometries (LL, RL, LR, RR — matching their x positions below),
+    each in a box with an arrow down to its point.  BOTTOM half: energy vs
+    reaction progress — stepwise paths via RL (red) / via LR (blue), concerted
+    LL->RR diagonal (black dashed), RL<->LR swap (thin gray vertical).
+
+    SVG-compatible: pass savepath ending in .svg to get editable vector output.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from spammm import plotUtils as _pu
+    corners = scan['corners']
+    n2u = {c['name']: u for u, c in corners.items()}
+    E = {c['name']: c['e_ev'] for c in corners.values()}
+    Emin = np.nanmin(list(E.values()))
+    Erel = {k: v - Emin for k, v in E.items()}
+
+    fig = plt.figure(figsize=(14, 10))
+    ax = fig.add_axes([0.08, 0.08, 0.86, 0.40])
+    ax.set_xlabel('reaction progress:  LL → RR')
+    ax.set_ylabel('E − E_min [eV]')
+    J = scan['J_ev']
+    ax.set_title(f"{scan.get('meta', {}).get('name', '')}  J = {J:+.3f} eV" if np.isfinite(J) else 'J = NaN')
+
+    edge = {p['label']: p for p in scan['paths'] if 'diag' not in p['label']}
+    diag = {p['label']: p for p in scan['paths'] if 'diag' in p['label']}
+
+    def _edge_xy(lab, x0, x1):
+        p = edge.get(lab)
+        if p is None:
+            return None
+        ok = np.isfinite(p['energies_ev'])
+        return x0 + (x1 - x0) * p['fracs'][ok], p['energies_ev'][ok] - Emin
+
+    for labs, col, name in ((('edge u2=0: LL→RL', 'edge u1=1: RL→RR'), 'tab:red', 'via RL'),
+                            (('edge u1=0: LL→LR', 'edge u2=1: LR→RR'), 'tab:blue', 'via LR')):
+        for k, lab in enumerate(labs):
+            seg = _edge_xy(lab, 0.5 * k, 0.5 * (k + 1))
+            if seg is not None:
+                ax.plot(*seg, 'o-', color=col, lw=0.9, ms=3, label=name if k == 0 else None)
+        ax.plot(0.5, Erel[name.split()[-1]], 's', color=col, ms=7, mfc='none', mew=1.4, zorder=6)
+    p = diag.get('diag LL→RR')
+    if p is not None:
+        ok = np.isfinite(p['energies_ev'])
+        ax.plot(p['fracs'][ok], p['energies_ev'][ok] - Emin, 's--', color='k', lw=0.9, ms=3, label='diag LL→RR (concerted)')
+    p = diag.get('diag RL→LR')
+    if p is not None:
+        ok = np.isfinite(p['energies_ev'])
+        ax.plot(0.5 + 0.0 * p['fracs'][ok], p['energies_ev'][ok] - Emin, 'd:', color='0.55', lw=0.7, ms=3, label='diag RL→LR (swap)')
+    for x, nm in ((0.0, 'LL'), (1.0, 'RR')):
+        ax.plot(x, Erel[nm], 'o', color='k', ms=8, mfc='none', mew=1.6, zorder=7)
+    ax.set_xticks([0.0, 0.5, 1.0])
+    ax.set_xticklabels(['LL', 'LR / RL', 'RR'])
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8, loc='best')
+
+    # top row: corner geometries LL, RL, LR, RR (matching x positions below) +
+    # narrow xz side view (axes=(0,2)) next to each -> shows the herringbone tilt
+    geo_order = ['LL', 'RL', 'LR', 'RR']
+    bw, bwz, bh, y0 = 0.17, 0.055, 0.40, 0.55
+    xs = [0.01, 0.26, 0.51, 0.76]
+    fixed = sorted({i for hb in scan['hbonds'] for i in (hb.donor_idx, hb.h_idx, hb.acceptor_idx)})
+    tgt = dict(LL=(0.0, Erel['LL']), RR=(1.0, Erel['RR']), RL=(0.5, Erel['RL']), LR=(0.5, Erel['LR']))
+    for nm, bx in zip(geo_order, xs):
+        u = n2u[nm]
+        c0 = corners[u]
+        axb = fig.add_axes([bx, y0, bw, bh])
+        bs = '  '.join(f"{d1:.2f}/{d2:.2f}" for d1, d2 in c0.get('bonds', []))
+        _pu.draw_mol_junctions(axb, atoms, c0['apos'], scan['hbonds'], label=f"{nm}  ΔE={Erel[nm]:.2f} eV\n{bs}", sz=sz, lvs=scan.get('lvs'), jnames=[str(j + 1) for j in range(len(scan['hbonds']))], lw=0.8, label_off=0.55, fixed_idx=fixed, frame=True)
+        axz = fig.add_axes([bx + bw + 0.004, y0 + 0.10, bwz, 0.24])
+        _pu.draw_mol_junctions(axz, atoms, c0['apos'], scan['hbonds'], sz=sz, axes=(0, 2), lvs=scan.get('lvs'), lw=0.8, fixed_idx=fixed, annotate=False, frame=True)
+        ax.annotate('', xy=tgt[nm], xycoords='data', xytext=(bx + 0.5 * bw, y0), textcoords='figure fraction',
+                    arrowprops=dict(arrowstyle='->', color='0.3', lw=0.9, shrinkA=2, shrinkB=4))
 
     os.makedirs(os.path.dirname(savepath) or '.', exist_ok=True)
     fig.savefig(savepath, dpi=150, bbox_inches='tight')

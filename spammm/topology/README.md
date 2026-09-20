@@ -16,7 +16,8 @@ See also: `kernels/README.md` (GPU force fields consume topology via `AtomicSyst
 | File | Purpose |
 |------|---------|
 | `AtomicGraph.py` | Object-graph: stable Atom/Bond/Ring `_id`; `format_table()` for test dumps |
-| `MoleculeEditorBackend.py` | Editing engine: hex grid, passivation, rings, `_sync_sys()`, MOL/XYZ export |
+| `MoleculeEditorBackend.py` | Editing engine: hex grid, passivation, rings, `_sync_sys()`, MOL/XYZ export; `build_zigzag_ribbon` — PBC zigzag GNR with edge passivation (`PASSIVATION_GROUPS`; 'N' pyridinic / 'NH' protonated edge, per-site strings) |
+| `ribbon_pbc.py` | Periodic ribbon builders & scans: `build_ribbon_cell` (single PBC ribbon → atoms/lvs/seam), `build_ribbon_junction_cell` (stacked N+NH pair → periodic N···H-N interfaces, {p,d,0} per-site states, returns AtomicSystem+lvs+HbondRecords, `run_corner_scan_pbc`-compatible), `scan_junction_gap` (E(d_DA) lattice-y scan via `run_pbc`, exact 3-pt parabola + p↔d parity), `check_degrees`, `save_xyz_lvs`. Plots in `plotUtils.plot_ribbon_*`; driver `tests/topology/testplot_ribbon.py` → `debug/ribbon/` |
 | `KekulePure.py` | Kekulé π-bond optimizer: feasibility, multi-seed localization, 6-ring validation; planned input to RI density (`doc/Tasks/Kekule_ExponentialDensityFit.md`) |
 | `PackedMolecule.py` | Dense NumPy snapshot of `AtomicGraph` for undo/clipboard |
 | `FFparams.py` | Parse UFF/SPFF `.dat` parameter files → atom types, REQs |

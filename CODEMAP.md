@@ -18,7 +18,8 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 
 ### spammm/topology/ — Molecular Topology (SSOT: AtomicGraph)
 - `AtomicGraph.py` — `Atom`, `Bond`, `Ring` classes; `to_arrays()`. **Authoritative** molecular structure (see skill:`molecular-structure-sync`)
-- `MoleculeEditorBackend.py` — molecular editor backend: graph ↔ dense arrays; hex grid, editing ops, `_sync_sys()`, export
+- `MoleculeEditorBackend.py` — molecular editor backend: graph ↔ dense arrays; hex grid, editing ops, `_sync_sys()`, export; `build_zigzag_ribbon` (PBC N/O/H-terminated GNRs, `bPeriodicX=True`, passivation strings `n/N/o/O/H/h`)
+- `ribbon_pbc.py` — periodic ribbon builders: `build_ribbon_cell` (single ribbon → atoms/lvs/seam), `build_ribbon_junction_cell` (two-ribbon N···H-N junction cell, PBC x/y, {p,d,0} site states, HbondRecords), `scan_junction_gap` (d_DA scan via run_pbc, 3-pt parabola, p↔d parity), `check_degrees`, `save_xyz_lvs`; MEB keeps lazy shims for the moved functions
 - `KekulePure.py` — Kekule pi-bond order solver; feasibility precheck, multi-seed localization, 6-ring validation; writes results back to `Bond.order`
 - `PackedMolecule.py` — compact molecule representation
 - `FFparams.py` — forcefield parameter assignment from topology
@@ -177,7 +178,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `ref_data/` — git-tracked reference files (`.ref.json`, `.ref.xyz`)
 - `helpers/` — test utility modules (`parity.py`, `geometry.py`, `scan.py`, `folded_rigid.py`, `topology_test.py`)
 - `SPM/` — AFM/STM tests and plots (`test_afm_contact_surface.py`, `testplot_afm_contact_surface.py`)
-- `topology/` — topology editing, Kekule (`test_kekule.py`), H-bond DFTB scan (`test_hbond_scan.py`), RC scan (`test_scan_dataset.py`, `testplot_hbond_scan.py`)
+- `topology/` — topology editing, Kekule (`test_kekule.py`), H-bond DFTB scan (`test_hbond_scan.py`), RC scan (`test_scan_dataset.py`, `testplot_hbond_scan.py`), PBC ribbons (`testplot_ribbon.py` → `debug/ribbon/`), π bond orders (`testplot_bond_order.py` → `debug/test_bond_order/`)
 - `GUI/` — `test_rc_scan_gui_script.py` (offscreen RC review script)
 - `surfaces/` — surface-specific tests
 - `forcefields/` — forcefield-specific tests

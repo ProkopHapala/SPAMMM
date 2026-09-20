@@ -44,6 +44,8 @@ pytest tests/topology/test_editing_ops.py --develop -s  # new feature debug
 | `testplot_assembly.py` | Hexagonal SAM assembly search, clash/strain maps, XYZ export |
 | `testplot_pairff_energy_mc.py` | PairFF+FAF rigid-body greedy MC assembly (8 mols, multi-species, charge colors, GIF trajectory) |
 | `testplot_contact_surface.py` | GPU contact surface vs brute Morse (separable + PIC) |
+| `topology/testplot_ribbon.py` | Thin driver over `spammm/topology/ribbon_pbc.py`: PBC zigzag GNRs, N-terminated edges (`--widths --ncells --passivation --dftb`); `--two` = two-ribbon N···H-N junction cell (`--bottom N --top NH --dda --state`); `--scan-ly` = d_DA lattice-y scan (3-pt parabola + p↔d parity, `--relax` for ionic relax) → `debug/ribbon/` |
+| `topology/testplot_bond_order.py` | π bond-order maps from DFTBcore DM over corner-scan states → `debug/test_bond_order/` |
 | `SPM/test_afm_*.py` | AFM pytest (Morse + FDBM; FAST_S3 parity) |
 | `SPM/bench_fdbm.py` | Headless FDBM timing (`SPAMMM_AFM_BENCH`); see `doc/Tasks/PerfBenchmark_FDBM.md` |
 | `SPM/testplot_*.py` | AFM visual diagnostics |

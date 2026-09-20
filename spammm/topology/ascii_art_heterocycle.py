@@ -774,6 +774,56 @@ PBC_CHAIN_ARTS = {
   C
   O
 """,
+    # pyridine-substituted hq2q variants: the inner ortho C-H's clash across the
+    # zigzag junctions (~0.4 A), so one clashing CH per junction -> pyridinic N.
+    #   hq2qNa: N alternates side — junction-internal N on the Q acceptor,
+    #           boundary N on the HQ donor (N's on DIFFERENT molecules).
+    #   hq2qNb: both N's on the Q acceptor molecule (same molecule).
+    # (left/right column of the ortho 'C C' rows = which side faces the junction)
+    'hq2qNa': """
+  O
+  C
+ C C
+ N C
+  C
+  O
+  :
+  o
+  C
+ C C
+ C N
+  C
+  o
+  :
+  O
+  C
+ C C
+ N C
+  C
+  O
+""",
+    'hq2qNb': """
+  O
+  C
+ C N
+ N C
+  C
+  O
+  :
+  o
+  C
+ C C
+ C C
+  C
+  o
+  :
+  O
+  C
+ C N
+ N C
+  C
+  O
+""",
     # pyrazine / 1,4-dihydropyrazine: N-H...N junctions (6-ring, N apex atoms).
     'pyr2hpyr': """
   N
@@ -866,7 +916,24 @@ C C C
 }
 
 
-def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0, relax_bonds=True, tilt=0.0):
+PBC_CELL_PARAMS = {  # per-system build defaults (overridable by explicit args)
+    # hydroquinone/quinone: O-H...O is bent ~120 deg at the acceptor.  Default is
+    # now the AXIAL geometry: molecules unrotated along y, blocks offset so every
+    # junction leans slant deg off y.  slant=60 gives C-O-H ~115-125 deg at the
+    # donor and C=O...H ~120 deg at the acceptor (the phenol-like kink; the
+    # proton path is oblique along the true D...A direction).  All junctions
+    # identical + sites related by half-cell translation -> E_LL = E_RR by
+    # construction.  (Old alternative: zigzag=60, tilt=30, slant=0.)
+    'hq2q': dict(tilt=0.0, zigzag=0.0, slant=60.0),
+    # pyridine-substituted variants (clashing ortho C-H -> N): same axial slant
+    # geometry; also clash-free under zigzag=60.
+    'hq2qNa': dict(tilt=0.0, zigzag=0.0, slant=60.0),
+    'hq2qNb': dict(tilt=0.0, zigzag=0.0, slant=60.0),
+}
+PBC_TILT_DEFAULT = 45.0   # herringbone tilt for all other chain systems
+
+
+def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0, relax_bonds=True, tilt=None, zigzag=None, slant=None):
     """Build a 1D-periodic H-bond chain unit cell from a PBC_CHAIN_ARTS stack.
 
     The art is a stack of molecule blocks separated by ':' junction rows; the
@@ -875,18 +942,36 @@ def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0
     last block becomes a boundary junction whose partner gets a cell shift of +1
     (HbondRecord.d_shift/a_shift).
 
+    Geometry assembly (after the flat stack is built):
+      1. zigzag : rotate molecule block k by (-1)^k * zigzag deg in-plane (about
+         z through the block centroid) — for bent X-H...Y bonds (~120 deg at the
+         acceptor, e.g. O-H...O in hq2q) so the junction can kink.
+      2. junction realignment : translate each block so every junction D...A
+         pair sits exactly hbond_length apart on a line parallel to y
+         (straightens staggered arts; no-op for symmetric ones).
+      3. the cell is rotated so the lattice vector is pure +y.
+      4. tilt : herringbone rotation of block k by (-1)^k * tilt deg about the
+         axis through the block's two junction heavy atoms — junction D...A is
+         preserved EXACTLY (atoms on the axis don't move); +/-45 makes
+         consecutive molecular planes ~perpendicular (same trick as
+         make_qxhq_chain.py), relieving H...H steric clash across junctions.
+
     Args:
-        tilt : herringbone tilt [deg] — molecule block k is rotated by
-               (-1)^k * tilt around the y-axis through its own center column.
-               Makes consecutive molecular planes mutually ~2*tilt apart (e.g.
-               +/-45 => perpendicular), relieving steric clash of facing H's
-               across the junctions (same trick as make_qxhq_chain.py).
+        tilt   : herringbone tilt [deg]; None -> PBC_CELL_PARAMS default (45).
+        zigzag : in-plane zigzag angle [deg]; None -> PBC_CELL_PARAMS default (0).
 
     Returns:
         atoms  : AtomicSystem for one cell (capping H included, junction H's on donors)
         lvs    : (3,3) lattice vectors [A], chain along y, vacuum in x/z
         hbonds : list[HbondRecord] with d_shift/a_shift marking image partners
     """
+    defaults = PBC_CELL_PARAMS.get(name, {})
+    if tilt is None:
+        tilt = defaults.get('tilt', PBC_TILT_DEFAULT)
+    if zigzag is None:
+        zigzag = defaults.get('zigzag', 0.0)
+    if slant is None:
+        slant = defaults.get('slant', 0.0)
     if art is None:
         art = PBC_CHAIN_ARTS[name]
     atoms = parse_ascii_art(art, hbond_length=hbond_length)
@@ -918,8 +1003,34 @@ def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0
     blocks = [[] for _ in range(nblocks)]
     for i in range(atoms.natoms):
         blocks[_block_of(i)].append(i)
+    if zigzag or tilt:
+        assert (nblocks - 1) % 2 == 0, "zigzag/tilt need an even number of in-cell blocks (image parity)"
 
-    # last block = periodic image of first: match atoms by (row, col) order and check
+    # junction endpoint heavy atoms per ':' row: (upper_atom, lower_atom),
+    # sorted so jpairs[j] connects blocks j and j+1 (hbonds_ascii order != row order)
+    jpairs = []
+    for ih, ia in atoms.hbonds_ascii:
+        ngh = [jj for jj in atoms.ngs[ih] if atoms.enames[jj] != 'H']
+        assert len(ngh) == 1, f"junction H {ih} has {len(ngh)} heavy neighbours"
+        idon = ngh[0]
+        bd, ba = _block_of(idon), _block_of(ia)
+        assert abs(bd - ba) == 1, f"junction must connect adjacent blocks (got {bd},{ba})"
+        jpairs.append((min(bd, ba), (idon, ia) if bd < ba else (ia, idon)))
+    jpairs = [p for _, p in sorted(jpairs)]
+    assert len(jpairs) == nblocks - 1
+
+    # (1) zigzag: rotate block k in-plane by (-1)^k * zigzag about z through its centroid
+    if zigzag:
+        for k, blk in enumerate(blocks):
+            idx = np.asarray(blk)
+            ctr = atoms.apos[idx].mean(axis=0)
+            th = np.radians((1.0 if k % 2 == 0 else -1.0) * zigzag)
+            c, s = np.cos(th), np.sin(th)
+            d = atoms.apos[idx] - ctr
+            atoms.apos[idx, 0] = ctr[0] + d[:, 0] * c - d[:, 1] * s
+            atoms.apos[idx, 1] = ctr[1] + d[:, 0] * s + d[:, 1] * c
+
+    # last block = periodic image of first: match atoms by (row, col) order
     first, last = blocks[0], blocks[-1]
     drawn_first = [i for i in first if i < ndrawn]
     drawn_last = [i for i in last if i < ndrawn]
@@ -928,10 +1039,51 @@ def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0
     drawn_last.sort(key=lambda i: (rows[i], atoms.apos[i, 0]))
     for i, j in zip(drawn_first, drawn_last):
         assert atoms.enames[i] == atoms.enames[j], f"image block ename mismatch at {i}/{j}"
+    img = {j: i for i, j in zip(drawn_first, drawn_last)}  # last-block atom -> first-block atom
+
+    # (2a) slant mode: straighten each block — rotate rigidly about its centroid so
+    #      the axis through its two junction heavy atoms is parallel to y (the bond
+    #      relax can skew junction atoms off-axis; straight axial molecules make the
+    #      slant offsets accumulate into a pure-y lattice; skipped under zigzag
+    #      where junction axes are intentionally rotated)
+    if slant and not zigzag:
+        for k, blk in enumerate(blocks[:-1]):
+            itop = jpairs[k - 1][1] if k >= 1 else img[jpairs[-1][1]]
+            ibot = jpairs[k][0]
+            pa, pb = atoms.apos[itop], atoms.apos[ibot]
+            axv = pb - pa
+            axv /= np.linalg.norm(axv)
+            uy = np.array([0.0, np.sign(axv[1]), 0.0])          # keep up/down order
+            rot = np.cross(axv, uy)
+            th = np.arcsin(np.clip(np.linalg.norm(rot), -1.0, 1.0))
+            if th < 1e-9:
+                continue
+            rot = rot / np.linalg.norm(rot) * th
+            c, s = np.cos(th), np.sin(th)
+            u = rot / th
+            idx = np.asarray(blk)
+            ctr = atoms.apos[idx].mean(axis=0)
+            d = atoms.apos[idx] - ctr
+            atoms.apos[idx] = ctr + d * c + np.cross(u, d) * s + u * (d @ u)[:, None] * (1.0 - c)
+
+    # (2) realign junctions: translate block j+1 so its junction atom sits exactly
+    #     hbond_length below block j's junction atom, on a line leaning by slant
+    #     deg off y (alternating sign per junction -> offsets cancel, lattice stays
+    #     pure y, molecules stay axial; slant mimics the ~120 deg C-O-H kink so the
+    #     H-bond/proton path is oblique).  slant=0 -> junctions vertical.
+    sa = np.radians(slant)
+    for j, (au, al) in enumerate(jpairs):
+        pu, pl = atoms.apos[au], atoms.apos[al]
+        sgn = 1.0 if j % 2 == 0 else -1.0
+        dx_t = sgn * np.sin(sa) * hbond_length
+        dy_t = -np.cos(sa) * hbond_length
+        dy = pl[1] - pu[1]
+        shift = np.array([pu[0] + dx_t - pl[0], dy_t - dy, 0.0])
+        atoms.apos[np.asarray(blocks[j + 1])] += shift
+
     t = np.median(np.array([atoms.apos[j] - atoms.apos[i] for i, j in zip(drawn_first, drawn_last)]), axis=0)
     resid = max(np.linalg.norm(atoms.apos[j] - atoms.apos[i] - t) for i, j in zip(drawn_first, drawn_last))
     assert resid < 0.05, f"image block not a pure translation of first (max resid {resid:.3f} A)"
-    img = {j: i for i, j in zip(drawn_first, drawn_last)}  # last-block atom -> first-block atom
 
     # cell contents: all blocks except the last
     cell_atoms = [i for b in blocks[:-1] for i in b]
@@ -940,47 +1092,68 @@ def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0
     apos_c = np.array([atoms.apos[i] for i in cell_atoms], dtype=float)
     bonds_c = [(remap[i], remap[j]) for i, j in atoms.bonds if i in remap and j in remap]
 
-    # flip y so the cell vector points +y, then wrap into [0, Ly)
-    Ly = abs(t[1])
-    apos_c[:, 1] *= -1.0 if t[1] < 0 else 1.0
+    # (3) rotate cell so the lattice vector is pure +y (zigzag may give t an x-component)
+    if t[1] < 0:
+        apos_c[:, 1] *= -1.0
+        t = t * np.array([1.0, -1.0, 1.0])
+    phi = np.arctan2(t[0], t[1])
+    if abs(phi) > 1e-9:
+        c, s = np.cos(-phi), np.sin(-phi)
+        xy = apos_c[:, :2].copy()
+        apos_c[:, 0] = xy[:, 0] * c - xy[:, 1] * s
+        apos_c[:, 1] = xy[:, 0] * s + xy[:, 1] * c
+        t = np.array([0.0, np.linalg.norm(t), 0.0])
+    Ly = t[1]
     apos_c[:, 1] -= apos_c[:, 1].min() - 0.5 * hbond_length   # margin so boundary junction sits inside plot range
 
-    # herringbone tilt: rotate block k by (-1)^k*tilt about the y-axis through
-    # the block's own center column (junction axis); image block has the same
-    # parity as block 0, so the boundary junction stays consistent
+    # (4) herringbone tilt: rotate block k by (-1)^k * tilt about the axis through
+    #     the block's two junction heavy atoms -> junction D...A preserved exactly
     if tilt:
-        th = np.radians(tilt)
         for k, blk in enumerate(blocks[:-1]):
+            itop = jpairs[k - 1][1] if k >= 1 else img[jpairs[-1][1]]
+            ibot = jpairs[k][0]
+            pa, pb = apos_c[remap[itop]], apos_c[remap[ibot]]
+            axv = pb - pa
+            axv /= np.linalg.norm(axv)
+            p0 = 0.5 * (pa + pb)
+            th = np.radians((1.0 if k % 2 == 0 else -1.0) * tilt)
+            c, s = np.cos(th), np.sin(th)
             idx = np.array([remap[i] for i in blk])
-            xa = apos_c[idx, 0].mean()
-            dx = apos_c[idx, 0] - xa
-            c, s = np.cos((1.0 if k % 2 == 0 else -1.0) * th), np.sin((1.0 if k % 2 == 0 else -1.0) * th)
-            x_new = dx * c - apos_c[idx, 2] * s
-            apos_c[idx, 2] = dx * s + apos_c[idx, 2] * c
-            apos_c[idx, 0] = xa + x_new
+            d = apos_c[idx] - p0
+            apos_c[idx] = p0 + d * c + np.cross(axv, d) * s + axv * (d @ axv)[:, None] * (1.0 - c)
 
     lvs = np.array([[apos_c[:, 0].ptp() + vac_x, 0.0, 0.0], [0.0, Ly, 0.0], [0.0, 0.0, apos_c[:, 2].ptp() + vac_z]])
     lvec = np.array([0.0, Ly, 0.0])
 
     # junctions: hbonds_ascii = (h_idx, acc_idx); donor = heavy neighbour of h;
-    # a partner in the last (image) block is remapped to its first-block atom with shift +1
+    # a partner in the last (image) block is remapped to its first-block atom with shift +1.
+    # The junction H is placed on the D->A axis at r_xh (the corner scan repositions it anyway).
     from spammm.topology.hbond_utils import HbondRecord
+    r_xh = 1.01
     hbonds = []
     for ih, ia in atoms.hbonds_ascii:
         ngh = [j for j in atoms.ngs[ih] if atoms.enames[j] != 'H']
-        assert len(ngh) == 1, f"junction H {ih} has {len(ngh)} heavy neighbours"
         idon = ngh[0]
         d_sh = +1 if _block_of(idon) == nblocks - 1 else 0
         a_sh = +1 if _block_of(ia) == nblocks - 1 else 0
-        id_c, ia_c = remap[img.get(idon, idon)], remap[img.get(ia, ia)]
-        dist = np.linalg.norm(apos_c[id_c] + d_sh * lvec - (apos_c[ia_c] + a_sh * lvec))
-        hbonds.append(HbondRecord(id_c, remap[ih], ia_c, float(dist), 180.0, d_shift=d_sh, a_shift=a_sh))
+        id_c, ih_c, ia_c = remap[img.get(idon, idon)], remap[ih], remap[img.get(ia, ia)]
+        pD, pA = apos_c[id_c] + d_sh * lvec, apos_c[ia_c] + a_sh * lvec
+        axv = pA - pD
+        dist = float(np.linalg.norm(axv))
+        apos_c[ih_c] = pD + r_xh * axv / dist
+        hbonds.append(HbondRecord(id_c, ih_c, ia_c, dist, 180.0, d_shift=d_sh, a_shift=a_sh))
 
     cell = AtomicSystem(apos=apos_c, enames=enames_c)
     cell.atypes = [_elements.ELEMENT_DICT[e][0] - 1 for e in enames_c]
     cell.bonds = np.array(bonds_c, dtype=np.int32)
     cell._pbc_img = img
     cell._pbc_remap = remap
+
+    # steric-clash check on the finished cell (incl. boundary image pairs);
+    # junction D..A/H..A pairs are close by design -> excluded
+    from spammm.atomicUtils import check_clashes
+    jexc = [p for hb in hbonds for p in ((hb.donor_idx, hb.h_idx), (hb.h_idx, hb.acceptor_idx), (hb.donor_idx, hb.acceptor_idx))]
+    check_clashes(cell.apos, cell.enames, cell.bonds, lvec=lvec, exclude=jexc, label=name or 'pbc_cell')
     return cell, lvs, hbonds
 def main():
     parser = argparse.ArgumentParser(description='Generate heterocycle geometry from ASCII art')

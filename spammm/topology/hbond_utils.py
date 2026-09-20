@@ -68,11 +68,23 @@ def hbond_positions(apos, hb, lvs=None):
     return apos[hb.donor_idx] + hb.d_shift * lvec, apos[hb.h_idx], apos[hb.acceptor_idx] + hb.a_shift * lvec
 
 
+def _min_image_dist(p1, p2, lvs):
+    """Minimum-image |p1-p2| along the chain axis (wrap y-difference into [-Ly/2, Ly/2])."""
+    d = np.asarray(p1) - np.asarray(p2)
+    if lvs is not None:
+        Ly = np.linalg.norm(np.asarray(lvs)[1])
+        if Ly > 1e-8:
+            d[1] -= Ly * round(d[1] / Ly)
+    return float(np.linalg.norm(d))
+
+
 def junction_bond_lengths(apos, hbonds, lvs=None):
     """Per-junction (D–H, H···A) distances [Å] for each HbondRecord — the state-defining
-    numbers of a proton-transfer corner (2 junctions → 4 lengths)."""
+    numbers of a proton-transfer corner (2 junctions → 4 lengths).
+    With lvs, the acceptor distance is minimum-image (the recorded shift is the
+    INTENDED pairing; after drift the nearest image may differ)."""
     out = []
     for h in hbonds:
         pD, pH, pA = hbond_positions(apos, h, lvs)
-        out.append((float(np.linalg.norm(pH - pD)), float(np.linalg.norm(pH - pA))))
+        out.append((float(_min_image_dist(pH, pD, lvs)), float(_min_image_dist(pH, pA, lvs))))
     return out

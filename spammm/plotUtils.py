@@ -1488,15 +1488,19 @@ def imshow_array(data_2d, title='', cmap='viridis', symmetric=None, colorbar=Tru
     return fig
 
 
-def draw_mol_junctions(ax, atoms, apos, hbonds, label=None, sz=90., axes=(0, 1), lvs=None, jnames=None):
+def draw_mol_junctions(ax, atoms, apos, hbonds, label=None, sz=90., axes=(0, 1), lvs=None, jnames=None, lw=1.2, label_off=0.35, r_cov=1.4, fixed_idx=None, annotate=True, frame=False):
     """Draw one molecule geometry on *ax* with its H-bond junctions annotated.
 
     Reusable panel for proton-transfer / corner-scan figures: renders the molecule via
-    `plotSystem` (bonds on, labels off), then per `HbondRecord` junction adds
-      - dashed H···A line (magenta),
-      - bond-length labels [Å] at the D–H (blue) and H···A (magenta) midpoints,
+    `plotSystem` (junction D-H / A-H pairs removed from the skeleton — the bond graph is
+    stale once H hops), then per `HbondRecord` junction draws BOTH segments itself:
+      - solid line where the bond is short (d < r_cov -> covalent), dashed where long
+        (H-bond); D-side segment blue, A-side magenta — so the proton position is
+        readable from line style alone,
+      - bond-length labels [A] placed to the LEFT of each segment midpoint,
       - marker rings: donor = blue, acceptor = red, transferring H = green,
-      - per-junction D_j/H_j/A_j labels if *jnames* given.
+      - per-junction D_j/H_j/A_j labels to the RIGHT of each atom if *jnames* given,
+      - small black triangles on *fixed_idx* atoms (pinned during relax).
 
     For periodic cells pass `lvs` — junction partners with nonzero
     HbondRecord.d_shift/a_shift are drawn at their image position
@@ -1505,39 +1509,66 @@ def draw_mol_junctions(ax, atoms, apos, hbonds, label=None, sz=90., axes=(0, 1),
 
     Args:
         ax: matplotlib axes to draw into.
-        atoms: AtomicSystem (only `.apos` is overridden with *apos* — not modified).
+        atoms: AtomicSystem (only `.apos`/`.bonds` overridden on a copy — not modified).
         apos: (n,3) geometry to draw.
         hbonds: list of HbondRecord (donor_idx, h_idx, acceptor_idx[, d_shift, a_shift]).
-        label: optional axes title (e.g. corner name + ΔE + bond summary).
+        label: optional axes title (e.g. corner name + dE + bond summary).
         sz: atom marker size passed to plotSystem; junction rings scale with it.
-        axes: projection axes (default xy).
+        axes: projection axes (default xy; use (0,2) for the xz side view).
         lvs: optional (3,3) lattice vectors for periodic image positions.
         jnames: optional per-junction label prefix (e.g. ['1','2'] -> D1/H1/A1).
+        lw: junction line width.
+        label_off: D_j/H_j/A_j label offset from the atom [data units].
+        r_cov: distance below which a junction segment is drawn solid [A].
+        fixed_idx: optional iterable of pinned atom indices (marked with triangles).
+        annotate: False draws only skeleton+junction lines (for the xz side view).
+        frame: draw a thin border box around the panel.
     """
     from spammm.topology.hbond_utils import hbond_positions
+    from matplotlib.patches import Rectangle
     import copy
     a = copy.copy(atoms)
     a.apos = np.asarray(apos, dtype=float)
+    jp = {tuple(sorted(p)) for hb in hbonds for p in ((hb.donor_idx, hb.h_idx), (hb.acceptor_idx, hb.h_idx))}
+    if a.bonds is None:
+        a.findBonds(Rcut=3.0, RvdwCut=0.5)
+    a.bonds = [b for b in a.bonds if tuple(sorted(b)) not in jp]  # stale graph would draw D-H solid even after the hop
     plt.sca(ax)
     plotSystem(a, axes=axes, bBonds=True, bLabels=False, sz=sz)
     ax1, ax2 = axes
     for jj, hb in enumerate(hbonds):
         pD, pH, pA = hbond_positions(a.apos, hb, lvs)
-        ax.plot([pH[ax1], pA[ax1]], [pH[ax2], pA[ax2]], '--', color=(0.8, 0.2, 0.8), lw=1.2, alpha=0.8, zorder=3)
-        for (pi, pj, col) in ((pD, pH, 'b'), (pH, pA, (0.8, 0.2, 0.8))):
-            ax.annotate(f"{np.linalg.norm(pi - pj):.2f}", (0.5 * (pi[ax1] + pj[ax1]), 0.5 * (pi[ax2] + pj[ax2])), fontsize=7, color=col, ha='center', va='center', zorder=7,
-                        bbox=dict(boxstyle='round,pad=0.1', fc='white', ec='none', alpha=0.75))
-        for p, c in ((pD, 'tab:blue'), (pA, 'tab:red'), (pH, 'lime')):
-            ax.scatter([p[ax1]], [p[ax2]], s=sz * 2.2, facecolors='none', edgecolors=c, linewidths=1.6, zorder=5)
-        if jnames:
-            jn = jnames[jj]
-            for p, t, c in ((pD, 'D' + jn, 'tab:blue'), (pH, 'H' + jn, 'green'), (pA, 'A' + jn, 'tab:red')):
-                ax.annotate(t, (p[ax1] + 0.35, p[ax2] + 0.25), fontsize=8, color=c, weight='bold', zorder=8)
+        if lvs is not None:
+            # draw to the NEAREST image of each partner (drift may re-pair the junction)
+            lvec = np.asarray(lvs)[1]
+            for s in (-1, 1):
+                if np.linalg.norm(pH - (pA + s * lvec)) < np.linalg.norm(pH - pA):
+                    pA = pA + s * lvec
+                if np.linalg.norm(pH - (pD + s * lvec)) < np.linalg.norm(pH - pD):
+                    pD = pD + s * lvec
+        for pi, pj, col in ((pD, pH, 'b'), (pH, pA, (0.8, 0.2, 0.8))):
+            d = np.linalg.norm(pi - pj)
+            ax.plot([pi[ax1], pj[ax1]], [pi[ax2], pj[ax2]], '-' if d < r_cov else '--', color=col, lw=lw, alpha=0.85, zorder=3)
+            if annotate:
+                ax.annotate(f"{d:.2f}", (0.5 * (pi[ax1] + pj[ax1]) - label_off, 0.5 * (pi[ax2] + pj[ax2])), fontsize=6, color=col, ha='right', va='center', zorder=7,
+                            bbox=dict(boxstyle='round,pad=0.08', fc='white', ec='none', alpha=0.7))
+        if annotate:
+            for p, c in ((pD, 'tab:blue'), (pA, 'tab:red'), (pH, 'lime')):
+                ax.scatter([p[ax1]], [p[ax2]], s=sz * 2.2, facecolors='none', edgecolors=c, linewidths=1.0, zorder=5)
+            if jnames:
+                jn = jnames[jj]
+                for p, t, c in ((pD, 'D' + jn, 'tab:blue'), (pH, 'H' + jn, 'green'), (pA, 'A' + jn, 'tab:red')):
+                    ax.annotate(t, (p[ax1] + label_off, p[ax2] + label_off * 0.6), fontsize=7, color=c, weight='bold', zorder=8)
+    if fixed_idx is not None:
+        pfix = a.apos[list(fixed_idx)]
+        ax.scatter(pfix[:, ax1], pfix[:, ax2] - 0.45, marker='^', s=10, c='k', zorder=9)
     if label:
         ax.set_title(label, fontsize=10)
     ax.set_aspect('equal')
     ax.axis('off')
     ax.margins(0.15)
+    if frame:
+        ax.add_patch(Rectangle((0, 0), 1, 1, transform=ax.transAxes, fill=False, ec='k', lw=0.8, zorder=10))
 
 
 def plot_geom_overlay(geoms, bonds, labels, ref=0, modes=None, markers=None, savepath=None, title='', figsize_per_panel=(7.0, 7.0)):
@@ -1648,6 +1679,139 @@ def plot_pbc_chain_cell(atoms, lvs, hbonds, n_cells=3, savepath=None, title=None
     ax.axis('off')
     ax.set_xlim(x0 - 0.5, x1 + 2.2)
     ax.set_title(title or f'PBC chain cell, Ly={lvec[1]:.2f} A')
+    if savepath:
+        os.makedirs(os.path.dirname(savepath) or '.', exist_ok=True)
+        fig.savefig(savepath, dpi=140, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Saved: {savepath}")
+    return fig
+
+
+RIBBON_CMAP = {'C': '0.45', 'N': 'tab:blue', 'O': 'tab:red', 'H': '0.75'}
+
+
+def plot_ribbon_pbc_cell(atoms, lvs, seam, n_cells=3, savepath=None, title=None, sz=140.):
+    """Tile n_cells copies of a PBC ribbon along the periodic (x) axis.
+
+    Seam bonds (seam=True) wrap: the low-x endpoint's next image bonds to the
+    high-x endpoint.  Cell box in magenta; neighbor cells faded.
+
+    Args:
+        atoms: AtomicSystem for one cell (atoms.bonds used for the skeleton).
+        lvs: (3,3) lattice vectors; ribbon direction = lvs[0].
+        seam: bool array per bond marking x-seam wrap bonds (from
+              ribbon_pbc.build_ribbon_cell).
+        n_cells: number of cells to tile (odd looks best).
+    """
+    from matplotlib.patches import Rectangle
+    apos = np.asarray(atoms.apos)
+    bonds = np.asarray(atoms.bonds)
+    Lx = lvs[0, 0]
+    fig, ax = plt.subplots(figsize=(2.0 + 3.2 * n_cells, 4.5))
+    half = n_cells // 2
+    for s in range(-half, half + 1):
+        alpha = 1.0 if s == 0 else 0.45
+        off = s * Lx
+        for k, (i, j) in enumerate(bonds):
+            if seam[k]:   # wrap bond: low-x endpoint's next image bonds to the high-x endpoint
+                ilo, ihi = (i, j) if apos[i, 0] < apos[j, 0] else (j, i)
+                ax.plot([apos[ilo, 0] + off + Lx, apos[ihi, 0] + off],
+                        [apos[ilo, 1], apos[ihi, 1]], 'k-', lw=1.2, alpha=alpha, zorder=1)
+            else:
+                ax.plot([apos[i, 0] + off, apos[j, 0] + off],
+                        [apos[i, 1], apos[j, 1]], 'k-', lw=1.2, alpha=alpha, zorder=1)
+        for i, e in enumerate(atoms.enames):
+            ax.scatter(apos[i, 0] + off, apos[i, 1], c=RIBBON_CMAP.get(e, '0.5'),
+                       s=sz if e != 'H' else sz * 0.3, zorder=3, alpha=alpha, edgecolor='k', lw=0.4)
+    ax.add_patch(Rectangle((0.0, apos[:, 1].min() - 1.0), Lx, apos[:, 1].ptp() + 2.0,
+                           fill=False, edgecolor='magenta', lw=2.0))
+    ax.annotate('cell', (Lx + 0.2, apos[:, 1].mean()), fontsize=12, color='magenta', weight='bold')
+    ax.set_aspect('equal')
+    ax.axis('off')
+    ax.set_title(title or f'PBC ribbon, Lx={Lx:.2f} A')
+    if savepath:
+        os.makedirs(os.path.dirname(savepath) or '.', exist_ok=True)
+        fig.savefig(savepath, dpi=140, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Saved: {savepath}")
+    return fig
+
+
+def plot_ribbon_junction_cell(atoms, lvs, hbonds, nx=3, ny=2, savepath=None, title=None, sz=140.):
+    """Tile the two-ribbon junction cell nx along x, ny along y (stacking dir).
+
+    Junctions drawn D-H solid (blue) / H...A dashed (magenta), image partners
+    placed via hbond_positions (a_shift crosses the cell boundary).
+
+    Args:
+        atoms: AtomicSystem for one junction cell (atoms.bonds = skeleton,
+               includes x-seam wraps — drawn as min-image segments).
+        lvs: (3,3) lattice vectors; lvs[0]=ribbon dir, lvs[1]=stack dir.
+        hbonds: list of HbondRecord (from ribbon_pbc.build_ribbon_junction_cell).
+    """
+    from matplotlib.patches import Rectangle
+    from spammm.topology.hbond_utils import hbond_positions
+    apos = np.asarray(atoms.apos)
+    bonds = np.asarray(atoms.bonds)
+    Lx, Ly = lvs[0, 0], lvs[1, 1]
+    fig, ax = plt.subplots(figsize=(2.0 + 3.0 * nx, 1.5 + 2.8 * ny))
+    hx = nx // 2
+    for sy in range(ny):
+        for sx in range(-hx, hx + 1):
+            alpha = 1.0 if (sx, sy) == (0, 0) else 0.35
+            off = np.array([sx * Lx, sy * Ly])
+            for i, j in bonds:
+                d = apos[j] - apos[i]
+                pi = apos[i, :2] + off
+                pj = pi + d[:2] - np.array([np.round(d[0] / Lx) * Lx, 0.0])   # min-image in x (seam bonds)
+                ax.plot([pi[0], pj[0]], [pi[1], pj[1]], 'k-', lw=1.2, alpha=alpha, zorder=1)
+            for i, e in enumerate(atoms.enames):
+                ax.scatter(apos[i, 0] + off[0], apos[i, 1] + off[1], c=RIBBON_CMAP.get(e, '0.5'),
+                           s=sz if e != 'H' else sz * 0.35, zorder=3, alpha=alpha, edgecolor='k', lw=0.4)
+            for hb in hbonds:   # junction: D-H covalent (blue) + H...A dashed (magenta)
+                pD, pH, pA = hbond_positions(apos, hb, lvs)
+                ax.plot([pD[0] + off[0], pH[0] + off[0]], [pD[1] + off[1], pH[1] + off[1]], color='b', lw=1.6, alpha=alpha, zorder=4)
+                ax.plot([pH[0] + off[0], pA[0] + off[0]], [pH[1] + off[1], pA[1] + off[1]], color=(0.8, 0.2, 0.8), lw=1.4, ls='--', alpha=alpha, zorder=4)
+    ax.add_patch(Rectangle((0.0, 0.0), Lx, Ly, fill=False, edgecolor='magenta', lw=2.0))
+    ax.annotate('cell', (Lx + 0.2, 0.5 * Ly), fontsize=12, color='magenta', weight='bold')
+    ax.set_aspect('equal')
+    ax.axis('off')
+    ax.set_title(title or 'two-ribbon junction cell')
+    if savepath:
+        os.makedirs(os.path.dirname(savepath) or '.', exist_ok=True)
+        fig.savefig(savepath, dpi=140, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Saved: {savepath}")
+    return fig
+
+
+def plot_gap_scan(gaps, res, fits, labels=None, savepath=None, title=None):
+    """Plot E(d_DA) scan curves + exact 3-pt parabola interpolations.
+
+    Args:
+        gaps: array of N...N distances [A].
+        res:  {state: E array [eV]} from ribbon_pbc.scan_junction_gap.
+        fits: {state: (coef, d_opt, E_opt, sel)} — parabola drawn through the
+              3 lowest points, vertex marked with 'x' + d_opt annotation.
+        labels: {state: display name} (default: state string itself).
+    """
+    labels = labels or {}
+    fig, ax = plt.subplots(figsize=(7, 5))
+    xf = np.linspace(np.min(gaps), np.max(gaps), 200)
+    for st, Es in res.items():
+        lab = labels.get(st, st)
+        E0 = np.nanmin(Es)
+        ax.plot(gaps, Es - E0, 'o', label=lab)
+        if st in fits:
+            c, d_opt, E_opt, sel = fits[st]
+            ax.plot(xf, np.polyval(c, xf) - E_opt, '-', lw=1.0)
+            ax.plot([d_opt], [0.0], 'x', ms=9, mew=2)
+            ax.annotate(f'{d_opt:.3f}', (d_opt, 0.0), fontsize=8, ha='center', va='bottom')
+    ax.set_xlabel('junction N...N distance d_DA [A]')
+    ax.set_ylabel('E - E_min [eV]')
+    ax.set_title(title or 'junction gap scan')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
     if savepath:
         os.makedirs(os.path.dirname(savepath) or '.', exist_ok=True)
         fig.savefig(savepath, dpi=140, bbox_inches='tight')

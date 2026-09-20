@@ -1823,8 +1823,10 @@ class MoleculeEditorBackend:
 
         # Apply anisotropic scaling if requested
         if scale_x != 1.0 or scale_y != 1.0:
+            self._sync_sys()   # passivation may have added atoms since last sync
             self.sys.apos[:, 0] *= scale_x
             self.sys.apos[:, 1] *= scale_y
+            self.graph.update_positions_from_array(self.sys.apos)
 
         return self
 
@@ -2066,46 +2068,42 @@ class MoleculeEditorBackend:
                 y_positions.append(y_positions[-1] + yb)
 
         # Build atoms - create all atoms (DFT code handles PBC wrapping)
-        self.sys.bonds = np.empty((0, 2), dtype=np.int32)
-        
+        # Bonds live in the graph (SSOT); modulo indices give the wrap bonds
+        # across the x-seam so the periodic topology is complete.
+        rows_atoms = []
         for row in range(width_chains):
             is_A_strip = strip_types[row]
             y = y_positions[row]
             x_shift = 0.0 if is_A_strip else xa
-
+            row_atoms = []
             for i in range(length_cells):
                 x = i * x_periodicity + x_shift
-                self._append_atom([x, y, 0.0], 'C', npi=1)
+                a = self._append_atom([x, y, 0.0], 'C', npi=1)
+                row_atoms.append(a)
 
                 # Add bonds to previous row
                 if row > 0:
-                    prev_row_start = (row - 1) * length_cells
+                    prev = rows_atoms[row - 1]
                     prev_is_A = strip_types[row - 1]
-                    atom_idx = len(self.sys.apos) - 1
-                    prev_idx = prev_row_start + i
-                    self.sys.bonds = np.append(self.sys.bonds, [[prev_idx, atom_idx]], axis=0)
-
+                    self.graph.add_bond(prev[i], a)
                     if is_A_strip and not prev_is_A:
-                        if i > 0:
-                            prev_idx = prev_row_start + (i - 1)
-                            self.sys.bonds = np.append(self.sys.bonds, [[prev_idx, atom_idx]], axis=0)
+                        self.graph.add_bond(prev[(i - 1) % length_cells], a)
                     elif not is_A_strip and prev_is_A:
-                        if i < length_cells - 1:
-                            prev_idx = prev_row_start + (i + 1)
-                            self.sys.bonds = np.append(self.sys.bonds, [[prev_idx, atom_idx]], axis=0)
+                        self.graph.add_bond(prev[(i + 1) % length_cells], a)
+            rows_atoms.append(row_atoms)
 
-        # Apply y offsets
+        # Apply y offsets (on graph atoms - sys.apos is a synced copy)
         if y_bottom_offset is not None:
-            for i in range(length_cells):
-                self.sys.apos[i, 1] -= y_bottom_offset
-
+            for a in rows_atoms[0]:
+                a.pos[1] -= y_bottom_offset
         if y_top_offset is not None:
-            start_idx = (width_chains - 1) * length_cells
-            for i in range(length_cells):
-                self.sys.apos[start_idx + i, 1] += y_top_offset
+            for a in rows_atoms[-1]:
+                a.pos[1] += y_top_offset
 
+        self._sync_sys()   # passivation reads sys.apos / adds atoms via graph
         # Passivate top and bottom rows only (zigzag edges)
         self._strip_passivate(width_chains, length_cells, passivation_bottom, passivation_top)
+        self._sync_sys()   # reflect passivated atoms/elements in sys
 
     def _strip_passivate(self, width_chains, length_cells, passivation_bottom, passivation_top):
         """Passivate only top and bottom rows for strip-based construction (zigzag edges).
@@ -2151,15 +2149,20 @@ class MoleculeEditorBackend:
         pos_C = self.sys.apos[ia]
         direction = 1.0 if is_top else -1.0
 
-        # Process each atom in the group
+        # Process each atom in the group; appended atoms bond to the previous
+        # group member (C-OH: O->edge, H->O; NH: H->edge N)
+        atom_list, *_ = self.graph.to_arrays()
+        prev_atom = atom_list[ia]
         for i, (elem, x, y, z) in enumerate(group):
             if i == 0 and x == 0.0 and y == 0.0 and z == 0.0:
                 # First atom at origin replaces the C atom
                 self._set_atom_element(ia, elem)
             else:
-                # Add atom at C_pos + scaled coords
+                # Add atom at C_pos + scaled coords, bonded to previous group atom
                 pos_new = [pos_C[0] + x, pos_C[1] + y * direction, pos_C[2] + z]
-                self._append_atom(pos_new, elem, npi=-1)
+                a_new = self._append_atom(pos_new, elem, npi=-1)
+                self.graph.add_bond(prev_atom, a_new)
+                prev_atom = a_new
 
     def combine_ribbons(self, backend1, backend2, L_Hb=2.0, shift_x=0.0):
         """Combine two single ribbons into a two-ribbon system with hydrogen-bond gap.
@@ -2179,10 +2182,11 @@ class MoleculeEditorBackend:
         -------
         self (for chaining)
         """
-        apos_N = backend1.sys.apos.copy()
-        apos_NH = backend2.sys.apos.copy()
-        enames_N = backend1.sys.enames
-        enames_NH = backend2.sys.enames
+        # Read source topologies from the graphs (SSOT) — sys may be stale
+        _, enames_N,  apos_N,  _, bonds_N,  blist_N,  _ = backend1.graph.to_arrays()
+        _, enames_NH, apos_NH, _, bonds_NH, blist_NH, _ = backend2.graph.to_arrays()
+        apos_N  = apos_N.copy()
+        apos_NH = apos_NH.copy()
 
         # Center y positions
         apos_N[:, 1] -= apos_N[:, 1].mean()
@@ -2197,19 +2201,18 @@ class MoleculeEditorBackend:
         y_min_NH = np.min(apos_NH[:, 1])
         apos_NH[:, 1] += (y_max_N + L_Hb) - y_min_NH
 
-        # Combine into this backend
+        # Combine into this backend: copy atoms, then bonds with the block offset
+        # (nearest-heavy bonding would give each atom a single bond — wrong topology)
         self.__init__(a_CC=self.a_CC)
-        added_atoms = []
-        for pos, ename in zip(apos_N, enames_N):
-            a = self._append_atom(pos, ename)
-            added_atoms.append(a)
-        for pos, ename in zip(apos_NH, enames_NH):
-            a = self._append_atom(pos, ename)
-            added_atoms.append(a)
-        # Create bonds for all added atoms (no recalc_bonds!)
-        for a in added_atoms:
-            self._create_bond_to_nearest_heavy(a)
+        added = [self._append_atom(p, e) for p, e in zip(apos_N,  enames_N)]
+        n1 = len(added)
+        added += [self._append_atom(p, e) for p, e in zip(apos_NH, enames_NH)]
+        for (i, j), b in zip(bonds_N, blist_N):
+            self.graph.add_bond(added[i], added[j], order=b.order)
+        for (i, j), b in zip(bonds_NH, blist_NH):
+            self.graph.add_bond(added[n1 + i], added[n1 + j], order=b.order)
         self.graph.sync_neighbor_lists()
+        self._sync_sys()
         return self
 
     def build_two_ribbon_cell(self, width_chains=4, length_cells=1, Lx=2.4, L_Hb=2.0, shift_x=0.0, 
@@ -2349,12 +2352,16 @@ class MoleculeEditorBackend:
         pos_C = self.sys.apos[ia]
         direction = 1.0 if is_top else -1.0
 
+        atom_list, *_ = self.graph.to_arrays()
+        prev_atom = atom_list[ia]
         for i, (elem, x, y, z) in enumerate(group):
             if i == 0 and x == 0.0 and y == 0.0 and z == 0.0:
                 self._set_atom_element(ia, elem)
             else:
                 pos_new = [pos_C[0] + x, pos_C[1] + y * direction, pos_C[2] + z]
-                self._append_atom(pos_new, elem, npi=-1)
+                a_new = self._append_atom(pos_new, elem, npi=-1)
+                self.graph.add_bond(prev_atom, a_new)
+                prev_atom = a_new
 
     def _apply_side_passivation(self, passivation):
         """Apply passivation to side edges (left/right) of the combined two-ribbon system.
@@ -2398,8 +2405,10 @@ class MoleculeEditorBackend:
             raise ValueError(f"Unknown passivation type: {passivation}")
 
         group = PASSIVATION_GROUPS[passivation]
+        atom_list, *_ = self.graph.to_arrays()
         for ia, direction in side_atoms:
             pos_C = self.sys.apos[ia]
+            prev_atom = atom_list[ia]
             # Process each atom in the group (swap x and y for side edges)
             for i, (elem, x, y, z) in enumerate(group):
                 if i == 0 and x == 0.0 and y == 0.0 and z == 0.0:
@@ -2409,7 +2418,9 @@ class MoleculeEditorBackend:
                     # Add atom at C_pos + coords (swap x and y for side edges)
                     # y becomes x-direction for side edges
                     pos_new = [pos_C[0] + y * direction, pos_C[1] + x, pos_C[2] + z]
-                    self._append_atom(pos_new, elem, npi=-1)
+                    a_new = self._append_atom(pos_new, elem, npi=-1)
+                    self.graph.add_bond(prev_atom, a_new)
+                    prev_atom = a_new
 
     def report_state(self):
         """Print summary of the backend state for debugging."""
@@ -2425,102 +2436,24 @@ class MoleculeEditorBackend:
 
 
 # ============ Module-level convenience functions ============
-
-def build_ribbon(passivation, width_chains, length_cells, Lx, a_CC=1.42):
-    """Build a ribbon and return arrays (mirrors deprecated GrapheneRibbonBuilder.build_ribbon API).
-
-    Parameters
-    ----------
-    passivation : str
-        Edge passivation type ('N', 'NH', 'CH', 'H', 'O', 'C=O', 'C-OH').
-    width_chains : int
-        Number of atom rows across the ribbon width.
-    length_cells : int
-        Number of unit cells along the ribbon length.
-    Lx : float
-        Target periodic length along x (Angstrom).
-    a_CC : float
-        C-C bond length (Angstrom).
-
-    Returns
-    -------
-    pos2d : np.ndarray, shape (n_atoms, 2)
-        2D atom positions.
-    atypes : np.ndarray, dtype int32
-        Atomic numbers.
-    elems : list of str
-        Element symbols.
-    """
-    backend = MoleculeEditorBackend(a_CC=a_CC)
-    xa_nom = a_CC * np.cos(np.pi / 6)
-    scale_x = Lx / (2.0 * xa_nom)
-    backend.build_zigzag_ribbon(width_chains=width_chains, length_cells=length_cells,
-                                  passivation=passivation, scale_x=scale_x, bPeriodicX=False)
-    elems = list(backend.sys.enames)
-    atypes = backend.sys.atypes
-    pos2d = backend.sys.apos[:, :2].copy()
-    return pos2d, atypes, elems
+# Ribbon builders moved to spammm/topology/ribbon_pbc.py:
+#   build_ribbon, build_two_ribbon_cell, build_ribbon_junction_cell,
+#   build_ribbon_cell, check_degrees, scan_junction_gap, save_xyz_lvs
 
 
-def build_two_ribbon_cell(width_chains=4, length_cells=1, Lx=2.4, a_CC=1.42, L_Hb=2.0, shift_x=0.0):
-    """Build a cell with two ribbons separated by a hydrogen-bond gap.
+def build_ribbon(*args, **kwargs):
+    """Backward-compat shim — implementation moved to spammm.topology.ribbon_pbc."""
+    from spammm.topology.ribbon_pbc import build_ribbon as _f
+    return _f(*args, **kwargs)
 
-    Mirrors the deprecated GrapheneRibbonBuilder.build_two_ribbon_cell API.
 
-    Parameters
-    ----------
-    width_chains : int
-        Number of atom rows per ribbon.
-    length_cells : int
-        Number of unit cells along ribbon length.
-    Lx : float
-        Target periodic length along x (Angstrom).
-    a_CC : float
-        C-C bond length (Angstrom).
-    L_Hb : float
-        Hydrogen-bond separation between ribbons (Angstrom).
-    shift_x : float
-        Relative shift along x (fraction of Lx).
+def build_two_ribbon_cell(*args, **kwargs):
+    """Backward-compat shim — implementation moved to spammm.topology.ribbon_pbc."""
+    from spammm.topology.ribbon_pbc import build_two_ribbon_cell as _f
+    return _f(*args, **kwargs)
 
-    Returns
-    -------
-    apos : np.ndarray, shape (n_atoms, 3)
-        3D atom positions.
-    atypes : np.ndarray, dtype int32
-        Atomic numbers.
-    elems : list of str
-        Element symbols.
-    lvs : np.ndarray, shape (3, 3)
-        Lattice vectors.
-    """
-    backend1 = MoleculeEditorBackend(a_CC=a_CC)
-    backend2 = MoleculeEditorBackend(a_CC=a_CC)
-    xa_nom = a_CC * np.cos(np.pi / 6)
-    scale_x = Lx / (2.0 * xa_nom)
-    backend1.build_zigzag_ribbon(width_chains, length_cells, passivation='N', scale_x=scale_x, bPeriodicX=False)
-    backend2.build_zigzag_ribbon(width_chains, length_cells, passivation='NH', scale_x=scale_x, bPeriodicX=False)
 
-    apos_N = backend1.sys.apos.copy()
-    apos_NH = backend2.sys.apos.copy()
-    apos_N[:, 1]  -= apos_N[:, 1].mean()
-    apos_NH[:, 1] -= apos_NH[:, 1].mean()
-    apos_NH[:, 0] += shift_x * Lx
-
-    y_max_N  = np.max(apos_N[:, 1])
-    y_min_NH = np.min(apos_NH[:, 1])
-    apos_NH[:, 1] += (y_max_N + L_Hb) - y_min_NH
-
-    y_span_N  = np.max(apos_N[:, 1])  - np.min(apos_N[:, 1])
-    y_span_NH = np.max(apos_NH[:, 1]) - np.min(apos_NH[:, 1])
-    Ly = y_span_N + y_span_NH + 2 * L_Hb
-
-    apos   = np.vstack([apos_N, apos_NH])
-    atypes = np.concatenate([backend1.sys.atypes, backend2.sys.atypes])
-    elems  = list(backend1.sys.enames) + list(backend2.sys.enames)
-
-    apos[:, 2] = 0.0
-    apos[:, 1] -= apos[:, 1].mean()
-    Lz = 20.0
-    apos[:, 2] += 0.5 * Lz
-    lvs = np.array([[Lx, 0.0, 0.0], [0.0, Ly, 0.0], [0.0, 0.0, Lz]])
-    return apos, atypes, elems, lvs
+def build_ribbon_junction_cell(*args, **kwargs):
+    """Backward-compat shim — implementation moved to spammm.topology.ribbon_pbc."""
+    from spammm.topology.ribbon_pbc import build_ribbon_junction_cell as _f
+    return _f(*args, **kwargs)

@@ -541,6 +541,55 @@ def rmsd(apos, ref, idx=None):
     return float(np.sqrt(((P - Q) ** 2).sum(1).mean()))
 
 
+def check_clashes(apos, enames, bonds=None, lvec=None, rmin=None, exclude=None, verbose=True, label=''):
+    """Steric-clash check on a built structure: list all NON-BONDED atom pairs
+    closer than element-pair thresholds (incl. periodic images if *lvec* given).
+    1,2- and 1,3-bonded pairs are excluded (need `bonds` for the 1,3 shell);
+    pairs in `exclude` (e.g. junction D···A/H···A) are skipped too.
+
+    Default thresholds [Å]: H–H 1.9, X–H 1.55, X–X 2.3 — tight enough to catch
+    steric repulsion without flagging normal H-bonds (H···A ~1.8-2.4).
+
+    Returns sorted list of (d, i, j, shift) violations; prints a report if verbose."""
+    apos = np.asarray(apos, dtype=float)
+    rmin = dict(rmin or {'HH': 1.9, 'XH': 1.55, 'XX': 2.3})
+    bonded = set()
+    if bonds is not None:
+        bs = {tuple(sorted(map(int, b))) for b in bonds}
+        bonded |= bs
+        ngs = neigh_atoms(len(apos), bonds)
+        for i in range(len(apos)):  # 1,3 pairs
+            for j in ngs[i]:
+                for k in ngs[j]:
+                    if k != i:
+                        bonded.add(tuple(sorted((i, int(k)))))
+    bonded |= {tuple(sorted(map(int, p))) for p in (exclude or [])}
+    shifts = [(0.0, 0.0, 0.0)] + ([tuple(lvec), tuple(-np.asarray(lvec))] if lvec is not None else [])
+    out = []
+    for i in range(len(apos)):
+        for j in range(i + 1, len(apos)):
+            if (i, j) in bonded:
+                continue
+            hh = enames[i] == 'H' and enames[j] == 'H'
+            xh = 'H' in (enames[i], enames[j])
+            thr = rmin['HH' if hh else 'XH' if xh else 'XX']
+            for s in shifts:
+                d = np.linalg.norm(apos[i] - apos[j] + np.asarray(s))
+                if d < thr:
+                    out.append((d, i, j, s))
+    out.sort()
+    if verbose:
+        tag = f'[{label}] ' if label else ''
+        if not out:
+            print(f'{tag}check_clashes: OK — no non-bonded pairs below thresholds')
+        else:
+            print(f'{tag}check_clashes: {len(out)} close non-bonded pairs:')
+            for d, i, j, s in out:
+                si = f' img{s}' if s != (0.0, 0.0, 0.0) else ''
+                print(f'    {enames[i]}{i} .. {enames[j]}{j}{si}: {d:.2f} A')
+    return out
+
+
 # def rotation_matrix(axis, angle):
 #     axis = axis / np.linalg.norm(axis)
 #     ca, sa = np.cos(angle), np.sin(angle)

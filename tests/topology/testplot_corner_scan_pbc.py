@@ -16,20 +16,71 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from spammm.topology.ascii_art_heterocycle import build_pbc_cell, PBC_CHAIN_ARTS
-from spammm.quantum.coordinate_scan import run_corner_scan_pbc, plot_corner_scan, plot_corner_overlay, write_corner_scan_xyz
+from spammm.quantum.coordinate_scan import (run_corner_scan_pbc, plot_corner_scan, plot_corner_overlay, plot_corner_diagram, write_corner_scan_xyz, load_scan, save_scan,
+                                            CORNER_US, CORNER_NAMES, SQUARE_PATHS, _axis_grid, interpolate_all_atoms, junction_bond_lengths, HAU2EV)
 
 DEBUG_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'debug', 'test_corner_scan_pbc')
 
 
-def run_one(name, dx=0.25, relax_corners=True, sk_set=None, work_root=None, nk=(1, 8, 1), filling_temp=300.0, rescue_temp=600.0, hbond_length=2.8, tilt=45.0):
-    atoms, lvs, hbonds = build_pbc_cell(name, hbond_length=hbond_length, tilt=tilt)
+def recover_scan(name, work_dir, atoms, lvs, hbonds, dx=0.25):
+    """Rebuild the scan dict (and scan.pkl) from an existing run's DFTB output
+    dirs — parses energies from OUT files, corner geometries from geom.out.gen.
+    For rescuing runs done before save_scan existed, or after manual edits."""
+    from spammm.quantum.DFTB_utils import parse_energy_out, read_relaxed_geometry
+
+    def _energy(d):
+        try:
+            return parse_energy_out(os.path.join(d, 'OUT')) * HAU2EV
+        except Exception:
+            return np.nan
+
+    corners = {}
+    scaffold = atoms.apos
+    for u in CORNER_US:
+        cname = CORNER_NAMES[u]
+        d = os.path.join(work_dir, f'corner_{cname}')
+        cwd = os.getcwd()
+        os.chdir(d)
+        apos_r = read_relaxed_geometry(atoms.apos, do_relax=True)
+        os.chdir(cwd)
+        corners[u] = dict(name=cname, apos=apos_r, e_ev=_energy(d), bonds=junction_bond_lengths(apos_r, hbonds, lvs))
+        if u == CORNER_US[0]:
+            scaffold = apos_r
+        bs = '  '.join(f"DH={d1:.3f} HA={d2:.3f}" for d1, d2 in corners[u]['bonds'])
+        print(f"    {cname} junctions: {bs}  E={corners[u]['e_ev']:.4f} eV")
+
+    fr = _axis_grid(0.0, 1.0, dx)
+    paths = []
+    for ip, (uA, uB, lab) in enumerate(SQUARE_PATHS):
+        stack = interpolate_all_atoms(corners[uA]['apos'], corners[uB]['apos'], fr)
+        energies_ev = np.array([_energy(os.path.join(work_dir, f'path_{ip:02d}_{i:03d}')) for i in range(len(fr))])
+        paths.append(dict(uA=uA, uB=uB, label=lab, fracs=fr, energies_ev=energies_ev, apos_frames=stack))
+
+    E00, E10, E01, E11 = (corners[u]['e_ev'] for u in CORNER_US)
+    J = E11 + E00 - E10 - E01 if np.isfinite([E00, E10, E01, E11]).all() else np.nan
+    meta = dict(name=name, scan_type='corner_square_pbc', dx=dx, lvs=[list(v) for v in lvs], hbond_records=[h.to_dict() for h in hbonds], J_ev=J, recovered=True)
+    scan = dict(corners=corners, corner_us=CORNER_US, paths=paths, J_ev=J, hbonds=hbonds, enames=atoms.enames, apos_ref=atoms.apos, lvs=lvs, meta=meta)
+    save_scan(scan, os.path.join(work_dir, 'scan.pkl'))
+    print(f"  recovered scan -> {work_dir}/scan.pkl   J = {J:+.4f} eV")
+    return scan
+
+
+def run_one(name, dx=0.25, relax_corners=True, sk_set=None, work_root=None, nk=(1, 8, 1), filling_temp=300.0, rescue_temp=600.0, hbond_length=2.8, tilt=None, zigzag=None, slant=None, plot_only=False, recover=False):
+    atoms, lvs, hbonds = build_pbc_cell(name, hbond_length=hbond_length, tilt=tilt, zigzag=zigzag, slant=slant)
     if len(hbonds) < 2:
         print(f"  SKIP {name}: only {len(hbonds)} junctions (need 2 for corner square)")
         return None
-    mapping = [0, 1]
     work_dir = os.path.join(work_root or DEBUG_DIR, name)
-    print(f"\n=== {name}: PBC corner square ({len(hbonds)} junctions, Ly={lvs[1, 1]:.2f} A, nk={nk}, dx={dx}) ===")
-    scan = run_corner_scan_pbc(atoms.enames, atoms.apos, lvs, hbonds, mapping, dx=dx, relax_corners=relax_corners, sk_set=sk_set, work_dir=work_dir, nk=nk, filling_temp=filling_temp, rescue_temp=rescue_temp, verbose=True)
+    if recover:
+        print(f"\n=== {name}: recover scan from {work_dir} ===")
+        scan = recover_scan(name, work_dir, atoms, lvs, hbonds, dx=dx)
+    elif plot_only:
+        scan = load_scan(os.path.join(work_dir, 'scan.pkl'))
+        print(f"\n=== {name}: replot from {work_dir}/scan.pkl ===")
+    else:
+        mapping = [0, 1]
+        print(f"\n=== {name}: PBC corner square ({len(hbonds)} junctions, Ly={lvs[1, 1]:.2f} A, nk={nk}, dx={dx}) ===")
+        scan = run_corner_scan_pbc(atoms.enames, atoms.apos, lvs, hbonds, mapping, dx=dx, relax_corners=relax_corners, sk_set=sk_set, work_dir=work_dir, nk=nk, filling_temp=filling_temp, rescue_temp=rescue_temp, verbose=True)
     os.makedirs(DEBUG_DIR, exist_ok=True)
     for u in scan['corner_us']:
         c0 = scan['corners'][u]
@@ -40,9 +91,13 @@ def run_one(name, dx=0.25, relax_corners=True, sk_set=None, work_root=None, nk=(
     xyz = os.path.join(DEBUG_DIR, f'corner_{name}.xyz')
     plot_corner_scan(scan, atoms, f'{name} PBC corner square', png)
     plot_corner_overlay(scan, atoms, png_ov)
+    svg = os.path.join(DEBUG_DIR, f'diagram_{name}.svg')
+    plot_corner_diagram(scan, atoms, svg)
+    plot_corner_diagram(scan, atoms, svg.replace('.svg', '.png'))
     write_corner_scan_xyz(scan, atoms, xyz)
     print(f"REVIEW: {png}")
     print(f"REVIEW: {png_ov}")
+    print(f"REVIEW: {svg}")
     print(f"REVIEW: {xyz}")
     return scan
 
@@ -54,14 +109,18 @@ def main():
     parser.add_argument('--sk_set', default=None, help='DFTB SK set (default: from config)')
     parser.add_argument('--nk', type=int, default=8, help='k-points along chain (default: 8)')
     parser.add_argument('--hbond', type=float, default=2.8, help='D..A junction gap [A] (default: 2.8)')
-    parser.add_argument('--tilt', type=float, default=45.0, help='herringbone tilt [deg], alternate molecules +/-tilt (default: 45)')
+    parser.add_argument('--tilt', type=float, default=None, help='herringbone tilt [deg], alternate molecules +/-tilt (default: per-system, 45 except hq2q=0)')
+    parser.add_argument('--zigzag', type=float, default=None, help='in-plane zigzag angle [deg] (default: per-system, hq2q=60)')
+    parser.add_argument('--slant', type=float, default=None, help='oblique junction lean off y-axis [deg], alternating per junction (default: per-system, 0)')
     parser.add_argument('--no-relax', action='store_true', help='Skip corner relax (rigid corners, SP only)')
     parser.add_argument('--filling-temp', type=float, default=300.0, help='Fermi smearing T [K] for all PBC runs (default: 300)')
     parser.add_argument('--rescue-temp', type=float, default=600.0, help='Retry failed SCC at this Fermi T [K] (0 disables)')
+    parser.add_argument('--plot-only', action='store_true', help='Skip DFTB; replot figures from saved <name>/scan.pkl')
+    parser.add_argument('--recover', action='store_true', help='Rebuild scan.pkl from existing DFTB output dirs (no new DFTB runs), then replot')
     args = parser.parse_args()
     names = sorted(PBC_CHAIN_ARTS) if args.name == 'all' else [args.name]
     for name in names:
-        run_one(name, dx=args.dx, relax_corners=not args.no_relax, sk_set=args.sk_set, nk=(1, args.nk, 1), filling_temp=args.filling_temp, rescue_temp=args.rescue_temp or None, hbond_length=args.hbond, tilt=args.tilt)
+        run_one(name, dx=args.dx, relax_corners=not args.no_relax, sk_set=args.sk_set, nk=(1, args.nk, 1), filling_temp=args.filling_temp, rescue_temp=args.rescue_temp or None, hbond_length=args.hbond, tilt=args.tilt, zigzag=args.zigzag, slant=args.slant, plot_only=args.plot_only, recover=args.recover)
 
 
 if __name__ == '__main__':
