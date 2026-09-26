@@ -46,6 +46,11 @@ pytest tests/topology/test_editing_ops.py --develop -s  # new feature debug
 | `testplot_contact_surface.py` | GPU contact surface vs brute Morse (separable + PIC) |
 | `topology/testplot_ribbon.py` | Thin driver over `spammm/topology/ribbon_pbc.py`: PBC zigzag GNRs, N-terminated edges (`--widths --ncells --passivation --dftb`); `--two` = two-ribbon N···H-N junction cell (`--bottom N --top NH --dda --state`); `--scan-ly` = d_DA lattice-y scan (3-pt parabola + p↔d parity, `--relax` for ionic relax) → `debug/ribbon/` |
 | `topology/testplot_bond_order.py` | π bond-order maps from DFTBcore DM over corner-scan states → `debug/test_bond_order/` |
+| `topology/testplot_muH.py` | Per-site H chemical potentials via DFTB3/3ob: monomer μ1/μ2/J/μ2H + dimer calibration + closed-shell 2H matrix → `debug/muH/`; results reusable via `debug/muH/results.json` (see `doc/ERC_private/muH_monomers.md`) |
+| `topology/testplot_mol_flakes.py` | Symmetric PAH flake generator (row profiles / coronene / triangulene + ASCII-art EXT fillers) + per-site edge chemistry (`C/c/N/n/O/o`) → `debug/mol_flakes/` PNG+XYZ+w×h overview; mirror-symmetry checked per flake (see `doc/ERC_private/task_Molecules.md`) |
+| `topology/testplot_mol_flakes_dftb.py` | DFTB battery on the 9-backbone flake set: 3 chemistries × 5 states SP (162 jobs) → `debug/mol_flakes_dftb/`; energy report/lines, electron-reservoir plot (φ_Au/φ_Gr), `--maps` per-backbone π-BO + relaxed bond-length maps (Aro/Qui/Mixed columns) |
+| `topology/run_pyscf_b3lyp.py` | B3LYP recalculation of jobs exported by `--export-pyscf` (jobs.csv manifest → per-job npz: S, h1e, fock, dm, mo_energy; resumable results.csv) |
+| `quantum/testplot_unfold.py` | Ribbon band structure + supercell unfolding: x1/x2/x4 canonical overlay (replicas, extended-zone check, weight dots), `--passiv` edge-chemistry comparison (w-encoded filenames), `--switch` ref-vs-hydrogenated per C/N/O system, `--sys3` relaxed 1-site-hydrogenated supercells → `debug/unfold/` (+ `index.html` gallery; doc `doc/TopicalAudit/BandUnfolding_Ribbons.md`) |
 | `SPM/test_afm_*.py` | AFM pytest (Morse + FDBM; FAST_S3 parity) |
 | `SPM/bench_fdbm.py` | Headless FDBM timing (`SPAMMM_AFM_BENCH`); see `doc/Tasks/PerfBenchmark_FDBM.md` |
 | `SPM/testplot_*.py` | AFM visual diagnostics |
@@ -56,6 +61,7 @@ pytest tests/topology/test_editing_ops.py --develop -s  # new feature debug
 | Folder | Purpose |
 |--------|---------|
 | `topology/` | Editing, Kekule, ascii art |
+| `quantum/` | PME charge rings (pytest), band unfolding (`testplot_unfold.py`) |
 | `SPM/` | Scanning probe microscopy |
 | `surfaces/` | GridFF utilities, contact-surface demo |
 | `helpers/` | parity, geometry, review, topology_test |

@@ -69,12 +69,14 @@ def hbond_positions(apos, hb, lvs=None):
 
 
 def _min_image_dist(p1, p2, lvs):
-    """Minimum-image |p1-p2| along the chain axis (wrap y-difference into [-Ly/2, Ly/2])."""
+    """Minimum-image |p1-p2| along the chain axis (wrap by integer multiples of
+    the a2 lattice vector; projection handles tilted cells correctly)."""
     d = np.asarray(p1) - np.asarray(p2)
     if lvs is not None:
-        Ly = np.linalg.norm(np.asarray(lvs)[1])
-        if Ly > 1e-8:
-            d[1] -= Ly * round(d[1] / Ly)
+        a2 = np.asarray(lvs)[1]
+        aa = float(np.dot(a2, a2))
+        if aa > 1e-8:
+            d = d - a2 * round(float(np.dot(d, a2)) / aa)
     return float(np.linalg.norm(d))
 
 

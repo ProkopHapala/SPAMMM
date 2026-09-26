@@ -365,7 +365,7 @@ def run_corner_scan(enames, apos_ref, hbonds, mapping, dx=0.25, relax_corners=Tr
     return dict(corners=corners, corner_us=CORNER_US, paths=paths, J_ev=J, hbonds=hbonds, enames=enames, apos_ref=apos_ref, meta=meta)
 
 
-def run_corner_scan_pbc(enames, apos_ref, lvs, hbonds, mapping, dx=0.25, relax_corners=True, fix_scan_h=True, sk_set=None, work_dir='.', r_xh=1.01, nk=(1, 8, 1), k_shift=(0.5, 0.5, 0.5), filling_temp=300.0, rescue_temp=600.0, verbose=True, on_fail='skip', meta=None):
+def run_corner_scan_pbc(enames, apos_ref, lvs, hbonds, mapping, dx=0.25, relax_corners=True, fix_scan_h=True, relax_paths=False, sk_set=None, work_dir='.', r_xh=1.01, nk=(1, 8, 1), k_shift=(0.5, 0.5, 0.5), filling_temp=300.0, rescue_temp=600.0, verbose=True, on_fail='skip', meta=None):
     """Four-state corner square for a PERIODIC H-bond chain cell (DFTB+ PBC).
 
     Same protocol as `run_corner_scan` (relax corners pinned H+bond-partner, then
@@ -383,6 +383,10 @@ def run_corner_scan_pbc(enames, apos_ref, lvs, hbonds, mapping, dx=0.25, relax_c
         nk, k_shift: k-point folding/shift for `run_pbc` (1D chain: nk=(1,Nk,1)).
         filling_temp: Fermi smearing T [K] used uniformly (default 300 K for PBC).
         rescue_temp: one retry at this T on SCC failure (None disables).
+        relax_paths: also relax each interior path frame (scan-H's pinned at the
+            interpolated position — the proton coordinate; everything else free).
+            Stored per path as 'energies_ev_relaxed' + 'apos_frames_relaxed';
+            endpoints reuse the relaxed corner results.
 
     Returns the same dict shape as `run_corner_scan`, plus 'lvs' (needed by
     `plot_corner_scan` to draw boundary junctions to image atoms).
@@ -458,15 +462,106 @@ def run_corner_scan_pbc(enames, apos_ref, lvs, hbonds, mapping, dx=0.25, relax_c
             e_ha, _ = _try_pbc(os.path.join(work_dir, f'path_{ip:02d}_{i:03d}'), apos_i, False, label=f'{lab} f={fr[i]:.2f}')
             if np.isfinite(e_ha):
                 energies_ev[i] = e_ha * HAU2EV
-        paths.append(dict(uA=uA, uB=uB, label=lab, fracs=fr, energies_ev=energies_ev, apos_frames=stack))
+        pth = dict(uA=uA, uB=uB, label=lab, fracs=fr, energies_ev=energies_ev, apos_frames=stack)
+        if relax_paths:
+            fixed_h = sorted({hbonds[mapping[j]].h_idx for j in range(len(mapping))})
+            e_rel = np.full(len(fr), np.nan); e_rel[0], e_rel[-1] = corners[uA]['e_ev'], corners[uB]['e_ev']
+            apos_rel = [corners[uA]['apos']] + [None] * (len(fr) - 2) + [corners[uB]['apos']]
+            for i in range(1, len(fr) - 1):
+                if verbose:
+                    print(f"    relax {lab} f={fr[i]:.2f}")
+                e_ha, apos_r = _try_pbc(os.path.join(work_dir, f'pathr_{ip:02d}_{i:03d}'), stack[i], True, fixed=fixed_h, label=f'{lab} f={fr[i]:.2f} relax')
+                if np.isfinite(e_ha):
+                    e_rel[i], apos_rel[i] = e_ha * HAU2EV, apos_r
+            pth['energies_ev_relaxed'] = e_rel
+            pth['apos_frames_relaxed'] = apos_rel
+        paths.append(pth)
 
     E00, E10, E01, E11 = (corners[u]['e_ev'] for u in CORNER_US)
     J = E11 + E00 - E10 - E01 if np.isfinite([E00, E10, E01, E11]).all() else np.nan
     meta = dict(meta or {})
-    meta.update(scan_type='corner_square_pbc', dx=dx, relax_corners=relax_corners, fix_scan_h=fix_scan_h, filling_temp=filling_temp, rescue_temp=rescue_temp, nk=list(nk), k_shift=list(k_shift), lvs=[list(v) for v in lvs], mapping=list(mapping), hbond_records=[h.to_dict() for h in hbonds], sk_set=sk_set, J_ev=J)
+    meta.update(scan_type='corner_square_pbc', dx=dx, relax_corners=relax_corners, fix_scan_h=fix_scan_h, relax_paths=relax_paths, filling_temp=filling_temp, rescue_temp=rescue_temp, nk=list(nk), k_shift=list(k_shift), lvs=[list(v) for v in lvs], mapping=list(mapping), hbond_records=[h.to_dict() for h in hbonds], sk_set=sk_set, J_ev=J)
     scan = dict(corners=corners, corner_us=CORNER_US, paths=paths, J_ev=J, hbonds=hbonds, enames=enames, apos_ref=apos_ref, lvs=lvs, meta=meta)
     save_scan(scan, os.path.join(work_dir, 'scan.pkl'))
     return scan
+
+
+def write_corner_scan_jobs_pbc(enames, apos_ref, lvs, hbonds, mapping, dx=0.25, sk_set=None, work_dir='.', r_xh=1.01, nk=(1, 8, 1), k_shift=(0.5, 0.5, 0.5), filling_temp=300.0, MixingParameter=0.2, MaxScc=200, SCCTolerance=1e-5, relax_paths=True, rigid_jobs=False, verbose=True):
+    """Bake (but do not run) the PBC corner-scan job tree for a cluster run.
+
+    Writes under work_dir:
+        corner_{LL,RL,LR,RR}/dftb_in.hsd   geometry relax; junction scaffold pinned
+        pathr_{ip:02d}_{i:03d}/dftb_in.hsd relax, scan-H pinned (interior frames only)
+        path_{ip:02d}_{i:03d}/dftb_in.hsd  SP interior frames (only if rigid_jobs)
+        meta.json                          enames/lvs/hbonds/mapping/dx/params for --recover
+
+    Only relaxations are baked by default — rigid path SPs are ~1 s each and are
+    recomputed locally by --recover on frames interpolated between the RECOVERED
+    relaxed corners (which is also more correct: baked path frames can only
+    interpolate the drawn, unrelaxed corners).  Endpoint SPs are never baked —
+    an SP at the relaxed corner geometry is the corner job's own final energy.
+
+    Protocol deviations vs run_corner_scan_pbc (kept honest):
+      - all corners built from the drawn scaffold (in-session seeds RL/LR/RR
+        from relaxed LL); junction atoms are PINNED at identical positions
+        either way, only the carbon-skeleton start differs.
+      - pathr_* starting frames interpolate drawn corners; pinned-H positions
+        are IDENTICAL (corner relax pins H at drawn values), so relaxed-path
+        energies converge to the same constrained minima.
+    """
+    import json
+    from spammm.quantum.DFTB_utils import makeDFTBjob_pbc
+    from spammm.topology.hbond_utils import hbond_positions
+    enames = list(enames)
+    apos_ref = np.asarray(apos_ref, dtype=float)
+    lvs = np.asarray(lvs, dtype=float)
+    hbonds = _hbonds_from_meta(hbonds)
+    assert max(mapping) + 1 == 2, "corner square needs m=2 controls"
+    os.makedirs(work_dir, exist_ok=True)
+
+    def _corner_geometry(u):
+        apos = apos_ref.copy()
+        for j, uj in enumerate(u):
+            hb = hbonds[mapping[j]]
+            pD, _, pA = hbond_positions(apos_ref, hb, lvs)
+            axis = (pA - pD) / np.linalg.norm(pA - pD)
+            apos[hb.h_idx] = (pD + r_xh * axis) if uj < 0.5 else (pA - r_xh * axis)
+        return apos
+
+    fixed_scaffold = sorted({i for j in range(len(mapping)) for i in (hbonds[mapping[j]].donor_idx, hbonds[mapping[j]].h_idx, hbonds[mapping[j]].acceptor_idx)})
+    fixed_h = sorted({hbonds[mapping[j]].h_idx for j in range(len(mapping))})
+    slim = 'Options {\n  WriteDetailedOut = No\n}\n'   # no detailed.out (~1 fewer file/job)
+    corners = {}
+    for u in CORNER_US:
+        cname = CORNER_NAMES[u]
+        cdir = os.path.join(work_dir, f'corner_{cname}')
+        os.makedirs(cdir, exist_ok=True)
+        apos_c = _corner_geometry(u)
+        corners[u] = apos_c
+        makeDFTBjob_pbc(enames=enames, apos=apos_c, lvs=lvs, fname=os.path.join(cdir, 'dftb_in.hsd'), sk_set=sk_set, nk=nk, k_shift=k_shift, opt=True, Temperature=filling_temp, MixingParameter=MixingParameter, MaxScc=MaxScc, SCCTolerance=SCCTolerance, fixed_atoms=fixed_scaffold, extra_hsd=slim)
+    fr = _axis_grid(0.0, 1.0, dx)
+    nsp = nrlx = 0
+    for ip, (uA, uB, lab) in enumerate(SQUARE_PATHS):
+        stack = interpolate_all_atoms(corners[uA], corners[uB], fr)
+        for i, apos_i in enumerate(stack):
+            if not (0 < i < len(fr) - 1):
+                continue                       # endpoints = corner jobs, never baked
+            if rigid_jobs:
+                d = os.path.join(work_dir, f'path_{ip:02d}_{i:03d}')
+                os.makedirs(d, exist_ok=True)
+                makeDFTBjob_pbc(enames=enames, apos=apos_i, lvs=lvs, fname=os.path.join(d, 'dftb_in.hsd'), sk_set=sk_set, nk=nk, k_shift=k_shift, opt=False, Temperature=filling_temp, MixingParameter=MixingParameter, MaxScc=MaxScc, SCCTolerance=SCCTolerance, extra_hsd=slim)
+                nsp += 1
+            if relax_paths:
+                d = os.path.join(work_dir, f'pathr_{ip:02d}_{i:03d}')
+                os.makedirs(d, exist_ok=True)
+                makeDFTBjob_pbc(enames=enames, apos=apos_i, lvs=lvs, fname=os.path.join(d, 'dftb_in.hsd'), sk_set=sk_set, nk=nk, k_shift=k_shift, opt=True, Temperature=filling_temp, MixingParameter=MixingParameter, MaxScc=MaxScc, SCCTolerance=SCCTolerance, fixed_atoms=fixed_h, extra_hsd=slim)
+                nrlx += 1
+    meta = dict(scan_type='corner_square_pbc_prepared', dx=dx, relax_paths=relax_paths, nk=list(nk), k_shift=list(k_shift), filling_temp=filling_temp, lvs=[list(v) for v in lvs], mapping=list(mapping), hbond_records=[h.to_dict() for h in hbonds], sk_set=sk_set)
+    with open(os.path.join(work_dir, 'meta.json'), 'w') as f:
+        json.dump(meta, f, indent=1)
+    if verbose:
+        print(f"  baked 4 corner relaxes + {nsp} path SP + {nrlx} path relaxes -> {work_dir}")
+    return meta
 
 
 def save_scan(scan, path):
@@ -551,7 +646,15 @@ def plot_corner_scan(scan, atoms, title, savepath):
         if rev:
             E, x = E[::-1], 1.0 - x[::-1]
         ok = np.isfinite(E)
-        ax_l.plot(k + x[ok], E[ok], 'o-', color=seg_colors[k], lw=1.4, ms=4, label=lab.split(':')[0])
+        ax_l.plot(k + x[ok], E[ok], 'o--', color=seg_colors[k], lw=0.9, ms=3, alpha=0.45, label=lab.split(':')[0])
+        Er = p.get('energies_ev_relaxed')
+        if Er is not None:
+            Er = np.asarray(Er) - Emin
+            xr = p['fracs'].copy()
+            if rev:
+                Er, xr = Er[::-1], 1.0 - xr[::-1]
+            okr = np.isfinite(Er)
+            ax_l.plot(k + xr[okr], Er[okr], 'o-', color=seg_colors[k], lw=1.6, ms=4)
     name2u = {c['name']: u for u, c in corners.items()}
     for k, nm in enumerate(loop_nodes):
         c0 = corners.get(name2u.get(nm))
@@ -572,9 +675,15 @@ def plot_corner_scan(scan, atoms, title, savepath):
     for p in paths:
         if 'diag' not in p['label']:
             continue
+        col = 'k' if 'LL' in p['label'] else '0.55'
         E = p['energies_ev'] - Emin
         ok = np.isfinite(E)
-        ax_d.plot(p['fracs'][ok], E[ok], 's--', lw=1.4, ms=4, color='k' if 'LL' in p['label'] else '0.55', label=p['label'])
+        ax_d.plot(p['fracs'][ok], E[ok], 's--', lw=0.9, ms=3, alpha=0.45, color=col, label=p['label'] + ' rigid')
+        Er = p.get('energies_ev_relaxed')
+        if Er is not None:
+            Er = np.asarray(Er) - Emin
+            okr = np.isfinite(Er)
+            ax_d.plot(p['fracs'][okr], Er[okr], 's-', lw=1.6, ms=4, color=col, label=p['label'] + ' relax')
     for p in paths:
         if 'diag' not in p['label']:
             continue
@@ -624,24 +733,30 @@ def plot_corner_diagram(scan, atoms, savepath, sz=18.):
     edge = {p['label']: p for p in scan['paths'] if 'diag' not in p['label']}
     diag = {p['label']: p for p in scan['paths'] if 'diag' in p['label']}
 
-    def _edge_xy(lab, x0, x1):
+    def _edge_xy(lab, x0, x1, key='energies_ev'):
         p = edge.get(lab)
-        if p is None:
+        if p is None or key not in p:
             return None
-        ok = np.isfinite(p['energies_ev'])
-        return x0 + (x1 - x0) * p['fracs'][ok], p['energies_ev'][ok] - Emin
+        ok = np.isfinite(p[key])
+        return x0 + (x1 - x0) * p['fracs'][ok], np.asarray(p[key])[ok] - Emin
 
     for labs, col, name in ((('edge u2=0: LL→RL', 'edge u1=1: RL→RR'), 'tab:red', 'via RL'),
                             (('edge u1=0: LL→LR', 'edge u2=1: LR→RR'), 'tab:blue', 'via LR')):
         for k, lab in enumerate(labs):
             seg = _edge_xy(lab, 0.5 * k, 0.5 * (k + 1))
             if seg is not None:
-                ax.plot(*seg, 'o-', color=col, lw=0.9, ms=3, label=name if k == 0 else None)
+                ax.plot(*seg, 'o--', color=col, lw=0.7, ms=2.5, alpha=0.45, label=(name + ' rigid') if k == 0 else None)
+            seg = _edge_xy(lab, 0.5 * k, 0.5 * (k + 1), key='energies_ev_relaxed')
+            if seg is not None:
+                ax.plot(*seg, 'o-', color=col, lw=1.3, ms=3.5, label=name if k == 0 else None)
         ax.plot(0.5, Erel[name.split()[-1]], 's', color=col, ms=7, mfc='none', mew=1.4, zorder=6)
     p = diag.get('diag LL→RR')
     if p is not None:
         ok = np.isfinite(p['energies_ev'])
-        ax.plot(p['fracs'][ok], p['energies_ev'][ok] - Emin, 's--', color='k', lw=0.9, ms=3, label='diag LL→RR (concerted)')
+        ax.plot(p['fracs'][ok], p['energies_ev'][ok] - Emin, 's--', color='k', lw=0.7, ms=2.5, alpha=0.45, label='diag LL→RR rigid')
+        if 'energies_ev_relaxed' in p:
+            ok = np.isfinite(p['energies_ev_relaxed'])
+            ax.plot(p['fracs'][ok], np.asarray(p['energies_ev_relaxed'])[ok] - Emin, 's-', color='k', lw=1.3, ms=3.5, label='diag LL→RR (concerted)')
     p = diag.get('diag RL→LR')
     if p is not None:
         ok = np.isfinite(p['energies_ev'])

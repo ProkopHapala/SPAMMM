@@ -672,3 +672,43 @@ Brute-force Morse continues to vary strongly in this region (Fz ranges 0.07–2.
 
 See [ContactSurface_Parity_InvPPAFM_Benzene.md](Tasks/ContactSurface_Parity_InvPPAFM_Benzene.md) §R2.2.
 
+
+---
+
+## 18. Band unfolding on nonorthogonal bases — S(k) metric is mandatory
+
+**Found 2026-09-24, ribbon xscan pipeline (`test_ribbon_stm_sys.py`).**
+
+The naive supercell→primitive unfolding weight (subcell Fourier projection,
+`unfold_spectral_weights_DEPRECATED`) is a projector **only for an
+orthogonal basis**. Both bases we use are nonorthogonal:
+
+- DFTB mio eigenvectors are S-orthonormal (`c†Sc = I`), |S_offdiag| up to **0.44**
+- GPAW dzp |S_offdiag| ~0.5 (diffuse 2nd shell)
+
+Symptoms of the wrong metric: ~20–30% of each eigenstate's weight leaks into
+adjacent primitive channels (bands look "dotted"/washed) and the error **grows
+with |kf|** — DFTB xscanv 0H showed Wmax med ~1.0 near the BZ centre collapsing
+to ~0.45 at the zone edge, purely artificial (the relaxed geometry is exactly
+periodic; verified by atom-shift multiset matching, incl. wrap images).
+
+**Correct weight** (`unfold_T_weights`): spectral projectors of the
+subcell-translation operator T in the S-metric — `w_j(n) = (1/Nc) Σ_m
+e^{−i2π q_j m} c† T^m S c`. Same states → Wmax med 1.000, 100% sharp;
+defect-localized states spread physically.
+
+**Rules:**
+1. Never judge unfolding quality visually before checking `c†Sc` vs `c†c` —
+   "cleaner" plots were a metric bug, not better physics.
+2. Fetch S(k) before the solver object is finalized (`dftb.get_s_cplx()`);
+   `eigenvec.bin`/`get_eigvecs_cplx` alone are insufficient — coefficients are
+   not Euclidean-orthonormal.
+3. Short primitive pitch (< ~2×SK cutoff/ncells) breaks the single-phase seam
+   model: mio O ribbons (pitch 2.46 Å vs C/N 4.92 Å) have [T,S(k)] growing
+   0.01→0.39 toward the zone edge → residual Wmax ~0.88 is representation
+   error, not symmetry breaking.
+4. GPAW `hs.npz` conjugation: eigenvectors satisfy `C*·S·Cᵀ = I` (right factor
+   unconjugated) — keep that convention when building T-expectations.
+
+See [TopicalAudit/BandUnfolding_Ribbons.md](TopicalAudit/BandUnfolding_Ribbons.md)
+§"Unfolding algorithm" and `doc/ERC_private/ribbon_switch_recap.md` §7.

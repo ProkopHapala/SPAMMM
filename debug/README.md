@@ -2,6 +2,9 @@
 
 Ephemeral test and diagnostic artifacts. **Gitignored** (except this file).
 
+ERC H-bond/ribbon campaign results (Sept 2026): see
+`doc/ERC_private/RESULT_MAP.md` — each ERC dir below has its own README.
+
 ## Layout
 
 ```

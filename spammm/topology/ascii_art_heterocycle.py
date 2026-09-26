@@ -512,6 +512,29 @@ def parse_ascii_art(text, hbond_length=None):
     return _build_single(lines, hbond_length=hbond_length)
 
 
+def mol_from_art(art, relax_bonds=True, n_iters=3, bmix=0.3):
+    """ASCII art -> capped monomer AtomicSystem (no cell, no junctions).
+
+    Same pipeline as tests/topology/testplot_muH.py::build_mol (parse ->
+    neighs -> pi-count -> target-valence capping H) plus optional Jacobi
+    bond-length relaxation of the heavy skeleton — run BEFORE capping so the
+    L0=1.42 A target does not stretch the X-H caps.  Lowercase art atoms
+    ('n','o') mark sp3/donor sites that receive the capping H.
+    """
+    atoms = parse_ascii_art(art)
+    atoms.neighs()
+    if relax_bonds:
+        jacobi_relax_bond_lengths(atoms, n_iters=n_iters, bmix=bmix)
+    n_pi0 = make_n_pi(atoms)
+    tv = _build_target_valence(atoms, n_pi0)
+    atoms.add_capping_h_sp2(target_valence=tv)
+    eo = getattr(atoms, '_enames_original', None)
+    if eo is not None and len(eo) < atoms.natoms:
+        atoms._enames_original = list(eo) + ['H'] * (atoms.natoms - len(eo))
+    atoms.neighs()
+    return atoms
+
+
 # ---------------------------------------------------------------------------
 # ASCII equivalents of the built-in examples from heterocycle_generator.py.
 # In dimer format atom symbols are only visual; the parser converts them to C.
@@ -933,7 +956,207 @@ PBC_CELL_PARAMS = {  # per-system build defaults (overridable by explicit args)
 PBC_TILT_DEFAULT = 45.0   # herringbone tilt for all other chain systems
 
 
-def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0, relax_bonds=True, tilt=None, zigzag=None, slant=None):
+# ---------------------------------------------------------------------------
+# Parametric acene-rhombus chains: ASCII art generated from (ncols, nrows, kind)
+# ---------------------------------------------------------------------------
+#
+# Molecule = rhombus of ncols x nrows fused benzene rings on the honeycomb
+# (col,k) lattice: pointy-top hexagon centers on q*(-1,3)+r*(+1,3), so all
+# atoms sit at col==k (mod 2) and the patch has exactly one apex atom at the
+# top and bottom corners -> the junction sites.  1x1 = benzene (quinone),
+# 1x2 = naphthalene, 2x2 = pyrene, 3x3 = coronene-like rhombus.
+#
+# Junction terminations per block end (etop/ebot):
+#   'O' = exocyclic =O on the apex C  (acceptor, C=O)
+#   'o' = exocyclic -OH on the apex C (donor)
+#   'N' = pyridinic N at the apex     (acceptor)
+#   'n' = pyrrolic N-H at the apex    (donor)
+#
+# ACENE_KINDS maps a short name to the per-block (etop,ebot) specs cycled over
+# the 3 drawn blocks (block0, block1, image-of-block0):
+ACENE_KINDS = {
+    'OO': [('O', 'O'), ('o', 'o')],   # alternating quinone/hydroquinone (hq2q-like): O-H...O=C
+    'NN': [('N', 'n')],               # self-complementary N-H...N   (pyrH2-like)
+    'Oo': [('O', 'o')],               # self-complementary O-H...O=C (hydroxy-quinone)
+    'nO': [('n', 'O')],               # self-complementary N-H...O=C (quinolone-like)
+    'No': [('N', 'o')],               # self-complementary O-H...N   (phenol-pyridine)
+    'Nn': [('n', 'N')],               # reversed-orientation N-H...N
+}
+
+
+def _rhombus_patch(nrows=1, ncols=1):
+    """(col,k)-grid atoms of an nrows x ncols rhombus of fused benzene rings.
+    Returns ({(col,k): 'C'}, (col_top,k_top), (col_bot,k_bot))."""
+    verts = [(0, 2), (1, 1), (1, -1), (0, -2), (-1, -1), (-1, 1)]
+    atoms = {}
+    for q in range(ncols):
+        for r in range(nrows):
+            cq, ck = r - q, 3 * (q + r)
+            for dc, dk in verts:
+                atoms[(cq + dc, ck + dk)] = 'C'
+    kt = max(k for _, k in atoms); kb = min(k for _, k in atoms)
+    tops = [c for c, k in atoms if k == kt]; bots = [c for c, k in atoms if k == kb]
+    assert len(tops) == 1 and len(bots) == 1, f"rhombus {nrows}x{ncols} has no unique apex atoms"
+    return atoms, (tops[0], kt), (bots[0], kb)
+
+
+def _acene_block(nrows, ncols, etop='O', ebot='O'):
+    """One molecule block {(col,k): char} with junction terminations at the apexes."""
+    patch, (ct, kt), (cb, kb) = _rhombus_patch(nrows, ncols)
+    blk = dict(patch)
+    for c, k, e, sgn in [(ct, kt, etop, +2), (cb, kb, ebot, -2)]:
+        if e in 'Oo':
+            blk[(c, k + sgn)] = e            # exocyclic =O / -OH one row past the apex C
+        else:
+            blk[(c, k)] = e                  # pyridinic N / N-H at the apex atom
+    return blk
+
+
+def make_acene_chain_art(nrows=1, ncols=1, kind='OO'):
+    """3-block stack art (block0, block1, image-of-block0) for build_pbc_cell.
+
+    Rasterizes the (col,k) lattice: every occupied k-level -> one text line,
+    atoms at character columns; ':' junction rows at the apex column between
+    blocks.  Adjacent lines carry the correct parity so the single-atom parser
+    reproduces the honeycomb y-spacing (aCC/2 diagonal, aCC vertical edges).
+    """
+    specs = ACENE_KINDS[kind]
+    blocks = [_acene_block(nrows, ncols, *specs[i % len(specs)]) for i in range(3)]
+    c0 = 1 - min(c for blk in blocks for c, _ in blk)          # global left margin
+    lines = []
+    for ib, blk in enumerate(blocks):
+        if ib:
+            cj = [c for (c, k) in blk if k == max(k2 for _, k2 in blk)][0] + c0
+            lines.append(' ' * cj + ':')
+        for k in sorted({k for _, k in blk}, reverse=True):
+            row = {c: ch for (c, kk), ch in blk.items() if kk == k}
+            lines.append(''.join(row.get(c - c0, ' ') for c in range(0, max(row) + c0 + 1)))
+    return '\n'.join(lines)
+
+
+# STRIP family (aligned chains, laterally thickened — armchair ribbons along y):
+#   T=1 'link'    : phenylene spine - | | edge-rows alternate with single | link
+#                   rows (apex-to-apex C-C bonds):  L=1 benzene, L=3 biphenyl,
+#                   L=5 p-terphenyl.  Needs odd L; ends aligned on the spine.
+#   T even 'zigzag': constant T/2 fused hexagons per row, consecutive rows offset
+#                   by +-1 column (zigzag fusion) — inherently asymmetric, ends
+#                   carry T/2 apex atoms.  T=2: phenanthrene-like; T=4: 2-wide.
+#   T odd >=3 'symm': centered rows alternating (T-1)/2 and (T+1)/2 hexagons —
+#                   mirror-symmetric about the spine axis (PTCDA-like), ends
+#                   carry (T-1)/2 apexes.  T=3: pyrene / perylene-homolog strips.
+def _strip_marks(nrows, ncols):
+    """'|' mark columns per dimer row + apex atom columns at both ends.
+    Returns (marks, apex_top, apex_bot).  nrows must be odd so both ends carry
+    the same apex set (junction interfaces then pair apex-to-apex)."""
+    assert nrows % 2 == 1, f"strip needs odd nrows (apexes must match at both ends), got {nrows}"
+    if ncols <= 1:
+        return [[-1, 1] if i % 2 == 0 else [0] for i in range(nrows)], [0], [0]
+    if ncols % 2 == 0:                                   # even T: constant zigzag
+        h = ncols // 2
+        s, hexes = 1 - h, []
+        for i in range(nrows):
+            if i:
+                s = (3 - 2 * h) - s                      # zigzag: offsets alternate +-1
+            hexes.append(list(range(s, s + 2 * h, 2)))
+    else:                                                # odd T: centered alternating
+        m = (ncols - 1) // 2
+        hexes = [list(range(1 - hh, hh + 1, 2)) for hh in (m + i % 2 for i in range(nrows))]
+    marks = [sorted({c for o in row for c in (o - 1, o + 1)}) for row in hexes]
+    return marks, hexes[0], hexes[-1]
+
+
+def _strip_block_lines(marks, apex_top, apex_bot, etop, ebot, c0):
+    """Text lines for one strip block: junction atoms at each apex col, '|' marks."""
+    w = c0 + max(c for row in marks for c in row) + 1
+    def atom_row(cols, ch):
+        line = [' '] * w
+        for c in cols:
+            line[c + c0] = ch
+        return ''.join(line).rstrip()
+    lines = []
+    if etop in 'Oo':
+        lines += [atom_row(apex_top, etop), atom_row(apex_top, 'C')]   # exocyclic =O/-OH
+    else:
+        lines += [atom_row(apex_top, etop)]                            # N / N-H at apex
+    for row in marks:
+        line = [' '] * w
+        for c in row:
+            line[c + c0] = '|'
+        lines.append(''.join(line).rstrip())
+    if ebot in 'Oo':
+        lines += [atom_row(apex_bot, 'C'), atom_row(apex_bot, ebot)]
+    else:
+        lines += [atom_row(apex_bot, ebot)]
+    return lines
+
+
+def make_strip_chain_art(nrows=1, ncols=1, kind='OO'):
+    """3-block stack art for build_pbc_cell: aligned spine strip.
+    nrows = dimer rows along the spine ('ring-rows'), ncols = thickness T:
+    1 -> phenylene link chain, even -> constant zigzag strip (T/2 apexes),
+    odd >=3 -> mirror-symmetric alternating strip ((T-1)/2 apexes)."""
+    specs = ACENE_KINDS[kind]
+    marks, atop, abot = _strip_marks(nrows, ncols)
+    c0 = 1 - min(c for row in marks for c in row)      # spine column -> char index
+    assert atop == abot, f"junction apexes differ top/bot ({atop} vs {abot})"
+    w = c0 + max(c for row in marks for c in row) + 1
+    jline = [' '] * w
+    for c in atop:
+        jline[c + c0] = ':'                            # one ':' per junction apex pair
+    jline = ''.join(jline).rstrip()
+    lines = []
+    for ib in range(3):
+        if ib:
+            lines.append(jline)
+        lines += _strip_block_lines(marks, atop, abot, *specs[ib % len(specs)], c0)
+    return '\n'.join(lines)
+
+
+def make_strip_mol_art(nrows=1, ncols=1, etop='N', ebot='N'):
+    """Single strip-block monomer art (no ':' junction rows) for mol_from_art.
+
+    Same family as make_strip_chain_art: nrows = ring-rows along the spine
+    (must be odd), ncols = thickness T (1 = link chain, odd >=3 =
+    mirror-symmetric strip).  etop/ebot in {'O','o','N','n'} set the tip
+    terminations independently ('o'/'n' = donor, 'O'/'N' = acceptor), so one
+    call yields the AA/BB/AB/BA corner-state arts of a tip-ended molecule.
+    """
+    marks, atop, abot = _strip_marks(nrows, ncols)
+    assert atop == abot, f"strip {nrows}x{ncols} tip columns differ top/bot ({atop} vs {abot})"
+    c0 = 1 - min(c for row in marks for c in row)
+    return '\n' + '\n'.join(_strip_block_lines(marks, atop, abot, etop, ebot, c0)) + '\n'
+
+
+def get_pbc_chain_art(name):
+    """PBC_CHAIN_ARTS lookup; falls back to generated 'ac<ncols>x<nrows><kind>' rhombus
+    or 'st<nrows>x<ncols><kind>' spine-strip chains."""
+    import re
+    if name in PBC_CHAIN_ARTS:
+        return PBC_CHAIN_ARTS[name]
+    m = re.fullmatch(r'ac(\d+)x(\d+)([A-Za-z]+)', name)
+    if m and m.group(3) in ACENE_KINDS:
+        return make_acene_chain_art(int(m.group(2)), int(m.group(1)), m.group(3))
+    m = re.fullmatch(r'st(\d+)x(\d+)([A-Za-z]+)', name)
+    if m and m.group(3) in ACENE_KINDS:
+        return make_strip_chain_art(int(m.group(1)), int(m.group(2)), m.group(3))
+    raise KeyError(f"unknown PBC chain '{name}' (not in PBC_CHAIN_ARTS, ac<ncols>x<nrows><kind>, or st<nrows>x<ncols><kind>)")
+
+
+def _pbc_defaults(name):
+    """PBC_CELL_PARAMS lookup; generated acene names get per-junction-kind defaults."""
+    if name in PBC_CELL_PARAMS:
+        return PBC_CELL_PARAMS[name]
+    if name.startswith('st') and 'x' in name:
+        # multi-apex ends (T>=4 -> >=2 parallel junction pairs per interface):
+        if 'O' in name or 'o' in name:
+            return dict(tilt=0.0, zigzag=0.0, slant=60.0)   # bent X-H...O kink like hq2q
+        return dict(tilt=0.0, zigzag=0.0, slant=0.0)
+    if name.startswith('ac') and ('O' in name or 'o' in name):
+        return dict(tilt=0.0, zigzag=0.0, slant=60.0)   # bent X-H...O kink like hq2q
+    return {}
+
+
+def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0, relax_bonds=True, tilt=None, zigzag=None, slant=None, jkink=None):
     """Build a 1D-periodic H-bond chain unit cell from a PBC_CHAIN_ARTS stack.
 
     The art is a stack of molecule blocks separated by ':' junction rows; the
@@ -965,15 +1188,17 @@ def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0
         lvs    : (3,3) lattice vectors [A], chain along y, vacuum in x/z
         hbonds : list[HbondRecord] with d_shift/a_shift marking image partners
     """
-    defaults = PBC_CELL_PARAMS.get(name, {})
+    defaults = _pbc_defaults(name)
     if tilt is None:
         tilt = defaults.get('tilt', PBC_TILT_DEFAULT)
     if zigzag is None:
         zigzag = defaults.get('zigzag', 0.0)
     if slant is None:
         slant = defaults.get('slant', 0.0)
+    if jkink is None:
+        jkink = defaults.get('jkink', 0.0)
     if art is None:
-        art = PBC_CHAIN_ARTS[name]
+        art = get_pbc_chain_art(name)
     atoms = parse_ascii_art(art, hbond_length=hbond_length)
     atoms.neighs()
     n_pi0 = make_n_pi(atoms)
@@ -1006,18 +1231,28 @@ def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0
     if zigzag or tilt:
         assert (nblocks - 1) % 2 == 0, "zigzag/tilt need an even number of in-cell blocks (image parity)"
 
-    # junction endpoint heavy atoms per ':' row: (upper_atom, lower_atom),
-    # sorted so jpairs[j] connects blocks j and j+1 (hbonds_ascii order != row order)
-    jpairs = []
+    # junction endpoint heavy atoms per ':' row, grouped by interface:
+    # jints[j] = [(upper_atom, lower_atom), ...] connecting blocks j and j+1.
+    # Multi-apex junctions (e.g. T>=4 strips) give >1 pair per interface —
+    # alignment/straighten then work on the interface MEAN position.
+    jints = [[] for _ in range(nblocks - 1)]
     for ih, ia in atoms.hbonds_ascii:
         ngh = [jj for jj in atoms.ngs[ih] if atoms.enames[jj] != 'H']
         assert len(ngh) == 1, f"junction H {ih} has {len(ngh)} heavy neighbours"
         idon = ngh[0]
         bd, ba = _block_of(idon), _block_of(ia)
         assert abs(bd - ba) == 1, f"junction must connect adjacent blocks (got {bd},{ba})"
-        jpairs.append((min(bd, ba), (idon, ia) if bd < ba else (ia, idon)))
-    jpairs = [p for _, p in sorted(jpairs)]
-    assert len(jpairs) == nblocks - 1
+        jints[min(bd, ba)].append((idon, ia) if bd < ba else (ia, idon))
+    assert all(jints), "every ':' interface must yield >=1 H-bond pair"
+
+    def _jpos(k):
+        """(top, bottom) junction-site positions of block k in its own frame —
+        mean over the interface's apex atoms; image block via the img map."""
+        pa = (np.mean([atoms.apos[l] for _, l in jints[k - 1]], axis=0) if k >= 1
+              else np.mean([atoms.apos[img[l]] for _, l in jints[-1]], axis=0))
+        pb = (np.mean([atoms.apos[u] for u, _ in jints[k]], axis=0) if k < len(jints)
+              else np.mean([atoms.apos[inv_img[u]] for u, _ in jints[0]], axis=0))
+        return pa, pb
 
     # (1) zigzag: rotate block k in-plane by (-1)^k * zigzag about z through its centroid
     if zigzag:
@@ -1035,22 +1270,27 @@ def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0
     drawn_first = [i for i in first if i < ndrawn]
     drawn_last = [i for i in last if i < ndrawn]
     assert len(drawn_first) == len(drawn_last), f"image block mismatch: {len(drawn_first)} vs {len(drawn_last)} atoms"
-    drawn_first.sort(key=lambda i: (rows[i], atoms.apos[i, 0]))
-    drawn_last.sort(key=lambda i: (rows[i], atoms.apos[i, 0]))
+    # match image atoms to first-block atoms by (art row, rounded x, y):
+    # the bond relax leaves bit-level asymmetry in x (~1e-15 A) which would
+    # scramble the two same-column atoms of a '|' pair differently per block;
+    # rounding x and sorting by y as tiebreak makes the match deterministic.
+    drawn_first.sort(key=lambda i: (rows[i], round(atoms.apos[i, 0], 4), atoms.apos[i, 1]))
+    drawn_last.sort(key=lambda i: (rows[i], round(atoms.apos[i, 0], 4), atoms.apos[i, 1]))
     for i, j in zip(drawn_first, drawn_last):
         assert atoms.enames[i] == atoms.enames[j], f"image block ename mismatch at {i}/{j}"
     img = {j: i for i, j in zip(drawn_first, drawn_last)}  # last-block atom -> first-block atom
 
-    # (2a) slant mode: straighten each block — rotate rigidly about its centroid so
-    #      the axis through its two junction heavy atoms is parallel to y (the bond
-    #      relax can skew junction atoms off-axis; straight axial molecules make the
-    #      slant offsets accumulate into a pure-y lattice; skipped under zigzag
-    #      where junction axes are intentionally rotated)
-    if slant and not zigzag:
-        for k, blk in enumerate(blocks[:-1]):
-            itop = jpairs[k - 1][1] if k >= 1 else img[jpairs[-1][1]]
-            ibot = jpairs[k][0]
-            pa, pb = atoms.apos[itop], atoms.apos[ibot]
+    # (2a) straighten each block — rotate rigidly about its centroid so the axis
+    #      through its two junction heavy atoms is parallel to y (the bond relax
+    #      can skew junction atoms off-axis, and generated diagonal acene arts have
+    #      genuinely tilted apex axes; straight molecules make the lattice pure-y;
+    #      skipped under zigzag where junction axes are intentionally rotated).
+    #      The image block gets the same treatment via the inverse img map so it
+    #      stays a pure translation.
+    if not zigzag:
+        inv_img = {i: j for j, i in img.items()}
+        for k, blk in enumerate(blocks):
+            pa, pb = _jpos(k)
             axv = pb - pa
             axv /= np.linalg.norm(axv)
             uy = np.array([0.0, np.sign(axv[1]), 0.0])          # keep up/down order
@@ -1066,14 +1306,55 @@ def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0
             d = atoms.apos[idx] - ctr
             atoms.apos[idx] = ctr + d * c + np.cross(u, d) * s + u * (d @ u)[:, None] * (1.0 - c)
 
+    # (2b) junction kink: rotate each DONOR-side exocyclic junction atom ('o','O')
+    #      with its attached H's outward about its apex carbon by jkink deg.
+    #      The splayed X-H arms let each parallel multi-apex junction lean
+    #      (C-O-H ~120 deg) without the donor landing on the NEIGHBOUR acceptor
+    #      — the reason block slant is capped ~30 deg for T>=4.  Symmetric splay
+    #      keeps the interface mean on-axis; image counterparts get identical
+    #      splay via the img map so the image block stays a pure translation.
+    if jkink:
+        inv_img = {i: j for j, i in img.items()}
+        ops = {}
+        def _splay_end(end_atoms):
+            cx = np.mean([atoms.apos[a][0] for a in end_atoms])
+            for ja in end_atoms:
+                hs = [jj for jj in atoms.ngs[ja] if atoms.enames[jj] == 'H']
+                if not hs:
+                    continue                              # acceptor: no H -> skip
+                heavy = [jj for jj in atoms.ngs[ja] if atoms.enames[jj] != 'H']
+                if len(heavy) != 1:
+                    continue                              # in-ring junction atom ('n','N')
+                cap = heavy[0]
+                om = np.radians(jkink) * (-np.sign(atoms.apos[ja][0] - cx) * np.sign(atoms.apos[ja][1] - atoms.apos[cap][1]))
+                if om == 0.0:
+                    continue                              # lone apex: no outward direction
+                if ja not in ops:
+                    ops[ja] = (hs, cap, om)
+        for pairs in jints:
+            _splay_end([u for u, _ in pairs])
+            _splay_end([l for _, l in pairs])
+        for ja, (hs, cap, om) in list(ops.items()):       # image counterparts: identical splay
+            for m in (img.get(ja), inv_img.get(ja)):
+                if m is not None and m not in ops:
+                    mh = [jj for jj in atoms.ngs[m] if atoms.enames[jj] == 'H']
+                    mc = [jj for jj in atoms.ngs[m] if atoms.enames[jj] != 'H'][0]
+                    ops[m] = (mh, mc, om)
+        for ja, (hs, cap, om) in ops.items():
+            c, s = np.cos(om), np.sin(om)
+            for a in [ja] + hs:
+                v = atoms.apos[a] - atoms.apos[cap]
+                atoms.apos[a] = atoms.apos[cap] + np.array([v[0]*c - v[1]*s, v[0]*s + v[1]*c, v[2]])
+
     # (2) realign junctions: translate block j+1 so its junction atom sits exactly
     #     hbond_length below block j's junction atom, on a line leaning by slant
     #     deg off y (alternating sign per junction -> offsets cancel, lattice stays
     #     pure y, molecules stay axial; slant mimics the ~120 deg C-O-H kink so the
     #     H-bond/proton path is oblique).  slant=0 -> junctions vertical.
     sa = np.radians(slant)
-    for j, (au, al) in enumerate(jpairs):
-        pu, pl = atoms.apos[au], atoms.apos[al]
+    for j, pairs in enumerate(jints):
+        pu = np.mean([atoms.apos[u] for u, _ in pairs], axis=0)
+        pl = np.mean([atoms.apos[l] for _, l in pairs], axis=0)
         sgn = 1.0 if j % 2 == 0 else -1.0
         dx_t = sgn * np.sin(sa) * hbond_length
         dy_t = -np.cos(sa) * hbond_length
@@ -1092,13 +1373,14 @@ def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0
     apos_c = np.array([atoms.apos[i] for i in cell_atoms], dtype=float)
     bonds_c = [(remap[i], remap[j]) for i, j in atoms.bonds if i in remap and j in remap]
 
-    # (3) rotate cell so the lattice vector is pure +y (zigzag may give t an x-component)
+    # (3) rotate cell so the lattice vector is pure +y (diagonal molecules give t
+    #     an x-component; rotation by +phi aligns t with +y)
     if t[1] < 0:
         apos_c[:, 1] *= -1.0
         t = t * np.array([1.0, -1.0, 1.0])
     phi = np.arctan2(t[0], t[1])
     if abs(phi) > 1e-9:
-        c, s = np.cos(-phi), np.sin(-phi)
+        c, s = np.cos(phi), np.sin(phi)
         xy = apos_c[:, :2].copy()
         apos_c[:, 0] = xy[:, 0] * c - xy[:, 1] * s
         apos_c[:, 1] = xy[:, 0] * s + xy[:, 1] * c
@@ -1110,9 +1392,10 @@ def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0
     #     the block's two junction heavy atoms -> junction D...A preserved exactly
     if tilt:
         for k, blk in enumerate(blocks[:-1]):
-            itop = jpairs[k - 1][1] if k >= 1 else img[jpairs[-1][1]]
-            ibot = jpairs[k][0]
-            pa, pb = apos_c[remap[itop]], apos_c[remap[ibot]]
+            itops = [l for _, l in jints[k - 1]] if k >= 1 else [img[l] for _, l in jints[-1]]
+            ibots = [u for u, _ in jints[k]]
+            pa = np.mean([apos_c[remap[i]] for i in itops], axis=0)
+            pb = np.mean([apos_c[remap[i]] for i in ibots], axis=0)
             axv = pb - pa
             axv /= np.linalg.norm(axv)
             p0 = 0.5 * (pa + pb)
@@ -1136,7 +1419,17 @@ def build_pbc_cell(name=None, art=None, hbond_length=2.8, vac_x=10.0, vac_z=10.0
         idon = ngh[0]
         d_sh = +1 if _block_of(idon) == nblocks - 1 else 0
         a_sh = +1 if _block_of(ia) == nblocks - 1 else 0
-        id_c, ih_c, ia_c = remap[img.get(idon, idon)], remap[ih], remap[img.get(ia, ia)]
+        id_c = remap[img.get(idon, idon)]
+        ia_c = remap[img.get(ia, ia)]
+        if ih in remap:
+            ih_c = remap[ih]
+        else:
+            # junction H on an image-block donor (donor-oriented-down kinds):
+            # reuse the corresponding H on the in-cell donor atom (position is
+            # recomputed on the D->A axis below anyway)
+            hs = [j for j in atoms.ngs[img.get(idon, idon)] if atoms.enames[j] == 'H' and j in remap]
+            assert hs, f"in-cell donor {img.get(idon, idon)} has no H for image junction"
+            ih_c = remap[hs[0]]
         pD, pA = apos_c[id_c] + d_sh * lvec, apos_c[ia_c] + a_sh * lvec
         axv = pA - pD
         dist = float(np.linalg.norm(axv))

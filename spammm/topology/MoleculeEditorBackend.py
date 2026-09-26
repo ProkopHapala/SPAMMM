@@ -84,6 +84,8 @@ PASSIVATION_GROUPS = {
     'O': [('O', 0.0, 0.0, 0.0)],
     'C=O': [('O', 0.0, 1.23, 0.0)],
     'C-OH': [('O', 0.0, 1.43, 0.0), ('H', 0.31, 2.34, 0.0)],  # H at 109.5° from y-axis
+    'CH2': [('H', 0.0, 0.63, 0.89), ('H*', 0.0, 0.63, -0.89)],  # sp3 edge C: 2 H tetrahedral above/below plane (HCH ~109.5°); '*' bonds to host C, not chained
+    'CHOH': [('O', 0.0, 1.43, 0.0), ('H', 0.31, 2.34, 0.0), ('H*', 0.0, 0.63, 0.89)],  # sp3 edge C: in-plane O-H + extra H out-of-plane ('*' -> host C)
 }
 
 # Passivation string encoding mapping for CLI
@@ -94,7 +96,8 @@ PASSIVATION_ENCODING = {
     'o': 'C=O',
     'O': 'O',
     'H': 'CH',
-    'h': 'C-OH'
+    'h': 'C-OH',
+    'm': 'CH2'
 }
 
 def parse_passivation_string(s):
@@ -107,6 +110,7 @@ def parse_passivation_string(s):
     - O -> O
     - H -> CH
     - h -> C-OH
+    - m -> CH2
     
     Each character in the string represents one passivation group at one site.
     """
@@ -1820,6 +1824,7 @@ class MoleculeEditorBackend:
             # Apply side passivation if specified
             if side_passivation:
                 self._apply_side_passivation_single_ribbon(side_passivation)
+            self._sync_sys()   # passivation appended atoms to graph — refresh sys
 
         # Apply anisotropic scaling if requested
         if scale_x != 1.0 or scale_y != 1.0:
@@ -1871,6 +1876,13 @@ class MoleculeEditorBackend:
         if passivation not in PASSIVATION_GROUPS:
             raise ValueError(f"Unknown passivation type: {passivation}")
 
+        # Strip existing H caps on the side atoms (adjust_h may have capped them;
+        # passivation groups are authoritative — do not stack).
+        atom_list, *_ = self.graph.to_arrays()
+        for ia, _dir in side_atoms:
+            for h in self.graph.h_children(atom_list[ia]):
+                self.graph.remove_atom(h)
+
         group = PASSIVATION_GROUPS[passivation]
         for ia, direction in side_atoms:
             pos_C = self.sys.apos[ia]
@@ -1916,6 +1928,25 @@ class MoleculeEditorBackend:
         if not edge_atoms:
             return
 
+        # Remove pre-existing H caps first — _build_ribbon_from_rings runs
+        # adjust_h (auto_h_cap) which caps ALL edge atoms; passivation groups
+        # are authoritative for edge chemistry and must not stack on old caps.
+        # (Only when a real group will be applied — passivation=None keeps caps.)
+        will_apply = any(p in PASSIVATION_GROUPS for seq in (passivation_bottom, passivation_top) if seq for p in seq)
+        h_indices = [i for i, e in enumerate(self.sys.enames) if e == 'H']
+        if h_indices and will_apply:
+            self._rebuild_after_delete(h_indices)   # soft-delete H + resync sys
+            self.graph.cleanup_invalid()
+            self.graph.sync_neighbor_lists()
+            self.sys.neighs()
+            edge_atoms = []
+            for i in range(len(self.sys.apos)):
+                if self.sys.enames[i] in ('H', 'E'):
+                    continue
+                heavy_neighs = [j for j in self.sys.ngs[i] if self.sys.enames[j] not in ('H', 'E')]
+                if len(heavy_neighs) < 3:
+                    edge_atoms.append(i)
+
         # Separate edge atoms by position
         y_center = self.sys.apos[:, 1].mean()
         xs = self.sys.apos[edge_atoms, 0]
@@ -1924,15 +1955,15 @@ class MoleculeEditorBackend:
 
         bottom_edge_atoms = []
         top_edge_atoms = []
-        
+
         for ia in edge_atoms:
             y = self.sys.apos[ia, 1]
             x = self.sys.apos[ia, 0]
-            
+
             # Skip side edge atoms (extreme x positions)
             if x < x_min + x_margin or x > x_max - x_margin:
                 continue
-            
+
             # Classify as top or bottom edge
             if y < y_center:
                 bottom_edge_atoms.append(ia)
@@ -1948,13 +1979,14 @@ class MoleculeEditorBackend:
             p = passivation_bottom[idx % len(passivation_bottom)] if passivation_bottom else None
             if p and p in PASSIVATION_GROUPS:
                 self._apply_passivation_group(ia, p, is_top=False)
-        
+
         for idx, ia in enumerate(top_edge_atoms):
             p = passivation_top[idx % len(passivation_top)] if passivation_top else None
             if p and p in PASSIVATION_GROUPS:
                 self._apply_passivation_group(ia, p, is_top=True)
         # Sync after passivation (no recalc_bonds!)
         self.graph.sync_neighbor_lists()
+        self._sync_sys()   # sys must include the added passivation atoms
 
     def _passivate_edges_top_bottom_only(self, passivation):
         """Passivate only top/bottom edge atoms (zigzag edges), not side edges (armchair edges)."""
@@ -2153,16 +2185,21 @@ class MoleculeEditorBackend:
         # group member (C-OH: O->edge, H->O; NH: H->edge N)
         atom_list, *_ = self.graph.to_arrays()
         prev_atom = atom_list[ia]
+        if passivation in ('CH2', 'CHOH'):
+            prev_atom.npi = 0                  # sp3 edge carbon — no pz, all 4 bonds sigma
         for i, (elem, x, y, z) in enumerate(group):
+            star = elem.endswith('*')          # '*' -> bond to host atom, not to previous group member
+            elem = elem.rstrip('*')
             if i == 0 and x == 0.0 and y == 0.0 and z == 0.0:
                 # First atom at origin replaces the C atom
                 self._set_atom_element(ia, elem)
             else:
-                # Add atom at C_pos + scaled coords, bonded to previous group atom
+                # Add atom at C_pos + scaled coords, bonded to previous group atom (or host if '*')
                 pos_new = [pos_C[0] + x, pos_C[1] + y * direction, pos_C[2] + z]
                 a_new = self._append_atom(pos_new, elem, npi=-1)
-                self.graph.add_bond(prev_atom, a_new)
-                prev_atom = a_new
+                self.graph.add_bond(atom_list[ia] if star else prev_atom, a_new)
+                if not star:
+                    prev_atom = a_new
 
     def combine_ribbons(self, backend1, backend2, L_Hb=2.0, shift_x=0.0):
         """Combine two single ribbons into a two-ribbon system with hydrogen-bond gap.
@@ -2354,14 +2391,21 @@ class MoleculeEditorBackend:
 
         atom_list, *_ = self.graph.to_arrays()
         prev_atom = atom_list[ia]
+        host_atom = prev_atom
+        if passivation in ('CH2', 'CHOH'):
+            host_atom.npi = 0  # sp3 edge carbon — no pz, all 4 bonds sigma
         for i, (elem, x, y, z) in enumerate(group):
+            host_only = elem.endswith('*')          # '*' suffix: bond to host atom, do not chain
+            if host_only:
+                elem = elem[:-1]
             if i == 0 and x == 0.0 and y == 0.0 and z == 0.0:
                 self._set_atom_element(ia, elem)
             else:
                 pos_new = [pos_C[0] + x, pos_C[1] + y * direction, pos_C[2] + z]
                 a_new = self._append_atom(pos_new, elem, npi=-1)
-                self.graph.add_bond(prev_atom, a_new)
-                prev_atom = a_new
+                self.graph.add_bond(host_atom if host_only else prev_atom, a_new)
+                if not host_only:
+                    prev_atom = a_new
 
     def _apply_side_passivation(self, passivation):
         """Apply passivation to side edges (left/right) of the combined two-ribbon system.

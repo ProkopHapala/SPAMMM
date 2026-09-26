@@ -1634,8 +1634,12 @@ def plot_geom_overlay(geoms, bonds, labels, ref=0, modes=None, markers=None, sav
 
 
 
-def plot_pbc_chain_cell(atoms, lvs, hbonds, n_cells=3, savepath=None, title=None, sz=160., axes=(0, 1), jnames=None):
+def plot_pbc_chain_cell(atoms, lvs, hbonds, n_cells=3, savepath=None, title=None, sz=20., axes=(0, 1), jnames=None):
     """Draw a 1D-periodic H-bond chain: n_cells tiled unit cells + cell box + junctions.
+
+    Canonical SPAMMM molecule style (same as enum/bond-map plots): thin skeleton
+    lines, small element-colored atom dots (ELEMENT_DICT radius x sz, no rims),
+    junction drawn D-H solid green + H-A dashed magenta at real H position.
 
     Junction partners with nonzero HbondRecord.d_shift/a_shift are drawn at their
     image positions (apos + shift*lvec), so a boundary junction's dashed line
@@ -1646,35 +1650,36 @@ def plot_pbc_chain_cell(atoms, lvs, hbonds, n_cells=3, savepath=None, title=None
         lvs: (3,3) lattice vectors; chain direction = lvs[1].
         hbonds: list of HbondRecord (junctions; shifts mark image partners).
         n_cells: number of cells to tile along the chain (odd looks best).
+        sz: atom size scale; sizes = ELEMENT_DICT[e][6]*sz (like plot_bond_scalar_map).
     """
     from matplotlib.patches import Rectangle
+    from spammm import elements
     from spammm.topology.hbond_utils import hbond_positions
     apos = np.asarray(atoms.apos, dtype=float)
     lvec = np.asarray(lvs)[1]
     ax1, ax2 = axes
     fig, ax = plt.subplots(figsize=(7, 2.5 + 3 * n_cells))
     half = n_cells // 2
-    colmap = {'C': '0.45', 'N': 'tab:blue', 'O': 'tab:red', 'H': '0.75'}
+    enames = [e.split('_')[0] for e in atoms.enames]
+    colors_a = [elements.ELEMENT_DICT[e][8] for e in enames]
+    sizes_a = [elements.ELEMENT_DICT[e][6] * sz for e in enames]
     for s in range(-half, half + 1):
         off = s * lvec
-        alpha = 1.0 if s == 0 else 0.45
+        alpha = 1.0 if s == 0 else 0.35
         for i, j in atoms.bonds:
-            ax.plot([apos[i, ax1], apos[j, ax1]], [apos[i, ax2] + off[ax2], apos[j, ax2] + off[ax2]], 'k-', lw=1.0, alpha=alpha, zorder=1)
-        for i, e in enumerate(atoms.enames):
-            ax.scatter(apos[i, ax1], apos[i, ax2] + off[ax2], c=colmap.get(e, '0.5'), s=sz if e != 'H' else sz * 0.3, zorder=3, alpha=alpha, edgecolor='k', lw=0.4)
+            ax.plot([apos[i, ax1], apos[j, ax1]], [apos[i, ax2] + off[ax2], apos[j, ax2] + off[ax2]], '-', c='0.55', lw=1.0, alpha=alpha, zorder=1)
+        ax.scatter(apos[:, ax1], apos[:, ax2] + off[ax2], c=colors_a, s=sizes_a, zorder=3, alpha=alpha, linewidths=0)
     for jj, hb in enumerate(hbonds):
         pD, pH, pA = hbond_positions(apos, hb, lvs)
-        ax.plot([pD[ax1], pA[ax1]], [pD[ax2], pA[ax2]], 'g--', lw=2.0, zorder=2)
-        u = (pA - pD) / np.linalg.norm(pA - pD)
-        pHj = pD + 1.0 * u   # schematic H at covalent distance from donor
-        ax.scatter([pHj[ax1]], [pHj[ax2]], c='lime', s=sz * 0.55, zorder=4, edgecolor='k', lw=0.6)
+        ax.plot([pD[ax1], pH[ax1]], [pD[ax2], pH[ax2]], 'g-', lw=1.2, zorder=5)
+        ax.plot([pH[ax1], pA[ax1]], [pH[ax2], pA[ax2]], 'm--', lw=1.0, zorder=5)
         jn = str(jj + 1) if jnames is None else jnames[jj]
-        for p, t, c in ((pD, 'D' + jn, 'tab:blue'), (pHj, 'H' + jn, 'green'), (pA, 'A' + jn, 'tab:red')):
-            ax.annotate(t, (p[ax1] - 0.95, p[ax2] - 0.1), fontsize=10, color=c, weight='bold', zorder=6)
+        for p, t, c in ((pD, 'D' + jn, 'tab:blue'), (pH, 'H' + jn, 'green'), (pA, 'A' + jn, 'tab:red')):
+            ax.annotate(t, (p[ax1] - 0.95, p[ax2] - 0.1), fontsize=9, color=c, weight='bold', zorder=6)
     x0, x1 = apos[:, ax1].min() - 1.5, apos[:, ax1].max() + 1.5
     ylo, yhi = apos[:, ax2].min(), apos[:, ax2].max()
-    ax.add_patch(Rectangle((x0, ylo), x1 - x0, yhi - ylo, fill=False, edgecolor='magenta', lw=2.0))
-    ax.annotate('cell', (x1 + 0.3, 0.5 * (ylo + yhi)), fontsize=13, color='magenta', weight='bold')
+    ax.add_patch(Rectangle((x0, ylo), x1 - x0, yhi - ylo, fill=False, edgecolor='magenta', lw=1.5))
+    ax.annotate('cell', (x1 + 0.3, 0.5 * (ylo + yhi)), fontsize=11, color='magenta', weight='bold')
     ax.set_aspect('equal')
     ax.axis('off')
     ax.set_xlim(x0 - 0.5, x1 + 2.2)
@@ -1749,7 +1754,7 @@ def plot_ribbon_junction_cell(atoms, lvs, hbonds, nx=3, ny=2, savepath=None, tit
         lvs: (3,3) lattice vectors; lvs[0]=ribbon dir, lvs[1]=stack dir.
         hbonds: list of HbondRecord (from ribbon_pbc.build_ribbon_junction_cell).
     """
-    from matplotlib.patches import Rectangle
+    from matplotlib.patches import Polygon
     from spammm.topology.hbond_utils import hbond_positions
     apos = np.asarray(atoms.apos)
     bonds = np.asarray(atoms.bonds)
@@ -1759,7 +1764,7 @@ def plot_ribbon_junction_cell(atoms, lvs, hbonds, nx=3, ny=2, savepath=None, tit
     for sy in range(ny):
         for sx in range(-hx, hx + 1):
             alpha = 1.0 if (sx, sy) == (0, 0) else 0.35
-            off = np.array([sx * Lx, sy * Ly])
+            off = sx * lvs[0, :2] + sy * lvs[1, :2]
             for i, j in bonds:
                 d = apos[j] - apos[i]
                 pi = apos[i, :2] + off
@@ -1772,8 +1777,9 @@ def plot_ribbon_junction_cell(atoms, lvs, hbonds, nx=3, ny=2, savepath=None, tit
                 pD, pH, pA = hbond_positions(apos, hb, lvs)
                 ax.plot([pD[0] + off[0], pH[0] + off[0]], [pD[1] + off[1], pH[1] + off[1]], color='b', lw=1.6, alpha=alpha, zorder=4)
                 ax.plot([pH[0] + off[0], pA[0] + off[0]], [pH[1] + off[1], pA[1] + off[1]], color=(0.8, 0.2, 0.8), lw=1.4, ls='--', alpha=alpha, zorder=4)
-    ax.add_patch(Rectangle((0.0, 0.0), Lx, Ly, fill=False, edgecolor='magenta', lw=2.0))
-    ax.annotate('cell', (Lx + 0.2, 0.5 * Ly), fontsize=12, color='magenta', weight='bold')
+    c0, c1 = lvs[0, :2], lvs[1, :2]                 # cell parallelogram (lvs[1] may be tilted)
+    ax.add_patch(Polygon(np.array([[0.0, 0.0], c0, c0 + c1, c1]), fill=False, edgecolor='magenta', lw=2.0))
+    ax.annotate('cell', (c0[0] + 0.2, 0.5 * (c1[1] + 0.0)), fontsize=12, color='magenta', weight='bold')
     ax.set_aspect('equal')
     ax.axis('off')
     ax.set_title(title or 'two-ribbon junction cell')

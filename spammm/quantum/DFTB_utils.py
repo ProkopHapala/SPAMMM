@@ -352,12 +352,16 @@ def read_relaxed_geometry(apos, do_relax=False):
                     apos_out[j] = [float(parts[1]), float(parts[2]), float(parts[3])]
     return apos_out
 
-def run_pbc(apos, enames, lvs, sk_set=None, do_relax=False, fixed_atoms=None, nk=(16,1,1), k_shift=(0.5,0.0,0.0), dftb_exe=DFTB_EXE, workdir=None, Temperature=300, MixingParameter=0.2, MaxScc=200, SCCTolerance=1e-5, params=None, allow_unconverged_energy=False):
+def run_pbc(apos, enames, lvs, sk_set=None, do_relax=False, fixed_atoms=None, nk=(16,1,1), k_shift=(0.5,0.0,0.0), dftb_exe=DFTB_EXE, workdir=None, Temperature=300, MixingParameter=0.2, MaxScc=200, SCCTolerance=1e-5, params=None, allow_unconverged_energy=False, Mixer=None, SCC=True, extra_hsd='', klist=None, patch_hsd=None, cart_constraints=None):
     """Run DFTB+ calculation for periodic systems.
-    
+
     Args:
         sk_set: Slater-Koster parametrization name (e.g., '3ob-3-1', 'mio-1-1').
                 If None, uses DEFAULT_SK_SET.
+        patch_hsd: optional callable (hsd_path, enames) -> None, invoked on the
+                written dftb_in.hsd before running dftb+ — use to inject
+                Hamiltonian-level keys (e.g. ThirdOrderFull/HubbardDerivs/DampXH
+                for 3ob-3-1, SpinPolarisation) that makeDFTBjob_pbc cannot write.
     """
     basis_path = get_sk_path(sk_set)
     if params is None:
@@ -367,7 +371,9 @@ def run_pbc(apos, enames, lvs, sk_set=None, do_relax=False, fixed_atoms=None, nk
         os.makedirs(workdir, exist_ok=True)
         os.chdir(workdir)
     try:
-        makeDFTBjob_pbc(enames=enames, apos=apos, lvs=lvs, fname='dftb_in.hsd', sk_set=sk_set, nk=nk, k_shift=k_shift, opt=do_relax, params=params, Temperature=Temperature, MixingParameter=MixingParameter, MaxScc=MaxScc, SCCTolerance=SCCTolerance, fixed_atoms=fixed_atoms)
+        makeDFTBjob_pbc(enames=enames, apos=apos, lvs=lvs, fname='dftb_in.hsd', sk_set=sk_set, nk=nk, k_shift=k_shift, opt=do_relax, params=params, Temperature=Temperature, MixingParameter=MixingParameter, MaxScc=MaxScc, SCCTolerance=SCCTolerance, fixed_atoms=fixed_atoms, Mixer=Mixer, SCC=SCC, extra_hsd=extra_hsd, klist=klist, cart_constraints=cart_constraints)
+        if patch_hsd is not None:
+            patch_hsd('dftb_in.hsd', enames)
         # Capture both stdout and stderr
         ierr = os.system(f'{dftb_exe} > OUT 2> ERR')
         if ierr != 0:
@@ -537,7 +543,7 @@ SK_PATHS = _get_sk_paths()
 WFC_HSD_PATHS = _get_wfc_hsd_paths()
 
 def _write_dftb_input_base(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxscc=200,
-                           analysis_block="", options_block="", filling_temp=None):
+                           analysis_block="", options_block="", filling_temp=None, scc=True):
     """Base function to write DFTB+ input HSD file.
 
     Args:
@@ -555,6 +561,7 @@ def _write_dftb_input_base(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, m
     max_ang = {s: '"s"' if s == 'H' else '"p"' for s in species}
     max_ang_str = '\n    '.join([f'{s} = {max_ang[s]}' for s in species])
     filling_str = f'  Filling = Fermi {{ Temperature [K] = {filling_temp} }}\n' if filling_temp else ''
+    scc_str = f'  SCCTolerance = {scctol}\n  MaxSccIterations = {maxscc}\n' if scc else ''
 
     if not sk_prefix.endswith('/'):
         sk_prefix = sk_prefix + '/'
@@ -563,7 +570,7 @@ def _write_dftb_input_base(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, m
   <<< "{os.path.basename(xyz_path)}"
 }}
 Hamiltonian = DFTB {{
-  SCC = Yes
+  SCC = {"Yes" if scc else "No"}
   SlaterKosterFiles = Type2FileNames {{
     Prefix = "{sk_prefix}"
     Separator = "-"
@@ -572,9 +579,7 @@ Hamiltonian = DFTB {{
   MaxAngularMomentum {{
     {max_ang_str}
   }}
-  SCCTolerance = {scctol}
-  MaxSccIterations = {maxscc}
-{filling_str}}}
+{scc_str}{filling_str}}}
 Analysis {{
 {analysis_block}
 }}
@@ -586,10 +591,10 @@ Options {{
         f.write(hsd)
 
 
-def write_dftb_input_sp(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxscc=200, filling_temp=None):
+def write_dftb_input_sp(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxscc=200, filling_temp=None, scc=True):
     """Write minimal DFTB+ input for single-point SCF calculation."""
     # Removed CalculateForces for DFTB+ compatibility with newer versions
-    _write_dftb_input_base(enames, xyz_path, out_path, sk_prefix, scctol, maxscc, analysis_block="", filling_temp=filling_temp)
+    _write_dftb_input_base(enames, xyz_path, out_path, sk_prefix, scctol, maxscc, analysis_block="", filling_temp=filling_temp, scc=scc)
 
 
 def write_dftb_input_relax(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxscc=400, max_steps=1000, grad_elem=1e-4, fixed_atoms=None, filling_temp=None):
@@ -758,7 +763,7 @@ def parse_mulliken_charges(fname='detailed.out', natoms=None):
     return q
 
 
-def run_dftb_sp(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz', maxscc=200, restart_charges_from=None, return_charges=False, filling_temp=None):
+def run_dftb_sp(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz', maxscc=200, restart_charges_from=None, return_charges=False, filling_temp=None, scc=True):
     """Run DFTB+ single-point calculation in work_dir.
 
     Returns energy in Ha.  Raises RuntimeError on failure.
@@ -769,7 +774,7 @@ def run_dftb_sp(work_dir, enames, apos, sk_prefix, xyz_fname='geom.xyz', maxscc=
     xyz_path = os.path.join(work_dir, xyz_fname)
     hsd_path = os.path.join(work_dir, 'dftb_in.hsd')
     au.save_xyz(xyz_path, enames, apos)
-    write_dftb_input_sp(enames, xyz_path, hsd_path, sk_prefix, maxscc=maxscc, filling_temp=filling_temp)
+    write_dftb_input_sp(enames, xyz_path, hsd_path, sk_prefix, maxscc=maxscc, filling_temp=filling_temp, scc=scc)
     if restart_charges_from and os.path.isfile(restart_charges_from):
         shutil.copy(restart_charges_from, os.path.join(work_dir, 'charges.bin'))
     cwd = os.getcwd()
@@ -938,7 +943,7 @@ def makeDFTBjob( enames=None, fname='dftb_in.hsd', gname="input.xyz", method='D3
     #Parallel { UseOmpThreads = Yes }
 
 def makeDFTBjob_pbc( enames, apos, lvs, fname='dftb_in.hsd', sk_set=None,
-                     nk=(1,1,1), k_shift=(0.5,0.0,0.0), opt=False, params=default_params, SCCTolerance=1e-5, MaxScc=200, Temperature=300, MixingParameter=0.2, fixed_atoms=None ):
+                     nk=(1,1,1), k_shift=(0.5,0.0,0.0), opt=False, params=default_params, SCCTolerance=1e-5, MaxScc=200, Temperature=300, MixingParameter=0.2, fixed_atoms=None, Mixer=None, extra_hsd='', SCC=True, klist=None, cart_constraints=None ):
     """Write a DFTB+ input for a periodic calculation using GenFormat (supercell type S).
     
     Args:
@@ -993,7 +998,24 @@ def makeDFTBjob_pbc( enames, apos, lvs, fname='dftb_in.hsd', sk_set=None,
                     moved_str = "1:-1"  # fallback
             else:
                 moved_str = "1:-1"
-            hsd.write(dedent(f"""Driver = GeometryOptimization {{
+            if cart_constraints:
+                # Directional constraints ({atom vx vy vz}: atom can't move along v)
+                # are only supported by the DEPRECATED LBFGS driver, not the new
+                # GeometryOptimization driver (this build parses no Constraints there).
+                hsd.write(dedent(f"""Driver = LBFGS {{
+    Memory = 20
+    MovedAtoms = {moved_str}
+    MaxSteps = {params["MaxSteps"]}
+    MaxForceComponent = 1e-4
+    OutputPrefix = "geom.out"
+    Constraints = {{
+"""))
+                for idxs, mask in cart_constraints:
+                    for i in idxs:
+                        hsd.write(f'    {i+1} {mask[0]:.6f} {mask[1]:.6f} {mask[2]:.6f}\n')
+                hsd.write('  }\n}\n\n')
+            else:
+                hsd.write(dedent(f"""Driver = GeometryOptimization {{
     Optimizer = {params["Optimizer"]}
     MovedAtoms = {moved_str}
     MaxSteps = {params["MaxSteps"]}
@@ -1013,7 +1035,7 @@ def makeDFTBjob_pbc( enames, apos, lvs, fname='dftb_in.hsd', sk_set=None,
 
         # Hamiltonian
         hsd.write('Hamiltonian = DFTB {\n')
-        hsd.write('  Scc = Yes\n')
+        hsd.write(f'  Scc = {"Yes" if SCC else "No"}\n')
         hsd.write('  SlaterKosterFiles = Type2FileNames {\n')
         hsd.write(f'    Prefix = {basis_path}\n')
         hsd.write('    Separator = "-"\n')
@@ -1023,20 +1045,32 @@ def makeDFTBjob_pbc( enames, apos, lvs, fname='dftb_in.hsd', sk_set=None,
         for ename in enameset:
             hsd.write(f'    {ename} = "{elements.ELEMENT_DICT[ename][4]}"\n')
         hsd.write('  }\n')
-        # K-points via SupercellFolding (Monkhorst-Pack)
-        hsd.write('  KPointsAndWeights = SupercellFolding {\n')
-        hsd.write(f'    {nk[0]} 0 0\n')
-        hsd.write(f'    0 {nk[1]} 0\n')
-        hsd.write(f'    0 0 {nk[2]}\n')
-        hsd.write(f'    {k_shift[0]:.1f} {k_shift[1]:.1f} {k_shift[2]:.1f}\n')
-        hsd.write('  }\n')
-        hsd.write(f'  SCCTolerance = {SCCTolerance:.2e}\n')
-        hsd.write(f'  MaxSccIterations = {MaxScc}\n')
+        # K-points: explicit list (fractional coords + weight) or SupercellFolding (Monkhorst-Pack)
+        if klist is not None:
+            hsd.write('  KPointsAndWeights {\n')
+            for k, w in klist:
+                hsd.write(f'    {k[0]:.8f} {k[1]:.8f} {k[2]:.8f}  {w:.8f}\n')
+            hsd.write('  }\n')
+        else:
+            hsd.write('  KPointsAndWeights = SupercellFolding {\n')
+            hsd.write(f'    {nk[0]} 0 0\n')
+            hsd.write(f'    0 {nk[1]} 0\n')
+            hsd.write(f'    0 0 {nk[2]}\n')
+            hsd.write(f'    {k_shift[0]:.1f} {k_shift[1]:.1f} {k_shift[2]:.1f}\n')
+            hsd.write('  }\n')
+        if SCC:
+            hsd.write(f'  SCCTolerance = {SCCTolerance:.2e}\n')
+            hsd.write(f'  MaxSccIterations = {MaxScc}\n')
+            if Mixer is not None:
+                hsd.write(f'  Mixer = {Mixer}\n')          # e.g. 'DIIS { InitMixParam = 0.2 }'
+            else:
+                hsd.write('  Mixer = Broyden {\n')
+                hsd.write(f'    MixingParameter = {MixingParameter}\n')
+                hsd.write('  }\n')
         hsd.write(f'  Filling = Fermi {{ Temperature [K] = {Temperature} }}\n')
-        hsd.write('  Mixer = Broyden {\n')
-        hsd.write(f'    MixingParameter = {MixingParameter}\n')
-        hsd.write('  }\n')
         hsd.write('}\n')
+        if extra_hsd:
+            hsd.write(extra_hsd)               # e.g. 'Options { WriteHS = Yes }' / 'Analysis { WriteEigenvectors = Yes }'
 
 
 def run( geom=None, params=None, id=0 ):

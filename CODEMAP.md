@@ -18,7 +18,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 
 ### spammm/topology/ — Molecular Topology (SSOT: AtomicGraph)
 - `AtomicGraph.py` — `Atom`, `Bond`, `Ring` classes; `to_arrays()`. **Authoritative** molecular structure (see skill:`molecular-structure-sync`)
-- `MoleculeEditorBackend.py` — molecular editor backend: graph ↔ dense arrays; hex grid, editing ops, `_sync_sys()`, export; `build_zigzag_ribbon` (PBC N/O/H-terminated GNRs, `bPeriodicX=True`, passivation strings `n/N/o/O/H/h`)
+- `MoleculeEditorBackend.py` — molecular editor backend: graph ↔ dense arrays; hex grid, editing ops, `_sync_sys()`, export; `build_zigzag_ribbon` (PBC zigzag GNRs, `bPeriodicX=True`; `PASSIVATION_GROUPS` per-edge-site chemistry CH/N/NH/CH2/C=O/C-OH/CHOH — `H*` marker bonds to host, not chained; char encoding `n/N/o/O/H/h/m`)
 - `ribbon_pbc.py` — periodic ribbon builders: `build_ribbon_cell` (single ribbon → atoms/lvs/seam), `build_ribbon_junction_cell` (two-ribbon N···H-N junction cell, PBC x/y, {p,d,0} site states, HbondRecords), `scan_junction_gap` (d_DA scan via run_pbc, 3-pt parabola, p↔d parity), `check_degrees`, `save_xyz_lvs`; MEB keeps lazy shims for the moved functions
 - `KekulePure.py` — Kekule pi-bond order solver; feasibility precheck, multi-seed localization, 6-ring validation; writes results back to `Bond.order`
 - `PackedMolecule.py` — compact molecule representation
@@ -79,11 +79,11 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `DFTB/DFTBplusParser.py` — DFTB+ output parser
 - `DFTB/Grid_dftb.py` — DFTB orbital grid projection (OpenCL)
 - `DFTB/basis_optimizer.py` — DFTB basis set optimization
-- `DFTB_utils.py` — DFTB+ utilities: `run_dftb_sp`, `run_dftb_relax`, `parse_mulliken_charges`, Hessian I/O, constrained scan helpers
+- `DFTB_utils.py` — DFTB+ utilities: `run_dftb_sp`, `run_dftb_relax`, `parse_mulliken_charges`, Hessian I/O, constrained scan helpers; `run_pbc`/`makeDFTBjob_pbc` periodic runs (`k_shift` Γ-centred mesh incl. BZ edge, `klist=` explicit kpts, `do_relax`, `Mixer`, `extra_hsd` → `eigenvec.bin`)
 - `coordinate_scan.py` — reaction-coordinate paths: control grids, pm-NEB (relax + interp), rigid DFTB scan → `ScanDataset`
 - `esp_grid.py` — Coulomb ESP on 2D grids from atomic charges (same KE/r as QEq); stack precompute for animation
 - `hbond_scan.py` — rigid DFTB H-bond proton-transfer scan for ASCII `:` systems (0.1 Å path grid)
-- `pi_bond_order.py` — π bond orders from DFTBcore density matrix: `run_dftbcore_sp` → dense DM+S, `pi_bond_order_matrix` (p⊥ Lowdin), `plot_bond_scalar_map` (bond colormaps); driver `tests/topology/testplot_bond_order.py` → `debug/test_bond_order/`
+- `pi_bond_order.py` — π bond orders from DFTB density matrix + **band unfolding**: `run_dftbcore_sp` → dense DM+S, `pi_bond_order_matrix` (p⊥ Lowdin), `pi_bond_orders_pbc` (periodic BO via `oversqr.dat`/`eigenvec.bin` + ICELL phases), `subcell_group_indices` + `unfold_T_weights` (supercell→primitive unfolding via subcell-translation spectral projectors in the true S(k) metric — canonical; `unfold_spectral_weights_DEPRECATED` = old Euclidean formula, wrong for S≠I), `plot_bond_scalar_map` (bond colormaps); drivers `tests/topology/testplot_bond_order.py` → `debug/test_bond_order/`, `tests/quantum/testplot_unfold.py` → `debug/unfold/` (`doc/TopicalAudit/BandUnfolding_Ribbons.md`)
 - `pySCF_utils.py` — pySCF integration utilities
 
 ### spammm/GUI/ — Graphical User Interface (VisPy)
@@ -178,11 +178,11 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `ref_data/` — git-tracked reference files (`.ref.json`, `.ref.xyz`)
 - `helpers/` — test utility modules (`parity.py`, `geometry.py`, `scan.py`, `folded_rigid.py`, `topology_test.py`)
 - `SPM/` — AFM/STM tests and plots (`test_afm_contact_surface.py`, `testplot_afm_contact_surface.py`)
-- `topology/` — topology editing, Kekule (`test_kekule.py`), H-bond DFTB scan (`test_hbond_scan.py`), RC scan (`test_scan_dataset.py`, `testplot_hbond_scan.py`), PBC ribbons (`testplot_ribbon.py` → `debug/ribbon/`), π bond orders (`testplot_bond_order.py` → `debug/test_bond_order/`)
+- `topology/` — topology editing, Kekule (`test_kekule.py`), H-bond DFTB scan (`test_hbond_scan.py`), RC scan (`test_scan_dataset.py`, `testplot_hbond_scan.py`), PBC ribbons (`testplot_ribbon.py` → `debug/ribbon/`), π bond orders (`testplot_bond_order.py` → `debug/test_bond_order/`), hydrogen chemical potentials (`testplot_muH.py` → `debug/muH/`; monomer μ1/μ2/J/μ2H table, dimer calibration, closed-shell 2H matrix — see `doc/ERC_private/muH_monomers.md`), symmetric PAH flakes (`testplot_mol_flakes.py` → `debug/mol_flakes/`; see `doc/ERC_private/task_Molecules.md`), PAH flake DFTB battery + bond maps (`testplot_mol_flakes_dftb.py` → `debug/mol_flakes_dftb/`; `--maps` = per-backbone π-BO/BL maps, `battery_reservoir.png` = electron-reservoir corrected energies), PySCF B3LYP benchmark driver (`run_pyscf_b3lyp.py`)
 - `GUI/` — `test_rc_scan_gui_script.py` (offscreen RC review script)
 - `surfaces/` — surface-specific tests
 - `forcefields/` — forcefield-specific tests
-- `quantum/` — quantum integration tests
+- `quantum/` — quantum integration tests; `testplot_unfold.py` — ribbon bands + supercell unfolding (`--passiv`/`--switch`/`--sys3` modes) → `debug/unfold/` + `index.html`
 
 ## data/ — Data Files
 - `mol/` — molecule files (`.mol2`)

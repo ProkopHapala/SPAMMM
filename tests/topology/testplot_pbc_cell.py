@@ -29,8 +29,8 @@ from spammm import plotUtils as pu
 OUTDIR = os.path.join(os.path.dirname(__file__), '..', '..', 'debug', 'pbc_cell')
 
 
-def build_one(name, hbond_length=2.8, tilt=None, zigzag=None, slant=None):
-    cell, lvs, hbonds = build_pbc_cell(name, hbond_length=hbond_length, tilt=tilt, zigzag=zigzag, slant=slant)
+def build_one(name, hbond_length=2.8, tilt=None, zigzag=None, slant=None, jkink=None):
+    cell, lvs, hbonds = build_pbc_cell(name, hbond_length=hbond_length, tilt=tilt, zigzag=zigzag, slant=slant, jkink=jkink)
     print(f"\n=== {name}: natoms={cell.natoms}  Ly={lvs[1, 1]:.3f} A ===")
     e = lambda i: cell.enames[i]
     for j, hb in enumerate(hbonds):
@@ -54,8 +54,9 @@ if __name__ == '__main__':
     ap.add_argument('--tilt', type=float, default=None, help='herringbone tilt [deg], alternate blocks +/-tilt (default: per-system, 45 except hq2q=0)')
     ap.add_argument('--zigzag', type=float, default=None, help='in-plane zigzag angle [deg] (default: per-system, hq2q=60)')
     ap.add_argument('--slant', type=float, default=None, help='oblique junction lean off y-axis [deg], alternating per junction (default: per-system, 0)')
+    ap.add_argument('--jkink', type=float, default=None, help='outward donor-OH splay at junction apexes [deg] (default: per-system, 0)')
     args = ap.parse_args()
     os.makedirs(OUTDIR, exist_ok=True)
     names = sorted(PBC_CHAIN_ARTS) if args.name == 'all' else [args.name]
     for name in names:
-        build_one(name, args.hbond, tilt=args.tilt, zigzag=args.zigzag, slant=args.slant)
+        build_one(name, args.hbond, tilt=args.tilt, zigzag=args.zigzag, slant=args.slant, jkink=args.jkink)
