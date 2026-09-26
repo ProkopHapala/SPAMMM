@@ -44,7 +44,7 @@ inline float eval_multipole(float3 d, int order, __global const float* cs) {
 // Kernel 1: Tip Field Calculation  (same as PME.cl, n_sites passed as arg)
 // ======================================================================
 
-__kernel void compute_tip_interaction(
+inline void compute_tip_interaction_impl(
     int n_pixels,
     int n_sites,
     __global const float4* restrict p_tips,
@@ -54,6 +54,8 @@ __kernel void compute_tip_interaction(
     __global const float*  restrict multipole_cs,
     __global const float* restrict params,
     int order,
+    __global const float* cell,
+    __global const int* periodic_sites,
     __global float* restrict out_H_shifts,
     __global float* restrict out_T_factors
 ) {
@@ -76,6 +78,25 @@ __kernel void compute_tip_interaction(
     for (int i = 0; i < n_sites; i++) {
         float4 site_data = p_sites[i];
         float3 site_pos = site_data.xyz;
+        if (cell && periodic_sites[i]) {
+            float2 dxy = tip_pos.xy - site_pos.xy;
+            float2 a = (float2)(cell[0], cell[1]);
+            float2 b = (float2)(cell[2], cell[3]);
+            float2 fractional = (float2)(dxy.x*cell[4]+dxy.y*cell[6],
+                                         dxy.x*cell[5]+dxy.y*cell[7]);
+            float2 center = rint(fractional);
+            float best = INFINITY;
+            float2 shift = (float2)(0.0f);
+            // Host Gauss-reduces the lattice; nine candidates contain the
+            // closest image, including oblique cells. Never sum replicas.
+            for (int u=-1; u<=1; ++u) for (int v=-1; v<=1; ++v) {
+                float2 candidate = (center.x+u)*a + (center.y+v)*b;
+                float2 delta = dxy-candidate;
+                float distance = dot(delta,delta);
+                if (distance < best) { best=distance; shift=candidate; }
+            }
+            site_pos.xy += shift;
+        }
         float E_base = site_data.w;
 
         const float* R = rots + i * 9;
@@ -114,6 +135,40 @@ __kernel void compute_tip_interaction(
         out_H_shifts[gid * n_sites + i] = E_base + E_val;
         out_T_factors[gid * n_sites + i] = t_fac;
     }
+}
+
+__kernel void compute_tip_interaction(
+    int n_pixels,
+    int n_sites,
+    __global const float4* restrict p_tips,
+    __global const float4* restrict p_sites,
+    __global const float*  restrict rots,
+    __global const float*  restrict v_tips,
+    __global const float*  restrict multipole_cs,
+    __global const float* restrict params,
+    int order,
+    __global float* restrict out_H_shifts,
+    __global float* restrict out_T_factors
+) {
+    compute_tip_interaction_impl(n_pixels, n_sites, p_tips, p_sites, rots, v_tips, multipole_cs, params, order, 0, 0, out_H_shifts, out_T_factors);
+}
+
+__kernel void compute_tip_interaction_nearest(
+    int n_pixels,
+    int n_sites,
+    __global const float4* restrict p_tips,
+    __global const float4* restrict p_sites,
+    __global const float*  restrict rots,
+    __global const float*  restrict v_tips,
+    __global const float*  restrict multipole_cs,
+    __global const float* restrict params,
+    int order,
+    __global const float* cell,
+    __global const int* periodic_sites,
+    __global float* restrict out_H_shifts,
+    __global float* restrict out_T_factors
+) {
+    compute_tip_interaction_impl(n_pixels, n_sites, p_tips, p_sites, rots, v_tips, multipole_cs, params, order, cell, periodic_sites, out_H_shifts, out_T_factors);
 }
 
 // ======================================================================

@@ -56,17 +56,25 @@ def export_hs(calc, atoms, fname='hs.npz'):
     #   orthonormality: C* S C^T = I   (S = raw S_kMM; right factor NOT conjugated)
     #   eigenequation:  H C^T = S C^T diag(eps)   (H,S in eV once eps is xHa)
     #   rho_MN = sum_n occ_n C_nM C*_nN   ->  Tr(rho S) = N_e per k
-    eps_kn, occ_kn, C_knM, rho_kMM = [], [], [], []
-    for kpt in wfs.kpt_u:                                  # (s,k) pairs; nspins=1 -> k-major
+    nk, nspins = len(kpts), wfs.nspins
+    nb = len(wfs.kpt_u[0].eps_n); nao = wfs.kpt_u[0].S_MM.shape[0]
+    eps_kn  = np.zeros((nk, nb)); occ_kn = np.zeros((nk, nb))
+    C_knM   = np.zeros((nk, nb, nao), complex); rho_kMM = np.zeros((nk, nao, nao), complex)
+    assert nspins == 1, 'use export_hs_spin for nspins=2'
+    for kpt in wfs.kpt_u:                                  # index by kpt.k — kpt_u order is NOT guaranteed = IBZ order under MPI
+        k = kpt.k
         occ = np.asarray(kpt.f_n) / kpt.weightk            # f_n = myocc * spin_degen * w_k -> occ 0..2
         C = np.asarray(kpt.C_nM)
-        eps_kn.append(np.asarray(kpt.eps_n) * Ha); occ_kn.append(occ); C_knM.append(C)
-        rho_kMM.append(np.einsum('nM,n,nN->MN', C, occ, C.conj()))
-        n = len(kpt.eps_n)
-        assert np.allclose(C.conj() @ kpt.S_MM.conj() @ C.T, np.eye(n), atol=1e-8), 'C* S C^T != I'
+        eps_kn[k], occ_kn[k], C_knM[k] = np.asarray(kpt.eps_n) * Ha, occ, C
+        rho_kMM[k] = np.einsum('nM,n,nN->MN', C, occ, C.conj())
+        assert np.allclose(C.conj() @ kpt.S_MM.conj() @ C.T, np.eye(nb), atol=1e-8), 'C* S C^T != I'
     S_kMM = np.asarray(S_kMM); H_kMM = np.asarray(H_skMM[0])
-    rho_kMM = np.asarray(rho_kMM); C_knM = np.asarray(C_knM)
-    eps_kn = np.asarray(eps_kn); occ_kn = np.asarray(occ_kn)
+    # convention differs across GPAW versions: 24.1 returns conj(H) vs 25.x returns H directly
+    # -> test the eigenequation on both and pick whichever satisfies it
+    def _resid(H_k, S_k, k=0):
+        return np.abs(H_k[k] @ C_knM[k].T - (S_k[k] @ C_knM[k].T) * eps_kn[k][None, :]).max()
+    if _resid(H_kMM, S_kMM) > _resid(H_kMM.conj(), S_kMM.conj()):
+        H_kMM, S_kMM = H_kMM.conj(), S_kMM.conj()
     for k in range(len(kpts)):
         H, S, C, eps = H_kMM[k], S_kMM[k], C_knM[k], eps_kn[k]
         assert np.allclose(H @ C.T, (S @ C.T) * eps[None, :], atol=1e-5), f'H C^T != S C^T eps at k={k}'
@@ -118,6 +126,11 @@ def export_hs_spin(calc, atoms, fname='hs.npz'):
         rho_skMM[s, k] = np.einsum('nM,n,nN->MN', C, occ, C.conj())
         n = len(kpt.eps_n)
         assert np.allclose(C.conj() @ kpt.S_MM.conj() @ C.T, np.eye(n), atol=1e-8), 'C* S C^T != I'
+    H_skMM = np.asarray(H_skMM); S_kMM = np.asarray(S_kMM)
+    def _resid_s(H_s, S_k):                      # same convention branch as export_hs
+        return np.abs(H_s[0, 0] @ C_sknM[0, 0].T - (S_k[0] @ C_sknM[0, 0].T) * eps_skn[0, 0][None, :]).max()
+    if _resid_s(H_skMM, S_kMM) > _resid_s(H_skMM.conj(), S_kMM.conj()):
+        H_skMM, S_kMM = H_skMM.conj(), S_kMM.conj()
     for s in range(nspins):
         for k in range(nk):
             H, S, C, eps = H_skMM[s, k], S_kMM[k], C_sknM[s, k], eps_skn[s, k]

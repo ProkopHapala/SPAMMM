@@ -32,6 +32,33 @@ def pack_float4(xyz_arr, w_arr=None, w_default=0.0):
     return np.ascontiguousarray(packed)
 
 
+def prepare_tip_cell(cell):
+    """Pack a planar lattice (row vectors, same length units as positions).
+
+    Gauss reduction keeps the lattice unchanged and makes a 3x3 local nearest
+    image search sufficient, even when the supplied basis is highly skewed.
+    """
+    cell = np.asarray(cell, dtype=np.float64)
+    if cell.shape == (2, 3):
+        if np.any(cell[:, 2] != 0):
+            raise ValueError("tip_cell must lie in the xy plane")
+        cell = cell[:, :2]
+    if cell.shape != (2, 2) or not np.isfinite(cell).all():
+        raise ValueError("tip_cell must be finite, shape (2,2) or planar (2,3)")
+    if abs(np.linalg.det(cell)) <= 1e-10 * np.linalg.norm(cell)**2:
+        raise ValueError("tip_cell is singular or numerically degenerate")
+    a, b = cell.copy()
+    for _ in range(100):
+        if np.dot(b, b) < np.dot(a, a):
+            a, b = b, a
+        m = np.rint(np.dot(a, b) / np.dot(a, a))
+        if m == 0:
+            reduced = np.array([a, b])
+            return np.concatenate([reduced.ravel(), np.linalg.inv(reduced).ravel()]).astype(np.float32)
+        b = b - m*a
+    raise ValueError("tip_cell reduction did not converge")
+
+
 class PauliSolverCL8(OpenCLBase):
     """8-site / 256-state PME solver via PME8.cl."""
 
@@ -56,6 +83,7 @@ class PauliSolverCL8(OpenCLBase):
             raise FileNotFoundError(f"Kernel file not found or failed to build: {kpath}")
 
         self.krn_compute_tip_interaction = cl.Kernel(self.prg, 'compute_tip_interaction')
+        self.krn_compute_tip_interaction_nearest = cl.Kernel(self.prg, 'compute_tip_interaction_nearest')
         self.krn_solve_pme8 = cl.Kernel(self.prg, 'solve_pme8')
         self._init_lookups()
 
@@ -71,17 +99,37 @@ class PauliSolverCL8(OpenCLBase):
     def scan_current_tip(self, pTips, Vtips, pSites, params, order, cs,
                          rots=None, Wij=None,
                          return_probs=False, return_state_energies=False,
-                         Vtips_gate=None):
+                         Vtips_gate=None, tip_cell=None, tip_periodic_sites=None):
         """Main simulation function (mirrors PauliSolverCL.scan_current_tip).
 
         pTips: (N, 3) tip positions.
         Vtips: (N,) voltages — used as tip chemical potential mu1 in solve_pme8.
         pSites: (n_sites, 3) or (n_sites, 4). Padded to 8 by caller.
         params: [Rtip, zV0, zVd, Esite, beta, Gamma, W, bMirror, bRamp]
+        tip_cell: optional planar lattice, two row vectors, shape (2,2) or
+            (2,3), in the same units as pTips/pSites. Each periodic site uses
+            its nearest xy replica for both gating and tunnelling; no sum.
+            Images share that site's occupation. Ei/Wij are not changed.
+        tip_periodic_sites: optional boolean mask of length nSingle; default
+            all sites. Exclude padded spectators explicitly. Use one site per
+            inequivalent basis position, not duplicate replicas of that site.
         Vtips_gate: optional (N,) gate voltages for compute_tip_interaction
             (site-energy shifts). Use e.g. alpha*(V_s - V0) for a lever-arm
             model while mu1 stays V_s. None => same as Vtips (old behaviour).
         """
+        # Optional nearest replica changes tip gating/tunnelling only. Ei/Wij
+        # and the many-body state space are untouched.
+        cell_cl = mask_cl = None
+        if tip_cell is None:
+            if tip_periodic_sites is not None:
+                raise ValueError("tip_periodic_sites requires tip_cell")
+        else:
+            packed_cell = prepare_tip_cell(tip_cell)
+            mask = np.ones(self.nSingle, dtype=np.int32) if tip_periodic_sites is None else np.asarray(tip_periodic_sites)
+            if mask.shape != (self.nSingle,) or not np.isin(mask, [0, 1]).all():
+                raise ValueError("tip_periodic_sites must contain one boolean per solver site")
+            cell_cl = cl_array.to_device(self.queue, packed_cell)
+            mask_cl = cl_array.to_device(self.queue, np.ascontiguousarray(mask, dtype=np.int32))
         n_pixels = len(pTips)
         n_sites = self.nSingle
 
@@ -120,7 +168,9 @@ class PauliSolverCL8(OpenCLBase):
 
         # Kernel 1: tip interaction
         global_size_1 = (n_pixels,)
-        self.krn_compute_tip_interaction(
+        tip_kernel = self.krn_compute_tip_interaction if cell_cl is None else self.krn_compute_tip_interaction_nearest
+        periodic_args = () if cell_cl is None else (cell_cl.data, mask_cl.data)
+        tip_kernel(
             self.queue, global_size_1, None,
             np.int32(n_pixels), np.int32(n_sites),
             p_tips_cl.data,
@@ -130,6 +180,7 @@ class PauliSolverCL8(OpenCLBase):
             cs_cl.data,
             params_cl.data,
             np.int32(order),
+            *periodic_args,
             h_shifts_cl.data,
             t_factors_cl.data
         )

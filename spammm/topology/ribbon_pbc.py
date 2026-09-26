@@ -362,23 +362,26 @@ D_DA_OPT = {'NN': 2.90, 'NO': 2.80, 'OO': 2.75}   # initial D...A optima per jun
 
 def build_mol_ribbon_cell(mol_art=None, mol=None, width_chains=8, ncells=4, d_DA=None,
                           shift_x=0.0, site=None, pbc_y=True, vac_y=14.0, Lz=20.0,
-                          a_CC=A_CC, relax_bonds=True, alt_CH=False, tilt_deg=0.0, label='mol_ribbon'):
+                          a_CC=A_CC, relax_bonds=True, alt_CH=False, tilt_deg=0.0, d_vac=7.0, label='mol_ribbon'):
     """Molecule bridging two ribbon edges: cell = 1 ribbon + 1 molecule.
 
     The molecule's bottom end H-bonds the ribbon top edge (internal junction)
     and its top end H-bonds the bottom edge of the +y image (boundary
-    junction) — 2 junctions per molecule, stack ...|rib|gap|mol|gap|rib'|...
+    junction) — stack ...|rib|gap|mol|gap|rib'|...
     (doc/ERC_private/mol_ribbon_Htransfer.md).
 
-    Donor/acceptor chemistry is detected from the molecule art: a junction end
-    carrying an H (lowercase 'n'/'o' donor in the art -> capped H) faces an
-    'N' acceptor edge site; a bare 'N'/'O' end is an acceptor and faces an
-    'NH' donor site.  So 'AA' (mol XH2, donates at both ends) uses all-N
-    edges, 'BB' (mol X) puts NH at the two junction sites, 'AB'/'BA' mix.
-    Non-junction edge sites stay 'N' (bare pyridinic) — or, with
-    alt_CH=True, the edge alternates N/CH (N at the junction site and every
-    2nd site of its parity; CH elsewhere) — a half-N-doped edge.  tilt_deg
-    rigidly rotates the molecule about its tip-tip axis (junction atoms are
+    Junction tips: the N/O atoms of the extreme heavy-atom row at each end —
+    a single apex tip (st<L>x<T> family) OR a whole multi-donor edge
+    ('n n n' = 3 tips, spaced exactly on the ribbon site pitch -> they pair
+    with consecutive edge sites, MOL_EDGE_ARTS).  An end with no N/O in the
+    extreme row is bare: it floats at d_vac (vdW gap, no junction records).
+    Donor/acceptor per tip is decided by CASE in the art (lowercase 'n'/'o' =
+    donor, uppercase = acceptor) — NOT by capped-H presence: an 'N' tip is
+    =NH and keeps its off-axis cap H while remaining an acceptor.  A donor
+    tip faces an 'N' acceptor edge site, an acceptor tip faces an 'NH' donor
+    site.  Non-junction edge sites stay 'N' — or, with alt_CH=True, the edge
+    alternates N/CH (junction-site parity keeps N; CH elsewhere).  tilt_deg
+    rigidly rotates the molecule about its end-to-end axis (anchor atoms are
     ON the axis, junction registration unchanged), tilting the molecular
     plane out of the ribbon plane to clear the edge C-H's.
 
@@ -407,76 +410,162 @@ def build_mol_ribbon_cell(mol_art=None, mol=None, width_chains=8, ncells=4, d_DA
     ngs_m = {}
     for i, j in bonds_m:
         ngs_m.setdefault(i, []).append(j); ngs_m.setdefault(j, []).append(i)
-    iNO_m = np.array([i for i, e in enumerate(enames_m) if e in ('N', 'O')], dtype=int)
-    assert len(iNO_m) >= 2, 'molecule needs N/O junction atoms at both ends'
-    iNO_m = iNO_m[np.argsort(apos_m[iNO_m, 1])]
-    jb, jt = int(iNO_m[0]), int(iNO_m[-1])
-    assert apos_m[iNO_m[1], 1] - apos_m[jb, 1] > 0.1 and apos_m[jt, 1] - apos_m[iNO_m[-2], 1] > 0.1, \
-        'need a single unique junction N/O at each molecule end'
-    don_b = any(enames_m[j] == 'H' for j in ngs_m.get(jb, ()))   # bottom end donates?
-    don_t = any(enames_m[j] == 'H' for j in ngs_m.get(jt, ()))   # top end donates?
+    eo = getattr(mol, '_enames_original', None)
+
+    # junction tips per end: N/O atoms of the extreme heavy-atom rows (several
+    # tips share a donor edge; a bare end carries no N/O -> no junction)
+    y_m = apos_m[:, 1]
+    ihe = np.array([i for i, e in enumerate(enames_m) if e != 'H'], dtype=int)
+    ylo, yhi = y_m[ihe].min(), y_m[ihe].max()
+    assert yhi - ylo > 1.0, 'molecule needs distinct top/bottom ends'
+    isNO = np.array([e in ('N', 'O') for e in enames_m])
+    jbots = np.array(sorted((i for i in ihe if isNO[i] and y_m[i] < ylo + 0.15), key=lambda i: apos_m[i, 0]), dtype=int)
+    jtops = np.array(sorted((i for i in ihe if isNO[i] and y_m[i] > yhi - 0.15), key=lambda i: apos_m[i, 0]), dtype=int)
+    assert len(jbots) or len(jtops), 'molecule needs >=1 junction N/O atom at an end'
+    if not len(jbots):
+        # one-edge molecule: functional end DOWN -> internal junction to the
+        # home ribbon; the bare end faces a wide vacuum gap (not a y bridge)
+        apos_m[:, 1] = ylo + yhi - apos_m[:, 1]
+        y_m = apos_m[:, 1]
+        jbots, jtops = jtops, jbots          # y-flip preserves the x order
+    bref = int(jbots[0])
+    tref = int(jtops[0]) if len(jtops) else int(ihe[np.argmax(y_m[ihe])])   # (heavy ref if end bare)
+
+    # exocyclic -NH2 tip (degree-1 n): the sp2 capper leaves a symmetric planar
+    # fork (C-N-H = H-N-H ~120 deg).  When every end carries a single such tip,
+    # rotate the molecule -60 deg in-plane so one fork arm lands on each
+    # junction axis (a real collinear N-H...N); the off-axis arm (and the =NH
+    # cap H of a B-state tip) ends up pointing away from the junction.
+    # Multi-tip edges cannot rotate without breaking site registration — their
+    # NH2 forks stay symmetric (bifurcated H-bond).
+    tips = list(jbots) + list(jtops)
+    nh2 = all(enames_m[t] == 'N' and sum(enames_m[j] != 'H' for j in ngs_m.get(t, ())) == 1 for t in tips)
+    if nh2 and len(jbots) <= 1 and len(jtops) <= 1:
+        c, s = np.cos(-np.pi / 3), np.sin(-np.pi / 3)
+        xy = apos_m[:, :2] - apos_m[bref, :2]
+        apos_m[:, 0] = apos_m[bref, 0] + xy[:, 0] * c - xy[:, 1] * s
+        apos_m[:, 1] = apos_m[bref, 1] + xy[:, 0] * s + xy[:, 1] * c
+
+    def _donor(t):
+        """mol tip donates? the art CASE decides ('n'/'o' = donor), not capped-H
+        presence: an 'N' tip is =NH and keeps its off-axis cap H."""
+        return eo[t].islower() if eo is not None else any(enames_m[j] == 'H' for j in ngs_m.get(t, ()))
 
     if site is None:
         site = ncells // 2
+    pitch = 2.0 * a_CC * np.cos(np.pi / 6.0)
+    Lx = ncells * pitch
+
+    def _build_ribbon(pbot, ptop):
+        b = MoleculeEditorBackend(a_CC=a_CC)
+        b.build_zigzag_ribbon(width_chains=width_chains, length_cells=ncells,
+                              passivation_bottom=pbot, passivation_top=ptop,
+                              bPeriodicX=True)
+        b._sync_sys()
+        return b.sys
+
+    def _edge_sites(apos_r, enames_r):
+        """(et, eb): edge-site atom indices of both edges, x-ordered."""
+        ihv = np.array([i for i, e in enumerate(enames_r) if not e.startswith('H')], dtype=int)
+        yb, yt = apos_r[ihv, 1].min(), apos_r[ihv, 1].max()
+        et = sorted(ihv[apos_r[ihv, 1] > yt - 0.2], key=lambda i: apos_r[i, 0])
+        eb = sorted(ihv[apos_r[ihv, 1] < yb + 0.2], key=lambda i: apos_r[i, 0])
+        assert len(et) == ncells and len(eb) == ncells, f'expected {ncells} edge sites per edge'
+        return ihv, et, eb, yb, yt
+
+    # probe ribbon first: the heavy edge-site x grid is passivation-independent
+    # (N/NH/CH all sit on the same zigzag nodes) -> place the molecule in x,
+    # THEN assign each junction tip to its NEAREST site (min-image in x) so
+    # wrapped tips never pair across the x seam, THEN build the real ribbon
+    # with the complementary passivation at exactly those sites.
+    s0 = _build_ribbon(['N'] * ncells, ['N'] * ncells)
+    apos0 = np.asarray(s0.apos, dtype=float)
+    _, et0, eb0, _, _ = _edge_sites(apos0, s0.enames)
+    xt0 = np.array([apos0[i, 0] for i in et0])
+    xb0 = np.array([apos0[i, 0] for i in eb0])
+
+    if tilt_deg:
+        # tilt the molecular plane about the end-to-end axis (Rodrigues); the
+        # anchor atoms lie on the axis -> registration and h_m unchanged
+        v = apos_m[tref] - apos_m[bref]
+        v /= np.linalg.norm(v)
+        th = np.deg2rad(tilt_deg)
+        c, s = np.cos(th), np.sin(th)
+        p = apos_m - apos_m[bref]
+        apos_m = apos_m[bref] + p * c + np.cross(v, p) * s + np.outer(p @ v, v) * (1.0 - c)
+
+    # x anchor: bottom tip row -> over top-edge sites (internal junction);
+    # else the top tips register over bottom-edge sites (boundary junction)
+    if len(jbots):
+        ab = int(jbots[np.argmin(np.abs(apos_m[jbots, 0] - apos_m[jbots, 0].mean()))])
+        apos_m[:, 0] += xt0[site] - apos_m[ab, 0]
+    elif len(jtops):
+        at = int(jtops[np.argmin(np.abs(apos_m[jtops, 0] - apos_m[jtops, 0].mean()))])
+        apos_m[:, 0] += xb0[site] - apos_m[at, 0]
+    apos_m[:, 0] = (apos_m[:, 0] + shift_x * Lx) % Lx
+
+    def _sites_of(tips, xs):
+        """Nearest site index per junction tip (min-image in x); the image-side
+        dx tilt absorbs any residual top-vs-bottom stagger."""
+        ss = []
+        for t in tips:
+            d = (apos_m[t, 0] - xs + 0.5 * Lx) % Lx - 0.5 * Lx
+            ss.append(int(np.argmin(np.abs(d))))
+        assert len(set(ss)) == len(ss), f'{label}: several junction tips map to one ribbon site'
+        return ss
+
+    sites_b = _sites_of(jbots, xt0)      # mol bottom tips <-> top-edge sites
+    sites_t = _sites_of(jtops, xb0)      # mol top tips <-> bottom-edge sites
+    jmap_t = {s: _donor(t) for t, s in zip(jbots, sites_b)}   # ribbon top edge <- mol bottom end
+    jmap_b = {s: _donor(t) for t, s in zip(jtops, sites_t)}   # ribbon bot edge <- mol top end
+
     # ribbon edge chemistry complementary to the facing molecule end:
     # top edge faces mol bottom end (internal junction), bottom edge faces the
-    # image mol top end (boundary junction).  Acceptor end -> 'NH' at site.
+    # image mol top end (boundary junction).  Acceptor tip -> 'NH' at its site.
     # alt_CH: N only at every 2nd site (junction-site parity), CH elsewhere.
-    def _edge_pass(don_end):
-        return ['NH' if (i == site and not don_end) else
+    def _edge_pass(jmap):
+        return [('N' if jmap[i] else 'NH') if i in jmap else
                 ('N' if (not alt_CH or (i - site) % 2 == 0) else 'CH') for i in range(ncells)]
-    pass_top = _edge_pass(don_b)
-    pass_bot = _edge_pass(don_t)
-    b = MoleculeEditorBackend(a_CC=a_CC)
-    b.build_zigzag_ribbon(width_chains=width_chains, length_cells=ncells,
-                          passivation_bottom=pass_bot, passivation_top=pass_top,
-                          bPeriodicX=True)
-    b._sync_sys()
-    apos = np.asarray(b.sys.apos, dtype=float).copy()
-    enames = list(b.sys.enames)
-    assert b.sys.bonds is not None and len(b.sys.bonds) > 0, 'ribbon has no bonds'
-    bonds_r = np.asarray(b.sys.bonds, dtype=np.int32)
+    pass_top = _edge_pass(jmap_t)
+    pass_bot = _edge_pass(jmap_b)
+    s = _build_ribbon(pass_bot, pass_top)
+    apos = np.asarray(s.apos, dtype=float).copy()
+    enames = list(s.enames)
+    assert s.bonds is not None and len(s.bonds) > 0, 'ribbon has no bonds'
+    bonds_r = np.asarray(s.bonds, dtype=np.int32)
     nR = len(apos)
-    Lx = ncells * 2.0 * a_CC * np.cos(np.pi / 6.0)
 
-    ihv = np.array([i for i, e in enumerate(enames) if not e.startswith('H')], dtype=int)
-    y_bot_r, y_top_r = apos[ihv, 1].min(), apos[ihv, 1].max()          # edge heavy-atom rows
-    et = sorted(ihv[apos[ihv, 1] > y_top_r - 0.2], key=lambda i: apos[i, 0])
-    eb = sorted(ihv[apos[ihv, 1] < y_bot_r + 0.2], key=lambda i: apos[i, 0])
-    assert len(et) == ncells and len(eb) == ncells, f'expected {ncells} edge sites per edge'
-    assert enames[et[site]] == 'N' and enames[eb[site]] == 'N', f'{label}: junction sites must be edge N'
-    x_t, x_b = apos[et[site], 0], apos[eb[site], 0]
+    ihv, et, eb, y_bot_r, y_top_r = _edge_sites(apos, enames)          # edge heavy-atom rows
+    for ss, ee in ((sites_b, et), (sites_t, eb)):
+        for si in set(ss):
+            assert enames[ee[si]] == 'N', f'{label}: junction sites must be edge N'
 
     if d_DA is None:
-        d_lo = D_DA_OPT[''.join(sorted((enames_m[jb], 'N')))]          # internal junction
-        d_hi = D_DA_OPT[''.join(sorted((enames_m[jt], 'N')))]          # boundary junction
+        _dopt = lambda tips: float(np.mean([D_DA_OPT[''.join(sorted((enames_m[t], 'N')))] for t in tips]))
+        d_lo = _dopt(jbots) if len(jbots) else d_vac               # internal junction gap
+        d_hi = _dopt(jtops) if len(jtops) else d_vac               # boundary junction gap
     elif np.isscalar(d_DA):
         d_lo = d_hi = float(d_DA)
     else:
         d_lo, d_hi = (float(v) for v in d_DA)
 
-    if tilt_deg:
-        # tilt the molecular plane about the tip-tip axis (Rodrigues); the
-        # junction atoms lie on the axis -> registration and h_m unchanged
-        v = apos_m[jt] - apos_m[jb]
-        v /= np.linalg.norm(v)
-        th = np.deg2rad(tilt_deg)
-        c, s = np.cos(th), np.sin(th)
-        p = apos_m - apos_m[jb]
-        apos_m = apos_m[jb] + p * c + np.cross(v, p) * s + np.outer(p @ v, v) * (1.0 - c)
-
-    h_m = apos_m[jt, 1] - apos_m[jb, 1]                # mol junction-to-junction span
-    apos_m[:, 0] += x_t - apos_m[jb, 0] + shift_x * Lx
-    apos_m[:, 0] %= Lx
-    apos_m[:, 1] += y_top_r + d_lo - apos_m[jb, 1]     # bottom end exactly d_lo above the top edge
+    h_m = apos_m[tref, 1] - apos_m[bref, 1]                # mol end-to-end span
+    apos_m[:, 1] += y_top_r + d_lo - apos_m[bref, 1]     # bottom end exactly d_lo above the top edge
     nM = len(apos_m)
     apos = np.vstack([apos, apos_m])
     enames += enames_m
     bonds = np.vstack([bonds_r, bonds_m + nR])
-    jb_c, jt_c = nR + jb, nR + jt
     if pbc_y:
         Ly = (y_top_r - y_bot_r) + d_lo + h_m + d_hi
-        dx = apos[jt_c, 0] - x_b                       # tilt registers image bottom site over mol top end
+        # tilt registers image bottom sites over the mol top tips (tip lattice
+        # = site pitch, so one dx registers the whole end; all tips must agree)
+        dx = 0.0
+        if len(jtops):
+            dxs = [(apos[nR + t, 0] - apos[eb[s], 0] + 0.5 * Lx) % Lx - 0.5 * Lx
+                   for t, s in zip(jtops, sites_t)]
+            dx = float(np.mean(dxs))      # relaxed mol spacing may deviate ~0.1 A from the site pitch
+            assert all(abs((d - dx + 0.5 * Lx) % Lx - 0.5 * Lx) < 0.6 for d in dxs), \
+                f'{label}: top-end tips need inconsistent cell tilt dx={dxs}'
         apos[:, 1] += 0.5 * d_hi - y_bot_r             # boundary junction gap centered on y=0/Ly
         lvec = np.array([dx, Ly, 0.0])
     else:
@@ -490,15 +579,17 @@ def build_mol_ribbon_cell(mol_art=None, mol=None, width_chains=8, ncells=4, d_DA
 
     # junction records from construction (the pairs are known — geometric H..A
     # search would miss donors whose cap-H points off-axis, e.g. exocyclic O-H):
-    #   internal: mol bottom end <-> top-edge site;  boundary: mol top end <->
-    #   bottom-edge site of the +y image (donor-side record keeps a_shift).
+    #   internal: mol bottom tips <-> top-edge sites;  boundary: mol top tips
+    #   <-> bottom-edge sites of the +y image (donor-side record keeps a_shift).
     neigh = {}
     for i, j in bonds:
         neigh.setdefault(i, []).append(j)
         neigh.setdefault(j, []).append(i)
-    pairs = [(jb_c, et[site], 0) if don_b else (et[site], jb_c, 0)]
+    pairs = [((nR + int(t)) if _donor(t) else et[s], et[s] if _donor(t) else (nR + int(t)), 0)
+             for t, s in zip(jbots, sites_b)]
     if pbc_y:
-        pairs.append((jt_c, eb[site], +1) if don_t else (eb[site], jt_c, -1))
+        pairs += [((nR + int(t)) if _donor(t) else eb[s], eb[s] if _donor(t) else (nR + int(t)),
+                   1 if _donor(t) else -1) for t, s in zip(jtops, sites_t)]
     r_xh = 1.01
     hbonds = []
     for idon, iacc, a_sh in pairs:
@@ -509,12 +600,15 @@ def build_mol_ribbon_cell(mol_art=None, mol=None, width_chains=8, ncells=4, d_DA
         axv = pA - pD
         dist = np.linalg.norm(axv)
         ih = max(hs, key=lambda j: np.dot(apos[j] - pD, axv))   # donor H most aligned with D->A
-        apos[ih] = pD + r_xh * axv / dist                      # junction H exactly on the axis
+        if len(hs) == 1:
+            apos[ih] = pD + r_xh * axv / dist                  # junction H exactly on the axis
+        # multi-H donors (NH2): keep the sp2 fork as drawn — snapping the best
+        # arm onto the axis would squeeze H-N-H to ~60 deg
         hbonds.append(HbondRecord(int(idon), int(ih), int(iacc), float(dist - r_xh), 180.0, d_shift=0, a_shift=a_sh))
     hbonds.sort(key=lambda h: (h.a_shift != 0, apos[h.donor_idx, 0]))  # internal junction first
 
     cell = AtomicSystem(apos=apos, enames=enames)
-    cell.atypes = np.concatenate([np.asarray(b.sys.atypes), np.asarray(mol.atypes)]).astype(np.int32)
+    cell.atypes = np.concatenate([np.asarray(s.atypes), np.asarray(mol.atypes)]).astype(np.int32)
     cell.bonds = bonds
     cell.seam = seam
     cell.n_ribbon = nR
@@ -523,6 +617,13 @@ def build_mol_ribbon_cell(mol_art=None, mol=None, width_chains=8, ncells=4, d_DA
     # junction D..A/H..A pairs are close by design -> excluded
     from spammm.atomicUtils import check_clashes
     jexc = [p for hb in hbonds for p in ((hb.donor_idx, hb.h_idx), (hb.h_idx, hb.acceptor_idx), (hb.donor_idx, hb.acceptor_idx))]
+    # residual cap H's on junction atoms (=NH acceptor tips, 2nd NH2 hydrogen)
+    # sit junction-adjacent by construction -> exempt them too
+    for hb in hbonds:
+        for t in (hb.donor_idx, hb.acceptor_idx):
+            for j_ in neigh.get(t, []):
+                if enames[j_] == 'H' and j_ != hb.h_idx:
+                    jexc += [(j_, hb.donor_idx), (j_, hb.acceptor_idx), (j_, hb.h_idx)]
     check_clashes(cell.apos, cell.enames, cell.bonds, lvec=lvec if pbc_y else None, exclude=jexc, label=label)
     return cell, lvs, hbonds
 

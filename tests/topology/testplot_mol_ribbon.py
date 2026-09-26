@@ -31,12 +31,19 @@ DampXH) is patched into dftb_in.hsd via testplot_muH._patch_hsd.  Energies +
 relaxed junction distances land in results.json; LL/RR/LR/RL label = proton
 host per junction (L = moLecule, R = Ribbon): LL=AA, RR=BB, LR=AB, RL=BA.
 
+Molecules: 'st<L>x<T><N|O>' strip mols (MOLS) OR MOL_EDGE_ARTS keys —
+generic edge-donor arts (multi-tip donor edges pair with consecutive ribbon
+sites; 'A' end = as drawn, 'B' = all tips bare acceptors): e.g.
+p_phenylenediamine, terephthalic_acid, HH-h_1, HHH-h, HNH-p, guanin.
+
 Usage: python tests/topology/testplot_mol_ribbon.py [--mols st1x1N,st3x1O]
        [--states AA,BB,AB,BA] [--dda 2.9] [--site 2] [--shiftx 0.0]
        [--alt --tilt 60] [--relax --widths 8,12 --nk 4,2,1 --sk 3ob-1-1]
+       [--out debug/mol_ribbon_art]
 """
 import os
 import sys
+import re
 import json
 import argparse
 import numpy as np
@@ -45,7 +52,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from spammm.topology.ribbon_pbc import (build_mol_ribbon_cell, check_degrees, relax_cell,
                                        junction_site_atoms, junction_geometry_report, save_xyz_lvs)
 from spammm.topology.hbond_utils import hbond_positions
-from spammm.topology.ascii_art_heterocycle import make_strip_mol_art
+from spammm.topology.ascii_art_heterocycle import make_strip_mol_art, mol_art_state, MOL_EDGE_ARTS
 from spammm.plotUtils import plot_ribbon_junction_cell
 
 OUTDIR = os.path.join(os.path.dirname(__file__), '..', '..', 'debug', 'mol_ribbon')
@@ -69,15 +76,15 @@ _STATE_TIPS = {'AA': (0, 0), 'BB': (1, 1), 'AB': (1, 0), 'BA': (0, 1)}
 
 
 def state_art(mol, st):
-    """ASCII art for (molecule, corner state); mol = 'st<L>x<T><N|O>'."""
-    import re
-    m = re.fullmatch(r'st(\d+)x(\d+)([NO])', mol)
-    assert m, f'molecule name must be st<L>x<T><N|O>, got {mol!r}'
-    L, T = int(m.group(1)), int(m.group(2))
-    don, acc = _TIP[m.group(3)]
+    """ASCII art for (molecule, corner state); mol = 'st<L>x<T><N|O>' or a
+    MOL_EDGE_ARTS key (A end = drawn case, B end = all tips uppercase)."""
     it, ib = _STATE_TIPS[st]
-    etop, ebot = (don, acc)[it], (don, acc)[ib]
-    return make_strip_mol_art(L, T, etop=etop, ebot=ebot)
+    m = re.fullmatch(r'st(\d+)x(\d+)([NO])', mol)
+    if m:
+        L, T = int(m.group(1)), int(m.group(2))
+        don, acc = _TIP[m.group(3)]
+        return make_strip_mol_art(L, T, etop=(don, acc)[it], ebot=(don, acc)[ib])
+    return mol_art_state(MOL_EDGE_ARTS[mol], etop='B' if it else 'A', ebot='B' if ib else 'A')
 
 
 def _draw_cell_panel(ax, atoms, hbonds, lvs, sz=26.):
@@ -195,15 +202,17 @@ def fig_dE_widths(results, mols, widths, fname):
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     d = results.get('dftb', {})
-    sizes = list(dict.fromkeys(m[:-1] for m in mols))           # ordered unique st<L>x<T>
+    is_st = {m: bool(re.fullmatch(r'st\d+x\d+[NO]', m)) for m in mols}
+    sizes = list(dict.fromkeys(m[:-1] if is_st[m] else m for m in mols))   # ordered unique st<L>x<T> / art names
     xi = {s: i for i, s in enumerate(sizes)}
     rname = {8: 'r3', 12: 'r5'}
-    col = {'N': 'tab:blue', 'O': 'tab:red'}
+    col = {'N': 'tab:blue', 'O': 'tab:red', 'art': 'tab:green'}
     fig, ax = plt.subplots(figsize=(6.2, 4.4))
     for w in widths:
-        for tip in ('N', 'O'):
-            pts = [(xi[m[:-1]], d[f'{m}_BB_w{w}']['E_ev'] - d[f'{m}_AA_w{w}']['E_ev'])
-                   for m in mols if m.endswith(tip) and d.get(f'{m}_BB_w{w}', {}).get('E_ev') is not None and d.get(f'{m}_AA_w{w}', {}).get('E_ev') is not None]
+        for tip in ('N', 'O', 'art'):
+            pts = [(xi[m[:-1] if is_st[m] else m], d[f'{m}_BB_w{w}']['E_ev'] - d[f'{m}_AA_w{w}']['E_ev'])
+                   for m in mols if (m.endswith(tip) if is_st[m] else tip == 'art')
+                   and d.get(f'{m}_BB_w{w}', {}).get('E_ev') is not None and d.get(f'{m}_AA_w{w}', {}).get('E_ev') is not None]
             if pts:
                 xs, ys = zip(*pts)
                 ax.plot(xs, ys, marker='o', ms=4, lw=0.9, ls='-' if w == widths[0] else '--', color=col[tip], label=f'{rname.get(w, f"w{w}")}-{tip}')
@@ -256,18 +265,26 @@ from ase.constraints import FixCartesian
 from gpaw import GPAW
 from gpaw_hs_export import export_hs
 
+
+class FixY(FixCartesian):
+    """FixCartesian with corrected todict: ASE 3.22.1 (MetaCentrum) writes
+    ~self.mask.tolist() which crashes trajectory write (unary ~ on list)."""
+    def todict(self):
+        return {{'name': 'FixCartesian', 'kwargs': {{'a': int(self.a), 'mask': (~self.mask).tolist()}}}}
+
+
 RELAX = {relax}      # relax with junction D/A atoms pinned along y only (as in DFTB)
 NK = {nk}            # k-mesh incl. Gamma (odd grid along x; y flat-band -> 1 pt)
 PINS = {pins}        # 0-based indices in geom.xyz order; constrained along y only
 
 atoms = read('geom.xyz')                     # cell + pbc baked into the extxyz header
 atoms.calc = GPAW(mode='lcao', xc='PBE', basis='dzp', kpts={{'size': NK, 'gamma': True}},
-                  txt='gpaw.out', symmetry='off')
+                  txt='gpaw.out', symmetry='off', parallel={{'kpt': 1, 'band': 1}})  # export_hs needs all kpts on every rank
 if RELAX:
     from ase.optimize import BFGS
     if PINS:
-        atoms.set_constraint([FixCartesian(i, mask=[0, 1, 0]) for i in PINS])
-    BFGS(atoms, trajectory='relax.traj', logfile='relax.log').run(fmax=0.05)
+        atoms.set_constraint([FixY(i, mask=[0, 1, 0]) for i in PINS])
+    BFGS(atoms, trajectory='relax.traj', logfile='relax.log').run(fmax=0.01)
     write('relaxed.xyz', atoms)
 E = atoms.get_potential_energy()
 with open('energy.txt', 'w') as f:
@@ -290,15 +307,34 @@ echo ALL DONE
     SUBMIT = '''#!/bin/bash
 # Metacentrum PBS array job: one task per line of jobs.txt
 # Adjust module/venv activation to your setup before qsub.
-#PBS -N molribbon_hs
-#PBS -l select=1:ncpus=8:mem=16gb
-#PBS -l walltime=24:00:00
+#PBS -N molribbon_gpaw
+#PBS -l select=1:ncpus=8:mem=16gb:scratch_local=10gb
+#PBS -l walltime=04:00:00
+#PBS -j oe
+#PBS -q luna
 #PBS -J 0-%d
+
+if [ -z "$SCRATCHDIR" ]; then echo "Error: run via qsub" >&2; exit 1; fi
+
 cd "$PBS_O_WORKDIR"
-# module load gpaw  # or: source /path/to/venv/bin/activate
 d=$(sed -n "$((PBS_ARRAY_INDEX + 1))p" jobs.txt)
-[ -f "$d/energy.txt" ] && exit 0
-cd "$d" && OMP_NUM_THREADS=$PBS_NCPUS python job.py > stdout.txt 2> stderr.txt
+[ -f "$d/hs.npz" ] && exit 0    # hs.npz = last output -> done marker (energy.txt alone can be a crash remnant)
+
+trap 'cp -a $SCRATCHDIR/job/. $PBS_O_WORKDIR/$d/ 2>/dev/null; rm -rf $SCRATCHDIR/* 2>/dev/null' EXIT
+
+module purge
+module add py-gpaw/24.1.0-gcc-10.2.1-fojjhkw
+export GPAW_SETUP_PATH=/storage/praha1/home/prokop/gpaw-setups-24.1.0/gpaw-setups-24.1.0
+export OMP_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+
+cp -r "$d" $SCRATCHDIR/job
+cd $SCRATCHDIR/job
+export TMPDIR=$SCRATCHDIR
+export GPAW_TMPDIR=$SCRATCHDIR
+echo "=== molribbon_gpaw $d === $(date) on $(hostname)"
+mpirun -np $PBS_NCPUS gpaw python job.py > stdout.txt 2> stderr.txt
+echo "Finished: $(date)"
 '''
     hs_src = os.path.join(os.path.dirname(__file__), '..', '..', 'spammm', 'quantum', 'gpaw_hs_export.py')
     jobs = []
@@ -378,6 +414,7 @@ def main():
     ap.add_argument('--shiftx', type=float, default=0.0, help='mol x shift, fraction of Lx')
     ap.add_argument('--no-pbc-y', action='store_true', help='vacuum y instead of the bridging stack')
     ap.add_argument('--alt', action='store_true', help='alternate edge sites N/CH (junction site stays N); outputs go to debug/mol_ribbon_alt/')
+    ap.add_argument('--out', default=None, help='output dir (default debug/mol_ribbon{,_alt})')
     ap.add_argument('--tilt', type=float, default=0.0, help='rotate molecular plane about tip-tip axis [deg] (clears edge C-H)')
     ap.add_argument('--relax', action='store_true', help='run DFTB PBC relax per (mol,state,width)')
     ap.add_argument('--bake-gpaw', metavar='BUNDLE_DIR', default=None, help='bake GPAW lcao/dzp/PBE job bundle (uses DFTB-relaxed geometry when present)')
@@ -389,7 +426,9 @@ def main():
     ap.add_argument('--sk', default=None, help='DFTB SK set (default: config DEFAULT_SK_SET = 3ob-3-1)')
     args = ap.parse_args()
     global OUTDIR
-    if args.alt:
+    if args.out:
+        OUTDIR = args.out
+    elif args.alt:
         OUTDIR = OUTDIR.rstrip('/') + '_alt'
     os.makedirs(OUTDIR, exist_ok=True)
 

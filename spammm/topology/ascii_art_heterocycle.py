@@ -278,30 +278,26 @@ def _build_dimer(lines, aCC=A_CC, hbond_length=None):
         tokens = _atom_tokens(line)
         if not tokens:
             continue
-        if any(ch.isalpha() for _, ch in tokens):
-            for c, ch in tokens:
-                xi = c // 2
-                i = _add_atom(c * dx / 2.0, y, ch, r, xi)
+        # mixed rows allowed: atom letters AND '|','-','.' marks on one line
+        for c, ch in tokens:
+            xi = c // 2
+            x = c * dx / 2.0
+            if ch.isalpha():
+                i = _add_atom(x, y, ch, r, xi)
                 row_atoms.setdefault(r, []).append(i)
-        else:
-            for c, ch in tokens:
-                if ch not in ('|', '-', '.'):
-                    continue
-                xi = c // 2
-                x = c * dx / 2.0
-                if ch == '.':
-                    i = _add_atom(x, y, 'C', r, xi)
-                    row_atoms.setdefault(r, []).append(i)
-                elif ch == '|':
-                    i1 = _add_atom(x, y - aCC / 2.0, 'C', r, xi)
-                    i2 = _add_atom(x, y + aCC / 2.0, 'C', r, xi)
-                    bonds.add((min(i1, i2), max(i1, i2)))
-                    row_atoms.setdefault(r, []).extend([i1, i2])
-                elif ch == '-':
-                    i1 = _add_atom(x - aCC / 2.0, y, 'C', r, xi)
-                    i2 = _add_atom(x + aCC / 2.0, y, 'C', r, xi)
-                    bonds.add((min(i1, i2), max(i1, i2)))
-                    row_atoms.setdefault(r, []).extend([i1, i2])
+            elif ch == '.':
+                i = _add_atom(x, y, 'C', r, xi)
+                row_atoms.setdefault(r, []).append(i)
+            elif ch == '|':
+                i1 = _add_atom(x, y - aCC / 2.0, 'C', r, xi)
+                i2 = _add_atom(x, y + aCC / 2.0, 'C', r, xi)
+                bonds.add((min(i1, i2), max(i1, i2)))
+                row_atoms.setdefault(r, []).extend([i1, i2])
+            elif ch == '-':
+                i1 = _add_atom(x - aCC / 2.0, y, 'C', r, xi)
+                i2 = _add_atom(x + aCC / 2.0, y, 'C', r, xi)
+                bonds.add((min(i1, i2), max(i1, i2)))
+                row_atoms.setdefault(r, []).extend([i1, i2])
 
     row_x = {}
     for i, (r, xi) in enumerate(zip(rows, xidxs)):
@@ -317,7 +313,7 @@ def _build_dimer(lines, aCC=A_CC, hbond_length=None):
             p = np.array(pos[i])
             for dx_i in (-1, 0, 1):
                 for j in row_x.get(r + 1, {}).get(xi + dx_i, []):
-                    if np.linalg.norm(p - np.array(pos[j])) < 1.6 * aCC:
+                    if np.linalg.norm(p - np.array(pos[j])) < 1.2 * aCC:
                         bonds.add((min(i, j), max(i, j)))
 
     atoms = AtomicSystem(apos=np.array(pos), enames=enames)
@@ -759,6 +755,156 @@ O n O
    C C
 """,
 }
+
+
+# ---------------------------------------------------------------------------
+# Edge-donor molecules for mol<->ribbon junction cells (build_mol_ribbon_cell).
+# From doc/ERC_private/Ascci_Art_heterocycles.md — ACS Nano Fig.3 DD/DDD/DAD/
+# DDA donors + classic 2H carriers.  Drawn state = corner 'A': lowercase
+# junction tips ('n','o') carry the mol-side proton (donor), uppercase are bare
+# acceptors.  mol_art_state() turns an end into 'B' = all tips uppercase (all
+# junction protons on the ribbon).  Junction tips = N/O atoms of the extreme
+# heavy-atom row at each end; several tips share one edge ('n n n' = 3-site
+# donor edge — the art lattice spacing equals the ribbon site pitch).
+# (hydroquinone = st1x1O, 1,4-dihydropyrazine = st1x1N are already covered by
+# the parametric st<L>x<T> family — not duplicated here.)
+MOL_EDGE_ARTS = {
+    # --- classic 2H carriers (single tip each end -> bridge like st family) ---
+    # para-NH2 tips; B end -> =NH (p-quinonediimine)
+    'p_phenylenediamine': """
+  n
+  C
+ C C
+ C C
+  C
+  n
+""",
+    # -COOH per end: only the hydroxyl 'o' sits on the tip row (1 junction per
+    # end); the carbonyl 'O' is drawn one row inside the molecule via '_'
+    'terephthalic_acid': """
+  o
+  C_O
+  C
+ C C
+ C C
+  C
+O_C
+  o
+""",
+    # --- DD edges (Fig.3) ---
+    'HH-h_1': """
+n n
+ C C
+ C C
+  n
+""",
+    # donors 2 site-pitches apart (skip 1 site)
+    'HH-h_2': """
+n C n
+ C C
+ C C
+  n
+""",
+    # bare bottom edge -> single (boundary) junction
+    'HH-p_1': """
+n n
+ C C
+ C_C
+""",
+    # --- DDD edges ---
+    'HHH-h': """
+n n n
+ C C
+ C C
+  n
+""",
+    'HHH-p': """
+n n n
+ C C
+ C_C
+""",
+    # --- DAD edges (D-A-D triad: 2 donors + central ring-N acceptor) ---
+    # 2,6-diaminopyridine motif; bare bottom CH apex
+    'HNH-h': """
+n N n
+ C C
+ C C
+  C
+""",
+    # bottom 'n' is a 5-ring N-H -> bridges
+    'HNH-p': """
+n N n
+ C C
+ n_C
+""",
+    # --- DDA edges ---
+    'HHO-h': """
+n n O
+ C C
+ C C
+  C
+""",
+    'HHO-p': """
+n n O
+ C C
+ C_n
+""",
+    # fused 6+5; bottom '-' dimer edge is bare C-C
+    'guanin': """
+n n O
+ C C
+ N C
+  C n
+   -
+""",
+    # --- fused multi-ring donors (dimer format; mixed rows OK) ---
+    # fused 6+6: 'n n' pyrrolic NH donors both ends (DD/DD bridge)
+    'HH-hh': """
+ n n
+| | |
+ n n
+""",
+    # fused 6+5 (pyrrole fused to the diazine): DD top edge, 'n c' bottom
+    'HH-hp': """
+ n n
+| | c
+ n c
+""",
+    # fused 5+5 (dipyrrrole): 'n n' donor edge; bare CH edge -> binds down only
+    'HH-pp': """
+ n n
+C | C
+ C C
+""",
+}
+
+
+def mol_art_tip_cells(art):
+    """(row,col) cells of the junction-tip atoms of a molecule art: the N/O
+    atoms sitting in the extreme heavy-atom rows (within 0.15 A).
+    Returns (bot_cells, top_cells), each sorted by column."""
+    atoms = parse_ascii_art(art)
+    dxh = np.sqrt(3.0) * A_CC / 2.0        # char column -> x
+    y = atoms.apos[:, 1]
+    iNO = [i for i, e in enumerate(atoms.enames) if e in ('N', 'O')]
+    bot = sorted((atoms._rows[i], int(round(atoms.apos[i, 0] / dxh))) for i in iNO if y[i] < y.min() + 0.15)
+    top = sorted((atoms._rows[i], int(round(atoms.apos[i, 0] / dxh))) for i in iNO if y[i] > y.max() - 0.15)
+    return bot, top
+
+
+def mol_art_state(art, etop='A', ebot='A'):
+    """Corner-state variant of a MOL_EDGE_ARTS art.  'A' = end as drawn;
+    'B' = every junction-tip heteroatom at that end uppercased (bare
+    acceptor -> all junction protons moved to the ribbon)."""
+    if etop == 'A' and ebot == 'A':
+        return art
+    bot, top = mol_art_tip_cells(art)
+    lines = art.strip('\n').split('\n')
+    for cells, st in ((top, etop), (bot, ebot)):
+        if st == 'B':
+            for r, c in cells:
+                lines[r] = lines[r][:c] + lines[r][c].upper() + lines[r][c + 1:]
+    return '\n'.join(lines)
 
 
 # ---------------------------------------------------------------------------
