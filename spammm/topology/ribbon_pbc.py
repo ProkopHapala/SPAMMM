@@ -362,7 +362,7 @@ D_DA_OPT = {'NN': 2.90, 'NO': 2.80, 'OO': 2.75}   # initial D...A optima per jun
 
 def build_mol_ribbon_cell(mol_art=None, mol=None, width_chains=8, ncells=4, d_DA=None,
                           shift_x=0.0, site=None, pbc_y=True, vac_y=14.0, Lz=20.0,
-                          a_CC=A_CC, relax_bonds=True, alt_CH=False, tilt_deg=0.0, d_vac=7.0, label='mol_ribbon'):
+                          a_CC=A_CC, relax_bonds=True, alt_CH=False, tilt_deg=0.0, d_vac=7.0, art_aa=None, lift_oh_deg=0.0, label='mol_ribbon'):
     """Molecule bridging two ribbon edges: cell = 1 ribbon + 1 molecule.
 
     The molecule's bottom end H-bonds the ribbon top edge (internal junction)
@@ -411,6 +411,11 @@ def build_mol_ribbon_cell(mol_art=None, mol=None, width_chains=8, ncells=4, d_DA
     for i, j in bonds_m:
         ngs_m.setdefault(i, []).append(j); ngs_m.setdefault(j, []).append(i)
     eo = getattr(mol, '_enames_original', None)
+    # the AA-state art defines the SWITCHABLE junction sites: a tip that is a
+    # donor (lowercase) in AA carries ONE shared proton which switches
+    # mol-side <-> ribbon-side; a tip already uppercase in AA is a passive
+    # acceptor contact in EVERY state (never junctioned -> conserves protons).
+    eo_ref = getattr(mol_from_art(art_aa, relax_bonds=False), '_enames_original', None) if art_aa is not None else eo
 
     # junction tips per end: N/O atoms of the extreme heavy-atom rows (several
     # tips share a donor edge; a bare end carries no N/O -> no junction)
@@ -433,7 +438,7 @@ def build_mol_ribbon_cell(mol_art=None, mol=None, width_chains=8, ncells=4, d_DA
 
     # exocyclic -NH2 tip (degree-1 n): the sp2 capper leaves a symmetric planar
     # fork (C-N-H = H-N-H ~120 deg).  When every end carries a single such tip,
-    # rotate the molecule -60 deg in-plane so one fork arm lands on each
+    # rotate the molecule -45 deg in-plane so one fork arm lands close to each
     # junction axis (a real collinear N-H...N); the off-axis arm (and the =NH
     # cap H of a B-state tip) ends up pointing away from the junction.
     # Multi-tip edges cannot rotate without breaking site registration — their
@@ -441,7 +446,7 @@ def build_mol_ribbon_cell(mol_art=None, mol=None, width_chains=8, ncells=4, d_DA
     tips = list(jbots) + list(jtops)
     nh2 = all(enames_m[t] == 'N' and sum(enames_m[j] != 'H' for j in ngs_m.get(t, ())) == 1 for t in tips)
     if nh2 and len(jbots) <= 1 and len(jtops) <= 1:
-        c, s = np.cos(-np.pi / 3), np.sin(-np.pi / 3)
+        c, s = np.cos(-np.pi / 4), np.sin(-np.pi / 4)
         xy = apos_m[:, :2] - apos_m[bref, :2]
         apos_m[:, 0] = apos_m[bref, 0] + xy[:, 0] * c - xy[:, 1] * s
         apos_m[:, 1] = apos_m[bref, 1] + xy[:, 0] * s + xy[:, 1] * c
@@ -450,6 +455,12 @@ def build_mol_ribbon_cell(mol_art=None, mol=None, width_chains=8, ncells=4, d_DA
         """mol tip donates? the art CASE decides ('n'/'o' = donor), not capped-H
         presence: an 'N' tip is =NH and keeps its off-axis cap H."""
         return eo[t].islower() if eo is not None else any(enames_m[j] == 'H' for j in ngs_m.get(t, ()))
+
+    def _switch(t):
+        """tip site carries the switchable junction proton? decided by the AA
+        art (lowercase donor tips); AA-uppercase acceptor tips are passive
+        contacts in every state (proton count is conserved)."""
+        return eo_ref[t].islower() if eo_ref is not None else _donor(t)
 
     if site is None:
         site = ncells // 2
@@ -516,15 +527,18 @@ def build_mol_ribbon_cell(mol_art=None, mol=None, width_chains=8, ncells=4, d_DA
 
     sites_b = _sites_of(jbots, xt0)      # mol bottom tips <-> top-edge sites
     sites_t = _sites_of(jtops, xb0)      # mol top tips <-> bottom-edge sites
-    jmap_t = {s: _donor(t) for t, s in zip(jbots, sites_b)}   # ribbon top edge <- mol bottom end
-    jmap_b = {s: _donor(t) for t, s in zip(jtops, sites_t)}   # ribbon bot edge <- mol top end
+    # ribbon site is protonated ('NH') iff the facing tip site is switchable
+    # AND the tip is acceptor-cased in this corner state (proton moved to the
+    # ribbon); passive acceptor tips never put H on the ribbon.
+    jmap_t = {s: _switch(t) and not _donor(t) for t, s in zip(jbots, sites_b)}   # ribbon top edge <- mol bottom end
+    jmap_b = {s: _switch(t) and not _donor(t) for t, s in zip(jtops, sites_t)}   # ribbon bot edge <- mol top end
 
     # ribbon edge chemistry complementary to the facing molecule end:
     # top edge faces mol bottom end (internal junction), bottom edge faces the
-    # image mol top end (boundary junction).  Acceptor tip -> 'NH' at its site.
+    # image mol top end (boundary junction).  Ribbon-protonated site -> 'NH'.
     # alt_CH: N only at every 2nd site (junction-site parity), CH elsewhere.
     def _edge_pass(jmap):
-        return [('N' if jmap[i] else 'NH') if i in jmap else
+        return [('NH' if jmap[i] else 'N') if i in jmap else
                 ('N' if (not alt_CH or (i - site) % 2 == 0) else 'CH') for i in range(ncells)]
     pass_top = _edge_pass(jmap_t)
     pass_bot = _edge_pass(jmap_b)
@@ -586,24 +600,61 @@ def build_mol_ribbon_cell(mol_art=None, mol=None, width_chains=8, ncells=4, d_DA
         neigh.setdefault(i, []).append(j)
         neigh.setdefault(j, []).append(i)
     pairs = [((nR + int(t)) if _donor(t) else et[s], et[s] if _donor(t) else (nR + int(t)), 0)
-             for t, s in zip(jbots, sites_b)]
+             for t, s in zip(jbots, sites_b) if _switch(t)]
     if pbc_y:
         pairs += [((nR + int(t)) if _donor(t) else eb[s], eb[s] if _donor(t) else (nR + int(t)),
-                   1 if _donor(t) else -1) for t, s in zip(jtops, sites_t)]
+                   1 if _donor(t) else -1) for t, s in zip(jtops, sites_t) if _switch(t)]
+    def _xwrap(v):
+        """min-image in x (the seam can sit inside a junction: tips register on
+        wrapped sites, so raw vectors pick wrong-sign Lx offsets)."""
+        v = v.copy(); v[0] -= Lx * np.floor(v[0] / Lx + 0.5); return v
     r_xh = 1.01
+    lifted = []
     hbonds = []
     for idon, iacc, a_sh in pairs:
         hs = [j for j in neigh.get(idon, []) if enames[j] == 'H']
         assert hs, f'{label}: junction donor atom {idon}({enames[idon]}) has no H'
         pD = apos[idon]
         pA = apos[iacc] + a_sh * lvec
-        axv = pA - pD
+        axv = _xwrap(pA - pD)
         dist = np.linalg.norm(axv)
-        ih = max(hs, key=lambda j: np.dot(apos[j] - pD, axv))   # donor H most aligned with D->A
+        ih = max(hs, key=lambda j: np.dot(_xwrap(apos[j] - pD), axv))   # donor H most aligned with D->A
         if len(hs) == 1:
-            apos[ih] = pD + r_xh * axv / dist                  # junction H exactly on the axis
+            if lift_oh_deg and enames[idon] == 'O' and idon >= nR:
+                # O-tip donor: lift the junction O-H out of the ribbon plane so the
+                # proton can't hop to the acceptor.  C-O-H ~lift_oh_deg, bend into z
+                # (with tilt=90 the mol plane is vertical -> H stays in the mol
+                # plane, z ~ sin(lift_oh_deg)*r_xh above the junction plane).
+                jc = next(j for j in neigh.get(idon, []) if enames[j] != 'H')
+                u = (apos[jc] - pD); u /= np.linalg.norm(u)              # O->C (into the molecule)
+                w = np.array([0., 0., 1.]); w -= np.dot(w, u) * u; w /= np.linalg.norm(w)  # z-most dir perp to O->C
+                ca, sa = np.cos(np.deg2rad(lift_oh_deg)), np.sin(np.deg2rad(lift_oh_deg))
+                cands = [pD + r_xh * (ca * u + sg * sa * w) for sg in (1., -1.)]
+                apos[ih] = max(cands, key=lambda q: min(np.linalg.norm(apos[j] - q)
+                                                        for j in range(len(apos)) if j != idon and j != ih))
+                lifted.append(int(ih))
+            else:
+                apos[ih] = pD + r_xh * axv / dist                  # junction H exactly on the axis
         # multi-H donors (NH2): keep the sp2 fork as drawn — snapping the best
         # arm onto the axis would squeeze H-N-H to ~60 deg
+        # switched amino tips (mol-side =NH acceptor): the capper parks the
+        # leftover H on the junction axis, head-on at the donor proton (H..H
+        # ~0.85 A clash, exempted below) -> relax rotates it onto a neighbouring
+        # bare acceptor, opening the junction.  Put it on the OFF-AXIS sp2 arm
+        # instead so the lone pair faces the donor (N..H-N acceptor geometry).
+        if iacc >= nR:
+            pD_img = apos[idon] - a_sh * lvec                    # donor site in the acceptor's image
+            hvs = [j for j in neigh.get(iacc, []) if enames[j] == 'H' and j != ih]
+            if hvs:
+                jc = next(j for j in neigh[iacc] if enames[j] != 'H')
+                u = apos[jc] - apos[iacc]; u /= np.linalg.norm(u)      # tip -> ring bond
+                axu = _xwrap(pD_img - apos[iacc]); axu /= np.linalg.norm(axu)
+                n = np.cross(u, axu); nn = np.linalg.norm(n)
+                n = n / nn if nn > 1e-6 else np.array([0., 0., 1.])   # mol plane normal
+                th = np.deg2rad(120.0); c_, s_ = np.cos(th), np.sin(th)
+                for j in hvs:
+                    arms = [apos[iacc] + r_xh * (u * c_ + sg * np.cross(n, u) * s_) for sg in (1., -1.)]
+                    apos[j] = max(arms, key=lambda q: np.linalg.norm(_xwrap(q - pD_img)))
         hbonds.append(HbondRecord(int(idon), int(ih), int(iacc), float(dist - r_xh), 180.0, d_shift=0, a_shift=a_sh))
     hbonds.sort(key=lambda h: (h.a_shift != 0, apos[h.donor_idx, 0]))  # internal junction first
 
@@ -612,6 +663,7 @@ def build_mol_ribbon_cell(mol_art=None, mol=None, width_chains=8, ncells=4, d_DA
     cell.bonds = bonds
     cell.seam = seam
     cell.n_ribbon = nR
+    cell.jh_lifted = lifted           # junction O-H indices lifted out of plane (lift_oh_deg)
 
     # steric-clash check on the finished cell (incl. boundary image pairs);
     # junction D..A/H..A pairs are close by design -> excluded
@@ -628,7 +680,45 @@ def build_mol_ribbon_cell(mol_art=None, mol=None, width_chains=8, ncells=4, d_DA
     return cell, lvs, hbonds
 
 
-def build_ribbon(passivation, width_chains, length_cells, Lx, a_CC=A_CC):
+def switch_junction_protons(atoms, lvs, hbonds, sel, r_xh=1.01):
+    """Proton-switch states WITHOUT rebuilding: for each selected junction
+    record the junction H is relocated donor->acceptor along the junction axis
+    and re-bonded to the acceptor.  Every other atom — including amino cap H's
+    on multi-H donor tips — keeps its position, atom order is unchanged and
+    the proton is traceable by index.  Replaces the fragile art-rebuild path
+    (uppercase art loses which fork arm was the junction H and parks the
+    residual =NH cap on the junction axis).
+
+    sel: indices into hbonds to flip (in AA all protons sit mol-side; a record
+    can be flipped back by selecting it again on the returned cell).
+    Returns (atoms2, hbonds2) — fresh copies; donor/acceptor swap sides and
+    a_shift flips sign so hbond_positions() resolves the switched bond."""
+    apos = np.asarray(atoms.apos, dtype=float).copy()
+    lvec = np.asarray(lvs)[1]
+    bonds = np.asarray(atoms.bonds, dtype=np.int64).copy()
+    hb2 = list(hbonds)
+    for j in sel:
+        hb = hb2[j]
+        pA_img = apos[hb.acceptor_idx] + hb.a_shift * lvec     # acceptor site in the junction's frame
+        axv = apos[hb.donor_idx] - pA_img
+        axv[0] -= lvs[0][0] * np.floor(axv[0] / lvs[0][0] + 0.5)   # min-image in x
+        apos[hb.h_idx] = apos[hb.acceptor_idx] + r_xh * axv / np.linalg.norm(axv)
+        bi = [k for k, (a, b) in enumerate(bonds) if {a, b} == {hb.donor_idx, hb.h_idx}]
+        assert len(bi) == 1, f'junction H{hb.h_idx} not bonded to donor {hb.donor_idx}'
+        bonds[bi[0]] = sorted((hb.acceptor_idx, hb.h_idx))     # re-bond H to the acceptor
+        hb2[j] = HbondRecord(int(hb.acceptor_idx), int(hb.h_idx), int(hb.donor_idx),
+                             hb.dist_ha, hb.angle, d_shift=0, a_shift=-hb.a_shift)
+    cell = AtomicSystem(apos=apos, enames=list(atoms.enames))
+    cell.atypes = np.asarray(atoms.atypes).copy() if getattr(atoms, 'atypes', None) is not None else None
+    cell.bonds = bonds
+    cell.seam = np.abs(apos[bonds[:, 1], 0] - apos[bonds[:, 0], 0]) > 0.5 * lvs[0][0]
+    for a in ('n_ribbon', 'jh_lifted'):
+        if hasattr(atoms, a):
+            setattr(cell, a, getattr(atoms, a))
+    return cell, hb2
+
+
+
     """Build a ribbon and return arrays (mirrors deprecated GrapheneRibbonBuilder.build_ribbon API).
 
     Returns (pos2d, atypes, elems): 2D positions, atomic numbers, element symbols.

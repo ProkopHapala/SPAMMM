@@ -51,7 +51,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from spammm.topology.ribbon_pbc import (build_mol_ribbon_cell, check_degrees, relax_cell,
                                        junction_site_atoms, junction_geometry_report, save_xyz_lvs)
-from spammm.topology.hbond_utils import hbond_positions
+from spammm.topology.hbond_utils import hbond_positions, _min_image_dist
 from spammm.topology.ascii_art_heterocycle import make_strip_mol_art, mol_art_state, MOL_EDGE_ARTS
 from spammm.plotUtils import plot_ribbon_junction_cell
 
@@ -69,22 +69,41 @@ MOLS = {'st1x1O': 'hydroquinone',        'st3x1O': 'biphenol rod',        'st5x1
         'st1x1N': 'pyrazine',            'st3x1N': 'bipyridine rod',      'st5x1N': 'terpyridine rod',
         'st3x3N': 'N-tip strip',         'st5x3N': 'N-tip long strip'}
 
-# corner state -> (etop, ebot); don/acc = donor/acceptor tip char per kind.
+# corner state -> per-end letters (bottom, top): 'A' = end as drawn (donor
+# tips keep their H), 'B' = all tips bare acceptors (end's protons on the
+# ribbon), 'S' = only the leftmost donor tip flipped (one H switches at that
+# end — second swap pattern for multi-donor edges, e.g. 'n N n' -> 'N N n').
 # 'A' = H on the molecule end (mol donates); internal junction = bottom end.
 _TIP = {'N': ('n', 'N'), 'O': ('o', 'O')}
-_STATE_TIPS = {'AA': (0, 0), 'BB': (1, 1), 'AB': (1, 0), 'BA': (0, 1)}
 
 
 def state_art(mol, st):
     """ASCII art for (molecule, corner state); mol = 'st<L>x<T><N|O>' or a
-    MOL_EDGE_ARTS key (A end = drawn case, B end = all tips uppercase)."""
-    it, ib = _STATE_TIPS[st]
+    MOL_EDGE_ARTS key (A end = drawn case, B end = all tips uppercase,
+    S end = leftmost donor tip only)."""
     m = re.fullmatch(r'st(\d+)x(\d+)([NO])', mol)
     if m:
         L, T = int(m.group(1)), int(m.group(2))
         don, acc = _TIP[m.group(3)]
-        return make_strip_mol_art(L, T, etop=(don, acc)[it], ebot=(don, acc)[ib])
-    return mol_art_state(MOL_EDGE_ARTS[mol], etop='B' if it else 'A', ebot='B' if ib else 'A')
+        c2e = {'A': don, 'B': acc, 'S': acc}      # 'S' == 'B' on a single-tip end
+        return make_strip_mol_art(L, T, etop=c2e[st[1]], ebot=c2e[st[0]])
+    return mol_art_state(MOL_EDGE_ARTS[mol], etop=st[1], ebot=st[0])
+
+
+def _uniq_states(mol, states, loud=False):
+    """Drop corner states whose art duplicates an earlier one (single-edge
+    molecules: flipping the bare end changes nothing -> BA==AA, AB==BB;
+    'S' on a single-tip end == 'B')."""
+    seen, out = {}, []
+    for st in states:
+        a = '\n'.join(l.rstrip() for l in state_art(mol, st).strip('\n').split('\n'))   # canonical (AA early-returns the raw art incl. blank lines)
+        if a in seen:
+            if loud:
+                print(f'  {mol}/{st}: identical cell to {seen[a]} -> skipped', flush=True)
+        else:
+            seen[a] = st
+            out.append(st)
+    return out
 
 
 def _draw_cell_panel(ax, atoms, hbonds, lvs, sz=26.):
@@ -149,15 +168,15 @@ def _load_xyz_apos(path):
     return [r[0] for r in rows], np.array([[float(x) for x in r[1:4]] for r in rows])
 
 
-def fig_dftb_summary(results, mols, width, fname, ncells=4, alt_CH=False, tilt_deg=0.0):
-    """Per-width DFTB summary figure, 3 rows: relaxed LL geometry (top),
+def fig_dftb_summary(results, mols, width, fname, ncells=4, alt_CH=False, tilt_deg=0.0, xyz_of=None, title=None, lift_oh_deg=0.0):
+    """Per-width summary figure, 3 rows: relaxed LL geometry (top),
     corner energies vs LL (middle), relaxed RR geometry (bottom)."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     d = results.get('dftb', {})
-    colors = {'AA': 'tab:blue', 'BB': 'tab:red', 'AB': 'tab:green', 'BA': 'tab:purple'}
-    marks = {'AA': 'o', 'BB': 's', 'AB': '^', 'BA': 'v'}
+    colors = {'AA': 'tab:blue', 'BB': 'tab:red', 'AB': 'tab:green', 'BA': 'tab:purple', 'SS': 'tab:orange'}
+    marks = {'AA': 'o', 'BB': 's', 'AB': '^', 'BA': 'v', 'SS': 'D'}
     n = len(mols)
     fig = plt.figure(figsize=(1.7 * n + 1.5, 12.5))
     gs = fig.add_gridspec(3, n, height_ratios=[3.4, 1.5, 3.4], hspace=0.06, wspace=0.05)
@@ -166,22 +185,27 @@ def fig_dftb_summary(results, mols, width, fname, ncells=4, alt_CH=False, tilt_d
         for r, st in ((0, 'AA'), (2, 'BB')):
             ax = fig.add_subplot(gs[r, i])
             art = state_art(mol, st)
-            atoms, lvs, hbonds = build_mol_ribbon_cell(mol_art=art, width_chains=width, ncells=ncells, label=f'{mol}/{st}', alt_CH=alt_CH, tilt_deg=tilt_deg)
-            xyz = os.path.join(OUTDIR, mol, st, f'dftb_w{width}', 'relaxed.xyz')
+            atoms, lvs, hbonds = build_mol_ribbon_cell(mol_art=art, width_chains=width, ncells=ncells, label=f'{mol}/{st}', alt_CH=alt_CH, tilt_deg=tilt_deg, art_aa=state_art(mol, 'AA'), lift_oh_deg=lift_oh_deg)
+            xyz = xyz_of(mol, st, width) if xyz_of else os.path.join(OUTDIR, mol, st, f'dftb_w{width}', 'relaxed.xyz')
             if os.path.exists(xyz):
                 _, atoms.apos = _load_xyz_apos(xyz)
             _draw_cell_panel(ax, atoms, hbonds, lvs, sz=34.)
             ax.set_title(f'{mol} {_LR[st]}' if r == 0 else _LR[st], fontsize=7)
     xs = np.arange(n)
-    Eall = {st: np.array([d.get(f'{mol}_{st}_w{width}', {}).get('E_ev', np.nan) or np.nan for mol in mols]) for st in ('AA', 'BB', 'AB', 'BA')}
-    for st in ('AA', 'BB', 'AB', 'BA'):
-        ax_e.plot(xs, Eall[st] - Eall['AA'], marker=marks[st], color=colors[st], ms=4, lw=0.9, label=_LR[st])
+    sts = ('AA', 'BB', 'AB', 'BA', 'SS')
+    Eall = {st: np.array([d.get(f'{mol}_{st}_w{width}', {}).get('E_ev', np.nan) or np.nan for mol in mols]) for st in sts}
+    for st in sts:
+        if np.isfinite(Eall[st]).any():
+            ax_e.plot(xs, Eall[st] - Eall['AA'], marker=marks[st], color=colors[st], ms=4, lw=0.9, label=_LR.get(st, st))
     ax_e.plot(xs, 0.5 * (Eall['BB'] - Eall['AA']), 'k--x', ms=5, lw=0.9, label='(LL+RR)/2')
     for i in range(n):
         E = {st: Eall[st][i] for st in Eall}
-        if np.isfinite(list(E.values())).all():
-            J = E['BB'] + E['AA'] - E['AB'] - E['BA']
-            ax_e.annotate(f'J={J:+.2f}\ndE={0.5 * (E["BB"] - E["AA"]):+.2f}', (i, 0.03), ha='center', va='bottom', fontsize=6.5)
+        if np.isfinite(E['AA']) and np.isfinite(E['BB']):
+            nj = len(results.get(f'{mols[i]}_AA_w{width}', {}).get('junctions', [1]))
+            txt = f'dE={E["BB"] - E["AA"]:+.2f}\ndE/H={(E["BB"] - E["AA"]) / nj:+.2f}'
+            if np.isfinite([E['AB'], E['BA']]).all():
+                txt = f'J={E["BB"] + E["AA"] - E["AB"] - E["BA"]:+.2f}\n' + txt
+            ax_e.annotate(txt, (i, 0.03), ha='center', va='bottom', fontsize=6.5)
     ax_e.set_xlim(-0.6, n - 0.4)
     ax_e.set_xticks(xs)
     ax_e.set_xticklabels(mols, rotation=45, ha='right', fontsize=8)
@@ -189,7 +213,7 @@ def fig_dftb_summary(results, mols, width, fname, ncells=4, alt_CH=False, tilt_d
     ax_e.grid(True, lw=0.4, alpha=0.6)
     ax_e.set_ylabel('E_state - E_LL [eV]')
     ax_e.legend(fontsize=7, loc='lower right', ncols=5, title='proton host (L=mol, R=ribbon)', title_fontsize=7)
-    fig.suptitle(f'mol->ribbon corner relaxes, w{width} ({"r3" if width == 8 else "r5" if width == 12 else "?"}) — 3ob-3-1, scaffold-pinned; top=LL relaxed, bottom=RR relaxed', fontsize=11)
+    fig.suptitle(title or f'mol->ribbon corner relaxes, w{width} ({"r3" if width == 8 else "r5" if width == 12 else "?"}) — 3ob-3-1, scaffold-pinned; top=LL relaxed, bottom=RR relaxed', fontsize=11)
     fig.savefig(fname, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f'REVIEW: {fname}', flush=True)
@@ -235,16 +259,17 @@ def print_summary(results, mols, states, widths):
     print('\n=== DFTB corner energies (L=H on moLecule, R=H on Ribbon) ===', flush=True)
     for mol in mols:
         for w in widths:
-            Es = {st: d.get(f'{mol}_{st}_w{w}', {}).get('E_ev') for st in states}
-            line = '  '.join(f'{_LR[st]}({st})={E:.4f}' if E is not None else f'{_LR[st]}=nan' for st, E in Es.items())
-            if all(E is not None for E in Es.values()) and len(states) == 4:
-                J = Es['BB'] + Es['AA'] - Es['AB'] - Es['BA']
-                dE = 0.5 * (Es['BB'] - Es['AA'])
-                line += f'   |  J={J:+.3f} eV  dE_transfer/H={dE:+.3f} eV'
+            Es = {st: d.get(f'{mol}_{st}_w{w}', {}).get('E_ev') for st in _uniq_states(mol, states)}
+            line = '  '.join(f'{_LR.get(st, st)}({st})={E:.4f}' if E is not None else f'{_LR.get(st, st)}({st})=nan' for st, E in Es.items())
+            nj = len(results.get(f'{mol}_AA_w{w}', {}).get('junctions', []))
+            if Es.get('AA') is not None and Es.get('BB') is not None and nj:
+                line += f'   |  dE_transfer/H={(Es["BB"] - Es["AA"]) / nj:+.3f} eV'
+            if all(Es.get(s) is not None for s in ('AA', 'BB', 'AB', 'BA')):
+                line += f'  J={Es["BB"] + Es["AA"] - Es["AB"] - Es["BA"]:+.3f} eV'
             print(f'{mol} w{w}:  {line} eV', flush=True)
 
 
-def bake_gpaw(mols, states, widths, bundle_root, ncells=4, nk=(7, 2, 1), alt_CH=False, tilt_deg=0.0, relax=True):
+def bake_gpaw(mols, states, widths, bundle_root, ncells=4, nk=(7, 2, 1), alt_CH=False, tilt_deg=0.0, relax=True, lift_oh_deg=0.0):
     """Bake a GPAW lcao/dzp/PBE job bundle per (mol,state,width) in the
     cluster_scan_*_gpaw convention: geom.xyz (extxyz, pbc T T F), job.py
     (BFGS relax with the same junction-scaffold pins as DFTB, then energy +
@@ -275,15 +300,23 @@ class FixY(FixCartesian):
 
 RELAX = {relax}      # relax with junction D/A atoms pinned along y only (as in DFTB)
 NK = {nk}            # k-mesh incl. Gamma (odd grid along x; y flat-band -> 1 pt)
-PINS = {pins}        # 0-based indices in geom.xyz order; constrained along y only
+PINS_Y = {pins_y}    # 0-based indices in geom.xyz order; constrained along y only
+PINS_Z = {pins_z}    # ribbon atoms: z-pinned -> ribbon stays flat (no tilt toward lifted O-H)
+PINS_XY = {pins_xy}  # mol-side junction H (lifted O-H): x,y-pinned -> can't reach the acceptor
 
 atoms = read('geom.xyz')                     # cell + pbc baked into the extxyz header
+if os.path.exists('relax.traj'):             # warm restart: last BFGS frame from a previous (e.g. walltime-killed) run
+    atoms = read('relax.traj', index=-1)
+    print('restart: resumed from relax.traj last frame')
 atoms.calc = GPAW(mode='lcao', xc='PBE', basis='dzp', kpts={{'size': NK, 'gamma': True}},
                   txt='gpaw.out', symmetry='off', parallel={{'kpt': 1, 'band': 1}})  # export_hs needs all kpts on every rank
 if RELAX:
     from ase.optimize import BFGS
-    if PINS:
-        atoms.set_constraint([FixY(i, mask=[0, 1, 0]) for i in PINS])
+    cons = ([FixY(i, mask=[0, 1, 0]) for i in PINS_Y] +
+            [FixY(i, mask=[0, 0, 1]) for i in PINS_Z] +
+            [FixY(i, mask=[1, 1, 0]) for i in PINS_XY])
+    if cons:
+        atoms.set_constraint(cons)
     BFGS(atoms, trajectory='relax.traj', logfile='relax.log').run(fmax=0.01)
     write('relaxed.xyz', atoms)
 E = atoms.get_potential_energy()
@@ -309,7 +342,7 @@ echo ALL DONE
 # Adjust module/venv activation to your setup before qsub.
 #PBS -N molribbon_gpaw
 #PBS -l select=1:ncpus=8:mem=16gb:scratch_local=10gb
-#PBS -l walltime=04:00:00
+#PBS -l walltime=08:00:00
 #PBS -j oe
 #PBS -q luna
 #PBS -J 0-%d
@@ -339,24 +372,31 @@ echo "Finished: $(date)"
     hs_src = os.path.join(os.path.dirname(__file__), '..', '..', 'spammm', 'quantum', 'gpaw_hs_export.py')
     jobs = []
     for mol in mols:
-        for st in states:
+        for st in _uniq_states(mol, states, loud=True):
             for w in widths:
                 atoms, lvs, hbonds = build_mol_ribbon_cell(mol_art=state_art(mol, st), width_chains=w,
-                                                         ncells=ncells, label=f'{mol}/{st}', alt_CH=alt_CH, tilt_deg=tilt_deg)
+                                                         ncells=ncells, label=f'{mol}/{st}', alt_CH=alt_CH, tilt_deg=tilt_deg, art_aa=state_art(mol, 'AA'),
+                                                         lift_oh_deg=lift_oh_deg)
                 xyz = os.path.join(OUTDIR, mol, st, f'dftb_w{w}', 'relaxed.xyz')
                 if os.path.exists(xyz):
-                    _, atoms.apos = _load_xyz_apos(xyz)              # start GPAW from the DFTB-relaxed geometry
-                pins = sorted({h.donor_idx for h in hbonds} | {h.acceptor_idx for h in hbonds})
+                    _, apos_r = _load_xyz_apos(xyz)                  # start GPAW from the DFTB-relaxed geometry
+                    if len(apos_r) == atoms.natoms:
+                        atoms.apos = apos_r
+                    else:
+                        print(f'  {mol}/{st}: relaxed.xyz natoms={len(apos_r)} != {atoms.natoms} (stale cell?) -> as-built', flush=True)
+                pins_y = sorted(h.h_idx for h in hbonds)             # junction protons (short covalent side) pinned in y only
+                pins_z = list(range(atoms.n_ribbon)) if lift_oh_deg else []                     # flat ribbon
+                pins_xy = sorted(h.h_idx for h in hbonds if h.donor_idx >= atoms.n_ribbon) if lift_oh_deg else []  # mol-side junction H (lifted O-H)
                 name = f'{mol}_{st}_w{w}'
                 jd = os.path.join(bundle_root, name)
                 os.makedirs(jd, exist_ok=True)
                 ase_write(os.path.join(jd, 'geom.xyz'),
                           Atoms(symbols=list(atoms.enames), positions=atoms.apos, cell=lvs, pbc=[True, True, False]))
                 with open(os.path.join(jd, 'job.py'), 'w') as f:
-                    f.write(JOB.format(relax=relax, nk=tuple(nk), pins=pins))
+                    f.write(JOB.format(relax=relax, nk=tuple(nk), pins_y=pins_y, pins_z=pins_z, pins_xy=pins_xy))
                 shutil.copy(hs_src, os.path.join(jd, 'gpaw_hs_export.py'))
                 jobs.append(name)
-                print(f'baked {jd}  pins={len(pins)}', flush=True)
+                print(f'baked {jd}  pins(y/z/xy)={len(pins_y)}/{len(pins_z)}/{len(pins_xy)}', flush=True)
     with open(os.path.join(bundle_root, 'jobs.txt'), 'w') as f:
         f.write('\n'.join(jobs) + '\n')
     with open(os.path.join(bundle_root, 'run_all.sh'), 'w') as f:
@@ -373,20 +413,27 @@ def _dftb3_patch():
     return lambda hsd, enames: _patch_hsd(hsd, enames, dftb3=True)
 
 
-def run_dftb(mol, st, width, atoms, lvs, hbonds, wd, nk, k_shift, sk_set, results):
-    """PBC DFTB relax of one (mol,state,width) cell; junction D/A atoms y-pinned.
+def run_dftb(mol, st, width, atoms, lvs, hbonds, wd, nk, k_shift, sk_set, results, lift=False):
+    """PBC DFTB relax of one (mol,state,width) cell; junction H's y-pinned.
 
-    Minimal constraint: only the heavy atoms forming each junction (donor +
-    acceptor) are fixed along y (the stack direction, so d_DA is preserved)
-    while x/z stay free — prevents the bare-N SCC meltdown and H hop-back
-    without biasing in-plane stress."""
+    Minimal constraint: only the junction proton (the short covalent X-H side
+    of each junction) is fixed along y — the proton cannot slide along the
+    junction axis (no hop-back / SCC meltdown) while donor + acceptor heavy
+    atoms and the H's xz components relax freely (strain can relax).  lift=True
+    additionally z-pins the whole ribbon and x-pins mol-side junction H's
+    (lifted O-H cannot slide to the acceptor)."""
     from spammm.quantum import DFTB_utils as DU
     name = f'{mol}_{st}_w{width}'
     sk = sk_set or DU.DEFAULT_SK_SET
     patch = _dftb3_patch() if sk.startswith('3ob') else None
-    jat = sorted({h.donor_idx for h in hbonds} | {h.acceptor_idx for h in hbonds})
-    print(f'  [{name}] relax: sk={sk}  nk={nk}+{k_shift}  y-pinned={len(jat)} junction atoms {jat} -> {wd}', flush=True)
-    E, apos_r = relax_cell(atoms, lvs, fixed_atoms=None, cart_constraints=[(jat, (0., 1., 0.))],
+    jh = sorted(h.h_idx for h in hbonds)
+    cons = [(jh, (0., 1., 0.))]                                          # junction protons pinned along y only
+    if lift:
+        jh_l = [h.h_idx for h in hbonds if h.donor_idx >= atoms.n_ribbon]   # mol-side junction H (lifted O-H)
+        cons += [(list(range(atoms.n_ribbon)), (0., 0., 1.)),            # ribbon stays flat (z)
+                 (jh_l, (1., 0., 0.))]                                   # lifted H pinned in x
+    print(f'  [{name}] relax: sk={sk}  nk={nk}+{k_shift}  y-pinned junction H {jh} -> {wd}', flush=True)
+    E, apos_r = relax_cell(atoms, lvs, fixed_atoms=None, cart_constraints=cons,
                            nk=nk, k_shift=k_shift, Temperature=300,
                            Mixer='DIIS { Generations = 8 }', workdir=wd, sk_set=sk, patch_hsd=patch)
     atoms_r = type(atoms)(apos=apos_r, enames=list(atoms.enames))
@@ -397,7 +444,7 @@ def run_dftb(mol, st, width, atoms, lvs, hbonds, wd, nk, k_shift, sk_set, result
     save_xyz_lvs(os.path.join(wd, 'relaxed.xyz'), atoms_r, lvs, name)
     png = os.path.join(wd, 'relaxed.png')
     plot_ribbon_junction_cell(atoms_r, lvs, hbonds, nx=2, ny=2, sz=80, savepath=png,
-                              title=f'{name} ({_LR[st]}): E={E:.4f} eV  relaxed D-H/H..A={"/".join(f"{a:.2f}:{b:.2f}" for a, b in bls)} A')
+                              title=f'{name} ({_LR.get(st, st)}): E={E:.4f} eV  relaxed D-H/H..A={"/".join(f"{a:.2f}:{b:.2f}" for a, b in bls)} A')
     print(f'  [{name}] E={E:.4f} eV\nREVIEW: {png}', flush=True)
     results.setdefault('dftb', {})[name] = {'E_ev': float(E), 'junctions_relaxed': [[float(a), float(b)] for a, b in bls], 'sk_set': sk, 'nk': list(nk), 'workdir': os.path.relpath(wd, OUTDIR)}
 
@@ -405,7 +452,7 @@ def run_dftb(mol, st, width, atoms, lvs, hbonds, wd, nk, k_shift, sk_set, result
 def main():
     ap = argparse.ArgumentParser(description='molecule-bridged ribbon junction cells')
     ap.add_argument('--mols', default=','.join(MOLS))
-    ap.add_argument('--states', default='AA,BB,AB,BA')
+    ap.add_argument('--states', default='AA,BB,AB,BA', help="corner states (bot,top per end): A=as drawn, B=all tips bare (protons on ribbon), S=leftmost donor tip only; e.g. 'AA,BB,AB,BA,SS'")
     ap.add_argument('--dda', type=float, default=None, help='override junction D...A distance [A] (default: per-pair optimum)')
     ap.add_argument('--ncells', type=int, default=4)
     ap.add_argument('--width', type=int, default=8, help='width_chains (r3 = 8 chains)')
@@ -416,6 +463,7 @@ def main():
     ap.add_argument('--alt', action='store_true', help='alternate edge sites N/CH (junction site stays N); outputs go to debug/mol_ribbon_alt/')
     ap.add_argument('--out', default=None, help='output dir (default debug/mol_ribbon{,_alt})')
     ap.add_argument('--tilt', type=float, default=0.0, help='rotate molecular plane about tip-tip axis [deg] (clears edge C-H)')
+    ap.add_argument('--lift-oh', type=float, default=0.0, help='lift mol-side junction O-H out of plane: C-O-H ~ANGLE deg bent into z (e.g. 110) — pins proton on the O so AA/LL is a real minimum. Adds z-pin on ribbon + x,y-pin on lifted H to the relax')
     ap.add_argument('--relax', action='store_true', help='run DFTB PBC relax per (mol,state,width)')
     ap.add_argument('--bake-gpaw', metavar='BUNDLE_DIR', default=None, help='bake GPAW lcao/dzp/PBE job bundle (uses DFTB-relaxed geometry when present)')
     ap.add_argument('--gpaw-nk', default='7,1,1', help='GPAW k-mesh, comma list (default: 7,1,1 — odd grid incl. Gamma along x only; y flat-band)')
@@ -437,7 +485,7 @@ def main():
         results_s = json.load(open(os.path.join(OUTDIR, 'results.json')))
         print_summary(results_s, args.mols.split(','), args.states.split(','), widths_s)
         for w in widths_s:
-            fig_dftb_summary(results_s, args.mols.split(','), w, os.path.join(OUTDIR, f'dftb_summary_w{w}.png'), ncells=args.ncells, alt_CH=args.alt, tilt_deg=args.tilt)
+            fig_dftb_summary(results_s, args.mols.split(','), w, os.path.join(OUTDIR, f'dftb_summary_w{w}.png'), ncells=args.ncells, alt_CH=args.alt, tilt_deg=args.tilt, lift_oh_deg=args.lift_oh)
         fig_dE_widths(results_s, args.mols.split(','), widths_s, os.path.join(OUTDIR, 'dftb_dE_widths.png'))
         return
 
@@ -449,33 +497,38 @@ def main():
     if args.bake_gpaw:
         bake_gpaw(mols, states, widths, args.bake_gpaw, ncells=args.ncells,
                   nk=tuple(int(k) for k in args.gpaw_nk.split(',')),
-                  alt_CH=args.alt, tilt_deg=args.tilt, relax=not args.gpaw_sp)
+                  alt_CH=args.alt, tilt_deg=args.tilt, relax=not args.gpaw_sp,
+                  lift_oh_deg=args.lift_oh)
         return
     results, panels = {}, []
     for mol in mols:
-        for st in states:
+        for st in _uniq_states(mol, states, loud=True):
             art = state_art(mol, st)
             for w in widths:
                 atoms, lvs, hbonds = build_mol_ribbon_cell(mol_art=art, width_chains=w,
                                                          ncells=args.ncells, d_DA=args.dda,
                                                          shift_x=args.shiftx, site=args.site,
                                                          pbc_y=not args.no_pbc_y, label=f'{mol}/{st}',
-                                                         alt_CH=args.alt, tilt_deg=args.tilt)
+                                                         alt_CH=args.alt, tilt_deg=args.tilt, art_aa=state_art(mol, 'AA'),
+                                                         lift_oh_deg=args.lift_oh)
                 name = f'{mol}_{st}' + (f'_w{w}' if len(widths) > 1 else '')
                 nint = sum(1 for h in hbonds if h.a_shift == 0)
-                d_da = [float(np.linalg.norm((lambda p: p[2] - p[0])(hbond_positions(atoms.apos, h, lvs)))) for h in hbonds]
-                print(f'\n=== {name} ({_LR[st]}): natoms={atoms.natoms}  cell={lvs[0,0]:.2f}x{lvs[1,1]:.2f} A (tilt dx={lvs[1,0]:+.2f})  junctions={len(hbonds)} ({nint} internal + {len(hbonds)-nint} boundary)  d_DA={"/".join(f"{d:.2f}" for d in d_da)} ===', flush=True)
+                d_da = [_min_image_dist(hbond_positions(atoms.apos, h, lvs)[0], hbond_positions(atoms.apos, h, lvs)[2], lvs) for h in hbonds]
+                print(f'\n=== {name} ({_LR.get(st, st)}): natoms={atoms.natoms}  cell={lvs[0,0]:.2f}x{lvs[1,1]:.2f} A (tilt dx={lvs[1,0]:+.2f})  junctions={len(hbonds)} ({nint} internal + {len(hbonds)-nint} boundary)  d_DA={"/".join(f"{d:.2f}" for d in d_da)} ===', flush=True)
                 check_degrees(atoms, name, deg_heavy=(1, 2, 3))
                 junction_geometry_report(atoms.apos, hbonds, lvs)
                 wd = os.path.join(OUTDIR, mol, st)
                 os.makedirs(wd, exist_ok=True)
                 if args.relax:
-                    run_dftb(mol, st, w, atoms, lvs, hbonds, os.path.join(wd, f'dftb_w{w}'), nk, k_shift, args.sk, results)
+                    run_dftb(mol, st, w, atoms, lvs, hbonds, os.path.join(wd, f'dftb_w{w}'), nk, k_shift, args.sk, results, lift=bool(args.lift_oh))
                 else:
                     xyz = save_xyz_lvs(os.path.join(wd, 'cell.xyz'), atoms, lvs, name)
                     png = os.path.join(wd, 'cell.png')
-                    plot_ribbon_junction_cell(atoms, lvs, hbonds, nx=2, ny=2, sz=80, savepath=png,
-                                              title=f'{name} (w{w}/4u): {atoms.natoms} atoms/cell, {len(hbonds)} junctions, d_DA={"/".join(f"{d:.2f}" for d in d_da)} A')
+                    import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
+                    fig, ax = plt.subplots(figsize=(4.6, 4.6))
+                    _draw_cell_panel(ax, atoms, hbonds, lvs, sz=42.)
+                    ax.set_title(f'{name} (w{w}/{args.ncells}u): {atoms.natoms} atoms/cell, {len(hbonds)} junctions, d_DA={"/".join(f"{d:.2f}" for d in d_da)} A', fontsize=9)
+                    fig.savefig(png, dpi=150, bbox_inches='tight'); plt.close(fig)
                     print(f'  wrote {xyz}\nREVIEW: {png}', flush=True)
                     panels.append((mol, st, atoms, lvs, hbonds))
                 results[name] = {'natoms': atoms.natoms, 'lvs': lvs.tolist(), 'd_DA': d_da,
@@ -484,15 +537,21 @@ def main():
     if args.relax:
         print_summary(results, mols, states, widths)
         for w in widths:
-            fig_dftb_summary(results, mols, w, os.path.join(OUTDIR, f'dftb_summary_w{w}.png'), ncells=args.ncells, alt_CH=args.alt, tilt_deg=args.tilt)
+            fig_dftb_summary(results, mols, w, os.path.join(OUTDIR, f'dftb_summary_w{w}.png'), ncells=args.ncells, alt_CH=args.alt, tilt_deg=args.tilt, lift_oh_deg=args.lift_oh)
         fig_dE_widths(results, mols, widths, os.path.join(OUTDIR, 'dftb_dE_widths.png'))
     else:
         png = os.path.join(OUTDIR, 'build_check.png')
         fig_overview(panels, mols, states, png)
         print(f'\nREVIEW: {png}', flush=True)
-    with open(os.path.join(OUTDIR, 'results.json'), 'w') as f:
+    rpath = os.path.join(OUTDIR, 'results.json')
+    if os.path.exists(rpath):                                     # merge: a build-only pass must not wipe 'dftb' energies (and vice versa)
+        merged = json.load(open(rpath))
+        merged.update({k: v for k, v in results.items() if k != 'dftb'})
+        merged.setdefault('dftb', {}).update(results.get('dftb', {}))
+        results = merged
+    with open(rpath, 'w') as f:
         json.dump(results, f, indent=1, sort_keys=True)
-    print(f'wrote {os.path.join(OUTDIR, "results.json")}', flush=True)
+    print(f'wrote {rpath}', flush=True)
 
 
 if __name__ == '__main__':

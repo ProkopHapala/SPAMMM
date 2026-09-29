@@ -1634,7 +1634,7 @@ def plot_geom_overlay(geoms, bonds, labels, ref=0, modes=None, markers=None, sav
 
 
 
-def plot_pbc_chain_cell(atoms, lvs, hbonds, n_cells=3, savepath=None, title=None, sz=20., axes=(0, 1), jnames=None):
+def plot_pbc_chain_cell(atoms, lvs, hbonds, n_cells=3, savepath=None, title=None, sz=20., axes=(0, 1), jnames=None, ax=None, jlabels=True):
     """Draw a 1D-periodic H-bond chain: n_cells tiled unit cells + cell box + junctions.
 
     Canonical SPAMMM molecule style (same as enum/bond-map plots): thin skeleton
@@ -1658,7 +1658,10 @@ def plot_pbc_chain_cell(atoms, lvs, hbonds, n_cells=3, savepath=None, title=None
     apos = np.asarray(atoms.apos, dtype=float)
     lvec = np.asarray(lvs)[1]
     ax1, ax2 = axes
-    fig, ax = plt.subplots(figsize=(7, 2.5 + 3 * n_cells))
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, 2.5 + 3 * n_cells))
+    else:
+        fig = ax.figure
     half = n_cells // 2
     enames = [e.split('_')[0] for e in atoms.enames]
     colors_a = [elements.ELEMENT_DICT[e][8] for e in enames]
@@ -1674,8 +1677,9 @@ def plot_pbc_chain_cell(atoms, lvs, hbonds, n_cells=3, savepath=None, title=None
         ax.plot([pD[ax1], pH[ax1]], [pD[ax2], pH[ax2]], 'g-', lw=1.2, zorder=5)
         ax.plot([pH[ax1], pA[ax1]], [pH[ax2], pA[ax2]], 'm--', lw=1.0, zorder=5)
         jn = str(jj + 1) if jnames is None else jnames[jj]
-        for p, t, c in ((pD, 'D' + jn, 'tab:blue'), (pH, 'H' + jn, 'green'), (pA, 'A' + jn, 'tab:red')):
-            ax.annotate(t, (p[ax1] - 0.95, p[ax2] - 0.1), fontsize=9, color=c, weight='bold', zorder=6)
+        if jlabels:
+            for p, t, c in ((pD, 'D' + jn, 'tab:blue'), (pH, 'H' + jn, 'green'), (pA, 'A' + jn, 'tab:red')):
+                ax.annotate(t, (p[ax1] - 0.95, p[ax2] - 0.1), fontsize=9, color=c, weight='bold', zorder=6)
     x0, x1 = apos[:, ax1].min() - 1.5, apos[:, ax1].max() + 1.5
     ylo, yhi = apos[:, ax2].min(), apos[:, ax2].max()
     ax.add_patch(Rectangle((x0, ylo), x1 - x0, yhi - ylo, fill=False, edgecolor='magenta', lw=1.5))

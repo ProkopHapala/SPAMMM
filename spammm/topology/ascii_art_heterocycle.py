@@ -217,6 +217,7 @@ def _build_dimer(lines, aCC=A_CC, hbond_length=None):
 
     row_kind = {}
     row_parity = {}
+    row_letx = {}
     for r, line in enumerate(lines):
         tokens = _atom_tokens(line)
         if not tokens:
@@ -224,12 +225,16 @@ def _build_dimer(lines, aCC=A_CC, hbond_length=None):
         for c, ch in tokens:
             if ch == ':':
                 hbond_marks.append((r, c))
-        row_kind[r] = 'E' if any(ch.isalpha() for _, ch in tokens) else 'D'
+        # a row carrying '|'/'-' marks is a D (mid) row even when it also holds
+        # atom letters — those letters are fused-5-ring outer vertices sitting
+        # at mid height (see below); pure-letter rows stay E (apex) rows
+        row_kind[r] = 'D' if any(ch in '|-' for _, ch in tokens) else ('E' if any(ch.isalpha() or ch == '.' for _, ch in tokens) else 'D')
         if row_kind[r] == 'E':
             for c, ch in tokens:
                 if ch.isalpha():
                     row_parity[r] = c % 2
                     break
+        row_letx[r] = [c * dx / 2.0 for c, ch in tokens if ch.isalpha()]
 
     y_list = {}
     y_pos = 0.0
@@ -278,15 +283,21 @@ def _build_dimer(lines, aCC=A_CC, hbond_length=None):
         tokens = _atom_tokens(line)
         if not tokens:
             continue
-        # mixed rows allowed: atom letters AND '|','-','.' marks on one line
         for c, ch in tokens:
             xi = c // 2
             x = c * dx / 2.0
-            if ch.isalpha():
-                i = _add_atom(x, y, ch, r, xi)
-                row_atoms.setdefault(r, []).append(i)
-            elif ch == '.':
-                i = _add_atom(x, y, 'C', r, xi)
+            if ch.isalpha() or ch == '.':
+                e = ch if ch.isalpha() else 'C'
+                if row_kind.get(r) == 'D':
+                    # letter in a dimer row = fused-5-ring outer vertex: sits at
+                    # mid height between the E rows and half a bond outside its
+                    # nearest apex column (same ~1.5 A reach as '-' pair atoms)
+                    # -> bonds the apices above AND below; a lattice-column x
+                    # would sit 1.9 A away and stay unbonded
+                    apex = row_letx.get(r - 1, []) + row_letx.get(r + 1, [])
+                    if apex:
+                        x += np.clip(min(apex, key=lambda xa: abs(xa - x)) - x, -aCC / 2.0, aCC / 2.0)
+                i = _add_atom(x, y, e, r, xi)
                 row_atoms.setdefault(r, []).append(i)
             elif ch == '|':
                 i1 = _add_atom(x, y - aCC / 2.0, 'C', r, xi)
@@ -779,17 +790,17 @@ MOL_EDGE_ARTS = {
   C
   n
 """,
-    # -COOH per end: only the hydroxyl 'o' sits on the tip row (1 junction per
-    # end); the carbonyl 'O' is drawn one row inside the molecule via '_'
+    # -COOH per end ('O o': bare carbonyl 'O' + hydroxyl 'o'); in an 'A' end
+    # only 'o' junctions — the 'O' is a passive acceptor contact (no ribbon H)
     'terephthalic_acid': """
-  o
-  C_O
+ O o
+  C
   C
  C C
  C C
   C
-O_C
-  o
+  C
+ O o
 """,
     # --- DD edges (Fig.3) ---
     'HH-h_1': """
@@ -864,17 +875,30 @@ n n O
 | | |
  n n
 """,
-    # fused 6+5 (pyrrole fused to the diazine): DD top edge, 'n c' bottom
+    # fused 6+5 (indole-like): the lone 'C' in the dimer row is the 5-ring's
+    # outer vertex (mid-height, half-offset -> bonds both apices); C=sp2.
+    # NOTE: sideways-fused pentagons are intrinsically squeezed on this
+    # lattice (~81/145 deg angles) — same as 7azaindol/fulvalene; only
+    # up/down-pointing pentagons (karbazol/guanin '_'/'-' convention) are
+    # near-equilateral, but those give donor tips at both ends instead of
+    # a shared donor edge.
     'HH-hp': """
  n n
-| | c
- n c
+| | C
+ n C
 """,
-    # fused 5+5 (dipyrrrole): 'n n' donor edge; bare CH edge -> binds down only
+    # fused 5+5 (diazapentalene): 'n n' donor edge; bare CH edge -> binds down
+    # only.  Same squeezed-pentagon caveat as HH-hp.
     'HH-pp': """
  n n
 C | C
  C C
+""",
+    # fused 6+6 with 'n N n' DAD triad edges (wider: 4 vertical dimers)
+    'HNH-hh': """
+ n N n
+| | | |
+ n N n
 """,
 }
 
@@ -893,18 +917,58 @@ def mol_art_tip_cells(art):
 
 
 def mol_art_state(art, etop='A', ebot='A'):
-    """Corner-state variant of a MOL_EDGE_ARTS art.  'A' = end as drawn;
+    """Corner-state variant of a MOL_EDGE_ARTS art.  Per end:
+    'A' = end as drawn;
     'B' = every junction-tip heteroatom at that end uppercased (bare
-    acceptor -> all junction protons moved to the ribbon)."""
+          acceptor -> all junction protons moved to the ribbon);
+    'S' = only the leftmost lowercase (switchable) tip uppercased
+          -> one junction proton switches side at that end;
+    a '0'/'1' mask string = arbitrary subset of that end's switchable
+          (lowercase) tips, x-ordered ('1' = proton moved to the ribbon)."""
     if etop == 'A' and ebot == 'A':
         return art
     bot, top = mol_art_tip_cells(art)
     lines = art.strip('\n').split('\n')
     for cells, st in ((top, etop), (bot, ebot)):
+        low = [(r, c) for r, c in cells if lines[r][c].islower()]
         if st == 'B':
-            for r, c in cells:
-                lines[r] = lines[r][:c] + lines[r][c].upper() + lines[r][c + 1:]
+            sel = low
+        elif st == 'S':
+            sel = low[:1]
+        elif st == 'A':
+            sel = []
+        else:
+            assert len(st) == len(low), f'mask {st} vs {len(low)} switchable tips at an end'
+            sel = [cell for cell, b in zip(low, st) if b == '1']
+        for r, c in sel:
+            lines[r] = lines[r][:c] + lines[r][c].upper() + lines[r][c + 1:]
     return '\n'.join(lines)
+
+
+def mol_art_states(art):
+    """All distinct switch states of an edge-tip art: every subset of the
+    switchable (lowercase) tips at each end, independent per end.
+
+    Returns [(label, art)] with label '<bot mask>/<top mask>' — a '0'/'1'
+    string per end over its x-ordered switchable tips ('1' = proton moved to
+    the ribbon; all-0 == AA, all-1 == BB).  States producing identical arts
+    (mirror-symmetric molecules) are merged, all their labels kept."""
+    from itertools import product
+    bot, top = mol_art_tip_cells(art)
+    lines = art.strip('\n').split('\n')
+    nb = sum(lines[r][c].islower() for r, c in bot)
+    nt = sum(lines[r][c].islower() for r, c in top)
+    out, seen = [], {}
+    for mb, mt in product(product('01', repeat=nb), product('01', repeat=nt)):
+        mb, mt = ''.join(mb), ''.join(mt)
+        st = mol_art_state(art, etop=mt or 'A', ebot=mb or 'A')
+        key = '\n'.join(l.rstrip() for l in st.split('\n'))
+        if key in seen:
+            out[seen[key]][0] += f'=={mb}|{mt}'        # identical art: alias label
+        else:
+            seen[key] = len(out)
+            out.append([f'{mb}|{mt}', st])
+    return [(l, a) for l, a in out]
 
 
 # ---------------------------------------------------------------------------
