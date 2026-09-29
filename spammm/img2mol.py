@@ -211,13 +211,15 @@ def ray_enclosure(R, xy, b, nray=36, r12=(0.35, 1.3), nr=20):
     return dict(q10=np.quantile(pk, 0.1, axis=1), min=pk.min(axis=1), maxgap=maxgap * 360.0 / nray)
 
 
-def ring_centers_E(flat, b, Ef_rel=0.25, dmax=2.2):
+def ring_centers_E(flat, b, Ef_rel=0.25, dmax=2.2, dmin=1.25):
     """Ring centers = peaks of fuzzy-AND enclosure E (on C), filtered by
-    ray-cast ridge enclosure (Rq10>0), raw-image enclosure Ef, and
-    one-molecule connectivity. Returns xy (N,2) accepted and a dict of
-    per-peak diagnostics for all peaks (xy, E, Ef, C, U, Rq10, Rmin, maxgap, reason)."""
-    from scipy.sparse import csr_matrix
-    from scipy.sparse.csgraph import connected_components
+    ray-cast ridge enclosure (Rq10>0), raw-image enclosure Ef, steric
+    exclusion ('close': candidates < dmin*b apart, weaker Rq10 loses —
+    two rings cannot have centers closer than ~2 pentagon apothems), and
+    connectivity (isolated singletons out; appendices detached by a weak
+    connector ring are kept — the graph builder handles that later).
+    Returns xy (N,2) accepted and a dict of per-peak diagnostics for all
+    peaks (xy, E, Ef, C, U, Rq10, Rmin, maxgap, reason)."""
     C = center_response(flat, b)
     ks = sector_kernels(b)
     E, M = sector_enclosure(C, ks)
@@ -239,18 +241,20 @@ def ring_centers_E(flat, b, Ef_rel=0.25, dmax=2.2):
     reason[rays['q10'] <= 0] = 'ray'
     passed = reason == ''
     reason[passed & (Efv < Ef_rel * np.quantile(Efv[passed], 0.9))] = 'Ef'
+    keep = np.zeros(len(pk), bool)
+    for i in np.flatnonzero(reason == '')[np.argsort(-rays['q10'][reason == ''])]:
+        if keep.any() and np.min(np.linalg.norm(pk[keep] - pk[i], axis=1)) < dmin * b:
+            reason[i] = 'close'
+        else:
+            keep[i] = True
     cand = np.flatnonzero(reason == '')
     if len(cand):
         inset = np.zeros(len(pk), bool); inset[cand] = True
+        linked = np.zeros(len(pk), bool)
         prs = np.array([(i, j) for i, j in cKDTree(pk).query_pairs(dmax * b) if inset[i] and inset[j]], dtype=int).reshape(-1, 2)
         if len(prs):
-            A = csr_matrix((np.ones(len(prs)), (prs[:, 0], prs[:, 1])), shape=(len(pk), len(pk)))
-            lab = connected_components(A, directed=False)[1]
-            cand = cand[lab[cand] == np.bincount(lab[cand]).argmax()]   # largest component
-            reason[(reason == '') & ~np.isin(np.arange(len(pk)), cand)] = 'comp'
-        elif len(cand) > 1:                                            # isolated candidates
-            cand = cand[:0]
-            reason[reason == ''] = 'comp'
+            linked[prs[:, 0]] = linked[prs[:, 1]] = True               # component size >= 2 survives
+        reason[(reason == '') & ~linked] = 'comp'                      # isolated singletons only
     reason[reason == ''] = 'ok'
     return xy[reason == 'ok'], dict(xy=xy, E=Ev, Ef=Efv, C=Cv, U=U, Rq10=rays['q10'], Rmin=rays['min'], maxgap=rays['maxgap'], reason=reason)
 

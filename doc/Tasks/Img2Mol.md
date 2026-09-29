@@ -196,3 +196,71 @@ explained by a fused-graph hypothesis that is optimized as a whole.
 1. Refine each template-predicted center against *local enclosed rim* evidence, with one-to-one assignment to observed center proposals; reject exterior and scan-line artifacts explicitly. Keep weak interior sites as hypotheses rather than auto-filled rings.
 2. Select centers and fused sides together using bright shared-wall evidence and carbon valence/Euler constraints; score local geometric deformation of the template. For unrelated molecules, infer the dual without a known 19-ring template.
 3. Show per-image ring and bond overlays for human review, then validate chemistry and `AtomicGraph` export. Keep task status unverified until user confirms the low-resolution results.
+
+## Progress report, session 3 — convolutional ring-center detector (`ring_centers_E`)
+
+Status: **ring-center detection works well on most images (user-reviewed), NOT yet wired into graph building.** Nothing downstream (graph, XYZ) is verified.
+
+### Why the previous pipeline was dropped as the main path
+
+The evidence-fusion + simulated-annealing + lattice-snap pipeline in `img_to_graph` (`ring_hypotheses`, `select_rings`, `fused_topology`, `fit_center_lattice`) was too fragile. Evidence from this session:
+- The weighted-sum score S (≈7 z-scored channels) let weak rim/vertex channels outvote a clean center dip, so 4+ real rings per image were lost at selection (panel D of `channels.png`).
+- Hard lattice snapping destroyed whole images: on 12.png the lattice fit locked onto a sheared basis (|B| = 10/16.6 px, 65°), all centers came out off-lattice, and 12.png collapsed to 3 rings. Neither projecting onto an ideal 60° basis nor free affine refit helped (big.png then collapsed to a denser lattice, d0 = 53–58 px vs 65 expected). **The lattice should only be a soft consistency check, never a snap.** (`fit_center_lattice` now has an experimental regularized refit; treat it as unverified.)
+- The b-rescale second pass could destroy a good first pass (9.png: 21 → 4 rings). `img_to_graph` now keeps the pass with the most rings.
+- USER correction: the molecule is planar and is NOT a helicene. There is no non-planar distortion to model; the differences are noise, contrast and tip artefacts.
+
+### How the new detector works (all convolution / batched sampling, ~0.02 s per small image, 0.45 s for big.png)
+
+Code: `spammm/img2mol.py` → `center_response`, `sector_kernels`, `sector_enclosure`, `ray_enclosure`, `ring_centers_E`, `junction_kernels`, `junction_response`.
+Diagnostics: `python3 tests/testplot_img2mol.py --filters --img 12.png` (or with no `--img` for 1.png) → `debug/testplot_img2mol/<img>/filter_bank.png`, `filter_response.png`, `ring_centers_E.png`.
+
+1. **Bond scale** `b` from ridge autocorrelation (`estimate_bond_scale`); about 8.1 px on the small scans, 37.5 px on big.png.
+2. **Center response** `C = -LoG(flat, 0.45 b) / localRMS(2b)`. This is the smooth, well-denoised map; ring interiors are dark blobs. USER: "good base, lines a bit too wide".
+3. **Filter bank** `sector_kernels(b, nsect=8, rads=(0.68, 0.90))`, a table of 2 radii × 8 angular sectors:
+   - *Radial part*: a zero-mean ring wavelet: negative inside, positive bump at r0 (0.68 b ≈ pentagon apothem, 0.90 b ≈ hexagon), negative skirt outside, zero beyond. The weights are balanced so ∫K = 0 (DC-free, so insensitive to contrast offsets).
+   - *Angular part*: periodic quadratic B-spline windows forming a partition of unity (Σ_j ang_j(θ) = 1, so the sectors sum to an isotropic annulus; checksum shown in `filter_bank.png`).
+   - Each kernel is L2-normalized (ΣK² = 1).
+   - FFT convolution (`signal.fftconvolve`); parity against `ndi.correlate` gives rel. error 2.5e-13.
+4. **Fuzzy AND**: `M_j = max_i S_ij` (a rim at *some* radius in sector j), then `E = (Π_j clamp(M_j, 0))^(1/nsect)`. Peaks of E are the ring-center *candidates*.
+5. **Filters on the candidates** (reason codes in `ring_centers_E.png`):
+   - `ray`: **ray-cast enclosure** on a *sharp* ridge map `R = -LoG(flat, 0.2 b)/localRMS(3b)`. 36 rays, radii 0.35–1.3 b, take the radial max per ray; require the 10th percentile over rays `Rq10 > 0`. This is the hard "wall in every direction" test. On the hand-labelled cases, real rings had Rq10 of 0.15–1.08 and fakes had −0.68 to −0.31, with no overlap across 1/9/12/big.
+   - `Ef`: the same filter bank applied to the raw flattened image instead of C. Background noise peaks have Ef ≈ 0–5 against 55–170 for real rings (C is RMS-normalized, so it amplifies background noise).
+   - `close`: steric exclusion. Candidates closer than `dmin = 1.25 b` to a stronger one are removed. **Known to be wrong, see below.**
+   - `comp`: isolated singletons with no candidate within 2.2 b are removed. Components of 2 or more are kept. An earlier rule that kept only the largest component deleted whole appendices on 2.png and 5.png.
+   - The earlier gates `U = min_j M_j / mean_j M_j ≥ 0.55` and `C < 0` were removed from the decision. They are still stored as diagnostics. `C<0` wrongly rejected a real big.png ring (C = +0.39), and U rejected the weak connector ring of the big.png appendix.
+
+### Why the fuzzy AND alone does not reach zero on false rings (answer to USER question)
+
+- E is computed on C, which is itself a LoG output. **A LoG creates a positive side-lobe ring around every dark blob**, so a dark halo gap or dark bay gets a fabricated rim in every direction. Measured: the false peak in 9.png at (21,115) has M_j(C) ≥ 0.84 in all sectors, while on the raw image its sectors 4–7 drop to 20–35 against 150.
+- The geometric mean ^(1/8) is soft: one sector at 1/5 of the others lowers E by only 5^(1/8) ≈ 1.22×.
+- The B-spline sectors overlap (support 135°), so an opening narrower than about 45–90° is covered by the neighbouring sectors.
+- This is why the hard test must use a *sharp* map along *narrow* rays (the `ray` check), not C.
+
+### Results (current code state, including the `close` rule)
+
+| img | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | big |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| accepted | 19 | 18 | 19 | 18 | 17 | 17 | 17 | 17 | 15 | 18 | 20 | 20 | 20 | 20 | 19 |
+
+USER review of the earlier U-based version: 12 and 3 perfect; 9 and 1 had one false positive each; big had 4 false negatives. The `ray` test fixed all of these: the 9.png (21,115) and 1.png (104,63) false positives are rejected, and the four missing big.png rings (164,308), (208,356), (250,405), (271,352) are recovered. The ray-based results on 2, 4–8, 10, 11, 13, 14 have **not yet been reviewed by the USER.**
+
+### Known problems / where it fails
+
+1. **The `close` steric rule is fragile and should be replaced.** It correctly removes the big.png false peak (169,264) at 1.18 b, but it also removes three probably-real connector rings at 1.24 b: 4.png (53,101), 5.png (54,79), 10.png (130,105). Distance does not separate these cases. These short-spaced connectors are probably pentagons (pent–hex spacing ≈ 1.56 b vs hex–hex 1.73 b; the median neighbour spacing measured here is ≈1.5 b).
+   **Measured replacement, not yet implemented**: *raw ring depth* = (q10 over rays of the radial-max of `gaussian_filter(flat, 0.2b)` − value at the center) / std. All accepted rings on 4, 5, 10, 12 and big have depth ≥ −0.27 (median 0.6–1.2); the big.png false peak has −0.93 (its center is brighter than its rim); the three connectors have 0.10–0.53. Plan: add a `depth < -0.5` rejection, comment out the `close` rule, re-run all 15 images.
+2. **Weak-contrast peripheral rings**, especially appendix connectors, are the main source of false negatives. Their outer wall is the soft molecule edge.
+3. **Scan artefacts** (9.png bright blobs under the molecule) produce well-enclosed-looking candidates. Three were removed only as isolated singletons (`comp`).
+4. **Remaining singleton `comp` rejects**: 13.png (49,72) has Rq10 = 1.19 (strongly enclosed) but no neighbour within 2.2 b. It could be a real ring whose neighbour was missed; review it.
+5. **Thresholds** (Rq10 > 0, Ef_rel = 0.25, dmax = 2.2 b) come from a handful of labelled points on 1/9/12/big. They are not validated on a labelled set.
+6. **`b` is almost constant (8.08 px) across the small images** because of autocorrelation binning. The measured median ring spacing is about 1.5 b, not √3 b ≈ 1.73 b, so b is probably overestimated by roughly 10–15%. The radii of the kernels and rays scale with b.
+7. **V3 junction map** (`junction_kernels(narm=3)`): the kernels are correct, but the response on C looks ridge-textured rather than point-like. It is not used in any decision yet.
+
+### Ideas / next steps
+
+1. Replace `close` with the raw-depth test (item 1 above); USER should review all 15 `ring_centers_E.png`.
+2. **Independent vertex / edge parity check** (USER request): V3 junction response on a sharper map (the sharp R, or `-LoG(0.15–0.2 b)`), evaluated only at predicted corners. For each accepted center and its fused neighbours, the shared-edge endpoints and triple-ring corners should light up in V3, and the shared wall should be bright in R along the center–center midline (measured: normal fused pairs have midline R ≥ 0.2, median 0.8). Use this to (a) confirm weak rings with low Rq10 and (b) link appendices across weak connectors.
+3. Hysteresis growth: strict seeds (Rq10 > 0.3), then admit weaker candidates only if they are fused to an accepted ring (bright shared wall plus V3 at the shared corners).
+4. Pentagon versus hexagon: use the local spacing to fused neighbours (pent–hex ≈ 0.90× hex–hex) and the angle between neighbour directions (72° vs 60°), together with a radius-resolved bank (keep M_ij per radius, not only its max: the argmax radius ≈ apothem ≈ ring size).
+5. Better `b`: take it from the median nearest-neighbour distance of accepted centers (≈ √3 b for hex–hex), then iterate the bank once.
+6. Then build the graph: accepted centers → fused pairs (bright midline wall, distance 1.3–2.1 b) → `graph_from_fused_rings` (shared vertices and edges by construction, degree ≤ 3, V−E+F = 1). Do **not** use annealing or hard lattice snapping; use the lattice only as a soft sanity check.
+7. Plot hygiene: `channels.png` panel (E), "fitted rims", draws per-ring polygons with independently fitted phase. The USER called it useless: randomly oriented, disconnected hexagons. Drop it, or draw polygons derived from the fused-neighbour directions.
