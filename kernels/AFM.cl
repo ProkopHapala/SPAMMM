@@ -702,6 +702,43 @@ __kernel void convolveZ(
     }
 }
 
+// Fz sampled along one lane at fractional index q (linear lerp, clamp 'nearest').
+inline float dfAmpZ_sampleFz( __global const float4* F, int base, float q, int nz ){
+    q = clamp( q, 0.0f, (float)(nz-1) );
+    int i0 = (int)floor(q);
+    int i1 = min( i0+1, nz-1 );
+    float t = q - (float)i0;
+    return F[base+i0].z*(1.0f-t) + F[base+i1].z*t;
+}
+
+// Finite-amplitude df along z (osc_dir=(0,0,1)) — Gauss-Chebyshev quadrature of
+// lerp-sampled field + central-difference gradient; matches host compute_df_amp_z.
+// One work-item per (scan_lane, iz) output element.
+__kernel void dfAmpZ(
+    __global const float4* FEs,
+    __global float* DF,
+    const int nz, const float dzi, const float amp
+){
+    const int gid   = get_global_id(0);
+    const int iscan = gid / nz;
+    const int iz    = gid - iscan*nz;
+    const int base  = iscan*nz;
+    const float adz = fabs(dzi);
+    const float inv = amp/adz;
+    const float W   = 1.0f/9.0f;
+    // np.gradient edge rule: central inside, one-sided first-order at boundaries
+    const int i0 = (iz==0)    ? 0    : iz-1;
+    const int i1 = (iz==nz-1) ? nz-1 : iz+1;
+    const float idv = (float)(i1-i0)*adz;
+    float df = 0.0f;
+    for(int k=0;k<9;k++){
+        float uk = cospi( (2.0f*k+1.0f)/18.0f );
+        float s  = uk*inv;
+        df -= W * ( dfAmpZ_sampleFz(FEs, base, i1+s, nz) - dfAmpZ_sampleFz(FEs, base, i0+s, nz) ) / idv;
+    }
+    DF[gid] = df;
+}
+
 __kernel void izoZ(
     __global  float4* Fin,
     __global  float*  zMap,

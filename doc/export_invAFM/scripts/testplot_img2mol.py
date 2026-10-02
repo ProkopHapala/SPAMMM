@@ -10,9 +10,10 @@ Step 1 (spammm/img2mol.img_to_graph), rings-first with chemical priors:
 Step 2: graph_to_atomicgraph -> AtomicGraph (all C, C-C=1.42 A) -> XYZ, optional rim H.
 
 Usage:
-  python3 tests/testplot_img2mol.py --img 1.png
-  python3 tests/testplot_img2mol.py --all            # images 1-14 + big.png
-  python3 tests/testplot_img2mol.py --img 1.png --bpx 8 --H
+  python3 doc/export_invAFM/scripts/testplot_img2mol.py --img 1.png
+  python3 doc/export_invAFM/scripts/testplot_img2mol.py --all            # images 1-14 + big.png
+  python3 doc/export_invAFM/scripts/testplot_img2mol.py --img-dir /path/to/images --all --filters
+  python3 doc/export_invAFM/scripts/testplot_img2mol.py --img 1.png --bpx 8 --H
 
 Artifacts -> debug/testplot_img2mol/<imgname>/
 """
@@ -22,11 +23,18 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from spammm import img2mol
+_here = os.path.dirname(os.path.abspath(__file__))
+_repo = _here
+while _repo != os.path.dirname(_repo) and not os.path.isdir(os.path.join(_repo, 'spammm')):
+    _repo = os.path.dirname(_repo)      # repo root = dir containing spammm/ (works from any depth)
+for p in (_repo, _here):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+import img2mol
 
 IMGDIR = '/home/prokop/Desktop/PROJECTs/Svec_Ditriptaceneo_Helicene/Images'
-OUTDIR = os.path.join(os.path.dirname(__file__), '..', 'debug', 'testplot_img2mol')
+BONUSDIR = '/home/prokop/Desktop/PROJECTs/Svec_Ditriptaceneo_Helicene/Images_Bonus/set_2_shade_AFM'
+OUTDIR = os.path.join(_repo, 'debug', 'testplot_img2mol')
 
 
 def plot_result(res, out, name):
@@ -242,6 +250,8 @@ def plot_filters(path, outdir):
     out = os.path.join(outdir, 'filter_bank.png')
     fig.tight_layout(); fig.savefig(out, dpi=110); plt.close(fig)
     print(f'REVIEW: {out}', flush=True)
+
+
     # ---- figure 2: response maps on the real image ----
     xy = img2mol.propose_centers(C, img2mol.molecule_mask(flat, 0.4 * b), b)
     fig, axs = plt.subplots(2, 4, figsize=(18, 9))
@@ -286,6 +296,175 @@ def plot_filters(path, outdir):
     print(f'REVIEW: {out}', flush=True)
 
 
+def plot_ve_kernels(path, outdir):
+    """Vertex 'Y' and linear double-edge kernel banks, per-orientation
+    responses and their products; kernels drawn in units of b with a molecule
+    crop at the same pixel scale."""
+    os.makedirs(outdir, exist_ok=True)
+    name = os.path.basename(path)
+    flat = img2mol.flatten_bg(img2mol.load_gray(path))
+    b = img2mol.estimate_bond_scale(flat)
+    Rs = -img2mol.ndi.gaussian_laplace(flat, 0.2 * b)
+    R = Rs / (np.sqrt(np.maximum(img2mol.ndi.uniform_filter(Rs * Rs, int(3 * b)), 0)) + 1e-9)
+    f6n = img2mol.prep_image(img2mol.load_gray(path), 'flat6n')   # noise-stabilized high-pass
+    kv = img2mol.vertex_kernels(b)
+    ke = img2mol.edge_kernels(b)
+    nrot, nd, dirs = kv.shape[0], ke.shape[0], ke.shape[1]
+    Sv = np.stack([img2mol.signal.fftconvolve(R, k[::-1, ::-1], mode='same') for k in kv])   # (nrot,H,W) on LoG ridge
+    Vr = Sv.max(axis=0)
+    Svn = np.stack([img2mol.signal.fftconvolve(f6n, k[::-1, ::-1], mode='same') for k in kv])
+    Vrn = Svn.max(axis=0)                                                                 # same on flat6n
+    Se = np.stack([img2mol.signal.fftconvolve(R, ke[i, k][::-1, ::-1], mode='same')
+                   for i in range(nd) for k in range(dirs)]).reshape(nd, dirs, *R.shape)   # edges on LoG ridge R
+    Resp = np.clip(Se.max(axis=0), 0, None)                  # (dirs,H,W): per-orientation max over ds, positive part
+    Estr = np.prod(Resp, axis=0)**(1.0 / dirs)               # product over orientations
+    Sen = np.stack([img2mol.signal.fftconvolve(f6n, ke[i, k][::-1, ::-1], mode='same')
+                    for i in range(nd) for k in range(dirs)]).reshape(nd, dirs, *f6n.shape)
+    Estrn = np.prod(np.clip(Sen.max(axis=0), 0, None), axis=0)**(1.0 / dirs)
+    fig = plt.figure(figsize=(19, 3.2 * (2 + nrot // 3)))
+    ncol = max(kv.shape[0], dirs + 1) + 2
+    gs = fig.add_gridspec(2 + nrot // 3, ncol, width_ratios=[1] * (ncol - 2) + [1.8, 1.8])
+    # --- row 0: vertex kernels + same-scale molecule crop + V3 response ---
+    for k in range(nrot):
+        ax = fig.add_subplot(gs[0, k])
+        ax.imshow(kv[k], cmap='RdBu_r', vmin=-np.abs(kv).max(), vmax=np.abs(kv).max(),
+                  extent=np.array([-kv.shape[-1], kv.shape[-1], kv.shape[-1], -kv.shape[-1]]) / 2 / b)
+        for rr in (0.5, 1.0):
+            ax.add_patch(plt.Circle((0, 0), rr, fill=False, ec='k', lw=0.6, ls='--'))
+        ax.set_title(f'V3-Y rot{k} (units of b)', fontsize=8); ax.set_aspect('equal')
+    cy, cx = np.unravel_index(np.argmax(img2mol.center_response(flat, b) * -1), flat.shape)
+    hw = int(1.5 * b)
+    ax = fig.add_subplot(gs[0, -2])
+    ax.imshow(flat[max(0, cy - hw):cy + hw, max(0, cx - hw):cx + hw], cmap='gray', extent=[-hw, hw, hw, -hw] / b)
+    ax.add_patch(plt.Circle((0, 0), 1.0, fill=False, ec='r', lw=0.8, ls='--'))
+    ax.set_title('molecule crop SAME SCALE', fontsize=8)
+    ax = fig.add_subplot(gs[0, -1]); ax.imshow(Vr, cmap='viridis'); ax.set_title('V3-Y response (max rot, on R)', fontsize=8); ax.set_axis_off()
+    # --- row 1: edge kernels (dirs cols, largest d) + strips product ---
+    ke1 = ke[-1]
+    for k in range(dirs):
+        ax = fig.add_subplot(gs[1, k])
+        ax.imshow(ke1[k], cmap='RdBu_r', vmin=-np.abs(ke1).max(), vmax=np.abs(ke1).max(),
+                  extent=np.array([-ke1.shape[-1], ke1.shape[-1], ke1.shape[-1], -ke1.shape[-1]]) / 2 / b)
+        for rr in (0.5, 1.0):
+            ax.add_patch(plt.Circle((0, 0), rr, fill=False, ec='k', lw=0.6, ls='--'))
+        ax.set_title(f'edge d=1.0b dir{k} (units of b)', fontsize=8); ax.set_aspect('equal')
+    ax = fig.add_subplot(gs[1, dirs]); ax.imshow(Estr, cmap='viridis'); ax.set_title('prod_k Resp_k on R (LoG ridge)', fontsize=8); ax.set_axis_off()
+    ax = fig.add_subplot(gs[1, -2]); ax.imshow(Estrn, cmap='viridis'); ax.set_title('prod_k Resp_k on flat6n', fontsize=8); ax.set_axis_off()
+    ax = fig.add_subplot(gs[1, -1]); ax.imshow(R, cmap='viridis'); ax.set_title('input R (LoG ridge, RMS-norm)', fontsize=8); ax.set_axis_off()
+    # --- rows 2+: per-orientation edge responses + vertex responses on R vs flat6n ---
+    for k in range(dirs):
+        ax = fig.add_subplot(gs[2, k]); ax.imshow(Resp[k], cmap='viridis'); ax.set_title(f'Resp dir{k} = max_d edge^+ on R', fontsize=8); ax.set_axis_off()
+    ax = fig.add_subplot(gs[2, -2]); ax.imshow(Vrn, cmap='viridis'); ax.set_title('V3-Y response on flat6n', fontsize=8); ax.set_axis_off()
+    ax = fig.add_subplot(gs[2, -1]); ax.imshow(f6n, cmap='gray'); ax.set_title('input flat6n', fontsize=8); ax.set_axis_off()
+    fig.suptitle(f'{name}: vertex-Y + linear double-edge filter banks, b={b:.1f}px')
+    out = os.path.join(outdir, 'vertex_edge_kernels.png')
+    fig.tight_layout(); fig.savefig(out, dpi=110); plt.close(fig)
+    print(f'REVIEW: {out}', flush=True)
+
+
+def plot_filter_skeleton(path, outdir):
+    """Review accepted ring centers and the connected shared-corner graph."""
+    os.makedirs(outdir, exist_ok=True)
+    gray = img2mol.load_gray(path)
+    flat = img2mol.flatten_bg(gray)
+    res = img2mol.ring_centers_graph(flat)
+    fig, ax = plt.subplots(figsize=(8, 8)); ax.imshow(gray, cmap='gray')
+    for ring in res['rings']:
+        q = res['verts'][ring + [ring[0]]]
+        ax.plot(q[:, 0], q[:, 1], color='lime', lw=1.0)
+    ax.plot(res['centers'][:, 0], res['centers'][:, 1], 'o', mfc='none', mec='cyan', ms=5)
+    n5 = sum(n == 5 for n in res['ns'].values()); n6 = sum(n == 6 for n in res['ns'].values())
+    ax.set_title(f'{os.path.basename(path)} centers={len(res["centers"])} fused={len(res["pairs"])} rings(5:{n5},6:{n6}) V={len(res["verts"])} E={len(res["edges"])}')
+    ax.set_axis_off(); fig.tight_layout()
+    out = os.path.join(outdir, 'filter_skeleton.png'); fig.savefig(out, dpi=130); plt.close(fig)
+    print(f'{os.path.basename(path)}: filter skeleton centers={len(res["centers"])} fused={len(res["pairs"])} V={len(res["verts"])} E={len(res["edges"])}', flush=True)
+    if res['removed_pairs']:
+        print(f'{os.path.basename(path)}: removed weak sides for valence={[(p[0], p[1], round(p[3], 3)) for p in res["removed_pairs"]]}', flush=True)
+    print(f'REVIEW: {out}', flush=True)
+
+
+def plot_preprocess_cmp(path, ref_path, outdir):
+    """Shading-removal comparison: per method show flat / ridge R / center C /
+    detections (lime circles) vs reference red dots, with match statistics."""
+    from scipy.spatial import cKDTree
+    os.makedirs(outdir, exist_ok=True)
+    name = os.path.basename(path)
+    g = img2mol.load_gray(path)
+    ref = img2mol.red_dot_centers(ref_path) if ref_path and os.path.isfile(ref_path) else None
+    METHODS = ['flat16', 'flat6', 'flat6n', 'median', 'poly2', 'rows', 'bandpass', 'lstd']
+    fig, axs = plt.subplots(len(METHODS), 4, figsize=(16, 2.6 * len(METHODS)))
+    for i, method in enumerate(METHODS):
+        flat = img2mol.prep_image(g, method)
+        b = img2mol.estimate_bond_scale(flat)
+        Rs = -img2mol.ndi.gaussian_laplace(flat, 0.2 * b)                      # same R as ring_centers_E
+        R = Rs / (np.sqrt(img2mol.ndi.uniform_filter(Rs * Rs, int(3 * b))) + 1e-9)
+        C = img2mol.center_response(flat, b)
+        xy, _ = img2mol.ring_centers_E(flat, b)
+        matched = FP = FN = 0
+        if ref is not None and len(ref):
+            dref = cKDTree(xy).query(ref)[0] if len(xy) else np.full(len(ref), np.inf)
+            ddet = cKDTree(ref).query(xy)[0] if len(xy) else np.zeros(0)
+            matched = int((dref < 0.6 * b).sum()); FP = int((ddet >= 0.6 * b).sum()); FN = int(len(ref) - matched)
+            stat = f'matched={matched} FP={FP} FN={FN}'
+        else:
+            stat = 'no ref'
+        axs[i, 0].imshow(flat, cmap='gray')
+        axs[i, 1].imshow(R, cmap='gray')
+        axs[i, 2].imshow(C, cmap='gray')
+        axs[i, 3].imshow(g, cmap='gray')
+        if ref is not None and len(ref):
+            axs[i, 3].plot(ref[:, 0], ref[:, 1], 'r+', ms=8)
+        if len(xy):
+            axs[i, 3].plot(xy[:, 0], xy[:, 1], 'o', ms=10, mfc='none', mec='lime', mew=1.2)
+        for j, t in enumerate(['flat', 'R ridge', 'C center', 'ref + detected']):
+            axs[i, j].set_axis_off()
+            if i == 0:
+                axs[i, j].set_title(t, fontsize=9)
+        axs[i, 0].set_ylabel(f'{method}\n{stat}', fontsize=9)
+        print(f'{name} {method}: b={b:.2f} det={len(xy)} matched={matched} FP={FP} FN={FN}', flush=True)
+    fig.suptitle(f'{name}: shading-removal comparison')
+    fig.tight_layout()
+    out = os.path.join(outdir, 'preprocess_cmp.png')
+    fig.savefig(out, dpi=110); plt.close(fig)
+    print(f'REVIEW: {out}', flush=True)
+
+
+def eval_vs_reference(names, img_dir, methods=('flat16',)):
+    """Score ring_centers_E against solution/ red-dot reference centers."""
+    from scipy.spatial import cKDTree
+    soldir = os.path.join(img_dir, 'solution')
+    for method in methods:
+        TF = TN = TD = 0
+        for n in names:
+            ref = img2mol.red_dot_centers(os.path.join(soldir, n))
+            flat = img2mol.prep_image(img2mol.load_gray(os.path.join(img_dir, n)), method)
+            b = img2mol.estimate_bond_scale(flat)
+            xy, _ = img2mol.ring_centers_E(flat, b)
+            dref = cKDTree(xy).query(ref)[0] if len(xy) else np.full(len(ref), np.inf)
+            ddet = cKDTree(ref).query(xy)[0] if len(ref) else np.ones(len(xy)) * np.inf
+            hit = int((dref < 0.6 * b).sum()); fp = int((ddet >= 0.6 * b).sum()); fn = len(ref) - hit
+            TF += fp; TN += fn; TD += len(xy)
+            print(f'{n:8s} {method:8s} ref={len(ref):2d} det={len(xy):2d} hit={hit:2d} FP={fp} FN={fn} b={b:.2f}', flush=True)
+        print(f'   {method:8s} TOTAL det={TD} FP={TF} FN={TN}', flush=True)
+
+
+def report_scale_calibration():
+    """Compare integer and parabolically interpolated autocorrelation scales."""
+    sets = [('original', [os.path.join(IMGDIR, f'{i}.png') for i in range(1, 15)] + [os.path.join(IMGDIR, 'big.png')]),
+            ('bonus', [os.path.join(BONUSDIR, f) for f in sorted(os.listdir(BONUSDIR), key=lambda f: int(os.path.splitext(f)[0])) if f.endswith('.png') and os.path.splitext(f)[0].isdigit()])]
+    rows = []
+    print('set/image           b_integer_px  b_subpixel_px  offset_px  change_pct', flush=True)
+    for group, paths in sets:
+        for path in paths:
+            flat = img2mol.flatten_bg(img2mol.load_gray(path))
+            b_int = img2mol.estimate_bond_scale(flat, subpixel=False)
+            b_sub = img2mol.estimate_bond_scale(flat)
+            rows.append((b_int, b_sub))
+            print(f'{group}/{os.path.basename(path):14} {b_int:12.3f} {b_sub:14.3f} {b_sub-b_int:10.3f} {100*(b_sub/b_int-1):10.2f}', flush=True)
+    offsets = np.asarray([b_sub - b_int for b_int, b_sub in rows])
+    print(f'images={len(rows)} median|offset|={np.median(np.abs(offsets)):.3f}px max|offset|={np.max(np.abs(offsets)):.3f}px', flush=True)
+
+
 def run(path, outdir, bpx=None, addH=False):
     os.makedirs(outdir, exist_ok=True)
     name = os.path.basename(path)
@@ -312,20 +491,57 @@ def run(path, outdir, bpx=None, addH=False):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--img', default=None)
+    ap.add_argument('--img-dir', default=IMGDIR, help='image directory for --all, --filters, and --filter-skeleton')
     ap.add_argument('--all', action='store_true')
     ap.add_argument('--bpx', type=float, default=None, help='initial bond length guess [px]')
     ap.add_argument('--H', action='store_true', help='add rim hydrogens')
     ap.add_argument('--template-big', action='store_true', help='diagnose alignment to the reviewed big.png ring pattern')
     ap.add_argument('--filters', action='store_true', help='plot the radial x angular filter bank and response maps')
+    ap.add_argument('--ve-kernels', action='store_true', help='plot vertex (3-fold) and double-edge (paired-sector) kernel banks + responses')
+    ap.add_argument('--filter-skeleton', action='store_true', help='plot accepted filter-bank centers as a shared-corner fused graph')
+    ap.add_argument('--scale-calibration', action='store_true', help='compare integer and fractional autocorrelation scale estimates on reference image sets')
+    ap.add_argument('--preprocess', action='store_true', help='compare shading-removal methods vs solution red-dot centers')
+    ap.add_argument('--eval-ref', action='store_true', help='score ring_centers_E vs solution/ red-dot centers')
+    ap.add_argument('--prep', default='flat16', help='prep_image method for --eval-ref (comma-separated)')
     args = ap.parse_args()
     names = [args.img] if args.img else \
-        ([f'{i}.png' for i in range(1, 15)] + ['big.png'] if args.all else ['1.png'])
+        (sorted([f for f in os.listdir(args.img_dir) if f.endswith('.png') and os.path.splitext(f)[0].isdigit()], key=lambda f: int(os.path.splitext(f)[0]))
+         if args.all and args.img_dir != IMGDIR else [f'{i}.png' for i in range(1, 15)] + ['big.png'] if args.all else ['1.png'])
+    outroot = OUTDIR if args.img_dir == IMGDIR else os.path.join(OUTDIR, os.path.basename(os.path.normpath(args.img_dir)))
+    if args.scale_calibration:
+        report_scale_calibration()
+        sys.exit(0)
+    if args.eval_ref:
+        eval_vs_reference(names, args.img_dir, args.prep.split(','))
+        sys.exit(0)
+    if args.preprocess:
+        soldir = os.path.join(args.img_dir, 'solution')
+        soldir = soldir if os.path.isdir(soldir) else None
+        for n in names:
+            ref_path = os.path.join(soldir, n) if soldir else None
+            plot_preprocess_cmp(os.path.join(args.img_dir, n), ref_path, os.path.join(outroot, n.replace('.png', '')))
+        sys.exit(0)
     if args.filters:
         for n in names:
-            plot_filters(os.path.join(IMGDIR, n), os.path.join(OUTDIR, n.replace('.png', '')))
+            plot_filters(os.path.join(args.img_dir, n), os.path.join(outroot, n.replace('.png', '')))
+        sys.exit(0)
+    if args.ve_kernels:
+        for n in names:
+            plot_ve_kernels(os.path.join(args.img_dir, n), os.path.join(outroot, n.replace('.png', '')))
+        sys.exit(0)
+    if args.filter_skeleton:
+        failed = []
+        for n in names:
+            try:
+                plot_filter_skeleton(os.path.join(args.img_dir, n), os.path.join(outroot, n.replace('.png', '')))
+            except ValueError as exc:
+                print(f'{n}: filter skeleton rejected: {exc}', flush=True)
+                failed.append(n)
+        if failed:
+            raise ValueError(f'filter skeleton rejected {len(failed)}/{len(names)} images: {failed}')
         sys.exit(0)
     if args.template_big:
-        flat = img2mol.flatten_bg(img2mol.load_gray(os.path.join(IMGDIR, 'big.png')))
+        flat = img2mol.flatten_bg(img2mol.load_gray(os.path.join(args.img_dir, 'big.png')))
         reference_b = img2mol.estimate_bond_scale(flat)
         R = -img2mol.ndi.gaussian_laplace(flat, max(0.8, reference_b / 7.0))
         reference, score = img2mol.ring_candidates(flat, R, reference_b)
@@ -333,7 +549,7 @@ if __name__ == '__main__':
         if len(reference) != 19:
             raise ValueError(f'Expected 19 reviewed big.png ring centers, found {len(reference)}')
         for n in names:
-            run_template(os.path.join(IMGDIR, n), os.path.join(OUTDIR, n.replace('.png', '')), reference, reference_b)
+            run_template(os.path.join(args.img_dir, n), os.path.join(outroot, n.replace('.png', '')), reference, reference_b)
         sys.exit(0)
     for n in names:
-        run(os.path.join(IMGDIR, n), os.path.join(OUTDIR, n.replace('.png', '')), bpx=args.bpx, addH=args.H)
+        run(os.path.join(args.img_dir, n), os.path.join(outroot, n.replace('.png', '')), bpx=args.bpx, addH=args.H)

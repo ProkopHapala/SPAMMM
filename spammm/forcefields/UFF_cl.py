@@ -74,8 +74,8 @@ class UFF_cl(OpenCLBase):
         self.bDoInversions = True
         self.bDoNonBonded = False
 
-    def toUFF(self, mol, bRealloc=True, bSimple=True, b141=True, bConj=True, bCumulene=True):
-        builder = UFF_Builder(mol, bSimple=bSimple, b141=b141, bConj=bConj, bCumulene=bCumulene)
+    def toUFF(self, mol, bRealloc=True, bSimple=True, b141=True, bConj=True, bCumulene=True, bKekule=True):
+        builder = UFF_Builder(mol, bSimple=bSimple, b141=b141, bConj=bConj, bCumulene=bCumulene, bKekule=bKekule)
         uff_data = builder.build()
         if bRealloc:
             self.realloc_buffers(
@@ -159,6 +159,8 @@ class UFF_cl(OpenCLBase):
             cl.enqueue_fill_buffer(self.queue, self.buffer_dict[bn], zero, 0, self.buffer_dict[bn].size)
         self.queue.finish()
         self.args_setup = False
+        if hasattr(self, 'kernel_params'):                    # counts/fint offsets may change -> rebuild in prepare_kernel_args
+            del self.kernel_params
         print(f"UFF buffers allocated for {nSystems} systems with {natoms} atoms each")
 
     def upload_positions(self, positions, iSys=0, masses=None):

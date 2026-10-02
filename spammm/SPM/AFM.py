@@ -428,6 +428,34 @@ class AFMulator(OpenCLBase):
         self.fdbm_step = float(step)
         self.fdbm_shape = (nx, ny, nz)
 
+    def sample_fdbm(self, queries):
+        """Trilinear (E,F) at arbitrary world positions from img_FF_fdbm (getFEinPoints).
+
+        queries: (N,3) positions [Ang], inside origin .. origin+(shape-1)*step per axis.
+        Out-of-grid points are rejected (sampler_1 is CLK_ADDRESS_REPEAT — no silent wrap).
+        Returns: (E (N,), F (N,3)) float32.
+        """
+        assert self.img_FF_fdbm is not None, "call setup_fdbm_grid() first"
+        q = np.asarray(queries, dtype=np.float32)
+        if q.ndim != 2 or q.shape[1] != 3 or q.shape[0] == 0:
+            raise ValueError(f'queries must be non-empty (N,3), got shape {q.shape}')
+        if not np.isfinite(q).all():
+            raise ValueError('queries contain non-finite values')
+        lo = self.fdbm_origin.astype(np.float32)
+        hi = (lo + (np.asarray(self.fdbm_shape, dtype=np.float64) - 1.0) * np.float64(self.fdbm_step)).astype(np.float32)
+        if np.any(q < lo) or np.any(q > hi):
+            raise ValueError(f'queries outside FDBM grid: allowed origin={lo} max={hi}')
+        nq = q.shape[0]
+        self.try_make_buffers({'fdbm_pts': nq * 16, 'fdbm_fes': nq * 16}, suffix='_cl')
+        pts = np.zeros((nq, 4), dtype=np.float32)
+        pts[:, :3] = q
+        self.toGPU_(self.fdbm_pts_cl, pts)
+        self.prg.getFEinPoints(self.queue, (nq,), (1,), self.img_FF_fdbm, self.fdbm_pts_cl, self.fdbm_fes_cl, self.fdbm_dinvA, self.fdbm_dinvB, self.fdbm_dinvC)
+        self.queue.finish()
+        out = np.zeros((nq, 4), dtype=np.float32)
+        self.fromGPU_(self.fdbm_fes_cl, out)
+        return out[:, 3].copy(), out[:, :3].copy()
+
     def compute_dispersion_to_img_cl(self, atomPos, atomTypes, origin, step, ngrid, C6_atom_dict=None, C6_CO=30.0, RA=1.5):
         """Dispersion → image3d on GPU (no host download). New helper for fast S3."""
         if C6_atom_dict is None:
@@ -1180,6 +1208,67 @@ class AFMulator(OpenCLBase):
         print(f"AFMulator.fit_contact_surface: done RMSE={rmse:.4e}")
         return sep
 
+    def fit_contact_field(self, sep, xyz, E_ref, F_ref=None, *, n_iter=200, tol=1e-5, force_weight=1.0, force_equalize=True, sample_weights=None, bPrint=True):
+        """Fit separable contact field from explicit (E,F) samples (no atom arrays, no use_morse).
+
+        Caller supplies sep (explicit h0_map) and sampled reference field; delegates to
+        ContactSurfaceCL.fit_separable_cg. Stores sep.fit_rmse / sep.fit_bounds only.
+        """
+        xyz = np.asarray(xyz, dtype=np.float32)
+        if xyz.ndim != 2 or xyz.shape[1] != 3 or xyz.shape[0] == 0 or not np.isfinite(xyz).all():
+            raise ValueError(f'xyz must be non-empty finite (N,3), got {xyz.shape}')
+        ns = xyz.shape[0]
+        E_ref = np.asarray(E_ref, dtype=np.float32)
+        if E_ref.shape != (ns,) or not np.isfinite(E_ref).all():
+            raise ValueError(f'E_ref must be finite (N,) matching xyz ({ns},), got {E_ref.shape}')
+        if F_ref is not None:
+            F_ref = np.asarray(F_ref, dtype=np.float32)
+            if F_ref.shape != xyz.shape or not np.isfinite(F_ref).all():
+                raise ValueError(f'F_ref must be finite (N,3) matching xyz, got {F_ref.shape}')
+        force_weight = float(force_weight)
+        tol = float(tol)
+        if not np.isfinite(force_weight) or force_weight < 0.0:
+            raise ValueError(f'force_weight must be finite >= 0, got {force_weight}')
+        if not np.isfinite(tol) or tol <= 0.0:
+            raise ValueError(f'tol must be finite > 0, got {tol}')
+        if not isinstance(n_iter, (int, np.integer)) or n_iter <= 0:
+            raise ValueError(f'n_iter must be a positive integer, got {n_iter!r}')
+        if force_weight > 0.0 and F_ref is None:
+            raise ValueError('F_ref required when force_weight > 0')
+        if sample_weights is not None:
+            sample_weights = np.asarray(sample_weights, dtype=np.float32)
+            if sample_weights.shape != (ns,) or not np.isfinite(sample_weights).all() or np.any(sample_weights < 0.0) or float(sample_weights.sum()) <= 0.0:
+                raise ValueError('sample_weights must be finite non-negative (N,) with positive sum')
+        for name in ('x0', 'y0', 'dx', 'dy', 'poly_R', 'poly_z0'):
+            if not np.isfinite(getattr(sep, name)):
+                raise ValueError(f'sep.{name}={getattr(sep, name)} not finite')
+        if not (sep.dx > 0.0 and sep.dy > 0.0 and sep.poly_R > 0.0):
+            raise ValueError(f'sep requires positive dx/dy/poly_R, got {sep.dx}/{sep.dy}/{sep.poly_R}')
+        if sep.ncx <= 0 or sep.ncy <= 0 or not 1 <= sep.nz <= 8 or sep.m_start <= 0:
+            raise ValueError(f'sep requires ncx/ncy>0, 1<=nz<=8 (kernel phi[8]), m_start>0, got {sep.ncx}/{sep.ncy}/{sep.nz}/{sep.m_start}')
+        if sep.h0_map is None or len(sep.h0_map) != sep.ncx * sep.ncy or not np.isfinite(sep.h0_map).all():
+            raise ValueError('sep.h0_map must be finite with ncx*ncy entries')
+        fit_bounds = np.array([xyz.min(axis=0), xyz.max(axis=0)], dtype=np.float64)
+        if force_weight > 0.0:
+            align_f = max(1, self._cs_fit_helper().ctx.devices[0].get_info(cl.device_info.MEM_BASE_ADDR_ALIGN) // 8 // 4)
+            npad = (-ns) % align_f
+            if npad:
+                xyz = np.vstack([xyz, np.repeat(xyz[:1], npad, axis=0)])
+                E_ref = np.concatenate([E_ref, np.zeros(npad, dtype=np.float32)])
+                F_ref = np.vstack([F_ref, np.zeros((npad, 3), dtype=np.float32)])
+                w = np.ones(ns, dtype=np.float32) if sample_weights is None else sample_weights
+                sample_weights = np.concatenate([w, np.zeros(npad, dtype=np.float32)])
+        rmse = self._cs_fit_helper().fit_separable_cg(sep, xyz, E_ref, F_ref=F_ref if force_weight > 0.0 else None, apos=None, n_iter=n_iter, tol=tol, sample_weights=sample_weights, force_weight=force_weight, force_equalize=force_equalize, bPrint=bPrint)
+        if not np.isfinite(rmse) or not np.isfinite(sep.coeffs).all():
+            raise RuntimeError(f'fit_separable_cg returned non-finite result (rmse={rmse})')
+        sep.fit_rmse = float(rmse)
+        sep.fit_bounds = fit_bounds
+        self.sep = sep
+        self.setup_contact_surface(sep)
+        if bPrint:
+            print(f"AFMulator.fit_contact_field: done RMSE={rmse:.4e} bounds={sep.fit_bounds.tolist()}")
+        return sep
+
     def fit_pic_contact_surface(self, margin=2.0, poly_R=10.0, m_start=4, nz=4, cell_size=10.0, z_local=1.2, xy_radius=14.0, fit_z_stack=None, fit_z_adaptive=None, fit_dx=None, fit_dy=None, fit_dz=0.15, fit_boltzmann=True, fit_boltzmann_T=None, n_iter=80, reg=1e-2, brute_ref='afm', pic=None, bPrint=True):
         """Fit radial PIC field on selected contact atoms; replaces img_FF via run_scan_pic."""
         assert self.use_morse, "fit_pic_contact_surface requires use_morse=True"
@@ -1306,29 +1395,30 @@ class AFMulator(OpenCLBase):
             scan_p0, scan_da, scan_db = self._scan_grid_auto(nxy)
         print(f"AFMulator.run_scan_contact: nxy={nxy} nz={nz} dtip={dtip}")
         print(f"  scan_p0={scan_p0}  da={scan_da}  db={scan_db}")
-        pts = np.zeros((n_scan, 4), dtype=np.float32)
-        k = 0
-        for ix in range(nx_s):
-            for iy in range(ny_s):
-                pts[k, :3] = scan_p0 + scan_da * ix + scan_db * iy
-                k += 1
-        FEs_bytes = n_scan * nz * 4 * 4
+        IX, IY = np.meshgrid(np.arange(nx_s), np.arange(ny_s), indexing='ij')
+        LS = 128                                                     # ls=1 serializes into 1-thread workgroups (~34x slower)
+        n_pad = self._roundup(n_scan, LS)                            # kernel has no bounds guard: pad to LS multiple, tail items redo point 0
+        pts = np.zeros((n_pad, 4), dtype=np.float32)
+        pts[:n_scan, :3] = scan_p0[:3] + IX.reshape(-1, 1) * np.float32(scan_da[:3]) + IY.reshape(-1, 1) * np.float32(scan_db[:3])
+        pts[n_scan:, :3] = pts[0, :3]
+        FEs_bytes = n_pad * nz * 4 * 4
         if FEs_bytes > self._max_alloc:
             raise MemoryError(f"run_scan_contact: FEs buffer needs {FEs_bytes} bytes ({_bytes_to_gb(FEs_bytes):.3f} GB) > device max_alloc {_bytes_to_gb(self._max_alloc):.3f} GB")
         if bAlloc:
-            self.realloc_scan_buffers(n_scan, nz)
+            self.realloc_scan_buffers(n_pad, nz)
         self.toGPU_(self.scan_pts_cl, pts)
-        FEs_h = np.zeros((n_scan * nz, 4), dtype=np.float32)
+        FEs_h = np.zeros((n_pad * nz, 4), dtype=np.float32)
         tipC = self.tipC.copy(); tipC[3] = np.float32(dtip)
-        gs = (self._roundup(n_scan, 1),)
-        ls = (1,)
+        gs = (n_pad,)
+        ls = (LS,)
         self.prg.relaxStrokesTiltedContact(self.queue, gs, ls, self.cs_coeffs_cl, self.cs_h0_cl, self.cs_meta, self.cs_origin_step, self.cs_dy_rc, self.cs_invRc_mstart, self.scan_pts_cl, self.scan_FEs_cl, self.tipA, self.tipB, tipC, self.stiffness, self.dpos0, self.relax_pars, self.surfFF, np.int32(nz))
         self.queue.finish()
         self.fromGPU_(self.scan_FEs_cl, FEs_h)
+        FEs_h = FEs_h[: n_scan * nz]                                  # drop padding results
         self.queue.finish()
         FEs = FEs_h.reshape(nx_s, ny_s, nz, 4)
         print(f"AFMulator.run_scan_contact: done FEs.shape={FEs.shape}")
-        return FEs, pts[:, :3].reshape(nx_s, ny_s, 3)
+        return FEs, pts[:n_scan, :3].reshape(nx_s, ny_s, 3)
 
     def get_raw_FE_contact(self, nxy=(60, 60), nz=21, dtip=-0.2, scan_p0=None, scan_da=None, scan_db=None, bAlloc=True):
         """Sample contact surface WITHOUT PP relaxation (getFEinStrokesTiltedContact)."""
@@ -1338,23 +1428,25 @@ class AFMulator(OpenCLBase):
         if scan_p0 is None:
             scan_p0, scan_da, scan_db = self._scan_grid_auto(nxy)
         print(f"AFMulator.get_raw_FE_contact: nxy={nxy} nz={nz} dtip={dtip}")
-        pts = np.zeros((n_scan, 4), dtype=np.float32)
-        k = 0
-        for ix in range(nx_s):
-            for iy in range(ny_s):
-                pts[k, :3] = scan_p0 + scan_da * ix + scan_db * iy
-                k += 1
+        IX, IY = np.meshgrid(np.arange(nx_s), np.arange(ny_s), indexing='ij')
+        LS = 128                                                     # ls=1 serializes into 1-thread workgroups; kernel has no bounds guard -> pad
+        n_pad = self._roundup(n_scan, LS)
+        pts = np.zeros((n_pad, 4), dtype=np.float32)
+        pts[:n_scan, :3] = scan_p0[:3] + IX.reshape(-1, 1) * np.float32(scan_da[:3]) + IY.reshape(-1, 1) * np.float32(scan_db[:3])
+        pts[n_scan:, :3] = pts[0, :3]
         if bAlloc:
-            self.realloc_scan_buffers(n_scan, nz)
+            self.realloc_scan_buffers(n_pad, nz)
         self.toGPU_(self.scan_pts_cl, pts)
-        FEs_h = np.zeros((n_scan * nz, 4), dtype=np.float32)
+        FEs_h = np.zeros((n_pad * nz, 4), dtype=np.float32)
         dTip = np.array([0., 0., dtip, 0.], dtype=np.float32)
-        gs = (self._roundup(n_scan, 1),)
-        ls = (1,)
+        gs = (n_pad,)
+        ls = (LS,)
         self.prg.getFEinStrokesTiltedContact(self.queue, gs, ls, self.cs_coeffs_cl, self.cs_h0_cl, self.cs_meta, self.cs_origin_step, self.cs_dy_rc, self.cs_invRc_mstart, self.scan_pts_cl, self.scan_FEs_cl, self.tipA, self.tipB, self.tipC, dTip, self.dpos0, np.int32(nz))
         self.queue.finish()
         self.fromGPU_(self.scan_FEs_cl, FEs_h)
+        FEs_h = FEs_h[: n_scan * nz]
         FEs = FEs_h.reshape(nx_s, ny_s, nz, 4)
+        pts = pts[:n_scan]
         print(f"AFMulator.get_raw_FE_contact: done FEs.shape={FEs.shape}")
         return FEs, pts[:, :3].reshape(nx_s, ny_s, 3)
 
@@ -1367,27 +1459,75 @@ class AFMulator(OpenCLBase):
             scan_p0, scan_da, scan_db = self._scan_grid_auto(nxy)
         print(f"AFMulator.run_scan_pic: nxy={nxy} nz={nz} dtip={dtip} PIC nat={self.pic.nat}")
         print(f"  scan_p0={scan_p0}  da={scan_da}  db={scan_db}")
-        pts = np.zeros((n_scan, 4), dtype=np.float32)
-        k = 0
-        for ix in range(nx_s):
-            for iy in range(ny_s):
-                pts[k, :3] = scan_p0 + scan_da * ix + scan_db * iy
-                k += 1
-        FEs_bytes = n_scan * nz * 4 * 4
+        IX, IY = np.meshgrid(np.arange(nx_s), np.arange(ny_s), indexing='ij')
+        LS = 128                                                     # ls=1 serializes into 1-thread workgroups; kernel has no bounds guard -> pad
+        n_pad = self._roundup(n_scan, LS)
+        pts = np.zeros((n_pad, 4), dtype=np.float32)
+        pts[:n_scan, :3] = scan_p0[:3] + IX.reshape(-1, 1) * np.float32(scan_da[:3]) + IY.reshape(-1, 1) * np.float32(scan_db[:3])
+        pts[n_scan:, :3] = pts[0, :3]
+        FEs_bytes = n_pad * nz * 4 * 4
         if FEs_bytes > self._max_alloc:
             raise MemoryError(f"run_scan_pic: FEs buffer needs {FEs_bytes} bytes")
         if bAlloc:
-            self.realloc_scan_buffers(n_scan, nz)
+            self.realloc_scan_buffers(n_pad, nz)
         self.toGPU_(self.scan_pts_cl, pts)
-        FEs_h = np.zeros((n_scan * nz, 4), dtype=np.float32)
+        FEs_h = np.zeros((n_pad * nz, 4), dtype=np.float32)
         tipC = self.tipC.copy(); tipC[3] = np.float32(dtip)
-        gs = (self._roundup(n_scan, 1),)
-        self.prg.relaxStrokesTiltedPIC(self.queue, gs, (1,), self.cs_pic_atoms_cl, self.cs_pic_coeffs_cl, self.cs_pic_buckets_cl, self.cs_pic_offsets_cl, self.cs_pic_meta, self.cs_pic_bmeta, np.float32(self.pic.m_start), self.scan_pts_cl, self.scan_FEs_cl, self.tipA, self.tipB, tipC, self.stiffness, self.dpos0, self.relax_pars, self.surfFF, np.int32(nz))
+        gs = (n_pad,)
+        self.prg.relaxStrokesTiltedPIC(self.queue, gs, (LS,), self.cs_pic_atoms_cl, self.cs_pic_coeffs_cl, self.cs_pic_buckets_cl, self.cs_pic_offsets_cl, self.cs_pic_meta, self.cs_pic_bmeta, np.float32(self.pic.m_start), self.scan_pts_cl, self.scan_FEs_cl, self.tipA, self.tipB, tipC, self.stiffness, self.dpos0, self.relax_pars, self.surfFF, np.int32(nz))
         self.queue.finish()
         self.fromGPU_(self.scan_FEs_cl, FEs_h)
+        FEs_h = FEs_h[: n_scan * nz]
         FEs = FEs_h.reshape(nx_s, ny_s, nz, 4)
+        pts = pts[:n_scan]
         print(f"AFMulator.run_scan_pic: done FEs.shape={FEs.shape}")
         return FEs, pts[:, :3].reshape(nx_s, ny_s, 3)
+
+    def set_tip_asymmetry(self, dx=0.0, dy=0.0):
+        """Asymmetric tip apex (bent CO): shift the lateral-spring rest point
+        dpos0.xy by (dx,dy) [Å]. The radial spring still confines the PP to the
+        sphere |dpos|≈dpos0.w, but the harmonic minimum is displaced — the PP
+        bends preferentially toward (+dx,+dy), producing the one-sided
+        bright/dark df contrast seen with real asymmetric tips. Cantilever axis
+        and stroke stay vertical (unlike set_tip_tilt). 0,0 restores symmetry."""
+        d = self.dpos0.copy(); d[0], d[1] = np.float32(dx), np.float32(dy)
+        self.dpos0 = d
+
+    def set_tip_tilt(self, theta_deg=0.0, phi_deg=0.0):
+        """Tilt the cantilever/probe axis by theta from +z toward azimuth phi [deg].
+        tipA/B/C are the tip-frame rotation rows used by all relaxStrokesTilted*
+        kernels; tipC.xyz is also the stroke direction, so the approach axis and
+        the PP equilibrium offset tilt together — the physical tilted-cantilever
+        scan (asymmetric / 'embossed' df contrast). theta=0 restores default."""
+        th, ph = np.deg2rad(theta_deg), np.deg2rad(phi_deg)
+        tz = np.array([np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)])
+        tx = np.array([-np.sin(ph), np.cos(ph), 0.0])
+        ty = np.cross(tz, tx)          # orthonormal right-handed frame (tx×ty=tz)
+        self.tipA = np.append(tx, 0.0).astype(np.float32)
+        self.tipB = np.append(ty, 0.0).astype(np.float32)
+        self.tipC = np.append(tz, self.tipC[3]).astype(np.float32)
+        return tz
+
+    def compute_df_amp_z_gpu(self, n_scan, nz, dz, amp=1.0):
+        """z-oscillation finite-amplitude df on GPU from the LAST scan's FEs buffer
+        (scan_FEs_cl must still hold (n_scan*nz) float4). Runs dfAmpZ kernel —
+        same math as compute_df_amp_z (Gauss-Chebyshev lerp + central diff).
+
+        Scan buffers are in kernel order (iz=0 = highest tip z, descending), so the
+        raw kernel output is +dFz/dz_phys = -df. We negate AND flip the z axis so the
+        return is physical df = -dFz/dz in ascending-z order (iz=0 = lowest h_scan),
+        matching shared_postprocess/compute_df_amp_z on ascending-z FEs."""
+        assert self.scan_FEs_cl is not None, "run a scan first (scan_FEs_cl is empty)"
+        n_out = int(n_scan) * int(nz)
+        if getattr(self, 'scan_df_cl', None) is None or getattr(self, '_scan_df_n', 0) != n_out:
+            self.scan_df_cl = cl.Buffer(self.ctx, cl.mem_flags.WRITE_ONLY, n_out * 4)
+            self._scan_df_n = n_out
+        self.prg.dfAmpZ(self.queue, (n_out,), None, self.scan_FEs_cl, self.scan_df_cl,
+                        np.int32(nz), np.float32(abs(dz)), np.float32(amp))
+        df = np.empty(n_out, dtype=np.float32)
+        self.fromGPU_(self.scan_df_cl, df)
+        self.queue.finish()
+        return (-df.reshape(int(n_scan), int(nz))[:, ::-1]).ravel()
 
     # ═══════════════════════════════════════════════════════════════════════════
     # contact_pme backend — Wave 2 host/API (doc/Tasks/ContactSurface_PME_ParallelPlan.md)
@@ -1618,6 +1758,37 @@ class AFMulator(OpenCLBase):
         return CoarseMesh(coeffs=coeffs, origin=origin, h=h, halo=halo,
                           query_interior=(interior_lo, interior_hi))
 
+    def pme_set_field(self, V_fn):
+        """Superimpose an external slowly-varying potential into the contact-PME
+        coarse mesh (e.g. electrostatic background / substrate charge patches).
+
+        V_fn(X, Y, Z) -> V [eV] is evaluated on the mesh nodes, converted to
+        B-spline control coefficients by the same separable prefilter used at
+        build time, and ADDED to the pristine mesh (pristine coeffs are cached
+        on first call, so repeated calls replace — not accumulate — the field;
+        V_fn=None restores the pristine mesh). The force contribution enters
+        automatically through the analytic tricubic gradient inside
+        cs_eval_contact_pme_at/_local_at — i.e. the field acts on the PP during
+        relaxation AND appears in the stored relaxed FEs. Mesh spacing is
+        h_mesh (default 1.0 Å) tricubic — smooth terms with σ ≳ 2–3 Å are
+        well resolved. Note: the mesh domain only covers query_bounds + halo,
+        so fields must be significant only inside the scan region."""
+        from spammm.surfaces.CoarseMesh import _prefilter_3d
+        cpm = self.cpm
+        assert cpm is not None, "fit_contact_pme first"
+        if getattr(self, '_cpm_coeffs0', None) is None:
+            self._cpm_coeffs0 = cpm.mesh_coeffs.copy()
+        cpm.mesh_coeffs = self._cpm_coeffs0.copy()
+        if V_fn is not None:
+            nx, ny, nz = cpm.mesh_coeffs.shape
+            xs = cpm.mesh_origin[0] + np.arange(nx) * cpm.mesh_h
+            ys = cpm.mesh_origin[1] + np.arange(ny) * cpm.mesh_h
+            zs = cpm.mesh_origin[2] + np.arange(nz) * cpm.mesh_h
+            X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
+            cpm.mesh_coeffs += _prefilter_3d(V_fn(X, Y, Z).astype(np.float64))
+        self._cpm_upload_id = None          # force re-upload on next scan/eval
+        return cpm
+
     def _pme_eval_python(self, params, queries):
         """Python fallback evaluator: eval_mesh + eval_core (CPU, float64).
 
@@ -1836,8 +2007,8 @@ class AFMulator(OpenCLBase):
                            f"worst={worst} code={code} ({'|'.join(flags)}) coord={coord}{extra}")
 
     def run_scan_contact_pme(self, nxy=(50, 50), nz=60, dtip=-0.1, scan_p0=None,
-                             scan_da=None, scan_db=None, bAlloc=True, use_gpu=None,
-                             core_backend='auto', workgroup_size=None):
+                             scan_da=None, scan_db=None, scan_pts=None, bAlloc=True,
+                             use_gpu=None, core_backend='auto', workgroup_size=None):
         """PP-AFM scan using the contact_pme backend.
 
         Same scan geometry and outputs as run_scan_contact(), but the field
@@ -1850,6 +2021,10 @@ class AFMulator(OpenCLBase):
             nz: number of z steps
             dtip: z step per stroke [Å] (negative = approaching)
             scan_p0, scan_da, scan_db: scan geometry (auto if None)
+            scan_pts: optional explicit stroke-start points (n_scan,>=3) or
+                (nx_s,ny_s,>=3); skips p0/da/db construction — enables warped
+                tip-height surfaces via per-column z offsets (e.g. tilted or
+                curved scan plane, no refit of the fitted field)
             bAlloc: allocate scan buffers
             use_gpu: force GPU/Python; default auto-detect
             core_backend: 'auto'|'local'|'bucket'
@@ -1868,7 +2043,14 @@ class AFMulator(OpenCLBase):
             print(f"AFMulator.run_scan_contact_pme: nxy={nxy} nz={nz} dtip={dtip} use_gpu={use_gpu} "
                   f"core_backend={core_backend}")
             print(f"  scan_p0={scan_p0}  da={scan_da}  db={scan_db}")
-        pts = build_scan_xy_points_vectorized(scan_p0, scan_da, scan_db, nx_s, ny_s)
+        if scan_pts is None:
+            pts = build_scan_xy_points_vectorized(scan_p0, scan_da, scan_db, nx_s, ny_s)
+        else:
+            pts = np.asarray(scan_pts, dtype=np.float32).reshape(-1, np.asarray(scan_pts).shape[-1])
+            assert pts.shape[0] == n_scan, f'scan_pts has {pts.shape[0]} rows, expected n_scan={n_scan}'
+            if pts.shape[1] < 4:
+                pts = np.concatenate([pts[:, :3], np.zeros((pts.shape[0], 4 - pts.shape[1]), np.float32)], axis=1)
+            pts = np.ascontiguousarray(pts[:, :4])
         FEs_bytes = n_scan * nz * 4 * 4
         if FEs_bytes > self._max_alloc:
             raise MemoryError(f"run_scan_contact_pme: FEs buffer needs {FEs_bytes} bytes "
@@ -3049,6 +3231,37 @@ def compute_df(Fz, dz):
     """df = -dFz/dz  (frequency-shift proxy).  Fz shape (nx,ny,nz)."""
     return -np.gradient(Fz, abs(dz), axis=2)
 
+def _lerp_axis_clamped(F, izq, axis):
+    """Sample array along `axis` at fractional indices (1-D lerp, 'nearest' clamp).
+    izq: (n,) float positions; F sampled at those positions along `axis`."""
+    F = np.asarray(F, dtype=np.float64)
+    n = F.shape[axis]
+    izc = np.clip(np.asarray(izq, dtype=np.float64), 0.0, n - 1.0)
+    i0 = np.floor(izc).astype(int)
+    i1 = np.clip(i0 + 1, 0, n - 1)
+    tt = izc - i0
+    return F.take(i0, axis=axis) * (1 - tt) + F.take(i1, axis=axis) * tt
+
+
+def compute_df_amp_z(Fz, dz, amp=1.0):
+    """Fast z-only finite-amplitude df — same math as compute_df_amp_dir with
+    osc_dir=(0,0,1): per quadrature node, sample F̃(z+uk·amp) by lerp, then
+    np.gradient along z. Vectorized equivalent of the map_coordinates version
+    (bitwise-identical), ~10x faster."""
+    Fz = np.asarray(Fz, dtype=np.float64)
+    nz = Fz.shape[2]
+    dz_abs = abs(float(dz))
+    n_quad = 9
+    k = np.arange(n_quad)
+    u_k = np.cos((2 * k + 1) / (2 * n_quad) * np.pi)
+    iz_grid = np.arange(nz)
+    df = np.zeros_like(Fz)
+    for uk in u_k:
+        Fsh = _lerp_axis_clamped(Fz, iz_grid + uk * amp / dz_abs, axis=2)
+        df -= np.gradient(Fsh, dz_abs, axis=2) / n_quad
+    return df.astype(np.float32)
+
+
 def compute_df_amp(Fz, dz, amp=1.0):
     """Frequency shift with finite oscillation amplitude (weighted average of dFz/dz).
 
@@ -3064,29 +3277,8 @@ def compute_df_amp(Fz, dz, amp=1.0):
       - df contrast is dominated by the closest approach point (h_Fz)
       - So df and Fz at the same column h_Fz show consistent contrast features
     """
-    from scipy.ndimage import map_coordinates
-    nz = Fz.shape[2]
-    dz_abs = abs(dz)
-    # 9-point Gauss-Chebyshev quadrature nodes: u_k = cos((2k+1)/(2n)*π)
-    n_quad = 9
-    k = np.arange(n_quad)
-    u_k = np.cos((2*k + 1) / (2*n_quad) * np.pi)  # nodes in [-1, 1]
-    w_k = np.full(n_quad, 1.0 / n_quad)            # equal weights for Chebyshev
-    # z indices for each quadrature point: iz + u_k * amp / dz
-    iz_grid = np.arange(nz, dtype=np.float64)
-    df = np.zeros_like(Fz, dtype=np.float64)
-    nx, ny = Fz.shape[0], Fz.shape[1]
-    for uk, wk in zip(u_k, w_k):
-        iz_shift = uk * amp / dz_abs
-        iz_query = iz_grid[None, None, :] + iz_shift  # (1, 1, nz)
-        # Use map_coordinates for each (ix, iy) — vectorize via broadcasting
-        coords = np.array([np.broadcast_to(np.arange(nx)[:, None, None], (nx, ny, nz)),
-                           np.broadcast_to(np.arange(ny)[None, :, None], (nx, ny, nz)),
-                           np.broadcast_to(iz_query, (nx, ny, nz))])
-        Fz_shifted = map_coordinates(Fz.astype(np.float64), coords, order=1, mode='nearest')
-        df_z = np.gradient(Fz_shifted, dz_abs, axis=2)
-        df -= wk * df_z
-    return df.astype(np.float32)
+    # z-only shifted sampling = lerp between slices; identical math, ~10x faster
+    return compute_df_amp_z(Fz, dz, amp=amp)
 
 def _df_direction_spacing(spacing, osc_dir):
     """Normalize df direction and xyz grid spacing; fail loud on degenerate input."""
@@ -3222,6 +3414,9 @@ def compute_df_amp_dir(FEs, spacing, osc_dir=(0., 0., 1.), amp=1.0):
     for ia in active:
         if F_n.shape[ia] < 2:
             raise ValueError(f"FEs axis {ia} needs at least 2 samples for osc_dir={tuple(n)}")
+    if len(active) == 1 and active[0] == 2:
+        # pure-z oscillation: shifted samples are lerps between z slices — vectorized
+        return compute_df_amp_z(F_n, dr[2], amp=float(amp))
     n_quad = 9
     k = np.arange(n_quad)
     u_k = np.cos((2*k + 1) / (2*n_quad) * np.pi)

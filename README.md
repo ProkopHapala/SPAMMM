@@ -13,6 +13,7 @@ The platform combines fast local-orbital DFT(B) methods with classical grid-proj
 SPAMMM streamlines the full simulation pipeline for molecules on surfaces:
 
 - **Molecular structure design** — Draw or load molecules in 2D/3D; perform interactive topology editing (hexagonal rings, bond creation/deletion, atom passivation, pi/n-pi toggling) inside the GUI.
+- **Experimental AFM image to molecule** — Angular ring filters and a shared-corner planar PAH skeleton diagnostic; see [`doc/Tasks/Img2Mol.md`](doc/Tasks/Img2Mol.md) for results and remaining failures.
 - **Geometry relaxation** — Relax structures with fast GPU-accelerated force fields (UFF, SPFFsp3) or with DFTB, using FIRE or velocity-Verlet MD.
 - **Surface docking and assembly** — Drag and place molecules on substrates, build assemblies, and run rigid-body or flexible docking using GridFF, Ewald2D, and folded-atomic-function models. **PairFF** adds GPU rigid-body molecule–molecule docking with directional H-bonds (epairs / σ-holes), interactive FIRE, click-to-select active body, and optional **FAF** substrate with a combined PairFF+FAF potential map — see [`demos/PairFF_manual.md`](demos/PairFF_manual.md).
 - **AFM simulation** — Generate AFM images using either a simple LJ/Morse + point-charge probe-particle model, or the full-density-based model (FDBM). For FDBM, electron density is projected onto a grid, Pauli and Hartree potentials are computed, and van der Waals contributions are added to build the total probe-sample interaction potential.

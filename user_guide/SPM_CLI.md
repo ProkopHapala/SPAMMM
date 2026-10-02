@@ -222,17 +222,51 @@ python run_spm.py afm-morse --xyz data/xyz/benzene.xyz --lj
 Same ScanSpec / height SSOT / `plot_afm_variant_height_strip` as Morse and contact 2.5D.
 Fits coarse mesh + compact PIC cores (`split_mode=paw` default), then PP-AFM scan.
 
+**Why use it:** the molecule field is stored as a coarse tricubic B-spline
+mesh (h≈1 Å) + per-atom compact core modes — **~80 KB/molecule vs ~112 MB
+for the dense `float4` GridFF image at the same scan volume (~1360× less
+memory, ~4 B/Å³ vs 16 kB/Å³)** — with df parity vs the GridFF reference
+path at NCC ≈ 0.999 (measured on the 100-flake PAH set, RTX 3090). Fit+scan
+is ~0.2 s/molecule. The fit is also **reusable**: a saved `ContactPMEParams`
+can be re-scanned at new heights/amp/stiffness without refitting (see
+`doc/export_invAFM/scripts/testplot_pah_afm_db.py`).
+
 ```bash
+# minimal — df/Fz height strip for an xyz, NVIDIA GPU auto-selected
 python run_spm.py afm --model contact_pme --xyz data/xyz/pyridine.xyz --show-atoms
-python run_spm.py afm --model contact_pme --xyz data/xyz/PTCDA.xyz --pme-q-tip -0.1 --show-atoms
+
+# sharper sub-molecular contrast (samples the repulsive wall): go lower
+python run_spm.py afm --model contact_pme --xyz data/xyz/PTCDA.xyz \
+    --h-min 2.8 --h-max 4.4 --amp 1.0 --K-LAT 0.5 --show-atoms
+
+# radial tip charge (charged-tip electrostatics on the long-range part)
+python run_spm.py afm --model contact_pme --xyz data/xyz/PTCDA.xyz --pme-q-tip -0.1
+
+# one of the generated PAH flakes
+python run_spm.py afm --model contact_pme --xyz debug/mol_flakes/rand8p1_s102r.xyz \
+    --h-min 2.8 --h-max 4.4 --show-atoms
 ```
 
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--pme-split` | `paw` | Long/short split (`paw`/`hermite`/`plateau`/`rho`/`softcore`) |
-| `--pme-q-tip` | `0` | Radial tip charge (multi-site `tipQs` forced off) |
+| `--pme-q-tip` | `0` | Radial tip charge (multi-site `tipQs` forced off — PME is radial only) |
 | `--pme-h-mesh` | `1.0` | Coarse mesh spacing [Å] |
-| heights / margin | same as `afm` | `--h-min 3.7`…`--h-max 4.7`, `--scan-margin`, `--margin` |
+| `--pme-halo` | `6` | Mesh halo nodes per side |
+| `--pme-r-cut` | `6.0` | Legacy rho outer cutoff [Å] |
+| `--pme-z-lo` / `--pme-z-hi` | `3.0` / `8.0` | Query envelope above zmax [Å] — must cover the **whole relaxed PP trajectory**, not just the scan plane: apex starts at `h_max+amp+bond_length` (≈8.4 Å at defaults) and strong repulsion/substrate wells can push the PP outside. Enlarge if you hit `stencil_out_of_bounds` postflight errors (see `doc/Caveats.md` §19). |
+| heights / margin | same as `afm` | `--h-min`…`--h-max`/`--h-step`, `--amp`, `--K-LAT`, `--K-RAD`, `--bond-length`, `--scan-margin`, `--margin` |
+
+**Outputs** (to `--outdir`, default `debug/spm_afm`): `compare_<scale>.png`
+df/Fz height strip, `params.txt`, and the usual `plots` products
+(`--plots compare,stage,df,fz,ediss`). The strip title reports the PME
+resident memory (`resident=…KB`).
+
+**Batch use:** `doc/export_invAFM/scripts/testplot_pah_afm_db.py` is the batch driver — per
+molecule `fit_contact_pme` + `run_scan_contact_pme`, pickles
+`ContactPMEParams` + df/Fz stacks to `debug/pah_afm_db/pah_db.pkl`, runs the
+GridFF reference in-GPU for parity (never saved), and has `--sweep` /
+`--field` / `--substrate` / `--qeq` experiment modes.
 
 ### `afm-kriging` — DFT GridFF → probe-particle AFM
 

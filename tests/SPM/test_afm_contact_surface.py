@@ -1925,3 +1925,204 @@ def test_contact_pme_afm_cli_ssot(xyz, visual_output_dir, make_review):
                  'CLI height SSOT 3.7–4.7 / amp-align Fz',
                  'plot_afm_variant_height_strip for overview strip')
     rv.finish()
+
+
+def _npz_sep(nz=4):
+    from spammm.surfaces.ContactSurface import SeparableParams
+    sep = SeparableParams(-1.0, 2.0, 0.7, 0.9, 5, 6, poly_R=10.0, poly_z0=0.0, m_start=4, nz=nz, h0_map=np.zeros(30, dtype=np.float32))
+    sep.coeffs = np.arange(sep.n_coeff, dtype=np.float64) * 0.001
+    return sep
+
+
+def test_separable_npz_roundtrip(tmp_path):
+    """CPU: SeparableParams.save_npz/load_npz roundtrip, resident_bytes, no sample arrays."""
+    from spammm.surfaces.ContactSurface import SeparableParams
+    sep = _npz_sep()
+    sep.fit_bounds = np.array([[-1.0, 2.0, 2.2], [1.8, 6.5, 6.8]])
+    sep.fit_rmse = 1.5e-3
+    sep.fit_pts_z = np.linspace(2.0, 6.0, 9)
+    p = tmp_path / 'sep.npz'
+    sep.save_npz(p, metadata={'source': 'FDBM', 'tip': 'CO'})
+    ld = SeparableParams.load_npz(p)
+    assert (ld.x0, ld.y0, ld.dx, ld.dy) == (-1.0, 2.0, 0.7, 0.9)
+    assert (ld.ncx, ld.ncy, ld.nz, ld.m_start) == (5, 6, 4, 4)
+    assert ld.poly_R == 10.0 and ld.poly_z0 == 0.0
+    np.testing.assert_array_equal(np.asarray(ld.coeffs, dtype=np.float32), sep.coeffs.astype(np.float32))
+    np.testing.assert_array_equal(ld.h0_map, np.zeros(30, dtype=np.float32))
+    np.testing.assert_array_equal(ld.fit_bounds, sep.fit_bounds)
+    assert ld.fit_rmse == pytest.approx(1.5e-3)
+    assert ld.metadata == {'source': 'FDBM', 'tip': 'CO'}
+    assert ld.resident_bytes == 4 * (sep.n_coeff + 5 * 6)
+    q = tmp_path / 'prov.npz'
+    ld.save_npz(q)
+    assert SeparableParams.load_npz(q).metadata == {'source': 'FDBM', 'tip': 'CO'}
+    with np.load(p, allow_pickle=False) as z:
+        for k in z.files:
+            assert 'pts' not in k and 'sample' not in k and 'E_ref' not in k and 'F_ref' not in k, f'npz must not store sample arrays, found {k}'
+    with pytest.raises(FileExistsError):
+        sep.save_npz(p)
+    unf = SeparableParams(-1.0, 2.0, 0.7, 0.9, 5, 6, poly_R=10.0, poly_z0=0.0, m_start=4, nz=4, h0_map=np.zeros(30, dtype=np.float32))
+    with pytest.raises(RuntimeError):
+        unf.save_npz(tmp_path / 'unfitted.npz')
+    with pytest.raises(RuntimeError):
+        _ = unf.resident_bytes
+    np.savez(tmp_path / 'bad.npz', schema_version=np.array(2, dtype=np.int64))
+    with pytest.raises(ValueError):
+        SeparableParams.load_npz(tmp_path / 'bad.npz')
+
+
+def test_separable_npz_rejects_invalid(tmp_path):
+    """CPU: save_npz validates before writing; no archive created for invalid objects."""
+    sep = _npz_sep()
+    sep.x0 = float('nan')
+    p = tmp_path / 'bad_x0.npz'
+    with pytest.raises(ValueError):
+        sep.save_npz(p)
+    assert not p.exists()
+    sep = _npz_sep()
+    sep.fit_bounds = np.array([[0.0, np.nan, 0.0], [1.0, 1.0, 1.0]])
+    p = tmp_path / 'bad_fb.npz'
+    with pytest.raises(ValueError):
+        sep.save_npz(p)
+    assert not p.exists()
+    sep = _npz_sep()
+    sep.coeffs = sep.coeffs[:-1]
+    p = tmp_path / 'bad_nc.npz'
+    with pytest.raises(ValueError):
+        sep.save_npz(p)
+    assert not p.exists()
+    sep = _npz_sep()
+    sep.coeffs[3] = np.nan
+    p = tmp_path / 'bad_c.npz'
+    with pytest.raises(ValueError):
+        sep.save_npz(p)
+    assert not p.exists()
+    sep = _npz_sep(nz=9)
+    p = tmp_path / 'bad_nz.npz'
+    with pytest.raises(ValueError):
+        sep.save_npz(p)
+    assert not p.exists()
+    sep = _npz_sep()
+    p = tmp_path / 'bad_md.npz'
+    with pytest.raises(ValueError):
+        sep.save_npz(p, metadata=['not', 'a', 'dict'])
+    assert not p.exists()
+
+
+def _linear_fdbm_grid(origin=(-2.0, -3.0, 1.0), step=0.2, shape=(12, 14, 16)):
+    """Analytical linear field: E=0.2x-0.3y+0.4z, F=(-0.2,0.3,-0.4) — exact for trilinear interp."""
+    ox, oy, oz = origin
+    nx, ny, nz = shape
+    i, j, k = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing='ij')
+    X = ox + i * step; Y = oy + j * step; Z = oz + k * step
+    F_total = np.zeros((nx, ny, nz, 4), dtype=np.float32)
+    F_total[..., 0] = -0.2
+    F_total[..., 1] = 0.3
+    F_total[..., 2] = -0.4
+    F_total[..., 3] = 0.2 * X - 0.3 * Y + 0.4 * Z
+    return F_total, np.asarray(origin, dtype=np.float64), step, shape
+
+
+@pytest.mark.gpu
+def test_sample_fdbm_linear_field():
+    """sample_fdbm matches analytical linear field: exact at nodes (atol 2e-6); off-node E bound step*sum|dE/dx_i|/256 for 8-bit linear-filter weight quantization; constant F exact everywhere."""
+    from spammm.SPM.AFM import AFMulator
+    afm = AFMulator(use_morse=False, use_fire=False)
+    assert 'nvidia' in afm.ctx.devices[0].name.lower()
+    F_total, origin, step, shape = _linear_fdbm_grid()
+    afm.setup_fdbm_grid(F_total, origin, step)
+    nodes = np.array([[0, 0, 0], [11, 13, 15], [3, 4, 5]], dtype=np.float64)
+    offs = np.array([[0.37, 0.62, 0.11], [5.5, 7.25, 9.9]], dtype=np.float64)
+    q = np.vstack([origin + nodes * step, origin + offs * step])
+    E, F = afm.sample_fdbm(q)
+    E_ref = 0.2 * q[:, 0] - 0.3 * q[:, 1] + 0.4 * q[:, 2]
+    F_ref = np.tile(np.array([-0.2, 0.3, -0.4]), (len(q), 1))
+    np.testing.assert_allclose(E[:3], E_ref[:3], atol=2e-6)
+    e_off = np.abs(E[3:] - E_ref[3:])
+    assert float(e_off.max()) <= step * (abs(0.2) + abs(-0.3) + abs(0.4)) / 256 + 2e-6, f'off-node E err {e_off.max():.3e}'
+    np.testing.assert_allclose(F, F_ref, atol=2e-6)
+    hi = origin + (np.asarray(shape) - 1.0) * step
+    with pytest.raises(ValueError):
+        afm.sample_fdbm([[float(origin[0]) - 0.01, 0.0, 2.0]])
+    with pytest.raises(ValueError):
+        afm.sample_fdbm([[0.0, 0.0, float(hi[2]) + 0.01]])
+    with pytest.raises(ValueError):
+        afm.sample_fdbm([[np.nan, 0.0, 2.0]])
+    with pytest.raises(ValueError):
+        afm.sample_fdbm(np.zeros((4, 4), dtype=np.float32))
+    with pytest.raises(ValueError):
+        afm.sample_fdbm(np.zeros((0, 3), dtype=np.float32))
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_fit_contact_field_2p5d(tmp_path):
+    """fit_contact_field reproduces a representable 2.5D separable field (E and F)."""
+    from spammm.SPM.AFM import AFMulator
+    from spammm.surfaces.ContactSurface import SeparableParams
+    afm = AFMulator(use_morse=False, use_fire=False)
+    assert 'nvidia' in afm.ctx.devices[0].name.lower()
+    cs = afm._cs_fit_helper()
+    ncx, ncy, nz = 9, 9, 2
+
+    def make_sep():
+        return SeparableParams(-3.0, -3.0, 1.0, 1.0, ncx, ncy, poly_R=10.0, poly_z0=0.0, m_start=4, nz=nz, h0_map=np.zeros(ncx * ncy, dtype=np.float32))
+
+    sep_ref = make_sep()
+    ixs, iys = np.meshgrid(np.arange(ncx), np.arange(ncy), indexing='ij')
+    xs, ys = -3.0 + ixs * 1.0, -3.0 + iys * 1.0
+    gauss = 0.8 * np.exp(-(xs ** 2 + ys ** 2) / (2 * 1.5 ** 2))
+    coeffs = np.zeros(sep_ref.n_coeff, dtype=np.float64)
+    coeffs[:ncx * ncy] = gauss.reshape(-1)
+    sep_ref.coeffs = coeffs
+    cs.setup_separable(sep_ref)
+
+    gx = np.arange(-2.0, 2.0 + 1e-9, 0.5)
+    gz = np.arange(2.0, 6.0 + 1e-9, 0.5)
+    X, Y, Z = np.meshgrid(gx, gx, gz, indexing='ij')
+    pts = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+    E_smp, F_smp = cs.eval_separable(pts, sep_ref)
+
+    sep_fit = make_sep()
+    sep_fit = afm.fit_contact_field(sep_fit, pts, E_smp, F_smp, n_iter=200, tol=1e-5, force_weight=1.0)
+    assert np.isfinite(sep_fit.coeffs).all()
+    np.testing.assert_array_equal(sep_fit.fit_bounds, np.array([pts.min(axis=0), pts.max(axis=0)]))
+
+    rng = np.random.default_rng(17)
+    held = np.column_stack([rng.uniform(-1.8, 1.8, 256), rng.uniform(-1.8, 1.8, 256), rng.uniform(2.2, 5.8, 256)])
+    E_true, F_true = cs.eval_separable(held, sep_ref)
+    E_pred, F_pred = cs.eval_separable(held, sep_fit)
+    assert np.isfinite(E_pred).all() and np.isfinite(F_pred).all()
+    rmse_E = float(np.sqrt(np.mean((E_pred - E_true) ** 2)))
+    rmse_F = float(np.sqrt(np.mean((F_pred - F_true) ** 2)))
+    assert rmse_E < 2e-3, f'E RMSE={rmse_E:.3e}'
+    assert rmse_F < 2e-3, f'F RMSE={rmse_F:.3e}'
+
+    p = tmp_path / 'contact_field.npz'
+    sep_fit.save_npz(p, metadata={'source': 'FDBM'})
+    sep_ld = SeparableParams.load_npz(p)
+    cs.setup_separable(sep_ld)
+    E_ld, F_ld = cs.eval_separable(held, sep_ld)
+    np.testing.assert_allclose(E_ld, E_pred, atol=1e-6)
+    np.testing.assert_allclose(F_ld, F_pred, atol=1e-6)
+
+    with pytest.raises(ValueError):
+        afm.fit_contact_field(make_sep(), pts, E_smp[:-1])
+    with pytest.raises(ValueError):
+        afm.fit_contact_field(make_sep(), pts, np.full(len(pts), np.nan))
+    with pytest.raises(ValueError):
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_ref=None, force_weight=1.0)
+    with pytest.raises(ValueError):
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_ref=np.full_like(pts, np.nan), force_weight=1.0)
+    with pytest.raises(ValueError):
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, force_weight=0.0, sample_weights=np.ones(len(pts) - 1))
+    with pytest.raises(ValueError):
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, force_weight=0.0, sample_weights=np.full(len(pts), -1.0))
+    with pytest.raises(ValueError):
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, force_weight=np.nan)
+    with pytest.raises(ValueError):
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, tol=np.nan)
+    with pytest.raises(ValueError):
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, n_iter=0)
+    with pytest.raises(ValueError):
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, force_weight=0.0, sample_weights=np.zeros(len(pts)))

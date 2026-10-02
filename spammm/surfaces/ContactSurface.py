@@ -30,6 +30,7 @@ doc/Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md · pitfalls: doc/Takeway
 
 import os
 import time
+import json
 import numpy as np
 import pyopencl as cl
 from scipy.linalg import solve_banded
@@ -306,6 +307,91 @@ class SeparableParams:
     @property
     def n_coeff(self):
         return self.ncx * self.ncy * self.nz
+
+    @property
+    def resident_bytes(self):
+        """GPU-resident bytes: float32 coeffs + h0_map only (no fit/sample arrays)."""
+        if self.coeffs is None or self.h0_map is None:
+            raise RuntimeError('SeparableParams not fitted (coeffs/h0_map missing)')
+        return int(4 * (self.n_coeff + self.ncx * self.ncy))
+
+    def _validate_npz_state(self):
+        """Fail-loud consistency checks shared by save_npz (pre-write) and load_npz."""
+        for name in ('x0', 'y0', 'dx', 'dy', 'poly_R', 'poly_z0'):
+            if not np.isfinite(getattr(self, name)):
+                raise ValueError(f'SeparableParams {name}={getattr(self, name)} not finite')
+        if not (self.dx > 0.0 and self.dy > 0.0 and self.poly_R > 0.0):
+            raise ValueError(f'dx/dy/poly_R must be positive, got {self.dx}/{self.dy}/{self.poly_R}')
+        if self.ncx <= 0 or self.ncy <= 0:
+            raise ValueError(f'ncx/ncy must be positive, got {self.ncx}x{self.ncy}')
+        if not 1 <= self.nz <= 8:
+            raise ValueError(f'nz must be in 1..8 (kernel phi[8]), got {self.nz}')
+        if self.m_start <= 0:
+            raise ValueError(f'm_start must be positive, got {self.m_start}')
+        if self.h0_map is None or np.asarray(self.h0_map).size != self.ncx * self.ncy or not np.isfinite(self.h0_map).all():
+            raise ValueError('h0_map must be finite with ncx*ncy entries')
+        if self.h0_samples is not None and (np.asarray(self.h0_samples).size != self.ncx * self.ncy or not np.isfinite(self.h0_samples).all()):
+            raise ValueError('h0_samples must be finite with ncx*ncy entries')
+        if self.coeffs is None or np.asarray(self.coeffs).size != self.n_coeff or not np.isfinite(self.coeffs).all():
+            raise ValueError(f'coeffs must be finite with n_coeff={self.n_coeff} entries')
+        fb = getattr(self, 'fit_bounds', None)
+        if fb is not None:
+            fb = np.asarray(fb, dtype=np.float64)
+            if fb.shape != (2, 3) or not np.isfinite(fb).all() or np.any(fb[0] > fb[1]):
+                raise ValueError('fit_bounds must be finite ordered (2,3)')
+        fr = getattr(self, 'fit_rmse', None)
+        if fr is not None and (not np.isfinite(fr) or fr < 0.0):
+            raise ValueError(f'fit_rmse must be finite >= 0, got {fr}')
+
+    def save_npz(self, path, *, metadata=None):
+        """Serialize reconstruction + provenance data (never fit samples / __dict__). 'xb' refuses overwrite."""
+        if self.coeffs is None or self.h0_map is None:
+            raise RuntimeError('SeparableParams.save_npz requires fitted coeffs and h0_map')
+        self._validate_npz_state()
+        md = metadata if metadata is not None else getattr(self, 'metadata', None)
+        if md is not None and not isinstance(md, dict):
+            raise ValueError(f'metadata must be a dict, got {type(md).__name__}')
+        arrs = {
+            'schema_version': np.array(1, dtype=np.int64),
+            'x0': np.float64(self.x0), 'y0': np.float64(self.y0),
+            'dx': np.float64(self.dx), 'dy': np.float64(self.dy),
+            'ncx': np.int64(self.ncx), 'ncy': np.int64(self.ncy),
+            'nz': np.int64(self.nz), 'm_start': np.int64(self.m_start),
+            'poly_R': np.float64(self.poly_R), 'poly_z0': np.float64(self.poly_z0),
+            'coeffs': np.ascontiguousarray(self.coeffs, dtype=np.float32).reshape(-1),
+            'h0_map': np.ascontiguousarray(self.h0_map, dtype=np.float32).reshape(-1),
+            'metadata_json': np.array(json.dumps(md or {})),
+        }
+        if self.h0_samples is not None:
+            arrs['h0_samples'] = np.ascontiguousarray(self.h0_samples, dtype=np.float32).reshape(-1)
+        if getattr(self, 'fit_bounds', None) is not None:
+            arrs['fit_bounds'] = np.ascontiguousarray(self.fit_bounds, dtype=np.float64)
+        if getattr(self, 'fit_rmse', None) is not None:
+            arrs['fit_rmse'] = np.float64(self.fit_rmse)
+        with open(path, 'xb') as f:
+            np.savez_compressed(f, **arrs)
+
+    @classmethod
+    def load_npz(cls, path):
+        """Inverse of save_npz; schema_version must be 1, all fields validated via _validate_npz_state."""
+        with np.load(path, allow_pickle=False) as z:
+            ver = int(z['schema_version'].item())
+            if ver != 1:
+                raise ValueError(f'unsupported SeparableParams schema_version={ver}')
+            sep = cls(float(z['x0']), float(z['y0']), float(z['dx']), float(z['dy']), int(z['ncx']), int(z['ncy']), poly_R=float(z['poly_R']), poly_z0=float(z['poly_z0']), m_start=int(z['m_start']), nz=int(z['nz']), h0_map=np.asarray(z['h0_map'], dtype=np.float32).reshape(-1))
+            sep.coeffs = np.asarray(z['coeffs'], dtype=np.float32).reshape(-1).astype(np.float64)
+            if 'h0_samples' in z:
+                sep.h0_samples = np.asarray(z['h0_samples'], dtype=np.float32).reshape(-1)
+            if 'fit_bounds' in z:
+                sep.fit_bounds = np.asarray(z['fit_bounds'], dtype=np.float64)
+            if 'fit_rmse' in z:
+                sep.fit_rmse = float(z['fit_rmse'])
+            md = json.loads(z['metadata_json'].item()) if 'metadata_json' in z else {}
+            if not isinstance(md, dict):
+                raise ValueError(f'metadata_json must decode to a dict, got {type(md).__name__}')
+            sep.metadata = md
+        sep._validate_npz_state()
+        return sep
 
 
 def separable_cl_args(sep: SeparableParams):

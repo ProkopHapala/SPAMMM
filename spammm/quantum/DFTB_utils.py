@@ -597,17 +597,19 @@ def write_dftb_input_sp(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxs
     _write_dftb_input_base(enames, xyz_path, out_path, sk_prefix, scctol, maxscc, analysis_block="", filling_temp=filling_temp, scc=scc)
 
 
-def write_dftb_input_relax(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxscc=400, max_steps=1000, grad_elem=1e-4, fixed_atoms=None, filling_temp=None):
+def write_dftb_input_relax(enames, xyz_path, out_path, sk_prefix, scctol=1e-7, maxscc=400, max_steps=1000, grad_elem=1e-4, fixed_atoms=None, filling_temp=None, mixer_param=None):
     """Write gas-phase DFTB+ geometry optimization input (same Hamiltonian as SP, no D3).
 
     fixed_atoms: 0-based indices held fixed via MovedAtoms exclusion. filling_temp: Fermi T [K].
-    """
+    mixer_param: Broyden mixing parameter (e.g. 0.05-0.2) — rescues SCC oscillations on
+    near-open-shell systems (pentagon defects, odd pi counts)."""
     if not sk_prefix.endswith('/'):
         sk_prefix = sk_prefix + '/'
     species = sorted(set(enames))
     max_ang = {s: '"s"' if s == 'H' else '"p"' for s in species}
     max_ang_str = '\n    '.join([f'{s} = {max_ang[s]}' for s in species])
     filling_str = f'  Filling = Fermi {{ Temperature [K] = {filling_temp} }}\n' if filling_temp else ''
+    mixer_str = f'  Mixer = Broyden {{ MixingParameter = {mixer_param} }}\n' if mixer_param else ''
     if fixed_atoms:
         moved = sorted(set(range(len(enames))) - set(fixed_atoms))
         moved_str = ' '.join(str(i + 1) for i in moved) if moved else '1:-1'
@@ -633,7 +635,7 @@ Hamiltonian = DFTB {{
   MaxAngularMomentum {{
     {max_ang_str}
   }}
-  SCCTolerance = {scctol}
+{mixer_str}  SCCTolerance = {scctol}
   MaxSccIterations = {maxscc}
 {filling_str}}}
 """

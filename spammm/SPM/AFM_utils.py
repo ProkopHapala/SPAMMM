@@ -3361,7 +3361,7 @@ class ScanResult:
 
 
 def shared_postprocess(FEs_full, scan_spec, *, FEs_bwd=None, tip_disp=None,
-                       backend_name='unknown', fft_path='none'):
+                       df_precomputed=None, backend_name='unknown', fft_path='none'):
     """Backend-agnostic df / Fz / E_diss extraction from a relaxed force volume.
 
     Replicates the postprocessing in ``run_fdbm_pp_from_density`` (AFM_utils.py
@@ -3376,6 +3376,8 @@ def shared_postprocess(FEs_full, scan_spec, *, FEs_bwd=None, tip_disp=None,
         FEs_bwd: optional (nx, ny, nz_scan, 4) backward stroke for E_diss;
                  None → E_diss is zeros
         tip_disp: optional {'dx','dy','dz'} dict; None → zeros
+        df_precomputed: optional (nx, ny, nz_scan) or flat df volume already computed
+                 (e.g. on GPU by AFMulator.compute_df_amp_z_gpu) — skips host df
         backend_name: 'fdbm' | 'morse' | 'contact'
         fft_path: 'GPU' | 'CPU' | 'none'
     Returns:
@@ -3389,7 +3391,10 @@ def shared_postprocess(FEs_full, scan_spec, *, FEs_bwd=None, tip_disp=None,
     spacing = (sx, sy, sz)
     osc_n = np.asarray(scan_spec.osc_dir, dtype=np.float64)
     osc_n = osc_n / np.linalg.norm(osc_n)
-    df_full = afm.compute_df_amp_dir(FEs_full, spacing, osc_dir=osc_n, amp=float(scan_spec.amplitude))
+    if df_precomputed is not None:
+        df_full = np.asarray(df_precomputed, dtype=np.float32).reshape(nx, ny, nz_scan)
+    else:
+        df_full = afm.compute_df_amp_dir(FEs_full, spacing, osc_dir=osc_n, amp=float(scan_spec.amplitude))
     idx_df = [int(np.argmin(np.abs(scan_spec.h_scan - h))) for h in scan_spec.h_df]
     idx_Fz = [int(np.argmin(np.abs(scan_spec.h_scan - h))) for h in scan_spec.h_Fz]
     Fz = FEs_full[..., 2][:, :, idx_Fz]
@@ -4074,13 +4079,16 @@ def run_morse_pp_afm(tag, atomPos, atomTypes, origin, step, ngrid, outdir, *,
     osc_n = np.asarray(scan_spec.osc_dir, dtype=np.float64)
     osc_n = osc_n / np.linalg.norm(osc_n)
     amp = float(scan_spec.amplitude)
-    pad_x = int(np.ceil(abs(amp * osc_n[0]) / step - 1e-12))
-    pad_y = int(np.ceil(abs(amp * osc_n[1]) / step - 1e-12))
     scan_xs = np.asarray(scan_spec.scan_xs, dtype=np.float32)
     scan_ys = np.asarray(scan_spec.scan_ys, dtype=np.float32)
-    scan_xs_full = (float(scan_xs[0]) + (np.arange(len(scan_xs) + 2 * pad_x, dtype=np.float64) - pad_x) * step).astype(np.float32)
-    scan_ys_full = (float(scan_ys[0]) + (np.arange(len(scan_ys) + 2 * pad_y, dtype=np.float64) - pad_y) * step).astype(np.float32)
-    required_margin_xy = np.array([scan_spec.scan_margin + pad_x * step, scan_spec.scan_margin + pad_y * step])
+    # Scan spacing may differ from grid step — pad/rebuild must use SCAN spacing
+    dxs = float(scan_xs[1] - scan_xs[0]) if len(scan_xs) > 1 else step
+    dys = float(scan_ys[1] - scan_ys[0]) if len(scan_ys) > 1 else step
+    pad_x = int(np.ceil(abs(amp * osc_n[0]) / dxs - 1e-12))
+    pad_y = int(np.ceil(abs(amp * osc_n[1]) / dys - 1e-12))
+    scan_xs_full = (float(scan_xs[0]) + (np.arange(len(scan_xs) + 2 * pad_x, dtype=np.float64) - pad_x) * dxs).astype(np.float32)
+    scan_ys_full = (float(scan_ys[0]) + (np.arange(len(scan_ys) + 2 * pad_y, dtype=np.float64) - pad_y) * dys).astype(np.float32)
+    required_margin_xy = np.array([scan_spec.scan_margin + pad_x * dxs, scan_spec.scan_margin + pad_y * dys])
     if np.any(required_margin_xy > float(margin) + 1e-9):
         raise ValueError(f"lateral amplitude leaves the force-field grid: required xy margins={required_margin_xy} Å exceed margin={margin} Å")
 

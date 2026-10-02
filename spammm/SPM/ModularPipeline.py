@@ -339,7 +339,9 @@ class ModularAFMPipeline:
 Hamiltonian = DFTB {{
   SCC = Yes
   SCCTolerance = 1e-7
-  MaxSCCIterations = 200
+  MaxSCCIterations = 600
+  Mixer = Broyden {{ MixingParameter = 0.05 }}
+  Filling = Fermi {{ Temperature [K] = 300 }}
   SlaterKosterFiles = Type2FileNames {{
     Prefix = "{sk_dir}/"
     Separator = "-"

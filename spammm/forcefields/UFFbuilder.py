@@ -71,7 +71,7 @@ class UFF_Builder:
         """Safely get hybridization char from UFF type name. 'H_' -> '1', 'C_3' -> '3', 'O_R' -> 'R'."""
         return name[2] if len(name) > 2 else '1'
 
-    def __init__(self, mol, bSimple=False, b141=False, bConj=False, bCumulene=False):
+    def __init__(self, mol, bSimple=False, b141=False, bConj=False, bCumulene=False, bKekule=True):
         self.mol = mol
         base_path = os.path.dirname(os.path.abspath(__file__))
         data_path = os.path.join(base_path, "../../data/")
@@ -131,6 +131,7 @@ class UFF_Builder:
         self.b141 = b141
         self.bConj = bConj
         self.bCumulene = bCumulene
+        self.bKekule = bKekule
 
     def build(self):
         self.assign_uff_types()
@@ -202,9 +203,10 @@ class UFF_Builder:
         self.assign_uff_types_nitro(neighs, BOs, BOs_int, set_atom, set_bond)
         print("set_atom after nitro:", np.where(~set_atom)[0])
 
-        # find a (hopefully) valid limit resonance structure
-        self.assign_uff_types_treewalk(neighs, BOs_int)
-        print("set_atom after treewalk:", np.where(~set_atom)[0])
+        if self.bKekule:
+            # find a (hopefully) valid limit resonance structure
+            self.assign_uff_types_treewalk(neighs, BOs_int)
+            print("set_atom after treewalk:", np.where(~set_atom)[0])
 
         if self.bSimple:
             # assign resonant atoms according to the "simple" rule: atoms with two sp2 neighbors (or heteroatoms) are resonant
@@ -218,6 +220,12 @@ class UFF_Builder:
         # assign the rest of atom types
         self.assign_uff_types_assignrest(neighs, BOs, BOs_int, set_atom, set_bond)
         print("set_atom after assignrest:", np.where(~set_atom)[0])
+
+        if not self.bKekule:
+            # no limit-resonance search: BOs_int is only bookkeeping for
+            # fixsaturation/checks — fill unset entries from BOs (1.5 -> 2)
+            m = (BOs_int < 0) & (BOs > 0)
+            BOs_int[m] = np.clip(np.rint(BOs[m]), 1, 3).astype(np.int32)
 
         # try to assign the rest of double bonds
         self.assign_uff_types_fixsaturation(neighs, BOs, BOs_int, set_bond, tol)

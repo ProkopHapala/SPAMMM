@@ -16,9 +16,9 @@ Rings-first pipeline (see doc/Tasks/Img2Mol.md for spec + chemical priors):
 Bond scale b auto-estimated from fused center distances (d ~ 1.73b hex-hex)
 and the whole pass re-runs at the corrected scale.
 
-Step 2: graph_to_atomicgraph -> AtomicGraph -> XYZ (tests/testplot_img2mol.py).
+Step 2: graph_to_atomicgraph -> AtomicGraph -> XYZ (doc/export_invAFM/scripts/testplot_img2mol.py).
 """
-import itertools
+import itertools, os
 import numpy as np
 import scipy.ndimage as ndi
 from scipy import signal
@@ -47,10 +47,54 @@ def load_gray(path):
     return g
 
 
+def red_dot_centers(path):
+    """Reference ring centers: centroids of pure-red marker dots drawn on the
+    solution image (human annotation). Returns (N,2) xy."""
+    if not os.path.isfile(path):
+        return np.zeros((0, 2))
+    a = np.asarray(Image.open(path)).astype(int)
+    m = (a[..., 0] > 150) & (a[..., 0] - a[..., 1] > 60) & (a[..., 0] - a[..., 2] > 60)
+    lab = label(m)
+    if lab.max() == 0:
+        return np.zeros((0, 2))
+    return np.array([ndi.center_of_mass(m, lab, i)[::-1] for i in range(1, lab.max() + 1)])
+
+
 def flatten_bg(g, sig_bg=None):
     sig_bg = sig_bg or min(g.shape) / 8.0
     flat = g - ndi.gaussian_filter(g, sig_bg)
     return flat - np.median(flat)
+
+
+def prep_image(g, method, b=None):
+    """Flattened image variants for shading/background removal. Returns flat."""
+    b = b or estimate_bond_scale(flatten_bg(g))   # bootstrap scale from default flat
+    if method == 'flat16':  return flatten_bg(g)
+    if method == 'flat6':   return flatten_bg(g, 0.75 * b)
+    if method == 'median':  # background = robust median filter r~3b
+        flat = g - ndi.median_filter(g, size=int(6 * b) | 1)
+        return flat - np.median(flat)
+    if method == 'poly2':   # least-squares deg-2 polynomial surface
+        yy, xx = np.mgrid[0:g.shape[0], 0:g.shape[1]] / np.array(g.shape)[:, None, None]  # normalized coords
+        A = np.stack([np.ones(xx.size), xx.ravel(), yy.ravel(), (xx * yy).ravel(), (xx * xx).ravel(), (yy * yy).ravel()], 1)
+        c, *_ = np.linalg.lstsq(A, g.ravel(), rcond=None)
+        flat = g - (A @ c).reshape(g.shape)
+        return flat - np.median(flat)
+    if method == 'rows':    # per-scanline median (AFM line shading) then column mean
+        flat = g - np.median(g, axis=1, keepdims=True)
+        return flat - np.median(flat)
+    if method == 'bandpass':# G(0.2b) - G(1.0b) band-pass, noise-stabilized smooth
+        return ndi.gaussian_filter(g, 0.2 * b) - ndi.gaussian_filter(g, 1.0 * b)
+    if method == 'lstd':    # noise-stabilized high-pass: dev / (localRMS + floor); floor kills noise blow-up in flat areas
+        flat = flatten_bg(g, 1.0 * b)
+        dev = flat - ndi.gaussian_filter(flat, 0.2 * b)
+        rms = np.sqrt(np.maximum(ndi.uniform_filter(dev * dev, int(3 * b)), 0))
+        return dev / (rms + 0.5 * np.median(rms))
+    if method == 'flat6n':  # flat6 + stabilized local-RMS normalization
+        flat = flatten_bg(g, 0.75 * b)
+        rms = np.sqrt(np.maximum(ndi.uniform_filter(flat * flat, int(3 * b)), 0))
+        return flat / (rms + 0.5 * np.median(rms))
+    raise ValueError(f'unknown prep method {method}')
 
 
 def molecule_mask(flat, r_close):
@@ -118,7 +162,7 @@ def center_response(flat, b):
     normalization keeps it stable against shading/ghost contrast.
     Ring centers = LOCAL MINIMA."""
     G = -ndi.gaussian_laplace(flat, 0.45 * b)   # annulus bump at ~0.7b around center
-    rms = np.sqrt(ndi.uniform_filter(G * G, max(3, int(2 * b)))) + 1e-9
+    rms = np.sqrt(np.maximum(ndi.uniform_filter(G * G, max(3, int(2 * b))), 0)) + 1e-9
     return G / rms
 
 
@@ -173,6 +217,7 @@ def sector_kernels(b, nsect=8, rads=(0.68, 0.90), sr=0.11):
             u = np.abs((th - k * dth + np.pi) % (2 * np.pi) - np.pi) / dth
             ang = np.where(u < 0.5, 0.75 - u * u, np.where(u < 1.5, 0.5 * (1.5 - u)**2, 0.0))
             K = w * ang
+            K -= K.mean()                                     # exact discrete DC rejection
             ks[i, k] = K / np.sqrt((K * K).sum())             # L2-normalized
     return ks
 
@@ -211,25 +256,41 @@ def ray_enclosure(R, xy, b, nray=36, r12=(0.35, 1.3), nr=20):
     return dict(q10=np.quantile(pk, 0.1, axis=1), min=pk.min(axis=1), maxgap=maxgap * 360.0 / nray)
 
 
-def ring_centers_E(flat, b, Ef_rel=0.25, dmax=2.2, dmin=1.25):
+def ring_centers_multi(g, methods=('flat6', 'bandpass'), base='flat6n', **kw):
+    """Consensus detection: E = geometric mean of per-method fuzzy-AND maps
+    (artefacts appear in only one preprocessing, real rings in all).
+    Filtering channels (ray/depth/Ef) run on the `base` method's flat."""
+    flats = {m: prep_image(g, m) for m in methods}
+    Es = []
+    for m in methods:
+        bm = estimate_bond_scale(flats[m])
+        Cm = center_response(flats[m], bm)
+        Es.append(sector_enclosure(Cm, sector_kernels(bm))[0])
+    E_geo = np.prod(np.stack(Es), axis=0) ** (1.0 / len(Es))
+    flat = prep_image(g, base)
+    return ring_centers_E(flat, estimate_bond_scale(flat), E=E_geo, **kw)
+
+
+def ring_centers_E(flat, b, Ef_rel=0.25, dmax=2.2, depth_min=-0.65, E=None):
     """Ring centers = peaks of fuzzy-AND enclosure E (on C), filtered by
-    ray-cast ridge enclosure (Rq10>0), raw-image enclosure Ef, steric
-    exclusion ('close': candidates < dmin*b apart, weaker Rq10 loses —
-    two rings cannot have centers closer than ~2 pentagon apothems), and
+    ray-cast ridge enclosure (Rq10>0), raw-image enclosure Ef, raw ring depth
+    (reject a center brighter than most of its surrounding rim), and
     connectivity (isolated singletons out; appendices detached by a weak
     connector ring are kept — the graph builder handles that later).
-    Returns xy (N,2) accepted and a dict of per-peak diagnostics for all
-    peaks (xy, E, Ef, C, U, Rq10, Rmin, maxgap, reason)."""
+    Returns xy (N,2) accepted and per-peak diagnostics including raw depth."""
     C = center_response(flat, b)
     ks = sector_kernels(b)
-    E, M = sector_enclosure(C, ks)
+    if E is None:
+        E, M = sector_enclosure(C, ks)
+    else:
+        M = sector_enclosure(C, ks)[1]
     Ef, _ = sector_enclosure(flat, ks)
     Rs = -ndi.gaussian_laplace(flat, 0.2 * b)
-    R = Rs / (np.sqrt(ndi.uniform_filter(Rs * Rs, int(3 * b))) + 1e-9)
+    R = Rs / (np.sqrt(np.maximum(ndi.uniform_filter(Rs * Rs, int(3 * b)), 0)) + 1e-9)
     pk = peak_local_max(E, min_distance=max(2, int(0.7 * b)), threshold_abs=0.05, exclude_border=max(1, int(b)))
     if not len(pk):
         z = np.zeros(0)
-        return np.zeros((0, 2)), dict(xy=np.zeros((0, 2)), E=z, Ef=z, C=z, U=z, Rq10=z, Rmin=z, maxgap=z, reason=np.zeros(0, dtype=object))
+        return np.zeros((0, 2)), dict(xy=np.zeros((0, 2)), E=z, Ef=z, C=z, U=z, Rq10=z, Rmin=z, maxgap=z, depth=z, reason=np.zeros(0, dtype=object))
     xy = pk[:, ::-1].astype(float)
     rays = ray_enclosure(R, xy, b)
     Mv = M[:, pk[:, 0], pk[:, 1]]                        # (nsect, N)
@@ -237,16 +298,18 @@ def ring_centers_E(flat, b, Ef_rel=0.25, dmax=2.2, dmin=1.25):
     Cv = C[pk[:, 0], pk[:, 1]]
     Ev = E[pk[:, 0], pk[:, 1]]
     Efv = Ef[pk[:, 0], pk[:, 1]]
+    sharp_flat = ndi.gaussian_filter(flat, 0.2 * b)
+    rr = np.linspace(0.35, 1.3, 20) * b
+    ys = xy[:, 1, None, None] + rr[None, None, :] * np.sin(np.arange(36) * (2*np.pi/36))[None, :, None]
+    xs = xy[:, 0, None, None] + rr[None, None, :] * np.cos(np.arange(36) * (2*np.pi/36))[None, :, None]
+    ray_flat = ndi.map_coordinates(sharp_flat, [ys.ravel(), xs.ravel()], order=1, mode='nearest').reshape(len(xy), 36, -1).max(axis=2)
+    center_flat = ndi.map_coordinates(sharp_flat, [xy[:, 1], xy[:, 0]], order=1, mode='nearest')
+    depth = (np.quantile(ray_flat, 0.1, axis=1) - center_flat) / (np.std(flat) + 1e-9)
     reason = np.full(len(pk), '', dtype=object)
     reason[rays['q10'] <= 0] = 'ray'
     passed = reason == ''
     reason[passed & (Efv < Ef_rel * np.quantile(Efv[passed], 0.9))] = 'Ef'
-    keep = np.zeros(len(pk), bool)
-    for i in np.flatnonzero(reason == '')[np.argsort(-rays['q10'][reason == ''])]:
-        if keep.any() and np.min(np.linalg.norm(pk[keep] - pk[i], axis=1)) < dmin * b:
-            reason[i] = 'close'
-        else:
-            keep[i] = True
+    reason[(reason == '') & (depth < depth_min)] = 'depth'
     cand = np.flatnonzero(reason == '')
     if len(cand):
         inset = np.zeros(len(pk), bool); inset[cand] = True
@@ -256,7 +319,131 @@ def ring_centers_E(flat, b, Ef_rel=0.25, dmax=2.2, dmin=1.25):
             linked[prs[:, 0]] = linked[prs[:, 1]] = True               # component size >= 2 survives
         reason[(reason == '') & ~linked] = 'comp'                      # isolated singletons only
     reason[reason == ''] = 'ok'
-    return xy[reason == 'ok'], dict(xy=xy, E=Ev, Ef=Efv, C=Cv, U=U, Rq10=rays['q10'], Rmin=rays['min'], maxgap=rays['maxgap'], reason=reason)
+    return xy[reason == 'ok'], dict(xy=xy, E=Ev, Ef=Efv, C=Cv, U=U, Rq10=rays['q10'], Rmin=rays['min'], maxgap=rays['maxgap'], depth=depth, reason=reason)
+
+
+def ring_centers_graph(flat, b=None, wall_min=0.0):
+    """Detect enclosed centers, infer fused sides from wall evidence, build shared-corner skeleton."""
+    b = estimate_bond_scale(flat) if b is None else float(b)
+    centers, diag = ring_centers_E(flat, b)
+    if len(centers) < 3:
+        raise ValueError(f'ring_centers_graph: only {len(centers)} centers survived enclosure filters')
+    R0 = -ndi.gaussian_laplace(flat, 0.2 * b)
+    R = R0 / (np.sqrt(np.maximum(ndi.uniform_filter(R0 * R0, max(3, int(3 * b))), 0)) + 1e-9)
+    tri = Delaunay(centers).simplices
+    candidate = sorted({tuple(sorted((int(i), int(j)))) for t in tri for i, j in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))})
+    pairs = [(i, j, float(np.linalg.norm(centers[i] - centers[j])), float(fused_wall_score(R, centers[i], centers[j], b))) for i, j in candidate]
+    pairs = [p for p in pairs if 0.85 * b < p[2] < 2.2 * b and p[3] > wall_min]
+    adj = [[] for _ in centers]
+    for i, j, *_ in pairs:
+        adj[i].append(j); adj[j].append(i)
+    if any(not nbs for nbs in adj):
+        raise ValueError(f'ring_centers_graph: {sum(not nbs for nbs in adj)} accepted centers have no bright fused side')
+    reached = {0}; stack = [0]
+    while stack:
+        i = stack.pop()
+        for j in adj[i]:
+            if j not in reached:
+                reached.add(j); stack.append(j)
+    if len(reached) != len(centers):
+        raise ValueError(f'ring_centers_graph: fused ring dual is disconnected ({len(reached)}/{len(centers)} reached)')
+    ns = {i: (5 if n_score_ang([np.arctan2(centers[j,1]-centers[i,1], centers[j,0]-centers[i,0]) for j in nbs], 5) > n_score_ang([np.arctan2(centers[j,1]-centers[i,1], centers[j,0]-centers[i,0]) for j in nbs], 6) else 6) for i, nbs in enumerate(adj)}
+    removed_pairs = []
+    while True:
+        try:
+            verts, edges, rings = graph_from_fused_rings(centers, pairs, ns, b)
+            break
+        except ValueError as exc:
+            if 'degree-' not in str(exc) or len(pairs) <= len(centers) - 1:
+                raise
+            # Remove the weakest wall proposal only when it is redundant to dual connectivity.
+            removed = False
+            for k in np.argsort([p[3] for p in pairs]):
+                trial = pairs[:k] + pairs[k + 1:]
+                seen = {0}; stack = [0]
+                while stack:
+                    i = stack.pop()
+                    for p in trial:
+                        j = p[1] if p[0] == i else p[0] if p[1] == i else -1
+                        if j >= 0 and j not in seen:
+                            seen.add(j); stack.append(j)
+                if len(seen) == len(centers):
+                    removed_pairs.append(pairs[k]); pairs = trial; removed = True; break
+            if not removed:
+                raise ValueError(f'ring_centers_graph: cannot remove valence-conflicting side without disconnecting rings ({exc})') from exc
+    if any(len(r) not in (5, 6) for r in rings):
+        raise ValueError('ring_centers_graph: ring sizes outside 5/6')
+    degree = np.bincount(np.asarray(edges).ravel(), minlength=len(verts))
+    if degree.max() > 3 or len(verts) - len(edges) + len(rings) != 1:
+        raise ValueError(f'ring_centers_graph: invalid skeleton invariants V={len(verts)} E={len(edges)} F={len(rings)} max_degree={degree.max()}')
+    return dict(centers=centers, center_diagnostics=diag, pairs=pairs, removed_pairs=removed_pairs, ns=ns, verts=verts, edges=edges, rings=rings, R=R, bond_px=b)
+
+
+def vertex_kernels(b, armL=1.0, sig=0.10, decay=0.6, nrot=6, rmax=1.35):
+    """3-fold 'Y' vertex ridge filters for sp2 carbons (3 bonds, 120 deg).
+
+    K(p) = Y(p)*decay(r) - lam * valley(p):
+      Y(p)     = exp(-dY^2/(2 sig^2)), dY = distance to the Y skeleton
+               (center + 3 arm rays at 120 deg, length armL*b) -> uniform-width
+               ridge, same value center and arms;
+      decay(r) = exp(-r^2/(2 (decay*b)^2)) -> MAXIMUM AT CENTER, arms fade out;
+      valley   = broad background filling the wedge space BETWEEN the arms:
+               angular Gaussians (35 deg) on the +60 deg bisectors times a
+               smooth radial window [0.2b, 1.3b].
+    Zero-mean, L2-normalized; nrot rotations cover the 120-deg period.
+    Response: max over rotations of corr(img, K)."""
+    h = int(np.ceil(rmax * b))
+    y, x = np.mgrid[-h:h + 1, -h:h + 1]
+    r = np.hypot(x, y); th = np.arctan2(y, x)
+    ks = np.zeros((nrot, 2 * h + 1, 2 * h + 1))
+    for k in range(nrot):
+        ph = np.pi / 3.0 * k / nrot * 2.0                       # rotations within the 120-deg period
+        dY = r.copy()
+        wang = np.zeros_like(r)
+        for m in range(3):
+            a = ph + 2 * np.pi * m / 3
+            ca, sa = np.cos(a), np.sin(a)
+            t = x * ca + y * sa                               # along-arm coordinate
+            u = -x * sa + y * ca                              # across-arm distance
+            dY = np.minimum(dY, np.where((t >= 0) & (t <= armL * b), np.abs(u),
+                                         np.hypot(np.minimum(np.abs(t - 0), np.abs(t - armL * b)), u)))
+            dv = np.abs((th - (a + np.pi / 3) + np.pi) % (2 * np.pi) - np.pi)   # angular distance to bisector
+            wang += np.exp(-0.5 * (dv / 0.6)**2)                # ~35 deg half-width valley wedges
+        pos = np.exp(-0.5 * (dY / (sig * b))**2) * np.exp(-0.5 * (r / (decay * b))**2)
+        neg = wang * np.clip((r - 0.15 * b) / (0.15 * b), 0, 1) * np.clip((1.30 * b - r) / (0.3 * b), 0, 1)
+        lam = pos.sum() / max(neg.sum(), 1e-12)
+        K = pos - min(lam, 0.9) * neg
+        K -= K.mean()
+        ks[k] = K / np.sqrt((K * K).sum())
+    return ks
+
+
+def edge_kernels(b, dirs=3, ds=(0.5, 0.75, 1.0), sigt=0.10, sigu=0.25, rmax=1.6):
+    """Linear double-edge filters: along-axis profile with NARROW maxima at
+    +-d and negative center + outer skirt; Gaussian ridge across the axis.
+
+    K(t,u) = exp(-u^2/(2 sigu^2)) * w_d(t), w_d = bumps at t=+-d minus
+    center lobe minus outer skirt, integral dt = 0 (DC-free), L2-normalized.
+    dirs orientations x len(ds) distances -> strips response per orientation;
+    product over orientations localizes edge segments / ring corners.
+    ds in units of b (e.g. 0.5b hits the two vertices of one bond)."""
+    h = int(np.ceil(rmax * b))
+    y, x = np.mgrid[-h:h + 1, -h:h + 1]
+    ks = np.zeros((len(ds), dirs, 2 * h + 1, 2 * h + 1))
+    for i, d in enumerate(ds):
+        for k in range(dirs):
+            a = np.pi * k / dirs
+            ca, sa = np.cos(a), np.sin(a)
+            t = x * ca + y * sa                               # along-axis
+            u = -x * sa + y * ca                              # across-axis
+            pos = np.exp(-0.5 * ((np.abs(t) - d * b) / (sigt * b))**2)
+            neg = np.exp(-0.5 * (t / (d * b + sigt * b))**2) + np.exp(-0.5 * ((np.abs(t) - (d + 4 * sigt) * b) / (sigt * b))**2) * 0.5
+            lam = pos.sum() / max(neg.sum(), 1e-12)
+            w = pos - lam * neg
+            K = w * np.exp(-0.5 * (u / (sigu * b))**2)
+            K -= K.mean()
+            ks[i, k] = K / np.sqrt((K * K).sum())
+    return ks
 
 
 def junction_kernels(b, narm=3, r12=(0.10, 0.80), sig=0.10, nrot=12):
@@ -288,8 +475,12 @@ def junction_response(img, ks):
     return J.max(axis=0)
 
 
-def estimate_bond_scale(flat):
-    """Estimate C-C pixel scale from the radial ridge autocorrelation peak."""
+def estimate_bond_scale(flat, subpixel=True):
+    """Estimate C-C pixel scale from radial ridge autocorrelation.
+
+    The ring-center dual has hexagonal pitch sqrt(3)*b. When subpixel=True,
+    parabolic interpolation refines the integer-radius autocorrelation peak.
+    """
     b0 = min(flat.shape) / 22.0
     R = -ndi.gaussian_laplace(flat, max(0.8, b0 / 7.0))
     ac = signal.fftconvolve(R, R[::-1, ::-1], mode='same')
@@ -304,7 +495,17 @@ def estimate_bond_scale(flat):
     peaks = peaks[radial[peaks] > 0]
     if not len(peaks):
         raise ValueError('No positive ring-spacing peak in ridge autocorrelation')
-    return peaks[np.argmax(radial[peaks])] / np.sqrt(3)
+    peak = peaks[np.argmax(radial[peaks])]
+    if not subpixel:
+        return peak / np.sqrt(3)
+    ym, y0, yp = radial[peak - 1:peak + 2]
+    curvature = ym - 2 * y0 + yp
+    if not np.isfinite(curvature) or curvature >= 0:
+        raise ValueError('Radial autocorrelation peak has no concave parabolic curvature')
+    delta = 0.5 * (ym - yp) / curvature
+    if not np.isfinite(delta) or abs(delta) > 0.5:
+        raise ValueError(f'Invalid subpixel radial-peak offset: {delta}')
+    return (peak + delta) / np.sqrt(3)
 
 
 def fit_center_lattice(xy, scores, b, nseed=30):
@@ -391,7 +592,7 @@ def ridge_map_ms(flat, b):
     R = np.full_like(flat, -np.inf)
     for s in (b / 9.0, b / 7.0, b / 5.0):
         Rs = -ndi.gaussian_laplace(flat, max(0.8, s))
-        rms = np.sqrt(ndi.uniform_filter(Rs * Rs, max(3, int(2 * b)))) + 1e-9
+        rms = np.sqrt(np.maximum(ndi.uniform_filter(Rs * Rs, max(3, int(2 * b))), 0)) + 1e-9
         R = np.maximum(R, Rs / rms)
     return R
 
@@ -727,12 +928,15 @@ def infer_graph(centers, fits, pairs, R, t_r, b):
     return verts, edges, rings, ring_ids, ns
 
 
-def graph_from_fused_rings(centers, pairs, ns, b):
+def graph_from_fused_rings(centers, pairs, ns, b, *, assignment=None):
     """Build one atom per shared topological corner of fused ring polygons.
 
     The ring-side identifications are exact: no spatial vertex clustering can
     accidentally merge unrelated atoms. Raises when the proposed dual graph
     requires a carbon with degree greater than three.
+    assignment: optional (phase, side) — phase[i] polygon rotation, side[(i,j)]
+    the side index of ring i fused to ring j. When supplied the free
+    phase/Hungarian fit below is skipped and the given layout is used verbatim.
     """
     centers = np.asarray(centers, float)
     nring = len(centers)
@@ -750,26 +954,29 @@ def graph_from_fused_rings(centers, pairs, ns, b):
     adj = [[] for _ in range(nring)]
     for i, j, *_ in pairs:
         adj[i].append(j); adj[j].append(i)
-    phase, side = {}, {}
-    for i in range(nring):
-        n = ns[i]
-        if len(adj[i]) > n:
-            raise ValueError(f'Ring {i} has {len(adj[i])} fused neighbors but only {n} sides')
-        if not adj[i]:
-            phase[i] = 0.0
-            continue
-        alpha = np.arctan2(centers[adj[i], 1] - centers[i, 1], centers[adj[i], 0] - centers[i, 0])
-        best = (np.inf, None, None)
-        for psi in np.linspace(0, 2 * np.pi / n, 181, endpoint=False):
-            normals = psi + 2 * np.pi * np.arange(n) / n
-            err = np.abs(np.angle(np.exp(1j * (alpha[:, None] - normals[None, :]))))
-            rows, cols = linear_sum_assignment(err)
-            value = np.square(err[rows, cols]).sum()
-            if value < best[0]:
-                best = (value, psi, cols)
-        phase[i] = best[1]
-        for j, k in zip(adj[i], best[2]):
-            side[i, j] = int(k)
+    if assignment is not None:
+        phase, side = assignment
+    else:
+        phase, side = {}, {}
+        for i in range(nring):
+            n = ns[i]
+            if len(adj[i]) > n:
+                raise ValueError(f'Ring {i} has {len(adj[i])} fused neighbors but only {n} sides')
+            if not adj[i]:
+                phase[i] = 0.0
+                continue
+            alpha = np.arctan2(centers[adj[i], 1] - centers[i, 1], centers[adj[i], 0] - centers[i, 0])
+            best = (np.inf, None, None)
+            for psi in np.linspace(0, 2 * np.pi / n, 181, endpoint=False):
+                normals = psi + 2 * np.pi * np.arange(n) / n
+                err = np.abs(np.angle(np.exp(1j * (alpha[:, None] - normals[None, :]))))
+                rows, cols = linear_sum_assignment(err)
+                value = np.square(err[rows, cols]).sum()
+                if value < best[0]:
+                    best = (value, psi, cols)
+            phase[i] = best[1]
+            for j, k in zip(adj[i], best[2]):
+                side[i, j] = int(k)
     for i, j, *_ in pairs:
         ki, kj = side[i, j], side[j, i]
         union(offsets[i] + ki, offsets[j] + (kj + 1) % ns[j])
@@ -794,20 +1001,751 @@ def graph_from_fused_rings(centers, pairs, ns, b):
     return verts, edges, rings
 
 
-def graph_from_ring_centers(centers, R, b):
-    """Infer a planar fused dual and exact carbon graph from reviewed centers.
+def _ring_layout(centers, i, nb, pset):
+    """Best (n, phase, ksteps, cost) for ring i given its angle-sorted fused
+    neighbors nb. Each cyclic gap takes an integer side-step: exactly 1 for a
+    triangular gap (the two neighbors share a fused pair AND the gap < pi),
+    >= 2 otherwise — prevents open V-junction corners and keeps
+    triple-junction corners coherent. Steps must sum to n in {5,6}; cost =
+    mean squared wrapped residual + 0.02*(6-n) (hexagon wins ties). None when
+    neither n admits a legal assignment."""
+    m = len(nb)
+    alpha = np.arctan2(centers[np.asarray(nb), 1] - centers[i, 1], centers[np.asarray(nb), 0] - centers[i, 0])
+    gap = np.roll(alpha, -1) - alpha; gap[-1] += 2 * np.pi   # cyclic gaps, sum 2pi
+    tri = np.array([gap[g] < np.pi and tuple(sorted((nb[g], nb[(g + 1) % m]))) in pset for g in range(m)])
+    best = None
+    for n in (5, 6):
+        if m > n:
+            continue
+        lo = np.where(tri, 1, 2)
+        if lo.sum() > n:
+            continue
+        hi = np.where(tri, 1, n - lo.sum() + lo)           # triangular gap: step exactly 1
+        for steps in itertools.product(*[range(lo[g], hi[g] + 1) for g in range(m)]):
+            if sum(steps) != n:
+                continue
+            k = np.cumsum([0] + list(steps[:-1])) % n
+            ph = np.angle(np.exp(1j * (alpha - 2 * np.pi * k / n)).mean())
+            resid = np.abs(np.angle(np.exp(1j * (alpha - (ph + 2 * np.pi * k / n)))))
+            c = float((resid**2).mean()) + 0.02 * (6 - n)
+            if best is None or (c, 6 - n) < best[:2]:        # tie -> hexagon
+                best = (c, 6 - n, ph, k, n)
+    if best is None:
+        return None
+    c, _, ph, k, n = best
+    return n, ph, k, c
 
-    Candidate shared sides come from Delaunay adjacency and bright wall
-    evidence. Rare pentagons follow fivefold neighbor-angle consistency;
-    ambiguous sites remain hexagons. Invalid valence fails in the graph builder.
-    """
+
+def _constrained_layout_info(centers, pset, nring):
+    """_constrained_layout that also reports the blocking ring.
+    Returns ((ns, phase, side, cost), -1) or (None, ring_index)."""
+    adj = [[] for _ in range(nring)]
+    for i, j in pset:
+        adj[i].append(j); adj[j].append(i)
+    ns, phase, side, cost = {}, {}, {}, {}
+    for i in range(nring):
+        if not adj[i]:
+            if nring == 1:
+                ns[i], phase[i], cost[i] = 6, 0.0, 0.0    # isolated ring: hexagon, phase 0
+                continue
+            return None, i                                # isolated ring in multi-ring input: invalid
+        nb = sorted(adj[i], key=lambda j: np.arctan2(centers[j, 1] - centers[i, 1], centers[j, 0] - centers[i, 0]))
+        r = _ring_layout(centers, i, nb, pset)
+        if r is None:
+            return None, i
+        n, ph, k, c = r
+        ns[i], phase[i], cost[i] = n, ph, c
+        for jj, j in enumerate(nb):
+            side[i, j] = int(k[jj])
+    return (ns, phase, side, cost), -1
+
+
+def _constrained_layout(centers, pset, nring):
+    """Per-ring constrained side assignment for fused pair set pset {(i,j)}.
+
+    Neighbors are cyclically ordered by angle; each cyclic gap gets an integer
+    side-step: exactly 1 when the gap is a triangular face (the two neighbors
+    share a fused pair AND the angular gap < pi), >= 2 otherwise — this
+    prevents open V-junction corners and keeps triple-junction corners
+    coherent. Steps sum to n for n in {5,6}. Side index of the first neighbor
+    is 0; subsequent indices accumulate the preceding gap steps mod n. Phase
+    is the circular mean of alpha - 2pi*k/n; cost = mean squared wrapped
+    residual + 0.02*(6-n), hexagon wins ties. Returns (ns, phase, side, cost)
+    or None when a ring fits neither n."""
+    lay, _ = _constrained_layout_info(centers, pset, nring)
+    return lay
+
+
+def _dual_connected(pset, nring):
+    if nring == 1:
+        return True
+    adj = [[] for _ in range(nring)]
+    for i, j in pset:
+        adj[i].append(j); adj[j].append(i)
+    seen, stack = {0}, [0]
+    while stack:
+        for j in adj[stack.pop()]:
+            if j not in seen:
+                seen.add(j); stack.append(j)
+    return len(seen) == nring
+
+
+def _topo_ok(verts, edges, rings, nring):
+    """Static chemical invariants: connected carbon graph, Euler V-E+F==1,
+    every edge in at most 2 rings."""
+    if not edges:
+        return False
+    adj = [[] for _ in range(len(verts))]
+    for a, c in edges:
+        adj[a].append(c); adj[c].append(a)
+    seen, stack = {0}, [0]
+    while stack:
+        i = stack.pop()
+        for j in adj[i]:
+            if j not in seen:
+                seen.add(j); stack.append(j)
+    if len(seen) != len(verts):
+        return False
+    if len(verts) - len(edges) + nring != 1:
+        return False
+    inc = {}
+    for r in rings:
+        for k in range(len(r)):
+            e = tuple(sorted((r[k], r[(k + 1) % len(r)])))
+            inc[e] = inc.get(e, 0) + 1
+            if inc[e] > 2:
+                return False                            # an edge shared by >2 rings
+    return True
+
+
+def _seg_disjoint_bad(p, q, r, s):
+    """Proper crossing or collinear interior overlap of segments pq and rs.
+    Used only for vertex-disjoint edges (shared endpoints never reach here)."""
+    d1 = np.cross(q - p, r - p); d2 = np.cross(q - p, s - p)
+    d3 = np.cross(s - r, p - r); d4 = np.cross(s - r, q - r)
+    if d1 * d2 < 0 and d3 * d4 < 0:
+        return True                                           # proper crossing
+    if abs(d1) < 1e-9 and abs(d2) < 1e-9 and abs(d3) < 1e-9 and abs(d4) < 1e-9:
+        t = np.dot(np.stack([r - p, s - p]), q - p) / np.dot(q - p, q - p)
+        lo, hi = min(t), max(t)
+        if lo < 1.0 - 1e-9 and hi > 1e-9:                     # interior overlap on the pq line
+            return True
+    return False
+
+
+def _geom_badness(verts, edges, rings):
+    """Count of geometric violations: inverted/degenerate rings + crossing or
+    overlapping disjoint edge pairs (incl. ring self-intersections). Also
+    returns the ring indices involved, for targeted repair."""
+    vs = np.asarray(verts, float)
+    nbad = 0
+    bad_rings = set()
+    v2r = {}
+    for ri, ring in enumerate(rings):
+        for vi in ring:
+            v2r.setdefault(vi, []).append(ri)
+        p = vs[ring]
+        if np.sum(p[:, 0] * np.roll(p[:, 1], -1) - np.roll(p[:, 0], -1) * p[:, 1]) <= 0:
+            nbad += 1; bad_rings.add(ri)
+    for (a, b_), (c, d) in itertools.combinations(edges, 2):
+        if len({a, b_, c, d}) < 4:
+            continue
+        if _seg_disjoint_bad(vs[a], vs[b_], vs[c], vs[d]):
+            nbad += 1
+            bad_rings |= set(v2r.get(a, ())) | set(v2r.get(b_, ())) | set(v2r.get(c, ())) | set(v2r.get(d, ()))
+    for ri, ring in enumerate(rings):
+        n = len(ring)
+        segs = [(ring[k], ring[(k + 1) % n]) for k in range(n)]
+        for k1 in range(n):
+            for k2 in range(k1 + 2, n):
+                if k1 == 0 and k2 == n - 1:
+                    continue                                  # adjacent (cyclic) edges share a vertex
+                if _seg_disjoint_bad(vs[segs[k1][0]], vs[segs[k1][1]], vs[segs[k2][0]], vs[segs[k2][1]]):
+                    nbad += 1; bad_rings.add(ri)
+    return nbad, bad_rings
+
+
+def _geom_bad(verts, edges, rings):
+    """Disjoint-edge crossings/overlaps, ring self-intersection, and
+    nonpositive (inverted) ring orientation."""
+    return _geom_badness(verts, edges, rings)[0] > 0
+
+
+def _refine_verts(verts, edges, rings, centers, b, lo=0.95, hi=1.05):
+    """SLSQP refine of shared vertex positions (normalized by b).
+
+    Objective: sum ||v-v0||^2 + 4*sum ||mean(v[ring])-center||^2. Hard
+    constraints for every distinct vertex pair |dv|^2 >= lo^2 and for bonded
+    pairs |dv|^2 <= hi^2. Returns refined verts (pixel units) or None."""
+    from scipy.optimize import minimize
+    v0 = np.asarray(verts, float) / b
+    ctr = np.asarray(centers, float) / b
+    rid = [i for i, r in enumerate(rings) for _ in r]
+    flat_idx = [v for r in rings for v in r]
+    ea = np.asarray(edges, int)
+    ii, jj = np.triu_indices(len(v0), 1)
+
+    def obj(v):
+        v = v.reshape(-1, 2)
+        acc = np.zeros((len(rings), 2)); cnt = np.zeros(len(rings))
+        np.add.at(acc, rid, v[flat_idx]); np.add.at(cnt, rid, 1)
+        return float(((v - v0)**2).sum() + 4.0 * ((acc / cnt[:, None] - ctr)**2).sum())
+
+    def cons(v):
+        v = v.reshape(-1, 2)
+        d2 = ((v[ii] - v[jj])**2).sum(1)
+        de = ((v[ea[:, 0]] - v[ea[:, 1]])**2).sum(1)
+        return np.concatenate([d2 - lo * lo, hi * hi - de])
+
+    res = minimize(obj, v0.ravel(), method='SLSQP', constraints=[{'type': 'ineq', 'fun': cons}],
+                   options=dict(maxiter=200, ftol=1e-8))
+    if not res.success or cons(res.x).min() < -1e-6:
+        return None
+    return res.x.reshape(-1, 2) * b
+
+
+def constrained_ring_graph(centers, R, b):
+    """Constrained fused-ring reconstruction: candidate duals = all Delaunay
+    edges in the fused window (0.85b<d<2.2b, wall score kept in the pair
+    record for diagnostics only) plus each single-edge deletion that keeps
+    the dual connected. Per-ring side assignment is constrained by cyclic
+    neighbor gaps (triangular gap -> step 1, else >=2). Candidates are
+    ranked by summed per-ring layout cost; the first <=8 ranked candidates
+    are tried for SLSQP geometric feasibility (all distinct pairs >=0.95b,
+    bonded <=1.05b, no edge crossings, valid invariants). Raises ValueError
+    when no physically admissible layout exists — never drops a ring.
+    Returns (verts, edges, rings, ns, pairs)."""
+    centers = np.asarray(centers, float)
+    nring = len(centers)
+    if nring == 0:
+        raise ValueError('constrained_ring_graph: no ring centers')
+    if nring < 3:
+        cand = [(i, j) for i, j in itertools.combinations(range(nring), 2)
+                if 0.85 * b < np.linalg.norm(centers[i] - centers[j]) < 2.2 * b]
+    else:
+        cand = sorted({tuple(sorted((int(a), int(c)))) for t in Delaunay(centers).simplices for a, c in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))})
+        cand = [(i, j) for i, j in cand if 0.85 * b < np.linalg.norm(centers[i] - centers[j]) < 2.2 * b]
+    rec = {(i, j): (i, j, float(np.linalg.norm(centers[i] - centers[j])), float(fused_wall_score(R, centers[i], centers[j], b))) if nring > 1 else None for i, j in cand}
+    pset0 = set(cand)
+
+    variants = [(None, pset0)]
+    for e in sorted(pset0):
+        trial = pset0 - {e}
+        if _dual_connected(trial, nring):
+            variants.append((e, trial))
+    scored = []
+    for deleted, pset in variants:
+        lay = _constrained_layout(centers, pset, nring)
+        if lay is None:
+            continue
+        ns, phase, side, cost = lay
+        try:
+            verts, edges, rings = graph_from_fused_rings(centers, [rec[e] for e in sorted(pset)], ns, b, assignment=(phase, side))
+        except ValueError:
+            continue
+        if not _topo_ok(verts, edges, rings, nring):
+            continue
+        scored.append((sum(cost.values()), deleted if deleted is not None else (-1, -1),
+                       verts, edges, rings, ns, pset))
+    scored.sort(key=lambda s: (s[0], s[1]))
+    for c_, deleted, verts, edges, rings, ns, pset in scored[:8]:
+        vr = _refine_verts(verts, edges, rings, centers, b)
+        if vr is None or _geom_bad(vr, edges, rings) or not _topo_ok(vr, edges, rings, nring):
+            continue
+        return vr, edges, rings, ns, [rec[e] for e in sorted(pset)]
+    raise ValueError(f'constrained_ring_graph: no physically admissible layout for {nring} centers ({len(scored)} ranked candidates)')
+
+
+# Fused-ring center-center distances in units of b (side length): the two
+# apothems of the joined n-gons. 5-5 = 1.376b, 5-6 = 1.554b, 6-6 = 1.732b.
+FUSED_D = np.array([2.0 * APO[5], APO[5] + APO[6], 2.0 * APO[6]])
+
+
+def _ideal_fused_centers(centers, pairs, ns, phase, side, b, anchor=0.3):
+    """Least-squares ideal ring centers for a fused-polygon embedding.
+
+    Each fused pair (i,j) pins its two shared-side corners: corner ka of ring
+    i coincides with corner kb of ring j -> linear equations c_i - c_j = rhs
+    in the unknown centers (regular polygons of circumradius CIRC[n]*b with
+    the fitted phases). Weak anchors (weight `anchor`) to the observed
+    centers fix the otherwise-free global translation/rotation. Use when the
+    observed positions are tip-distorted and untrustworthy."""
+    centers = np.asarray(centers, float)
+    nring = len(centers)
+    rho = np.array([CIRC[ns[i]] for i in range(nring)]) * b
+    def u(i, k):
+        th = phase[i] - np.pi / ns[i] + 2 * np.pi * k / ns[i]
+        return np.array([np.cos(th), np.sin(th)])
+    A, y = [], []
+    for i, j, *_ in pairs:
+        ki, kj = side[i, j], side[j, i]
+        for ka, kb in ((ki, (kj + 1) % ns[j]), ((ki + 1) % ns[i], kj)):
+            rhs = rho[j] * u(j, kb) - rho[i] * u(i, ka)
+            for d in (0, 1):
+                row = np.zeros(2 * nring); row[2 * i + d] = 1.0; row[2 * j + d] = -1.0
+                A.append(row); y.append(rhs[d])
+    if anchor > 0:
+        w = np.sqrt(anchor)
+        for i in range(nring):
+            for d in (0, 1):
+                row = np.zeros(2 * nring); row[2 * i + d] = w
+                A.append(row); y.append(w * centers[i, d])
+    c = np.linalg.lstsq(np.asarray(A), np.asarray(y), rcond=None)[0]
+    return c.reshape(-1, 2)
+
+
+def _layout_fails(centers, pset, nring):
+    """Ring indices with no legal 5/6 side-step assignment under fused pair
+    set pset (isolated rings count as failures for nring > 1)."""
+    adj = [[] for _ in range(nring)]
+    for i, j in pset:
+        adj[i].append(j); adj[j].append(i)
+    fails = []
+    for i in range(nring):
+        if not adj[i]:
+            if nring > 1:
+                fails.append(i)
+            continue
+        nb = sorted(adj[i], key=lambda j: np.arctan2(centers[j, 1] - centers[i, 1], centers[j, 0] - centers[i, 0]))
+        if _ring_layout(centers, i, nb, pset) is None:
+            fails.append(i)
+    return fails
+
+
+def constrained_ring_graph_distorted(centers, R, b, dwin=(0.60, 2.60), anchor=0.3, max_iter=250, max_kick=20):
+    """Distortion-tolerant fused-ring reconstruction for AFM images where tip
+    deflection (electrostatics, vdW) shifts apparent ring positions off their
+    true sites — the dots fix WHICH rings exist, not exact positions.
+
+    Differences vs constrained_ring_graph:
+      * candidates = ALL center pairs in dwin*b (not just Delaunay, wide
+        window), each scored by misfit to the fused distances in FUSED_D;
+      * repair = hill-climb over single-edge toggles (delete or re-add) on the
+        candidate dual, scored by (#rings with no legal side assignment,
+        topology/build failure, total distance misfit); connectivity is never
+        broken and no ring is ever dropped; local minima escape via forced
+        deletion of the worst-misfit edge at a failing ring ('kick');
+      * final geometry = IDEAL fused-polygon embedding (_ideal_fused_centers),
+        not the distorted dot positions.
+
+    Returns (verts, edges, rings, ns, pairs, toggled) — same convention as
+    constrained_ring_graph plus the list of toggled candidate pairs. Raises
+    ValueError when no admissible dual is found."""
+    centers = np.asarray(centers, float)
+    nring = len(centers)
+    if nring == 0:
+        raise ValueError('constrained_ring_graph_distorted: no ring centers')
+    if nring < 3:
+        v, e, rings, ns, pairs = constrained_ring_graph(centers, R, b)
+        return v, e, rings, ns, pairs, []
+    dm = np.linalg.norm(centers[:, None] - centers[None, :], axis=-1) / b
+    cand = [(i, j) for i, j in itertools.combinations(range(nring), 2)
+            if dwin[0] < dm[i, j] < dwin[1]]
+    rec = {e: (e[0], e[1], float(np.linalg.norm(centers[e[0]] - centers[e[1]])),
+               float(fused_wall_score(R, centers[e[0]], centers[e[1]], b))) for e in cand}
+    ecost = {e: float(np.abs(dm[e] - FUSED_D).min()) for e in cand}
+    pset = set(cand)
+    visited, kicks = set(), 0
+
+    def state_score(ps):
+        """(n_layout_fails, topo/build fail, n_geom_crossings, total misfit).
+        Geometry is scored on the IDEAL embedding — distorted positions only
+        steer topology, never decide it."""
+        nf = len(_layout_fails(centers, ps, nring))
+        if nf:
+            return (nf, 1, 999, 0.0), None
+        lay, _ = _constrained_layout_info(centers, ps, nring)
+        ns, phase, side, cost = lay
+        pairs = [rec[e] for e in sorted(ps)]
+        try:
+            v, ed, rg = graph_from_fused_rings(centers, pairs, ns, b, assignment=(phase, side))
+            ok = _topo_ok(v, ed, rg, nring)
+        except ValueError:
+            ok = False
+        if not ok:
+            return (0, 1, 999, sum(ecost[e] for e in ps)), None
+        cI = _ideal_fused_centers(centers, pairs, ns, phase, side, b, anchor)
+        try:
+            v, ed, rg = graph_from_fused_rings(cI, pairs, ns, b, assignment=(phase, side))
+            nbad, bad_rings = _geom_badness(v, ed, rg)
+        except ValueError:
+            nbad, bad_rings = 999, set()
+        return (0, 0, nbad, sum(ecost[e] for e in ps)), (lay, pairs, bad_rings)
+
+    for _ in range(max_iter):
+        sc, res = state_score(pset)
+        if sc[:3] == (0, 0, 0):
+            lay, pairs, _ = res
+            ns, phase, side, cost = lay
+            cI = _ideal_fused_centers(centers, pairs, ns, phase, side, b, anchor)
+            verts, edges, rings = graph_from_fused_rings(cI, pairs, ns, b, assignment=(phase, side))
+            return verts, edges, rings, ns, pairs, sorted(set(cand) ^ pset)
+        visited.add(frozenset(pset))
+        best_e, best_sc = None, sc
+        for e in cand:
+            t = pset ^ {e}
+            if frozenset(t) in visited:
+                continue
+            if e in pset and not _dual_connected(t, nring):
+                continue                                  # never disconnect the dual / isolate a ring
+            sc2, _ = state_score(t)
+            if sc2 < best_sc:
+                best_sc, best_e = sc2, e
+        if best_e is None:                                # local minimum -> forced 'kick'
+            fails = _layout_fails(centers, pset, nring)
+            if fails:
+                pool = [e for e in pset if any(f in e for f in fails)]
+            elif res is not None and res[2]:              # geom-bad terminal: toggle edges at the crossing rings
+                pool = [e for e in pset if any(f in e for f in res[2])]
+            else:
+                pool = list(pset)
+            for e in sorted(pool, key=lambda e: -ecost[e]):
+                t = pset - {e}
+                if frozenset(t) not in visited and _dual_connected(t, nring):
+                    best_e = e
+                    break
+            if best_e is None or (kicks := kicks + 1) > max_kick:
+                break
+        pset ^= {best_e}
+    raise ValueError(f'constrained_ring_graph_distorted: no admissible layout for {nring} centers ({len(visited)} states tried)')
+
+
+# ---------------------------------------------------------------------------
+# Staggered-grid molecular channels ("pixelization") for image->graph nets.
+# Atom channel: <=1 atom per ~1 A cell (atoms never closer than ~1 A), storing
+# occupancy + exact sub-cell offset + element. Bond channels: staggered ports —
+# each atom cell stores up to 3 links to the CELLS it is bonded to (a 1.4 A bond
+# on a 1 A grid can reach cells 2 apart, so links encode cell offset, not just
+# the 4 face-neighbor edges). Ring channel: same occ+offset as atoms.
+# ---------------------------------------------------------------------------
+
+BOND_DIRS = [(i, j) for j in range(-2, 3) for i in range(-2, 3)
+             if (i, j) != (0, 0) and (i < 0 or (i == 0 and j < 0))]   # canonical half of neighbor offsets
+
+
+def voxelize_mol(apos, bonds, cell=1.0, enames=None, ring_centers=None, origin=None, max_links=3):
+    """Molecule -> staggered-grid channels. See header above.
+
+    Returns dict of arrays on grid shape (H,W):
+      atom_occ (H,W) 0/1, atom_pos (H,W,2) absolute xy of the atom in that cell,
+      atom_elem (H,W) atomic number if enames given, bond_port (H,W,max_links,2)
+      cell offsets (di,dj) of each bonded neighbor (BOTH endpoints store the link),
+      ring_occ/ring_pos same scheme for ring centers, plus 'origin','cell'."""
+    xy = np.asarray(apos, float)[:, :2]
+    origin = (xy.min(axis=0) - cell) if origin is None else np.asarray(origin, float)
+    qi = np.floor((xy - origin) / cell).astype(int)
+    assert len(np.unique(qi, axis=0)) == len(qi), f'voxelize_mol: two atoms share a cell (cell={cell} too big)'
+    W, H = qi.max(axis=0) + 2, qi[:, 1].max() + 2
+    W = qi[:, 0].max() + 2
+    atom_occ = np.zeros((H, W)); atom_pos = np.zeros((H, W, 2))
+    atom_elem = np.zeros((H, W))
+    ports = np.zeros((H, W, max_links, 2), dtype=np.int8)
+    zof = {}
+    if enames is not None:
+        from spammm.elements import ELEMENTS
+        zof = {e[1]: e[0] for e in ELEMENTS}
+    for k, (ix, iy) in enumerate(qi):
+        atom_occ[iy, ix] = 1; atom_pos[iy, ix] = xy[k]
+        if enames is not None:
+            atom_elem[iy, ix] = zof[str(enames[k]).split('_')[0]]
+    for i, j in bonds:
+        d = qi[j] - qi[i]
+        assert abs(d[0]) <= 2 and abs(d[1]) <= 2, f'voxelize_mol: bond {i}-{j} spans >2 cells — increase cell'
+        ci, cj = qi[i], qi[j]
+        for (ix, iy), dd in ((ci, d), (cj, -d)):
+            free = np.flatnonzero((ports[iy, ix] == 0).all(axis=1))
+            assert len(free), f'voxelize_mol: atom cell has >{max_links} bonds'
+            ports[iy, ix, free[0]] = dd
+    out = dict(atom_occ=atom_occ, atom_pos=atom_pos, atom_elem=atom_elem, bond_port=ports, origin=origin, cell=cell)
+    if ring_centers is not None:
+        rc = np.asarray(ring_centers, float).reshape(-1, 2)
+        rq = np.floor((rc - origin) / cell).astype(int)
+        ring_occ = np.zeros((H, W)); ring_pos = np.zeros((H, W, 2))
+        for p, (ix, iy) in zip(rc, rq):
+            if 0 <= iy < H and 0 <= ix < W:
+                assert ring_occ[iy, ix] == 0, 'voxelize_mol: two ring centers share a cell'
+                ring_occ[iy, ix] = 1; ring_pos[iy, ix] = p
+        out.update(ring_occ=ring_occ, ring_pos=ring_pos)
+    return out
+
+
+def unvoxelize_mol(g):
+    """Staggered-grid channels -> (apos, bonds, ring_centers). Round-trip check."""
+    iy, ix = np.nonzero(g['atom_occ'])
+    apos = g['atom_pos'][iy, ix]
+    idx = {(x, y): k for k, (x, y) in enumerate(zip(ix, iy))}
+    bonds = set()
+    for x, y in zip(ix, iy):
+        for d in g['bond_port'][y, x]:
+            if not d.any():
+                continue
+            jx, jy = x + d[0], y + d[1]
+            assert (jx, jy) in idx, 'unvoxelize_mol: port points at empty cell'
+            bonds.add(tuple(sorted((idx[(x, y)], idx[(jx, jy)]))))
+    rc = g['ring_pos'][np.nonzero(g['ring_occ'])] if 'ring_occ' in g else np.zeros((0, 2))
+    return apos, sorted(bonds), rc
+
+
+def voxelize_mol_smooth(apos, bonds, cell=0.5, enames=None, ring_centers=None, origin=None, shape=None):
+    """Smooth (bilinear-splatted) molecular channels — translation-equivariant
+    version of voxelize_mol. Each feature's weight is distributed over its 4
+    surrounding cell centers; each cell stores the weighted residual offset to
+    the feature's true position (not absolute coordinates).
+
+    Returns dict on grid (H,W):
+      atom_w, atom_off(H,W,2)  — atom weight splat + residual to atom pos
+      atom_elem (H,W)          — weighted mean Z (integer where single atom)
+      bond_w, bond_off(H,W,2)  — bond-MIDPOINT splat + residual to midpoint
+      bond_vec (H,W,2)         — weighted mean HALF-vector (pB-pA)/2; endpoints = mid +- vec
+      ring_w, ring_off         — ring-center splat + residual
+    With cell <= 0.5 the splat footprints of features >= ~1 A apart never share a
+    cell, so every occupied cell encodes exactly one feature (no mixing)."""
+    xy = np.asarray(apos, float)[:, :2]
+    origin = (xy.min(axis=0) - 2 * cell) if origin is None else np.asarray(origin, float)
+    if shape is None:
+        span = np.ceil((xy.max(axis=0) - origin) / cell) + 3
+        W, H = int(span[0]), int(span[1])
+    else:
+        H, W = shape
+
+    def splat(pts):
+        """pts (M,2) -> weight (H,W), residual (H,W,2).
+        Cell (i,j) covers [origin+i*cell, origin+(i+1)*cell) — its CENTER is
+        origin+(i+0.5)*cell; weights/offsets are relative to centers."""
+        w = np.zeros((H, W)); res = np.zeros((H, W, 2))
+        u = (pts - origin) / cell - 0.5                # position in cell-center coords
+        i0, j0 = np.floor(u[:, 0]).astype(int), np.floor(u[:, 1]).astype(int)
+        fx, fy = u[:, 0], u[:, 1]
+        for di in (0, 1):
+            for dj in (0, 1):
+                i, j = i0 + di, j0 + dj
+                ok = (i >= 0) & (i < W) & (j >= 0) & (j < H)
+                wt = (1 - np.abs(fx - i)) * (1 - np.abs(fy - j))
+                ii, jj, ww = i[ok], j[ok], wt[ok]
+                cen = origin + cell * (np.stack([ii, jj], axis=1) + 0.5)
+                np.add.at(w, (jj, ii), ww)
+                np.add.at(res[..., 0], (jj, ii), ww * (pts[ok, 0] - cen[:, 0]))
+                np.add.at(res[..., 1], (jj, ii), ww * (pts[ok, 1] - cen[:, 1]))
+        m = w > 0
+        res[m] /= w[m, None]
+        return w, res
+
+    def splat_val(pts, val):
+        """Bilinear splat of per-point scalar val -> (H,W) weighted sum."""
+        wv = np.zeros((H, W))
+        u = (pts - origin) / cell - 0.5
+        i0, j0 = np.floor(u[:, 0]).astype(int), np.floor(u[:, 1]).astype(int)
+        for di in (0, 1):
+            for dj in (0, 1):
+                i, j = i0 + di, j0 + dj
+                ok = (i >= 0) & (i < W) & (j >= 0) & (j < H)
+                wt = (1 - np.abs(u[ok, 0] - i[ok])) * (1 - np.abs(u[ok, 1] - j[ok]))
+                np.add.at(wv, (j[ok], i[ok]), wt * val[ok])
+        return wv
+
+    atom_w, atom_off = splat(xy)
+    out = dict(atom_w=atom_w, atom_off=atom_off, origin=origin, cell=cell)
+    if enames is not None:
+        from spammm.elements import ELEMENTS
+        zof = {e[1]: e[0] for e in ELEMENTS}
+        Zs = np.array([zof[str(e).split('_')[0]] for e in enames], float)
+        zw = splat_val(xy, Zs)
+        m = atom_w > 0
+        out['atom_elem'] = np.where(m, zw / np.maximum(atom_w, 1e-9), 0)
+    if bonds is not None and len(bonds):
+        bnd = np.asarray(bonds)
+        mid = 0.5 * (xy[bnd[:, 0]] + xy[bnd[:, 1]])
+        hv = 0.5 * (xy[bnd[:, 1]] - xy[bnd[:, 0]])
+        bond_w, bond_off = splat(mid)
+        # splat the half-vectors with the same bilinear weights, normalized by w
+        bvec = np.zeros((H, W, 2))
+        bvec[..., 0] = splat_val(mid, hv[:, 0]); bvec[..., 1] = splat_val(mid, hv[:, 1])
+        m = bond_w > 0
+        bvec[m] /= bond_w[m, None]
+        out.update(bond_w=bond_w, bond_off=bond_off, bond_vec=bvec)
+    if ring_centers is not None:
+        ring_w, ring_off = splat(np.asarray(ring_centers, float).reshape(-1, 2))
+        out.update(ring_w=ring_w, ring_off=ring_off)
+    return out
+
+
+def unvoxelize_mol_smooth(g, thr=0.15, merge=0.4):
+    """Decode smooth channels back to (apos, bonds, ring_centers).
+    Every cell with weight > thr proposes feature pos = cell_center + offset;
+    proposals of the same feature land < merge*cell apart and are weight-averaged."""
+    cell, origin = g['cell'], g['origin']
+
+    def collect(w, off):
+        pts, wts = [], []
+        for j, i in zip(*np.nonzero(w > thr)):
+            pts.append(origin + cell * (np.array([i, j]) + 0.5) + off[j, i]); wts.append(w[j, i])
+        if not pts:
+            return np.zeros((0, 2)), np.zeros(0)
+        pts, wts = np.asarray(pts), np.asarray(wts)
+        order = np.argsort(-wts); taken = np.zeros(len(pts), bool)
+        outp, outw = [], []
+        for k in order:
+            if taken[k]:
+                continue
+            grp = np.linalg.norm(pts - pts[k], axis=1) < merge * cell * 2 + 0.01 * cell
+            grp &= ~taken
+            taken |= grp
+            outp.append((pts[grp] * wts[grp, None]).sum(0) / wts[grp].sum()); outw.append(wts[grp].sum())
+        return np.asarray(outp), np.asarray(outw)
+
+    apos, _ = collect(g['atom_w'], g['atom_off'])
+    iy, ix = np.nonzero(g['bond_w'] > thr)
+    mids, vecs, bwts = [], [], []
+    for j, i in zip(iy, ix):
+        mids.append(origin + cell * (np.array([i, j]) + 0.5) + g['bond_off'][j, i])
+        vecs.append(g['bond_vec'][j, i]); bwts.append(g['bond_w'][j, i])
+    bonds = []
+    if mids:
+        mids, vecs, bwts = np.asarray(mids), np.asarray(vecs), np.asarray(bwts)
+        order = np.argsort(-bwts); taken = np.zeros(len(mids), bool)
+        for k in order:
+            if taken[k]:
+                continue
+            grp = (np.linalg.norm(mids - mids[k], axis=1) < merge * cell * 2 + 0.01 * cell) & ~taken
+            taken |= grp
+            mid = (mids[grp] * bwts[grp, None]).sum(0) / bwts[grp].sum()
+            vec = (vecs[grp] * bwts[grp, None]).sum(0) / bwts[grp].sum()
+            bonds.append((mid - vec, mid + vec))               # endpoint pair
+    rc, _ = collect(g['ring_w'], g['ring_off']) if 'ring_w' in g else (np.zeros((0, 2)), None)
+    return apos, bonds, rc
+
+
+def voxelize_mol_hard(apos, bonds, cell=0.5, enames=None, ring_centers=None, origin=None, shape=None):
+    """HARD single-cell occupancy — alternative to voxelize_mol_smooth.
+    Each feature occupies exactly the ONE cell containing it (floor indexing):
+    w=1 there, 0 elsewhere (no bilinear smear). The cell still stores the
+    residual offset center->feature, so precision is retained. Sparse by
+    construction: activation maps are Dirac combs, never continuous.
+    Same dict layout as voxelize_mol_smooth (w, off, bond_vec in UNITS of
+    the caller's coordinate system; offsets in [-0.5, 0.5]*cell)."""
+    xy = np.asarray(apos, float)[:, :2]
+    origin = (xy.min(axis=0) - 2 * cell) if origin is None else np.asarray(origin, float)
+    if shape is None:
+        span = np.ceil((xy.max(axis=0) - origin) / cell) + 3
+        W, H = int(span[0]), int(span[1])
+    else:
+        H, W = shape
+
+    def assign(pts, tag='feature'):
+        """pts (M,2) -> w (H,W) 0/1, res (H,W,2) offset center->point.
+        Containing cell = floor((pts-origin)/cell), half-open bounds; two
+        features in one cell are unrepresentable -> raise, never merge."""
+        w = np.zeros((H, W)); res = np.zeros((H, W, 2))
+        u = np.floor((pts - origin) / cell).astype(int)          # containing cell
+        owner = {}
+        for f, ((i, j), p) in enumerate(zip(u, pts)):
+            if 0 <= i < W and 0 <= j < H:
+                if w[j, i]:
+                    raise ValueError(f'voxelize_mol_hard: {tag} cell collision at ({i},{j}) between features {owner[i, j]} and {f}')
+                owner[i, j] = f
+                w[j, i] = 1
+                res[j, i] = p - (origin + cell * (np.array([i, j]) + 0.5))
+        return w, res
+
+    atom_w, atom_off = assign(xy, 'atom')
+    out = dict(atom_w=atom_w, atom_off=atom_off, origin=origin, cell=cell)
+    if enames is not None:
+        from spammm.elements import ELEMENTS
+        zof = {e[1]: e[0] for e in ELEMENTS}
+        ae = np.zeros((H, W))
+        u = np.floor((xy - origin) / cell).astype(int)
+        Zs = np.array([zof[str(e).split('_')[0]] for e in enames], float)
+        for (i, j), z in zip(u, Zs):
+            if 0 <= i < W and 0 <= j < H: ae[j, i] = z
+        out['atom_elem'] = ae
+    if bonds is not None and len(bonds):
+        bnd = np.asarray(bonds)
+        mid = 0.5 * (xy[bnd[:, 0]] + xy[bnd[:, 1]])
+        hv = 0.5 * (xy[bnd[:, 1]] - xy[bnd[:, 0]])
+        bond_w, bond_off = assign(mid, 'bond')
+        bvec = np.zeros((H, W, 2))
+        u = np.floor((mid - origin) / cell).astype(int)
+        for (i, j), v in zip(u, hv):
+            if 0 <= i < W and 0 <= j < H: bvec[j, i] = v
+        out.update(bond_w=bond_w, bond_off=bond_off, bond_vec=bvec)
+    if ring_centers is not None:
+        ring_w, ring_off = assign(np.asarray(ring_centers, float).reshape(-1, 2), 'ring')
+        out.update(ring_w=ring_w, ring_off=ring_off)
+    return out
+
+
+def unvoxelize_mol_hard(g, thr=0.5):
+    """Decode hard-occupancy channels -> (apos, bonds, ring_centers).
+    Prediction maps may still be soft/delocalized, so apply non-max
+    suppression: a cell counts only if w>thr AND it is the 3x3 local max.
+    Then pos = cell_center + offset (no weight averaging — one cell/feature)."""
+    cell, origin = g['cell'], g['origin']
+    from scipy.ndimage import maximum_filter
+
+    def collect(w, off):
+        mx = maximum_filter(w, size=3, mode='constant')
+        jy, ix = np.nonzero((w > thr) & (w >= mx))
+        if len(jy) == 0:
+            return np.zeros((0, 2))
+        pts = origin + cell * (np.stack([ix, jy], 1) + 0.5) + off[jy, ix]
+        return pts
+
+    apos = collect(g['atom_w'], g['atom_off'])
+    bonds = []
+    if 'bond_w' in g:
+        mx = maximum_filter(g['bond_w'], size=3, mode='constant')
+        jy, ix = np.nonzero((g['bond_w'] > thr) & (g['bond_w'] >= mx))
+        for j, i in zip(jy, ix):
+            mid = origin + cell * (np.array([i, j]) + 0.5) + g['bond_off'][j, i]
+            bonds.append((mid - g['bond_vec'][j, i], mid + g['bond_vec'][j, i]))
+    rc = collect(g['ring_w'], g['ring_off']) if 'ring_w' in g else np.zeros((0, 2))
+    return apos, bonds, rc
+
+
+def ring_faces(apos, bonds, enames=None, max_ring=8):
+    """Planar faces of a fused graph: shortest cycle through each bond with that
+    bond removed (BFS), deduplicated. Returns list of atom-index lists."""
+    nbr = {}
+    heavy = range(len(apos)) if enames is None else [i for i, e in enumerate(enames) if str(e).split('_')[0] != 'H']
+    hset = set(heavy)
+    for i, j in bonds:
+        if i in hset and j in hset:
+            nbr.setdefault(i, []).append(j); nbr.setdefault(j, []).append(i)
+    faces, seen = [], set()
+    from collections import deque
+    for a, c in bonds:
+        if a not in hset or c not in hset:
+            continue
+        dist = {a: 0}; par = {a: None}; q = deque([a])
+        while q:
+            u = q.popleft()
+            for v in nbr.get(u, []):
+                if (u, v) == (a, c) or (v, u) == (a, c):
+                    continue
+                if v not in dist:
+                    dist[v] = dist[u] + 1; par[v] = u; q.append(v)
+        if c not in dist or dist[c] > max_ring - 1:
+            continue
+        path = [c]
+        while path[-1] != a:
+            path.append(par[path[-1]])
+        key = tuple(sorted(path))
+        if key not in seen:
+            seen.add(key); faces.append(path)
+    return faces
+
+
+def ring_dual_proposals(centers, R, b, dwin=(0.85, 2.2)):
+    """Fused-side candidates (pairs with distance + wall evidence) and
+    per-ring n in {5,6} from neighbor-angle consistency. Used by
+    graph_from_ring_centers and by repair loops needing _deg_violation_rings."""
     centers = np.asarray(centers, float)
     if len(centers) < 3:
         raise ValueError('Need at least three ring centers for fused topology')
     triangles = Delaunay(centers).simplices
     candidates = sorted({tuple(sorted((int(a), int(c)))) for t in triangles for a, c in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))})
     pairs = [(i, j, float(np.linalg.norm(centers[i] - centers[j])), float(fused_wall_score(R, centers[i], centers[j], b))) for i, j in candidates]
-    pairs = [p for p in pairs if 0.85 * b < p[2] < 2.2 * b and p[3] > 0]
+    pairs = [p for p in pairs if dwin[0] * b < p[2] < dwin[1] * b and p[3] > 0]   # fused side = 1.3-1.8b; gap-spanning links are not sides
     adj = [[] for _ in centers]
     for i, j, *_ in pairs:
         adj[i].append(j); adj[j].append(i)
@@ -815,6 +1753,226 @@ def graph_from_ring_centers(centers, R, b):
     for i, js in enumerate(adj):
         angles = [np.arctan2(centers[j, 1] - centers[i, 1], centers[j, 0] - centers[i, 0]) for j in js]
         ns[i] = 5 if n_score_ang(angles, 5) > n_score_ang(angles, 6) else 6
+    return pairs, ns
+
+
+def consistent_pairs(centers, pairs, ns, b, tol=0.45):
+    """Drop fused-side proposals whose claimed shared EDGE does not
+    geometrically coincide: after per-ring phase assignment, the side of ring i
+    facing j and the side of j facing i must cover the same two corner
+    positions (within tol*b), and no ring corner may be claimed by two
+    different fused sides. Returns the filtered pair list."""
+    centers = np.asarray(centers, float)
+    adj, phase, side = _assign_sides(centers, pairs, ns)
+    # corner positions per ring: vertex k sits at phase - pi/n + 2pi k/n
+    def corners(i):
+        n = ns[i]
+        th = phase[i] - np.pi / n + 2 * np.pi * np.arange(n) / n
+        return centers[i] + b * CIRC[n] * np.stack((np.cos(th), np.sin(th)), axis=1)
+    keep = []
+    for pi, (i, j, d, w) in enumerate(pairs):
+        if (i, j) not in side or (j, i) not in side: continue
+        ki, kj = side[i, j], side[j, i]
+        ci, cj = corners(i), corners(j)
+        seg_i = ci[[ki, (ki + 1) % ns[i]]]; seg_j = cj[[kj, (kj + 1) % ns[j]]]
+        err = min(np.linalg.norm(seg_i - seg_j, axis=1).mean(),
+                  np.linalg.norm(seg_i - seg_j[::-1], axis=1).mean()) / b
+        if err < tol:
+            keep.append((i, j, d, w))
+    return keep
+
+
+def _assign_sides(centers, pairs, ns):
+    """Per-ring phase fit + Hungarian side assignment (as graph_from_fused_rings).
+    Returns (adj, side dict (i,j)->side index of i facing j)."""
+    nring = len(centers)
+    adj = [[] for _ in range(nring)]
+    for i, j, *_ in pairs:
+        adj[i].append(j); adj[j].append(i)
+    phase, side = {}, {}
+    for i in range(nring):
+        n = ns[i]
+        if not adj[i]:
+            phase[i] = 0.0; continue
+        alpha = np.arctan2(centers[np.asarray(adj[i]), 1] - centers[i, 1], centers[np.asarray(adj[i]), 0] - centers[i, 0])
+        best = (np.inf, None, None)
+        for psi in np.linspace(0, 2 * np.pi / n, 181, endpoint=False):
+            normals = psi + 2 * np.pi * np.arange(n) / n
+            err = np.abs(np.angle(np.exp(1j * (alpha[:, None] - normals[None, :]))))
+            rows, cols = linear_sum_assignment(err)
+            v = np.square(err[rows, cols]).sum()
+            if v < best[0]: best = (v, psi, cols)
+        phase[i] = best[1]
+        for j, k in zip(adj[i], best[2]):
+            side[i, j] = int(k)
+    return adj, phase, side
+
+
+def _legal(pairs, ns, centers, b):
+    try:
+        graph_from_fused_rings(centers, pairs, ns, b); return True
+    except ValueError:
+        return False
+
+
+def vertex_collisions(verts, edges, rings, tol):
+    """Hard chemical check: two DISTINCT atoms can never be closer than a bond.
+    Returns {ring_pair: n_collisions} for every pair of rings whose drawn
+    corners lie < tol apart without being the same vertex. Same-ring corner
+    collisions count under (i,i)."""
+    eset = {tuple(sorted(e)) for e in edges}
+    owner = {}
+    for ri, r in enumerate(rings):
+        for v in r:
+            owner.setdefault(v, []).append(ri)
+    bad = {}
+    for i in range(len(verts)):
+        for j in range(i + 1, len(verts)):
+            if (i, j) in eset: continue                       # bonded atoms ARE a bond apart... but tol<b so bonded never triggers
+            if np.linalg.norm(verts[i] - verts[j]) < tol:
+                for ri in owner.get(i, []):
+                    for rj in owner.get(j, []):
+                        key = (ri, rj) if ri <= rj else (rj, ri)
+                        bad[key] = bad.get(key, 0) + 1
+    return bad
+
+
+def _violation_vertices(centers, pairs, ns, b):
+    """Replay the fused-side union. Returns dict {vertex_id: [rings]} for every
+    degree->3 carbon plus list of rings whose corners collapse."""
+    centers = np.asarray(centers, float)
+    nring = len(centers)
+    offsets = np.r_[0, np.cumsum([ns[i] for i in range(nring)])]
+    parent = np.arange(offsets[-1])
+    def root(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]; a = parent[a]
+        return a
+    def union(a, c):
+        parent[root(c)] = root(a)
+    adj, phase, side = _assign_sides(centers, pairs, ns)
+    overflow = [i for i in range(nring) if len(adj[i]) > ns[i]]
+    try:
+        for i, j, *_ in pairs:
+            ki, kj = side[i, j], side[j, i]
+            union(offsets[i] + ki, offsets[j] + (kj + 1) % ns[j]); union(offsets[i] + (ki + 1) % ns[i], offsets[j] + kj)
+    except KeyError:
+        return {}, overflow if overflow else list(range(nring))
+    roots = np.array([root(q) for q in range(offsets[-1])])
+    _, ids = np.unique(roots, return_inverse=True)
+    rings = [ids[offsets[i]:offsets[i + 1]].tolist() for i in range(nring)]
+    collapsed = [i for i, r in enumerate(rings) if len(set(r)) != len(r)]
+    edges = sorted({tuple(sorted((r[k], r[(k + 1) % len(r)]))) for r in rings for k in range(len(r))})
+    deg = np.bincount(np.asarray(edges).ravel(), minlength=ids.max() + 1) if edges else np.zeros(1, int)
+    badv = {v: [i for i, r in enumerate(rings) if v in r] for v in np.where(deg > 3)[0]}
+    return badv, collapsed
+
+
+def repair_fused_graph(centers, pairs, ns, b, R=None, max_iter=60):
+    """Repair an invalid fused dual WITHOUT losing rings. Degree-4 carbons come
+    from 'V' triple junctions — three rings claiming one vertex via only two
+    fused pairs. Physical fixes tried in order:
+      1. ADD the missing third pair when the two centers are at fused distance
+         (d < ~1.95b) — coronene-type triple junction.
+      2. FLIP n of a ring at the vertex (5<->6 changes side spacing 60<->72 deg).
+      3. Only then is one claimed fusion false: report the violating rings as
+         suspects for the caller (a ring center must be a false positive —
+         min-distance prior forbids close non-fused rings).
+    Returns (pairs, ns, suspects) — suspects empty on success."""
+    centers = np.asarray(centers, float)
+    pairs = list(pairs); ns = dict(ns)
+    def refit_ns():
+        adj = [[] for _ in range(len(centers))]
+        for i, j, *_ in pairs:
+            adj[i].append(j); adj[j].append(i)
+        for i, js in enumerate(adj):
+            if js:
+                a = [np.arctan2(centers[j, 1] - centers[i, 1], centers[j, 0] - centers[i, 0]) for j in js]
+                ns[i] = 5 if n_score_ang(a, 5) > n_score_ang(a, 6) else 6
+    suspects = []
+    for _ in range(max_iter):
+        if _legal(pairs, ns, centers, b):
+            refit_ns()
+            if not _legal(pairs, ns, centers, b):
+                continue
+            verts, edges, rings = graph_from_fused_rings(centers, pairs, ns, b)
+            coll = vertex_collisions(verts, edges, rings, 0.6 * b)
+            if not coll:
+                return pairs, ns, []
+            # unbonded atoms closer than a bond — impossible. If the two rings
+            # are at fused distance with free sides they MUST fuse; else FP.
+            adj0 = [[] for _ in range(len(centers))]
+            for i, j, *_ in pairs:
+                adj0[i].append(j); adj0[j].append(i)
+            pset0 = {tuple(sorted((p[0], p[1]))) for p in pairs}
+            progressed = False
+            for (i, j), cnt in sorted(coll.items(), key=lambda kv: -kv[1]):
+                if i == j:
+                    suspects = [i]; return pairs, ns, suspects
+                if tuple(sorted((i, j))) in pset0: continue
+                d = float(np.linalg.norm(centers[i] - centers[j]))
+                if d < 1.95 * b and len(adj0[i]) < ns[i] and len(adj0[j]) < ns[j]:
+                    w = float(fused_wall_score(R, centers[i], centers[j], b)) if R is not None else 0.0
+                    pairs.append((i, j, d, w)); progressed = True; break
+            if not progressed:
+                (i, j), _ = max(coll.items(), key=lambda kv: kv[1])
+                suspects = [i, j]
+                return pairs, ns, suspects
+            continue
+        badv, collapsed = _violation_vertices(centers, pairs, ns, b)
+        adj = [[] for _ in range(len(centers))]
+        for i, j, *_ in pairs:
+            adj[i].append(j); adj[j].append(i)
+        pset = {tuple(sorted((p[0], p[1]))): p for p in pairs}
+        if collapsed:
+            cand = [p for p in pairs if collapsed[0] in (p[0], p[1])]
+            if not cand:
+                suspects = [collapsed[0]]; return pairs, ns, suspects
+            pairs.remove(min(cand, key=lambda p: p[3])); continue
+        if not badv:
+            return pairs, ns, []
+        rh = badv[sorted(badv)[0]]
+        # 1) add a missing pair inside the junction when fused distance allows
+        missing = [(i, j) for i, j in itertools.combinations(rh, 2) if tuple(sorted((i, j))) not in pset]
+        added = False
+        for i, j in sorted(missing, key=lambda p: np.linalg.norm(centers[p[0]] - centers[p[1]])):
+            d = float(np.linalg.norm(centers[i] - centers[j]))
+            if d > 1.95 * b: continue
+            if len(adj[i]) >= ns[i] or len(adj[j]) >= ns[j]: continue
+            w = float(fused_wall_score(R, centers[i], centers[j], b)) if R is not None else 0.0
+            trial = pairs + [(i, j, d, w)]
+            if _legal(trial, ns, centers, b) or len(_violation_vertices(centers, trial, ns, b)[0]) < len(badv):
+                pairs = trial; added = True; break
+        if added: continue
+        # 2) flip n of a ring at the vertex if it reduces violations
+        flipped = False
+        for w in rh:
+            ns2 = dict(ns); ns2[w] = 11 - ns[w]
+            if len(adj[w]) > ns2[w]: continue
+            nb2, _ = _violation_vertices(centers, pairs, ns2, b)
+            if len(nb2) < len(badv):
+                ns[w] = ns2[w]; flipped = True; break
+        if flipped: continue
+        # 3) unresolvable by side-level edits — these rings contain a false center
+        suspects = rh
+        return pairs, ns, suspects
+    return pairs, ns, suspects if suspects else list(range(len(centers)))
+
+
+def graph_from_ring_centers(centers, R, b):
+    """Infer a planar fused dual and exact carbon graph from reviewed centers.
+
+    Candidate shared sides come from Delaunay adjacency and bright wall
+    evidence, geometrically filtered by consistent_pairs, then repaired by
+    repair_fused_graph (drops weakest false-fusion pair at degree-4 vertices).
+    Rare pentagons follow fivefold neighbor-angle consistency.
+    """
+    centers = np.asarray(centers, float)
+    pairs, ns = ring_dual_proposals(centers, R, b)
+    pairs = consistent_pairs(centers, pairs, ns, b)
+    pairs, ns, suspects = repair_fused_graph(centers, pairs, ns, b, R=R)
+    if suspects:
+        raise ValueError(f'Unrepairable fused dual; suspect rings: {suspects}')
     verts, edges, rings = graph_from_fused_rings(centers, pairs, ns, b)
     return verts, edges, rings, ns, pairs
 
@@ -1003,8 +2161,10 @@ LATTICE_NN = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, -1), (-1, 1))
 
 def _deg_violation_rings(cxy, sub_pairs, ns):
     """Replay the shared-corner union of graph_from_fused_rings; return the set
-    of ring indices contributing to any vertex with >3 distinct rings, or any
-    ring whose own corners collapsed. Diagnostic for repair, not geometry."""
+    of ring indices contributing to any vertex with >3 distinct rings, any
+    vertex with >3 incident EDGES (degree-4 carbon — 3 rings at a vertex with
+    inconsistent corner alignment also produces this), or any ring whose own
+    corners collapsed. Diagnostic for repair, not geometry."""
     from collections import defaultdict
     nring = len(cxy)
     offsets = np.r_[0, np.cumsum([ns[i] for i in range(nring)])]
@@ -1052,6 +2212,24 @@ def _deg_violation_rings(cxy, sub_pairs, ns):
     for i in range(nring):
         if len({root(offsets[i] + k) for k in range(ns[i])}) != ns[i]:
             bad.add(i)
+        if len(adj[i]) > ns[i]:                             # more fused sides than the polygon has
+            bad.add(i)
+    # degree-4 carbons: count edges incident on each merged vertex
+    roots = np.array([root(a) for a in range(offsets[-1])])
+    _, ids = np.unique(roots, return_inverse=True)
+    vedges = defaultdict(set)
+    for i in range(nring):
+        for k in range(ns[i]):
+            vedges[tuple(sorted((ids[offsets[i] + k], ids[offsets[i] + (k + 1) % ns[i]])))].add(i)
+    vdeg = defaultdict(set)
+    for (a, c), rs in vedges.items():
+        vdeg[a] |= rs; vdeg[c] |= rs
+    deg = defaultdict(int)
+    for a, c in vedges:
+        deg[a] += 1; deg[c] += 1
+    for v, d in deg.items():
+        if d > 3:
+            bad |= vdeg[v]
     return bad
 
 

@@ -1340,13 +1340,151 @@ def main_ptcda():
     print('Done.')
 
 
+def run_fdbm_compression(cache_dir, out_dir, grid_step=0.1, bspl_steps=(0.8, 0.5), n_iter=400, z_modes=6, poly_z0=1.8, poly_R=12.0):
+    """Compress one cached FDBM field; independent holdout and matched PP scan comparison."""
+    import time
+    from spammm.SPM import AFM as afm_mod, AFM_utils as au
+    from spammm.surfaces.ContactSurface import SeparableParams, _bspline_prefilter_2d, bspline_n_intervals, make_fit_grid_zstack
+    from tests.helpers.parity import rmse, max_err, correlation
+
+    os.makedirs(out_dir, exist_ok=False)
+    cache_dir = os.path.abspath(cache_dir)
+    molecule = os.path.basename(os.path.normpath(cache_dir))
+    field_path = os.path.join(cache_dir, 'cache_stage3_potentials_prolonged.npz')
+    grid_path = os.path.join(cache_dir, 'cache_stage2_grids.npz')
+    stages_path = os.path.join(cache_dir, 'brstm_stages.npz')
+    with np.load(field_path, allow_pickle=False) as data:
+        field = np.ascontiguousarray(data['F_total'], dtype=np.float32)
+        E_sum = data['E_pauli_field'] + data['E_ES_field'] + data['E_vdw']
+        assert np.allclose(field[..., 3], E_sum, rtol=2e-5, atol=2e-5), 'FDBM energy channel does not match its component sum'
+    with np.load(grid_path, allow_pickle=False) as data:
+        origin, ngrid = data['origin'].copy(), data['ngrid'].copy()
+    with np.load(stages_path, allow_pickle=False) as data:
+        apos = data['atomPos'].copy()
+        scan_xs, scan_ys = data['scan_xs'].copy(), data['scan_ys'].copy()
+        source_h_scan = data['heights_scan'].copy()
+        projection = str(data['projection'])
+    assert tuple(ngrid) == field.shape[:3] and field.shape[-1] == 4
+    assert np.isfinite(field).all() and np.isfinite(apos).all()
+    scan_dx, scan_dy = float(scan_xs[1] - scan_xs[0]), float(scan_ys[1] - scan_ys[0])
+    assert np.allclose(np.diff(scan_xs), scan_dx, atol=2e-6) and np.allclose(np.diff(scan_ys), scan_dy, atol=2e-6), 'Source scan must be a uniform raster'
+    mol_z = float(apos[:, 2].max())
+    h_df, h_Fz, h_scan = au.afm_df_height_stacks(3.7, 4.7, 0.1, amp=1.0, amp_align=True)
+    assert source_h_scan.shape == h_scan.shape and np.allclose(source_h_scan, h_scan, atol=1e-5), 'Cached scan uses different height convention'
+    afm = afm_mod.AFMulator(use_morse=False, use_fire=True)
+    dev = afm.ctx.devices[0]
+    assert 'nvidia' in (dev.name + dev.vendor).lower(), f'NVIDIA required, got {dev.name}'
+    afm.setup_fdbm_grid(field, origin, grid_step)
+    K_lat, K_rad, L = afm_mod.stiffness_Nm_to_eVA2(0.5), 20.0, 3.0
+    afm.stiffness = np.array([-K_lat, -K_lat, -K_lat, -K_rad], dtype=np.float32)
+    afm.dpos0 = np.array([0., 0., -L, L], dtype=np.float32)
+    afm.surfFF[:] = 0.0
+    xlo, xhi = float(scan_xs[0]) - 0.75, float(scan_xs[-1]) + 0.75
+    ylo, yhi = float(scan_ys[0]) - 0.75, float(scan_ys[-1]) + 0.75
+    fit_heights = np.arange(2.4, 7.0001, 0.15)
+    xyz = make_fit_grid_zstack(xlo, xhi, ylo, yhi, mol_z + fit_heights, 0.25, 0.25)
+    ns = len(xyz)
+    pad = (-ns) % 32
+    xyz = np.concatenate([xyz, np.repeat(xyz[:1], pad, axis=0)])
+    weights = np.concatenate([np.ones(ns), np.zeros(pad)])
+    print(f'FDBM reference: {field_path}; grid={field.shape} step={grid_step} origin={origin} device={dev.name}', flush=True)
+    print(f'Fit: flat h0={mol_z}; h=2.4..7.0 A; xy step=0.25 A; samples={ns}; zero-weight alignment padding={pad}', flush=True)
+    E_ref, F_ref = afm.sample_fdbm(xyz)
+    rng = np.random.default_rng(20261002)
+    holdout = rng.uniform([xlo, ylo, mol_z + 2.5], [xhi, yhi, mol_z + 6.8], (8192, 3)).astype(np.float32)
+    E_hold, F_hold = afm.sample_fdbm(holdout)
+    print('Scanning original FDBM: h_Fz=2.7..3.7 A; df centers=3.7..4.7 A; amp=1 A; dense scan=2.7..5.7 A; L=3 A; K_lat=0.5 N/m', flush=True)
+    t0 = time.perf_counter()
+    FEs_ref, disp_ref = afm.scan_fdbm(scan_xs, scan_ys, h_scan, mol_z=mol_z, K_LAT=K_lat, K_RAD=K_rad, bond_length=L, use_fire=True)
+    scan_ref_sec = time.perf_counter() - t0
+    GX, GY, GZ = np.meshgrid(scan_xs, scan_ys, mol_z + h_scan, indexing='ij')
+    trajectory = np.stack([GX + disp_ref['dx'], GY + disp_ref['dy'], GZ + disp_ref['dz']], axis=-1).reshape(-1, 3)
+    assert np.all(trajectory >= xyz.min(axis=0)) and np.all(trajectory <= xyz.max(axis=0)), 'Reference PP trajectory leaves fit domain'
+    E_traj, F_traj = afm.sample_fdbm(trajectory)
+    idx_df = np.array([int(np.argmin(abs(h_scan - h))) for h in h_df])
+    idx_Fz = np.array([int(np.argmin(abs(h_scan - h))) for h in h_Fz])
+    df_ref = afm_mod.compute_df_amp(FEs_ref[..., 2], 0.1, amp=1.0)[..., idx_df]
+    Fz_ref = FEs_ref[..., 2][..., idx_Fz]
+    lines = [f'FDBM contact compression: cached {projection} sample, original source tip field unchanged', f'source={field_path}', f'device={dev.name}', f'grid={field.shape} origin={origin.tolist()} step={grid_step}', f'dense_float4_bytes={field.nbytes}', f'fit_samples={ns} alignment_padding={pad}', f'K_lat_Nm=0.5 K_rad_eVA2=20 bond_length_A=3 amp_A=1', f'h_Fz={h_Fz.tolist()} h_df_center={h_df.tolist()}', f'reference_scan_sec={scan_ref_sec:.6f}', 'Status: experimental; USER visual review pending']
+    snapshots = dict(holdout=holdout, E_hold=E_hold, F_hold=F_hold, fit_xyz=xyz, fit_E_ref=E_ref, fit_F_ref=F_ref, fit_weights=weights, reference_trajectory=trajectory, trajectory_E_ref=E_traj, trajectory_F_ref=F_traj, scan_xs=scan_xs, scan_ys=scan_ys, h_df=h_df, h_Fz=h_Fz, h_scan=h_scan, df_ref=df_ref, Fz_ref=Fz_ref, FEs_ref=FEs_ref, atomPos=apos, origin=origin, grid_step=grid_step)
+    variants = {'FDBM': {'df': df_ref, 'Fz': Fz_ref}}
+    row_specs = [('df', 'FDBM', 'FDBM df', 'gray')]
+    for dx in bspl_steps:
+        label = f'contact_{dx:g}'
+        x0, y0 = xlo - 2 * dx, ylo - 2 * dx
+        ncx, ncy = bspline_n_intervals(xhi - x0 + 2 * dx, dx), bspline_n_intervals(yhi - y0 + 2 * dx, dx)
+        h0 = _bspline_prefilter_2d(np.full((ncy, ncx), mol_z))
+        sep = SeparableParams(x0, y0, dx, dx, ncx, ncy, poly_R=poly_R, poly_z0=poly_z0, m_start=1, nz=z_modes, h0_map=h0.ravel())
+        print(f'Fitting {label}: {ncx}x{ncy}x{z_modes}; poly_z0={poly_z0} poly_R={poly_R}; E + Fx/Fy/Fz loss; n_iter={n_iter}', flush=True)
+        t0 = time.perf_counter()
+        afm.fit_contact_field(sep, xyz, E_ref, F_ref, n_iter=n_iter, force_weight=1.0, sample_weights=weights, bPrint=True)
+        fit_sec = time.perf_counter() - t0
+        archive = os.path.join(out_dir, f'{label}.npz')
+        sep.save_npz(archive, metadata={'source': 'FDBM', 'source_field': field_path, 'source_grid': grid_path, 'source_stages': stages_path, 'projection': projection, 'grid_step': grid_step, 'atomPos': apos.tolist(), 'fit_h_min': 2.4, 'fit_h_max': float(fit_heights[-1]), 'tip': 'fixed tip from source FDBM cache; not refitted'})
+        loaded = SeparableParams.load_npz(archive)
+        E_before, F_before = afm._cs_fit_helper().eval_separable(holdout, sep)
+        E_fit, F_fit = afm._cs_fit_helper().eval_separable(holdout, loaded)
+        assert np.array_equal(E_before, E_fit) and np.array_equal(F_before, F_fit), 'Serialization changes evaluated field'
+        assert np.isfinite(E_fit).all() and np.isfinite(F_fit).all()
+        _, F_fit_traj = afm._cs_fit_helper().eval_separable(trajectory, loaded)
+        fd_step = 0.002
+        fd_points = holdout[:256]
+        _, F_fd_eval = afm._cs_fit_helper().eval_separable(fd_points, loaded)
+        for c in range(3):
+            delta = np.eye(3, dtype=np.float32)[c] * fd_step
+            Ep, _ = afm._cs_fit_helper().eval_separable(fd_points + delta, loaded)
+            Em, _ = afm._cs_fit_helper().eval_separable(fd_points - delta, loaded)
+            assert np.allclose(-(Ep - Em) / (2 * fd_step), F_fd_eval[:, c], atol=3e-3, rtol=2e-2), f'{label} F != -grad E component {c}'
+        afm.setup_contact_surface(loaded)
+        scan_p0 = np.array([scan_xs[0], scan_ys[0], mol_z + h_scan[-1] + L], dtype=np.float32)
+        scan_da, scan_db = np.array([scan_dx, 0., 0.], dtype=np.float32), np.array([0., scan_dy, 0.], dtype=np.float32)
+        t0 = time.perf_counter()
+        FEs_fit, _ = afm.run_scan_contact(nxy=(len(scan_xs), len(scan_ys)), nz=len(h_scan), dtip=-0.1, scan_p0=scan_p0, scan_da=scan_da, scan_db=scan_db)
+        scan_sec = time.perf_counter() - t0
+        FEs_fit = FEs_fit[:, :, ::-1, :]
+        assert np.isfinite(FEs_fit).all() and float(np.std(FEs_fit[..., 2])) > 1e-8
+        df_fit = afm_mod.compute_df_amp(FEs_fit[..., 2], 0.1, amp=1.0)[..., idx_df]
+        Fz_fit = FEs_fit[..., 2][..., idx_Fz]
+        variants[label] = {'df': df_fit, 'Fz': Fz_fit}
+        row_specs.append(('df', label, f'{dx:g} A mesh df', 'gray'))
+        snapshots.update({f'{label}_E_hold': E_fit, f'{label}_F_hold': F_fit, f'{label}_df': df_fit, f'{label}_Fz': Fz_fit, f'{label}_FEs': FEs_fit})
+        lines.extend([f'\n[{label}] modes={sep.nz} knots={ncx}x{ncy} n_coeff={sep.n_coeff}', f'resident_float32_bytes={loaded.resident_bytes} archive_bytes={os.path.getsize(archive)} dense_to_resident_ratio={field.nbytes / loaded.resident_bytes:.3f}', f'fit_sec={fit_sec:.6f} contact_scan_sec={scan_sec:.6f}', f'holdout_E_rmse_eV={rmse(E_hold, E_fit):.8e} max={max_err(E_hold, E_fit):.8e}'])
+        for c, name in enumerate(('Fx', 'Fy', 'Fz')):
+            ref_rms = float(np.sqrt(np.mean(F_hold[:, c].astype(float)**2)))
+            lines.append(f'holdout_{name}_rmse_eVA={rmse(F_hold[:, c], F_fit[:, c]):.8e} rel_rms={rmse(F_hold[:, c], F_fit[:, c]) / max(ref_rms, 1e-30):.6f} max={max_err(F_hold[:, c], F_fit[:, c]):.8e} corr={correlation(F_hold[:, c], F_fit[:, c]):.8f}')
+            lines.append(f'reference_trajectory_{name}_rmse_eVA={rmse(F_traj[:, c], F_fit_traj[:, c]):.8e}')
+        for iz, (hf, hd) in enumerate(zip(h_Fz, h_df)):
+            lines.append(f'h_Fz={hf:.2f} h_df_center={hd:.2f} df_corr={correlation(df_ref[..., iz].ravel(), df_fit[..., iz].ravel()):.8f} df_rmse={rmse(df_ref[..., iz], df_fit[..., iz]):.8e} Fz_corr={correlation(Fz_ref[..., iz].ravel(), Fz_fit[..., iz].ravel()):.8f} Fz_rmse={rmse(Fz_ref[..., iz], Fz_fit[..., iz]):.8e}')
+        print('\n'.join(lines[-(5 + 6 + len(h_Fz)):]), flush=True)
+    row_specs += [('Fz', key, f'{key} Fz', 'bwr') for key in variants]
+    figure = os.path.join(out_dir, 'compare_df_Fz.png')
+    au.plot_afm_variant_height_strip(variants, row_specs, h_Fz, figure, title=f'Cached {molecule} FDBM vs reloaded 2.5D contact fields; physical probe heights; df amp=1 A', extent=au.scan_extent(scan_xs, scan_ys), amp=None, amp_align=False, dpi=150)
+    snapshot_path = os.path.join(out_dir, 'comparison_arrays.npz')
+    np.savez_compressed(snapshot_path, **snapshots)
+    summary_path = os.path.join(out_dir, 'SUMMARY.out')
+    with open(summary_path, 'x') as f:
+        f.write('\n'.join(lines) + '\n')
+    print('\n'.join(lines), flush=True)
+    print(f'REVIEW: {summary_path}\nREVIEW: {figure}\nREVIEW: {snapshot_path}', flush=True)
+
+
 def main():
     import argparse
     p = argparse.ArgumentParser(description='Contact-surface fit/parity (PTCDA or toy rigid FF)')
     p.add_argument('--toys', action='store_true',
                    help='1-atom / 2-atom rigid FF: brute vs contact vs GridFF (PTCDA + assembly knobs)')
+    p.add_argument('--fdbm-cache', help='Existing FDBM campaign directory with Stage 2/3 and brstm_stages.npz')
+    p.add_argument('--outdir', default=os.path.join(PLOT_DIR, 'fdbm_pentacene_v1'))
+    p.add_argument('--grid-step', type=float, default=0.1)
+    p.add_argument('--bspl-steps', type=float, nargs='+', default=[0.8, 0.5])
+    p.add_argument('--fit-iters', type=int, default=400)
+    p.add_argument('--z-modes', type=int, default=6)
+    p.add_argument('--poly-z0', type=float, default=1.8)
+    p.add_argument('--poly-R', type=float, default=12.0)
     args = p.parse_args()
-    if args.toys:
+    if args.fdbm_cache:
+        run_fdbm_compression(args.fdbm_cache, args.outdir, grid_step=args.grid_step, bspl_steps=tuple(args.bspl_steps), n_iter=args.fit_iters, z_modes=args.z_modes, poly_z0=args.poly_z0, poly_R=args.poly_R)
+    elif args.toys:
         run_toys()
     else:
         main_ptcda()

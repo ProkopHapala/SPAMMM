@@ -712,3 +712,75 @@ defect-localized states spread physically.
 
 See [TopicalAudit/BandUnfolding_Ribbons.md](TopicalAudit/BandUnfolding_Ribbons.md)
 §"Unfolding algorithm" and `doc/ERC_private/ribbon_switch_recap.md` §7.
+
+
+---
+
+## 19. `pme_set_field` — V_fn must be bounded ON THE WHOLE PME MESH, and the query interior must cover the relaxed trajectory
+
+Two failure modes that both surface as mass `stencil_out_of_bounds`
+postflight flags (nearly all scan pixels flagged with identical coordinates —
+the reported `coord` is the scan-pixel **start** point, not the offending
+trajectory point):
+
+1. **Singularity inside the mesh domain.** `pme_set_field` samples V_fn on
+   coarse-mesh nodes, which span far beyond the scan volume (e.g. z ∈ −5…11 Å
+   for a planar molecule at z=0). A potential that is only evaluated "in the
+   scan region" in your head can still have a pole inside the mesh: an LJ(9-3)
+   substrate `E_s[(d_eq/d)⁹/3 − (d_eq/d)³]` with substrate plane z_sub = −3.3 Å
+   has its `d→0` divergence at z = −3.3 — inside the mesh. A `d≥0.3` clamp
+   still leaves ~10⁸ eV node values → B-spline coefficients → ~10⁵ eV/Å
+   forces → every relaxation trajectory ejected out of bounds. **Clamp at a
+   physically unreachable distance** (`d≥2 Å` → flat ~10 eV plateau, zero
+   force) or taper the term smoothly to a constant below the domain of
+   interest.
+2. **Query interior vs. trajectory envelope.** The PP trajectory is not the
+   scan plane: the apex *starts* at `h_max + amp + bond_length` (≈8.4 Å for
+   h_df≤4.4, amp=1.0, L=3.0) and the PP can dive toward a substrate well near
+   z≈0 over bare regions, with FIRE transient overshoot below. Fit with
+   margin on both ends — for the substrate sweeps:
+   `fit_contact_pme(z_above_lo=-2.0, z_above_hi=11.0)`. Widening only the
+   runtime scan range is not enough — the mesh itself must cover the region.
+
+Related: a **uniform** substrate term (xy-flat) cannot produce a lateral halo
+in normalized df — it only shifts the PP equilibrium baseline. Rim-following
+halos need footprint-modulated terms (`mol_footprint` screening,
+`footprint_attract`). See `doc/export_invAFM/scripts/testplot_pah_afm_db.py` `substrate_combos`
+and `doc/topical_audit.md` PAH entry.
+
+---
+
+## 20. OpenCL `ls=(1,)` — single-thread workgroups serialize a parallel kernel (~34x slowdown)
+
+**Found 2026-10-02** profiling `run_scan_contact` on compressed
+`SeparableParams` rescans (invAFM training augmentation): a 38k-point
+x 31-z scan took ~0.6 s — almost all kernel time.
+
+The scan kernels are written as **one work-item per scan pixel** (the z
+stroke + FIRE relaxation loop runs inside the work item). That does not
+mean `local_size=1` is correct: `ls=(1,)` creates tens of thousands of
+1-thread workgroups, which the scheduler handles terribly. Measured on
+RTX 3090 (same kernel, same inputs):
+
+| local size | kernel time |
+|-----------|-------------|
+| 1         | 1.19 s      |
+| 32        | 0.069 s     |
+| 64        | 0.056 s     |
+| **128**   | **0.035 s** |
+| 256       | 0.068 s     |
+
+**Rules:**
+- Never launch with `ls=(1,)`; use `ls=128` (or `_roundup(n, wg)` +
+  `(wg,)` as `run_scan_contact_pme`'s Local variant does).
+- **These kernels have NO bounds guard** — `points[get_global_id(0)]` runs
+  unguarded, so a padded `gs` reads/writes out of bounds. Either pad the
+  `points`/`FEs` host arrays to the LS multiple (tail items redundantly
+  redo point 0, ~0.3% waste; then slice results back) or add an
+  `iG >= n_scan` guard to the kernel. `run_scan_contact`,
+  `get_raw_FE_contact`, `run_scan_pic` use the padding approach.
+- Vectorize the raster build (`meshgrid`, ~2 ms) — the python
+  `for ix: for iy:` loop cost ~0.1 s alone.
+- Remaining per-raster cost is CPU `shared_postprocess`
+  (`compute_df_amp_dir` per-pixel FFT, ~0.1 s) — candidate for a GPU
+  df kernel, shared by all contact backends.
