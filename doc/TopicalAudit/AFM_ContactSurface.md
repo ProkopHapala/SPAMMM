@@ -18,16 +18,17 @@ Two compact replacements for dense 3D `img_FF` in classical Morse(+Q) PP-AFM:
 
 | Language | Location | Status | Notes |
 |----------|----------|--------|-------|
-| OpenCL | `kernels/contact_surface.cl` | active | Separable/PIC + **PME**: `evalContactPME`/`Local`, `relaxStrokesTiltedContactPME`/`Local`, `fillContactPMEMeshVL` |
+| OpenCL | `kernels/contact_surface.cl` | active | Separable/PIC + **PME**: `evalContactPME`/`Local`, `relaxStrokesTiltedContactPME`/`Local`, `fillContactPMEMeshVL`, **fast relaxers** `…LocalQN` (secant→FD-Newton→FIRE) and `…LocalSph` (sphere-constrained, 2 soft DOF) |
 | Python | `spammm/surfaces/PMESplit.py` | active | PAW/hermite/plateau/rho split; `precompute_split_cache`; closed-form a0 |
 | Python | `spammm/surfaces/CoarseMesh.py` | active | CPU V_L raster + batched prefilter (oracle / fallback) |
 | Python | `spammm/surfaces/PICCore.py` | active | `fit_core_1d` doubling-power residual (host LS) |
 | Python | `spammm/surfaces/ContactSurface.py` | active | Quasi-2D + `ContactPMEParams` |
-| Python | `spammm/SPM/AFM.py` | active | `fit_contact_pme` (GPU mesh), `run_scan_contact_pme` (`core_backend` local/bucket) |
+| Python | `spammm/SPM/AFM.py` | active | `fit_contact_pme` (GPU mesh), `run_scan_contact_pme` (`core_backend` local/bucket, `relax_mode` fire/qn/sph + `qn_cap`/`qn_conv`) |
 | Python | `spammm/SPM/AFM_utils.py` | active | `run_contact_pme_pp_afm` — CLI SSOT, forces `local` |
 | CLI | `run_spm.py afm --model contact_pme` | active | Same ScanSpec / strip plots as Morse/FDBM |
 | Design | `doc/Tasks/ContactSurface_PME_ParallelPlan.md` | active | Parallel plan + harness packet |
 | Report | `doc/Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md` | active | Memory/speed SSOT |
+| Report | `doc/Reports/ContactPME_RelaxQuasiNewton_Sph_2026-10-03.md` | active | QN/Sph relaxers, bench vs FIRE |
 | Design | `doc/Topics/AFM/ContactSurface_Static.md` | active | Quasi-2D physics + API |
 | Report | `doc/Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md` | active | Quasi-2D vs GridFF parity |
 
@@ -41,6 +42,8 @@ Two compact replacements for dense 3D `img_FF` in classical Morse(+Q) PP-AFM:
 | local vs bucket FIRE FE | gate ≤2e-5 | pyridine exact; PTCDA sparse ~2e-3 float32 drift | reported |
 | GPU vs CPU mesh coeffs | ~1e-8 | `fillContactPMEMeshVL` vs `build_coarse_mesh` | verified |
 | CLI AFM strips | visual | `wave2_afm_cli/*/compare_per_image.png` | **USER confirmed OK (2026-08-11)** |
+| `sph` relax vs FIRE | NCC(Fx) 0.998–0.9999, max\|ΔF\|≈0.003–0.014 eV/Å | `invPPAFM testplot_artifact_atlas.py --bench-qn` | measured, USER review pending |
+| `qn` relax vs FIRE | NCC(Fx) 0.998, max\|ΔF\|≈0.024 eV/Å | same | measured, superseded by sph |
 
 ## Performance (RTX 3090, 2026-08-11)
 
@@ -51,10 +54,22 @@ Two compact replacements for dense 3D `img_FF` in classical Morse(+Q) PP-AFM:
 | SCAN wall (after pts-loop fix) | ~10 ms | ~20 ms |
 | FIT (GPU mesh + host core LS) | ~11 ms | ~36 ms |
 
+### SCAN relax solvers (GTX 1650, PTCDA 240²×31, 2026-10-03)
+
+| `relax_mode` | wall | kernel | NCC(Fx) vs FIRE | note |
+|---|---|---|---|---|
+| `fire` (default) | ~95 ms | ~87 ms | — | mean ~7 evals/cell |
+| `sph` | **~25 ms** | ~15 ms | 0.998–0.9999 | K_RAD→∞ caveat; ≤20 iters/slice |
+| `qn` | ~33 ms | ~24 ms | 0.998 | superseded by sph |
+
+Wall = ~1.2 evals/cell floor + ~10 ms host (FEs D2H 29MB, telemetry, postflight).
+See `doc/Reports/ContactPME_RelaxQuasiNewton_Sph_2026-10-03.md`.
+
 ## Open Issues
 
 - [x] USER confirm regenerated CLI AFM strips (`wave2_afm_cli`) — OK 2026-08-11
 - [ ] Core LS still host — optional GPU residual sampling / lstsq
 - [ ] PTCDA FIRE local-vs-bucket sparse float32 drift (p99 fine; max ~2e-3)
 - [~] Quasi-2D XY sharpness vs GridFF (older path; separate from contact_pme)
+- [~] `sph` relaxer = `K_RAD→∞` (no radial compression, ~0.1 Å deep contact) — USER confirm df parity before pipeline use; bucket backend has no qn/sph variant
 - ND `--contact-surface` flag still open for quasi-2D

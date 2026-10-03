@@ -497,14 +497,14 @@ def cmd_afm(args: argparse.Namespace) -> int:
     if do_planar:
         from spammm.forcefields.FFController import make_planar_xy
         atomPos[:] = make_planar_xy(atomPos)
-        print(f'planarize → z=0  zspan={atomPos[:,2].ptp():.3e}Å')
+        print(f'planarize → z=0  zspan={np.ptp(atomPos[:,2]):.3e}Å')
     if not getattr(args, 'no_orient', False):
         from spammm.forcefields.FFController import orient_long_axis_x
         orient_long_axis_x(atomPos)
         if do_planar:
             atomPos[:, 2] = 0.0
-        print(f'orientPCA long→x  span_xy=({atomPos[:,0].ptp():.3f},{atomPos[:,1].ptp():.3f})'
-              f'  zspan={atomPos[:,2].ptp():.3e}Å')
+        print(f'orientPCA long→x  span_xy=({np.ptp(atomPos[:,0]):.3f},{np.ptp(atomPos[:,1]):.3f})'
+              f'  zspan={np.ptp(atomPos[:,2]):.3e}Å')
 
     z_vac = float(args.z_extra) if args.z_extra is not None else 6.0
     grid_spec, origin, ngrid, step = afm_utils.make_fdbm_grid_com_zsym(

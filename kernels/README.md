@@ -15,7 +15,7 @@ OpenCL source for SPAMMM GPU compute. Python harnesses concatenate `.cl` snippet
 | `nonbonded_grid.cl` | GridFF-augmented nonbonded + spatial bucketing | SPFF (on demand) |
 | `gridFF.cl` | 3D B-spline grid build, Poisson, sampling | SPFF, GridFF, rigid |
 | `surface.cl` | Ewald2D, folded basis, brute Morse, isosurface | SPFF, SurfaceEwald |
-| `contact_surface.cl` | Quasi-2D contact + **contact_pme** (local/bucket FIRE, `fillContactPMEMeshVL`) | `SPM/AFM.py`, `surfaces/ContactSurface.py` |
+| `contact_surface.cl` | Quasi-2D contact + **contact_pme** (local/bucket FIRE, `fillContactPMEMeshVL`, QN/Sph relaxers) | `SPM/AFM.py`, `surfaces/ContactSurface.py` |
 | `rigid.cl` | 6-DOF rigid body, PairFF+FAF replica energy, and ping-pong concurrent multi-molecule MD | `forcefields/RigidBodyDynamics.py` |
 | `assembly.cl` | Multi-molecule rigid transforms + clash | `forcefields/Assembly.py` |
 | `AFM.cl` | Probe relaxation + AFM image generation | `SPM/AFM.py` |
@@ -237,9 +237,11 @@ Spec: `doc/Topics/AFM/ContactSurface_Static.md` · pitfalls: `doc/Takeways.md`
 |--------|------|
 | `evalContactPME` / `evalContactPMELocal` | Batch E,F (bucket vs WG+local atom preload) |
 | `relaxStrokesTiltedContactPME` / `…Local` | Fused FIRE PP scan (CLI uses **Local**) |
+| `relaxStrokesTiltedContactPMELocalQN` | Opt-in quasi-Newton relax (secant→FD-Newton→FIRE tail), `relax_mode='qn'` |
+| `relaxStrokesTiltedContactPMELocalSph` | Opt-in sphere-constrained Newton — `|dpos|=L` analytic, 2 soft lateral DOF only (K_RAD→∞ caveat); `relax_mode='sph'`, ~4× vs FIRE |
 | `fillContactPMEMeshVL` | FIT: raster PAW V_L on coarse mesh (WG+local) |
 
-Report: `doc/Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md` · plan: `doc/Tasks/ContactSurface_PME_ParallelPlan.md`
+Report: `doc/Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md` · relax solvers: `doc/Reports/ContactPME_RelaxQuasiNewton_Sph_2026-10-03.md` · plan: `doc/Tasks/ContactSurface_PME_ParallelPlan.md`
 
 ### Reference & helpers
 

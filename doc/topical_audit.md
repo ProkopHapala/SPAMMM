@@ -256,6 +256,8 @@ L0: `tests/SPM/test_afm_contact_surface.py`. L2: `tests/testplot_contact_surface
 
 **Task SSOT:** [Tasks/Fast_2p5D_AFM_ContactSurface.md](Tasks/Fast_2p5D_AFM_ContactSurface.md)
 
+- **Fast relax solvers (2026-10-03, opt-in):** `relax_mode='qn'` (secant→FD-Newton→FIRE) and `relax_mode='sph'` (sphere-constrained, |dpos|=L analytic → only 2 soft lateral DOFs; removes the K_RAD≫K_LAT stiff mode that makes FIRE crawl). GTX 1650 PTCDA 240²×31: FIRE ~95 ms → sph ~25 ms (~4×), NCC(Fx)≈0.998–0.9999, df diff ≈0.002–0.013 — `sph` omits radial compression (K_RAD→∞ caveat). Report: [Reports/ContactPME_RelaxQuasiNewton_Sph_2026-10-03.md](Reports/ContactPME_RelaxQuasiNewton_Sph_2026-10-03.md)
+
 **Open issues:** USER confirm maps; residual XY sharpness; PIC re-validate; pipeline flag; elastic Phase 2.
 
 ## 4. AFM/STM Simulation
@@ -272,7 +274,8 @@ L0: `tests/SPM/test_afm_contact_surface.py`. L2: `tests/testplot_contact_surface
 - **Topical audit:** [TopicalAudit/AFM_FDBM.md](TopicalAudit/AFM_FDBM.md)
 - **Overview doc:** [afm_stm_simulation.md](afm_stm_simulation.md)
 - **Rigid body AFM:** `spammm/forcefields/RigidBodyAFM.py`
-- **Caveats:** K_LAT N/m vs eV/Å²; prefer `step ≤ 0.1 Å` (`doc/Tasks/AFMTesting.md`)
+- **Batch df dataset (invPPAFM):** `invPPAFM/export_invAFM/scripts/testplot_fdbm_db.py` — generates small UFF-relaxed decorated flakes (20–50 at) → `get_density_from_dftb_dense` → FDBM → `scan_fdbm` → per-mol npz + montage (`debug/fdbm_db/`). Follows the `run_spm.py afm` recipe (verified same morphology on identical molecule + PTCDA).
+- **Caveats:** K_LAT N/m vs eV/Å²; prefer `step ≤ 0.1 Å` (`doc/Tasks/AFMTesting.md`); **real AFM morphology needs the full recipe** — `tip_mode='co'` (gaussian tip → mushy blobs), **prolonged** ρ_scf for Pauli (`make_slater_tail_species_list`; stock ρ decays too fast → no repulsion at h≈4 Å), `compute_df_amp_dir` (raw dFz/dz is wrong), planar molecule (corrugated → top-atom reference puts bulk below probe reach → all-dark df); **element map fails loud** — `AFM_utils` `ELEM_Z`/`inv_z` now covers H,C,N,O,F,P,S,Cl,Br,I and raises on others (was `.get(z,'C')` → F silently became C → wrong electron count → SCC oscillation → DFTB `ERROR STOP` kills host process, not a Python exception).
 
 ### 4b. STM Simulation
 - LCAO orbital projection, spectral function / BR-STM; vacuum tails need prolonged basis

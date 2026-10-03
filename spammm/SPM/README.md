@@ -2,7 +2,7 @@
 
 Scanning Probe Microscopy — AFM and STM. GPU-accelerated via PyOpenCL. FDBM path is the GUI engine (not Morse+point-charge).
 
-- **AFM.py** — AFMulator (LJ/Morse + FDBM), PP relax; **contact_pme** `fit_contact_pme` / `run_scan_contact_pme` (local WG default); stiffness SSOT; FAST_S3 switches.
+- **AFM.py** — AFMulator (LJ/Morse + FDBM), PP relax; **contact_pme** `fit_contact_pme` / `run_scan_contact_pme` (local WG default; `relax_mode` = `fire` default | `qn` | `sph` ~4× faster, `qn_cap`/`qn_conv` knobs — report `doc/Reports/ContactPME_RelaxQuasiNewton_Sph_2026-10-03.md`); stiffness SSOT; FAST_S3 switches.
 - **AFM_utils.py** — Tip densities, FDBM; strip plots; **`run_contact_pme_pp_afm`** (CLI SSOT for `--model contact_pme`, forces `core_backend='local'`).
 - **stm_compare.py** — DFTB vs pySCF frontier orbitals / STM current / vacuum panels; SSOT for `run_spm.py stm *`.
 - **ModularPipeline.py** — Staged S1–S6 AFM/STM with disk cache; dual Stage-3 (fast vs `FAST_S3=0` legacy).

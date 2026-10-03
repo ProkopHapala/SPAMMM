@@ -1688,9 +1688,11 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
     import multiprocessing as mp
     import shutil
 
-    ELEM_Z = {'H':1,'C':6,'N':7,'O':8,'P':15,'S':16,'Br':35,'I':53}
+    ELEM_Z = {'H':1,'C':6,'N':7,'O':8,'F':9,'P':15,'S':16,'Cl':17,'Br':35,'I':53}
     inv_z = {v:k for k,v in ELEM_Z.items()}
-    enames = [inv_z.get(int(z), 'C') for z in atomTypes]
+    # Fail loud on unsupported Z (was .get(z,'C') — silently turned F into C,
+    # corrupting electron count -> SCC non-convergence -> DFTB ERROR STOP).
+    enames = [inv_z[int(z)] for z in atomTypes]
 
     # Ensure work_dir exists (use absolute path for subprocess)
     work_dir = os.path.abspath(work_dir)
@@ -1868,9 +1870,9 @@ def get_density_from_pyscf(atomPos, atomTypes, grid_spec=None, step=0.1, margin=
 
     BOHR_PER_ANGSTROM = 1.8897259886
 
-    ELEM_Z = {'H': 1, 'C': 6, 'N': 7, 'O': 8, 'P': 15, 'S': 16, 'Br': 35, 'I': 53}
+    ELEM_Z = {'H': 1, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'P': 15, 'S': 16, 'Cl': 17, 'Br': 35, 'I': 53}
     inv_z = {v: k for k, v in ELEM_Z.items()}
-    enames = [inv_z.get(int(z), 'C') for z in atomTypes]
+    enames = [inv_z[int(z)] for z in atomTypes]      # fail loud on unsupported Z (see get_density_from_dftb_dense)
 
     # Setup grid
     if grid_spec is None:
@@ -2948,9 +2950,9 @@ def get_density_from_dftb_plus(atomPos, atomTypes, basis, slako_prefix, work_dir
     """
     from spammm.quantum.DFTB_utils import SK_PATHS as _SK_PATHS, WFC_HSD_PATHS as _WFC_HSD_PATHS
     from spammm.quantum.DFTB_utils import run_dftb_for_density as _run_dftb_for_density
-    ELEM_Z = {'H':1,'C':6,'N':7,'O':8,'P':15,'S':16,'Br':35,'I':53}
+    ELEM_Z = {'H':1,'C':6,'N':7,'O':8,'F':9,'P':15,'S':16,'Cl':17,'Br':35,'I':53}
     inv_z = {v:k for k,v in ELEM_Z.items()}
-    enames = [inv_z.get(int(z), 'C') for z in atomTypes]
+    enames = [inv_z[int(z)] for z in atomTypes]      # fail loud on unsupported Z
 
     if grid_spec is None:
         grid_spec, origin, ngrid, step = _make_grid_spec(atomPos, step, margin, z_extra)
@@ -3679,11 +3681,11 @@ def run_fukui_one(mol, xyz_rel, outdir_root, *,
     os.makedirs(outdir, exist_ok=True)
     plots = set(plots or ())
 
-    ELEM_Z = {'H': 1, 'C': 6, 'N': 7, 'O': 8}
+    ELEM_Z = {'H': 1, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'P': 15, 'S': 16, 'Cl': 17, 'Br': 35, 'I': 53}
     pos, _, names, _, _ = au.load_xyz(xyz)
     atomPos_xyz = np.array(pos, dtype=np.float64)
     enames = list(names)
-    atomTypes_xyz = np.array([ELEM_Z.get(e, 6) for e in enames], dtype=np.int32)
+    atomTypes_xyz = np.array([ELEM_Z[e] for e in enames], dtype=np.int32)
 
     lines = [
         f'Fukui FDBM panel: {mol}',
@@ -5986,16 +5988,16 @@ def _set_projector_species_basis(projector, atoms_dict, species_list_ang, *, rc_
 
 
 # DFTB+/mio/3ob valence electrons per element (SCC filling). Not Z!
-DFTB_VALENCE_ELEC = {'H': 1, 'C': 4, 'N': 5, 'O': 6, 'P': 5, 'S': 6, 'Br': 7, 'I': 7}
+DFTB_VALENCE_ELEC = {'H': 1, 'C': 4, 'N': 5, 'O': 6, 'F': 7, 'P': 5, 'S': 6, 'Cl': 7, 'Br': 7, 'I': 7}
 
 
 def dftb_n_valence_electrons(enames=None, atomTypes=None):
     """Total valence electrons for DFTB occupation (closed-shell → n_occ = n_elec//2)."""
     if enames is not None:
-        return int(sum(DFTB_VALENCE_ELEC.get(str(e), 4) for e in enames))
+        return int(sum(DFTB_VALENCE_ELEC[str(e)] for e in enames))
     if atomTypes is not None:
-        inv = {1: 'H', 6: 'C', 7: 'N', 8: 'O', 15: 'P', 16: 'S', 35: 'Br', 53: 'I'}
-        return int(sum(DFTB_VALENCE_ELEC.get(inv.get(int(z), 'C'), 4) for z in atomTypes))
+        inv = {1: 'H', 6: 'C', 7: 'N', 8: 'O', 9: 'F', 15: 'P', 16: 'S', 17: 'Cl', 35: 'Br', 53: 'I'}
+        return int(sum(DFTB_VALENCE_ELEC[inv[int(z)]] for z in atomTypes))
     raise ValueError('dftb_n_valence_electrons: need enames or atomTypes')
 
 
@@ -7376,7 +7378,7 @@ def run_afm_from_xyz(
         dict with 'df', 'intermediates', 'grid_spec'
     """
     import spammm.atomicUtils as au
-    ELEM_Z = {'H':1,'C':6,'N':7,'O':8,'P':15,'S':16,'Br':35,'I':53}
+    ELEM_Z = {'H':1,'C':6,'N':7,'O':8,'F':9,'P':15,'S':16,'Cl':17,'Br':35,'I':53}
 
     os.makedirs(output_dir, exist_ok=True)
     if work_dir is None:
@@ -7386,7 +7388,7 @@ def run_afm_from_xyz(
     print(f"\nLoading molecule from {xyz_file}")
     pos, _, names, _, _ = au.load_xyz(xyz_file)
     atomPos  = np.array(pos, dtype=np.float64)
-    atomTypes = np.array([ELEM_Z.get(e, 6) for e in names], dtype=np.int32)
+    atomTypes = np.array([ELEM_Z[e] for e in names], dtype=np.int32)
     print(f"  {len(atomPos)} atoms")
 
     # Scan grid (compute points from step size)

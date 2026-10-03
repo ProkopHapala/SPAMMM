@@ -8,7 +8,8 @@ and full FDBM (density-based) methods.
 
 Key functionality:
   - LJ/Morse force field computation on 3D grid (evalLJC_QZs_toImg, evalMorseC_QZs_toImg)
-  - Probe-particle relaxation: FIRE and damped velocity (relaxStrokesTilted)
+  - Probe-particle relaxation: FIRE and damped velocity (relaxStrokesTilted); contact_pme
+    also has opt-in quasi-Newton/sphere-constrained solvers (relax_mode='qn'/'sph')
   - FDBM: Pauli overlap, electrostatic convolution, dispersion (FFT-based)
   - CO tip model: precompute tip density from DFTB or pySCF
   - QEq charge equilibration (numpy)
@@ -2008,7 +2009,8 @@ class AFMulator(OpenCLBase):
 
     def run_scan_contact_pme(self, nxy=(50, 50), nz=60, dtip=-0.1, scan_p0=None,
                              scan_da=None, scan_db=None, scan_pts=None, bAlloc=True,
-                             use_gpu=None, core_backend='auto', workgroup_size=None):
+                             use_gpu=None, core_backend='auto', workgroup_size=None,
+                             relax_mode='fire', qn_cap=0, qn_conv=1.0):
         """PP-AFM scan using the contact_pme backend.
 
         Same scan geometry and outputs as run_scan_contact(), but the field
@@ -2060,7 +2062,8 @@ class AFMulator(OpenCLBase):
             use_gpu = hasattr(self.prg, 'relaxStrokesTiltedContactPME')
         if use_gpu and hasattr(self.prg, 'relaxStrokesTiltedContactPME'):
             FEs = self._pme_scan_gpu(params, pts, nxy, nz, dtip, bAlloc,
-                                    core_backend=core_backend, workgroup_size=workgroup_size)
+                                    core_backend=core_backend, workgroup_size=workgroup_size,
+                                    relax_mode=relax_mode, qn_cap=qn_cap, qn_conv=qn_conv)
         else:
             FEs = self._pme_scan_python(params, pts, nxy, nz, dtip)
         if getattr(self, 'verbosity', 0) > 0:
@@ -2068,15 +2071,26 @@ class AFMulator(OpenCLBase):
         return FEs, pts[:, :3].reshape(nx_s, ny_s, 3)
 
     def _pme_scan_gpu(self, params, pts, nxy, nz, dtip, bAlloc, *, core_backend='auto',
-                      workgroup_size=None):
-        """GPU PP relaxation via bucket or Local contact-PME kernels."""
+                      workgroup_size=None, relax_mode='fire', qn_cap=0, qn_conv=1.0):
+        """GPU PP relaxation via bucket or Local contact-PME kernels.
+        relax_mode: 'fire' (default), 'qn' (quasi-Newton), 'sph' (sphere-constrained
+        Newton — |dpos|=L enforced analytically, only the 2 soft lateral DOFs solved).
+        qn/sph support optional two-pass: pass 1 caps at qn_cap iters; pixels with
+        non-converged slices (iters<0 telemetry) are re-scanned in pass 2 with
+        the full N_RELAX_STEP_MAX budget. qn_cap=0 (default) = single pass.
+        qn_conv scales the |f|^2 convergence tolerance (default 1.0 = F2CONV)."""
+        import time as _time
         backend = self._pme_select_core_backend(params, core_backend)
         wg = self._pme_workgroup_size(workgroup_size)
         nx_s, ny_s = nxy
         n_scan = nx_s * ny_s
+        prof = getattr(self, 'verbosity', 0) > 1
+        _tp = [('t0', _time.perf_counter())] if prof else []
         if bAlloc:
             self.realloc_scan_buffers(n_scan, nz)
+        if prof: _tp.append(('realloc_scan', _time.perf_counter()))
         self._pme_upload_resident(params)
+        if prof: _tp.append(('resident_upload', _time.perf_counter()))
         self.toGPU_(self.scan_pts_cl, pts)
         FEs_h = np.zeros((n_scan * nz, 4), dtype=np.float32)
         tipC = self.tipC.copy(); tipC[3] = np.float32(dtip)
@@ -2094,21 +2108,56 @@ class AFMulator(OpenCLBase):
             'cpm_scan_status': n_tele * 4, 'cpm_scan_min_r': n_tele * 4,
             'cpm_scan_offender': n_tele * 4, 'cpm_scan_overflow': n_tele * 4,
         }, suffix='_cl')
+        if prof: _tp.append(('telemetry_alloc', _time.perf_counter()))
+        if relax_mode != 'fire' and backend != 'local':
+            raise ValueError(f"relax_mode='{relax_mode}' implemented only for core_backend='local' (got '{backend}')")
         gs = (self._roundup(n_scan, wg),)
         if backend == 'local':
             LATOMS = cl.LocalMemory(na * 16)
             LCOEFFS = cl.LocalMemory(na * 5 * 4)
-            self.prg.relaxStrokesTiltedContactPMELocal(
-                self.queue, gs, (wg,),
-                self.cpm_mesh_cl, mesh_meta, mesh_origin_h,
-                self.cpm_atoms_cl, self.cpm_core_coeffs_cl,
-                core_meta, core_bucket_meta,
-                self.cpm_scan_status_cl, self.cpm_scan_min_r_cl,
-                self.cpm_scan_offender_cl, self.cpm_scan_overflow_cl,
-                self.scan_pts_cl, self.scan_FEs_cl,
-                self.tipA, self.tipB, tipC, self.stiffness,
-                self.dpos0, self.relax_pars, self.surfFF,
-                np.int32(n_scan), np.int32(nz), LATOMS, LCOEFFS)
+            if relax_mode in ('qn', 'sph'):
+                qn_kname = {'qn': 'relaxStrokesTiltedContactPMELocalQN',
+                            'sph': 'relaxStrokesTiltedContactPMELocalSph'}[relax_mode]
+                if not hasattr(self.prg, qn_kname):
+                    raise RuntimeError(f"relax_mode='{relax_mode}' requires kernel {qn_kname} (contact_surface.cl) — not compiled in")
+                n_tele = n_scan * nz
+                self.try_make_buffers({'cpm_scan_iters': n_tele * 4}, suffix='_cl')
+                rp1 = self.relax_pars.copy(); rp1[2] = np.float32(qn_cap); rp1[3] = np.float32(qn_conv)  # cap | conv-tol scale
+                if qn_cap > 0:          # two-pass machinery (iz_start / pix_map / out_pp)
+                    self.try_make_buffers({'cpm_izstart': n_scan * 4, 'cpm_pixmap': n_scan * 4}, suffix='_cl')
+                    self.toGPU_(self.cpm_izstart_cl, np.zeros(n_scan, np.int32))
+                    self.toGPU_(self.cpm_pixmap_cl, np.arange(n_scan, dtype=np.int32))
+                    iz1_b, pm1_b, pp_b = self.cpm_izstart_cl, self.cpm_pixmap_cl, self.scan_disps_cl
+                else:
+                    iz1_b = pm1_b = pp_b = None                          # NULL -> single-pass, no pp writes
+                getattr(self.prg, qn_kname)(
+                    self.queue, gs, (wg,),
+                    self.cpm_mesh_cl, mesh_meta, mesh_origin_h,
+                    self.cpm_atoms_cl, self.cpm_core_coeffs_cl,
+                    core_meta, core_bucket_meta,
+                    self.cpm_scan_status_cl, self.cpm_scan_min_r_cl,
+                    self.cpm_scan_offender_cl, self.cpm_scan_overflow_cl,
+                    self.cpm_scan_iters_cl, pp_b,                          # out_pp <- scan_disps (per-slice PP pos)
+                    self.scan_pts_cl, self.scan_FEs_cl,
+                    self.tipA, self.tipB, tipC, self.stiffness,
+                    self.dpos0, rp1, self.surfFF,
+                    np.int32(n_scan), np.int32(nz),
+                    iz1_b, pm1_b,
+                    LATOMS, LCOEFFS)
+            elif relax_mode == 'fire':
+                self.prg.relaxStrokesTiltedContactPMELocal(
+                    self.queue, gs, (wg,),
+                    self.cpm_mesh_cl, mesh_meta, mesh_origin_h,
+                    self.cpm_atoms_cl, self.cpm_core_coeffs_cl,
+                    core_meta, core_bucket_meta,
+                    self.cpm_scan_status_cl, self.cpm_scan_min_r_cl,
+                    self.cpm_scan_offender_cl, self.cpm_scan_overflow_cl,
+                    self.scan_pts_cl, self.scan_FEs_cl,
+                    self.tipA, self.tipB, tipC, self.stiffness,
+                    self.dpos0, self.relax_pars, self.surfFF,
+                    np.int32(n_scan), np.int32(nz), LATOMS, LCOEFFS)
+            else:
+                raise ValueError(f"relax_mode must be 'fire', 'qn' or 'sph', got {relax_mode!r}")
         else:
             self.prg.relaxStrokesTiltedContactPME(
                 self.queue, gs, (1,),
@@ -2121,11 +2170,70 @@ class AFMulator(OpenCLBase):
                 self.scan_pts_cl, self.scan_FEs_cl,
                 self.tipA, self.tipB, tipC, self.stiffness,
                 self.dpos0, self.relax_pars, self.surfFF, np.int32(nz))
+        if prof:
+            self.queue.finish(); _tp.append(('kernel_exec', _time.perf_counter()))
         self.fromGPU_(self.scan_FEs_cl, FEs_h)
+        if prof: _tp.append(('FEs_download_29MB', _time.perf_counter()))
         # Telemetry: download status only; pull detail buffers only on failure (fail-loud).
         status_z = np.empty(n_tele, dtype=np.int32)
         cl.enqueue_copy(self.queue, status_z, self.cpm_scan_status_cl)
+        if relax_mode in ('qn', 'sph'):                          # iteration telemetry (diagnostics)
+            iters_z = np.empty(n_tele, dtype=np.int32)
+            cl.enqueue_copy(self.queue, iters_z, self.cpm_scan_iters_cl)
+            self.last_relax_iters = iters_z.reshape(nx_s, ny_s, nz)
         self.queue.finish()
+        if prof: _tp.append(('telemetry_dl+finish', _time.perf_counter()))
+        if relax_mode in ('qn', 'sph') and qn_cap > 0:
+            # pass 2: re-scan pixel columns whose slices hit the pass-1 cap
+            # unconverged (iters<0). SIMT: pass-1 warps pay only ~cap iters.
+            hard_px = np.where((self.last_relax_iters.reshape(n_scan, nz) < 0).any(axis=1))[0]
+            self.last_relax_hard = (self.last_relax_iters.reshape(n_scan, nz) < 0).any(axis=1).reshape(nx_s, ny_s)
+            self.last_relax_flagz = (self.last_relax_iters.reshape(n_scan, nz) < 0).sum(axis=0)  # per-slice flag count (pre-merge)
+            if len(hard_px):
+                n2 = len(hard_px)
+                flag2d = self.last_relax_iters.reshape(n_scan, nz) < 0
+                iz0 = np.argmax(flag2d[hard_px], axis=1).astype(np.int32)   # first flagged slice / pixel
+                pts2 = np.ascontiguousarray(pts[hard_px])
+                mf = cl.mem_flags
+                pts2_cl = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pts2)
+                iz2_cl = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=iz0)
+                pm2_cl = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=hard_px.astype(np.int32))
+                nt2 = n2 * nz
+                fe2_cl = cl.Buffer(self.ctx, mf.READ_WRITE, size=nt2 * 16)
+                st2_cl = cl.Buffer(self.ctx, mf.READ_WRITE, size=nt2 * 4)
+                mr2_cl = cl.Buffer(self.ctx, mf.READ_WRITE, size=nt2 * 4)
+                of2_cl = cl.Buffer(self.ctx, mf.READ_WRITE, size=nt2 * 4)
+                ov2_cl = cl.Buffer(self.ctx, mf.READ_WRITE, size=nt2 * 4)
+                it2_cl = cl.Buffer(self.ctx, mf.READ_WRITE, size=nt2 * 4)
+                rp2 = self.relax_pars.copy(); rp2[2] = np.float32(0); rp2[3] = np.float32(qn_conv)  # full budget, same tol
+                gs2 = (self._roundup(n2, wg),)
+                getattr(self.prg, qn_kname)(
+                    self.queue, gs2, (wg,),
+                    self.cpm_mesh_cl, mesh_meta, mesh_origin_h,
+                    self.cpm_atoms_cl, self.cpm_core_coeffs_cl,
+                    core_meta, core_bucket_meta,
+                    st2_cl, mr2_cl, of2_cl, ov2_cl, it2_cl, self.scan_disps_cl,
+                    pts2_cl, fe2_cl,
+                    self.tipA, self.tipB, tipC, self.stiffness,
+                    self.dpos0, rp2, self.surfFF,
+                    np.int32(n2), np.int32(nz), iz2_cl, pm2_cl, LATOMS, LCOEFFS)
+                fe2 = np.empty((nt2, 4), np.float32); it2 = np.empty(nt2, np.int32); st2 = np.empty(nt2, np.int32)
+                cl.enqueue_copy(self.queue, fe2, fe2_cl)
+                cl.enqueue_copy(self.queue, it2, it2_cl)
+                cl.enqueue_copy(self.queue, st2, st2_cl)
+                self.queue.finish()
+                # merge only the re-scanned slices iz>=iz0 (slices below kept from pass 1)
+                slc = np.arange(nz)[None, :] >= iz0[:, None]
+                FEv = FEs_h.reshape(n_scan, nz, 4)
+                tmp = FEv[hard_px].copy(); tmp[slc] = fe2.reshape(n2, nz, 4)[slc]; FEv[hard_px] = tmp
+                sv = status_z.reshape(n_scan, nz)
+                tmp = sv[hard_px].copy(); tmp[slc] = st2.reshape(n2, nz)[slc]; sv[hard_px] = tmp
+                iv = self.last_relax_iters.reshape(n_scan, nz)
+                tmp = iv[hard_px].copy(); tmp[slc] = it2.reshape(n2, nz)[slc]; iv[hard_px] = tmp
+                self.toGPU_(self.scan_FEs_cl, FEs_h)                    # device copy now reflects pass-2
+                if getattr(self, 'verbosity', 0) > 0:
+                    print(f'  qn pass2: {n2}/{n_scan} hard pixels, iz0 median={np.median(iz0):.0f} (slices re-done only iz>=iz0)', flush=True)
+        if prof: _tp.append(('pass2', _time.perf_counter()))
         if np.any(status_z):
             min_r_z = np.empty(n_tele, dtype=np.float32)
             offender_z = np.empty(n_tele, dtype=np.int32)
@@ -2149,6 +2257,11 @@ class AFMulator(OpenCLBase):
             bad = np.argwhere(~np.isfinite(FEs).all(axis=-1))
             worst = tuple(bad[0]) if len(bad) else None
             raise RuntimeError(f"contact_pme GPU scan: non-finite FEs at {len(bad)} pixels, worst={worst}")
+        if prof:
+            _tp.append(('end', _time.perf_counter()))
+            tot = (_tp[-1][1] - _tp[0][1]) * 1e3
+            segs = '  '.join(f'{b}={(c-a)*1e3:.1f}' for (_, a), (b, c) in zip(_tp, _tp[1:]))
+            print(f'  scan_prof[{relax_mode}] total={tot:.1f}ms: {segs}', flush=True)
         return FEs
 
     def _pme_scan_python(self, params, pts, nxy, nz, dtip):

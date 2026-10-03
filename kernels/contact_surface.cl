@@ -9,6 +9,8 @@
 //   - evalSeparableBsplinePoly: Separable field eval; F = -∇E (AFM force convention)
 //   - cs_sep_Av / cs_sep_Atv / cs_sep_Atv_masked: Matrix-free separable fit operators
 //   - cs_pic_Av / cs_pic_Atv / cs_pic_eval_tile16 / evalRadialPIC: PIC fit and eval
+//   - relaxStrokesTiltedContactPMELocalQN:   opt-in quasi-Newton PP relax (secant->FD-Newton->FIRE)
+//   - relaxStrokesTiltedContactPMELocalSph:  opt-in sphere-constrained relax (|dpos|=L, 2 soft DOF)
 //   - CG helpers: dot_wg, addMul, setLinear, cs_zero, cs_copy
 //
 // Python: spammm/surfaces/ContactSurface.py
@@ -1795,6 +1797,411 @@ __kernel void fillContactPMEMeshVL(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     if (active) samples[gid] = vL;
+}
+
+// ===================== contact_pme SCAN — quasi-Newton relaxation =====================
+#ifndef QN_BUDGET
+#define QN_BUDGET 8
+#endif
+#ifndef NR_BUDGET
+#define NR_BUDGET 16
+#endif
+
+// Total residual force on PP at pos: f_sample + tip-spring + surf bias (Local backend).
+// Same telemetry pointers as cs_eval_contact_pme_local_at.
+inline float3 cs_pme_total_force_local(
+    float3 pos, float3 tipPos,
+    float3 tipA, float3 tipB, float3 tipC,
+    __global const float* mesh_coeffs, const int4 mesh_meta, const float4 mesh_origin_h,
+    __local const float4* LATOMS, __local const float* LCOEFFS, int nat, float d_span,
+    float4 stiffness, float4 dpos0, float4 surfFF,
+    int* out_status, float* out_min_r, int* out_offender, int* out_overflow,
+    float4* out_fe)
+{
+    float4 fe = cs_eval_contact_pme_local_at(pos.x, pos.y, pos.z,
+        mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+        mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+        LATOMS, LCOEFFS, nat, d_span, out_status, out_min_r, out_offender, out_overflow);
+    *out_fe = fe;
+    float3 f = fe.xyz;
+    float3 dpos_ = rotMat(pos - tipPos, tipA, tipB, tipC);
+    f += rotMatT(tipForce(dpos_, stiffness, dpos0), tipA, tipB, tipC);
+    f += tipC * surfFF.x;
+    return f;
+}
+
+// Solve general 3x3 A x = b by Cramer/cofactors. Returns 0 ok, 4 singular.
+inline int solve3x3_general(float3 a0, float3 a1, float3 a2, float3 b, float3* x){
+    // a0,a1,a2 are ROWS of A
+    float det = a0.x*(a1.y*a2.z - a1.z*a2.y) - a0.y*(a1.x*a2.z - a1.z*a2.x) + a0.z*(a1.x*a2.y - a1.y*a2.x);
+    float scale = fmax(fabs(a0.x), fmax(fabs(a1.y), fmax(fabs(a2.z), fmax(fabs(a0.y), fmax(fabs(a1.x), fabs(a0.z))))));
+    if (fabs(det) < 1e-12f * fmax(scale*scale*scale, 1e-12f)) return 4;
+    float inv = 1.0f / det;
+    x->x = (b.x*(a1.y*a2.z - a1.z*a2.y) - a0.y*(b.y*a2.z - a1.z*b.z) + a0.z*(b.y*a2.y - a1.y*b.z)) * inv;
+    x->y = (a0.x*(b.y*a2.z - a1.z*b.z) - b.x*(a1.x*a2.z - a1.z*a2.x) + a0.z*(a1.x*b.z - b.y*a2.x)) * inv;
+    x->z = (a0.x*(a1.y*b.z - b.y*a2.y) - a0.y*(a1.x*b.z - b.y*a2.x) + b.x*(a1.x*a2.y - a1.y*a2.x)) * inv;
+    return 0;
+}
+// relaxStrokesTiltedContactPMELocalQN — same scan loop/telemetry as
+// relaxStrokesTiltedContactPMELocal, but the inner loop is a diagonal-secant
+// quasi-Newton solver instead of FIRE/damped-MD:
+//   G(x) = f_s(x) + f_tip(x - tipPos) + f_surf = 0  (3x1 residual)
+//   dx = -G / Jd , Jd ~ diag(dG/dx) refined by secant df/dx per axis.
+//   Init Jd = stiffness.xyz (Hook's law: dx = F / k_tip in linear response).
+// Safeguards: trust cap |dx|<=0.1A, reject-and-damp on force growth, clamp
+// Jd negative (stable directions only). QN budget = QN_BUDGET iters; harder
+// slices then finish under plain FIRE (nonlinear contact regime).
+__kernel void relaxStrokesTiltedContactPMELocalQN(
+    __global const float* mesh_coeffs, const int4 mesh_meta, const float4 mesh_origin_h,
+    __global const float4* atoms, __global const float* atom_coeffs,
+    const int4 core_meta, const float4 core_bucket_meta,
+    __global int* out_status, __global float* out_min_r, __global int* out_offender, __global int* out_overflow,
+    __global int* out_iters, __global float4* out_pp,
+    __global float4* points, __global float4* FEs,
+    float4 tipA, float4 tipB, float4 tipC,
+    float4 stiffness, float4 dpos0, float4 relax_params, float4 surfFF,
+    int n_scan, int nz,
+    __global const int* iz_start_buf, __global const int* pix_map,
+    __local float4* LATOMS, __local float* LCOEFFS)
+{
+    int gid = get_global_id(0);
+    int lid = get_local_id(0);
+    int lsize = get_local_size(0);
+    int nat = core_meta.x;
+    for (int i = lid; i < nat; i += lsize) LATOMS[i] = atoms[i];
+    for (int i = lid; i < nat * CS_PME_NMODES; i += lsize) LCOEFFS[i] = atom_coeffs[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (gid >= n_scan) return;
+
+    const float3 dTip = tipC.xyz * tipC.w;
+    float4 dpos0_ = dpos0;
+    dpos0_.xyz = rotMatT(dpos0_.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+    // two-pass resume: iz0 = first flagged slice of this pixel (0 = fresh column).
+    // out_pp[ipx*nz+iz] stores the START pos of slice iz+1 (written after pos+=dTip),
+    // so pass 2 resumes from out_pp[iz0-1] — warm start preserved.
+    const int ipx = (pix_map) ? pix_map[gid] : gid;      // original pixel slot for out_pp
+    const int iz0 = (iz_start_buf) ? iz_start_buf[gid] : 0;
+    float3 tipPos = points[gid].xyz + dTip * (float)iz0;
+    float3 pos = (iz0 > 0) ? out_pp[ipx * nz + iz0 - 1].xyz : (tipPos.xyz + dpos0_.xyz);
+    const float dt_md = relax_params.x;      // FIRE dt (fallback phase)
+    const float damp0 = relax_params.y;      // FIRE damp
+    const int imax = (relax_params.z > 0.5f) ? (int)relax_params.z : N_RELAX_STEP_MAX;  // two-pass cap
+    const float f2conv = F2CONV * fmax(relax_params.w, 1e-12f);   // qn_conv: tol scale (spline-smooth field)
+    const float3 a3 = tipA.xyz, b3 = tipB.xyz, c3 = tipC.xyz;
+    float3 Jd = stiffness.xyz;               // Hooke init, then CARRIED across slices (warm Jacobian)
+
+    for (int iz = iz0; iz < nz; iz++) {
+        float4 fe;
+        float3 v = (float3)(0.0f, 0.0f, 0.0f);
+        int status_acc = 0; float min_r_acc = 1e30f; int offender_acc = -1; int overflow_acc = 0;
+        float3 fp = (float3)(0.0f, 0.0f, 0.0f);
+        float3 xp = pos;
+        float f2p = 1e30f;
+        float trust = 1.0f;
+        float dt = dt_md, damp = damp0;
+        const float dtmin = dt_md * 0.1f, dtmax = dt_md;
+        int niter = 0, conv = 0;
+        float f2l = 1e30f;                     // last residual — flag only genuinely stuck slices
+        for (int i = 0; i < imax; i++) {
+            niter = i + 1;
+            int status = 0; float min_r = 1e30f; int offender = -1; int overflow = 0;
+            float3 f = cs_pme_total_force_local(pos, tipPos, a3, b3, c3,
+                mesh_coeffs, mesh_meta, mesh_origin_h, LATOMS, LCOEFFS, nat, core_bucket_meta.w,
+                stiffness, dpos0, surfFF, &status, &min_r, &offender, &overflow, &fe);
+            status_acc |= status;
+            if (min_r < min_r_acc) { min_r_acc = min_r; offender_acc = offender; }
+            overflow_acc += overflow;
+            if (status & 1 || status & 2) { conv = -1; break; }   // invalid — more iters cannot help
+            float f2 = dot(f, f);
+            f2l = f2;
+            if (f2 < f2conv) { conv = 1; break; }
+
+            if (i < QN_BUDGET) {
+                // --- phase 1: diagonal-secant quasi-Newton (cheap, 1 eval/iter) ---
+                if (i > 0) {
+                    float3 dd = pos - xp;
+                    float3 df = f - fp;
+                    if (fabs(dd.x) > 1e-4f) Jd.x = df.x / dd.x;
+                    if (fabs(dd.y) > 1e-4f) Jd.y = df.y / dd.y;
+                    if (fabs(dd.z) > 1e-4f) Jd.z = df.z / dd.z;
+                    Jd = clamp(Jd, -1e6f, -0.1f);    // keep negative (stable)
+                    if (f2 > f2p * 3.0f) {           // overshot -> reject, shrink trust
+                        pos = xp;
+                        trust = fmax(trust * 0.3f, 0.05f);
+                    }
+                }
+                float3 dx = -f / Jd;                    // Jd<0 -> along +f
+                dx *= 0.7f * trust;
+                dx = clamp(dx, -0.1f, 0.1f);
+                xp = pos; fp = f; f2p = f2;
+                pos += dx;
+                trust = fmin(trust * 1.4f, 1.0f);
+            } else if (i < QN_BUDGET + NR_BUDGET) {
+                // --- phase 2: full Newton, FD Jacobian of total G (4 evals/iter) ---
+                const float h = 1e-3f;
+                int s1 = 0, s2_ = 0, s3 = 0; float mr; int of_, ov; float4 fet;
+                float3 gx = cs_pme_total_force_local(pos + (float3)(h, 0.f, 0.f), tipPos, a3, b3, c3, mesh_coeffs, mesh_meta, mesh_origin_h, LATOMS, LCOEFFS, nat, core_bucket_meta.w, stiffness, dpos0, surfFF, &s1, &mr, &of_, &ov, &fet);
+                float3 gy = cs_pme_total_force_local(pos + (float3)(0.f, h, 0.f), tipPos, a3, b3, c3, mesh_coeffs, mesh_meta, mesh_origin_h, LATOMS, LCOEFFS, nat, core_bucket_meta.w, stiffness, dpos0, surfFF, &s2_, &mr, &of_, &ov, &fet);
+                float3 gz = cs_pme_total_force_local(pos + (float3)(0.f, 0.f, h), tipPos, a3, b3, c3, mesh_coeffs, mesh_meta, mesh_origin_h, LATOMS, LCOEFFS, nat, core_bucket_meta.w, stiffness, dpos0, surfFF, &s3, &mr, &of_, &ov, &fet);
+                status_acc |= s1 | s2_ | s3;
+                if ((s1 | s2_ | s3) & 3) break;         // perturbed point invalid -> stay
+                float3 j0 = (gx - f) / h;              // columns dG/dx_j
+                float3 j1 = (gy - f) / h;
+                float3 j2 = (gz - f) / h;
+                // rows of J = cols transposed; symmetrize for stability
+                float3 r0 = (float3)(j0.x, (j1.x + j0.y) * 0.5f, (j2.x + j0.z) * 0.5f);
+                float3 r1 = (float3)(r0.y, j1.y, (j2.y + j1.z) * 0.5f);
+                float3 r2 = (float3)(r0.z, r1.z, j2.z);
+                float3 dx;
+                if (solve3x3_general(r0, r1, r2, -f, &dx) != 0 || !all(isfinite(dx)))
+                    dx = -f / Jd;                       // singular -> Hooke/secant fallback
+                dx *= 0.8f;
+                dx = clamp(dx, -0.15f, 0.15f);
+                pos += dx;
+            } else {
+                // --- phase 3: plain FIRE (last resort, same as reference kernel) ---
+                #if OPT_FIRE
+                v = update_FIRE(f, v, &dt, &damp, dtmin, dtmax, damp0);
+                #else
+                v *= (1.0f - damp);
+                #endif
+                v += f * dt;
+                pos += v * dt;
+            }
+        }
+        if (!conv) {
+            // cap exit -> re-eval at moved pos (breaks already have fe at pos)
+            int status = 0; float min_r = 1e30f; int offender = -1; int overflow = 0;
+            fe = cs_eval_contact_pme_local_at(pos.x, pos.y, pos.z,
+                mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+                mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+                LATOMS, LCOEFFS, nat, core_bucket_meta.w,
+                &status, &min_r, &offender, &overflow);
+            status_acc |= status;
+            if (min_r < min_r_acc) { min_r_acc = min_r; offender_acc = offender; }
+            overflow_acc += overflow;
+        }
+        float4 fe_;
+        fe_.xyz = rotMat(fe.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+        fe_.w = fe.w;
+        int idx = gid * nz + iz;
+        FEs[idx] = fe_;
+        out_status[idx] = status_acc; out_min_r[idx] = min_r_acc; out_offender[idx] = offender_acc; out_overflow[idx] = overflow_acc;
+        // negative iters = hit cap AND residual >> tol (spline-noise floor) -> pass-2 candidate.
+        out_iters[idx] = (conv != 0 || f2l < f2conv * 1e4f) ? niter : -niter;
+        tipPos += dTip.xyz;
+        pos += dTip.xyz;
+        if (iz_start_buf) out_pp[ipx * nz + iz] = (float4)(pos, 0.0f);   // warm-start pos for slice iz+1 (two-pass only)
+    }
+}
+
+// ===================== contact_pme SCAN — sphere-constrained relaxation =====================
+// relaxStrokesTiltedContactPMELocalSph — same scan/telemetry as the LocalQN kernel,
+// but the PP is CONSTRAINED to the sphere |dpos|=L=dpos0.w analytically:
+// the stiff radial DOF (K_RAD >> K_LAT) is eliminated; we solve only the two
+// soft lateral DOFs in tip coords  dpos_tip = (x, y, -sqrt(L^2-x^2-y^2)).
+// Residual: G_i = f_total . e_i  with tangent dirs e1=a+x/|z|c, e2=b+y/|z|c.
+// Physics note: this is the K_RAD -> inf limit — the PP cannot compress
+// radially (~0.1-0.3 A in hard contact), so expect small systematic diffs
+// vs FIRE in deepest contact. For training-data generation likely fine.
+// 3 phases: diag-secant QN (soft DOFs) -> full 2x2 FD-Newton -> damped-MD.
+__kernel void relaxStrokesTiltedContactPMELocalSph(
+    __global const float* mesh_coeffs, const int4 mesh_meta, const float4 mesh_origin_h,
+    __global const float4* atoms, __global const float* atom_coeffs,
+    const int4 core_meta, const float4 core_bucket_meta,
+    __global int* out_status, __global float* out_min_r, __global int* out_offender, __global int* out_overflow,
+    __global int* out_iters, __global float4* out_pp,
+    __global float4* points, __global float4* FEs,
+    float4 tipA, float4 tipB, float4 tipC,
+    float4 stiffness, float4 dpos0, float4 relax_params, float4 surfFF,
+    int n_scan, int nz,
+    __global const int* iz_start_buf, __global const int* pix_map,
+    __local float4* LATOMS, __local float* LCOEFFS)
+{
+    int gid = get_global_id(0);
+    int lid = get_local_id(0);
+    int lsize = get_local_size(0);
+    int nat = core_meta.x;
+    for (int i = lid; i < nat; i += lsize) LATOMS[i] = atoms[i];
+    for (int i = lid; i < nat * CS_PME_NMODES; i += lsize) LCOEFFS[i] = atom_coeffs[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (gid >= n_scan) return;
+
+    const float3 dTip = tipC.xyz * tipC.w;
+    float4 dpos0_ = dpos0;
+    dpos0_.xyz = rotMatT(dpos0_.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+    const int ipx = (pix_map) ? pix_map[gid] : gid;
+    const int iz0 = (iz_start_buf) ? iz_start_buf[gid] : 0;
+    float3 tipPos = points[gid].xyz + dTip * (float)iz0;
+    float3 pos;
+    const float L = dpos0.w;                                // sphere radius [A]
+    const float L2 = L * L;
+    const float3 a3 = tipA.xyz, b3 = tipB.xyz, c3 = tipC.xyz;
+    float2 dxy;
+    if (iz0 > 0) {                                          // resume from stored pos
+        pos = out_pp[ipx * nz + iz0 - 1].xyz;
+        float3 dv = rotMat(pos - tipPos, a3, b3, c3);       // world dpos -> tip coords
+        dxy = dv.xy;
+    } else {
+        dxy = dpos0_.xy;
+        pos = tipPos + rotMatT((float3)(dxy.x, dxy.y, -sqrt(fmax(L2 - dxy.x*dxy.x - dxy.y*dxy.y, 1e-4f))), a3, b3, c3);
+    }
+    const float dt_md = relax_params.x;
+    const float damp0 = relax_params.y;
+    const int imax = (relax_params.z > 0.5f) ? (int)relax_params.z : N_RELAX_STEP_MAX;
+    const float f2conv = F2CONV * fmax(relax_params.w, 1e-12f);
+    float2 Jd = stiffness.xy;                               // Hooke init: lateral tip stiffness
+
+    for (int iz = iz0; iz < nz; iz++) {
+        float4 fe;
+        float2 v = (float2)(0.0f, 0.0f);
+        int status_acc = 0; float min_r_acc = 1e30f; int offender_acc = -1; int overflow_acc = 0;
+        float2 fp = (float2)(0.0f); float2 xp = dxy;
+        float f2p = 1e30f;
+        float trust = 1.0f;
+        float dt = dt_md, damp = damp0;
+        const float dtmin = dt_md * 0.1f, dtmax = dt_md;
+        int niter = 0, conv = 0;
+        float f2l = 1e30f;
+        int ball = 0;
+        for (int i = 0; i < imax; i++) {
+            niter = i + 1;
+            // place PP on sphere (clamp inside 0.9L if overbent)
+            float rr = dxy.x*dxy.x + dxy.y*dxy.y;
+            float Lz2 = L2 - rr;
+            if (Lz2 < 1e-4f) {                              // >~90 deg bend — off-model, cap
+                float sc = sqrt(fmax(L2 * 0.81f, 1e-8f) / fmax(rr, 1e-8f));
+                dxy *= sc; Lz2 = L2 - dxy.x*dxy.x - dxy.y*dxy.y;
+            }
+            float zz = -sqrt(Lz2);
+            float3 d_ = (float3)(dxy.x, dxy.y, zz);
+            pos = tipPos + rotMatT(d_, a3, b3, c3);
+            int status = 0; float min_r = 1e30f; int offender = -1; int overflow = 0;
+            fe = cs_eval_contact_pme_local_at(pos.x, pos.y, pos.z,
+                mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+                mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+                LATOMS, LCOEFFS, nat, core_bucket_meta.w,
+                &status, &min_r, &offender, &overflow);
+            status_acc |= status;
+            if (min_r < min_r_acc) { min_r_acc = min_r; offender_acc = offender; }
+            overflow_acc += overflow;
+            if (status & 1 || status & 2) { conv = -1; break; }
+            float3 f = fe.xyz + rotMatT(tipForce(d_, stiffness, dpos0), a3, b3, c3) + c3 * surfFF.x;
+            // tangent residual: G = f . e_i, e1=a+x/|z|c, e2=b+y/|z|c
+            float iz_ = 1.0f / (-zz);
+            float fc_ = dot(f, c3);
+            float2 G = (float2)(dot(f, a3) + dxy.x * iz_ * fc_,
+                                dot(f, b3) + dxy.y * iz_ * fc_);
+            float f2 = dot(G, G);
+            f2l = f2;
+            if (f2 < f2conv) { conv = 1; break; }
+
+            if (i < QN_BUDGET) {
+                // --- phase 1: diagonal secant on 2 soft DOFs ---
+                if (i > 0) {
+                    float2 dd = dxy - xp;
+                    float2 df = G - fp;
+                    if (fabs(dd.x) > 1e-4f) Jd.x = df.x / dd.x;
+                    if (fabs(dd.y) > 1e-4f) Jd.y = df.y / dd.y;
+                    Jd = clamp(Jd, -1e6f, -0.1f);
+                    if (f2 > f2p * 3.0f) { dxy = xp; trust = fmax(trust * 0.3f, 0.05f); }
+                }
+                float2 dx = -G / Jd;
+                dx *= 0.7f * trust;
+                dx = clamp(dx, -0.1f, 0.1f);
+                xp = dxy; fp = G; f2p = f2;
+                dxy += dx;
+                trust = fmin(trust * 1.4f, 1.0f);
+            } else if (i < QN_BUDGET + NR_BUDGET) {
+                // --- phase 2: full 2x2 FD-Newton on (x,y) ---
+                const float h = 1e-3f;
+                float2 Gx_, Gy_; int s1 = 0, s2_ = 0; float mr; int of_, ov;
+                // probe +x
+                {
+                    float2 dp = dxy + (float2)(h, 0.f);
+                    float z2 = L2 - dp.x*dp.x - dp.y*dp.y; if (z2 < 1e-4f) z2 = 1e-4f;
+                    float z3 = -sqrt(z2);
+                    float3 dd_ = (float3)(dp.x, dp.y, z3);
+                    float3 pp = tipPos + rotMatT(dd_, a3, b3, c3);
+                    float4 fej = cs_eval_contact_pme_local_at(pp.x, pp.y, pp.z,
+                        mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+                        mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+                        LATOMS, LCOEFFS, nat, core_bucket_meta.w, &s1, &mr, &of_, &ov);
+                    float3 fj = fej.xyz + rotMatT(tipForce(dd_, stiffness, dpos0), a3, b3, c3) + c3 * surfFF.x;
+                    float izj = 1.0f / (-z3); float fcj = dot(fj, c3);
+                    Gx_ = (float2)(dot(fj, a3) + dp.x * izj * fcj, dot(fj, b3) + dp.y * izj * fcj);
+                }
+                {
+                    float2 dp = dxy + (float2)(0.f, h);
+                    float z2 = L2 - dp.x*dp.x - dp.y*dp.y; if (z2 < 1e-4f) z2 = 1e-4f;
+                    float z3 = -sqrt(z2);
+                    float3 dd_ = (float3)(dp.x, dp.y, z3);
+                    float3 pp = tipPos + rotMatT(dd_, a3, b3, c3);
+                    float4 fej = cs_eval_contact_pme_local_at(pp.x, pp.y, pp.z,
+                        mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+                        mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+                        LATOMS, LCOEFFS, nat, core_bucket_meta.w, &s2_, &mr, &of_, &ov);
+                    float3 fj = fej.xyz + rotMatT(tipForce(dd_, stiffness, dpos0), a3, b3, c3) + c3 * surfFF.x;
+                    float izj = 1.0f / (-z3); float fcj = dot(fj, c3);
+                    Gy_ = (float2)(dot(fj, a3) + dp.x * izj * fcj, dot(fj, b3) + dp.y * izj * fcj);
+                }
+                status_acc |= s1 | s2_;
+                if ((s1 | s2_) & 3) break;
+                // J cols: dG/dx, dG/dy
+                float j00 = (Gx_.x - G.x) / h, j10 = (Gx_.y - G.x) / h;
+                float j01 = (Gy_.x - G.y) / h, j11 = (Gy_.y - G.y) / h;
+                float det = j00 * j11 - j01 * j10;
+                float2 dx;
+                if (fabs(det) > 1e-12f && isfinite(det)) {
+                    dx = (float2)((-j11 * G.x + j01 * G.y) / det, (j10 * G.x - j00 * G.y) / det);  // -J^-1 G
+                } else {
+                    dx = -G / Jd;
+                }
+                dx *= 0.8f;
+                dx = clamp(dx, -0.15f, 0.15f);
+                dxy += dx;
+            } else {
+                // --- phase 3: damped-MD on the 2 soft DOFs ---
+                v *= (1.0f - damp);
+                v += G * dt;
+                dxy += v * dt;
+            }
+        }
+        // final eval at converged dxy -> pos. Skip when the loop already evaluated
+        // fe at exactly this pos (converged break) — saves ~1 eval/slice.
+        float rr = dxy.x*dxy.x + dxy.y*dxy.y;
+        float Lz2 = L2 - rr;
+        if (Lz2 < 1e-4f) { float sc = sqrt(fmax(L2*0.81f,1e-8f)/fmax(rr,1e-8f)); dxy *= sc; Lz2 = L2 - dxy.x*dxy.x - dxy.y*dxy.y; }
+        float zz = -sqrt(Lz2);
+        float3 d_ = (float3)(dxy.x, dxy.y, zz);
+        pos = tipPos + rotMatT(d_, a3, b3, c3);
+        if (!conv) {
+            int status = 0; float min_r = 1e30f; int offender = -1; int overflow = 0;
+            fe = cs_eval_contact_pme_local_at(pos.x, pos.y, pos.z,
+                mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+                mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+                LATOMS, LCOEFFS, nat, core_bucket_meta.w,
+                &status, &min_r, &offender, &overflow);
+            status_acc |= status;
+            if (min_r < min_r_acc) { min_r_acc = min_r; offender_acc = offender; }
+            overflow_acc += overflow;
+        }
+        float4 fe_;
+        fe_.xyz = rotMat(fe.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+        fe_.w = fe.w;
+        int idx = gid * nz + iz;
+        FEs[idx] = fe_;
+        out_status[idx] = status_acc; out_min_r[idx] = min_r_acc; out_offender[idx] = offender_acc; out_overflow[idx] = overflow_acc;
+        out_iters[idx] = (conv != 0 || f2l < f2conv * 1e4f) ? niter : -niter;
+        tipPos += dTip.xyz;
+        pos += dTip.xyz;
+        if (iz_start_buf) out_pp[ipx * nz + iz] = (float4)(pos, 0.0f);   // two-pass only
+        // warm-start dxy for next slice from new pos
+        {
+            float3 dv = rotMat(pos - tipPos, a3, b3, c3);
+            dxy = dv.xy;
+        }
+    }
 }
 
 #endif // AFM_STANDALONE

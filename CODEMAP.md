@@ -137,7 +137,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `AFM.cl` — AFM PP relax + FDBM Stage-3 `fdbm_*` helpers (FAST_S3)
 - `gridFF.cl` — grid force field kernels
 - `surface.cl` — surface interaction kernels
-- `contact_surface.cl` — quasi-2D contact + **contact_pme**: bucket/local eval+FIRE (`relaxStrokesTiltedContactPME*`), GPU mesh FIT (`fillContactPMEMeshVL`)
+- `contact_surface.cl` — quasi-2D contact + **contact_pme**: bucket/local eval+FIRE (`relaxStrokesTiltedContactPME*`), GPU mesh FIT (`fillContactPMEMeshVL`); opt-in fast relaxers `…LocalQN`/`…LocalSph` (report `doc/Reports/ContactPME_RelaxQuasiNewton_Sph_2026-10-03.md`)
 - `rigid.cl` — rigid body dynamics kernels (14: energy replica, 15: multimol MD, 16: persistent, 17: single-WG, 18: `rigid_body_pairff_probe_grid` — 2D grid PairFF energy via shared `pairff_unified_site_EF` inline primitive)
 - `assembly.cl` — rigid-body SAM packing: `emit_configuration_xyz`, `evaluate_packing_3d`
 - `nonbonded.cl` — non-bonded interaction kernels
