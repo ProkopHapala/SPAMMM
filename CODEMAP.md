@@ -56,7 +56,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `ContactSurface.py` — **quasi-2D contact field** for aperiodic AFM: separable B-spline×poly + radial PIC; also `ContactPMEParams` for particle-mesh backend
 - `PMESplit.py` — atomwise PAW/hermite/plateau/rho soft long/short split (default `paw`, `Δ_in=1.0`); `precompute_split_cache`
 - `CoarseMesh.py` — coarse 3D cubic B-spline mesh of V_L; batched prefilter; CPU raster oracle
-- `PICCore.py` — compact doubling-power core fit of v_S (`fit_core_1d`, powers 2…32)
+- `PICCore.py` — compact doubling-power core of v_S (`fit_core_1d` host; paw oracle `fit_core_paw_grid`; GPU `cs_fit_core_paw`)
 - `GridFFRelaxedScan.py` — relaxed scan over surface grid
 - `FoldedRigid.py` — folded basis rigid body relaxation
 - `Ewald2D.py` — 2D Ewald summation for surfaces
@@ -205,6 +205,9 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `Topics/AFM/ContactSurface_Elastic.md` — elastic extension (future)
 - `Tasks/ContactSurface_PME_ParallelPlan.md` — **contact_pme** particle-mesh plan (PAW split, mesh+core, harness packet)
 - `Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md` — memory/speed report; local-kernel SCAN + GPU mesh FIT
+- `Reports/ContactPME_Split_Rcut_Locality_2026-10-04.md` — split mechanics (PAW=damping), Rcut=Δ_b sweep (residual dead by ~4 Å → r_b is locality knob), mesh-first-residual failure, layer pruning
+- `Reports/ContactPME_Supersample_Scale_2026-10-04.md` — fit vs scan scale, GridFF voxel build, 1×1×1 spline sufficient (USER 2026-10-04)
+- `Reports/ContactPME_RelaxQuasiNewton_Sph_2026-10-03.md` — opt-in quasi-Newton and sphere-constrained Newton (`relax_mode='qn'|'sph'`); graphene size sweep, tile sphere vs local/bucket (USER 2026-10-04)
 - `TopicalAudit/AFM_ContactSurface.md` — contact surface + contact_pme implementation map
 - `Topics/ForceFields/LFF_ProjectiveRelax.md` — LFF projective Jacobi (springs + FAF outer); 3rd relax path
 - `Topics/Vibrations.md` — normal-mode analysis (Hessian, GUI, units, tests)

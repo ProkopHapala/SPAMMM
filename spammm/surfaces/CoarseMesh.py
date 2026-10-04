@@ -54,6 +54,23 @@ def _dbasis(u):
                      0.5 * u2], dtype=np.float64)
 
 
+def _bspline_thomas_factors(n):
+    """Thomas LU factors for the zero-padded cubic B-spline tridiagonal [1,4,1].
+
+    Solves c_{i-1}+4c_i+c_{i+1} = 6 d_i (equivalent to _bspline_tridiag_ab with
+    RHS scaled by 6). Returns (invden, cprime) float32 arrays consumed by the
+    cs_bspline_prefilter_lines kernel: invden[i] = 1/(4 - c'[i-1]).
+    """
+    invden = np.empty(n, np.float64)
+    cprime = np.empty(n, np.float64)
+    invden[0] = 0.25
+    cprime[0] = 0.25 if n > 1 else 0.0
+    for i in range(1, n):
+        invden[i] = 1.0 / (4.0 - cprime[i - 1])
+        cprime[i] = invden[i] if i < n - 1 else 0.0
+    return invden.astype(np.float32), cprime.astype(np.float32)
+
+
 def _prefilter_3d(samples):
     """Separable cubic B-spline prefilter with batched solve_banded (no Python line loops)."""
     coeffs = np.asarray(samples, dtype=np.float64).copy()

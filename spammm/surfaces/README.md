@@ -27,12 +27,12 @@ Caveats: [doc/Caveats.md](../../doc/Caveats.md) §6 · Debugging: [doc/Takeways.
 
 ## contact_pme (particle-mesh)
 
-`V ≈ V_mesh + Σ V_core`. CLI: `run_spm.py afm --model contact_pme`. Plan: [`ContactSurface_PME_ParallelPlan.md`](../../doc/Tasks/ContactSurface_PME_ParallelPlan.md). Report: [`ContactPME_PAW_AFM_MemSpeed_2026-08-11.md`](../../doc/Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md). Audit: [`AFM_ContactSurface.md`](../../doc/TopicalAudit/AFM_ContactSurface.md).
+`V ≈ V_mesh + Σ V_core`. CLI: `run_spm.py afm --model contact_pme`. Plan: [`ContactSurface_PME_ParallelPlan.md`](../../doc/Tasks/ContactSurface_PME_ParallelPlan.md). Reports: [`ContactPME_PAW_AFM_MemSpeed_2026-08-11.md`](../../doc/Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md), [`ContactPME_Supersample_Scale_2026-10-04.md`](../../doc/Reports/ContactPME_Supersample_Scale_2026-10-04.md) (1×1×1 spline is enough). Audit: [`AFM_ContactSurface.md`](../../doc/TopicalAudit/AFM_ContactSurface.md).
 
 | Stage | Device | Entry |
 |-------|--------|-------|
 | FIT mesh V_L | GPU | `fillContactPMEMeshVL` via `AFMulator.fit_contact_pme` |
-| FIT core LS | host | `PICCore.fit_core_1d` |
+| FIT core LS | GPU for paw, host otherwise | `cs_fit_core_paw` / `PICCore.fit_core_1d` |
 | SCAN FIRE | GPU | `relaxStrokesTiltedContactPMELocal` (`core_backend='local'`) |
 
 ## Contact surface — variants (2.5D)

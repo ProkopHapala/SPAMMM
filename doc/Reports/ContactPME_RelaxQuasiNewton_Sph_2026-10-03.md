@@ -132,6 +132,26 @@ Bench harness + figures: `invPPAFM/export_invAFM/scripts/testplot_artifact_atlas
   `cpm_izstart`, `cpm_pixmap`); `scan_disps` reused as `out_pp`; verbosity>1
   `scan_prof` section timing.
 
+## Size sweep (square bilayer graphene, GTX 1650, 2026-10-04)
+
+Same PP contract as SPM_CLI: `K_LAT=0.5 N/m`, `K_RAD=20 eV/Å²`, `L=3 Å`, df window 3.7–4.7 Å, amplitude 1 Å, 0.1 Å pixels. Second run. Harness `tests/SPM/testplot_pme_tiles.py --solvers`. Figure `debug/testplot_pme_tiles/solvers_scale.png`. **USER confirmed this figure (2026-10-04).**
+
+The local kernel stores every atom core in local memory (16 B position + 20 B of five coefficients = 36 B/atom) and leaves the B-spline in global memory. On this device that budget is 48 KB, so the local kernel stops at about 1365 atoms. A 24 Å sheet (418 atoms) uses 14.7 KB of cores and 0 KB of mesh. The tiled sphere kernel preloads only the workgroup's atoms plus a 10×10×5 mesh window: 4.1 KB on that same sheet.
+
+Wall time, milliseconds:
+
+| atoms | scan | local FIRE | local QN | local sphere | tile sphere | bucket FIRE |
+|---:|---|---:|---:|---:|---:|---:|
+| 194 | 188×190×31 | 373 | 80 | 78 | 40 | |
+| 418 | 262×261×31 | 2225 | 476 | 512 | 86 | |
+| 810 | 360×346×31 | 12583 | 2918 | 3314 | 182 | |
+| 1756 | 508×509×31 | does not fit (63 KB) | | | 467 | 37400 |
+| 3232 | 680×679×31 | does not fit (116 KB) | | | 881 | 66000 |
+
+While the cores fit, quasi-Newton and the sphere solver are about 4× faster than FIRE and nearly tied. The tiled sphere kernel is another factor of 2–18 faster, because each workgroup walks only its own atoms. At 3232 atoms it is 0.9 s; bucket FIRE on the same scan is 66 s. Bucket has no quasi-Newton or sphere variant. The tile backend is sphere-only.
+
+Largest |Δdf| against FIRE is 1.4–1.6×10⁻² for both sphere kernels and 2.1–3.2×10⁻² for quasi-Newton. At 1756 and 3232 atoms the reference is bucket FIRE (1.5×10⁻² for the tile).
+
 ## Open issues
 
 - `sph` = `K_RAD→∞` limit — radial compression omitted (small deep-contact diff).

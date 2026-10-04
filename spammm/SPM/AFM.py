@@ -56,7 +56,7 @@ Optimization Policy:
 
 import numpy as np
 import pyopencl as cl
-import os, sys
+import os, sys, time
 from ..globals import debug_print
 from ..utils.OpenCLBase import OpenCLBase
 
@@ -94,6 +94,36 @@ def build_scan_xy_points_vectorized(scan_p0, scan_da, scan_db, nx, ny):
     pts = np.zeros((int(nx) * int(ny), 4), dtype=np.float32)
     pts[:, :3] = xyz.reshape(-1, 3)
     return pts
+
+
+def compact_scan_tile(dx, dy, n_threads=256):
+    """(tx, ty) with tx*ty = n_threads and the pixel rectangle as square as possible in Å.
+
+    One workgroup shares one local-memory block (atom list + B-spline slab). A long
+    rectangle has a longer halo, so it loads more atoms and more mesh nodes than a
+    square of the same thread count. 256 threads is the occupancy point: a compute
+    unit with 1024 threads and 48 KB local then holds 4 such workgroups, ~12 KB each.
+    Span of n samples is (n-1)*pitch, not n*pitch.
+    """
+    dx, dy = abs(float(dx)), abs(float(dy))
+    if dx <= 0.0 or dy <= 0.0:
+        raise ValueError(f'pixel pitch must be positive, got dx={dx} dy={dy}')
+    n = int(n_threads)
+    if n < 1:
+        raise ValueError(f'n_threads must be >= 1, got {n}')
+    best = None
+    for tx in range(1, n + 1):
+        if n % tx:
+            continue
+        ty = n // tx
+        Wx = max(tx - 1, 1) * dx
+        Hy = max(ty - 1, 1) * dy
+        aspect = max(Wx, Hy) / min(Wx, Hy)
+        warp = 0 if (tx % 16 == 0 and ty % 16 == 0) else 1
+        key = (aspect, warp, abs(tx - ty))
+        if best is None or key < best[0]:
+            best = (key, tx, ty)
+    return best[1], best[2]
 
 
 def build_scan_points_vectorized(scan_xs, scan_ys, h_scan):
@@ -1608,7 +1638,7 @@ class AFMulator(OpenCLBase):
     def fit_contact_pme(self, *, r_cut=6.0, h_mesh=1.0, halo_nodes=6, query_bounds=None,
                         margin=2.0, z_above_lo=3.0, z_above_hi=8.0,
                         n_shells=300, n_endpoint=30, n_holdout=80, seed=42, bPrint=True,
-                        split_mode='paw', q_tip=0.0):
+                        split_mode='paw', q_tip=0.0, delta_b=None):
         """Orchestrate contact_pme fit: split → coarse mesh → compact core.
 
         Builds SplitParams from assigned Morse params (R0/E0 from cLJs_arr, q from
@@ -1645,9 +1675,12 @@ class AFMulator(OpenCLBase):
         alpha = float(abs(cMs[0, 2]))
         r_damp = 0.1  # GFFParams convention (matches cs_brute_plqh_points default)
         q_tip = float(q_tip)
-        p = SplitParams(R0=cMs[:, 0].astype(np.float64), E0=cMs[:, 1].astype(np.float64),
-                        q=qs, alpha=alpha, q_tip=q_tip, r_damp=r_damp, r_cut=float(r_cut),
-                        split_mode=str(split_mode))
+        sp_kw = dict(R0=cMs[:, 0].astype(np.float64), E0=cMs[:, 1].astype(np.float64),
+                     q=qs, alpha=alpha, q_tip=q_tip, r_damp=r_damp, r_cut=float(r_cut),
+                     split_mode=str(split_mode))
+        if delta_b is not None:
+            sp_kw['delta_b'] = float(delta_b)
+        p = SplitParams(**sp_kw)
         # Query envelope
         if query_bounds is None:
             zmax = float(apos[:, 2].max())
@@ -1657,6 +1690,7 @@ class AFMulator(OpenCLBase):
         query_bounds = np.asarray(query_bounds, dtype=np.float64)
         # Preflight (fail-loud)
         self._pme_preflight(p, query_bounds, max_resident_bytes=self._global_mem)
+        _t_fit0 = time.perf_counter()
         r_core_max = float(p.r_core_max)
         if bPrint:
             print(f"AFMulator.fit_contact_pme: na={na} mode={p.split_mode} r_core_max={r_core_max:.3f} "
@@ -1664,19 +1698,25 @@ class AFMulator(OpenCLBase):
             print(f"  query_bounds={query_bounds.tolist()} alpha={alpha} r_damp={r_damp} q_tip={q_tip}")
             print(f"  Δ_in={p.delta_in} Δ_a={p.delta_a} Δ_b={p.delta_b}")
         # Build coarse mesh (V_L = Σ v_i^L) — GPU raster when available (PAW)
+        _t_mesh = time.perf_counter()
         if hasattr(self.prg, 'fillContactPMEMeshVL') and str(p.split_mode) == 'paw':
             mesh = self._pme_build_coarse_mesh_gpu(apos, p, query_bounds, h_mesh=h_mesh, halo_nodes=halo_nodes)
             if bPrint:
                 print(f"  mesh: GPU fillContactPMEMeshVL shape={mesh.coeffs.shape}")
         else:
             mesh = build_coarse_mesh(apos, p, query_bounds, h_mesh=h_mesh, halo_nodes=halo_nodes)
+        mesh_ms = (time.perf_counter() - _t_mesh) * 1e3
         if bPrint:
-            print(f"  mesh: shape={mesh.coeffs.shape} origin={mesh.origin.tolist()} resident={mesh.coeffs.nbytes} bytes")
-        # Fit compact core (v_S per atom) — still host LS for now; samples use PAW cache
-        core_fit = fit_core_1d(p, n_shells=n_shells, n_endpoint=n_endpoint, n_holdout=n_holdout, seed=seed)
+            print(f"  mesh: shape={mesh.coeffs.shape} origin={mesh.origin.tolist()} resident={mesh.coeffs.nbytes} bytes  {mesh_ms:.1f} ms", flush=True)
+        # Fit compact core. PAW uses the GPU Chebyshev 5×5; other modes stay on fit_core_1d.
+        _t_core = time.perf_counter()
+        if str(p.split_mode) == 'paw' and hasattr(self.prg, 'cs_fit_core_paw'):
+            core_fit = self._pme_fit_core_gpu(p)
+        else:
+            core_fit = fit_core_1d(p, n_shells=n_shells, n_endpoint=n_endpoint, n_holdout=n_holdout, seed=seed)
         if bPrint:
             print(f"  core: na={core_fit.coeffs.shape[0]} n_modes={core_fit.coeffs.shape[1]} "
-                  f"basis={core_fit.basis} cond_raw=[{float(core_fit.cond_raw.min()):.1f},{float(core_fit.cond_raw.max()):.1f}]")
+                  f"basis={core_fit.basis} {(time.perf_counter()-_t_core)*1e3:.2f} ms", flush=True)
         # PIC buckets for core evaluation (cell_size >= max r_b)
         cell_size = r_core_max
         x0 = float(apos[:, 0].min()) - cell_size
@@ -1691,15 +1731,98 @@ class AFMulator(OpenCLBase):
             bucket_nbx=nbx, bucket_nby=nby, bucket_cell_size=cell_size, bucket_bounds=(x0, y0, x1, y1))
         self.cpm = params
         self._cpm_upload_id = None  # force re-upload on next GPU eval/scan
+        self.last_pme_times = dict(mesh_ms=mesh_ms, core_ms=(time.perf_counter() - _t_core) * 1e3,
+                                   fit_ms=(time.perf_counter() - _t_fit0) * 1e3, na=na,
+                                   mesh_shape=tuple(int(x) for x in mesh.coeffs.shape))
         if bPrint:
             print(f"  ContactPMEParams: resident={params.resident_bytes} bytes ({params.resident_kb:.1f} KB) "
                   f"buckets={nbx}x{nby} cell={cell_size:.1f}Å")
         return params
 
-    def _pme_build_coarse_mesh_gpu(self, atom_pos, split_params, query_bounds, h_mesh=1.0, halo_nodes=6):
-        """Raster V_L on coarse mesh via fillContactPMEMeshVL (WG+local), then host prefilter."""
-        from spammm.surfaces.PMESplit import precompute_split_cache
-        from spammm.surfaces.CoarseMesh import CoarseMesh, _prefilter_3d
+    def _pme_prefilter_gpu(self, buf, nx, ny, nz):
+        """In-place separable cubic B-spline prefilter on a device buffer (Thomas).
+
+        buf: cl.Buffer of nx*ny*nz float32, C-order (nx,ny,nz), z fastest.
+        Same math as CoarseMesh._prefilter_3d (scipy solve_banded), exact
+        tridiag(1,4,1) c = 6 d per axis — no CPU transfer, no iterations.
+        Axis mapping: n_inner=1 → z-lines, nz → y-lines, ny*nz → x-lines.
+        Skips axes with n<3, matching _prefilter_3d.
+        """
+        from spammm.surfaces.CoarseMesh import _bspline_thomas_factors
+        cache = getattr(self, '_thomas_factor_cl', None)
+        if cache is None:
+            cache = self._thomas_factor_cl = {}
+        kern = getattr(self, '_prefilter_kernel', None)
+        if kern is None:
+            kern = self._prefilter_kernel = self.prg.cs_bspline_prefilter_lines
+        mf = cl.mem_flags
+        for line_len, n_inner in ((nz, 1), (ny, nz), (nx, ny * nz)):
+            if line_len < 3:
+                continue
+            key = int(line_len)
+            if key not in cache:
+                invden, cprime = _bspline_thomas_factors(key)
+                cache[key] = (cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=invden),
+                              cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=cprime))
+            invden_cl, cprime_cl = cache[key]
+            n_lines = nx * ny * nz // line_len
+            kern(self.queue, (n_lines,), None,
+                buf, np.int32(n_lines), np.int32(line_len), np.int32(n_inner),
+                invden_cl, cprime_cl)
+        self.queue.finish()
+
+    def _pme_fit_core_gpu(self, split_params):
+        """PAW core coefficients on the GPU. One thread per atom, 32-node Chebyshev grid.
+
+        Replaces the per-atom Python loop in fit_core_1d for split_mode='paw'.
+        Coefficients match PICCore.fit_core_paw_grid (float64 normal equations).
+        """
+        from spammm.surfaces.PICCore import paw_coeffs_batch, CORE_FIT_NSAMP, CoreFit, CORE_POWERS
+        a0, a2, a4, a6, r_b = paw_coeffs_batch(split_params)
+        r_lo = np.atleast_1d(np.asarray(split_params.r_lo, np.float64))
+        R0 = np.atleast_1d(np.asarray(split_params.R0, np.float64))
+        E0 = np.atleast_1d(np.asarray(split_params.E0, np.float64))
+        q = np.atleast_1d(np.asarray(split_params.q, np.float64))
+        na = len(R0)
+        reqs = np.zeros((na, 4), np.float32)
+        reqs[:, 0], reqs[:, 1], reqs[:, 2], reqs[:, 3] = R0, E0, q, r_lo
+        paw = np.stack([a0, a2, a4, a6], axis=1).astype(np.float32)
+        rb = np.ascontiguousarray(r_b, np.float32)
+        self.try_make_buffers({
+            'cpm_fit_reqs': na * 16, 'cpm_fit_paw': na * 16,
+            'cpm_fit_rb': na * 4, 'cpm_fit_coeffs': na * 5 * 4,
+        }, suffix='_cl')
+        self.toGPU_(self.cpm_fit_reqs_cl, reqs)
+        self.toGPU_(self.cpm_fit_paw_cl, paw)
+        self.toGPU_(self.cpm_fit_rb_cl, rb)
+        wg = 32
+        gs = (self._roundup(na, wg),)
+        kern = getattr(self, '_fit_core_kernel', None)
+        if kern is None:
+            kern = self._fit_core_kernel = cl.Kernel(self.prg, 'cs_fit_core_paw')
+        kern(self.queue, gs, (wg,),
+             self.cpm_fit_reqs_cl, self.cpm_fit_paw_cl, self.cpm_fit_rb_cl,
+             np.float32(split_params.alpha), np.float32(split_params.r_damp), np.float32(split_params.q_tip),
+             np.int32(na), np.int32(CORE_FIT_NSAMP), self.cpm_fit_coeffs_cl)
+        coeffs = np.empty((na, 5), np.float32)
+        cl.enqueue_copy(self.queue, coeffs, self.cpm_fit_coeffs_cl)
+        self.queue.finish()
+        if not np.isfinite(coeffs).all():
+            raise RuntimeError(f"cs_fit_core_paw produced non-finite coefficients (na={na})")
+        nan = np.full(na, np.nan)
+        return CoreFit(coeffs=coeffs.astype(np.float64), r_lo=r_lo, r_b=np.asarray(r_b, np.float64),
+                       powers=CORE_POWERS, basis='gpu_paw_grid',
+                       cond_raw=nan.copy(), cond_hier=nan.copy(),
+                       train_rmse_E=nan.copy(), train_rmse_F=nan.copy(),
+                       held_rmse_E=nan.copy(), held_rmse_F=nan.copy(),
+                       held_max_E=nan.copy(), held_max_F=nan.copy(), worst_r=nan.copy())
+
+    def _pme_build_coarse_mesh_gpu(self, atom_pos, split_params, query_bounds, h_mesh=1.0, halo_nodes=6, prefilter=True):
+        """Raster V_L on the mesh via fillContactPMEMeshVL (one sample per node), then GPU prefilter.
+
+        prefilter=False returns the nodal samples themselves (no spline fit)."""
+        from spammm.surfaces.PICCore import paw_coeffs_batch
+        from spammm.surfaces.CoarseMesh import CoarseMesh
         atom_pos = np.asarray(atom_pos, dtype=np.float64).reshape(-1, 3)
         qb = np.asarray(query_bounds, dtype=np.float64)
         h = float(h_mesh); halo = int(halo_nodes)
@@ -1711,18 +1834,15 @@ class AFMulator(OpenCLBase):
         na = len(atom_pos)
         atoms4 = np.zeros((na, 4), dtype=np.float32)
         atoms4[:, :3] = atom_pos.astype(np.float32)
+        a0, a2, a4, a6, r_b = paw_coeffs_batch(split_params)
         reqs = np.zeros((na, 4), dtype=np.float32)
-        paw = np.zeros((na, 4), dtype=np.float32)
+        R0 = np.atleast_1d(np.asarray(split_params.R0, np.float64))
+        E0 = np.atleast_1d(np.asarray(split_params.E0, np.float64))
+        qq = np.atleast_1d(np.asarray(split_params.q, np.float64))
+        reqs[:, 0], reqs[:, 1], reqs[:, 2] = R0, E0, qq
+        paw = np.stack([a0, a2, a4, a6], axis=1).astype(np.float32)
         paw_rb = np.zeros((na, 4), dtype=np.float32)
-        for ia in range(na):
-            pi = split_params.with_atom(ia)
-            cache = precompute_split_cache(pi)
-            assert cache.get('mode') == 'paw', f"GPU mesh fill requires paw cache, got {cache.get('mode')}"
-            reqs[ia, 0] = float(np.atleast_1d(pi.R0)[0])
-            reqs[ia, 1] = float(np.atleast_1d(pi.E0)[0])
-            reqs[ia, 2] = float(np.atleast_1d(pi.q)[0])
-            paw[ia] = (cache['a0'], cache['a2'], cache['a4'], cache['a6'])
-            paw_rb[ia, 0] = cache['r_b']
+        paw_rb[:, 0] = r_b
         ntot = nx * ny * nz
         self.try_make_buffers({
             'cpm_fill_samples': ntot * 4, 'cpm_fill_atoms': na * 16, 'cpm_fill_reqs': na * 16,
@@ -1744,16 +1864,25 @@ class AFMulator(OpenCLBase):
         LREQS = cl.LocalMemory(wg * 16)
         LPAW = cl.LocalMemory(wg * 16)
         LRB = cl.LocalMemory(wg * 16)
+        self.queue.finish()
+        _t_fill = time.perf_counter()
         self.prg.fillContactPMEMeshVL(
             self.queue, gs, (wg,),
             self.cpm_fill_samples_cl, mesh_n, origin_h,
             self.cpm_fill_atoms_cl, self.cpm_fill_reqs_cl, self.cpm_fill_paw_cl, self.cpm_fill_paw_rb_cl,
             np.int32(na), GFFParams, PLQH, LATOMS, LREQS, LPAW, LRB)
-        samples_f32 = np.empty(ntot, dtype=np.float32)
-        cl.enqueue_copy(self.queue, samples_f32, self.cpm_fill_samples_cl)
         self.queue.finish()
-        samples = samples_f32.astype(np.float64).reshape(nx, ny, nz)
-        coeffs = _prefilter_3d(samples)
+        fill_ms = (time.perf_counter() - _t_fill) * 1e3
+        # GPU prefilter in place (replaces host _prefilter_3d + download-then-solve)
+        _t_pf = time.perf_counter()
+        if prefilter:
+            self._pme_prefilter_gpu(self.cpm_fill_samples_cl, nx, ny, nz)
+        pf_ms = (time.perf_counter() - _t_pf) * 1e3
+        self.last_raster_ms = dict(fill_ms=fill_ms, prefilter_ms=pf_ms, ntot=ntot, shape=(nx, ny, nz), h=h)
+        coeffs_f32 = np.empty(ntot, dtype=np.float32)
+        cl.enqueue_copy(self.queue, coeffs_f32, self.cpm_fill_samples_cl)
+        self.queue.finish()
+        coeffs = coeffs_f32.astype(np.float64).reshape(nx, ny, nz)
         interior_lo = np.array([halo, halo, halo], dtype=np.int64)
         interior_hi = np.array([nx - 1 - halo, ny - 1 - halo, nz - 1 - halo], dtype=np.int64)
         return CoarseMesh(coeffs=coeffs, origin=origin, h=h, halo=halo,
@@ -1844,8 +1973,12 @@ class AFMulator(OpenCLBase):
                 raise ValueError(f"contact_pme Local ABI requires coeffs.shape=(na,5), got {coeffs.shape}")
             if not np.array_equal(powers, np.array([2, 4, 8, 16, 32], dtype=np.int64)):
                 raise ValueError(f"contact_pme Local ABI requires powers=[2,4,8,16,32], got {powers}")
+        elif backend == 'tile':
+            if not hasattr(self.prg, 'relaxStrokesTiltedContactPMETileSph'):
+                raise RuntimeError("contact_pme core_backend='tile' requires kernel "
+                                   "relaxStrokesTiltedContactPMETileSph — not compiled in")
         elif backend != 'bucket':
-            raise ValueError(f"core_backend must be 'auto'|'local'|'bucket', got {core_backend!r}")
+            raise ValueError(f"core_backend must be 'auto'|'local'|'bucket'|'tile', got {core_backend!r}")
         return backend
 
     def _pme_upload_resident(self, params, *, force=False):
@@ -1985,9 +2118,10 @@ class AFMulator(OpenCLBase):
         """Host postflight: raise on any trajectory-domain, stencil-bound, or bucket-overflow flag.
 
         status: (nq,) int32 — 0 = OK, bit 0 (1)=mesh stencil OOB, bit 1 (2)=core domain
-                violation, bit 2 (4)=bucket overflow. Reports worst coordinates.
+                violation, bit 2 (4)=bucket overflow. Bit 3 (8)=rho_cap reached is a
+                soft invalid marker (tile backend), not a hard error. Reports worst coordinates.
         """
-        bad = np.where(status != 0)[0]
+        bad = np.where((status & 7) != 0)[0]
         if len(bad) == 0:
             return
         worst = int(bad[0])
@@ -2010,7 +2144,8 @@ class AFMulator(OpenCLBase):
     def run_scan_contact_pme(self, nxy=(50, 50), nz=60, dtip=-0.1, scan_p0=None,
                              scan_da=None, scan_db=None, scan_pts=None, bAlloc=True,
                              use_gpu=None, core_backend='auto', workgroup_size=None,
-                             relax_mode='fire', qn_cap=0, qn_conv=1.0):
+                             relax_mode='fire', qn_cap=0, qn_conv=1.0,
+                             tile_xy=None, rho_max=1.0, nzL=5, rho_cap=None):
         """PP-AFM scan using the contact_pme backend.
 
         Same scan geometry and outputs as run_scan_contact(), but the field
@@ -2029,8 +2164,13 @@ class AFMulator(OpenCLBase):
                 curved scan plane, no refit of the fitted field)
             bAlloc: allocate scan buffers
             use_gpu: force GPU/Python; default auto-detect
-            core_backend: 'auto'|'local'|'bucket'
-            workgroup_size: OpenCL local size (default 32)
+            core_backend: 'auto'|'local'|'bucket'|'tile'
+                'tile' = tiled WG path (A1–A3): local mesh slab + per-WG atom
+                list; relax_mode='sph' + qn_cap=0 only (experimental)
+            workgroup_size: OpenCL local size for the non-tile kernels (default 32)
+            tile_xy: (tx, ty) pixel tile for the tiled kernel. None picks the
+                factorization of 256 threads whose rectangle is most square in Å
+                (compact_scan_tile). A long rectangle wastes the shared local block.
         Returns:
             FEs (nx_s, ny_s, nz, 4), pts (nx_s, ny_s, 3)
         """
@@ -2058,20 +2198,182 @@ class AFMulator(OpenCLBase):
             raise MemoryError(f"run_scan_contact_pme: FEs buffer needs {FEs_bytes} bytes "
                               f"({_bytes_to_gb(FEs_bytes):.3f} GB) > device max_alloc "
                               f"{_bytes_to_gb(self._max_alloc):.3f} GB")
+        if tile_xy is None:
+            if scan_da is not None and scan_db is not None:
+                dx = float(np.hypot(scan_da[0], scan_da[1]))
+                dy = float(np.hypot(scan_db[0], scan_db[1]))
+            else:
+                dx = float(np.hypot(pts[ny_s, 0] - pts[0, 0], pts[ny_s, 1] - pts[0, 1])) if nx_s > 1 else 1.0
+                dy = float(np.hypot(pts[1, 0] - pts[0, 0], pts[1, 1] - pts[0, 1])) if ny_s > 1 else 1.0
+            tile_xy = compact_scan_tile(dx, dy)
         if use_gpu is None:
             use_gpu = hasattr(self.prg, 'relaxStrokesTiltedContactPME')
         if use_gpu and hasattr(self.prg, 'relaxStrokesTiltedContactPME'):
             FEs = self._pme_scan_gpu(params, pts, nxy, nz, dtip, bAlloc,
                                     core_backend=core_backend, workgroup_size=workgroup_size,
-                                    relax_mode=relax_mode, qn_cap=qn_cap, qn_conv=qn_conv)
+                                    relax_mode=relax_mode, qn_cap=qn_cap, qn_conv=qn_conv,
+                                    tile_xy=tile_xy, rho_max=rho_max, nzL=nzL, rho_cap=rho_cap)
         else:
             FEs = self._pme_scan_python(params, pts, nxy, nz, dtip)
         if getattr(self, 'verbosity', 0) > 0:
             print(f"AFMulator.run_scan_contact_pme: done FEs.shape={FEs.shape}")
         return FEs, pts[:, :3].reshape(nx_s, ny_s, 3)
 
+    def pauli_force_at_relaxed_pp(self, iz, x0, y0, dx, dy):
+        """Morse force of each atom on the relaxed PP at the pixel above that atom.
+
+        Requires a fire/local contact-PME scan, which stores the relaxed PP in
+        ``last_pp``. Returns (na, 4) float32: r, R0, Fr, Fz. Fr > 0 is repulsive
+        (Pauli wall, r < R0). One work-item per atom.
+        """
+        if not hasattr(self, 'last_pp'):
+            raise RuntimeError('no relaxed PP positions; the last scan did not store deflections')
+        pp = np.ascontiguousarray(self.last_pp, np.float32)
+        nx, ny, nz = pp.shape[:3]
+        iz = int(iz)
+        if not (0 <= iz < nz):
+            raise ValueError(f'iz={iz} outside the stored deflection stack nz={nz}')
+        atoms = np.ascontiguousarray(self.atoms_arr, np.float32)
+        rea = np.ascontiguousarray(self.cLJs_arr, np.float32)
+        if atoms.shape != rea.shape or atoms.ndim != 2 or atoms.shape[1] != 4:
+            raise ValueError(f'atoms {atoms.shape} and Morse REA {rea.shape} must both be (na, 4)')
+        na = int(len(atoms))
+        out = np.empty((na, 4), np.float32)
+        mf = cl.mem_flags
+        atoms_cl = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=atoms)
+        rea_cl = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=rea)
+        out_cl = cl.Buffer(self.ctx, mf.WRITE_ONLY, size=out.nbytes)
+        self.toGPU_(self.scan_disps_cl, pp.reshape(-1, 4))
+        self.prg.pauliForceAtRelaxedPP(self.queue, (na,), None, atoms_cl, rea_cl, self.scan_disps_cl,
+            np.int32(nx), np.int32(ny), np.int32(nz), np.int32(iz),
+            np.float32(x0), np.float32(y0), np.float32(dx), np.float32(dy), out_cl)
+        cl.enqueue_copy(self.queue, out, out_cl)
+        self.queue.finish()
+        if not np.isfinite(out).all():
+            raise RuntimeError('pauliForceAtRelaxedPP returned a non-finite force')
+        return out
+
+    def _pme_build_wg_tiles(self, params, pts, nx_s, ny_s, nz, dtip,
+                            tx=8, ty=4, rho_max=1.0, nzL=5):
+        """Per-WG tile descriptors for relaxStrokesTiltedContactPMETileSph
+        (doc/Tasks/PME_ContactSurface_Opt.md, track A).
+
+        pts: (n_scan,4) float32 ix-major (ipx = ix*ny_s + iy).
+        Each (tx,ty) pixel tile gets: lateral mesh window (ix0,iy0,nxL,nyL) covering
+        pixel footprint + tip drift + rho_max PP bend + cubic stencil margin;
+        a per-iz slab schedule tile_kz (nodes [kz,kz+nzL) covering the analytic
+        PP z-range on the bond sphere); and a CSR atom list of r_b-spheres
+        intersecting the swept box — preloaded once per whole stroke.
+        Returns dict with buffers + dims (nloc_max drives local-mem sizing).
+        """
+        apos = params.atom_pos
+        r_b = np.asarray(params.core_fit.r_lo, np.float64) + float(params.core_d_span)
+        ox, oy, oz = (float(v) for v in params.mesh_origin)
+        h = float(params.mesh_h)
+        nxm, nym, nzm = params.mesh_shape
+        L = float(self.dpos0[3])
+        pts3 = pts[:, :3].reshape(nx_s, ny_s, 3)
+        ntx = (nx_s + tx - 1) // tx
+        nty = (ny_s + ty - 1) // ty
+        dTip = self.tipC[:3].astype(np.float64) * float(dtip)   # per-iz tip step (tilted scan ok)
+        tile_desc = np.zeros((ntx * nty, 4), np.int32)
+        tile_kz = np.zeros(ntx * nty * nz, np.int32)
+        tile_pix = np.zeros((ntx * nty, 4), np.float64)    # pixel box xl,xh,yl,yh (atoms whose center is here = in-box)
+        tile_sweep = np.zeros((ntx * nty, 6), np.float64)  # swept AABB xl,xh,yl,yh,zbl,zbh (sphere must touch this)
+        offs = [0]
+        ids = []
+        nxL_max = nyL_max = nloc_max = 0
+        for tyi in range(nty):
+            for txi in range(ntx):
+                t = tyi * ntx + txi
+                x0, x1 = txi * tx, min(txi * tx + tx, nx_s)
+                y0, y1 = tyi * ty, min(tyi * ty + ty, ny_s)
+                p = pts3[x0:x1, y0:y1].reshape(-1, 3)
+                tile_pix[t] = (float(p[:, 0].min()), float(p[:, 0].max()), float(p[:, 1].min()), float(p[:, 1].max()))
+                xdr = sorted((0.0, (nz - 1) * dTip[0]))
+                ydr = sorted((0.0, (nz - 1) * dTip[1]))
+                zdr = sorted((0.0, (nz - 1) * dTip[2]))
+                xl = p[:, 0].min() + xdr[0] - rho_max
+                xh = p[:, 0].max() + xdr[1] + rho_max
+                yl = p[:, 1].min() + ydr[0] - rho_max
+                yh = p[:, 1].max() + ydr[1] + rho_max
+                i0x = max(0, int(np.floor((xl - ox) / h)) - 2)
+                i1x = min(nxm - 1, int(np.floor((xh - ox) / h)) + 3)
+                i0y = max(0, int(np.floor((yl - oy) / h)) - 2)
+                i1y = min(nym - 1, int(np.floor((yh - oy) / h)) + 3)
+                nxL = i1x - i0x + 1
+                nyL = i1y - i0y + 1
+                tile_desc[t] = (i0x, i0y, nxL, nyL)
+                nxL_max = max(nxL_max, nxL)
+                nyL_max = max(nyL_max, nyL)
+                zlo0 = float(p[:, 2].min())
+                zhi0 = float(p[:, 2].max())
+                for iz in range(nz):
+                    z_lo = zlo0 + iz * dTip[2] - L                # PP bottom (straight-down)
+                    j0 = int(np.floor((z_lo - oz) / h))
+                    tile_kz[t * nz + iz] = min(max(j0 - 1, 0), max(0, nzm - nzL))
+                zbl = zlo0 + zdr[0] - L - 0.25                    # PP bottom + small margin
+                zbh = zhi0 + zdr[1] - L + 0.5 * rho_max**2 / L + 0.25  # PP top: sphere lifts PP by rho^2/2L
+                tile_sweep[t] = (xl, xh, yl, yh, zbl, zbh)
+                c = np.array([(xl + xh) / 2, (yl + yh) / 2, (zbl + zbh) / 2])
+                hw = np.array([(xh - xl) / 2, (yh - yl) / 2, (zbh - zbl) / 2])
+                d = np.maximum(np.abs(apos - c) - hw, 0.0)
+                m = (d * d).sum(axis=1) < r_b * r_b
+                ids.extend(np.flatnonzero(m).tolist())
+                offs.append(len(ids))
+                nloc_max = max(nloc_max, offs[-1] - offs[-2])
+        return dict(tile_desc=tile_desc, tile_kz=tile_kz,
+                    tile_pix=tile_pix, tile_sweep=tile_sweep,
+                    wg_atom_offsets=np.asarray(offs, np.int32),
+                    wg_atom_ids=np.asarray(ids, np.int32) if ids else np.zeros(0, np.int32),
+                    ntx=ntx, nty=nty, tx=tx, ty=ty, nzL=int(nzL),
+                    nxL_max=int(nxL_max), nyL_max=int(nyL_max), nloc_max=int(nloc_max),
+                    rho_max=float(rho_max))
+
+    def _pme_tile_local_bytes(self, tiles):
+        """Bytes the tile kernel actually allocates. One size for every workgroup:
+        nloc_max and the mesh window are each the max over tiles, then multiplied.
+        LATOMS = nloc*float4, LCOEFFS = nloc*5 floats, LMESH = nxL*nyL*nzL floats.
+        """
+        nloc = int(tiles['nloc_max'])
+        nxL, nyL, nzL = int(tiles['nxL_max']), int(tiles['nyL_max']), int(tiles['nzL'])
+        b_at, b_co, b_me = nloc * 16, nloc * 5 * 4, nxL * nyL * nzL * 4
+        desc = np.asarray(tiles['tile_desc'])
+        per = desc[:, 2].astype(np.int64) * desc[:, 3].astype(np.int64) * nzL * 4
+        return dict(atoms=b_at, coeffs=b_co, mesh=b_me, total=b_at + b_co + b_me,
+                    nloc_max=nloc, nxL=nxL, nyL=nyL, nzL=nzL, mesh_max_tile=int(per.max()) if len(per) else 0)
+
+    def _pme_tile_inbox_halo(self, params, tiles):
+        """Split each WG atom list into three disjoint sets (same lists the kernel preloads).
+
+        in-box:  center inside the pixel rectangle this workgroup owns
+        margin:  center inside the swept box (pixel + tip drift + rho_max) but outside the pixels
+                 — loaded for any r_b>0, so shrinking Rcut does not drop them
+        halo:    center outside the swept box, included only because the r_b sphere reaches it
+        """
+        apos = np.asarray(params.atom_pos, np.float64)
+        pix, sw = tiles['tile_pix'], tiles['tile_sweep']
+        offs, ids = tiles['wg_atom_offsets'], tiles['wg_atom_ids']
+        nWG = len(pix)
+        n_in = np.zeros(nWG, np.int32)
+        n_margin = np.zeros(nWG, np.int32)
+        n_halo = np.zeros(nWG, np.int32)
+        for t in range(nWG):
+            sel = ids[int(offs[t]):int(offs[t + 1])]
+            if len(sel) == 0:
+                continue
+            ap = apos[sel]
+            xl, xh, yl, yh = pix[t]
+            in_pix = (ap[:, 0] >= xl) & (ap[:, 0] <= xh) & (ap[:, 1] >= yl) & (ap[:, 1] <= yh)
+            in_sw = (ap[:, 0] >= sw[t, 0]) & (ap[:, 0] <= sw[t, 1]) & (ap[:, 1] >= sw[t, 2]) & (ap[:, 1] <= sw[t, 3])
+            n_in[t] = int(in_pix.sum())
+            n_margin[t] = int((in_sw & ~in_pix).sum())
+            n_halo[t] = int((~in_sw).sum())
+        return n_in, n_margin, n_halo
+
     def _pme_scan_gpu(self, params, pts, nxy, nz, dtip, bAlloc, *, core_backend='auto',
-                      workgroup_size=None, relax_mode='fire', qn_cap=0, qn_conv=1.0):
+                      workgroup_size=None, relax_mode='fire', qn_cap=0, qn_conv=1.0,
+                      tile_xy=None, rho_max=1.0, nzL=5, rho_cap=None):
         """GPU PP relaxation via bucket or Local contact-PME kernels.
         relax_mode: 'fire' (default), 'qn' (quasi-Newton), 'sph' (sphere-constrained
         Newton — |dpos|=L enforced analytically, only the 2 soft lateral DOFs solved).
@@ -2084,6 +2386,10 @@ class AFMulator(OpenCLBase):
         wg = self._pme_workgroup_size(workgroup_size)
         nx_s, ny_s = nxy
         n_scan = nx_s * ny_s
+        if tile_xy is None:
+            dx = float(np.hypot(pts[ny_s, 0] - pts[0, 0], pts[ny_s, 1] - pts[0, 1])) if nx_s > 1 else 1.0
+            dy = float(np.hypot(pts[1, 0] - pts[0, 0], pts[1, 1] - pts[0, 1])) if ny_s > 1 else 1.0
+            tile_xy = compact_scan_tile(dx, dy)
         prof = getattr(self, 'verbosity', 0) > 1
         _tp = [('t0', _time.perf_counter())] if prof else []
         if bAlloc:
@@ -2109,10 +2415,64 @@ class AFMulator(OpenCLBase):
             'cpm_scan_offender': n_tele * 4, 'cpm_scan_overflow': n_tele * 4,
         }, suffix='_cl')
         if prof: _tp.append(('telemetry_alloc', _time.perf_counter()))
-        if relax_mode != 'fire' and backend != 'local':
-            raise ValueError(f"relax_mode='{relax_mode}' implemented only for core_backend='local' (got '{backend}')")
+        if relax_mode != 'fire' and backend not in ('local', 'tile'):
+            raise ValueError(f"relax_mode='{relax_mode}' implemented only for core_backend='local'|'tile' (got '{backend}')")
+        if backend == 'tile':
+            if relax_mode != 'sph':
+                raise ValueError(f"contact_pme tile backend supports relax_mode='sph' only (got '{relax_mode}')")
+            if qn_cap > 0:
+                raise ValueError("contact_pme tile backend is single-pass (qn_cap>0 unsupported); "
+                                 "use core_backend='local' for two-pass")
+        rho_cap = float(rho_max if rho_cap is None else rho_cap)
         gs = (self._roundup(n_scan, wg),)
-        if backend == 'local':
+        if backend == 'tile':
+            tiles = self._pme_build_wg_tiles(params, pts, nx_s, ny_s, nz, dtip,
+                                             tx=tile_xy[0], ty=tile_xy[1],
+                                             rho_max=rho_max, nzL=nzL)
+            n_tele = n_scan * nz
+            self.try_make_buffers({
+                'cpm_scan_iters': n_tele * 4, 'cpm_scan_esc': n_tele * 4,
+                'cpm_scan_dbg': n_tele * 4,
+                'cpm_tile_desc': tiles['tile_desc'].nbytes,
+                'cpm_tile_kz': tiles['tile_kz'].nbytes,
+                'cpm_wg_off': tiles['wg_atom_offsets'].nbytes,
+                'cpm_wg_ids': max(tiles['wg_atom_ids'].nbytes, 4),
+            }, suffix='_cl')
+            self.toGPU_(self.cpm_tile_desc_cl, tiles['tile_desc'])
+            self.toGPU_(self.cpm_tile_kz_cl, tiles['tile_kz'])
+            self.toGPU_(self.cpm_wg_off_cl, tiles['wg_atom_offsets'])
+            if len(tiles['wg_atom_ids']):
+                self.toGPU_(self.cpm_wg_ids_cl, tiles['wg_atom_ids'])
+            lmem_avail = int(self.ctx.devices[0].get_info(cl.device_info.LOCAL_MEM_SIZE))
+            need = tiles['nloc_max'] * 36 + tiles['nxL_max'] * tiles['nyL_max'] * nzL * 4
+            if need > lmem_avail:
+                raise MemoryError(f"contact_pme tile: local mem {need} B > {lmem_avail} B "
+                                  f"(nloc_max={tiles['nloc_max']}, tile={tiles['nxL_max']}x{tiles['nyL_max']}x{nzL}); "
+                                  f"reduce tile_xy/rho_max")
+            LATOMS = cl.LocalMemory(tiles['nloc_max'] * 16)
+            LCOEFFS = cl.LocalMemory(tiles['nloc_max'] * 5 * 4)
+            LMESH = cl.LocalMemory(tiles['nxL_max'] * tiles['nyL_max'] * nzL * 4)
+            tile_meta = np.array([tiles['ntx'], int(nzL), 0, 0], dtype=np.int32)
+            gs2 = (tiles['ntx'] * tiles['tx'], tiles['nty'] * tiles['ty'])
+            rp1 = self.relax_pars.copy(); rp1[2] = np.float32(0); rp1[3] = np.float32(qn_conv)
+            self.prg.relaxStrokesTiltedContactPMETileSph(
+                self.queue, gs2, (tiles['tx'], tiles['ty']),
+                self.cpm_mesh_cl, mesh_meta, mesh_origin_h,
+                self.cpm_atoms_cl, self.cpm_core_coeffs_cl,
+                self.cpm_buckets_cl, self.cpm_offsets_cl,
+                core_meta, core_bucket_meta,
+                self.cpm_scan_status_cl, self.cpm_scan_min_r_cl,
+                self.cpm_scan_offender_cl, self.cpm_scan_overflow_cl,
+                self.cpm_scan_iters_cl, self.cpm_scan_esc_cl, self.cpm_scan_dbg_cl,
+                self.scan_pts_cl, self.scan_FEs_cl,
+                self.tipA, self.tipB, tipC, self.stiffness,
+                self.dpos0, rp1, self.surfFF,
+                np.int32(nx_s), np.int32(ny_s), np.int32(nz),
+                self.cpm_tile_desc_cl, self.cpm_tile_kz_cl,
+                self.cpm_wg_off_cl, self.cpm_wg_ids_cl,
+                tile_meta, np.float32(rho_cap), LATOMS, LCOEFFS, LMESH)
+            self.last_pme_tiles = tiles
+        elif backend == 'local':
             LATOMS = cl.LocalMemory(na * 16)
             LCOEFFS = cl.LocalMemory(na * 5 * 4)
             if relax_mode in ('qn', 'sph'):
@@ -2152,7 +2512,7 @@ class AFMulator(OpenCLBase):
                     core_meta, core_bucket_meta,
                     self.cpm_scan_status_cl, self.cpm_scan_min_r_cl,
                     self.cpm_scan_offender_cl, self.cpm_scan_overflow_cl,
-                    self.scan_pts_cl, self.scan_FEs_cl,
+                    self.scan_pts_cl, self.scan_FEs_cl, self.scan_disps_cl,
                     self.tipA, self.tipB, tipC, self.stiffness,
                     self.dpos0, self.relax_pars, self.surfFF,
                     np.int32(n_scan), np.int32(nz), LATOMS, LCOEFFS)
@@ -2173,14 +2533,30 @@ class AFMulator(OpenCLBase):
         if prof:
             self.queue.finish(); _tp.append(('kernel_exec', _time.perf_counter()))
         self.fromGPU_(self.scan_FEs_cl, FEs_h)
+        if relax_mode == 'fire' and backend == 'local':
+            PPs_h = np.empty((n_scan * nz, 4), np.float32)
+            self.fromGPU_(self.scan_disps_cl, PPs_h)
+            self.last_pp = PPs_h.reshape(nx_s, ny_s, nz, 4)
         if prof: _tp.append(('FEs_download_29MB', _time.perf_counter()))
         # Telemetry: download status only; pull detail buffers only on failure (fail-loud).
         status_z = np.empty(n_tele, dtype=np.int32)
         cl.enqueue_copy(self.queue, status_z, self.cpm_scan_status_cl)
+        self.last_scan_status = status_z.reshape(nx_s, ny_s, nz)
         if relax_mode in ('qn', 'sph'):                          # iteration telemetry (diagnostics)
             iters_z = np.empty(n_tele, dtype=np.int32)
             cl.enqueue_copy(self.queue, iters_z, self.cpm_scan_iters_cl)
             self.last_relax_iters = iters_z.reshape(nx_s, ny_s, nz)
+            if backend == 'tile':
+                esc = np.empty(n_tele, dtype=np.int32)
+                cl.enqueue_copy(self.queue, esc, self.cpm_scan_esc_cl)
+                self.last_pme_esc = esc.reshape(nx_s, ny_s, nz)
+                nclamp = np.empty(n_tele, dtype=np.int32)
+                cl.enqueue_copy(self.queue, nclamp, self.cpm_scan_dbg_cl)
+                self.last_pme_nclamp = nclamp.reshape(nx_s, ny_s, nz)
+                if getattr(self, 'verbosity', 0) > 0:
+                    print(f'  tile: escapes={int(esc.sum())} evals '
+                          f'pixels={int((esc > 0).any(axis=2).sum())}/{n_scan} '
+                          f'clamps={int(nclamp.sum())}', flush=True)
         self.queue.finish()
         if prof: _tp.append(('telemetry_dl+finish', _time.perf_counter()))
         if relax_mode in ('qn', 'sph') and qn_cap > 0:

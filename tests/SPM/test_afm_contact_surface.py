@@ -4,7 +4,7 @@ test_afm_contact_surface.py — Memory-efficient Morse PP-AFM via contact surfac
 Pipeline: load molecule → assign_params → fit_contact_surface (no 3D grid)
 → run_scan_contact (relaxStrokesTiltedContact) → finite FEs.
 """
-import os
+import os, time
 import pytest
 import numpy as np
 
@@ -1486,6 +1486,61 @@ def test_contact_pme_mesh_halo_convergence(make_review):
     assert err_E < 1e-6, f'Halo convergence E failed: {err_E}'
     assert err_F < 1e-6, f'Halo convergence F failed: {err_F}'
     rv.checklist('Halo 6 vs 8 converges (boundary padding sufficient)')
+    rv.finish()
+
+
+@pytest.mark.gpu
+def test_contact_pme_core_fit_gpu_parity(make_review, xyz):
+    """cs_fit_core_paw matches the float64 Chebyshev normal equations, and beats the Python atom loop."""
+    from spammm.surfaces.PMESplit import SplitParams
+    from spammm.surfaces.PICCore import fit_core_paw_grid, fit_core_1d
+    rv = make_review('test_contact_pme_core_fit_gpu_parity')
+    afm = _make_afm(xyz('PTCDA.xyz'))
+    cMs = afm.cLJs_arr
+    qs = afm.atoms_arr[:, 3].astype(np.float64) if afm.atoms_arr.shape[1] > 3 else np.zeros(len(cMs))
+    p = SplitParams(R0=cMs[:, 0].astype(np.float64), E0=cMs[:, 1].astype(np.float64),
+                    q=qs, alpha=float(abs(cMs[0, 2])), q_tip=0.0, r_damp=0.1, r_cut=6.0)
+    ref = fit_core_paw_grid(p)
+    t0 = time.perf_counter()
+    got = afm._pme_fit_core_gpu(p)
+    ms = (time.perf_counter() - t0) * 1e3
+    err = float(np.max(np.abs(got.coeffs - ref)))
+    rv.out(f'PTCDA na={p.na} GPU vs float64 grid: max|dc|={err:.4e}  {ms:.2f} ms')
+    assert err < 1e-3, f'GPU core fit max|dc|={err}'
+    # Same parameters tiled so the Python loop is the thing being replaced.
+    nrep = 40
+    pbig = SplitParams(R0=np.tile(p.R0, nrep), E0=np.tile(p.E0, nrep), q=np.tile(p.q, nrep),
+                       alpha=p.alpha, q_tip=0.0, r_damp=0.1, r_cut=6.0)
+    t0 = time.perf_counter(); fit_core_1d(pbig); cpu_ms = (time.perf_counter() - t0) * 1e3
+    t0 = time.perf_counter(); gbig = afm._pme_fit_core_gpu(pbig); gpu_ms = (time.perf_counter() - t0) * 1e3
+    refb = fit_core_paw_grid(pbig)
+    errb = float(np.max(np.abs(gbig.coeffs - refb)))
+    rv.out(f'na={pbig.na}  python fit_core_1d {cpu_ms:.0f} ms   GPU {gpu_ms:.2f} ms   max|dc|={errb:.4e}')
+    assert errb < 1e-3, f'GPU core fit (tiled) max|dc|={errb}'
+    rv.checklist('GPU paw core fit matches the float64 Chebyshev solve')
+    rv.finish()
+
+
+@pytest.mark.gpu
+def test_contact_pme_mesh_prefilter_gpu_parity(make_review, xyz):
+    """cs_bspline_prefilter_lines (Thomas, in-place, f32) must match scipy _prefilter_3d."""
+    from spammm.surfaces.CoarseMesh import _prefilter_3d
+    import pyopencl as cl
+    rv = make_review('test_contact_pme_mesh_prefilter_gpu_parity')
+    afm = _make_afm(xyz('benzene.xyz'))
+    rng = np.random.default_rng(3)
+    for n in [(5, 7, 9), (29, 24, 18), (2, 7, 9), (5, 7, 2), (3, 3, 3)]:
+        data = rng.standard_normal(n).astype(np.float32)
+        buf = cl.Buffer(afm.ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, hostbuf=data)
+        afm._pme_prefilter_gpu(buf, *n)
+        out = np.empty(data.size, np.float32)
+        cl.enqueue_copy(afm.queue, out, buf)
+        afm.queue.finish()
+        ref = _prefilter_3d(data.astype(np.float64).reshape(n)).astype(np.float32)
+        err = float(np.max(np.abs(out - ref.ravel())))
+        rv.out(f'prefilter parity n={n}: max|d|={err:.4e}')
+        assert err < 5e-5, f'prefilter parity n={n}: max|d|={err}'
+    rv.checklist('GPU Thomas prefilter matches scipy solve_banded (incl. n<3 axes)')
     rv.finish()
 
 

@@ -1283,6 +1283,106 @@ inline float4 cs_eval_contact_pme_local_at(
     return (float4)(fm.xyz + fc.xyz, fm.w + fc.w);
 }
 
+// ===================== contact_pme tiled evaluator (WG-local mesh slab) =====================
+
+// Tricubic eval from a WG-cached coefficient slab (local memory, z-fastest):
+// LMESH[(ix_l*nyL + iy_l)*nzL + iz_l] holds global coeff node (ix0+ix_l, iy0+iy_l, kz0+iz_l).
+// Caller must guarantee the 4x4x4 stencil base lies inside the slab —
+// cs_eval_contact_pme_tile_at checks this and falls back to global eval otherwise.
+inline float4 cs_pme_tricubic_eval_tile(
+    float x, float y, float z,
+    __local const float* coeffs,
+    int ix0, int iy0, int kz0, int nxL, int nyL, int nzL,
+    float ox, float oy, float oz, float h)
+{
+    float inv_h = 1.0f / h;
+    float fx = (x - ox) * inv_h;
+    float fy = (y - oy) * inv_h;
+    float fz = (z - oz) * inv_h;
+    int ix = (int)floor(fx); int iy = (int)floor(fy); int iz = (int)floor(fz);
+    float ux = fx - (float)ix; float uy = fy - (float)iy; float uz = fz - (float)iz;
+    int i0x = ix - 1 - ix0, i0y = iy - 1 - iy0, i0z = iz - 1 - kz0;  // local stencil base
+    float4 bx = cs_pme_basis(ux), by = cs_pme_basis(uy), bz = cs_pme_basis(uz);
+    float4 dbx = cs_pme_dbasis(ux) * inv_h, dby = cs_pme_dbasis(uy) * inv_h, dbz = cs_pme_dbasis(uz) * inv_h;
+    float bxa[4] = {bx.x, bx.y, bx.z, bx.w};
+    float bya[4] = {by.x, by.y, by.z, by.w};
+    float dbxa[4] = {dbx.x, dbx.y, dbx.z, dbx.w};
+    float dbya[4] = {dby.x, dby.y, dby.z, dby.w};
+    float e = 0.0f, gx = 0.0f, gy = 0.0f, gz = 0.0f;
+    for (int a = 0; a < 4; a++) {
+        int ia = i0x + a; float cx = bxa[a], dx = dbxa[a];
+        for (int b = 0; b < 4; b++) {
+            int ib = i0y + b; float cy = bya[b], dy = dbya[b];
+            float cxy = cx * cy;
+            int ixyz = (ia * nyL + ib) * nzL + i0z;
+            float4 v = vload4(0, coeffs + ixyz);
+            float ez = dot(v, bz);
+            float dez = dot(v, dbz);
+            e  += cxy * ez;
+            gx += dx * cy * ez;
+            gy += cx * dy * ez;
+            gz += cxy * dez;
+        }
+    }
+    return (float4)(-gx, -gy, -gz, e);
+}
+
+// Tiled PME eval: if the query's 4x4x4 stencil fits the cached slab window AND
+// the tile atom list, evaluate entirely from local memory; else fall back to the
+// global mesh + bucket core eval (exact) and increment *inout_esc.
+// Telemetry identical to cs_eval_contact_pme_at (offender translated to global id).
+inline float4 cs_eval_contact_pme_tile_at(
+    float x, float y, float z,
+    __global const float* mesh_coeffs, int nx, int ny, int nz,
+    float ox, float oy, float oz, float h,
+    __global const float4* atoms, __global const float* atom_coeffs,
+    __global const int* bucket_atoms, __global const int* bucket_offsets,
+    int nat, int nbx, int nby, int nbuckets,
+    float bx0, float by0, float cell,
+    __local const float* LMESH, int ix0, int iy0, int nxL, int nyL, int kz0, int nzL,
+    __local const float4* LATOMS, __local const float* LCOEFFS, int nloc, float d_span,
+    __global const int* wg_ids,
+    int* out_status, float* out_min_r, int* out_offender, int* out_overflow,
+    int3* inout_esc)
+{
+    float inv_h = 1.0f / h;
+    int i0x = (int)floor((x - ox) * inv_h) - 1;
+    int i0y = (int)floor((y - oy) * inv_h) - 1;
+    int i0z = (int)floor((z - oz) * inv_h) - 1;
+    bool inside = (i0x >= ix0) && (i0x + 3 < ix0 + nxL)
+               && (i0y >= iy0) && (i0y + 3 < iy0 + nyL)
+               && (i0z >= kz0) && (i0z + 3 < kz0 + nzL);
+    int mesh_status = 0, core_status = 0;
+    float min_r = 1e30f; int offender = -1; int overflow = 0;
+    float4 fm, fc;
+    if (inside) {
+        fm = cs_pme_tricubic_eval_tile(x, y, z, LMESH, ix0, iy0, kz0, nxL, nyL, nzL, ox, oy, oz, h);
+        fc = cs_pme_core_eval_local_at(x, y, z, LATOMS, LCOEFFS, nloc, d_span, &core_status, &min_r, &offender, &overflow);
+        if (offender >= 0) offender = wg_ids[offender];   // local index -> global atom id
+    } else {
+        if (inout_esc) {
+            inout_esc->x += (i0x < ix0 || i0x + 3 >= ix0 + nxL) ? 1 : 0;
+            inout_esc->y += (i0y < iy0 || i0y + 3 >= iy0 + nyL) ? 1 : 0;
+            inout_esc->z += (i0z < kz0 || i0z + 3 >= kz0 + nzL) ? 1 : 0;
+        }
+
+        fm = cs_pme_tricubic_eval(x, y, z, mesh_coeffs, nx, ny, nz, ox, oy, oz, h, &mesh_status);
+        if (nloc == nat) {
+            // local list holds every atom — exact everywhere, reuse it
+            fc = cs_pme_core_eval_local_at(x, y, z, LATOMS, LCOEFFS, nloc, d_span, &core_status, &min_r, &offender, &overflow);
+            if (offender >= 0) offender = wg_ids[offender];
+        } else {
+            fc = cs_pme_core_eval_at(x, y, z, atoms, atom_coeffs, bucket_atoms, bucket_offsets,
+                                     nat, nbx, nby, nbuckets, bx0, by0, cell, d_span,
+                                     &core_status, &min_r, &offender, &overflow);
+        }
+    }
+    int status = mesh_status | core_status;
+    *out_status = status; *out_min_r = min_r; *out_offender = offender; *out_overflow = overflow;
+    if (status & 1 || status & 2) return (float4)(NAN, NAN, NAN, NAN);
+    return (float4)(fm.xyz + fc.xyz, fm.w + fc.w);
+}
+
 // Batch evaluation of V_mesh + V_core at query points. Returns (E,F) per query + telemetry.
 // Invalid queries (mesh OOB or domain violation) produce non-finite outputs.
 __kernel void evalContactPME(
@@ -1334,6 +1434,174 @@ __kernel void evalContactPMELocal(
         LATOMS, LCOEFFS, nat, core_bucket_meta.w,
         &status, &min_r, &offender, &overflow);
     out_fe[iq] = fe; out_status[iq] = status; out_min_r[iq] = min_r; out_offender[iq] = offender; out_overflow[iq] = overflow;
+}
+
+// Separable cubic B-spline prefilter — Thomas solve of tridiag(1,4,1) c = 6 d
+// along one axis. Zero-padded boundary; reproduces scipy solve_banded of
+// ContactSurface._bspline_tridiag_ab (diag 4/6, off 1/6) used by
+// CoarseMesh._prefilter_3d. One work-item per line.
+// Line layout: base = (gid/n_inner)*(line_len*n_inner) + (gid%n_inner), stride = n_inner.
+//   z-axis: n_inner = 1       y-axis: n_inner = nz       x-axis: n_inner = ny*nz
+// invden[i] = 1/(4 - c'[i-1]) and cprime[i] = invden[i] (c_i = 1), host-precomputed
+// by CoarseMesh._bspline_thomas_factors.
+__kernel void cs_bspline_prefilter_lines(
+    __global float* a,
+    const int n_lines, const int line_len, const int n_inner,
+    __global const float* invden, __global const float* cprime)
+{
+    const int gid = get_global_id(0);
+    if (gid >= n_lines || line_len < 2) return;
+    const int base = (gid / n_inner) * (line_len * n_inner) + (gid % n_inner);
+    // forward elimination: d'[i] = (6 d[i] - d'[i-1]) * invden[i]  (a_i = 1)
+    float yp = 6.0f * a[base] * invden[0];
+    a[base] = yp;
+    for (int i = 1; i < line_len; i++) {
+        const int p = base + i * n_inner;
+        const float yi = (6.0f * a[p] - yp) * invden[i];
+        a[p] = yi;
+        yp = yi;
+    }
+    // backward substitution: x[i] = d'[i] - cprime[i] * x[i+1]
+    float xp = a[base + (line_len - 1) * n_inner];
+    for (int i = line_len - 2; i >= 0; i--) {
+        const int p = base + i * n_inner;
+        const float xi = a[p] - cprime[i] * xp;
+        a[p] = xi;
+        xp = xi;
+    }
+}
+
+// Per-atom PAW core fit. One work-item per atom, 32 Chebyshev nodes on [r_lo, r_b].
+// Normal equations of the weighted energy+force rows, then a 5×5 Cholesky.
+// Matches PICCore.fit_core_paw_grid (float64 oracle). Powers 2,4,8,16,32.
+#define CS_CORE_FIT_NSAMP 32
+
+inline void cs_chol_solve_5(float* G, float* rhs, float* c) {
+    for (int i = 0; i < 5; i++) {
+        for (int j = 0; j <= i; j++) {
+            float s = G[i * 5 + j];
+            for (int k = 0; k < j; k++) s -= G[i * 5 + k] * G[j * 5 + k];
+            if (i == j) {
+                G[i * 5 + i] = (s > 1e-20f) ? sqrt(s) : 0.0f;
+            } else {
+                G[i * 5 + j] = s / G[j * 5 + j];
+            }
+        }
+    }
+    float y[5];
+    for (int i = 0; i < 5; i++) {
+        float s = rhs[i];
+        for (int k = 0; k < i; k++) s -= G[i * 5 + k] * y[k];
+        y[i] = (G[i * 5 + i] > 0.0f) ? s / G[i * 5 + i] : 0.0f;
+    }
+    for (int i = 4; i >= 0; i--) {
+        float s = y[i];
+        for (int k = i + 1; k < 5; k++) s -= G[k * 5 + i] * c[k];
+        c[i] = (G[i * 5 + i] > 0.0f) ? s / G[i * 5 + i] : NAN;
+    }
+}
+
+__kernel void cs_fit_core_paw(
+    __global const float4* reqs,     // (R0, E0, q, r_lo)
+    __global const float4* paw,      // (a0, a2, a4, a6)
+    __global const float* r_b,
+    const float alpha, const float r_damp, const float q_tip,
+    const int na, const int n_samp,
+    __global float* coeffs)
+{
+    const int ia = get_global_id(0);
+    if (ia >= na || n_samp != CS_CORE_FIT_NSAMP) return;
+    const float4 rq = reqs[ia];
+    const float4 pw = paw[ia];
+    const float R0 = rq.x, E0 = rq.y, q = rq.z, r_lo = rq.w;
+    const float rb = r_b[ia];
+    const float D = rb - r_lo;
+    const float K = -alpha;
+    const float R2 = r_damp * r_damp;
+    const float cc = 14.3996448915f * q * q_tip;
+    float vt[CS_CORE_FIT_NSAMP], vs[CS_CORE_FIT_NSAMP], dvs[CS_CORE_FIT_NSAMP];
+    float phi[5], dphi[5];
+    for (int k = 0; k < CS_CORE_FIT_NSAMP; k++) {
+        float u = 0.5f * (1.0f - cos(M_PI_F * ((float)k + 0.5f) / (float)CS_CORE_FIT_NSAMP));
+        float r = r_lo + D * u;
+        float e = exp(K * (r - R0));
+        float e2 = e * e;
+        float v = E0 * (e2 - 2.0f * e);
+        float dv = 2.0f * K * E0 * (e2 - e);
+        float s2 = r * r + R2;
+        float inv_s = 1.0f / sqrt(s2);
+        float inv_s3 = inv_s * inv_s * inv_s;
+        v += cc * inv_s;
+        dv -= cc * r * inv_s3;
+        float r2 = r * r, r4 = r2 * r2, r6 = r4 * r2;
+        float P = pw.x + pw.y * r2 + pw.z * r4 + pw.w * r6;
+        float dP = 2.0f * pw.y * r + 4.0f * pw.z * r2 * r + 6.0f * pw.w * r4 * r;
+        vt[k] = v;
+        vs[k] = v - P;
+        dvs[k] = dv - dP;
+    }
+    float vmin = vt[0];
+    for (int k = 1; k < CS_CORE_FIT_NSAMP; k++) vmin = fmin(vmin, vt[k]);
+    float ord[CS_CORE_FIT_NSAMP];
+    for (int k = 0; k < CS_CORE_FIT_NSAMP; k++) ord[k] = vt[k];
+    for (int i = 1; i < CS_CORE_FIT_NSAMP; i++) {
+        float key = ord[i];
+        int j = i - 1;
+        while (j >= 0 && ord[j] > key) { ord[j + 1] = ord[j]; j--; }
+        ord[j + 1] = key;
+    }
+    float pos = 0.95f * (float)(CS_CORE_FIT_NSAMP - 1);
+    int lo = (int)pos;
+    int hi = lo + 1 < CS_CORE_FIT_NSAMP ? lo + 1 : CS_CORE_FIT_NSAMP - 1;
+    float p95 = (1.0f - (pos - (float)lo)) * ord[lo] + (pos - (float)lo) * ord[hi];
+    float T = fmax((p95 - vmin) / 3.0f, 0.05f);
+    float meanS = 0.0f, meanF = 0.0f, wmax = 0.0f;
+    float w[CS_CORE_FIT_NSAMP];
+    for (int k = 0; k < CS_CORE_FIT_NSAMP; k++) {
+        w[k] = exp(-(vt[k] - vmin) / T);
+        wmax = fmax(wmax, w[k]);
+        meanS += vs[k];
+        meanF += dvs[k];
+    }
+    wmax = fmax(wmax, 1e-16f);
+    meanS /= (float)CS_CORE_FIT_NSAMP;
+    meanF /= (float)CS_CORE_FIT_NSAMP;
+    float varS = 0.0f, varF = 0.0f;
+    for (int k = 0; k < CS_CORE_FIT_NSAMP; k++) {
+        w[k] /= wmax;
+        float ds = vs[k] - meanS, df = dvs[k] - meanF;
+        varS += ds * ds;
+        varF += df * df;
+    }
+    varS /= (float)CS_CORE_FIT_NSAMP;
+    varF /= (float)CS_CORE_FIT_NSAMP;
+    float E_scale = fmax(sqrt(varS), 1e-12f);
+    float F_scale = fmax(sqrt(varF), 1e-12f);
+    float lamE2 = 1.0f / (E_scale * E_scale);
+    float lamF2 = 1.0f / (F_scale * F_scale);
+    float G[25], rhs[5];
+    for (int m = 0; m < 25; m++) G[m] = 0.0f;
+    for (int m = 0; m < 5; m++) rhs[m] = 0.0f;
+    for (int k = 0; k < CS_CORE_FIT_NSAMP; k++) {
+        float u = 0.5f * (1.0f - cos(M_PI_F * ((float)k + 0.5f) / (float)CS_CORE_FIT_NSAMP));
+        float r = r_lo + D * u;
+        cs_pme_core_basis(r, r_lo, rb, phi, dphi);
+        float wE = w[k] * lamE2, wF = w[k] * lamF2;
+        for (int m = 0; m < 5; m++) {
+            rhs[m] += wE * phi[m] * vs[k] + wF * dphi[m] * dvs[k];
+            for (int n = 0; n < 5; n++)
+                G[m * 5 + n] += wE * phi[m] * phi[n] + wF * dphi[m] * dphi[n];
+        }
+    }
+    float col[5];
+    for (int m = 0; m < 5; m++) col[m] = fmax(sqrt(fmax(G[m * 5 + m], 0.0f)), 1e-12f);
+    for (int m = 0; m < 5; m++) {
+        rhs[m] /= col[m];
+        for (int n = 0; n < 5; n++) G[m * 5 + n] /= (col[m] * col[n]);
+    }
+    float c[5];
+    cs_chol_solve_5(G, rhs, c);
+    for (int m = 0; m < 5; m++) coeffs[ia * 5 + m] = c[m] / col[m];
 }
 
 // ===================== AFMulator integration (requires AFM.cl before this file) =====================
@@ -1657,7 +1925,7 @@ __kernel void relaxStrokesTiltedContactPMELocal(
     __global const float4* atoms, __global const float* atom_coeffs,
     const int4 core_meta, const float4 core_bucket_meta,
     __global int* out_status, __global float* out_min_r, __global int* out_offender, __global int* out_overflow,
-    __global float4* points, __global float4* FEs,
+    __global float4* points, __global float4* FEs, __global float4* out_pp,
     float4 tipA, float4 tipB, float4 tipC,
     float4 stiffness, float4 dpos0, float4 relax_params, float4 surfFF,
     int n_scan, int nz, __local float4* LATOMS, __local float* LCOEFFS)
@@ -1725,10 +1993,34 @@ __kernel void relaxStrokesTiltedContactPMELocal(
         fe_.w = fe.w;
         int idx = gid * nz + iz;
         FEs[idx] = fe_;
+        out_pp[idx] = (float4)(pos.x, pos.y, pos.z, 0.0f);
         out_status[idx] = status_acc; out_min_r[idx] = min_r_acc; out_offender[idx] = offender_acc; out_overflow[idx] = overflow_acc;
         tipPos += dTip.xyz;
         pos += dTip.xyz;
     }
+}
+
+// One work-item per atom. Reads the relaxed PP at the pixel above that atom and
+// returns the Morse force of that atom alone. Fr > 0 is repulsive (force along
+// +dp, away from the nucleus): the Pauli wall, r < R0.
+__kernel void pauliForceAtRelaxedPP(
+    __global const float4* atoms, __global const float4* rea, __global const float4* pp,
+    int nx, int ny, int nz, int iz, float x0, float y0, float dx, float dy,
+    __global float4* out)
+{
+    int ia = get_global_id(0);
+    float4 a = atoms[ia];
+    float4 m = rea[ia];
+    int ix = (int)floor((a.x - x0) / dx + 0.5f);
+    int iy = (int)floor((a.y - y0) / dy + 0.5f);
+    ix = clamp(ix, 0, nx - 1);
+    iy = clamp(iy, 0, ny - 1);
+    float4 p = pp[(ix * ny + iy) * nz + iz];
+    float3 dp = p.xyz - a.xyz;
+    float4 fe = getMorse(dp, m.xyz);
+    float r = sqrt(dot(dp, dp) + R2SAFE);
+    float Fr = dot(fe.xyz, dp) / r;
+    out[ia] = (float4)(r, m.x, Fr, fe.z);
 }
 
 // ===================== contact_pme FIT — mesh V_L raster (PAW), WG+local atoms =====================
@@ -2196,6 +2488,341 @@ __kernel void relaxStrokesTiltedContactPMELocalSph(
         tipPos += dTip.xyz;
         pos += dTip.xyz;
         if (iz_start_buf) out_pp[ipx * nz + iz] = (float4)(pos, 0.0f);   // two-pass only
+        // warm-start dxy for next slice from new pos
+        {
+            float3 dv = rotMat(pos - tipPos, a3, b3, c3);
+            dxy = dv.xy;
+        }
+    }
+}
+
+// Batch tile-eval for verification/diagnostics: WG t preloads tile t's atoms +
+// mesh slab (kz = tile_kz[t*nz + iz_tile]), each lane evaluates one query via
+// cs_eval_contact_pme_tile_at. Queries grouped by tile on the host:
+// queries[t*lsize + lid].
+__kernel void evalContactPMETile(
+    __global const float* mesh_coeffs, const int4 mesh_meta, const float4 mesh_origin_h,
+    __global const float4* atoms, __global const float* atom_coeffs,
+    __global const int* bucket_atoms, __global const int* bucket_offsets,
+    const int4 core_meta, const float4 core_bucket_meta,
+    __global const float4* queries, __global float4* out_fe, __global int* out_status,
+    __global const int4* tile_desc, __global const int* tile_kz,
+    __global const int* wg_atom_offsets, __global const int* wg_atom_ids,
+    const int4 tile_meta, const int iz_tile,
+    __local float4* LATOMS, __local float* LCOEFFS, __local float* LMESH)
+{
+    const int iwg = get_group_id(0);
+    const int lid = get_local_id(0), lsz = get_local_size(0);
+    const int nzL = tile_meta.y;
+    const int4 td = tile_desc[iwg];
+    const int ix0 = td.x, iy0 = td.y, nxL = td.z, nyL = td.w;
+    const int a0 = wg_atom_offsets[iwg];
+    const int nloc = wg_atom_offsets[iwg + 1] - a0;
+    const int nmesh = nxL * nyL * nzL;
+    for (int j = lid; j < nloc; j += lsz) {
+        const int ia = wg_atom_ids[a0 + j];
+        LATOMS[j] = atoms[ia];
+        const int ig = ia * CS_PME_NMODES, il = j * CS_PME_NMODES;
+        const float4 c03 = vload4(0, atom_coeffs + ig);
+        vstore4(c03, 0, LCOEFFS + il);
+        LCOEFFS[il + 4] = atom_coeffs[ig + 4];
+    }
+    const int kz0 = tile_kz[iwg * (tile_meta.z ? tile_meta.z : 1) + iz_tile];
+    for (int e = lid; e < nmesh; e += lsz) {
+        const int izl = e % nzL, t2 = e / nzL, iy = t2 % nyL, ix = t2 / nyL;
+        LMESH[e] = mesh_coeffs[((ix0 + ix) * mesh_meta.y + (iy0 + iy)) * mesh_meta.z + kz0 + izl];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const int gid = get_global_id(0);
+    const float4 q = queries[gid];
+    int status = 0; float min_r = 1e30f; int offender = -1; int overflow = 0;
+    float4 fe = cs_eval_contact_pme_tile_at(q.x, q.y, q.z,
+        mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+        mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+        atoms, atom_coeffs, bucket_atoms, bucket_offsets,
+        core_meta.x, core_meta.y, core_meta.z, core_meta.w,
+        core_bucket_meta.x, core_bucket_meta.y, core_bucket_meta.z,
+        LMESH, ix0, iy0, nxL, nyL, kz0, nzL,
+        LATOMS, LCOEFFS, nloc, core_bucket_meta.w,
+        wg_atom_ids + a0,
+        &status, &min_r, &offender, &overflow, NULL);
+    out_fe[gid] = fe;
+    out_status[gid] = status;
+}
+
+// Tiled contact-PME relaxation (sph) — doc/Tasks/PME_ContactSurface_Opt.md A1–A3.
+// WG = compact 2D pixel tile (Tx,Ty). Local memory holds ONLY the tile's nearby
+// atoms + a thin mesh slab (nxL×nyL×nzL, streamed in z via tile_kz schedule).
+// Host contract: 2D launch (nx_s-pad, ny_s-pad) × (Tx,Ty); lane (gx,gy) → pixel
+// ipx = gx*ny_s + gy (ix-major pts). tile_desc[iwg] = (ix0,iy0,nxL,nyL);
+// tile_kz[iwg*nz+iz] = base z-node of the cached slab at step iz;
+// wg_atom_offsets/ids = per-tile atom CSR list. Padded lanes stay alive for barriers.
+// PP escaping the tile → exact global eval, counted in out_esc[ipx].
+// Single-pass only (no iz_start/out_pp resume); pass-2 uses LocalSph.
+__kernel void relaxStrokesTiltedContactPMETileSph(
+    __global const float* mesh_coeffs, const int4 mesh_meta, const float4 mesh_origin_h,
+    __global const float4* atoms, __global const float* atom_coeffs,
+    __global const int* bucket_atoms, __global const int* bucket_offsets,
+    const int4 core_meta, const float4 core_bucket_meta,
+    __global int* out_status, __global float* out_min_r, __global int* out_offender, __global int* out_overflow,
+    __global int* out_iters, __global int* out_esc, __global int* out_nclamp,
+    __global float4* points, __global float4* FEs,
+    float4 tipA, float4 tipB, float4 tipC,
+    float4 stiffness, float4 dpos0, float4 relax_params, float4 surfFF,
+    int nx_s, int ny_s, int nz,
+    __global const int4* tile_desc, __global const int* tile_kz,
+    __global const int* wg_atom_offsets, __global const int* wg_atom_ids,
+    const int4 tile_meta, const float rho_cap,
+    __local float4* LATOMS, __local float* LCOEFFS, __local float* LMESH)
+{
+    const int gx = get_global_id(0), gy = get_global_id(1);
+    const int lid = get_local_id(1) * get_local_size(0) + get_local_id(0);
+    const int lsz = get_local_size(0) * get_local_size(1);
+    const int ntx = tile_meta.x, nzL = tile_meta.y;
+    const int iwg = get_group_id(1) * ntx + get_group_id(0);
+    const bool active = (gx < nx_s) && (gy < ny_s);
+    const int ipx = gx * ny_s + gy;
+    const int4 td = tile_desc[iwg];
+    const int ix0 = td.x, iy0 = td.y, nxL = td.z, nyL = td.w;
+    const int a0 = wg_atom_offsets[iwg];
+    const int nloc = wg_atom_offsets[iwg + 1] - a0;
+    const int nat = core_meta.x;
+    const int nmesh = nxL * nyL * nzL;
+    // --- one-time cooperative preload: tile atoms + 5 coeffs each ---
+    for (int j = lid; j < nloc; j += lsz) {
+        const int ia = wg_atom_ids[a0 + j];
+        LATOMS[j] = atoms[ia];
+        const int ig = ia * CS_PME_NMODES, il = j * CS_PME_NMODES;
+        const float4 c03 = vload4(0, atom_coeffs + ig);
+        vstore4(c03, 0, LCOEFFS + il);
+        LCOEFFS[il + 4] = atom_coeffs[ig + 4];
+    }
+    // --- initial mesh slab (iz = 0) ---
+    int cache_kz = tile_kz[iwg * nz];
+    for (int e = lid; e < nmesh; e += lsz) {
+        const int izl = e % nzL, t2 = e / nzL, iy = t2 % nyL, ix = t2 / nyL;
+        LMESH[e] = mesh_coeffs[((ix0 + ix) * mesh_meta.y + (iy0 + iy)) * mesh_meta.z + cache_kz + izl];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const float3 dTip = tipC.xyz * tipC.w;
+    float4 dpos0_ = dpos0;
+    dpos0_.xyz = rotMatT(dpos0_.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+    const float L = dpos0.w;
+    const float L2 = L * L;
+    const float3 a3 = tipA.xyz, b3 = tipB.xyz, c3 = tipC.xyz;
+    float3 tipPos = (float3)(0.0f, 0.0f, 0.0f);
+    float3 pos = tipPos;
+    float2 dxy = dpos0_.xy;
+    if (active) {
+        tipPos = points[ipx].xyz;
+        pos = tipPos + rotMatT((float3)(dxy.x, dxy.y, -sqrt(fmax(L2 - dxy.x*dxy.x - dxy.y*dxy.y, 1e-4f))), a3, b3, c3);
+    }
+    const float dt_md = relax_params.x;
+    const float damp0 = relax_params.y;
+    const int imax = (relax_params.z > 0.5f) ? (int)relax_params.z : N_RELAX_STEP_MAX;
+    const float f2conv = F2CONV * fmax(relax_params.w, 1e-12f);
+    float2 Jd = stiffness.xy;                               // Hooke init: lateral tip stiffness
+    const float rho_cap2 = rho_cap * rho_cap;               // hard lateral bound |dxy| <= rho_cap
+    bool done = false;                                      // stroke aborted (PP at cap — deeper slices invalid)
+
+    for (int iz = 0; iz < nz; iz++) {
+        const int kz_new = tile_kz[iwg * nz + iz];
+        if (kz_new != cache_kz) {                           // slab window moved — stream new planes
+            barrier(CLK_LOCAL_MEM_FENCE);                   // all lanes done with old slab
+            for (int e = lid; e < nmesh; e += lsz) {
+                const int izl = e % nzL, t2 = e / nzL, iy = t2 % nyL, ix = t2 / nyL;
+                LMESH[e] = mesh_coeffs[((ix0 + ix) * mesh_meta.y + (iy0 + iy)) * mesh_meta.z + kz_new + izl];
+            }
+            cache_kz = kz_new;
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (!active || done) continue;                      // padded lanes / aborted strokes: barriers only
+
+        int3 esc_iz = (int3)(0, 0, 0);
+        int nclamp_iz = 0;
+        float4 fe;
+        float2 v = (float2)(0.0f, 0.0f);
+        int status_acc = 0; float min_r_acc = 1e30f; int offender_acc = -1; int overflow_acc = 0;
+        float2 fp = (float2)(0.0f); float2 xp = dxy;
+        float f2p = 1e30f;
+        float trust = 1.0f;
+        float dt = dt_md, damp = damp0;
+        const float dtmin = dt_md * 0.1f, dtmax = dt_md;
+        int niter = 0, conv = 0;
+        float f2l = 1e30f;
+        for (int i = 0; i < imax; i++) {
+            niter = i + 1;
+            // place PP on sphere: hard lateral cap |dxy| <= rho_cap, then |dpos|=L
+            float rr = dxy.x*dxy.x + dxy.y*dxy.y;
+            if (rr > rho_cap2) { dxy *= rho_cap * rsqrt(rr); rr = rho_cap2; nclamp_iz++; }
+            float Lz2 = L2 - rr;
+            if (Lz2 < 1e-4f) {                              // >~90 deg bend — off-model, cap
+                float sc = sqrt(fmax(L2 * 0.81f, 1e-8f) / fmax(rr, 1e-8f));
+                dxy *= sc; Lz2 = L2 - dxy.x*dxy.x - dxy.y*dxy.y;
+            }
+            float zz = -sqrt(Lz2);
+            float3 d_ = (float3)(dxy.x, dxy.y, zz);
+            pos = tipPos + rotMatT(d_, a3, b3, c3);
+            int status = 0; float min_r = 1e30f; int offender = -1; int overflow = 0;
+            fe = cs_eval_contact_pme_tile_at(pos.x, pos.y, pos.z,
+                mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+                mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+                atoms, atom_coeffs, bucket_atoms, bucket_offsets,
+                nat, core_meta.y, core_meta.z, core_meta.w,
+                core_bucket_meta.x, core_bucket_meta.y, core_bucket_meta.z,
+                LMESH, ix0, iy0, nxL, nyL, cache_kz, nzL,
+                LATOMS, LCOEFFS, nloc, core_bucket_meta.w,
+                wg_atom_ids + a0,
+                &status, &min_r, &offender, &overflow, &esc_iz);
+            status_acc |= status;
+            if (min_r < min_r_acc) { min_r_acc = min_r; offender_acc = offender; }
+            overflow_acc += overflow;
+            if (status & 1 || status & 2) { conv = -1; break; }
+            float3 f = fe.xyz + rotMatT(tipForce(d_, stiffness, dpos0), a3, b3, c3) + c3 * surfFF.x;
+            // tangent residual: G = f . e_i, e1=a+x/|z|c, e2=b+y/|z|c
+            float iz_ = 1.0f / (-zz);
+            float fc_ = dot(f, c3);
+            float2 G = (float2)(dot(f, a3) + dxy.x * iz_ * fc_,
+                                dot(f, b3) + dxy.y * iz_ * fc_);
+            float f2 = dot(G, G);
+            f2l = f2;
+            if (f2 < f2conv) { conv = 1; break; }
+
+            if (i < QN_BUDGET) {
+                // --- phase 1: diagonal secant on 2 soft DOFs ---
+                if (i > 0) {
+                    float2 dd = dxy - xp;
+                    float2 df = G - fp;
+                    if (fabs(dd.x) > 1e-4f) Jd.x = df.x / dd.x;
+                    if (fabs(dd.y) > 1e-4f) Jd.y = df.y / dd.y;
+                    Jd = clamp(Jd, -1e6f, -0.1f);
+                    if (f2 > f2p * 3.0f) { dxy = xp; trust = fmax(trust * 0.3f, 0.05f); }
+                }
+                float2 dx = -G / Jd;
+                dx *= 0.7f * trust;
+                dx = clamp(dx, -0.1f, 0.1f);
+                xp = dxy; fp = G; f2p = f2;
+                dxy += dx;
+                trust = fmin(trust * 1.4f, 1.0f);
+            } else if (i < QN_BUDGET + NR_BUDGET) {
+                // --- phase 2: full 2x2 FD-Newton on (x,y) ---
+                const float h = 1e-3f;
+                float2 Gx_, Gy_; int s1 = 0, s2_ = 0; float mr; int of_, ov;
+                // probe +x
+                {
+                    float2 dp = dxy + (float2)(h, 0.f);
+                    float z2 = L2 - dp.x*dp.x - dp.y*dp.y; if (z2 < 1e-4f) z2 = 1e-4f;
+                    float z3 = -sqrt(z2);
+                    float3 dd_ = (float3)(dp.x, dp.y, z3);
+                    float3 pp = tipPos + rotMatT(dd_, a3, b3, c3);
+                    float4 fej = cs_eval_contact_pme_tile_at(pp.x, pp.y, pp.z,
+                        mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+                        mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+                        atoms, atom_coeffs, bucket_atoms, bucket_offsets,
+                        nat, core_meta.y, core_meta.z, core_meta.w,
+                        core_bucket_meta.x, core_bucket_meta.y, core_bucket_meta.z,
+                        LMESH, ix0, iy0, nxL, nyL, cache_kz, nzL,
+                        LATOMS, LCOEFFS, nloc, core_bucket_meta.w,
+                        wg_atom_ids + a0,
+                        &s1, &mr, &of_, &ov, &esc_iz);
+                    float3 fj = fej.xyz + rotMatT(tipForce(dd_, stiffness, dpos0), a3, b3, c3) + c3 * surfFF.x;
+                    float izj = 1.0f / (-z3); float fcj = dot(fj, c3);
+                    Gx_ = (float2)(dot(fj, a3) + dp.x * izj * fcj, dot(fj, b3) + dp.y * izj * fcj);
+                }
+                {
+                    float2 dp = dxy + (float2)(0.f, h);
+                    float z2 = L2 - dp.x*dp.x - dp.y*dp.y; if (z2 < 1e-4f) z2 = 1e-4f;
+                    float z3 = -sqrt(z2);
+                    float3 dd_ = (float3)(dp.x, dp.y, z3);
+                    float3 pp = tipPos + rotMatT(dd_, a3, b3, c3);
+                    float4 fej = cs_eval_contact_pme_tile_at(pp.x, pp.y, pp.z,
+                        mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+                        mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+                        atoms, atom_coeffs, bucket_atoms, bucket_offsets,
+                        nat, core_meta.y, core_meta.z, core_meta.w,
+                        core_bucket_meta.x, core_bucket_meta.y, core_bucket_meta.z,
+                        LMESH, ix0, iy0, nxL, nyL, cache_kz, nzL,
+                        LATOMS, LCOEFFS, nloc, core_bucket_meta.w,
+                        wg_atom_ids + a0,
+                        &s2_, &mr, &of_, &ov, &esc_iz);
+                    float3 fj = fej.xyz + rotMatT(tipForce(dd_, stiffness, dpos0), a3, b3, c3) + c3 * surfFF.x;
+                    float izj = 1.0f / (-z3); float fcj = dot(fj, c3);
+                    Gy_ = (float2)(dot(fj, a3) + dp.x * izj * fcj, dot(fj, b3) + dp.y * izj * fcj);
+                }
+                status_acc |= s1 | s2_;
+                if ((s1 | s2_) & 3) break;
+                // J cols: dG/dx, dG/dy
+                float j00 = (Gx_.x - G.x) / h, j10 = (Gx_.y - G.x) / h;
+                float j01 = (Gy_.x - G.y) / h, j11 = (Gy_.y - G.y) / h;
+                float det = j00 * j11 - j01 * j10;
+                float2 dx;
+                if (fabs(det) > 1e-12f && isfinite(det)) {
+                    dx = (float2)((-j11 * G.x + j01 * G.y) / det, (j10 * G.x - j00 * G.y) / det);  // -J^-1 G
+                } else {
+                    dx = -G / Jd;
+                }
+                dx *= 0.8f;
+                dx = clamp(dx, -0.15f, 0.15f);
+                dxy += dx;
+            } else {
+                // --- phase 3: damped-MD on the 2 soft DOFs ---
+                v *= (1.0f - damp);
+                v += G * dt;
+                dxy += v * dt;
+            }
+        }
+        // final eval at converged dxy -> pos. Skip when the loop already evaluated
+        // fe at exactly this pos (converged break) — saves ~1 eval/slice.
+        float rr = dxy.x*dxy.x + dxy.y*dxy.y;
+        if (rr > rho_cap2) { dxy *= rho_cap * rsqrt(rr); rr = rho_cap2; nclamp_iz++; }
+        float Lz2 = L2 - rr;
+        if (Lz2 < 1e-4f) { float sc = sqrt(fmax(L2*0.81f,1e-8f)/fmax(rr,1e-8f)); dxy *= sc; Lz2 = L2 - dxy.x*dxy.x - dxy.y*dxy.y; }
+        float zz = -sqrt(Lz2);
+        float3 d_ = (float3)(dxy.x, dxy.y, zz);
+        pos = tipPos + rotMatT(d_, a3, b3, c3);
+        if (!conv) {
+            int status = 0; float min_r = 1e30f; int offender = -1; int overflow = 0;
+            fe = cs_eval_contact_pme_tile_at(pos.x, pos.y, pos.z,
+                mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+                mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+                atoms, atom_coeffs, bucket_atoms, bucket_offsets,
+                nat, core_meta.y, core_meta.z, core_meta.w,
+                core_bucket_meta.x, core_bucket_meta.y, core_bucket_meta.z,
+                LMESH, ix0, iy0, nxL, nyL, cache_kz, nzL,
+                LATOMS, LCOEFFS, nloc, core_bucket_meta.w,
+                wg_atom_ids + a0,
+                &status, &min_r, &offender, &overflow, &esc_iz);
+            status_acc |= status;
+            if (min_r < min_r_acc) { min_r_acc = min_r; offender_acc = offender; }
+            overflow_acc += overflow;
+        }
+        float4 fe_;
+        fe_.xyz = rotMat(fe.xyz, tipA.xyz, tipB.xyz, tipC.xyz);
+        fe_.w = fe.w;
+        int idx = ipx * nz + iz;
+        FEs[idx] = fe_;
+        const bool at_cap = (rr >= rho_cap2 * 0.99f);       // converged state sits on the cap → invalid regime
+        if (at_cap) status_acc |= 8;
+        out_status[idx] = status_acc; out_min_r[idx] = min_r_acc; out_offender[idx] = offender_acc; out_overflow[idx] = overflow_acc;
+        out_iters[idx] = (conv != 0 || f2l < f2conv * 1e4f) ? niter : -niter;
+        out_esc[ipx * nz + iz] = esc_iz.x + esc_iz.y + esc_iz.z;
+        out_nclamp[ipx * nz + iz] = nclamp_iz;
+        if (at_cap) {
+            // PP snapped to the lateral cap — deeper approach stays invalid.
+            // Mark remaining slices (status bit 8, iters=-1) and stop this stroke.
+            for (int iz2 = iz + 1; iz2 < nz; iz2++) {
+                int idx2 = ipx * nz + iz2;
+                FEs[idx2] = fe_;
+                out_status[idx2] = 8; out_min_r[idx2] = min_r_acc; out_offender[idx2] = offender_acc; out_overflow[idx2] = 0;
+                out_iters[idx2] = -1;
+                out_esc[idx2] = 0; out_nclamp[idx2] = nclamp_iz;
+            }
+            done = true;
+            continue;                                       // skip tipPos advance — stroke over
+        }
+        tipPos += dTip.xyz;
+        pos += dTip.xyz;
         // warm-start dxy for next slice from new pos
         {
             float3 dv = rotMat(pos - tipPos, a3, b3, c3);

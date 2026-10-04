@@ -256,7 +256,8 @@ L0: `tests/SPM/test_afm_contact_surface.py`. L2: `tests/testplot_contact_surface
 
 **Task SSOT:** [Tasks/Fast_2p5D_AFM_ContactSurface.md](Tasks/Fast_2p5D_AFM_ContactSurface.md)
 
-- **Fast relax solvers (2026-10-03, opt-in):** `relax_mode='qn'` (secant→FD-Newton→FIRE) and `relax_mode='sph'` (sphere-constrained, |dpos|=L analytic → only 2 soft lateral DOFs; removes the K_RAD≫K_LAT stiff mode that makes FIRE crawl). GTX 1650 PTCDA 240²×31: FIRE ~95 ms → sph ~25 ms (~4×), NCC(Fx)≈0.998–0.9999, df diff ≈0.002–0.013 — `sph` omits radial compression (K_RAD→∞ caveat). Report: [Reports/ContactPME_RelaxQuasiNewton_Sph_2026-10-03.md](Reports/ContactPME_RelaxQuasiNewton_Sph_2026-10-03.md)
+- **Fast relax solvers (2026-10-03, opt-in):** `relax_mode='qn'` (secant→FD-Newton→FIRE) and `relax_mode='sph'` (sphere-constrained, |dpos|=L analytic → only 2 soft lateral DOFs; removes the K_RAD≫K_LAT stiff mode that makes FIRE crawl). GTX 1650 PTCDA 240²×31: FIRE ~95 ms → sph ~25 ms (~4×), NCC(Fx)≈0.998–0.9999, df diff ≈0.002–0.013 — `sph` omits radial compression (K_RAD→∞ caveat). Size sweep on square bilayer (USER confirmed 2026-10-04, `debug/testplot_pme_tiles/solvers_scale.png`): local kernel dies above ~1365 atoms (36 B/atom, 48 KB); tile sphere is 40 ms→881 ms from 194 to 3232 atoms, while bucket FIRE on the same scans is 37 s and 66 s. Report: [Reports/ContactPME_RelaxQuasiNewton_Sph_2026-10-03.md](Reports/ContactPME_RelaxQuasiNewton_Sph_2026-10-03.md)
+- **1×1×1 spline is enough (2026-10-04, USER confirmed):** 2×2×2 and 3×3×3 samples of `V_L` projected onto the same 1 Å coefficients do not reduce corrugation or change a relaxed df image (CLI `K_LAT=0.5 N/m`, `K_RAD=20`, `L=3`, FIRE). Scan dominates fit. Report: [Reports/ContactPME_Supersample_Scale_2026-10-04.md](Reports/ContactPME_Supersample_Scale_2026-10-04.md)
 
 **Open issues:** USER confirm maps; residual XY sharpness; PIC re-validate; pipeline flag; elastic Phase 2.
 

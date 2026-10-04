@@ -22,6 +22,8 @@ from spammm.surfaces.ContactSurface import build_pic_buckets, boltzmann_fit_weig
 # than the legacy (4,8,16,32,64) which collapses mid-shell.
 CORE_POWERS = np.array([2, 4, 8, 16, 32], dtype=np.int64)
 N_MODES = len(CORE_POWERS)
+# Deterministic radial grid for the GPU core fit (cs_fit_core_paw). Same count in the kernel.
+CORE_FIT_NSAMP = 32
 
 
 @dataclass
@@ -231,6 +233,107 @@ def fit_core_1d(p: SplitParams, n_shells=300, n_endpoint=30, n_holdout=80,
                    train_rmse_E=train_rmse_E, train_rmse_F=train_rmse_F,
                    held_rmse_E=held_rmse_E, held_rmse_F=held_rmse_F,
                    held_max_E=held_max_E, held_max_F=held_max_F, worst_r=worst_r)
+
+
+def _chebyshev_u(n):
+    """Open nodes on (0,1), clustered at both ends. Shared by the GPU kernel."""
+    k = np.arange(n, dtype=np.float64)
+    return 0.5 * (1.0 - np.cos(np.pi * (k + 0.5) / n))
+
+
+def _p95_rows(v):
+    """Linear percentile 95 along axis 1. Matches np.percentile(..., 95)."""
+    s = np.sort(v, axis=1)
+    n = s.shape[1]
+    pos = 0.95 * (n - 1)
+    lo = int(np.floor(pos))
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return (1.0 - frac) * s[:, lo] + frac * s[:, hi]
+
+
+def paw_coeffs_batch(p: SplitParams):
+    """Even-poly PAW coefficients for every atom. One batched 3×3 solve, no atom loop.
+
+    Same a0 minimization as PMESplit._paw_even_coeffs.
+    Returns a0, a2, a4, a6, r_b, each shape (na,).
+    """
+    from spammm.surfaces.PMESplit import combined_atom_potential
+    r_b = np.atleast_1d(np.asarray(p.r_b, dtype=np.float64))
+    Vc, Gc, Hc = combined_atom_potential(r_b, p)
+    Vc, Gc, Hc = np.atleast_1d(Vc), np.atleast_1d(Gc), np.atleast_1d(Hc)
+    D = r_b
+    D2, D3, D4, D5, D6 = D*D, D**3, D**4, D**5, D**6
+    A = np.empty((len(D), 3, 3), dtype=np.float64)
+    A[:, 0, 0], A[:, 0, 1], A[:, 0, 2] = D2, D4, D6
+    A[:, 1, 0], A[:, 1, 1], A[:, 1, 2] = 2*D, 4*D3, 6*D5
+    A[:, 2, 0], A[:, 2, 1], A[:, 2, 2] = 2.0, 12*D2, 30*D4
+    # rhs must be (na, 3, 1). A (na, 3) right-hand side is read as m=na, n=3.
+    a_at_0 = np.linalg.solve(A, np.stack([Vc, Gc, Hc], axis=1)[..., None])[..., 0]
+    a_hom = np.linalg.solve(A, np.tile(np.array([-1.0, 0.0, 0.0]), (len(D), 1))[..., None])[..., 0]
+    s = np.sqrt(0.6)
+    xs = 0.5 * D[:, None] * (1.0 + np.array([-s, 0.0, s]))
+    ws = 0.5 * D[:, None] * np.array([5.0/9.0, 8.0/9.0, 5.0/9.0])
+    xs2, xs4 = xs*xs, xs**4
+    u = 2*a_at_0[:, 0:1] + 12*a_at_0[:, 1:2]*xs2 + 30*a_at_0[:, 2:3]*xs4
+    v = 2*a_hom[:, 0:1] + 12*a_hom[:, 1:2]*xs2 + 30*a_hom[:, 2:3]*xs4
+    denom = np.sum(ws * v * v, axis=1)
+    a0 = np.where(denom < 1e-30, 0.0, -np.sum(ws * u * v, axis=1) / np.maximum(denom, 1e-30))
+    a246 = np.linalg.solve(A, np.stack([Vc - a0, Gc, Hc], axis=1)[..., None])[..., 0]
+    return a0, a246[:, 0], a246[:, 1], a246[:, 2], r_b
+
+
+def fit_core_paw_grid(p: SplitParams, n_samp=CORE_FIT_NSAMP):
+    """Float64 normal equations of the PAW core on the Chebyshev grid.
+
+    Oracle for cs_fit_core_paw. Same weights as fit_core_1d (Boltzmann on v,
+    separate E/F scales) but a fixed grid instead of the random shell sample.
+    Returns coefficients (na, 5).
+    """
+    assert p.split_mode == 'paw', f'fit_core_paw_grid is the paw GPU path, got {p.split_mode}'
+    a0, a2, a4, a6, r_b = paw_coeffs_batch(p)
+    r_lo = np.atleast_1d(np.asarray(p.r_lo, dtype=np.float64))
+    R0 = np.atleast_1d(np.asarray(p.R0, dtype=np.float64))
+    E0 = np.atleast_1d(np.asarray(p.E0, dtype=np.float64))
+    q = np.atleast_1d(np.asarray(p.q, dtype=np.float64))
+    u = _chebyshev_u(n_samp)
+    r = r_lo[:, None] + (r_b - r_lo)[:, None] * u[None, :]
+    # Morse + Coulomb, broadcast over samples. combined_atom_potential wants a SplitParams
+    # whose R0/E0/q line up with r. Evaluate per the closed form so one atom axis stays.
+    K = -float(p.alpha)
+    R2 = float(p.r_damp) ** 2
+    e = np.exp(K * (r - R0[:, None]))
+    e2 = e * e
+    v = E0[:, None] * (e2 - 2.0 * e)
+    dv = 2.0 * K * E0[:, None] * (e2 - e)
+    cc = 14.3996448915 * q[:, None] * float(p.q_tip)
+    s2 = r * r + R2
+    inv_s = 1.0 / np.sqrt(s2)
+    v = v + cc * inv_s
+    dv = dv - cc * r * inv_s ** 3
+    r2, r4, r6 = r*r, r**4, r**6
+    P = a0[:, None] + a2[:, None]*r2 + a4[:, None]*r4 + a6[:, None]*r6
+    dP = (2*a2[:, None])*r + (4*a4[:, None])*r2*r + (6*a6[:, None])*r4*r
+    v_S = v - P
+    dv_S = dv - dP
+    D = (r_b - r_lo)[:, None]
+    t = np.clip((r_b[:, None] - r) / D, 0.0, 1.0)
+    powers = CORE_POWERS.astype(np.float64)
+    phi = t[:, :, None] ** powers[None, None, :]
+    dphi = -powers[None, None, :] * t[:, :, None] ** (powers - 1.0)[None, None, :] / D[:, :, None]
+    E_shift = v.min(axis=1)
+    p95 = _p95_rows(v)
+    T = np.maximum((p95 - E_shift) / 3.0, 0.05)
+    w = np.exp(-(v - E_shift[:, None]) / T[:, None])
+    w /= np.maximum(w.max(axis=1, keepdims=True), 1e-16)
+    E_scale = np.maximum(v_S.std(axis=1), 1e-12)
+    F_scale = np.maximum(dv_S.std(axis=1), 1e-12)
+    wE = w * (1.0 / E_scale[:, None]) ** 2
+    wF = w * (1.0 / F_scale[:, None]) ** 2
+    # G_mn = Σ wE phi_m phi_n + wF dphi_m dphi_n
+    G = np.einsum('ak,akm,akn->amn', wE, phi, phi) + np.einsum('ak,akm,akn->amn', wF, dphi, dphi)
+    rhs = np.einsum('ak,akm,ak->am', wE, phi, v_S) + np.einsum('ak,akm,ak->am', wF, dphi, dv_S)
+    return np.linalg.solve(G, rhs[..., None])[..., 0]
 
 
 # ── eval_core ───────────────────────────────────────────────────────────────
