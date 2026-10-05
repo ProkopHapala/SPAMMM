@@ -2145,7 +2145,8 @@ class AFMulator(OpenCLBase):
                              scan_da=None, scan_db=None, scan_pts=None, bAlloc=True,
                              use_gpu=None, core_backend='auto', workgroup_size=None,
                              relax_mode='fire', qn_cap=0, qn_conv=1.0,
-                             tile_xy=None, rho_max=1.0, nzL=5, rho_cap=None):
+                             tile_xy=None, rho_max=1.0, nzL=5, rho_cap=None,
+                             fe0=False):
         """PP-AFM scan using the contact_pme backend.
 
         Same scan geometry and outputs as run_scan_contact(), but the field
@@ -2171,6 +2172,11 @@ class AFMulator(OpenCLBase):
             tile_xy: (tx, ty) pixel tile for the tiled kernel. None picks the
                 factorization of 256 threads whose rectangle is most square in Å
                 (compact_scan_tile). A long rectangle wastes the shared local block.
+            fe0: also write the field at the UNDEFLECTED PP position into an
+                iz-major buffer (fire+local only; ~1 extra field eval per masked
+                iz). True = all nz slices; or pass an iterable of kernel z-step
+                indices (iz=0 = highest) to write only those planes.
+                Download slices with download_fe0(izs).
         Returns:
             FEs (nx_s, ny_s, nz, 4), pts (nx_s, ny_s, 3)
         """
@@ -2212,12 +2218,37 @@ class AFMulator(OpenCLBase):
             FEs = self._pme_scan_gpu(params, pts, nxy, nz, dtip, bAlloc,
                                     core_backend=core_backend, workgroup_size=workgroup_size,
                                     relax_mode=relax_mode, qn_cap=qn_cap, qn_conv=qn_conv,
-                                    tile_xy=tile_xy, rho_max=rho_max, nzL=nzL, rho_cap=rho_cap)
+                                    tile_xy=tile_xy, rho_max=rho_max, nzL=nzL, rho_cap=rho_cap,
+                                    fe0=fe0)
         else:
+            if fe0:
+                raise ValueError('fe0 output requires the GPU local+fire path')
             FEs = self._pme_scan_python(params, pts, nxy, nz, dtip)
         if getattr(self, 'verbosity', 0) > 0:
             print(f"AFMulator.run_scan_contact_pme: done FEs.shape={FEs.shape}")
         return FEs, pts[:, :3].reshape(nx_s, ny_s, 3)
+
+    def download_fe0(self, izs):
+        """Per-slice field at the UNDEFLECTED PP position, written by the last
+        fire/local contact-PME scan launched with fe0=True. The kernel buffer is
+        iz-major (plane iz contiguous) so each requested slice is one copy.
+        izs: kernel z-step indices (iz=0 = highest stroke). `iz = nz-1-j` maps
+        ascending height index j -> kernel step. Returns (K, nx_s, ny_s, 4) f32."""
+        meta = getattr(self, '_fe0_meta', None)
+        if meta is None:
+            raise RuntimeError('no fe0 output — run_scan_contact_pme(..., fe0=True) on the fire/local path first')
+        n_scan, nz, nx_s, ny_s, mask = meta
+        izs = np.asarray(izs, dtype=np.int64).ravel()
+        if izs.size == 0 or izs.min() < 0 or izs.max() >= nz:
+            raise ValueError(f'download_fe0: izs {izs.tolist()} outside [0,{nz})')
+        unwritten = [int(iz) for iz in izs if not (mask >> int(iz)) & 1]
+        if unwritten:
+            raise ValueError(f'download_fe0: slices {unwritten} were not in the fe0 mask of the last scan')
+        out = np.empty((izs.size, n_scan, 4), np.float32)
+        for j, iz in enumerate(izs):
+            cl.enqueue_copy(self.queue, out[j], self.cpm_scan_fe0_cl, device_offset=int(iz) * n_scan * 16)
+        self.queue.finish()
+        return out.reshape(izs.size, nx_s, ny_s, 4)
 
     def pauli_force_at_relaxed_pp(self, iz, x0, y0, dx, dy):
         """Morse force of each atom on the relaxed PP at the pixel above that atom.
@@ -2373,7 +2404,7 @@ class AFMulator(OpenCLBase):
 
     def _pme_scan_gpu(self, params, pts, nxy, nz, dtip, bAlloc, *, core_backend='auto',
                       workgroup_size=None, relax_mode='fire', qn_cap=0, qn_conv=1.0,
-                      tile_xy=None, rho_max=1.0, nzL=5, rho_cap=None):
+                      tile_xy=None, rho_max=1.0, nzL=5, rho_cap=None, fe0=False):
         """GPU PP relaxation via bucket or Local contact-PME kernels.
         relax_mode: 'fire' (default), 'qn' (quasi-Newton), 'sph' (sphere-constrained
         Newton — |dpos|=L enforced analytically, only the 2 soft lateral DOFs solved).
@@ -2415,6 +2446,17 @@ class AFMulator(OpenCLBase):
             'cpm_scan_offender': n_tele * 4, 'cpm_scan_overflow': n_tele * 4,
         }, suffix='_cl')
         if prof: _tp.append(('telemetry_alloc', _time.perf_counter()))
+        self._fe0_meta = None
+        if fe0 is not False and fe0 is not None and not (relax_mode == 'fire' and backend == 'local'):
+            raise ValueError(f"fe0 output implemented only for relax_mode='fire' + core_backend='local' (got relax_mode={relax_mode!r}, backend={backend!r})")
+        fe0_mask = 0
+        if fe0 is not False and fe0 is not None:
+            if nz > 32:
+                raise ValueError(f'fe0 bitmask is int32 — nz={nz} > 32 not supported')
+            izl = range(nz) if fe0 is True else np.asarray(list(fe0), dtype=np.int64).ravel()
+            for iz in izl:
+                if not (0 <= int(iz) < nz): raise ValueError(f'fe0 slice iz={int(iz)} outside [0,{nz})')
+                fe0_mask |= 1 << int(iz)
         if relax_mode != 'fire' and backend not in ('local', 'tile'):
             raise ValueError(f"relax_mode='{relax_mode}' implemented only for core_backend='local'|'tile' (got '{backend}')")
         if backend == 'tile':
@@ -2505,6 +2547,12 @@ class AFMulator(OpenCLBase):
                     iz1_b, pm1_b,
                     LATOMS, LCOEFFS)
             elif relax_mode == 'fire':
+                if fe0 is not False and fe0 is not None:
+                    self.try_make_buffers({'cpm_scan_fe0': n_scan * nz * 16}, suffix='_cl')   # float4 per (iz,gid), iz-major planes
+                    fe0_b = self.cpm_scan_fe0_cl
+                    self._fe0_meta = (int(n_scan), int(nz), int(nx_s), int(ny_s), int(fe0_mask))
+                else:
+                    fe0_b = None
                 self.prg.relaxStrokesTiltedContactPMELocal(
                     self.queue, gs, (wg,),
                     self.cpm_mesh_cl, mesh_meta, mesh_origin_h,
@@ -2512,7 +2560,7 @@ class AFMulator(OpenCLBase):
                     core_meta, core_bucket_meta,
                     self.cpm_scan_status_cl, self.cpm_scan_min_r_cl,
                     self.cpm_scan_offender_cl, self.cpm_scan_overflow_cl,
-                    self.scan_pts_cl, self.scan_FEs_cl, self.scan_disps_cl,
+                    self.scan_pts_cl, self.scan_FEs_cl, self.scan_disps_cl, fe0_b, np.int32(fe0_mask),
                     self.tipA, self.tipB, tipC, self.stiffness,
                     self.dpos0, self.relax_pars, self.surfFF,
                     np.int32(n_scan), np.int32(nz), LATOMS, LCOEFFS)

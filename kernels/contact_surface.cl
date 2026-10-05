@@ -1926,6 +1926,7 @@ __kernel void relaxStrokesTiltedContactPMELocal(
     const int4 core_meta, const float4 core_bucket_meta,
     __global int* out_status, __global float* out_min_r, __global int* out_offender, __global int* out_overflow,
     __global float4* points, __global float4* FEs, __global float4* out_pp,
+    __global float4* out_fe0, int fe0_mask,
     float4 tipA, float4 tipB, float4 tipC,
     float4 stiffness, float4 dpos0, float4 relax_params, float4 surfFF,
     int n_scan, int nz, __local float4* LATOMS, __local float* LCOEFFS)
@@ -1995,6 +1996,14 @@ __kernel void relaxStrokesTiltedContactPMELocal(
         FEs[idx] = fe_;
         out_pp[idx] = (float4)(pos.x, pos.y, pos.z, 0.0f);
         out_status[idx] = status_acc; out_min_r[idx] = min_r_acc; out_offender[idx] = offender_acc; out_overflow[idx] = overflow_acc;
+        if (out_fe0 && (fe0_mask & (1 << iz))) {                // field at the UNDEFLECTED PP pos (== host eval_Fz0), only on masked slices; iz-major layout -> per-slice contiguous download
+            int st0 = 0; float mr0 = 1e30f; int of0 = -1; int ov0 = 0;
+            float3 p0u = tipPos + dpos0_.xyz;
+            out_fe0[iz * n_scan + gid] = cs_eval_contact_pme_local_at(p0u.x, p0u.y, p0u.z,
+                mesh_coeffs, mesh_meta.x, mesh_meta.y, mesh_meta.z,
+                mesh_origin_h.x, mesh_origin_h.y, mesh_origin_h.z, mesh_origin_h.w,
+                LATOMS, LCOEFFS, nat, core_bucket_meta.w, &st0, &mr0, &of0, &ov0);
+        }
         tipPos += dTip.xyz;
         pos += dTip.xyz;
     }
