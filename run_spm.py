@@ -60,6 +60,15 @@ def _parse_vec3(s: str, default=(0., 0., 1.)):
     return tuple(parts)
 
 
+def _warn_deprecated_cpu_fft():
+    import warnings
+    warnings.warn(
+        "--cpu-fft / SPAMMM_AFM_CPU_FFT=1 selects the DEPRECATED NumPy CPU-FFT path "
+        "(parity backup only, several× slower and much heavier on RAM). "
+        "The fused GPU FAST_S3 path is the default — drop the flag.",
+        DeprecationWarning)
+
+
 def _add_common_afm_args(p: argparse.ArgumentParser) -> None:
     g = p.add_argument_group('geometry / density')
     g.add_argument('--xyz',      default=None,  help='Sample geometry (.xyz); default benzene if no SMILES')
@@ -477,6 +486,7 @@ def cmd_afm(args: argparse.Namespace) -> int:
     if use_fast:
         os.environ.pop('SPAMMM_AFM_CPU_FFT', None)
     else:
+        _warn_deprecated_cpu_fft()
         os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -806,6 +816,7 @@ def cmd_panel_fukui(args: argparse.Namespace) -> int:
     if use_fast:
         os.environ.pop('SPAMMM_AFM_CPU_FFT', None)
     else:
+        _warn_deprecated_cpu_fft()
         os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
     afm_utils.run_fukui_panel(
         args.outdir, molecules=args.molecule, use_fast_s3=use_fast,
@@ -831,8 +842,9 @@ def cmd_replot_panel(args: argparse.Namespace) -> int:
 def cmd_es_diag(args: argparse.Namespace) -> int:
     """Cube ES chain diagnostics: ρ, Δρ, V_ES=Poisson(Δρ), E_ES, tip + mirror metrics."""
     from tests.SPM import testplot_fdbm_relax as diag
-    # CPU FFT only when explicitly requested via --cpu-fft (no silent env mutation)
+    # CPU FFT only when explicitly requested via --cpu-fft (DEPRECATED; no silent env mutation)
     if getattr(args, 'cpu_fft', False):
+        _warn_deprecated_cpu_fft()
         os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
     else:
         os.environ.pop('SPAMMM_AFM_CPU_FFT', None)
@@ -941,8 +953,9 @@ def cmd_stm_br(args: argparse.Namespace) -> int:
         mo_rel = [0, 1]  # HOMO + LUMO
     stm_heights = tuple(float(x) for x in str(args.stm_heights).replace(',', ' ').split() if x.strip())
     amp_align = not bool(getattr(args, 'no_amp_align', False))
-    # CPU FFT only when explicitly requested via --cpu-fft (no silent env mutation)
+    # CPU FFT only when explicitly requested via --cpu-fft (DEPRECATED; no silent env mutation)
     if getattr(args, 'cpu_fft', False):
+        _warn_deprecated_cpu_fft()
         os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
     else:
         os.environ.pop('SPAMMM_AFM_CPU_FFT', None)

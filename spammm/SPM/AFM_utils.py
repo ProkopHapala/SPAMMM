@@ -1649,7 +1649,8 @@ def build_orbital_layout(basis_data, enames):
 def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
                                  grid_spec=None, step=0.1, margin=4.0, z_extra=6.0,
                                  verbosity=0, max_shells=None, projection_basis_ang=None,
-                                 project_density=True):
+                                 project_density=True, need_es=True, need_ves=True,
+                                 dm_in=None):
     """Get density grids using DFTBcore dense matrix projection (supports d-orbitals).
 
     Uses direct DFTBcore library access (no file parsing) and dense density matrix
@@ -1676,6 +1677,9 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
               - See `make_slater_tail_species_list` docstring and `doc/DFTB_basis_fit.md`.
         project_density: if False, skip ρ/V_ES (STM orbital-only path still returns
             eigvecs + projector).
+        need_es: if False, skip rho_na/rho_diff (dual-basis second call wants only rho_scf).
+        need_ves: if False, skip the Poisson V_ES (fused-ES callers use rho_diff directly).
+        dm_in: precomputed density matrix — skips the whole DFTBcore SCF (dual-basis reuse).
 
     Returns:
         dict with 'rho_scf', 'rho_na', 'rho_diff', 'V_ES', 'origin', 'ngrid', 'grid_spec'
@@ -1687,6 +1691,13 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
     from spammm import atomicUtils as au
     import multiprocessing as mp
     import shutil
+
+    _dbg_t = bool(os.environ.get('FDBM_TIME'))
+    import time as _time
+    _t = [_time.time()]
+    def _mark(tag):
+        if _dbg_t:
+            _t.append(_time.time()); print(f'  [get_density] {tag}: {_t[-1]-_t[-2]:.2f}s', flush=True)
 
     ELEM_Z = {'H':1,'C':6,'N':7,'O':8,'F':9,'P':15,'S':16,'Cl':17,'Br':35,'I':53}
     inv_z = {v:k for k,v in ELEM_Z.items()}
@@ -1725,6 +1736,7 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
     # Setup projector with max_shells for d-orbital support
     proj_basis = projection_basis_ang if projection_basis_ang is not None else basis_ang
     projector, atoms_dict = dg.setup_gridprojector_from_dftb(dftb_data, proj_basis, verbosity=verbosity, max_shells=max_shells)
+    _mark('projector setup')
 
     # Run DFTBcore SCF directly (single molecule - no Fortran state conflicts expected)
     basis_name = os.path.basename(basis_hsd_path).replace('wfc.', '').replace('.hsd', '')
@@ -1778,55 +1790,64 @@ Hamiltonian = DFTB {{
                 if os.path.exists(src):
                     shutil.copy(src, work_dir)
 
-    # Run SCF
-    old_cwd = os.getcwd()
-    try:
-        os.chdir(work_dir)
-        dftb = DFTBcore()
-        dftb.init('dftb_in.hsd')
-        dftb.enable_matrix_collection(dm=True, h=False, s=False)
-        energy = dftb.run_scf()
-        dm_dense = dftb.get_dm_dense()
-        eigvecs, eigvals = dftb.get_eigvecs_dense()  # Get eigenvectors for STM
-        dftb.finalize()
-        # Note: DM is in non-orthogonal basis, GPU kernel handles this correctly
+    # Run SCF (skipped when caller supplies a precomputed DM — dual-basis reuse)
+    if dm_in is not None:
+        dm_dense = dm_in; eigvecs = eigvals = None
+    else:
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(work_dir)
+            dftb = DFTBcore()
+            dftb.init('dftb_in.hsd')
+            dftb.enable_matrix_collection(dm=True, h=False, s=False)
+            energy = dftb.run_scf()
+            dm_dense = dftb.get_dm_dense()
+            eigvecs, eigvals = dftb.get_eigvecs_dense()  # Get eigenvectors for STM
+            dftb.finalize()
+            # Note: DM is in non-orthogonal basis, GPU kernel handles this correctly
 
-    finally:
-        os.chdir(old_cwd)
+        finally:
+            os.chdir(old_cwd)
+    _mark('SCF')
 
     rho_scf = rho_na = rho_diff = V_ES = None
     if project_density:
         # Project SCF density using dense method (supports d-orbitals)
         rho_scf = projector.project_density_dense(dm_dense.astype(np.float32), norb_per_atom, orb_offsets, atoms_dict, grid_spec)
+        _mark('project rho_scf')
 
-        # Build geo dict for neutral density projection (sparse method)
-        geo = {
-            'natoms': len(enames),
-            'species_per_atom': species_per_atom,
-            'species_names': enames,
-            'coords_bohr': coords_bohr
-        }
-        # Neutral-atom density: diagonal NA DM → one project_density_dense (same physics as AO loop)
-        rho_na = dg.project_neutral_density(
-            geo, projector, atoms_dict, grid_spec, proj_basis,
-            norb_per_atom=norb_per_atom, orb_offsets=orb_offsets)
+        if need_es:
+            # Build geo dict for neutral density projection (sparse method)
+            geo = {
+                'natoms': len(enames),
+                'species_per_atom': species_per_atom,
+                'species_names': enames,
+                'coords_bohr': coords_bohr
+            }
+            # Neutral-atom density: diagonal NA DM → one project_density_dense (same physics as AO loop)
+            rho_na = dg.project_neutral_density(
+                geo, projector, atoms_dict, grid_spec, proj_basis,
+                norb_per_atom=norb_per_atom, orb_offsets=orb_offsets)
+            _mark('project rho_na')
 
-        rho_diff = (rho_scf - rho_na).astype(np.float32)
+            rho_diff = (rho_scf - rho_na).astype(np.float32)
 
-        # CRITICAL: Check charge conservation - rho_diff should integrate to ~0
-        # Both rho_scf and rho_na should contain the same total number of electrons
-        cell_volume = step**3
-        q_scf = rho_scf.sum() * cell_volume
-        q_na = rho_na.sum() * cell_volume
-        q_diff_val = rho_diff.sum() * cell_volume
-        print(f"  [CHARGE CHECK] step={step:.3f} Å, cell_vol={cell_volume:.6f} Å³")
-        print(f"  [CHARGE CHECK] rho_scf.sum={rho_scf.sum():.1f}, rho_na.sum={rho_na.sum():.1f}")
-        print(f"  [CHARGE CHECK] q_scf={q_scf:.3f}, q_na={q_na:.3f}, q_diff={q_diff_val:.6f} (should be ~0)")
-        if abs(q_diff_val) > 2.0:  # More than 2.0 electron discrepancy is serious
-            print(f"  WARNING: Large charge imbalance in rho_diff! Electrostatics may be unreliable.")
-            print(f"           Consider increasing grid resolution or checking basis consistency.")
+            # CRITICAL: Check charge conservation - rho_diff should integrate to ~0
+            # Both rho_scf and rho_na should contain the same total number of electrons
+            cell_volume = step**3
+            q_scf = rho_scf.sum() * cell_volume
+            q_na = rho_na.sum() * cell_volume
+            q_diff_val = rho_diff.sum() * cell_volume
+            print(f"  [CHARGE CHECK] step={step:.3f} Å, cell_vol={cell_volume:.6f} Å³")
+            print(f"  [CHARGE CHECK] rho_scf.sum={rho_scf.sum():.1f}, rho_na.sum={rho_na.sum():.1f}")
+            print(f"  [CHARGE CHECK] q_scf={q_scf:.3f}, q_na={q_na:.3f}, q_diff={q_diff_val:.6f} (should be ~0)")
+            if abs(q_diff_val) > 2.0:  # More than 2.0 electron discrepancy is serious
+                print(f"  WARNING: Large charge imbalance in rho_diff! Electrostatics may be unreliable.")
+                print(f"           Consider increasing grid resolution or checking basis consistency.")
 
-        V_ES = afm.fft_poisson(rho_diff, step)
+            if need_ves:
+                V_ES = afm.fft_poisson(rho_diff, step)
+                _mark('poisson V_ES')
 
     return {'rho_scf': rho_scf, 'rho_na': rho_na, 'rho_diff': rho_diff, 'V_ES': V_ES,
             'origin': origin, 'ngrid': ngrid, 'grid_spec': grid_spec,
@@ -2886,7 +2907,7 @@ def build_fdbm_grid_from_cubes(sample_cube_dir, tip_cube_dir, *, step=0.1, margi
               f"p_diff={p_diff} A={A_pauli} beta={beta_pauli} apex_Z={apex_Z} reoriented={tip_reoriented}")
         print(f"  [fdbm-cube] tip peak after roll={np.unravel_index(int(np.argmax(np.abs(tip_tot))), tip_tot.shape)}")
 
-    os.environ.setdefault('SPAMMM_AFM_CPU_FFT', '1')
+    # NOTE: GPU FFT (gpyfft) is the default; no SPAMMM_AFM_CPU_FFT forcing (deprecated CPU path)
     overlap = afm_mod.compute_pauli_overlap(rho_scf, tip_tot, step, tip_rolled=True)
     E_pauli = afm_mod.scale_pauli_field(overlap, step, A_pauli, beta_pauli, return_grads=False)
     if use_esp_cube and d_s.get('V_ES') is not None and d_s.get('esp_path'):
@@ -3482,7 +3503,11 @@ def run_fdbm_pp_from_density(tag, rho_scf, atomPos, atomTypes, origin, step, ngr
         afmulator.queue.finish()
         reuse_grid = True
     else:
-        # Legacy host FFT path (parity / --cpu-fft)
+        # Legacy host FFT path (parity / --cpu-fft) — DEPRECATED, several× slower and much
+        # heavier on RAM (complex128 workspaces). Use the fused GPU FAST_S3 path above.
+        import warnings
+        warnings.warn("run_fdbm_pp_from_density(use_fast_s3=False): legacy CPU-FFT path is DEPRECATED "
+                      "(parity backup only); use the fused GPU FAST_S3 path.", DeprecationWarning)
         os.environ['SPAMMM_AFM_CPU_FFT'] = '1'
         afm.AFM_CPU_FFT = 1
         if V_ES is None:
@@ -8747,7 +8772,7 @@ def run_basis_tails_compare(
         parse_wfc_hsd, convert_wfc_to_species_list_ang, make_slater_tail_species_list)
     from spammm.quantum.DFTB.basis_optimizer import extract_z_profiles
 
-    os.environ.setdefault('SPAMMM_AFM_CPU_FFT', '1')
+    # NOTE: GPU FFT (gpyfft) is the default; no SPAMMM_AFM_CPU_FFT forcing (deprecated CPU path)
     gpaw_dir = gpaw_dir or _BASIS_TAILS_GPAW
     pyscf_dir = pyscf_dir or _BASIS_TAILS_PYSCF
     outdir = os.path.abspath(outdir)

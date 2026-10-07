@@ -67,9 +67,9 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `README.md` — module index; contact-surface + **contact_pme** API
 
 ### spammm/SPM/ — Scanning Probe Microscopy (AFM/STM)
-- `AFM.py` — AFMulator; **contact_pme**: `fit_contact_pme` (GPU mesh fill), `run_scan_contact_pme` (`core_backend` local/bucket), vectorized scan pts
-- `AFM_utils.py` — tip densities, FDBM; `run_contact_pme_pp_afm` (CLI SSOT, forces `core_backend='local'`)
-- `ModularPipeline.py` — modular AFM/STM pipeline (S1–S6) with dual Stage-3 (fast/legacy)
+- `AFM.py` — AFMulator; **contact_pme**: `fit_contact_pme` (GPU mesh fill), `run_scan_contact_pme` (`core_backend` local/bucket), vectorized scan pts. FDBM Stage-3: `stage3_fdbm_fields_fast` (**fused GPU FAST_S3 — production default**); the NumPy `*_cpu` FFT helpers (`fft_poisson_cpu`, `compute_pauli_overlap_cpu`, `compute_es_conv_field_cpu`) are **DEPRECATED** — parity backup only, emit `DeprecationWarning`.
+- `AFM_utils.py` — tip densities, FDBM; `run_contact_pme_pp_afm` (CLI SSOT, forces `core_backend='local'`); `run_fdbm_pp_from_density` defaults to `use_fast_s3=True`, legacy branch warns (deprecated); `get_density_from_dftb_dense(dm_in/need_es/need_ves)` — dual-basis callers reuse one SCF. End-to-end GPU-pipeline design: `doc/Tasks/FDBM_EndToEnd_GPU_Pipeline.md`.
+- `ModularPipeline.py` — modular AFM/STM pipeline (S1–S6) with dual Stage-3 (FAST_S3 default; legacy = debug only). CPU FFT (`SPAMMM_AFM_CPU_FFT=1`, `--cpu-fft`) deprecated — never `setdefault` it at module level.
 - Perf: `doc/Tasks/PerfBenchmark_FDBM.md`; contact-PME: `doc/Reports/ContactPME_PAW_AFM_MemSpeed_2026-08-11.md`
 - `ManipulationPathOpt.py` — manipulation path optimization
 - `ScanUtils.py` — scan grid utilities

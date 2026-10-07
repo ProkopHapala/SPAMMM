@@ -26,7 +26,7 @@ python run_spm.py stm orbitals --help
 python -c "import pyopencl as cl; print([(p.name,[d.name for d in p.get_devices()]) for p in cl.get_platforms()])"
 ```
 
-Awkward FDBM grid sizes: keep **CPU FFT** (`afm` default `--cpu-fft`).
+**FFT backend (default = fused GPU FAST_S3):** the NumPy CPU-FFT path (`--cpu-fft` / `SPAMMM_AFM_CPU_FFT=1`) is **DEPRECATED** — it is several× slower and allocates huge complex128 workspaces (multi-GB on large grids). It remains only as an explicit parity/debug fallback and emits a `DeprecationWarning`. The fused GPU path (`stage3_fdbm_fields_fast`, FAST_S3) is the default everywhere.
 
 ---
 

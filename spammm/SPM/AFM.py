@@ -167,6 +167,9 @@ AFM_BENCH: int = _afm_int_env("SPAMMM_AFM_BENCH", 1)
 AFM_BENCH_NO_IO: int = _afm_int_env("SPAMMM_AFM_BENCH_NO_IO", 0)
 # Explicit CPU backups (default = GPU; no silent fallback)
 AFM_CPU_TASKS: int = _afm_int_env("SPAMMM_AFM_CPU_TASKS", 0)
+# DEPRECATED parity backup (2026-10-07): NumPy FFT path is several× slower and allocates
+# multi-GB complex128 workspaces. The fused GPU FAST_S3 path is the production default;
+# *_cpu helpers emit DeprecationWarning. Never set this for speed-critical work.
 AFM_CPU_FFT: int = _afm_int_env("SPAMMM_AFM_CPU_FFT", 0)
 AFM_NA_ORBITAL_LOOP: int = _afm_int_env("SPAMMM_AFM_NA_ORBITAL_LOOP", 0)
 # Round-2 fast Stage-3 path (fused ES + GPU pad/scale; default ON). Set =0 for legacy S3.
@@ -195,7 +198,7 @@ def afm_use_cpu_tasks() -> bool:
 
 
 def afm_use_cpu_fft() -> bool:
-    """True → NumPy FFT (SPAMMM_AFM_CPU_FFT=1). Default False = gpyFFT."""
+    """True → NumPy FFT (SPAMMM_AFM_CPU_FFT=1, DEPRECATED). Default False = gpyFFT."""
     return AFM_CPU_FFT > 0
 
 
@@ -1731,6 +1734,7 @@ class AFMulator(OpenCLBase):
             bucket_nbx=nbx, bucket_nby=nby, bucket_cell_size=cell_size, bucket_bounds=(x0, y0, x1, y1))
         self.cpm = params
         self._cpm_upload_id = None  # force re-upload on next GPU eval/scan
+        self._cpm_coeffs0 = None    # invalidate pme_set_field's pristine-mesh cache (was: stale mesh from previous fit)
         self.last_pme_times = dict(mesh_ms=mesh_ms, core_ms=(time.perf_counter() - _t_core) * 1e3,
                                    fit_ms=(time.perf_counter() - _t_fit0) * 1e3, na=na,
                                    mesh_shape=tuple(int(x) for x in mesh.coeffs.shape))
@@ -4009,6 +4013,13 @@ def compute_dissipation(FEs_fwd, FEs_bwd, h_scan, h_df, amp, osc_dir=(0., 0., 1.
     return E_diss
 
 
+def _deprecate_cpu_fft(fname):
+    import warnings
+    warnings.warn(f'{fname}: CPU NumPy FFT path is DEPRECATED (parity only) — use the fused GPU path '
+                  'stage3_fdbm_fields_fast (FAST_S3). Do NOT set SPAMMM_AFM_CPU_FFT=1 for speed-critical work.',
+                  DeprecationWarning, stacklevel=3)
+
+
 def fft_poisson_cpu(rho, step):
     """CPU NumPy FFT Poisson (parity / backup). V(r) from charge density rho(r).
 
@@ -4020,6 +4031,7 @@ def fft_poisson_cpu(rho, step):
         sx = sy = sz = float(step)
     else:
         sx, sy, sz = (float(x) for x in np.asarray(step, dtype=np.float64).ravel()[:3])
+    _deprecate_cpu_fft('fft_poisson_cpu')
     rho_k = np.fft.fftn(rho)
     kx = 2*np.pi * np.fft.fftfreq(nx, d=sx)
     ky = 2*np.pi * np.fft.fftfreq(ny, d=sy)
@@ -4815,7 +4827,8 @@ PAULI_FITTED_DEFAULTS = {
 }
 
 def compute_pauli_overlap_cpu(rho_grid, rho_tip_total, step, tip_rolled=False):
-    """CPU NumPy Pauli overlap (parity / backup)."""
+    """CPU NumPy Pauli overlap (parity / backup). DEPRECATED — fused GPU path is stage3_fdbm_fields_fast."""
+    _deprecate_cpu_fft('compute_pauli_overlap_cpu')
     dV = step**3
     overlap_raw = dV * np.real(np.fft.ifftn(np.fft.fftn(rho_grid) * np.conj(np.fft.fftn(rho_tip_total)))).astype(np.float32)
     return np.clip(overlap_raw, 1e-30, None)
@@ -4867,7 +4880,8 @@ def compute_pauli_field(rho_grid, rho_tip_total, step, A_pauli=1.0, beta_pauli=1
     return scale_pauli_field(overlap_raw, step, A_pauli, beta_pauli)
 
 def compute_es_conv_field_cpu(V_ES, rho_tip_delta, step, tip_rolled=False, return_grads=True):
-    """CPU NumPy ES convolution (parity / backup)."""
+    """CPU NumPy ES convolution (parity / backup). DEPRECATED — fused GPU path is stage3_fdbm_fields_fast."""
+    _deprecate_cpu_fft('compute_es_conv_field_cpu')
     dV = step**3
     nx_t, ny_t, nz_t = rho_tip_delta.shape
     flipped = rho_tip_delta[::-1, ::-1, ::-1]

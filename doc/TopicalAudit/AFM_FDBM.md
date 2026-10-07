@@ -58,7 +58,8 @@ Full report: [`doc/Tasks/PerfBenchmark_FDBM.md`](../Tasks/PerfBenchmark_FDBM.md)
 - **Pauli A,β SSOT:** `AFM.PAULI_FITTED_DEFAULTS['3ob-3-1']` = **A=124.84, β=1.4330** (evaluation). Old single-atom fits (509.28 / 1.0586) are obsolete.
 - **Height SSOT:** df window 3.7–4.7 Å, amp=1.0 → `afm_df_height_stacks` + `compute_df_amp`.
 - **Lateral/arbitrary AFM:** acquisition remains an `(x,y,z)` volume approached along z. For unit oscillation vector `n`, df is `-n·∇(F·n)`; finite amplitude samples along `n`. Only `amp*abs(n_z)` pads/aligns z, while x/y amplitude pads the lateral scan before cropping.
-- **Legacy restore only for debug:** `SPAMMM_AFM_FAST_S3=0` or `SPAMMM_AFM_CPU_FFT=1` — not product path.
+- **CPU/legacy FFT path DEPRECATED (2026-10-06):** `SPAMMM_AFM_CPU_FFT=1`, `--cpu-fft`, and the unfused `fft_poisson`/`compute_pauli_overlap`/`compute_es_conv_field` NumPy path emit `DeprecationWarning` — parity backup only. Several× slower (PTCDA 17.7→4.8 s) and multi-GB complex128 workspaces. Product path is `stage3_fdbm_fields_fast` (fused GPU FAST_S3) everywhere; `SPAMMM_AFM_FAST_S3=0` is debug-only. Never `os.environ.setdefault('SPAMMM_AFM_CPU_FFT','1')` at module level — that silent forcing caused a 4× speed/memory regression.
+- **Residual waste (design doc):** densities still bounce GPU→CPU→GPU (projector context ≠ AFMulator context), two-basis calls share no SCF/projector state, tip+FFT plans rebuilt per molecule shape. Design + API sketch: [`doc/Tasks/FDBM_EndToEnd_GPU_Pipeline.md`](../Tasks/FDBM_EndToEnd_GPU_Pipeline.md). `get_density_from_dftb_dense` gained `dm_in`/`need_es`/`need_ves` (2026-10-07) — dual-basis caller now does ONE SCF + skips unused V_ES/ρ_na.
 
 ## Open Issues
 
