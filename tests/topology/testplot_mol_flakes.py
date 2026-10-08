@@ -458,11 +458,12 @@ def build_random_pah(n_rings, seed=None, n_pent=0, n_sw=0, base_R=None):
     assert len(rings) == n_rings and patch_connected(rings)
     mb = _mb_from_skel(parse_ascii_art(_patch_to_art(patch_atoms(rings))))
     ids = []
-    for kind in ['pent'] * n_pent + ['sw'] * n_sw:           # small flakes may lack qualifying sites; fall back to the other op
-        if kind == 'pent':
-            r = pentagon_by_cut(mb, rng) or stone_wales(mb, rng)
-        else:
-            r = stone_wales(mb, rng) or pentagon_by_cut(mb, rng)
+    # Bond flips (Stone-Wales) produce heptagons — generally discouraged.
+    # Pentagons are made ONLY by cutting an atom from a hexagon
+    # (pentagon_by_cut); never via bond flips. 'sw' kept only for explicit
+    # legacy requests; do not use it as a fallback for 'pent'.
+    for kind in ['pent'] * n_pent + ['sw'] * n_sw:
+        r = pentagon_by_cut(mb, rng) if kind == 'pent' else stone_wales(mb, rng)
         if r:
             ids += r
     mb.adjust_h()

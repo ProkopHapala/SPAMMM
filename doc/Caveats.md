@@ -784,3 +784,116 @@ RTX 3090 (same kernel, same inputs):
 - Remaining per-raster cost is CPU `shared_postprocess`
   (`compute_df_amp_dir` per-pixel FFT, ~0.1 s) — candidate for a GPU
   df kernel, shared by all contact backends.
+
+---
+
+## 21. Zero-core B-spline mesh on a sharp field — atom-dot artifacts in relaxed df
+
+**Found 2026-10-07** debugging `cpm_from_field` output (invPPAFM
+`debug/analyze_pme_atom_dip.py`, exp_set1_9): relaxed PME scans show a small
+**dark dot centred on every atom** that is absent from the FDBM scan. This
+poisons synthetic training data — it looks like an atom-position signal that
+does not exist in experiment.
+
+**Root cause** (verified by elimination): when `core_fit=None` the dense
+tricubic mesh alone must represent the repulsive wall. It slightly softens
+the sharp wall peak on the atom axis → the PP relaxes marginally deeper →
+dark dot in df at ~0.03 amplitude. It is NOT the core (coefficients are all
+zero), NOT the eval kernel (GPU vs Python `eval_contact_pme` agree to
+~1e-9), and present already in rigid (unrelaxed) Fz/df maps.
+
+**Measured h_mesh response** (FDBM source field at 0.1 Å step):
+- `h_mesh=0.4 Å` → **spline ringing**: the interpolating B-spline
+  overshoots/oscillates across the narrow (~1.5 Å FWHM) atom peaks —
+  every mesh node becomes a local extremum → moiré/checkerboard at mesh
+  frequency in relaxed df, NCC 0.73–0.91. Unusable. (Residual curves:
+  ±0.17 overshoot + flank lobes at wall z≈2.5, ±0.005 ringing persisting
+  to the PP plane z≈3.9.)
+- `h_mesh=0.3 Å` → error becomes **smooth undershoot** (no oscillation);
+  NCC ≥0.98, faint residual dots.
+- `h_mesh≈0.2 Å` → dots visually gone, NCC ≥0.989. Recommended for
+  zero-core fits of sharp FDBM-like fields.
+- **The real fix would be the PAW split** (cores carry the wall, coarse
+  mesh the residual — PME's reason to exist): `fit_cores_paw_field` exists
+  and is the default in `testplot_fdbm_fields_compress.py`, but measured
+  2026-10-08 it FAILS df parity (azaindol df_corr 0.11–0.83; rigid-df
+  superlattice ringing). **VERDICT 2026-10-08: BROKEN for FDBM at all
+  mesh sizes — shelved.** The PAW path was only ever validated on the
+  analytic Morse oracle (a literal sum of radial per-atom potentials);
+  on FDBM it never passed. Even after the bookkeeping fixes below, the
+  5-mode radial basis cannot hold the wall → coarse mesh still rings.
+  Production = `pme_dataset.py --scan fdbm` (raw field image). **DECOMPOSED same day** (invPPAFM
+  analyze_pme_atom_dip.py PME_CORE=1, `E_hat−E = [mesh−R] + [cφ−v_S] −
+  (1−S)(E−v_S)`): in the probed region the error is almost entirely
+  **B = c·φ − v_S** — runtime adds the 5-mode compact basis while the
+  mesh fit subtracted the Jacobi spline profile; ±0.2 eV oscillation =
+  the whole lateral signal. The mesh itself fits its (wrong) target to
+  ~0.03 eV — bookkeeping, not spline resolution, is the bug. Fixes:
+  subtract `eval_core` (runtime object) not `v_S`; joint core LSQ
+  (`fit_cores_from_samples`); taper only unreachable deep region.
+  Zero-core dense mesh is the interim, not the design.
+- The 0.3→0.4 transition is a ringing-regime boundary, NOT a Nyquist
+  rate limit — the peak is resolvable by all three meshes; what changes
+  is whether the spline oscillates or smoothly under-fits it.
+- Source-field step matters more than mesh h: 0.15→0.1 Å cut errors ~3×.
+
+**Alignment is a red herring — do NOT snap mesh_origin to the field
+lattice.** Controlled origin-shift test (h=0.2–0.45, shifts 0 vs 0.5·step)
+shows half-step offsets are marginally BETTER than coincident nodes
+(trilinear sampling of the source field pre-smooths the wall and tames
+B-spline ringing). The earlier "h_mesh should be an integer multiple of
+field_step" hypothesis is refuted.
+
+**Still unexplained**: Fz is under-represented deep inside the repulsive
+core (z≲2.5 Å over atoms, 50–400 eV/Å depending on h) at ALL mesh
+spacings — unreachable by the PP, cosmetic only, but flag if a future
+workflow probes there.
+
+---
+
+## 22. contact_pme PAW split needs a pairwise per-atom v_i(r) — FDBM fields are not pairwise
+
+**Stated 2026-10-07** (USER): the entire Morse-side split machinery —
+`SplitParams`, `soft_core_split`, `combined_atom_potential`,
+`precompute_split_cache`, GPU `cs_fit_core_paw` — exists only because the
+Morse+Q field **is** a sum of analytic per-atom radial potentials
+`v_i(r) = E0_i[e^{2K(r−R0_i)} − 2e^{K(r−R0_i)}] + coul`. Everything clean
+about the split follows from that identity: the even-poly `v_L` C²-matched
+to the true `v` at `r_b`, `v_S ≡ 0` beyond `r_b`, `r_b` = PIC cell = pure
+locality knob.
+
+An FDBM field is a **sampled many-body field** `E(x)` (DFTB/LCAO Pauli +
+electrostatics rasterized on a grid): there is no per-atom `v_i(r)`, and in
+bond-overlap regions the field is genuinely non-radial. The production
+split **cannot run verbatim** — every FDBM-PME path must first manufacture
+a per-atom decomposition, and *how* is the whole problem:
+
+1. **Parametric Morse refit** — `PMESplit.fit_morse_atom_params`: fit
+   per-atom `(E0_i, R0_i)` of `Σ_i E0_i·M(r_i; R0_i, α)` to the samples
+   (linear LSQ in E0 + affine trend columns for the smooth background +
+   alternating golden search on R0_i), then run the production split
+   verbatim. Assumes the wall is Morse-shaped AND atom-radial — both are
+   approximations, not identities.
+2. **Field oracle** — `PICCore.fit_cores_paw_field`: damped-Jacobi
+   extraction of per-atom radial profiles `v_i(r)` (median profile over
+   samples where atom i is nearest, inside the probe cone), then the usual
+   `v_S,i = v_i − P_i`. Radialization is an approximation — the un-sampled
+   deep region and bond-overlap anisotropy have no radial representative.
+   See §21 for the measured df-parity failure this produced (bookkeeping
+   bug `c·φ vs v_S` fixed via `consistent_split`; residual limiter is the
+   5-mode core basis).
+3. **Energy-space clamp split** (no per-atom potential at all) —
+   `E_soft = soft_clamp_rational(E; y1≈E_min, y2≈−2·E_min)` → mesh;
+   `E_hard = E − E_soft` is compact around atoms → joint radial-core LSQ
+   `PICCore.fit_cores_from_samples`. Splits the field *value* directly, so
+   pairwise structure is never needed. Under test in
+   `tests/SPM/testplot_fdbm_pme_debug.py` (`--e-cap auto --y2 auto`),
+   2026-10-07 — unverified.
+
+**Corollary for the Rcut sweep** (Report
+`ContactPME_Split_Rcut_Locality_2026-10-04`): "residual dead by r≈4 Å,
+`r_b` is a pure locality knob" was measured on the pairwise Morse field
+where `v_L` is C²-matched to the true potential at `r_b`. For a field-space
+split there is no analytic join point — the compact-core radius is still
+the locality knob (PIC cell size follows the core support), but its
+smallest-safe value must be re-measured per field representation.

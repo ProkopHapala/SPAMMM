@@ -86,6 +86,10 @@ def _add_common_afm_args(p: argparse.ArgumentParser) -> None:
     b.add_argument('--basis',      default='3ob-3-1',    choices=['3ob-3-1', 'mio-1-1'])
     b.add_argument('--projection', default='prolonged', choices=['stock', 'prolonged', 'both'],
                    help='Pauli ρ basis (GUI/BR-STM SSOT = prolonged; ES always stock Δρ)')
+    b.add_argument('--pipeline', default='gpu', choices=['legacy', 'gpu'],
+                   help='FDBM orchestration: gpu (default — device-resident FDBMPipeline: one ctx, '
+                        'no host round-trips, one SCF) or legacy (deprecated; host densities, kept '
+                        'for debugging/back-compat only)')
     b.add_argument('--tip-mode',   default='co',         choices=['co', 'gaussian'])
 
     grid = p.add_argument_group('grid')
@@ -568,35 +572,55 @@ def cmd_afm(args: argparse.Namespace) -> int:
             osc_dir=osc_dir, base_pos=base_pos,
         )
 
-    V_ES_stock = None
-    rho_diff_stock = None
-    need_stock_es = args.projection in ('stock', 'both', 'prolonged') or not args.cube
-    if need_stock_es and (args.projection in ('stock', 'both', 'prolonged')):
-        work = os.path.join(args.outdir, 'dftb_work_stock')
-        print('DFTB stock density...')
-        res = afm_utils.get_density_from_dftb_dense(
-            atomPos, atomTypes, basis_hsd, work, grid_spec=grid_spec, step=step, verbosity=0)
-        V_ES_stock = res['V_ES']
-        rho_diff_stock = res['rho_diff']
-        if args.projection in ('stock', 'both'):
-            variants['stock'] = _pp('stock', res['rho_scf'], rho_diff_stock, V_ES_stock)
+    if getattr(args, 'pipeline', 'legacy') == 'gpu':
+        # Device-resident path (doc/Tasks/FDBM_EndToEnd_GPU_Pipeline.md): one ctx, one SCF,
+        # ρ stays on the GPU (project (dm−dm_na) straight into FFT scratch). Legacy stays
+        # available for parity/debug via --pipeline legacy.
+        from spammm.SPM.FDBMPipeline import FDBMPipeline
+        print('pipeline=gpu → FDBMPipeline (device-resident; --pipeline legacy = old orchestration)')
+        _pipe = FDBMPipeline(verbosity=0)
+        variants.update(_pipe.run(
+            atomPos, atomTypes, basis_hsd, os.path.join(args.outdir, 'dftb_work'),
+            grid_spec, origin, step, ngrid, A_pauli, beta_pauli, args.tip_mode, args.outdir,
+            projection=args.projection, basis=args.basis, margin=args.margin,
+            h_min=args.h_min, h_max=args.h_max, h_step=args.h_step,
+            amp=args.amp, amp_align=not getattr(args, 'no_amp_align', False),
+            K_LAT_Nm=args.K_LAT, K_RAD=args.K_RAD, bond_length=args.bond_length,
+            scan_margin=args.scan_margin, plots=plot_diag,
+            df_cmap=args.df_cmap, cmap=args.cmap, stage_height=args.height,
+            osc_dir=osc_dir, base_pos=base_pos))
+    else:
+        print('pipeline=legacy → DEPRECATED staged host-density path (debug/back-compat only; '
+              'default is --pipeline gpu = device-resident FDBMPipeline)')
+        V_ES_stock = None
+        rho_diff_stock = None
+        need_stock_es = args.projection in ('stock', 'both', 'prolonged') or not args.cube
+        if need_stock_es and (args.projection in ('stock', 'both', 'prolonged')):
+            work = os.path.join(args.outdir, 'dftb_work_stock')
+            print('DFTB stock density...')
+            res = afm_utils.get_density_from_dftb_dense(
+                atomPos, atomTypes, basis_hsd, work, grid_spec=grid_spec, step=step, verbosity=0)
+            V_ES_stock = res['V_ES']
+            rho_diff_stock = res['rho_diff']
+            if args.projection in ('stock', 'both'):
+                variants['stock'] = _pp('stock', res['rho_scf'], rho_diff_stock, V_ES_stock)
 
-    if args.projection in ('prolonged', 'both'):
-        basis_data = parse_wfc_hsd(basis_hsd)
-        basis_ang = convert_wfc_to_species_list_ang(basis_data, resolution_bohr=0.04)
-        prol = make_slater_tail_species_list(basis_ang)
-        work = os.path.join(args.outdir, 'dftb_work_prolonged')
-        print('DFTB prolonged (Pauli ρ; ES=stock Δρ)...')
-        if rho_diff_stock is None:
-            res0 = afm_utils.get_density_from_dftb_dense(
-                atomPos, atomTypes, basis_hsd, os.path.join(args.outdir, 'dftb_work_stock'),
-                grid_spec=grid_spec, step=step, verbosity=0)
-            V_ES_stock = res0['V_ES']
-            rho_diff_stock = res0['rho_diff']
-        res_p = afm_utils.get_density_from_dftb_dense(
-            atomPos, atomTypes, basis_hsd, work, grid_spec=grid_spec, step=step,
-            verbosity=0, projection_basis_ang=prol)
-        variants['prolonged'] = _pp('prolonged', res_p['rho_scf'], rho_diff_stock, V_ES_stock)
+        if args.projection in ('prolonged', 'both'):
+            basis_data = parse_wfc_hsd(basis_hsd)
+            basis_ang = convert_wfc_to_species_list_ang(basis_data, resolution_bohr=0.04)
+            prol = make_slater_tail_species_list(basis_ang)
+            work = os.path.join(args.outdir, 'dftb_work_prolonged')
+            print('DFTB prolonged (Pauli ρ; ES=stock Δρ)...')
+            if rho_diff_stock is None:
+                res0 = afm_utils.get_density_from_dftb_dense(
+                    atomPos, atomTypes, basis_hsd, os.path.join(args.outdir, 'dftb_work_stock'),
+                    grid_spec=grid_spec, step=step, verbosity=0)
+                V_ES_stock = res0['V_ES']
+                rho_diff_stock = res0['rho_diff']
+            res_p = afm_utils.get_density_from_dftb_dense(
+                atomPos, atomTypes, basis_hsd, work, grid_spec=grid_spec, step=step,
+                verbosity=0, projection_basis_ang=prol)
+            variants['prolonged'] = _pp('prolonged', res_p['rho_scf'], rho_diff_stock, V_ES_stock)
 
     if d_cube is not None:
         prep = afm_utils.allelectron_cube_to_fdbm_grid(

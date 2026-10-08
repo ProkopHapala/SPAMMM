@@ -70,7 +70,9 @@ class GridProjector(OpenCLBase):
     Host class for projecting sparse density matrices to a real-space grid using OpenCL.
     """
     def __init__(self, fdata_dir, ctx=None, queue=None, nloc=32, debug_early_exit=False, debug_clear_only=False, debug_return0=False, debug_read_task=False, debug_read_grid=False, verbosity=0):
-        super().__init__(nloc=nloc)
+        if ctx is not None and queue is None:
+            queue = cl.CommandQueue(ctx)
+        super().__init__(nloc=nloc, ctx=ctx, queue=queue)  # forward shared ctx → no throwaway context
         self.fdata_dir = fdata_dir
         self.debug_early_exit = bool(debug_early_exit)
         self.debug_clear_only = bool(debug_clear_only)
@@ -423,6 +425,59 @@ class GridProjector(OpenCLBase):
         task_atoms_np = task_atoms_np[idx]
         
         return tasks_np, task_atoms_np
+
+    def build_tasks_dev(self, atoms, grid_spec, block_res=8, nMaxAtom=64):
+        """Device-resident variant of build_tasks_gpu: same kernels, but the compacted
+        task list STAYS on the GPU — returns (tasks_buff, task_atoms_buff, n_tasks)
+        for direct use as project_density_dense kernel args (tasks_dev=...).
+        Skips the tasks_np/task_atoms_np download→re-upload round-trip and the host
+        argsort (load-balance nicety only). Host still downloads the small
+        block_counts array for n_tasks + the nMaxAtom safety check."""
+        nx, ny, nz = grid_spec['ngrid'][:3]
+        n_blocks_xyz = np.array([nx // block_res, ny // block_res, nz // block_res], dtype=np.int32)
+        n_blocks_total = int(np.prod(n_blocks_xyz))
+        natoms = len(atoms['pos'])
+        atom_data = np.zeros(natoms, dtype=[
+            ('pos_rcut', 'f4', 4), ('type', 'i4'), ('i0orb', 'i4'), ('norb', 'i4'), ('pad', 'i4')])
+        atom_data['pos_rcut'][:, :3] = np.asarray(atoms['pos'][:natoms], dtype=np.float32)
+        atom_data['pos_rcut'][:,  3] = np.asarray(atoms['Rcut'][:natoms], dtype=np.float32)
+        atom_data['type'] = np.asarray(atoms['type'][:natoms], dtype=np.int32)
+        atom_data['norb'] = 4
+        self.realloc_task_buffers(natoms, n_blocks_total, nMaxAtom)
+        self.toGPU_(self.gtask_grid_buff,  self.grid_to_np(grid_spec))
+        self.toGPU_(self.gtask_atoms_buff, atom_data)
+        cl.enqueue_fill_buffer(self.queue, self.gtask_block_counts_buff, np.int32(0), 0, n_blocks_total * 4)
+        self._krn_count_atoms_per_block(
+            self.queue, (natoms,), None,
+            self.gtask_grid_buff, np.int32(natoms), self.gtask_atoms_buff, np.int32(block_res),
+            np.int32(n_blocks_xyz[0]), np.int32(n_blocks_xyz[1]), np.int32(n_blocks_xyz[2]),
+            self.gtask_block_counts_buff)
+        cl.enqueue_fill_buffer(self.queue, self.gtask_task_atoms_raw_buff, np.int32(-1), 0, n_blocks_total * nMaxAtom * 4)
+        cl.enqueue_fill_buffer(self.queue, self.gtask_block_fill_buff, np.int32(0), 0, n_blocks_total * 4)
+        self._krn_fill_task_atoms(
+            self.queue, (natoms,), None,
+            self.gtask_grid_buff, np.int32(natoms), self.gtask_atoms_buff, np.int32(block_res),
+            np.int32(n_blocks_xyz[0]), np.int32(n_blocks_xyz[1]), np.int32(n_blocks_xyz[2]),
+            self.gtask_block_fill_buff, self.gtask_task_atoms_raw_buff, np.int32(nMaxAtom))
+        # Small blocking D2H (needed on host: n_tasks count + nMaxAtom overflow check)
+        h_block_counts = np.empty(n_blocks_total, dtype=np.int32)
+        cl.enqueue_copy(self.queue, h_block_counts, self.gtask_block_counts_buff)
+        self.last_block_atom_counts = h_block_counts
+        n_tasks   = int(np.sum(h_block_counts > 0))
+        max_count = int(h_block_counts.max()) if n_blocks_total > 0 else 0
+        if max_count > nMaxAtom:
+            raise RuntimeError(f"GPU build_tasks: block has {max_count} atoms > nMaxAtom={nMaxAtom}")
+        if n_tasks > 0:
+            h_task_offsets = np.zeros(n_blocks_total, dtype=np.int32)
+            h_task_offsets[h_block_counts > 0] = np.arange(n_tasks, dtype=np.int32)
+            self.toGPU_(self.gtask_task_offsets_buff, h_task_offsets)
+            self._krn_compact_tasks(
+                self.queue, (int(n_blocks_xyz[0]), int(n_blocks_xyz[1]), int(n_blocks_xyz[2])), None,
+                np.int32(n_blocks_xyz[0]), np.int32(n_blocks_xyz[1]), np.int32(n_blocks_xyz[2]),
+                self.gtask_block_counts_buff, self.gtask_task_offsets_buff, self.gtask_task_atoms_raw_buff,
+                self.gtask_tasks_out_buff, self.gtask_task_atoms_out_buff, np.int32(nMaxAtom))
+        # NOTE: no host argsort by 'na' — ordering only affects work-group load balance, not results.
+        return self.gtask_tasks_out_buff, self.gtask_task_atoms_out_buff, n_tasks
 
     def build_tasks_selected(self, atoms, grid_spec, block_res=8, nMaxAtom=64):
         """Dispatch to GPU or CPU task builder. Controlled by SPAMMM_AFM_CPU_TASKS (default GPU).
@@ -1369,7 +1424,7 @@ class GridProjector(OpenCLBase):
         self.queue.finish()
         return res
 
-    def project_density_dense(self, dm_dense, norb_per_atom, orb_offsets, atoms_dict, grid_spec, nMaxAtom=64, bAlloc=True):
+    def project_density_dense(self, dm_dense, norb_per_atom, orb_offsets, atoms_dict, grid_spec, nMaxAtom=64, bAlloc=True, out_cl=None, tasks_dev=None):
         """Project dense density matrix onto a 3D grid.
         
         Args:
@@ -1380,15 +1435,25 @@ class GridProjector(OpenCLBase):
             grid_spec: dict with 'origin', 'dA', 'dB', 'dC', 'ngrid'
             nMaxAtom: max atoms per task
             bAlloc: if True (default), reallocate GPU buffers if sizes changed
+            out_cl: optional cl.Buffer (nxyz float32, same (nx,ny,nz) C-order layout as the
+                host return). When given, the kernel writes there, the B3_FACTOR is folded
+                into the uploaded DM (projection is linear in dm), the buffer is returned
+                and NO host download happens — device-resident density path.
         
         Returns:
-            rho: (nx, ny, nz) float32 density
+            rho: (nx, ny, nz) float32 density in e/Å³ — host ndarray, or `out_cl` itself.
         """
         import time
-        
-        tasks_np, task_atoms_np = self.build_tasks_selected(atoms_dict, grid_spec, nMaxAtom=nMaxAtom, block_res=8)
-        if self.verbosity > 0: print(f"[DEBUG] project_density_dense: n_tasks={len(tasks_np)}")
-        
+
+        if tasks_dev is None:
+            tasks_np, task_atoms_np = self.build_tasks_selected(atoms_dict, grid_spec, nMaxAtom=nMaxAtom, block_res=8)
+            if self.verbosity > 0: print(f"[DEBUG] project_density_dense: n_tasks={len(tasks_np)}")
+            n_tasks = len(tasks_np)
+        else:
+            tasks_buff, task_atoms_buff, n_tasks = tasks_dev
+            tasks_np = task_atoms_np = None
+            if self.verbosity > 0: print(f"[DEBUG] project_density_dense: n_tasks={n_tasks} (device-resident tasks)")
+
         natoms = len(atoms_dict['pos'])
         norb_total = int(orb_offsets[-1])
         dm_dense = np.asarray(dm_dense, dtype=np.float32)
@@ -1396,23 +1461,28 @@ class GridProjector(OpenCLBase):
             dm_dense = dm_dense.ravel()
         if dm_dense.shape[0] != norb_total * norb_total:
             raise ValueError(f"dm_dense shape {dm_dense.shape} != {norb_total*norb_total}")
-        
+
         atom_data = self._build_atom_data_dense(atoms_dict, norb_per_atom, orb_offsets)
         nx, ny, nz = grid_spec['ngrid'][:3]
-        n_tasks = len(tasks_np)
 
         if bAlloc:
             self.realloc_dense_projection_buffers(natoms, n_tasks, nMaxAtom, int(nx), int(ny), int(nz), norb_total)
 
         self.toGPU_(self.dproj_grid_buff,  self.grid_to_np(grid_spec))
         self.toGPU_(self.dproj_atoms_buff, atom_data)
-        if n_tasks > 0:
-            self.toGPU_(self.dproj_tasks_buff,      tasks_np)
-            self.toGPU_(self.dproj_task_atoms_buff, task_atoms_np)
+        if tasks_dev is None:
+            tasks_buff, task_atoms_buff = self.dproj_tasks_buff, self.dproj_task_atoms_buff
+            if n_tasks > 0:
+                self.toGPU_(self.dproj_tasks_buff,      tasks_np)
+                self.toGPU_(self.dproj_task_atoms_buff, task_atoms_np)
+        # Device-output path: fold Bohr→Å⁻³ into the uploaded DM (linear in dm) — no host multiply/download.
+        if out_cl is not None:
+            dm_dense = dm_dense * np.float32(1.0 / (0.5291772109 ** 3))
         self.toGPU_(self.dproj_dm_buff, dm_dense)
 
+        out_buff = self.dproj_out_buff if out_cl is None else out_cl
         out_nbytes = int(nx) * int(ny) * int(nz) * 4
-        cl.enqueue_fill_buffer(self.queue, self.dproj_out_buff, np.float32(0), 0, out_nbytes)
+        cl.enqueue_fill_buffer(self.queue, out_buff, np.float32(0), 0, out_nbytes)
         
         
         ls = (32,)
@@ -1422,18 +1492,20 @@ class GridProjector(OpenCLBase):
         self._krn_project_density_dense(
             self.queue, gs, ls,
             self.dproj_grid_buff, np.int32(n_tasks),
-            self.dproj_tasks_buff, self.dproj_atoms_buff, self.dproj_task_atoms_buff,
+            tasks_buff, self.dproj_atoms_buff, task_atoms_buff,
             self.dproj_dm_buff, np.int32(norb_total),
             self.d_basis,
             np.int32(self.basis_meta['n_nodes']),
             np.float32(self.basis_meta['dr']),
             np.int32(self.basis_meta['max_shells']),
             np.int32(nMaxAtom),
-            self.dproj_out_buff
+            out_buff
         )
         self.queue.finish()
         T1 = time.perf_counter_ns()
         if self.verbosity > 0: print(f"[TIME] project_density_dense {(T1-T0)*1e-6:.3f} [ms]")
+        if out_cl is not None:
+            return out_cl
         
         res = np.empty((int(nx), int(ny), int(nz)), dtype=np.float32)
         cl.enqueue_copy(self.queue, res, self.dproj_out_buff)
@@ -2355,7 +2427,7 @@ def _project_neutral_density_orbital_loop(geo, projector, atoms_dict, grid_spec,
 
 
 def project_neutral_density(geo, projector, atoms_dict, grid_spec, basis, B3_FACTOR=B3_FACTOR,
-                            norb_per_atom=None, orb_offsets=None):
+                            norb_per_atom=None, orb_offsets=None, out_cl=None):
     """
     Project superposition of neutral atom densities onto a real-space grid.
     Uses reference valence occupations per (l, Z).
@@ -2363,7 +2435,7 @@ def project_neutral_density(geo, projector, atoms_dict, grid_spec, basis, B3_FAC
     Default: one project_density_dense with diagonal NA DM (same physics as AO loop).
     SPAMMM_AFM_NA_ORBITAL_LOOP=1 → legacy per-AO loop (parity / backup).
 
-    Returns rho_na_grid (nx,ny,nz) float32 in e/Å³.
+    Returns rho_na_grid (nx,ny,nz) float32 in e/Å³ (or out_cl when given — device-resident).
     """
     import time
     from spammm.SPM.AFM import AFM_NA_ORBITAL_LOOP
@@ -2374,6 +2446,6 @@ def project_neutral_density(geo, projector, atoms_dict, grid_spec, basis, B3_FAC
     dm, norb_per_atom, orb_offsets = build_na_dm_diagonal(
         geo, basis, atoms_dict, norb_per_atom=norb_per_atom, orb_offsets=orb_offsets)
     # project_density_dense already applies B3_FACTOR
-    rho_na = projector.project_density_dense(dm, norb_per_atom, orb_offsets, atoms_dict, grid_spec)
+    rho_na = projector.project_density_dense(dm, norb_per_atom, orb_offsets, atoms_dict, grid_spec, out_cl=out_cl)
     print(f"[project_neutral_density] dense_dm {time.time()-t0:.2f}s  norb={int(orb_offsets[-1])}")
-    return rho_na.astype(np.float32)
+    return rho_na if out_cl is not None else rho_na.astype(np.float32)

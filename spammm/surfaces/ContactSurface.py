@@ -621,7 +621,11 @@ class ContactSurfaceCL(OpenCLBase):
         return np.sqrt(rsnew / max(nc, 1))
 
     def fit_separable_cg(self, sep: SeparableParams, xyz, E_ref, F_ref=None, apos=None, n_iter=80, tol=1e-5, sample_weights=None, force_weight=0.0, force_equalize=True, bPrint=False):
-        """Global GPU CG fit. Optional WLS plus Fx,Fy,Fz rows; force_weight=1 equalizes RMS(E) vs RMS(Fα)."""
+        """Global GPU CG fit. Optional WLS plus Fx,Fy,Fz rows; force_weight=1 equalizes RMS(E) vs RMS(Fα).
+
+        DEPRECATED for batch compression — iterative CG (~2 min/mol). Prefer the
+        direct cpm_params_from_samples() dense-mesh prefilter (~0.05 s/mol).
+        """
         self.setup_separable(sep, apos=apos)
         self.upload_samples(xyz, E_ref, F_ref=F_ref if force_weight > 0.0 else None, sample_weights=sample_weights)
         wE, wF = self._loss_row_weights(E_ref, F_ref, force_weight, force_equalize=force_equalize)
@@ -1162,4 +1166,89 @@ class ContactPMEParams:
     @property
     def mesh_shape(self) -> tuple:
         return tuple(self.mesh_coeffs.shape)
+
+
+def cpm_params_from_samples(samples, mesh_origin, mesh_h, halo, apos, cLJs,
+                            split_mode='paw', r_cut=6.0, core_fit=None, split_params=None):
+    """Assemble ContactPMEParams for an ARBITRARY sampled energy field.
+
+    Fast PME compression of a grid field (e.g. FDBM E_total): the dense tricubic
+    B-spline mesh IS the representation — prefiltered control coefficients from
+    CoarseMesh._prefilter_3d (separable tridiagonal solves, O(n), no CG).
+
+    Two modes:
+      - `core_fit=None` (default): zero core — the whole field sits on the mesh;
+        mesh_h must resolve the repulsive wall itself. Measured (FDBM field,
+        0.1 Å source grid, 2026-10-07): h_mesh=0.4 Å → interpolating
+        B-spline ringing on the ~1.5 Å atom peaks → moiré/checkerboard in
+        relaxed df (NCC ~0.73–0.91); h_mesh=0.3 → smooth-undershoot regime,
+        NCC ≥0.98, faint atom-localized dots; h_mesh≈0.2 Å removes them
+        (NCC ≥0.989). The dots are a smoothed-wall artifact amplified by
+        PP relaxation — NOT the (absent) core, NOT the eval kernel. Also
+        measured: mesh/field grid ALIGNMENT is irrelevant — sampling nodes
+        offset by half a field step is marginally BETTER than coincident
+        nodes (trilinear pre-smoothing tames spline ringing); do not bother
+        snapping mesh_origin to the field lattice.
+      - `core_fit=None` deep-wall note: Fz is under-represented inside the
+        repulsive core (z≲2.5 Å over atoms, ~50–150 eV/Å) at ALL mesh
+        spacings — unreachable by the PP, cosmetic only.
+      - `core_fit=CoreFit` (real PAW — the intended design): `samples` must
+        be the SMOOTH RESIDUAL (E − core evaluated at nodes); the mesh can
+        then be very coarse (0.35–1.0 Å) — cores carry the sharp short-range
+        structure. Fit cores with PICCore.fit_cores_paw_field /
+        fit_cores_from_samples against oracle samples. CAVEAT 2026-10-08:
+        on FDBM fields this path currently FAILS df parity (azaindol
+        df_corr 0.11–0.83; taper-shell ringing) — fix before relying on it;
+        zero-core h≤0.2 is the measured-accurate interim.
+
+    Args:
+        samples: (nx, ny, nz) E-field (or residual) values at the mesh nodes.
+        mesh_origin: (3,) world coords of node (0,0,0) — query_bounds lo - halo*h.
+        mesh_h: mesh spacing [Å].
+        halo: halo node count per side (>= ~4 for the tricubic stencil interior).
+        apos: (na, 3) atom positions (heavy atoms only, production convention).
+        cLJs: (na, 4) Morse params (R0, E0, alpha, 0) — feeds SplitParams unless
+              `split_params` is given.
+        core_fit: optional CoreFit from PICCore.fit_cores_from_samples — r_lo/r_b
+              must match `split_params`/kernel ABI (span = Δ_in+Δ_b).
+        split_params: optional SplitParams override (needed when core_fit given —
+              its r_lo/r_b drive both the core eval and the bucket cell size).
+    Returns:
+        ContactPMEParams (mesh + CoreFit + 'paw' SplitParams + PIC buckets).
+    """
+    from spammm.surfaces.CoarseMesh import _prefilter_3d
+    from spammm.surfaces.PICCore import CoreFit, CORE_POWERS
+    from spammm.surfaces.PMESplit import SplitParams
+    samples = np.asarray(samples, np.float64)
+    ns = np.asarray(samples.shape, np.int64)
+    coeffs = _prefilter_3d(samples).astype(np.float32)
+    na = len(apos)
+    cMs = np.asarray(cLJs, np.float64)
+    sp = split_params if split_params is not None else SplitParams(
+                     R0=cMs[:, 0], E0=cMs[:, 1], q=np.zeros(na), alpha=float(abs(cMs[0, 2])),
+                     q_tip=0.0, r_damp=0.1, r_cut=r_cut, split_mode=split_mode)
+    if core_fit is None:
+        z_ = np.zeros(na, np.float64)
+        core = CoreFit(coeffs=np.zeros((na, len(CORE_POWERS))), r_lo=np.full(na, 2.0),
+                       r_b=np.full(na, 4.0), powers=np.asarray(CORE_POWERS, np.int64), basis='raw',
+                       cond_raw=z_, cond_hier=z_, train_rmse_E=z_, train_rmse_F=z_,
+                       held_rmse_E=z_, held_rmse_F=z_, held_max_E=z_, held_max_F=z_, worst_r=z_)
+    else:
+        core = core_fit
+        assert core.coeffs.shape[0] == na, f'core_fit na={core.coeffs.shape[0]} vs {na}'
+        sp_span = float(sp.delta_in + sp.delta_b)
+        assert np.allclose(np.asarray(core.r_b) - np.asarray(core.r_lo), sp_span), \
+            f'core span {core.r_b - core.r_lo} vs split_params Δ_in+Δ_b={sp_span} (kernel ABI)'
+    cs = float(sp.r_core_max)
+    x0 = float(apos[:, 0].min()) - cs; x1 = float(apos[:, 0].max()) + cs
+    y0 = float(apos[:, 1].min()) - cs; y1 = float(apos[:, 1].max()) + cs
+    batoms, boffs, nbx, nby = build_pic_buckets(np.asarray(apos, np.float64), x0, y0, x1, y1, cs)
+    interior = (np.array([halo] * 3, np.int64),
+                np.array([ns[0] - 1 - halo, ns[1] - 1 - halo, ns[2] - 1 - halo], np.int64))
+    return ContactPMEParams(mesh_coeffs=coeffs, mesh_origin=np.asarray(mesh_origin, np.float64),
+                            mesh_h=float(mesh_h), mesh_halo=int(halo),
+                            query_interior=interior, core_fit=core, split_params=sp,
+                            atom_pos=np.asarray(apos, np.float64), bucket_atoms=batoms,
+                            bucket_offsets=boffs, bucket_nbx=nbx, bucket_nby=nby,
+                            bucket_cell_size=cs, bucket_bounds=(x0, y0, x1, y1))
 

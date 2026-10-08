@@ -260,7 +260,8 @@ class ModularAFMPipeline:
                 'species_per_atom': species_per_atom,
                 'species_names': self.enames
             }
-            self.projector, self.atoms_dict = dg.setup_gridprojector_from_dftb(dftb_data, basis_ang, verbosity=0, max_shells=max_shells)
+            afmulator = self._get_afmulator()  # share ONE OpenCL ctx/queue: projector + afmulator + FDBM FFT
+            self.projector, self.atoms_dict = dg.setup_gridprojector_from_dftb(dftb_data, basis_ang, ctx=afmulator.ctx, queue=afmulator.queue, verbosity=0, max_shells=max_shells)
             debug_print(1, f"[ModularPipeline] DFTB backend initialized with {len(self.enames)} atoms")
         else:
             print(f"[ModularPipeline] WARNING: Basis file not found: {basis_hsd_path}")

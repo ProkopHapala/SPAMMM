@@ -172,3 +172,19 @@ this tile size is far under that. The cost of Rcut is the inner-loop length
   per-atom coefficients MUST be kept (no type dedup).
 - Δ_b default still 2.0 — changing the default pending user decision
   (0.6 for locality vs 1.2 for accuracy).
+
+## Applicability: pairwise (Morse+Q) fields only
+
+Everything above uses the **Morse oracle** — the field is literally a sum of
+analytic per-atom radial `v_i(r)`, which is what makes the split well-defined
+(PAW poly C²-matched to `v` at `r_b`, `v_S ≡ 0` beyond `r_b`). A sampled FDBM
+field has **no `v_i(r)`** (many-body Pauli + ES, non-radial in bond overlaps),
+so neither the split construction nor the "residual dead by r≈4 Å" conclusion
+apply verbatim — see `doc/Caveats.md` §22. What does transfer:
+
+- **PIC cell = compact core radius** locality relation and the halo-scaling
+  table shape (halo ∝ r_b²-ish, in-box/margin Rcut-independent) hold for any
+  compact-core representation.
+- The smallest-safe cutoff must be **re-measured per field representation**
+  (radialized oracle `fit_cores_paw_field` or energy-space clamp split in
+  `tests/SPM/testplot_fdbm_pme_debug.py`), not borrowed from this Morse sweep.

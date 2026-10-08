@@ -36,6 +36,16 @@ Two compact replacements for dense 3D `img_FF` in classical Morse(+Q) PP-AFM:
 
 ## Parity Status
 
+Sampled-field fit under USER review (2026-10-07): `CoarseMesh.fit_coremesh_lsq`
+uses a core prefit followed by one weighted joint objective over overlapping
+bases. Numerical core supports are C2; no physical cutoff surface is fitted.
+Cached C–C, h=0.5 Å: independent reachable xz E rms 2.95 meV versus 4.06 meV
+for the same weighted spline-only solve, maximum 46.0 versus 59.9 meV. The
+deep-wall sampled guard has minimum model E=0.3403 eV for original E>=1 eV
+(E_cut=0.3 eV). Analytic synthetic E/F and existing evaluator regressions pass;
+real FDBM force/df, azaindol, and coarser grids remain unverified. See
+[the design](../Tasks/ContactPME_CoreMesh_Fit_Design.md).
+
 | Pair | Tolerance / metric | Test / artifact | Status |
 |------|--------------------|-----------------|--------|
 | Separable eval vs force stencil | RMSE < 1e-4 | `tests/SPM/test_afm_contact_surface.py` | verified (L0) |
@@ -111,10 +121,84 @@ max|Δdf| vs FIRE: sphere 1.4–1.6×10⁻², quasi-Newton 2.1–3.2×10⁻². *
 - Projecting 2×2×2 or 3×3×3 samples of `V_L` onto the same 1 Å cubic coefficients increases off-node force error. Cores stay the radial fit. Relaxed df (CLI springs, FIRE, gray) is unchanged. **1×1×1 is sufficient** — USER confirmed `heights_df_strip.png`.
 - Report: `doc/Reports/ContactPME_Supersample_Scale_2026-10-04.md`.
 
+### Zero-core mesh on sharp FDBM fields (80-atom SVEC molecule, RTX 3090, 2026-10-07)
+
+Opposite mode to the PAW fits above: `core_fit=None`, the dense mesh alone
+carries the repulsive wall (invPPAFM `cpm_from_field`).
+
+- Relaxed df shows a **dark dot on every atom** — smoothed-wall artifact
+  amplified by PP relaxation, present already in rigid Fz/df; NOT the (zero)
+  core, NOT the kernel (GPU≡Python eval to ~1e-9).
+- h_mesh response at 0.1 Å source field: **0.4 Å → spline ringing on the
+  ~1.5 Å atom peaks → moiré dot lattice** (NCC 0.73–0.91, unusable);
+  0.3 Å → smooth-undershoot regime, NCC ≥0.98, faint dots; **0.2 Å →
+  clean** (NCC ≥0.989). Verified by residual Fz curves
+  (`exp_set1_9_dip_hmesh_curves.png`): 0.4 oscillates ±0.17 at the wall
+  and ±0.005 at the PP plane; ≤0.3 under-fits smoothly instead.
+- **Grid alignment irrelevant**: origin-shift test shows half-step offsets
+  beat node-coincident fits slightly (trilinear pre-smoothing damps spline
+  ringing). Refutes the "integer-multiple h_mesh/field_step" hypothesis —
+  the driver is source-field resolution, not lattice alignment.
+- Full caveat + figures: `doc/Caveats.md` §21; analysis harness
+  `invPPAFM/debug/analyze_pme_atom_dip.py`,
+  `invPPAFM/export_invAFM/fdbm_compression.md`.
+
+### PAW-core split on FDBM — BROKEN, was never FDBM-validated (2026-10-08)
+
+**VERDICT: the PAW split never passed df parity on a real FDBM field.**
+Every "validated" PAW result above is on the analytic Morse oracle — a
+field that is a literal sum of radial per-atom potentials. On FDBM the
+split gives df_corr 0.1–0.8 at every h_mesh (0.2–0.5 Å) — worse than zero
+core. After all bookkeeping fixes below the residual is still too sharp
+for a coarse mesh → **the path is shelved; `pme_dataset.py --scan fdbm`
+(raw field image) is the production dataset path.** Reviving PAW needs a
+new core basis (radial spline table / fitted exponentials) + GPU eval
+kernels + alternating mesh↔core LSQ — a real project, not a fix.
+
+**Why the Morse split does not transfer (USER 2026-10-07):** the whole PAW
+machinery assumes an analytic per-atom radial `v_i(r)`, which exists only
+because Morse+Q is pairwise. FDBM `E(x)` is a sampled many-body field — no
+`v_i(r)`, genuinely non-radial in bond overlaps — so `v_S,i = v_i − P_i`
+has no exact meaning; `fit_cores_paw_field` manufactures `v_i` by damped
+Jacobi radialization (approximation). Alternatives that never need `v_i(r)`:
+`PMESplit.fit_morse_atom_params` (Morse refit of samples → production split
+verbatim) and the **energy-space clamp split** under test in
+`tests/SPM/testplot_fdbm_pme_debug.py` — `E_soft = soft_clamp_rational(E;
+y1≈E_min, y2≈−2E_min)` → mesh, `E_hard` compact → `fit_cores_from_samples`
+joint LSQ (2026-10-07, unverified). See `doc/Caveats.md` §22.
+
+`fit_cores_paw_field` + `eval_vs_oracle` tapered residual (`--method pme`
+default in `testplot_fdbm_fields_compress.py`, also `cpm_from_field
+fit_core=True`) gives azaindol df_corr 0.11–0.83, exp_set1_9 NCC 0.10–0.26.
+The runtime model is `E_hat = mesh + c·φ`, but the fit objective is
+`mesh ← fit[(E − v_S)·S]` — a different function. Decomposition:
+
+- **B = c·φ − v_S (core truncation gap)** dominates in the probed region:
+  ±0.14 eV on the wall-top lateral cut ≈ the entire signal. The mesh fit
+  subtracted the Jacobi spline profile `v_S`; runtime adds the 5-mode
+  compact basis `c·φ` — NOT the same object. Taper S then blinds the mesh
+  inside the coverage shell, so the gap is uncorrectable by construction.
+- **C = (1−S)(E−v_S)** reaches ~2700 eV deep in the core (unreachable,
+  cosmetic) — the flat-extended profile diverges from E below r_min.
+- **A = mesh fit of the tapered residual ≈ 0.03–0.07 eV** — the B-spline is
+  nearly perfect at what it was asked. The bug is bookkeeping, not
+  resolution, not "non-radial physics".
+
+Fixes — implemented in invPPAFM `cpm_from_field` and MEASURED 2026-10-08:
+`consistent_split=True` (subtract `eval_core_fast` = the runtime c·φ object
+instead of v_S) + `core_method='lsq'` (joint `fit_cores_from_samples` on
+(E,F) instead of Jacobi) + cores on ALL atoms incl. H + taper only r<1.2 Å.
+Benzene: probed-region lateral error 0.15→0.001 eV, NCC 0.14→0.63 @ h=0.3.
+**Remaining limiter = the 5-mode even-power core basis itself** — c·φ−v_S
+is a wall-concentrated sharp residual the mesh can't hold at coarse h
+(0.5 still fails). Options: radial-spline-table cores (kernel change),
+better basis (fitted exponentials), alternating mesh↔core LSQ.
+
 ## Open Issues
 
 - [x] USER confirm regenerated CLI AFM strips (`wave2_afm_cli`) — OK 2026-08-11
 - [ ] Non-paw core fit is still host `fit_core_1d`. Paw production path is GPU `cs_fit_core_paw` (measured, not a separate USER sign-off)
+- [ ] PAW core path on FDBM fields fails df parity at ALL mesh sizes (0.2–0.5 Å) — BROKEN, shelved; was only ever validated on the analytic Morse oracle (field is non-pairwise, Caveats §22). Root cause measured = inconsistent split bookkeeping (fixed) + insufficient 5-mode radial basis (unsolved). Do not use for training data; production = direct FDBM scan. Revival needs new core basis + kernels — or the per-atom-free energy-space clamp split under test in `testplot_fdbm_pme_debug.py`
 - [ ] Δ_b default still 2.0 — user decision pending: 0.6 (r_b≈4.0, halo −45%) vs 1.2 (best accuracy) — see 2026-10-04 report
 - [ ] tile scan escapes at mesh-node-boundary z slices (~7% → global fallback; correct but wasteful) — suspected tile_kz slab off-by-one
 - [ ] PTCDA FIRE local-vs-bucket sparse float32 drift (p99 fine; max ~2e-3)

@@ -16,7 +16,8 @@ Product FDBM path is **ModularAFMPipeline** (FAST_S3 GPU Stage-3 + FIRE PP scan)
 | Language | Location | Status | Notes |
 |----------|----------|--------|-------|
 | Python | `spammm/SPM/ModularPipeline.py` | **active (SSOT)** | S1–S6; FAST_S3 default; GUI + `stm br` |
-| Python | `spammm/SPM/AFM.py` | active | AFMulator, `AFMBench`, gpyFFT, `stage3_fdbm_fields_fast`, `compute_df_amp` |
+| Python | `spammm/SPM/FDBMPipeline.py` | **active (CLI default)** | Device-resident path (`afm --pipeline gpu`, default): one ctx, one SCF, ρ never leaves GPU; parity df ≥0.9996 vs legacy; **batch contract: reuse ONE instance across molecules (different natoms/positions/DM) — same ngrid+step → warm ~0.1–0.2 s/mol**; `run_fields`/`fields_for_fit` for FDBM→2.5D-contact encode (`doc/export_invAFM/fdbm_compression.md`); `doc/Tasks/FDBM_EndToEnd_GPU_Pipeline.md` |
+| Python | `spammm/SPM/AFM.py` | active | AFMulator, `AFMBench`, gpyFFT, `stage3_fdbm_fields_fast` (now also accepts `*_cl` device buffers), `compute_df_amp` |
 | Python | `spammm/SPM/AFM_utils.py` | active | Tips, `compose_and_relax_total`, `run_br_stm_afm_panel`, plot SSOT |
 | Python | `spammm/GUI/AFMExtension.py` | active | GUI adapter; must use Pauli SSOT from `PAULI_FITTED_DEFAULTS` |
 | Python | `run_spm.py` `afm` | **deprecated fork** | Still calls `_run_from_density`; replace after parity gate (done) |
@@ -30,6 +31,7 @@ Product FDBM path is **ModularAFMPipeline** (FAST_S3 GPU Stage-3 + FIRE PP scan)
 |------|--------|------------------|
 | FAST_S3 Pauli+ES vs legacy FFT (synthetic) | corr > 0.999, RMSE < 1e-5 | `test_afm_fdbm.py::test_fdbm_fast_s3_parity_pauli_es` |
 | **CLI legacy Stage3–4 vs Modular FAST_S3** (shared ρ/tip/scan/FIRE) | corr ≥ 0.9996 on df; fields ~1.000; **~5.5×** S3+S4 speedup | `testplot_cli_vs_modular_parity.py` → `debug/cli_vs_modular_parity/` — **USER confirmed plots 2026-07-28** |
+| **FDBMPipeline (device-resident) vs legacy CLI path** | ρ max\|Δ\| ≈1–3e-5; df corr 0.9996–0.9998 (azaindol/pentacene/PTCDA); ~2.2× end-to-end; host RSS ~3× lower | `test_fdbm_pipeline_v2.py` + `testplot_fdbm_pipeline_parity.py` → `debug/testplot_fdbm_pipeline_parity/` |
 | GUI defaults vs CLI SSOT | **not yet identical** — see Open Issues (wrong Pauli spins were primary) | — |
 | Directional df, vertical compatibility | `compute_df*_dir(n=z)` matches established vertical functions; analytical x derivative retains z slices | `test_afm_morse.py::test_df_direction_*` |
 | Lateral scan geometry | `scan_fdbm(n=x)` and `scan_fdbm(n=z)` acquire identical `(x,y,z)` volumes on NVIDIA; only df projection changes | `test_afm_morse.py::test_scan_fdbm_oscillation_direction_does_not_replace_z_approach` |

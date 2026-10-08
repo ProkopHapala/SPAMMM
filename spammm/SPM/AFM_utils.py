@@ -1650,11 +1650,17 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
                                  grid_spec=None, step=0.1, margin=4.0, z_extra=6.0,
                                  verbosity=0, max_shells=None, projection_basis_ang=None,
                                  project_density=True, need_es=True, need_ves=True,
-                                 dm_in=None):
+                                 dm_in=None, ctx=None, queue=None, device_out=False,
+                                 max_scc=200, fermi_temp_K=None):
     """Get density grids using DFTBcore dense matrix projection (supports d-orbitals).
 
     Uses direct DFTBcore library access (no file parsing) and dense density matrix
     projection, enabling support for d-orbitals (e.g., Br in 3ob-3-1 basis).
+
+    NOTE for PP-AFM scans: this host-density entry point is part of the DEPRECATED
+    staged orchestration (kept for STM/orbital paths and back-compat). New FDBM
+    scan code should use ``spammm.SPM.FDBMPipeline.FDBMPipeline`` (one ctx, one SCF,
+    device-resident ρ; see doc/Tasks/FDBM_EndToEnd_GPU_Pipeline.md).
 
     Args:
         atomPos: (natoms, 3) positions in Angstrom
@@ -1680,6 +1686,17 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
         need_es: if False, skip rho_na/rho_diff (dual-basis second call wants only rho_scf).
         need_ves: if False, skip the Poisson V_ES (fused-ES callers use rho_diff directly).
         dm_in: precomputed density matrix — skips the whole DFTBcore SCF (dual-basis reuse).
+        max_scc: MaxSCCIterations in the generated dftb_in.hsd (SCC non-convergence
+            aborts DFTB+ with ERROR STOP — keep small for batch screening).
+        fermi_temp_K: if set, write `Filling = Fermi { Temperature [Kelvin] }` —
+            smearing stabilizes SCC on near-degenerate HOMO/LUMO flakes.
+        ctx/queue: share an existing OpenCL context (e.g. the AFMulator's) — enables the
+            device-resident path (no GPU→CPU→GPU round trips). Design:
+            doc/Tasks/FDBM_EndToEnd_GPU_Pipeline.md
+        device_out: if True, rho_scf/rho_na/rho_diff are returned as pyopencl buffers
+            (cl.Buffer / cl_array) in the shared context instead of host arrays.
+            rho_diff is computed by a device-side subtract. Charge check still runs
+            via a small device reduction. V_ES stays host-side (need_ves).
 
     Returns:
         dict with 'rho_scf', 'rho_na', 'rho_diff', 'V_ES', 'origin', 'ngrid', 'grid_spec'
@@ -1735,7 +1752,7 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
 
     # Setup projector with max_shells for d-orbital support
     proj_basis = projection_basis_ang if projection_basis_ang is not None else basis_ang
-    projector, atoms_dict = dg.setup_gridprojector_from_dftb(dftb_data, proj_basis, verbosity=verbosity, max_shells=max_shells)
+    projector, atoms_dict = dg.setup_gridprojector_from_dftb(dftb_data, proj_basis, ctx=ctx, queue=queue, verbosity=verbosity, max_shells=max_shells)
     _mark('projector setup')
 
     # Run DFTBcore SCF directly (single molecule - no Fortran state conflicts expected)
@@ -1762,6 +1779,7 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
 
     # Write minimal DFTBcore-compatible HSD (no Analysis/Options blocks)
     max_ang_str = '\n'.join(max_ang_lines)
+    filling = f'  Filling = Fermi {{\n    Temperature [Kelvin] = {float(fermi_temp_K)}\n  }}\n' if fermi_temp_K else ''
     with open(hsd_path, 'w') as f:
         f.write(f'''Geometry = xyzFormat {{
   <<< "geom.xyz"
@@ -1769,8 +1787,8 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
 Hamiltonian = DFTB {{
   SCC = Yes
   SCCTolerance = 1e-7
-  MaxSCCIterations = 200
-  SlaterKosterFiles = Type2FileNames {{
+  MaxSCCIterations = {max_scc}
+{filling}  SlaterKosterFiles = Type2FileNames {{
     Prefix = "{sk_dir}/"
     Separator = "-"
     Suffix = ".skf"
@@ -1812,8 +1830,15 @@ Hamiltonian = DFTB {{
 
     rho_scf = rho_na = rho_diff = V_ES = None
     if project_density:
-        # Project SCF density using dense method (supports d-orbitals)
-        rho_scf = projector.project_density_dense(dm_dense.astype(np.float32), norb_per_atom, orb_offsets, atoms_dict, grid_spec)
+        if device_out:
+            # Device-resident path (FDBM_EndToEnd_GPU_Pipeline): densities stay in cl buffers.
+            nx_d, ny_d, nz_d = [int(v) for v in grid_spec['ngrid'][:3]]
+            import pyopencl.array as _cla
+            rho_scf = _cla.empty(projector.queue, (nx_d, ny_d, nz_d), dtype=np.float32)
+            projector.project_density_dense(dm_dense.astype(np.float32), norb_per_atom, orb_offsets, atoms_dict, grid_spec, out_cl=rho_scf.data)
+        else:
+            # Project SCF density using dense method (supports d-orbitals)
+            rho_scf = projector.project_density_dense(dm_dense.astype(np.float32), norb_per_atom, orb_offsets, atoms_dict, grid_spec)
         _mark('project rho_scf')
 
         if need_es:
@@ -1824,29 +1849,43 @@ Hamiltonian = DFTB {{
                 'species_names': enames,
                 'coords_bohr': coords_bohr
             }
-            # Neutral-atom density: diagonal NA DM → one project_density_dense (same physics as AO loop)
-            rho_na = dg.project_neutral_density(
-                geo, projector, atoms_dict, grid_spec, proj_basis,
-                norb_per_atom=norb_per_atom, orb_offsets=orb_offsets)
-            _mark('project rho_na')
-
-            rho_diff = (rho_scf - rho_na).astype(np.float32)
+            if device_out:
+                rho_na = _cla.empty_like(rho_scf)
+                dg.project_neutral_density(
+                    geo, projector, atoms_dict, grid_spec, proj_basis,
+                    norb_per_atom=norb_per_atom, orb_offsets=orb_offsets, out_cl=rho_na.data)
+                _mark('project rho_na')
+                rho_diff = rho_scf - rho_na            # elementwise on device
+            else:
+                # Neutral-atom density: diagonal NA DM → one project_density_dense (same physics as AO loop)
+                rho_na = dg.project_neutral_density(
+                    geo, projector, atoms_dict, grid_spec, proj_basis,
+                    norb_per_atom=norb_per_atom, orb_offsets=orb_offsets)
+                _mark('project rho_na')
+                rho_diff = (rho_scf - rho_na).astype(np.float32)
 
             # CRITICAL: Check charge conservation - rho_diff should integrate to ~0
             # Both rho_scf and rho_na should contain the same total number of electrons
             cell_volume = step**3
-            q_scf = rho_scf.sum() * cell_volume
-            q_na = rho_na.sum() * cell_volume
-            q_diff_val = rho_diff.sum() * cell_volume
+            if device_out:
+                q_scf = float(_cla.sum(rho_scf).get()) * cell_volume
+                q_na = float(_cla.sum(rho_na).get()) * cell_volume
+                q_diff_val = float(_cla.sum(rho_diff).get()) * cell_volume
+            else:
+                q_scf = rho_scf.sum() * cell_volume
+                q_na = rho_na.sum() * cell_volume
+                q_diff_val = rho_diff.sum() * cell_volume
             print(f"  [CHARGE CHECK] step={step:.3f} Å, cell_vol={cell_volume:.6f} Å³")
-            print(f"  [CHARGE CHECK] rho_scf.sum={rho_scf.sum():.1f}, rho_na.sum={rho_na.sum():.1f}")
             print(f"  [CHARGE CHECK] q_scf={q_scf:.3f}, q_na={q_na:.3f}, q_diff={q_diff_val:.6f} (should be ~0)")
             if abs(q_diff_val) > 2.0:  # More than 2.0 electron discrepancy is serious
                 print(f"  WARNING: Large charge imbalance in rho_diff! Electrostatics may be unreliable.")
                 print(f"           Consider increasing grid resolution or checking basis consistency.")
 
             if need_ves:
-                V_ES = afm.fft_poisson(rho_diff, step)
+                if device_out:
+                    V_ES = afm.fft_poisson(np.asarray(rho_diff.get(), dtype=np.float32), step)
+                else:
+                    V_ES = afm.fft_poisson(rho_diff, step)
                 _mark('poisson V_ES')
 
     return {'rho_scf': rho_scf, 'rho_na': rho_na, 'rho_diff': rho_diff, 'V_ES': V_ES,
@@ -2066,11 +2105,14 @@ ANG_TO_BOHR = 1.0 / BOHR_TO_ANG
 # soft_clamp_density (tanh clamp) removed 2026-07-21 — only served deleted prepare_delta_rho_clamped.
 # All-electron clamp SSOT: soft_clamp_rational → delta_rho_clamp_compact_na.
 
-def soft_clamp_rational(y, y1, y2, dy=None):
+def soft_clamp_rational(y, y1, y2, dy=None, smoothness=1):
     """Rational soft clamp (USER SSOT): above y1, approach y2 via 1/(1+z).
 
     For y > y1:  y' = y1 + (y2-y1)·(1 − 1/(1+z)),  z=(y−y1)/(y2−y1)
     dy' = dy / (1+z)²  (chain rule) if dy given.
+    smoothness=2: replace z/(1+z) by z/sqrt(1+z²), preserving the
+    identity through its second derivative at y1. For bounded field fitting;
+    the existing all-electron density clamp keeps smoothness=1 by default.
 
     Same formula as `spammm.utils.test_utils.soft_clamp` — non-mutating copy here.
     Use for all-electron nuclear cusps before compact NA subtraction (CO guinea-pig).
@@ -2079,6 +2121,8 @@ def soft_clamp_rational(y, y1, y2, dy=None):
     y1, y2 = float(y1), float(y2)
     if not (y2 > y1):
         raise ValueError(f'soft_clamp_rational: need y2 > y1, got y1={y1}, y2={y2}')
+    if smoothness not in (1, 2):
+        raise ValueError('soft_clamp_rational: smoothness must be 1 or 2')
     y_new = y.copy()
     dy_new = None if dy is None else np.asarray(dy, dtype=np.float64).copy()
     mask = y_new > y1
@@ -2086,6 +2130,12 @@ def soft_clamp_rational(y, y1, y2, dy=None):
         return (y_new.astype(np.float32), dy_new)
     y12 = y2 - y1
     z = (y_new[mask] - y1) / y12
+    if smoothness == 2:
+        den = np.hypot(1.0, z)
+        y_new[mask] = y1 + y12*z/den
+        if dy_new is not None:
+            dy_new[mask] *= den**-3
+        return y_new.astype(np.float32), dy_new
     y_new[mask] = y1 + y12 * (1.0 - 1.0 / (1.0 + z))
     if dy_new is not None:
         dy_new[mask] *= 1.0 / (1.0 + z) ** 2
@@ -3463,6 +3513,11 @@ def run_fdbm_pp_from_density(tag, rho_scf, atomPos, atomTypes, origin, step, ngr
     attributes (``df_z_slice_rms``, ``stage_path``, ``tip``, ``A``, ``beta``, ``tag``,
     ``path``, ``atomPos``, ``origin``, ``step``, ``h_scan``, ``osc_dir``) for CLI/GUI compat.
     """
+    import warnings
+    warnings.warn("run_fdbm_pp_from_density: staged host-density orchestration is DEPRECATED — "
+                  "use spammm.SPM.FDBMPipeline.FDBMPipeline (device-resident; CLI default "
+                  "--pipeline gpu). Kept for debugging/back-compat/parity.", DeprecationWarning,
+                  stacklevel=2)
     rho_scf = np.asarray(rho_scf, dtype=np.float32)
     atomPos = np.asarray(atomPos, dtype=np.float64)
     atomTypes = np.asarray(atomTypes, dtype=np.int32)

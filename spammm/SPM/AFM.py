@@ -338,7 +338,10 @@ class AFMulator(OpenCLBase):
     DEFAULT_tipQZs     = np.array([ 0., 1.8, 3.6, 0.], dtype=np.float32)
 
 
-    def __init__(self, cl_src_dir=None, use_morse=False, nloc=32, use_fire=True):
+    def __init__(self, cl_src_dir=None, use_morse=False, nloc=32, use_fire=True, pme_core_basis='raw'):
+        if pme_core_basis not in ('raw', 'smooth'):
+            raise ValueError('pme_core_basis must be raw or smooth')
+        self.pme_core_basis = pme_core_basis
         super().__init__(nloc=nloc, preferred_vendor='nvidia', bPrint=True)
         self.use_morse = use_morse
         self._vram_bytes = 0
@@ -353,6 +356,7 @@ class AFMulator(OpenCLBase):
         debug_print(2, f"AFMulator: device max_alloc={_bytes_to_gb(self._max_alloc):.3f} GB global_mem={_bytes_to_gb(self._global_mem):.3f} GB")
         # Build options: -DOPT_FIRE=0 for damped velocity (matches CPU), -DOPT_FIRE=1 for FIRE
         build_options = ['-D', f'OPT_FIRE={1 if use_fire else 0}']
+        build_options += ['-D', f'CS_PME_SMOOTH_CORE={int(pme_core_basis == "smooth")}']
         kernel_paths = [
             os.path.join(cl_src_dir, 'common.cl'),
             os.path.join(cl_src_dir, 'Forces.cl'),
@@ -557,7 +561,7 @@ class AFMulator(OpenCLBase):
                   K_LAT=0.03, K_RAD=20.0, bond_length=3.0,
                   stiffness=None, dpos0=None, relax_pars=None,
                   osc_dir=(0., 0., 1.), base_pos=(0., 0., 0.),
-                  reverse=False):
+                  reverse=False, scan_pts=None):
         """
         GPU probe-particle relaxation over a 2D scan using relaxStrokes kernel.
         Requires setup_fdbm_grid() to be called first.
@@ -606,6 +610,10 @@ class AFMulator(OpenCLBase):
             osc_dir:       (3,) df oscillation direction; scan approach remains along z
             base_pos:      (3,) constant world-coordinate scan offset
             reverse:       bool  True=scan z ascending (backward stroke for dissipation)
+            scan_pts:      optional explicit stroke-start points (n_scan,>=3) world
+                           coords — overrides the regular scan_xs x scan_ys raster
+                           (for warped/rotated raster variants); z is overridden by
+                           the stroke start height
 
         Returns:
             FEs_relax: (nx_s, ny_s, nz_s, 4) float32  relaxed (Fx,Fy,Fz,E) at probe pos
@@ -655,11 +663,17 @@ class AFMulator(OpenCLBase):
 
         # vectorised: outer product of scan_xs, scan_ys -> (nx_s*ny_s, 4)
         # pts must be world coordinates (Ang); interpFE applies the full dinv transform internally
-        gx, gy = np.meshgrid(scan_xs, scan_ys, indexing='ij')
-        pts = np.zeros((n_scan, 4), dtype=np.float32)
-        pts[:, 0] = gx.ravel() + base[0]
-        pts[:, 1] = gy.ravel() + base[1]
-        pts[:, 2] = z_start
+        if scan_pts is None:
+            gx, gy = np.meshgrid(scan_xs, scan_ys, indexing='ij')
+            pts = np.zeros((n_scan, 4), dtype=np.float32)
+            pts[:, 0] = gx.ravel() + base[0]
+            pts[:, 1] = gy.ravel() + base[1]
+            pts[:, 2] = z_start
+        else:
+            pts = np.asarray(scan_pts, dtype=np.float32).reshape(-1, np.asarray(scan_pts).shape[-1]).copy()
+            assert pts.shape[0] == n_scan, f'scan_pts has {pts.shape[0]} rows, expected n_scan={n_scan}'
+            pts = np.pad(pts[:, :3], ((0, 0), (0, 4 - 3)), mode='constant')
+            pts[:, 2] = z_start
 
         # --- allocate/reuse GPU scan buffers ---
         self.realloc_scan_buffers(n_scan, nz_s)
@@ -1247,6 +1261,15 @@ class AFMulator(OpenCLBase):
 
         Caller supplies sep (explicit h0_map) and sampled reference field; delegates to
         ContactSurfaceCL.fit_separable_cg. Stores sep.fit_rmse / sep.fit_bounds only.
+
+        DEPRECATED for batch compression (~1200 CG iters ≈ 2 min/mol): prefer the
+        ContactPME dense-mesh path — sample_fdbm at h_mesh nodes →
+        cpm_params_from_samples (direct _prefilter_3d, ~0.05 s/mol, ~2–3 MB/mol).
+        NOTE: dense zero-core is interim — the intended PME split (PAW cores +
+        coarse mesh, fit_cores_paw_field) exists but fails df parity as of
+        2026-10-08; dense mesh wins on measured accuracy-per-byte today.
+        Kept for back-compat and the minimum-bytes (~23 KB) option; see
+        doc/export_invAFM/fdbm_compression.md.
         """
         xyz = np.asarray(xyz, dtype=np.float32)
         if xyz.ndim != 2 or xyz.shape[1] != 3 or xyz.shape[0] == 0 or not np.isfinite(xyz).all():
@@ -1667,6 +1690,8 @@ class AFMulator(OpenCLBase):
         from spammm.surfaces.CoarseMesh import build_coarse_mesh
         from spammm.surfaces.PICCore import fit_core_1d
         from spammm.surfaces.ContactSurface import ContactPMEParams, build_pic_buckets
+        if self.pme_core_basis != 'raw':
+            raise ValueError('pairwise PAW fitting requires pme_core_basis=raw; smooth kernels evaluate sampled-field fits')
         assert self.use_morse, "fit_contact_pme requires use_morse=True"
         assert self.atoms_arr is not None and self.cLJs_arr is not None, "call assign_params() first"
         apos = self.atoms_arr[:, :3].astype(np.float64)
@@ -1987,6 +2012,9 @@ class AFMulator(OpenCLBase):
 
     def _pme_upload_resident(self, params, *, force=False):
         """Upload mesh/atoms/core/buckets once per ContactPMEParams identity."""
+        basis = 'smooth' if params.core_fit.basis == 'smooth' else 'raw'
+        if basis != getattr(self, 'pme_core_basis', 'raw') and np.any(params.core_fit.coeffs):
+            raise ValueError(f'core basis {basis} mismatches compiled pme_core_basis; construct AFMulator(pme_core_basis={basis!r})')
         na = params.na
         nc_mesh = int(params.mesh_coeffs.size)
         nc_core = int(params.core_fit.coeffs.size)
@@ -4179,14 +4207,14 @@ class _FDBMGpyFFT:
             raise RuntimeError("_FDBMGpyFFT: bind_afm_program() required for device xyz→FFT path")
         gs, ls = self._gs3()
         nx, ny, nz = self._shape
-        self._krn_fdbm_xyz_to_fft_c64(self.queue, gs, ls, xyz_cl.data, fft_buf.data,
+        self._krn_fdbm_xyz_to_fft_c64(self.queue, gs, ls, getattr(xyz_cl, 'data', xyz_cl), fft_buf.data,
                                 np.int32(nx), np.int32(ny), np.int32(nz))
 
     def _fft_real_to_xyz_cl(self, fft_buf, xyz_cl):
         prg = self._afm_prg
         gs, ls = self._gs3()
         nx, ny, nz = self._shape
-        self._krn_fdbm_fft_real_to_xyz_f32(self.queue, gs, ls, fft_buf.data, xyz_cl.data,
+        self._krn_fdbm_fft_real_to_xyz_f32(self.queue, gs, ls, fft_buf.data, getattr(xyz_cl, 'data', xyz_cl),
                                      np.int32(nx), np.int32(ny), np.int32(nz))
 
     def fft_forward(self, buf):
@@ -4247,7 +4275,7 @@ class _FDBMGpyFFT:
         self._krn_fdbm_pad_roll_f32(
             self.queue, gs, ls,
             src_cl.data, np.int32(sx), np.int32(sy), np.int32(sz),
-            dest_cl.data, np.int32(nx), np.int32(ny), np.int32(nz),
+            getattr(dest_cl, 'data', dest_cl), np.int32(nx), np.int32(ny), np.int32(nz),
             np.int32(ox), np.int32(oy), np.int32(oz),
             np.int32(rx), np.int32(ry), np.int32(rz),
         )
@@ -4257,7 +4285,7 @@ class _FDBMGpyFFT:
         prg = self._afm_prg
         gs, ls = self._gs3()
         nx, ny, nz = self._shape
-        prg.fdbm_flip3_f32(self.queue, gs, ls, src_cl.data, dest_cl.data,
+        prg.fdbm_flip3_f32(self.queue, gs, ls, getattr(src_cl, 'data', src_cl), getattr(dest_cl, 'data', dest_cl),
                            np.int32(nx), np.int32(ny), np.int32(nz))
         return dest_cl
 
@@ -4950,12 +4978,19 @@ def compute_es_fused_field(rho_diff, rho_tip_delta, step, tip_rolled=True, retur
 def stage3_fdbm_fields_fast(afmulator, rho_scf, rho_diff, tip_total_raw, tip_delta_raw,
                             origin, step, ngrid, atomPos, atomTypes,
                             A_pauli, beta_pauli, C6_CO=30.0,
-                            tip_already_rolled=False, download_fields=True):
+                            tip_already_rolled=False, download_fields=True,
+                            rho_scf_cl=None, rho_diff_cl=None,
+                            tip_tot_cl=None, tip_del_cl=None, download_F=True):
     """Round-2 Stage-3 on GPU: pad/roll tip, Pauli+scale, fused ES, vdW, compose+grad — minimal host transfers.
 
     Returns (V_ES, E_pauli, E_ES, E_vdw, F_total).
     V_ES is None (fused path); E_* downloaded only if download_fields.
-    F_total always downloaded once (S4 / API need it) — no mid-pipeline transfers.
+    F_total downloaded once when download_F (legacy callers need it; device-resident
+    pipelines skip it — setup_fdbm_grid_from_img consumes the device image directly).
+
+    Device-resident inputs: pass rho_scf_cl / rho_diff_cl / tip_tot_cl / tip_del_cl
+    (cl_array or raw cl.Buffer on the same context) to skip the host uploads; the
+    corresponding host args may then be None.
     """
     target_shape = tuple(int(x) for x in ngrid[:3])
     fft = _get_fdbm_fft(ctx=afmulator.ctx, queue=afmulator.queue)
@@ -4963,9 +4998,12 @@ def stage3_fdbm_fields_fast(afmulator, rho_scf, rho_diff, tip_total_raw, tip_del
     fft.ensure(target_shape, step=step)
 
     # Tip pad/roll on GPU (or upload if already rolled / full-grid gaussian)
-    if tip_already_rolled:
+    if tip_tot_cl is not None and tip_del_cl is not None:
+        tip_tot_use, tip_del_use = tip_tot_cl, tip_del_cl
+    elif tip_already_rolled:
         fft._xyz_host_to_cl(fft._xyz_tip_tot, tip_total_raw)
         fft._xyz_host_to_cl(fft._xyz_tip_del, tip_delta_raw)
+        tip_tot_use, tip_del_use = fft._xyz_tip_tot, fft._xyz_tip_del
     else:
         for raw, dest in ((tip_total_raw, fft._xyz_tip_tot), (tip_delta_raw, fft._xyz_tip_del)):
             if tuple(raw.shape) == target_shape:
@@ -4973,27 +5011,36 @@ def stage3_fdbm_fields_fast(afmulator, rho_scf, rho_diff, tip_total_raw, tip_del
             else:
                 ox, oy, oz, rx, ry, rz = pad_roll_shifts(raw, target_shape)
                 fft.pad_roll_to_cl(raw, target_shape, ox, oy, oz, rx, ry, rz, dest_cl=dest)
+        tip_tot_use, tip_del_use = fft._xyz_tip_tot, fft._xyz_tip_del
 
-    fft._xyz_host_to_cl(fft._xyz_rho_scf, rho_scf)
-    fft._xyz_host_to_cl(fft._xyz_rho_diff, rho_diff)
+    if rho_scf_cl is None:
+        if rho_scf is None:
+            raise ValueError("stage3_fdbm_fields_fast: need rho_scf (host) or rho_scf_cl (device)")
+        fft._xyz_host_to_cl(fft._xyz_rho_scf, rho_scf)
+        rho_scf_cl = fft._xyz_rho_scf
+    if rho_diff_cl is None:
+        if rho_diff is None:
+            raise ValueError("stage3_fdbm_fields_fast: need rho_diff (host) or rho_diff_cl (device)")
+        fft._xyz_host_to_cl(fft._xyz_rho_diff, rho_diff)
+        rho_diff_cl = fft._xyz_rho_diff
 
     E_pauli_cl = fft.pauli_overlap_scaled_cl(
-        fft._xyz_rho_scf, fft._xyz_tip_tot, step, A_pauli, beta_pauli, out_cl=fft._xyz_E_pauli)
+        rho_scf_cl, tip_tot_use, step, A_pauli, beta_pauli, out_cl=fft._xyz_E_pauli)
     E_es_cl = fft.es_fused_from_rho_cl(
-        fft._xyz_rho_diff, fft._xyz_tip_del, step, out_cl=fft._xyz_E_es)
+        rho_diff_cl, tip_del_use, step, out_cl=fft._xyz_E_es)
 
     img_vdw = afmulator.compute_dispersion_to_img_cl(
         atomPos, atomTypes, origin, step, ngrid, C6_CO=C6_CO)
     img_F = afmulator.compose_E_and_gradient_fast_cl(E_pauli_cl, E_es_cl, img_vdw, step, target_shape)
     afmulator.setup_fdbm_grid_from_img(img_F, target_shape, origin, step)
 
-    F_total = afmulator.download_image_rgba_xyz(afmulator.img_FF_fdbm, target_shape)
+    F_total = afmulator.download_image_rgba_xyz(afmulator.img_FF_fdbm, target_shape) if download_F else None
     V_ES = E_pauli = E_ES = E_vdw = None
     if download_fields:
         E_pauli = np.ascontiguousarray(E_pauli_cl.get())
         E_ES = np.ascontiguousarray(E_es_cl.get())
         E_vdw = afmulator.download_image_rgba_xyz(img_vdw, target_shape)[..., 3]
-        if afm_diag_download():
+        if afm_diag_download() and rho_diff is not None:
             V_ES = fft_poisson(rho_diff, step)
     return V_ES, E_pauli, E_ES, E_vdw, F_total
 

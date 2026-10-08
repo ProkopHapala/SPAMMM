@@ -1114,6 +1114,12 @@ inline void cs_pme_core_basis(float r, float r_lo_i, float r_b, float* phi, floa
     // Needed for PP-AFM close approach; mesh soft field (PAW) remains valid at r→0.
     bool active = (r < r_b);
     float dt = (r > r_lo_i && r < r_b) ? (-1.0f / D) : 0.0f;  // flat for r<=r_lo
+    // Sampled-field option: C2 joins per mode, preserving all five coefficients.
+    // The host validates the basis against the compiled option on upload.
+#if CS_PME_SMOOTH_CORE
+    dt *= 30.0f * t * t * (1.0f-t) * (1.0f-t);
+    t = t*t*t*(10.0f+t*(-15.0f+6.0f*t));
+#endif
     // powers 2,4,8,16,32 via successive squaring from t^2
     float t2 = t * t;         float dt2 = 2.0f * t * dt;
     float t4 = t2 * t2;       float dt4 = 2.0f * t2 * dt2;

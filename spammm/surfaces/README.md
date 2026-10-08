@@ -13,9 +13,10 @@ Caveats: [doc/Caveats.md](../../doc/Caveats.md) §6 · Debugging: [doc/Takeways.
 ## File index
 
 - **ContactSurface.py** — GPU contact field: sphere-envelope `h₀`; separable/PIC; **`ContactPMEParams`** for particle-mesh backend
-- **PMESplit.py** — atomwise PAW soft-replacement long/short split (default `paw`); `precompute_split_cache`, closed-form a0
+- **PMESplit.py** — atomwise PAW soft-replacement long/short split (default `paw`); `precompute_split_cache`, closed-form a0. **Pairwise Morse+Q oracle only** — sampled fields (FDBM) have no per-atom `v_i(r)`; use `fit_morse_atom_params` refit or a field-space split (`doc/Caveats.md` §22)
 - **CoarseMesh.py** — coarse 3D B-spline of V_L; batched prefilter; CPU raster (GPU fill lives in AFMulator / `fillContactPMEMeshVL`)
-- **PICCore.py** — compact residual core fit (`fit_core_1d`, powers 2…32)
+- **Sampled-field fit (`CoarseMesh.fit_coremesh_lsq`)** — cores first, then one weighted joint solve over overlapping cores and mesh; C2 radial joins, raw five-power coefficients, sparse axis products and analytic E/F evaluation. Diagnostic: `python3 tests/SPM/testplot_fdbm_pme_debug.py cc --samples debug/testplot_fdbm_pme_debug/cc_h0.5/coremesh_samples.npz`. Cached C–C E improvement measured; real-field force/df and molecular generalization remain unverified. Design: [ContactPME_CoreMesh_Fit_Design.md](../../doc/Tasks/ContactPME_CoreMesh_Fit_Design.md).
+- **PICCore.py** — compact residual core fit (`fit_core_1d`, powers 2…32); non-pairwise field variants: `fit_cores_paw_field` (damped-Jacobi radial oracle), `fit_cores_from_samples` (joint LSQ, incl. energy-space `E_hard` targets)
 - **GridFF.py** — PyOpenCL B-spline grid force field for periodic substrates (Pauli/London/Coulomb channels)
 - **SurfaceEwald.py** — GPU 2D Ewald summation for electrostatic potentials/fields above periodic surfaces
 - **Ewald2D.py** — NumPy 2D Ewald reference (plane-wave formulation, parity vs GPU)

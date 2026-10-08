@@ -19,6 +19,11 @@ Two independent work streams, verified against the same golden references:
 - **Track B — fitting:** move remaining CPU/NumPy/SciPy numerics to OpenCL
   (mesh prefilter, per-atom split-cache loop, per-atom `fit_core_1d`).
 
+**Scope note (2026-10-07):** all of this is the **Morse(+Q) oracle** track —
+the PAW split needs an analytic per-atom `v_i(r)`. FDBM fields are
+non-pairwise and need a field-space split instead (see `doc/Caveats.md`
+§22); the tile/locality numbers here do not transfer verbatim to FDBM.
+
 ## Hard design rules (USER — non-negotiable, do not regress)
 
 1. **No heavy numerics in Python.** Grid-sized and atom-sized numerical work

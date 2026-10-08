@@ -480,3 +480,117 @@ def eval_atom_ef(queries, atom_pos, p: SplitParams):
     r_safe = np.where(r > 1e-30, r, 1.0)
     F = (-dvdr / r_safe)[:, None] * dp
     return v, np.where((r > 1e-30)[:, None], F, 0.0)
+
+
+# ── field→Morse parametric adapter (FDBM) ────────────────────────────────────
+# The production split needs the analytic per-atom oracle v_i(r) = Morse+Coulomb.
+# A sampled field (FDBM) has no analytic v — but its short-range repulsion IS
+# atom-centered and Morse-like, so the adapter is parametric: fit (E0_i, R0_i) of
+#   v_i(r) = E0_i · (e^{2K(r-R0_i)} - 2 e^{K(r-R0_i)}),   K = -alpha
+# to the samples. With R0,alpha fixed this is LINEAR in E0 (one small LSQ over
+# all atoms, plus affine trend columns so the smooth non-Morse background —
+# electrostatics, vdW, non-radial terms — does not bias the wall amplitudes).
+# R0_i is then refined by a per-atom golden search (alternating), because a
+# misplaced wall leaves sharp residual on the mesh.
+# The trend is fit-and-discarded: it only debiases (E0,R0); the true smooth
+# background stays in mesh = E - Σ_i v_S,i, exactly as production's Σ v_L.
+
+def morse_basis(r, R0, alpha):
+    """Unit-amplitude Morse M(r; R0, alpha) = e^{2K(r-R0)} - 2 e^{K(r-R0)}, K=-alpha."""
+    e = np.exp(-float(alpha) * (np.asarray(r, np.float64) - np.asarray(R0, np.float64)))
+    return e * e - 2.0 * e
+
+
+def _morse_design(xyz, apos, R0, alpha, r_max):
+    """(ns, na) unit-Morse design, columns zeroed beyond r_max (per atom)."""
+    r = np.linalg.norm(np.asarray(xyz, np.float64)[:, None, :] - np.asarray(apos, np.float64)[None, :, :], axis=-1)
+    M = morse_basis(r, R0[None, :], alpha)
+    return np.where(r < r_max[None, :], M, 0.0), r
+
+
+def fit_morse_atom_params(xyz, E, apos, R0, alpha, *, n_alt=4, r0_span=0.8,
+                          r_b_extra=1.0, ridge=1e-8, w_clip=4.0, bPrint=True):
+    """Fit per-atom (E0_i, R0_i) of sum_i E0_i*M(r_i; R0_i, alpha) to sampled E.
+
+    Args:
+        xyz, E:     field samples (ns,3), (ns,) [eV]
+        apos, R0:   atom positions (na,3) and initial R0 [Å] (e.g. cLJs[:,0])
+        alpha:      global Morse stiffness (positive; from tip cLJs |alpha|)
+        n_alt:      alternating E0-lsq / R0-golden rounds (0 = E0 only)
+        r0_span:    R0 golden-search half-width [Å] around current R0
+        r_b_extra:  design cutoff beyond r_b = R0 + delta_b-equivalent span
+        w_clip:     clip per-sample residual magnitude for robust reweighting
+    Returns (E0 (na,), R0 (na,)) — feed into SplitParams; the production split
+    (soft_core_split / fit_core_paw_grid / cs_fit_core_paw) then runs verbatim.
+    """
+    xyz = np.asarray(xyz, np.float64); E = np.asarray(E, np.float64)
+    apos = np.asarray(apos, np.float64); R0 = np.asarray(R0, np.float64).copy()
+    na, ns = len(apos), len(E)
+    r_max = R0 + float(r0_span) + float(r_b_extra)
+    B = np.concatenate([np.ones((ns, 1)), xyz], axis=1)            # affine trend (fit+discard)
+    for it in range(int(n_alt) + 1):
+        M, r = _morse_design(xyz, apos, R0, alpha, r_max)
+        A = np.concatenate([M, B], axis=1)
+        c = np.linalg.solve(A.T @ A + float(ridge) * np.eye(na + 4), A.T @ E)
+        E0 = c[:na]
+        resid = E - A @ c
+        # robust clip: a stray keV wall sample must not dominate amplitudes
+        sc = max(np.median(np.abs(resid)) * 6.0, 0.05)
+        w = 1.0 / np.sqrt(1.0 + (resid / sc) ** 2 * float(w_clip))
+        Aw = A * w[:, None]
+        c = np.linalg.solve(Aw.T @ A + float(ridge) * np.eye(na + 4), Aw.T @ E)
+        E0 = c[:na]
+        resid = E - M @ E0                                    # includes trend → full resid vs atoms only
+        if bPrint:
+            print(f'  fit_morse_atom_params it{it}: E0=[{E0.min():.4f},{E0.max():.4f}] '
+                  f'resid rms={np.sqrt(np.mean(resid * resid)):.4f}', flush=True)
+        if it >= int(n_alt):
+            break
+        # per-atom R0 golden search on samples within the atom's active radius
+        E_back = resid[:, None] + M * E0[None, :]              # column i = E − Σ_{j≠i} E0_j M_j (own term added back)
+        R0_new = R0.copy()
+        for i in range(na):
+            sel = r[:, i] < r_max[i]
+            if not np.any(sel):
+                continue
+            rs, ys = r[sel, i], E_back[sel, i]
+
+            def obj(r0):
+                m = np.where(rs < r0 + r_b_extra, morse_basis(rs, r0, alpha), 0.0)
+                den = float(m @ m)
+                e0 = float(m @ ys) / den if den > 1e-12 else 0.0
+                rr = ys - e0 * m
+                return float(rr @ rr)
+
+            lo, hi = R0[i] - float(r0_span), R0[i] + float(r0_span)
+            gr = 0.6180339887
+            x1, x2 = hi - gr * (hi - lo), lo + gr * (hi - lo)
+            f1, f2 = obj(x1), obj(x2)
+            for _ in range(12):
+                if f1 > f2:
+                    lo = x1; x1, f1 = x2, f2; x2 = lo + gr * (hi - lo); f2 = obj(x2)
+                else:
+                    hi = x2; x2, f2 = x1, f1; x1 = hi - gr * (hi - lo); f1 = obj(x1)
+            R0_new[i] = 0.5 * (lo + hi)
+        R0 = R0_new
+        if bPrint:
+            print(f'    R0 -> [{R0.min():.3f},{R0.max():.3f}] (shift max {np.max(np.abs(R0_new - R0)):.3f})', flush=True)
+    return E0, R0
+
+
+def eval_vs_analytic(xyz, apos, p: SplitParams):
+    """Sum_i v_S,i(r_i) for analytic SplitParams — v_S = v_i - P_i inside r_b, 0 outside.
+
+    Vectorized; float64. The FDBM adapter counterpart of eval_vs_oracle — here
+    the oracle is the closed-form Morse, so no profile tables are needed.
+    Returns (ns,) total short-range energy at xyz.
+    """
+    from spammm.surfaces.PICCore import paw_coeffs_batch
+    a0, a2, a4, a6, r_b = paw_coeffs_batch(p)
+    dp = np.asarray(xyz, np.float64)[:, None, :] - np.asarray(apos, np.float64)[None, :, :]
+    r = np.linalg.norm(dp, axis=-1)                                # (ns, na)
+    v, _, _ = combined_atom_potential(r, p)                        # (ns, na) broadcast over atoms
+    r2, r4, r6 = r * r, r ** 4, r ** 6
+    P = a0[None, :] + a2[None, :] * r2 + a4[None, :] * r4 + a6[None, :] * r6
+    vs = np.where(r < r_b[None, :], v - P, 0.0)
+    return vs.sum(axis=1)
