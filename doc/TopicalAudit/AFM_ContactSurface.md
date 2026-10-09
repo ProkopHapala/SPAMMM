@@ -21,7 +21,7 @@ Two compact replacements for dense 3D `img_FF` in classical Morse(+Q) PP-AFM:
 | OpenCL | `kernels/contact_surface.cl` | active | Separable/PIC + **PME**: `evalContactPME`/`Local`, `relaxStrokesTiltedContactPME`/`Local`, `fillContactPMEMeshVL`, **fast relaxers** `…LocalQN` (secant→FD-Newton→FIRE) and `…LocalSph` (sphere-constrained, 2 soft DOF) |
 | Python | `spammm/surfaces/PMESplit.py` | active | PAW/hermite/plateau/rho split; `precompute_split_cache`; closed-form a0 |
 | Python | `spammm/surfaces/CoarseMesh.py` | active | CPU V_L raster + batched prefilter (oracle / fallback) |
-| Python | `spammm/surfaces/PICCore.py` | active | `fit_core_1d` (host, non-paw); paw oracle `fit_core_paw_grid`; production paw fit is GPU `cs_fit_core_paw`; **poly8 core+mesh basis** (`poly_core_basis`, `fit_core_poly_shell`, `eval_core_poly`; kernel `CS_PME_POLY_CORE`); **poly8sp angular basis** (`fit_core_sp_shell`, `eval_core_sp`; kernel `CS_PME_SP_CORE`, `CS_PME_NMODES=3+3·NP`, spec `A:s3p2+B:s1`→9-slot / `A:s3p3`→12-slot, w-channel = per-center radius scale); **GPU matrix-free CGLS core fit** `fit_core_sp_shell(solver='gpu')` → `ContactSurfaceCL.fit_core_sp_cg` (kernels `cs_sp_Av` = eval funnel, `cs_sp_Atv` owner-computes gather + `cs_reduce_groups`, no atomics; design doc §16; core fit 3–10 s flat up to 72-atom flakes, mesh scipy-CG now the bottleneck) |
+| Python | `spammm/surfaces/PICCore.py` | active | `fit_core_1d` (host, non-paw); paw oracle `fit_core_paw_grid`; production paw fit is GPU `cs_fit_core_paw`; **poly8 core+mesh basis** (`poly_core_basis`, `fit_core_poly_shell`, `eval_core_poly`; kernel `CS_PME_POLY_CORE`); **poly8sp angular basis** (`fit_core_sp_shell`, `eval_core_sp`; kernel `CS_PME_SP_CORE`, `CS_PME_NMODES=3+3·NP`, spec `A:s3p2+B:s1`→9-slot / `A:s3p3`→12-slot, w-channel = per-center radius scale); **GPU matrix-free CGLS core fit** `fit_core_sp_shell(solver='gpu')` → `ContactSurfaceCL.fit_core_sp_cg` (kernels `cs_sp_Av` = eval funnel, `cs_sp_Atv` owner-computes gather + `cs_reduce_groups`, no atomics; design doc §16); **direct Gram solve** `solver='gpugram'` → `fit_core_sp_gram` (G columns via `Atv(Av e_j)` on GPU + scaled Tikhonov λ≈1e-6 + host Cholesky, ~0.3–1.9 s flat, deterministic — §18). Mesh fit: production-style `inpaint_residual` (+`seed` from node fit) → `CoarseMesh.fit_mesh_lsq_3d` separable banded solves (design doc §17) — 0.8–4 s vs 8–120 s for the weighted scipy CG `fit_coremesh_lsq` (kept via `--mesh-fit cg`); df_corr equal/better for `A:s3p2+B:s1` (min .96–.99), slightly worse for atoms-only `A:s3p3` mid-heights |
 | Python | `spammm/surfaces/CoreBasisStudy.py` | experimental | core+mesh basis design survey: spec grammar `A:s3p2+B:s1` (s/p/d angular × `(1−r/R)₊⁸`), weighted LSQ w/ force rows, **core-only residual study**; canonical figure `surface_plots.plot_core_residual_study`; driver `tests/SPM/testplot_coremesh_basis_survey.py` → `debug/testplot_coremesh_basis_survey/` |
 | Python | `spammm/surfaces/ContactSurface.py` | active | Quasi-2D + `ContactPMEParams` |
 | Python | `spammm/SPM/AFM.py` | active | `fit_contact_pme` (GPU mesh), `run_scan_contact_pme` (`core_backend` local/bucket, `relax_mode` fire/qn/sph + `qn_cap`/`qn_conv`) |
@@ -32,20 +32,23 @@ Two compact replacements for dense 3D `img_FF` in classical Morse(+Q) PP-AFM:
 | Report | `doc/Reports/ContactPME_Split_Rcut_Locality_2026-10-04.md` | active | Split mechanics, Rcut(Δ_b) sweep, layer pruning, mesh-first-residual experiment |
 | Report | `doc/Reports/ContactPME_RelaxQuasiNewton_Sph_2026-10-03.md` | active | QN/Sph relaxers, bench vs FIRE |
 | Report | `doc/Reports/ContactPME_Supersample_Scale_2026-10-04.md` | active | Fit vs scan scale, GridFF, 1×1×1 sufficient (USER 2026-10-04) |
+| Report | `doc/Reports/FDBM_CoreMesh_Compression_Benchmark_2026-10-09.md` | active | Dense GridFF vs coremesh disk/speed SSOT: 156–505 KB archives vs 0.65–2.2 GB dense (~9000×), fit 1.4–7.1 s, scan ≤0.2 s |
+| HowTo | `doc/HowTo/FDBM_Compression_CoreMesh.md` | active | End-to-end recipe: basis spec, gpugram + inpaint mesh fit, CLI, pitfalls |
 | Design | `doc/Topics/AFM/ContactSurface_Static.md` | active | Quasi-2D physics + API |
 | Report | `doc/Reports/ContactSurface_2p5D_vs_GridFF_2026-07-24.md` | active | Quasi-2D vs GridFF parity |
 
 ## Parity Status
 
-Sampled-field fit under USER review (2026-10-07): `CoarseMesh.fit_coremesh_lsq`
-uses a core prefit followed by one weighted joint objective over overlapping
-bases. Numerical core supports are C2; no physical cutoff surface is fitted.
-Cached C–C, h=0.5 Å: independent reachable xz E rms 2.95 meV versus 4.06 meV
-for the same weighted spline-only solve, maximum 46.0 versus 59.9 meV. The
-deep-wall sampled guard has minimum model E=0.3403 eV for original E>=1 eV
-(E_cut=0.3 eV). Analytic synthetic E/F and existing evaluator regressions pass;
-real FDBM force/df, azaindol, and coarser grids remain unverified. See
-[the design](../Tasks/ContactPME_CoreMesh_Fit_Design.md).
+Sampled-field coremesh fit measured on real FDBM fields (2026-10-09):
+`poly8sp` core (`A:s3p2+B:s1`, GPU Gram λ=1e-6) + omit-by-inpaint banded mesh —
+df corr .958–.999 vs FDBM across azaindol…circumcoronene (72 atoms),
+holdout Fz corr ≥.999, CPU↔GPU max|ΔF| ≤1.7e-6, ~9000× disk compression.
+Legacy note (2026-10-07, weighted `fit_coremesh_lsq` path, kept via
+`--mesh-fit cg`): core prefit + one weighted joint objective; C–C cached
+h=0.5 Å xz E rms 2.95 meV vs 4.06 meV spline-only; deep-wall guard min model
+E=0.34 eV for E≥1 eV (E_cut=0.3 eV). See
+[the design](../Tasks/ContactPME_CoreMesh_Fit_Design.md) and
+[the benchmark](../Reports/FDBM_CoreMesh_Compression_Benchmark_2026-10-09.md).
 
 | Pair | Tolerance / metric | Test / artifact | Status |
 |------|--------------------|-----------------|--------|

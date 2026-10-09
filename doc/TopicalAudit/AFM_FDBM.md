@@ -21,6 +21,7 @@ Product FDBM path is **ModularAFMPipeline** (FAST_S3 GPU Stage-3 + FIRE PP scan)
 | Python | `spammm/SPM/AFM_utils.py` | active | Tips, `compose_and_relax_total`, `run_br_stm_afm_panel`, plot SSOT |
 | Python | `spammm/GUI/AFMExtension.py` | active | GUI adapter; must use Pauli SSOT from `PAULI_FITTED_DEFAULTS` |
 | Python | `run_spm.py` `afm` | **deprecated fork** | Still calls `_run_from_density`; replace after parity gate (done) |
+| Python | `tests/SPM/testplot_fdbm_fields_compress.py` | active | FDBM→coremesh compression harness (`--method coremesh --core-basis poly8sp --core-solver gpugram`): ~9000× disk vs dense GridFF (156–505 KB vs 0.65–2.2 GB), df corr .958–.999 on 5 PAHs — benchmark `doc/Reports/FDBM_CoreMesh_Compression_Benchmark_2026-10-09.md`, recipe `doc/HowTo/FDBM_Compression_CoreMesh.md` |
 | Python | `tests/SPM/testplot_fdbm_relax._run_from_density` | **deprecated** | Legacy CPU-FFT Stage-3; keep only as parity/diagnostic until CLI cutover |
 | Python | `tests/SPM/testplot_cli_vs_modular_parity.py` | active | LEGACY vs FAST step parity + timing |
 | OpenCL | `kernels/AFM.cl` | active | PP relax + `fdbm_*` Stage-3 helpers |

@@ -1018,6 +1018,89 @@ class ContactSurfaceCL(OpenCLBase):
             print(f'fit_core_sp_cg: ns={ns} ncoef={ncoef} ({nc}x{nmod}) iters={it} |Âᵀs|/|Âᵀs0|={hist[-1]:.2e} resid_rms={info["rms_s"]:.3e} ({sec:.1f}s)', flush=True)
         return coeffs, info
 
+    def fit_core_sp_gram(self, centers, w, Rlad, pts, E_ref, F_ref, wF=0.3, ridge=1e-6, SB=1024, bPrint=True, active=None):
+        """Direct normal-equation solve on the GPU: assemble G = ÂᵀÂ column by
+        column (G[:,j] = Atv(Av e_j), ~3 kernel calls/column, no dense design
+        anywhere), then Jacobi-scaled Tikhonov + Cholesky on the host.
+        Deterministic — no CG iterations. Same contract as fit_core_sp_cg
+        (returns per-center slot-layout coeffs; fitted buffer stays resident)."""
+        assert hasattr(self.prg, 'cs_sp_Av'), 'ContactSurfaceCL program lacks cs_sp_* kernels — build with CS_PME_SP_CORE=1 (poly8sp options)'
+        centers = np.ascontiguousarray(centers, np.float64).reshape(-1, 3)
+        w = np.ascontiguousarray(w, np.float64).reshape(-1)
+        Rlad = np.asarray(Rlad, np.float64)
+        nmod = 3 + 3 * (len(Rlad) - 3)
+        nc = len(centers); ncoef = nc * nmod
+        pts = np.ascontiguousarray(pts, np.float32).reshape(-1, 3)
+        E_ref = np.ascontiguousarray(E_ref, np.float64).reshape(-1)
+        assert len(pts) == len(E_ref)
+        ns = len(pts)
+        wF_eff = float(wF) if F_ref is not None else 0.0
+        if F_ref is None:
+            F_ref = np.zeros((ns, 3), np.float64)
+        lsz = self.nloc
+        loc = self.ctx.devices[0].get_info(cl.device_info.LOCAL_MEM_SIZE)
+        assert nc * 16 + ncoef * 4 + 2 * lsz * 16 <= loc, f'local memory insufficient for nat={nc} NMODES={nmod}'
+        SB = max(int(SB), lsz)
+        ngroups = (ns + SB - 1) // SB
+        self._sp_ensure(ns, ncoef, ngroups)
+        atoms4 = np.zeros((nc, 4), np.float32); atoms4[:, :3] = centers; atoms4[:, 3] = w
+        if getattr(self, 'cs_sp_atoms_buff', None) is None or self.cs_sp_atoms_buff.size != nc * 16:
+            self.cs_sp_atoms_buff = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, nc * 16)
+        self.toGPU_(self.cs_sp_atoms_buff, atoms4)
+        b4 = np.zeros((ns, 4), np.float32)
+        b4[:, :3] = -wF_eff * F_ref; b4[:, 3] = E_ref
+        self.toGPU_(self.cs_sp_samp_buff, pts.reshape(-1))
+        self.toGPU_(self.cs_sp_b_buff, b4)
+        d_span = np.float32(Rlad[0])
+        t0 = time.perf_counter()
+        nGs = self._roundup(ns, lsz)
+        ns4 = 4 * ns
+        act = np.ones(ncoef, bool) if active is None else np.asarray(active, bool)
+        assert act.shape == (ncoef,)
+        # column norms (diag of G) and rhs b = Âᵀ b̂
+        self.prg.cs_copy(self.queue, (self._roundup(ns4, lsz),), (lsz,), np.int32(ns4), self.cs_sp_b_buff, self.cs_sp_s_buff)
+        self._sp_Atv(ns, ncoef, nc, ngroups, SB, d_span, wF_eff, 1, self.cs_sp_D_buff)
+        colnorm = self.fromGPU_(self.cs_sp_D_buff, shape=(ncoef,)).astype(np.float64)
+        assert np.isfinite(colnorm).all(), 'non-finite column norm in sp design'
+        self._sp_Atv(ns, ncoef, nc, ngroups, SB, d_span, wF_eff, 0, self.cs_sp_g_buff)
+        b = self.fromGPU_(self.cs_sp_g_buff, shape=(ncoef,)).astype(np.float64)
+        # Gram columns: only active ones (inactive slot columns are exactly 0)
+        G = np.zeros((ncoef, ncoef), np.float64)
+        jact = np.flatnonzero(act & (colnorm > 0))
+        one = np.zeros(1, np.float32); one[0] = 1.0
+        for j in jact:
+            self.prg.cs_zero(self.queue, (self._roundup(ncoef, lsz),), (lsz,), np.int32(ncoef), self.cs_sp_v_buff)
+            cl.enqueue_fill_buffer(self.queue, self.cs_sp_v_buff, one, 4 * int(j), 4)
+            self._sp_Av(nGs, ns, ncoef, nc, d_span, wF_eff, self.cs_sp_v_buff, self.cs_sp_q_buff)
+            self.prg.cs_copy(self.queue, (self._roundup(ns4, lsz),), (lsz,), np.int32(ns4), self.cs_sp_q_buff, self.cs_sp_s_buff)
+            self._sp_Atv(ns, ncoef, nc, ngroups, SB, d_span, wF_eff, 0, self.cs_sp_g_buff)
+            G[:, j] = self.fromGPU_(self.cs_sp_g_buff, shape=(ncoef,))
+            if bPrint and j % 200 == 0:
+                print(f'  fit_core_sp_gram: col {j}/{ncoef} ({time.perf_counter() - t0:.1f}s)', flush=True)
+        G = 0.5 * (G + G.T)                                        # symmetrize f32 assembly noise
+        d = 1.0 / np.sqrt(np.maximum(colnorm, 1e-30)); d[~(act & (colnorm > 0))] = 0.0
+        Gs = G * d[:, None] * d[None, :] + float(ridge) * np.eye(ncoef)
+        try:
+            xs = np.linalg.solve(Gs, d * b)
+        except np.linalg.LinAlgError:
+            xs = np.linalg.lstsq(Gs, d * b, rcond=1e-12)[0]
+        c = (xs * d).astype(np.float32)
+        self.toGPU_(self.cs_sp_v_buff, c)
+        # true operator residual: s = b̂ - Â c
+        self._sp_Av(nGs, ns, ncoef, nc, d_span, wF_eff, self.cs_sp_v_buff, self.cs_sp_q_buff)
+        self.prg.cs_copy(self.queue, (self._roundup(ns4, lsz),), (lsz,), np.int32(ns4), self.cs_sp_b_buff, self.cs_sp_s_buff)
+        self.prg.addMul(self.queue, (self._roundup(ns4, lsz),), (lsz,), np.int32(ns4), self.cs_sp_s_buff, self.cs_sp_q_buff, np.float32(-1.0))
+        rms_s = float(np.sqrt(self.dot_gpu(self.cs_sp_s_buff, self.cs_sp_s_buff, ns4) / ns4))
+        self.queue.finish()
+        sec = time.perf_counter() - t0
+        self._sp_fit = dict(nat=nc, nmod=nmod, d_span=float(d_span), wF=float(wF_eff))
+        coeffs = c.astype(np.float64).reshape(nc, nmod)
+        resid = np.linalg.norm(G @ c - b) / max(np.linalg.norm(b), 1e-30)
+        info = dict(iters=0, sec=sec, nactive=len(jact), colnorm=colnorm, resid=resid, rms_s=rms_s)
+        if bPrint:
+            print(f'fit_core_sp_gram: ns={ns} ncoef={ncoef} active={len(jact)} ridge={ridge:g} |Gc-b|/|b|={resid:.2e} ({sec:.1f}s)', flush=True)
+        return coeffs, info
+
     def eval_core_sp_gpu(self, pts, chunk=1 << 20):
         """Evaluate the fitted poly8sp core (E, F=-grad E) via cs_sp_Av with wF=1.
         Requires a prior fit_core_sp_cg (resident centers + coefficients)."""

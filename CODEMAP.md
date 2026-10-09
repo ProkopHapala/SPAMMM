@@ -56,7 +56,7 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `ContactSurface.py` — **quasi-2D contact field** for aperiodic AFM: separable B-spline×poly + radial PIC; also `ContactPMEParams` for particle-mesh backend
 - `PMESplit.py` — atomwise PAW/hermite/plateau/rho soft long/short split (default `paw`, `Δ_in=1.0`); `precompute_split_cache`
 - `CoarseMesh.py` — coarse 3D cubic B-spline mesh of V_L; batched prefilter; CPU raster oracle
-- `PICCore.py` — compact doubling-power core of v_S (`fit_core_1d` host; paw oracle `fit_core_paw_grid`; GPU `cs_fit_core_paw`); core+mesh bases: poly8 scalar (`fit_core_poly_shell`, `eval_core_poly`) and poly8sp angular s/p (`fit_core_sp_shell`, `eval_core_sp`, `sp_ladder`; kernel `CS_PME_SP_CORE`, NMODES=3+3·NP; GPU CGLS fit via `ContactSurfaceCL.fit_core_sp_cg` — kernels `cs_sp_Av`/`cs_sp_Atv`/`cs_reduce_groups`, no atomics; `min_dist_to_atoms`)
+- `PICCore.py` — compact doubling-power core of v_S (`fit_core_1d` host; paw oracle `fit_core_paw_grid`; GPU `cs_fit_core_paw`); core+mesh bases: poly8 scalar (`fit_core_poly_shell`, `eval_core_poly`) and poly8sp angular s/p (`fit_core_sp_shell`, `eval_core_sp`, `sp_ladder`; kernel `CS_PME_SP_CORE`, NMODES=3+3·NP); GPU fit solvers in `ContactSurfaceCL`: matrix-free CGLS `fit_core_sp_cg` and **direct Gram `fit_core_sp_gram`** (production default, ~0.3–1.9 s flat) via kernels `cs_sp_Av`/`cs_sp_Atv`/`cs_reduce_groups`; `inpaint_residual` for omit-by-inpaint mesh fit; `min_dist_to_atoms`
 - `CoreBasisStudy.py` — experimental angular core-basis survey machinery: spec grammar `A:s3p2+B:s1`, design matrix, weighted LSQ (force rows), core-only residual study vs oracle grid
 - `GridFFRelaxedScan.py` — relaxed scan over surface grid
 - `FoldedRigid.py` — folded basis rigid body relaxation
@@ -199,7 +199,8 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `TEST_DESIGN.md` — test system design
 - `TEST_RESULTS.md` (in `tests/`) — test results log
 - `AGENTS/` — agent instructions, skills, protocols, workflows
-- `HowTo/` — how-to guides
+- `HowTo/` — how-to guides (`FDBM_Compression_CoreMesh.md` — coremesh fit/usage recipe)
+- `Reports/` — measurement/benchmark reports (`FDBM_CoreMesh_Compression_Benchmark_2026-10-09.md` — dense GridFF vs coremesh disk/speed)
 - `Tasks/` — task design documents (e.g. `ReactionCoordinateExtension_Design.md`)
 - `Reports/` — durable scientific handoffs (e.g. Fukui panel ES notes)
 - `TopicalAudit/` — per-topic implementation maps (e.g. `AFM_FDBM.md`)

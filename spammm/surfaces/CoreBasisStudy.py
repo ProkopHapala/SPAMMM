@@ -118,6 +118,43 @@ def fit_core_lsq(Pf, Ef, Ff, sets, wF=0.0, rcond=1e-12):
     return c, ME
 
 
+def fit_core_gram(Pf, Ef, Ff, sets, wF=0.0, ridge=1e-8, chunk=4000, active=None, bPrint=False):
+    """Direct normal-equation solve: assemble the small Gram G=AᵀA (ncoef²)
+    in memory-bounded chunks, then Cholesky. Same weighted objective as
+    fit_core_lsq (E rows + wF·∂rows). No iterations, deterministic time;
+    memory O(chunk·ncoef + ncoef²) — unlike lstsq's O(npts·ncoef).
+    `active` (ncoef bool) freezes unused slots (e.g. bond p/d modes) at 0.
+    ridge stabilizes unconstrained near-null directions. Returns (coef, info)."""
+    import scipy.linalg as sla
+    nc = sum(len(modes) * len(C) for C, modes in sets)
+    npt = len(Pf)
+    G = np.zeros((nc, nc)); b = np.zeros(nc)
+    for i0 in range(0, npt, chunk):
+        i1 = min(i0 + chunk, npt)
+        ME, MG = design(Pf[i0:i1], sets, grad=True)
+        G += ME.T @ ME; b += ME.T @ Ef[i0:i1]
+        if wF > 0:
+            for a in range(3):
+                G += wF * wF * (MG[:, :, a].T @ MG[:, :, a]); b += wF * wF * (MG[:, :, a].T @ (-Ff[i0:i1, a]))
+    if active is not None:
+        act = np.asarray(active, bool)
+        G[~act, :] = 0.0; G[:, ~act] = 0.0
+        G[~act, ~act] = 1.0; b[~act] = 0.0
+    diag = np.diag(G).copy()
+    d = 1.0 / np.sqrt(np.maximum(diag, 1e-30)); d[diag <= 0] = 0.0       # Jacobi scale, zero cols frozen
+    Gs = G * d[:, None] * d[None, :] + ridge * np.eye(nc)                # Tikhonov in scaled space
+    try:
+        xs = sla.solve(Gs, d * b, assume_a='pos')
+    except sla.LinAlgError:
+        xs = np.linalg.lstsq(Gs, d * b, rcond=1e-12)[0]
+    c = xs * d
+    r = np.linalg.norm(G @ c - b) / max(np.linalg.norm(b), 1e-30)
+    nzero = int(np.sum(diag <= 0))
+    if bPrint:
+        print(f'fit_core_gram: npt={npt} ncoef={nc} zero-cols={nzero} |Gc-b|/|b|={r:.2e} cond~{np.linalg.cond(Gs):.2e}', flush=True)
+    return c, dict(resid=r, nzero=nzero, ncoef=nc)
+
+
 def eval_terms(P, sets, coef, chunk=8000):
     """Evaluate core E and Fz at points P. Returns (E (np,), Fz (np,))."""
     E = np.empty(len(P)); Fz = np.empty(len(P))

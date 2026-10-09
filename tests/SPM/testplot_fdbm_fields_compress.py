@@ -75,8 +75,8 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
                  bspl_steps=(0.8,), n_iter=1200, z_modes=8, poly_z0=2.2, poly_R=8.0,
                  no_core=False, n_shell=6000, n_cloud=32768,
                  delta_in=1.0, delta_b=1.0, z_fit_dz=1.2, resid_cap=10.0, lam=1e-3,
-                 core_basis='poly8', core_wF=0.3, core_spec='A:s3p2+B:s1', core_solver='gpu',
-                 skip_spline_only=False):
+                 core_basis='poly8', core_wF=0.3, core_spec='A:s3p2+B:s1', core_solver='gpu', core_ridge=1e-8,
+                 mesh_fit='inpaint', skip_spline_only=False):
     from spammm import atomicUtils as au
     from spammm.SPM import AFM as afm, AFM_utils as afm_utils
     from spammm.config_utils import get_dftb_basis_path
@@ -85,7 +85,7 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
     tag = method
     if method == 'coremesh':
         spec_tag = '' if core_basis == 'poly8' else '-' + re.sub(r'[^A-Za-z0-9]+', '', core_spec)
-        tag = f'coremesh_{core_basis}{spec_tag}'
+        tag = f'coremesh_{core_basis}{spec_tag}' + ('' if mesh_fit == 'inpaint' else f'_{mesh_fit}')
     outdir = os.path.join(OUTROOT, f'{mol_name}_s{step:g}_{tag}{h_mesh if method != "sep" else bspl_steps[0]:g}')
     os.makedirs(outdir, exist_ok=True)
     atomPos, _, enames, _, _ = au.load_xyz(xyz_file)
@@ -287,13 +287,13 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
             # angular sp core (default spec A:s3p2+B:s1 -> 9 slots/center, kernel CS_PME_SP_CORE)
             from spammm.surfaces.PICCore import fit_core_sp_shell, eval_core_sp, sp_ladder
             Rlab, _ = sp_ladder(core_spec)
-            if core_solver == 'gpu':
-                # the GPU CGLS runs in the kernel slot layout -> SP-compiled
+            if core_solver in ('gpu', 'gpugram'):
+                # the GPU solvers run in the kernel slot layout -> SP-compiled
                 # program must exist BEFORE the fit (the later call is a no-op)
                 a.set_pme_core_basis('poly8sp', poly_R=Rlab)
-            fit, centers = fit_core_sp_shell(atomPos, pts=pts, E=E_ss, F=F_ss, wF=core_wF, rin=2.5, rcut=4.0, z_min=z_min, spec=core_spec, solver=core_solver, afm=a)
+            fit, centers = fit_core_sp_shell(atomPos, pts=pts, E=E_ss, F=F_ss, wF=core_wF, rin=2.5, rcut=4.0, z_min=z_min, spec=core_spec, solver=core_solver, afm=a, ridge=core_ridge)
             cg_info = getattr(fit, 'cg_info', None)
-            if core_solver == 'gpu':
+            if core_solver in ('gpu', 'gpugram'):
                 E_core, _ = a._cs_fit_helper().eval_core_sp_gpu(pts)
             else:
                 E_core, _ = eval_core_sp(pts, centers, fit.coeffs, fit.r_lo, fit.poly_R)
@@ -306,26 +306,57 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
             n_bond = int(is_bond.sum())
             Rlab = POLY_CORE_R
         resid = (E_ss.astype(np.float64) - E_core).reshape(ns_ss)
-        from spammm.surfaces.PICCore import min_dist_to_atoms
-        rm_pts = min_dist_to_atoms(pts, atomPos)
-        w = ((rm_pts > 2.5) & (pts[:, 2] > z_min)).reshape(ns_ss).astype(np.float64)
+        from spammm.surfaces.PICCore import min_dist_to_atoms, inpaint_residual
         t_core = time.perf_counter() - t1
-        tm = time.perf_counter()
-        mesh, _, dg_res = fit_coremesh_lsq(resid, np.empty((0, 3)), lo, h, np.empty(0), np.empty(0),
+
+        def mesh_fit_lsq(target3):
+            """Fit mesh on node grid. 'inpaint': omit too-close cells (rm<2.5 or below
+            z_min) by harmonic fill (PAW recipe) + separable banded solve — no CG.
+            'cg': legacy weighted supersampled CG (fit_coremesh_lsq)."""
+            if mesh_fit == 'inpaint':
+                from scipy.ndimage import binary_dilation, map_coordinates
+                from spammm.surfaces.CoarseMesh import fit_mesh_lsq_3d, CoarseMesh
+                rn = np.ascontiguousarray(target3[::s, ::s, ::s])          # node samples
+                Pn = np.stack(np.meshgrid(*[lo[a_] + np.arange(n_mesh[a_]) * h for a_ in range(3)], indexing='ij'), -1).reshape(-1, 3)
+                mask = (min_dist_to_atoms(Pn, atomPos) < 2.5) | (Pn[:, 2] < z_min)
+                mask = binary_dilation(mask.reshape(n_mesh), iterations=1)
+                rf = inpaint_residual(rn.ravel(), n_mesh, mask).reshape(n_mesh)
+                cf = fit_mesh_lsq_3d(rf, s=1, lam=lam)
+                ev = map_coordinates(cf, np.indices(n_mesh, dtype=np.float64).reshape(3, -1), order=3, mode='nearest', prefilter=False).reshape(n_mesh)
+                wrms = np.sqrt(np.mean((rn - ev)[~mask] ** 2))
+                print(f'[coremesh] mesh inpaint nodes: masked {int(mask.sum())}/{mask.size} ({100.0 * mask.mean():.1f}%), node wrms={wrms * 1e3:.3f} meV', flush=True)
+                if s > 1:
+                    # omitted ss cells: seed with node-fit mesh value, then harmonic
+                    # fill -> smooth continuation; refit on the full ss grid (banded)
+                    msk_ss = ((min_dist_to_atoms(pts, atomPos) < 2.5) | (pts[:, 2] < z_min)).reshape(ns_ss)
+                    msk_ss = binary_dilation(msk_ss, iterations=s // 2)
+                    g = ((pts - np.asarray(lo)) / h).T                       # node-fraction coords
+                    seed = np.zeros(int(np.prod(ns_ss)))
+                    seed[msk_ss.ravel()] = map_coordinates(cf, g[:, msk_ss.ravel()], order=3, mode='nearest', prefilter=False)
+                    rf_ss = inpaint_residual(target3.ravel(), ns_ss, msk_ss, n_iter=150, seed=seed).reshape(ns_ss)
+                    cf = fit_mesh_lsq_3d(rf_ss, s=s, lam=lam)
+                return CoarseMesh(cf, np.asarray(lo, np.float64).copy(), float(h), 2,
+                                  (np.full(3, halo, np.int64), np.asarray(n_mesh) - 1 - halo)), dict(iterations=0, wrmse=wrms)
+            rm_pts = min_dist_to_atoms(pts, atomPos)
+            w = ((rm_pts > 2.5) & (pts[:, 2] > z_min)).reshape(ns_ss).astype(np.float64)
+            mesh, _, dg = fit_coremesh_lsq(target3, np.empty((0, 3)), lo, h, np.empty(0), np.empty(0),
                                            s=s, weights=w, lam=lam, tol=1e-7, maxiter=20000)
+            return mesh, dg
+
+        tm = time.perf_counter()
+        mesh, dg_res = mesh_fit_lsq(resid)
         t_m1 = time.perf_counter() - tm
-        print(f'[coremesh] mesh(E-core) CG iters {dg_res["iterations"]} wrms={dg_res["wrmse"]*1e3:.3f} meV ({t_m1:.1f}s)', flush=True)
+        print(f'[coremesh] mesh(E-core) {mesh_fit} iters {dg_res["iterations"]} wrms={dg_res["wrmse"]*1e3:.3f} meV ({t_m1:.1f}s)', flush=True)
         cpm = cpm_params_from_coremesh(mesh.coeffs, lo, h, halo, centers, fit)
         tm = time.perf_counter()
         if skip_spline_only:
-            mesh_s = None; t_m2 = 0.0; dg_spl = None
+            mesh_s = None; t_m2 = 0.0
             print('[coremesh] mesh_spl=skipped (--skip-spline-only)', flush=True)
         else:
-            mesh_s, _, dg_spl = fit_coremesh_lsq(E_ss.astype(np.float64).reshape(ns_ss), np.empty((0, 3)), lo, h, np.empty(0), np.empty(0),
-                                               s=s, weights=w, lam=lam, tol=1e-7, maxiter=20000)
+            mesh_s, dg_spl = mesh_fit_lsq(E_ss.astype(np.float64).reshape(ns_ss))
             t_m2 = time.perf_counter() - tm
-            print(f'[coremesh] mesh(spline-only) CG iters {dg_spl["iterations"]} wrms={dg_spl["wrmse"]*1e3:.3f} meV ({t_m2:.1f}s)', flush=True)
-        print(f'[timing] sample={t_samp:.2f}s core_fit={t_core:.2f}s mesh1={t_m1:.2f}s mesh2={t_m2:.2f}s' + (f' cg_iters={cg_info["iters"]} cg_sec={cg_info["sec"]:.2f}' if cg_info is not None else ''), flush=True)
+            print(f'[coremesh] mesh(spline-only) {mesh_fit} iters {dg_spl["iterations"]} wrms={dg_spl["wrmse"]*1e3:.3f} meV ({t_m2:.1f}s)', flush=True)
+        print(f'[timing] sample={t_samp:.2f}s core_fit={t_core:.2f}s mesh1={t_m1:.2f}s mesh2={t_m2:.2f}s' + (f' cg_iters={cg_info["iters"]} cg_sec={cg_info["sec"]:.2f}' if (cg_info is not None and 'iters' in cg_info) else ''), flush=True)
         fit0 = dataclasses.replace(fit, coeffs=np.zeros_like(fit.coeffs))
         cpm0 = cpm_params_from_coremesh(mesh_s.coeffs, lo, h, halo, centers, fit0) if not skip_spline_only else None
         a.set_pme_core_basis(core_basis, poly_R=Rlab)
@@ -478,7 +509,7 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
     if method == 'coremesh':
         row.update(natoms=len(atomPos), ncenters=len(centers), ncoef=int(fit.coeffs.size),
                    npts=len(pts), mesh_nodes='x'.join(map(str, n_mesh)), core_fit_sec=t_core,
-                   cg_iters=(cg_info['iters'] if cg_info is not None else -1), cg_sec=(cg_info['sec'] if cg_info is not None else 0.0),
+                   cg_iters=(cg_info['iters'] if (cg_info is not None and 'iters' in cg_info) else -1), cg_sec=(cg_info.get('sec', 0.0) if cg_info is not None else 0.0),
                    mesh_res_sec=t_m1, mesh_res_iters=dg_res['iterations'], eval_ms=eval_ms,
                    resident_bytes=cpm.resident_bytes)
     return row
@@ -502,8 +533,11 @@ def main():
                    help='coremesh core basis: poly8 = 5 scalar slots; poly8sp = 9-slot angular sp (A:s3p2+B:s1)')
     p.add_argument('--core-wF', type=float, default=0.3, help='poly8sp force-row weight in core LSQ (0 = energy only)')
     p.add_argument('--core-spec', default='A:s3p2+B:s1', help="poly8sp basis spec, e.g. 'A:s3p2+B:s1' or atom-only 'A:s3p3'")
-    p.add_argument('--core-solver', choices=('gpu', 'lstsq'), default='gpu',
-                   help="poly8sp core fit solver: gpu = matrix-free CGLS on OpenCL (design doc §16); lstsq = CPU dense design (small molecules only)")
+    p.add_argument('--core-solver', choices=('gpu', 'gpugram', 'lstsq', 'gram'), default='gpu',
+                   help="poly8sp core fit solver: gpu = matrix-free CGLS on OpenCL (design doc §16); gpugram = GPU Gram columns + Cholesky (exact+ridge, no iterations); gram/lstsq = CPU references")
+    p.add_argument('--core-ridge', type=float, default=1e-8, help='gram solver: Tikhonov ridge on the column-scaled Gram (fraction of trace/ncoef)')
+    p.add_argument('--mesh-fit', choices=('inpaint', 'cg'), default='inpaint',
+                   help="coremesh mesh solve: inpaint = omit rm<2.5/z<z_min cells via harmonic fill + separable banded fit (fast, PAW recipe); cg = legacy weighted supersampled CG")
     p.add_argument('--skip-spline-only', action='store_true', help='coremesh: skip the spline-only mesh fit + scan variant (halves mesh time)')
     args = p.parse_args()
     MOLS = {'azaindol': 'data/xyz/azaindol.xyz', 'PTCDA': 'data/xyz/PTCDA.xyz',
@@ -520,7 +554,7 @@ def main():
                                  delta_in=args.din, delta_b=args.db,
                                  z_fit_dz=args.z_fit, resid_cap=args.cap, lam=args.lam,
                                  core_basis=args.core_basis, core_wF=args.core_wF, core_spec=args.core_spec, core_solver=args.core_solver,
-                                 skip_spline_only=args.skip_spline_only))
+                                 skip_spline_only=args.skip_spline_only, mesh_fit=args.mesh_fit, core_ridge=args.core_ridge))
     print(f"\n\n{'='*80}")
     hdr = (f"{'mol':22s} {'method':8s} {'nat':>4s} {'ncntr':>6s} {'ncoef':>6s} {'npts':>9s} {'mesh':>10s} "
            f"{'core_s':>7s} {'cgit':>5s} {'mesh1_s':>7s} {'scan_s':>7s} {'ms/1k':>6s} {'res_MB':>7s} "

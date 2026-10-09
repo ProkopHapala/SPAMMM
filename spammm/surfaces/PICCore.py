@@ -202,7 +202,7 @@ def sp_ladder(spec='A:s3p2+B:s1'):
 
 def fit_core_sp_shell(apos, pts=None, E=None, F=None, wF=0.3, rin=2.5, rcut=4.0,
                       z_min=None, dbond=1.6, spec='A:s3p2+B:s1', N=POLY_CORE_N, bPrint=True,
-                      solver='lstsq', afm=None):
+                      solver='lstsq', afm=None, ridge=1e-8):
     """Weighted LSQ fit of the poly8sp core on shell rin<r_min<rcut.
 
     solver='lstsq' delegates the basis machinery to CoreBasisStudy (build_terms +
@@ -215,7 +215,7 @@ def fit_core_sp_shell(apos, pts=None, E=None, F=None, wF=0.3, rin=2.5, rcut=4.0,
     (encoded as slot0 with radius scale w=Rb/Rlad[0]). Returns (CoreFit
     basis='poly8sp', centers (nc,3)) — centers ordered atoms then bond
     midpoints, matching CoreBasisStudy.build_terms."""
-    from spammm.surfaces.CoreBasisStudy import build_terms, fit_core_lsq
+    from spammm.surfaces.CoreBasisStudy import build_terms, fit_core_lsq, fit_core_gram
     apos = np.asarray(apos, np.float64).reshape(-1, 3)
     na = len(apos)
     Rlad, Rb = sp_ladder(spec)
@@ -242,7 +242,7 @@ def fit_core_sp_shell(apos, pts=None, E=None, F=None, wF=0.3, rin=2.5, rcut=4.0,
     w = np.ones(na + nb)
     if nb:
         w[na:] = Rb / Rlad[0]                            # bond radius scale (kernel w-channel)
-    if solver == 'gpu':
+    if solver in ('gpu', 'gpugram'):
         assert afm is not None, "solver='gpu' needs afm=AFMulator compiled for 'poly8sp'"
         opts = getattr(afm, '_pme_build_opts', []) or []
         assert 'CS_PME_SP_CORE=1' in opts, f"afm not compiled for poly8sp (opts={opts})"
@@ -252,23 +252,38 @@ def fit_core_sp_shell(apos, pts=None, E=None, F=None, wF=0.3, rin=2.5, rcut=4.0,
         if nb:
             ab = np.zeros(nb * nmod, bool); ab[0::nmod] = True   # bond centers: slot0 only (='B:s1')
             active = np.concatenate([active, ab])
-        coeffs, cinfo = afm._cs_fit_helper().fit_core_sp_cg(centers, w, Rlad, Pf, Ef, Ff, wF=wF, bPrint=bPrint, active=active)
+        if solver == 'gpugram':
+            coeffs, cinfo = afm._cs_fit_helper().fit_core_sp_gram(centers, w, Rlad, Pf, Ef, Ff, wF=wF, ridge=ridge, bPrint=bPrint, active=active)
+        else:
+            coeffs, cinfo = afm._cs_fit_helper().fit_core_sp_cg(centers, w, Rlad, Pf, Ef, Ff, wF=wF, bPrint=bPrint, active=active)
         _cg_info = cinfo
         if bPrint:
             print(f'fit_core_sp_shell(gpu): spec={spec} fit samples {len(Pf)}, ncoef {coeffs.size} ({na}+{nb} centers), wF={wF if Ff is not None else 0.0} '
                   f'iters={cinfo["iters"]} ({cinfo["sec"]:.1f}s)  resid rms={cinfo["rms_s"] * 1e3:.2f} meV-rows', flush=True)
         cond = np.nan
     else:
-        assert solver == 'lstsq', f"unknown solver '{solver}'"
-        coef, ME = fit_core_lsq(Pf, Ef, Ff, sets, wF=wF if Ff is not None else 0.0)
+        assert solver in ('lstsq', 'gram'), f"unknown solver '{solver}'"
+        if solver == 'gram':
+            coef, _ginfo = fit_core_gram(Pf, Ef, Ff, sets, wF=wF if Ff is not None else 0.0, ridge=ridge, bPrint=bPrint)
+        else:
+            coef, ME = fit_core_lsq(Pf, Ef, Ff, sets, wF=wF if Ff is not None else 0.0)
         assert coef.shape == (nmod * na + nb,)
         coeffs = np.zeros((na + nb, nmod))
         coeffs[:na] = coef[:nmod * na].reshape(nmod, na).T   # mode-major -> per-center slots
         if nb:
             coeffs[na:, 0] = coef[nmod * na:]                # bond s -> slot 0
-        ec = ME @ coef - Ef
-        cond = np.linalg.cond(ME)
-        _cg_info = None
+        if solver == 'gram':
+            from spammm.surfaces.CoreBasisStudy import design
+            ec = np.empty(len(Ef))
+            for i0 in range(0, len(Pf), 20000):
+                i1 = min(i0 + 20000, len(Pf))
+                ec[i0:i1] = design(Pf[i0:i1], sets) @ coef - Ef[i0:i1]
+            cond = np.nan
+            _cg_info = _ginfo
+        else:
+            ec = ME @ coef - Ef
+            cond = np.linalg.cond(ME)
+            _cg_info = None
         if bPrint:
             print(f'fit_core_sp_shell: spec={spec} fit samples {len(Pf)}, ncoef {len(coef)} ({na}+{nb} centers), wF={wF if Ff is not None else 0.0} '
                   f'cond~{cond:.2e}  shell rms={1e3 * np.sqrt(np.mean(ec**2)):.2f} meV '
@@ -1021,7 +1036,7 @@ def eval_vs_oracle(xyz, apos, oracle: FieldOracle):
     return vs, cov
 
 
-def inpaint_residual(resid_nodes, ns, mask, n_iter=400):
+def inpaint_residual(resid_nodes, ns, mask, n_iter=400, seed=None):
     """Harmonic (Laplace) fill of a residual field inside masked grid cells.
 
     Inside an atom's un-sampled deep ball (r < r_min of the field oracle) the
@@ -1031,6 +1046,8 @@ def inpaint_residual(resid_nodes, ns, mask, n_iter=400):
     solve ∇²g = 0 on the mask with Dirichlet BC = residual on the covered
     boundary (Jacobi iteration, vectorized slices). Masked cells at the grid
     border are excluded (no wrap-around).
+    `seed` optionally pre-fills masked cells (e.g. a coarse-mesh continuation)
+    before iterating — converges much faster than the default zero seed.
     Returns flattened (nx*ny*nz,) float64 residual with the mask inpainted."""
     g = np.asarray(resid_nodes, np.float64).reshape(tuple(ns)).copy()
     m = np.asarray(mask, bool).reshape(tuple(ns))
@@ -1038,7 +1055,10 @@ def inpaint_residual(resid_nodes, ns, mask, n_iter=400):
     if not m_in.any():
         return g.ravel()
     gi = g[1:-1, 1:-1, 1:-1]
-    gi[m_in] = 0.0                                               # seed
+    if seed is not None:
+        gi[m_in] = np.asarray(seed, np.float64).reshape(tuple(ns))[1:-1, 1:-1, 1:-1][m_in]
+    else:
+        gi[m_in] = 0.0                                           # seed
     for _ in range(n_iter):
         g6 = (g[:-2, 1:-1, 1:-1] + g[2:, 1:-1, 1:-1] + g[1:-1, :-2, 1:-1] +
               g[1:-1, 2:, 1:-1] + g[1:-1, 1:-1, :-2] + g[1:-1, 1:-1, 2:]) * (1.0 / 6.0)
