@@ -13,7 +13,9 @@ Open issues / caveats:
   - Always lock axes from explicit extent (xlim/ylim) so movie frames do not jump.
 
 Key helpers: plot_relaxation, plot_force_map, plot_manipulation,
-plot_pairff_faf_background, render_pairff_tip_pull_movie, save_pairff_xyz_trajectory.
+plot_pairff_faf_background, render_pairff_tip_pull_movie, save_pairff_xyz_trajectory,
+plot_core_residual_study (canonical core+mesh core-only residual figure; compute
+in CoreBasisStudy.core_residual_study).
 """
 
 import os
@@ -634,6 +636,44 @@ def render_pairff_tip_pull_movie(traj, Esum, extent, vmax, active_body, save_dir
         save_path=still_svg)
     print(f'REVIEW: {still_svg}')
     return paths, still
+
+
+def plot_core_residual_study(res, geo, rows, fname, title=None, inner_contour=2.5):
+    """Canonical CORE-ONLY residual figure (oracle - core, no mesh) for basis choice.
+
+    One row per fit variant (keys of res, ordered by `rows`); columns: energy
+    residual on an xz cut through the median-atom y, then Fz residual on xy
+    slices at heights geo['hs']. Shared symmetric clim per column (99th pct over
+    all rows) so rows are directly comparable; NaN = outside the display domain
+    (geo['w3']==0: r_min below the smallest fitted rin, or under the molecule).
+    Contours: r_min = inner_contour (black) and r_min = variant rcut (green).
+    Row ylabel carries high-pass rms (res[label]['hpe'/'hpf']) — the part of the
+    residual a ~1 A mesh cannot represent. Compute: CoreBasisStudy.core_residual_study.
+    """
+    P3, A, iz_h, mol_z, rm3, w3 = geo['P3'], geo['apos'], geo['iz_h'], geo['mol_z'], geo['rm3'], geo['w3']
+    hs = geo['hs']; spec = geo['spec']; ncol = 1 + len(hs)
+    yc = np.median(A[:, 1]); iy = int(np.argmin(np.abs(P3[0, :, 0, 1] - yc))); zs = P3[0, 0, :, 2]; kz = zs > mol_z + 0.5
+    fig, axs = plt.subplots(len(rows), ncol, figsize=(3.3 * ncol + 1.5, 2.9 * len(rows)), squeeze=False)
+    vE = max(np.nanpercentile(np.abs(np.where(w3 > 0, res[lab]['RE'], np.nan)[:, iy, kz]), 99) for lab in rows)
+    vF = {h: max(np.nanpercentile(np.abs(np.where(w3 > 0, res[lab]['RF'], np.nan)[..., iz]), 99) for lab in rows) for h, iz in iz_h.items()}
+    for i, lab in enumerate(rows):
+        r = res[lab]
+        RE = np.where(w3 > 0, r['RE'], np.nan)[:, iy, kz]
+        ax = axs[i, 0]; im = ax.imshow(RE.T, origin='lower', extent=[P3[0, 0, 0, 0], P3[-1, 0, 0, 0], zs[kz][0], zs[kz][-1]], cmap='seismic', vmin=-vE, vmax=vE, aspect='equal')
+        ax.contour(P3[:, 0, 0, 0], zs[kz], rm3[:, iy, kz].T, levels=[inner_contour, r['rcut']], colors=['k', 'g'], linewidths=0.8)
+        ax.plot(A[:, 0], A[:, 2], 'k.', ms=2); ax.set_ylabel(f'{lab}\nHP E={r["hpe"]:.2f} meV\nHP Fz={r["hpf"]:.1f} meV/A', fontsize=8)
+        if i == 0: ax.set_title(f'resid E xz y={yc:.1f} (+/-{1e3*vE:.0f} meV)\nblack r={inner_contour}, green r=rcut', fontsize=8)
+        fig.colorbar(im, ax=ax, shrink=0.7)
+        for j, (h, iz) in enumerate(iz_h.items()):
+            S = np.where(w3[..., iz] > 0, r['RF'][..., iz], np.nan); ax = axs[i, 1 + j]
+            im = ax.imshow(S.T, origin='lower', extent=[P3[0, 0, 0, 0], P3[-1, 0, 0, 0], P3[0, 0, 0, 1], P3[0, -1, 0, 1]], cmap='bwr', vmin=-vF[h], vmax=vF[h], aspect='equal')
+            ax.contour(P3[:, 0, 0, 0], P3[0, :, 0, 1], rm3[..., iz].T, levels=[r['rcut']], colors='g', linewidths=0.6)
+            ax.plot(A[:, 0], A[:, 1], 'k.', ms=1.2); fig.colorbar(im, ax=ax, shrink=0.7)
+            ax.set_xlabel(f'rms {r["fz"][j]:.1f} meV/A', fontsize=8)
+            if i == 0: ax.set_title(f'resid Fz h={h} (+/-{1e3*vF[h]:.0f} meV/A)', fontsize=8)
+    fig.suptitle(title or f'CORE-ONLY residual (oracle - core), basis {spec}; shared color scale per column; NaN = excluded')
+    fig.tight_layout(); fig.savefig(fname, dpi=115); plt.close(fig)
+    return fname
 
 
 def save_pairff_xyz_trajectory(filename, traj, comments_prefix='tip_pull'):

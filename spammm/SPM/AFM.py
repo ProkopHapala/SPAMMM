@@ -338,12 +338,40 @@ class AFMulator(OpenCLBase):
     DEFAULT_tipQZs     = np.array([ 0., 1.8, 3.6, 0.], dtype=np.float32)
 
 
-    def __init__(self, cl_src_dir=None, use_morse=False, nloc=32, use_fire=True, pme_core_basis='raw'):
-        if pme_core_basis not in ('raw', 'smooth'):
-            raise ValueError('pme_core_basis must be raw or smooth')
+    def _pme_build_options(self, use_fire, pme_core_basis, pme_poly_R):
+        """OpenCL -D build options for the AFM+contact_surface kernels.
+
+        CS_PME_SMOOTH_CORE=1 for 'smooth'; CS_PME_POLY_CORE=1 + CS_PME_POLY_N +
+        CS_PME_POLY_R0..R4 ladder for 'poly8'/'poly8sp'; 'poly8sp' additionally
+        sets CS_PME_SP_CORE=1 + CS_PME_NMODES=9 (raw/smooth stay unchanged otherwise).
+        """
+        if pme_core_basis not in ('raw', 'smooth', 'poly8', 'poly8sp'):
+            raise ValueError("pme_core_basis must be 'raw', 'smooth', 'poly8' or 'poly8sp'")
+        poly = pme_core_basis in ('poly8', 'poly8sp')
+        opts = ['-D', f'OPT_FIRE={1 if use_fire else 0}',
+                '-D', f'CS_PME_SMOOTH_CORE={int(pme_core_basis == "smooth")}',
+                '-D', f'CS_PME_POLY_CORE={int(poly)}']
+        if poly:
+            from spammm.surfaces.PICCore import POLY_CORE_N
+            R = np.asarray(pme_poly_R, np.float64)
+            nR_ok = (5,) if pme_core_basis == 'poly8' else (5, 6)   # poly8sp: 3 s + NP=2|3 p radii
+            if R.shape not in [(_n,) for _n in nR_ok] or not np.all(np.isfinite(R)) or np.any(R <= 0):
+                raise ValueError(f'{pme_core_basis} requires pme_poly_R of {nR_ok} positive floats, got {pme_poly_R}')
+            opts += ['-D', f'CS_PME_POLY_N={POLY_CORE_N}']
+            for m in range(len(R)):
+                opts += ['-D', f'CS_PME_POLY_R{m}={R[m]:.9e}f']
+        if pme_core_basis == 'poly8sp':
+            opts += ['-D', 'CS_PME_SP_CORE=1', '-D', f'CS_PME_NMODES={3 * (len(R) - 2)}']
+        return opts
+
+    def __init__(self, cl_src_dir=None, use_morse=False, nloc=32, use_fire=True, pme_core_basis='raw', pme_poly_R=None):
+        if pme_core_basis not in ('raw', 'smooth', 'poly8', 'poly8sp'):
+            raise ValueError("pme_core_basis must be 'raw', 'smooth', 'poly8' or 'poly8sp'")
         self.pme_core_basis = pme_core_basis
+        self.pme_poly_R = np.asarray(pme_poly_R, np.float64) if pme_poly_R is not None else None
         super().__init__(nloc=nloc, preferred_vendor='nvidia', bPrint=True)
         self.use_morse = use_morse
+        self.use_fire = use_fire
         self._vram_bytes = 0
         if cl_src_dir is None:
             d = os.path.dirname(os.path.abspath(__file__))
@@ -355,8 +383,7 @@ class AFMulator(OpenCLBase):
         self._global_mem = dev.get_info(cl.device_info.GLOBAL_MEM_SIZE)
         debug_print(2, f"AFMulator: device max_alloc={_bytes_to_gb(self._max_alloc):.3f} GB global_mem={_bytes_to_gb(self._global_mem):.3f} GB")
         # Build options: -DOPT_FIRE=0 for damped velocity (matches CPU), -DOPT_FIRE=1 for FIRE
-        build_options = ['-D', f'OPT_FIRE={1 if use_fire else 0}']
-        build_options += ['-D', f'CS_PME_SMOOTH_CORE={int(pme_core_basis == "smooth")}']
+        build_options = self._pme_build_options(use_fire, pme_core_basis, pme_poly_R)
         kernel_paths = [
             os.path.join(cl_src_dir, 'common.cl'),
             os.path.join(cl_src_dir, 'Forces.cl'),
@@ -364,6 +391,8 @@ class AFMulator(OpenCLBase):
             os.path.join(cl_src_dir, 'contact_surface.cl'),
         ]
         debug_print(2, f"AFMulator: compiling {kernel_paths}")
+        self._pme_kernel_paths = kernel_paths
+        self._pme_build_opts = build_options
         self.load_program_multi(kernel_paths, build_options=build_options)
         debug_print(1, f"AFMulator: AFM.cl + contact_surface.cl compiled OK (use_fire={use_fire})")
         # State
@@ -1088,10 +1117,16 @@ class AFMulator(OpenCLBase):
     # ── contact surface (memory-efficient Morse PP-AFM) ───────────────────────
 
     def _cs_fit_helper(self):
-        """Lazy ContactSurfaceCL on shared ctx/queue (fit CG only)."""
-        if self._cs_fit is None:
+        """Lazy ContactSurfaceCL on shared ctx/queue (fit CG only).
+
+        Built with self._pme_build_opts so the core-fit kernels (cs_sp_Av/Atv,
+        CS_PME_SP_CORE) match the compiled core basis; recreated if the opts
+        changed since it was built (e.g. after set_pme_core_basis)."""
+        opts = getattr(self, '_pme_build_opts', None)
+        if self._cs_fit is None or getattr(self._cs_fit, '_build_opts_used', None) != opts:
             from spammm.surfaces.ContactSurface import ContactSurfaceCL
-            self._cs_fit = ContactSurfaceCL(ctx=self.ctx, queue=self.queue, nloc=64, bPrint=False)
+            self._cs_fit = ContactSurfaceCL(ctx=self.ctx, queue=self.queue, nloc=64, bPrint=False, build_options=opts)
+            self._cs_fit._build_opts_used = opts
         return self._cs_fit
 
     @staticmethod
@@ -1948,6 +1983,40 @@ class AFMulator(OpenCLBase):
         self._cpm_upload_id = None          # force re-upload on next scan/eval
         return cpm
 
+    def set_pme_core_basis(self, basis, poly_R=None):
+        """Recompile self.prg for a different contact-PME core basis (e.g. 'poly8')
+        if the build options actually changed.
+
+        Needed because FDBMPipeline.ensure_afm() constructs the shared AFMulator
+        with default options; the harness switches the core basis AFTER the FDBM
+        reference scan. NOTE: pipeline ffts hold bind_afm_program() references to
+        the OLD program object — those stay alive and keep working; only calls
+        through self.prg (eval/scan/sample) see the newly compiled program.
+        No-op when the resulting options equal the current ones.
+        """
+        if poly_R is None:
+            poly_R = self.pme_poly_R
+        opts = self._pme_build_options(self.use_fire, basis, poly_R)
+        if opts == getattr(self, '_pme_build_opts', None):
+            self.pme_core_basis = basis
+            self.pme_poly_R = np.asarray(poly_R, np.float64) if poly_R is not None else None
+            return
+        source_parts = []
+        for path in self._pme_kernel_paths:
+            with open(path, 'r') as f:
+                source_parts.append(f.read())
+        self.prg = cl.Program(self.ctx, '\n'.join(source_parts)).build(options=opts)
+        self.pme_core_basis = basis
+        self.pme_poly_R = np.asarray(poly_R, np.float64) if poly_R is not None else None
+        self._pme_build_opts = opts
+        self._cpm_upload_id = None          # old program's upload key is stale
+
+    def _pme_n_modes(self):
+        """Core coefficient stride per center — must match compiled CS_PME_NMODES."""
+        if getattr(self, 'pme_core_basis', 'raw') == 'poly8sp':
+            return 3 * (len(self.pme_poly_R) - 2)                  # 3 s slots + 3*NP p slots
+        return 5
+
     def _pme_eval_python(self, params, queries):
         """Python fallback evaluator: eval_mesh + eval_core (CPU, float64).
 
@@ -1995,12 +2064,14 @@ class AFMulator(OpenCLBase):
             if need > local_avail:
                 raise MemoryError(f"contact_pme local-core needs {need} B local mem for na={na} "
                                   f"> device LOCAL_MEM_SIZE {local_avail} B; use core_backend='bucket'")
-            # Frozen five-mode ABI for Local kernels
+            # Per-center coefficient ABI for Local kernels: 9 slots for poly8sp,
+            # 5 for everything else (raw/smooth powers / poly8 scalar ladder).
             coeffs = np.asarray(params.core_fit.coeffs)
             powers = np.asarray(params.core_fit.powers, dtype=np.int64)
-            if coeffs.shape != (na, 5):
-                raise ValueError(f"contact_pme Local ABI requires coeffs.shape=(na,5), got {coeffs.shape}")
-            if not np.array_equal(powers, np.array([2, 4, 8, 16, 32], dtype=np.int64)):
+            nmod = self._pme_n_modes()
+            if coeffs.shape != (na, nmod):
+                raise ValueError(f"contact_pme Local ABI requires coeffs.shape=(na,{nmod}), got {coeffs.shape}")
+            if params.core_fit.basis not in ('poly8', 'poly8sp') and not np.array_equal(powers, np.array([2, 4, 8, 16, 32], dtype=np.int64)):
                 raise ValueError(f"contact_pme Local ABI requires powers=[2,4,8,16,32], got {powers}")
         elif backend == 'tile':
             if not hasattr(self.prg, 'relaxStrokesTiltedContactPMETileSph'):
@@ -2012,9 +2083,25 @@ class AFMulator(OpenCLBase):
 
     def _pme_upload_resident(self, params, *, force=False):
         """Upload mesh/atoms/core/buckets once per ContactPMEParams identity."""
-        basis = 'smooth' if params.core_fit.basis == 'smooth' else 'raw'
-        if basis != getattr(self, 'pme_core_basis', 'raw') and np.any(params.core_fit.coeffs):
-            raise ValueError(f'core basis {basis} mismatches compiled pme_core_basis; construct AFMulator(pme_core_basis={basis!r})')
+        cb = getattr(self, 'pme_core_basis', 'raw')
+        fb = params.core_fit.basis
+        if cb in ('poly8', 'poly8sp') or fb in ('poly8', 'poly8sp'):
+            if cb != fb:
+                raise ValueError(f"core basis {fb} mismatches compiled pme_core_basis {cb}; "
+                                 f"call set_pme_core_basis({fb!r}, poly_R=R) first")
+            R = np.asarray(params.core_fit.poly_R, np.float64)
+            if not np.allclose(R, np.asarray(self.pme_poly_R, np.float64)):
+                raise ValueError(f'{fb} R ladder {R} differs from compiled pme_poly_R {self.pme_poly_R}')
+            if fb == 'poly8':
+                if np.any(np.asarray(params.core_fit.r_lo) != 0.0) or not np.allclose(np.asarray(params.core_fit.r_b), float(R.max())):
+                    raise ValueError('poly8 CoreFit requires r_lo==0 and r_b==R_max (kernel ABI)')
+            else:
+                if np.any(np.asarray(params.core_fit.r_lo) <= 0.0) or not np.allclose(np.asarray(params.core_fit.r_b), np.asarray(params.core_fit.r_lo) * float(R[0])):
+                    raise ValueError('poly8sp CoreFit requires r_lo=radius scale>0 and r_b==r_lo*R0 (kernel ABI)')
+        else:
+            basis = 'smooth' if params.core_fit.basis == 'smooth' else 'raw'
+            if basis != cb and np.any(params.core_fit.coeffs):
+                raise ValueError(f'core basis {basis} mismatches compiled pme_core_basis; construct AFMulator(pme_core_basis={basis!r})')
         na = params.na
         nc_mesh = int(params.mesh_coeffs.size)
         nc_core = int(params.core_fit.coeffs.size)
@@ -2115,7 +2202,7 @@ class AFMulator(OpenCLBase):
         nG = self._roundup(nq, wg)
         if backend == 'local':
             LATOMS = cl.LocalMemory(na * 16)
-            LCOEFFS = cl.LocalMemory(na * 5 * 4)
+            LCOEFFS = cl.LocalMemory(na * self._pme_n_modes() * 4)
             self.prg.evalContactPMELocal(self.queue, (nG,), (wg,),
                 self.cpm_queries_cl, self.cpm_out_fe_cl, self.cpm_status_cl,
                 self.cpm_min_r_cl, self.cpm_offender_cl, self.cpm_overflow_cl,
@@ -2396,11 +2483,11 @@ class AFMulator(OpenCLBase):
     def _pme_tile_local_bytes(self, tiles):
         """Bytes the tile kernel actually allocates. One size for every workgroup:
         nloc_max and the mesh window are each the max over tiles, then multiplied.
-        LATOMS = nloc*float4, LCOEFFS = nloc*5 floats, LMESH = nxL*nyL*nzL floats.
+        LATOMS = nloc*float4, LCOEFFS = nloc*n_modes floats, LMESH = nxL*nyL*nzL floats.
         """
         nloc = int(tiles['nloc_max'])
         nxL, nyL, nzL = int(tiles['nxL_max']), int(tiles['nyL_max']), int(tiles['nzL'])
-        b_at, b_co, b_me = nloc * 16, nloc * 5 * 4, nxL * nyL * nzL * 4
+        b_at, b_co, b_me = nloc * 16, nloc * self._pme_n_modes() * 4, nxL * nyL * nzL * 4
         desc = np.asarray(tiles['tile_desc'])
         per = desc[:, 2].astype(np.int64) * desc[:, 3].astype(np.int64) * nzL * 4
         return dict(atoms=b_at, coeffs=b_co, mesh=b_me, total=b_at + b_co + b_me,
@@ -2518,13 +2605,14 @@ class AFMulator(OpenCLBase):
             if len(tiles['wg_atom_ids']):
                 self.toGPU_(self.cpm_wg_ids_cl, tiles['wg_atom_ids'])
             lmem_avail = int(self.ctx.devices[0].get_info(cl.device_info.LOCAL_MEM_SIZE))
-            need = tiles['nloc_max'] * 36 + tiles['nxL_max'] * tiles['nyL_max'] * nzL * 4
+            nmod = self._pme_n_modes()
+            need = tiles['nloc_max'] * (16 + nmod * 4) + tiles['nxL_max'] * tiles['nyL_max'] * nzL * 4
             if need > lmem_avail:
                 raise MemoryError(f"contact_pme tile: local mem {need} B > {lmem_avail} B "
                                   f"(nloc_max={tiles['nloc_max']}, tile={tiles['nxL_max']}x{tiles['nyL_max']}x{nzL}); "
                                   f"reduce tile_xy/rho_max")
             LATOMS = cl.LocalMemory(tiles['nloc_max'] * 16)
-            LCOEFFS = cl.LocalMemory(tiles['nloc_max'] * 5 * 4)
+            LCOEFFS = cl.LocalMemory(tiles['nloc_max'] * nmod * 4)
             LMESH = cl.LocalMemory(tiles['nxL_max'] * tiles['nyL_max'] * nzL * 4)
             tile_meta = np.array([tiles['ntx'], int(nzL), 0, 0], dtype=np.int32)
             gs2 = (tiles['ntx'] * tiles['tx'], tiles['nty'] * tiles['ty'])
@@ -2548,7 +2636,7 @@ class AFMulator(OpenCLBase):
             self.last_pme_tiles = tiles
         elif backend == 'local':
             LATOMS = cl.LocalMemory(na * 16)
-            LCOEFFS = cl.LocalMemory(na * 5 * 4)
+            LCOEFFS = cl.LocalMemory(na * self._pme_n_modes() * 4)
             if relax_mode in ('qn', 'sph'):
                 qn_kname = {'qn': 'relaxStrokesTiltedContactPMELocalQN',
                             'sph': 'relaxStrokesTiltedContactPMELocalSph'}[relax_mode]

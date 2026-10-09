@@ -311,6 +311,250 @@ def test_coremesh_smooth_gpu_basis(make_review):
     rv.finish()
 
 
+def test_poly_core_basis_dphi_fd():
+    """poly8 basis: analytic dphi = central finite difference of phi."""
+    from spammm.surfaces.PICCore import poly_core_basis, POLY_CORE_R
+    r = np.linspace(0.01, 10.0, 20001)
+    phi, dphi = poly_core_basis(r, POLY_CORE_R)
+    dr = r[1] - r[0]
+    fd = (phi[2:] - phi[:-2]) / (2 * dr)
+    ok = np.min(np.abs(r[1:-1, None] - POLY_CORE_R[None, :]), axis=1) > 3 * dr  # cutoffs: derivative exists but FD straddles the join
+    np.testing.assert_allclose(dphi[1:-1][ok], fd[ok], atol=5e-5, rtol=1e-4)
+
+
+@pytest.mark.gpu
+def test_coremesh_poly8_gpu_basis(make_review):
+    """OpenCL cs_pme_core_basis (CS_PME_POLY_CORE=1) vs PICCore.poly_core_basis."""
+    from pathlib import Path
+    import pyopencl as cl
+    from spammm.utils.OpenCLBase import select_device
+    from spammm.surfaces.PICCore import poly_core_basis, POLY_CORE_R, POLY_CORE_N
+    rv = make_review('test_coremesh_poly8_gpu_basis')
+    ctx, queue = select_device(preferred_vendor='nvidia', return_queue=True)
+    if 'nvidia' not in ctx.devices[0].vendor.lower():
+        pytest.skip('NVIDIA OpenCL device unavailable')
+    source = (Path(__file__).resolve().parents[2] / 'kernels/contact_surface.cl').read_text()
+    fn = 'inline void cs_pme_core_basis' + source.split('inline void cs_pme_core_basis', 1)[1].split('inline float2 cs_pme_core_reduce', 1)[0]
+    wrapper = '\n__kernel void probe(__global const float* r, __global float* out){ int i=get_global_id(0); float p[5],d[5]; cs_pme_core_basis(r[i],0.0f,9.0f,p,d); for(int k=0;k<5;k++){out[10*i+k]=p[k];out[10*i+5+k]=d[k];}}'
+    # cover [0,10] incl. just below/above every cutoff R_m
+    r = np.unique(np.concatenate([np.linspace(0.0, 10.0, 501)]
+                  + [POLY_CORE_R + d for d in (-1e-3, 0.0, 1e-3)])).astype(np.float32)
+    rb = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=r)
+    out = np.empty((len(r), 10), np.float32)
+    ob = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, out.nbytes)
+    opts = ['-DCS_PME_POLY_CORE=1', f'-DCS_PME_POLY_N={POLY_CORE_N}'] + [f'-DCS_PME_POLY_R{m}={float(R):.9e}f' for m, R in enumerate(POLY_CORE_R)]
+    program = cl.Program(ctx, fn + wrapper).build(options=opts)
+    program.probe(queue, (len(r),), None, rb, ob)
+    cl.enqueue_copy(queue, out, ob).wait()
+    p, d = poly_core_basis(r.astype(np.float64), POLY_CORE_R)
+    np.testing.assert_allclose(out[:, :5], p, atol=2e-6, rtol=1e-5)
+    np.testing.assert_allclose(out[:, 5:], d, atol=2e-5, rtol=1e-4)
+    rv.out(f'{ctx.devices[0].name} poly8: max phi delta={np.max(abs(out[:, :5] - p)):.3g}, max dphi delta={np.max(abs(out[:, 5:] - d)):.3g}')
+    rv.finish()
+
+
+@pytest.mark.gpu
+def test_coremesh_poly8_eval_parity(make_review):
+    """poly8 end-to-end: eval_contact_pme GPU (local+bucket) vs _pme_eval_python,
+    and host F vs finite differences of host E."""
+    from spammm.SPM.AFM import AFMulator
+    from spammm.surfaces.PICCore import POLY_CORE_R, CoreFit
+    from spammm.surfaces.ContactSurface import cpm_params_from_coremesh
+    rv = make_review('test_coremesh_poly8_eval_parity')
+    a = AFMulator(pme_core_basis='poly8', pme_poly_R=POLY_CORE_R)
+    rng = np.random.default_rng(7)
+    centers = rng.uniform(-4.0, 4.0, (10, 3))
+    nan = np.full(len(centers), np.nan)
+    coeffs = rng.uniform(-0.5, 0.5, (len(centers), 5))
+    fit = CoreFit(coeffs=coeffs, r_lo=np.zeros(len(centers)), r_b=np.full(len(centers), float(POLY_CORE_R.max())),
+                  powers=np.full(5, 8, np.int64), basis='poly8', cond_raw=nan, cond_hier=nan,
+                  train_rmse_E=nan, train_rmse_F=nan, held_rmse_E=nan, held_rmse_F=nan,
+                  held_max_E=nan, held_max_F=nan, worst_r=nan, poly_R=POLY_CORE_R.copy())
+    ns, halo, h, origin = (16, 16, 16), 2, 0.75, np.array([-5.0, -5.0, -4.0])
+    mesh_coeffs = rng.uniform(-0.05, 0.05, ns)
+    cpm = cpm_params_from_coremesh(mesh_coeffs, origin, h, halo, centers, fit)
+    lo = origin + 2.0 * h
+    hi = origin + (np.asarray(ns) - 4.0) * h
+    queries = rng.uniform(lo, hi, (300, 3))
+    E_py, F_py = a._pme_eval_python(cpm, queries)
+    for backend in ('local', 'bucket'):
+        E_g, F_g = a.eval_contact_pme(queries, params=cpm, use_gpu=True, core_backend=backend)
+        np.testing.assert_allclose(E_g, E_py, atol=1e-4, rtol=2e-4)
+        np.testing.assert_allclose(F_g, F_py, atol=1e-3, rtol=2e-3)
+        rv.out(f'{backend}: max|dE|={np.abs(E_g - E_py).max():.3g} max|dF|={np.abs(F_g - F_py).max():.3g}')
+    eps = 1e-3
+    F_fd = np.empty_like(F_py)
+    for c in range(3):
+        dp = np.zeros(3); dp[c] = eps
+        Ep, _ = a._pme_eval_python(cpm, queries + dp)
+        Em, _ = a._pme_eval_python(cpm, queries - dp)
+        F_fd[:, c] = -(Ep - Em) / (2 * eps)
+    np.testing.assert_allclose(F_py, F_fd, atol=2e-3, rtol=2e-3)
+    rv.out(f'host F vs FD(E): max|dF|={np.abs(F_py - F_fd).max():.3g}')
+    rv.finish()
+
+
+@pytest.mark.gpu
+def test_coremesh_poly8sp_eval_parity(make_review):
+    """poly8sp (CS_PME_SP_CORE, 9-slot A:s3p2+B:s1 layout): GPU local+bucket vs
+    _pme_eval_python, and host F vs finite differences of host E."""
+    from spammm.SPM.AFM import AFMulator
+    from spammm.surfaces.PICCore import SP_CORE_R, SP_BOND_RSCALE, CoreFit
+    from spammm.surfaces.ContactSurface import cpm_params_from_coremesh
+    rv = make_review('test_coremesh_poly8sp_eval_parity')
+    a = AFMulator(pme_core_basis='poly8sp', pme_poly_R=SP_CORE_R)
+    rng = np.random.default_rng(11)
+    na_, nb = 8, 4                                        # 8 'atoms' + 4 'bond' centers
+    centers = rng.uniform(-4.0, 4.0, (na_ + nb, 3))
+    w = np.full(na_ + nb, SP_BOND_RSCALE); w[:na_] = 1.0  # radius scale (kernel w-channel)
+    nan = np.full(len(centers), np.nan)
+    coeffs = rng.uniform(-0.5, 0.5, (len(centers), 9))
+    coeffs[na_:, 1:] = 0.0                                # bonds: slot0 only (as fit produces)
+    fit = CoreFit(coeffs=coeffs, r_lo=w, r_b=w * SP_CORE_R[0],
+                  powers=np.full(9, 8, np.int64), basis='poly8sp', cond_raw=nan, cond_hier=nan,
+                  train_rmse_E=nan, train_rmse_F=nan, held_rmse_E=nan, held_rmse_F=nan,
+                  held_max_E=nan, held_max_F=nan, worst_r=nan, poly_R=SP_CORE_R.copy())
+    ns, halo, h, origin = (16, 16, 16), 2, 0.75, np.array([-5.0, -5.0, -4.0])
+    mesh_coeffs = rng.uniform(-0.05, 0.05, ns)
+    cpm = cpm_params_from_coremesh(mesh_coeffs, origin, h, halo, centers, fit)
+    lo = origin + 2.0 * h
+    hi = origin + (np.asarray(ns) - 4.0) * h
+    queries = rng.uniform(lo, hi, (300, 3))
+    E_py, F_py = a._pme_eval_python(cpm, queries)
+    for backend in ('local', 'bucket'):
+        E_g, F_g = a.eval_contact_pme(queries, params=cpm, use_gpu=True, core_backend=backend)
+        np.testing.assert_allclose(E_g, E_py, atol=1e-4, rtol=2e-4)
+        np.testing.assert_allclose(F_g, F_py, atol=1e-3, rtol=2e-3)
+        rv.out(f'{backend}: max|dE|={np.abs(E_g - E_py).max():.3g} max|dF|={np.abs(F_g - F_py).max():.3g}')
+    eps = 1e-3
+    F_fd = np.empty_like(F_py)
+    for c in range(3):
+        dp = np.zeros(3); dp[c] = eps
+        Ep, _ = a._pme_eval_python(cpm, queries + dp)
+        Em, _ = a._pme_eval_python(cpm, queries - dp)
+        F_fd[:, c] = -(Ep - Em) / (2 * eps)
+    np.testing.assert_allclose(F_py, F_fd, atol=2e-3, rtol=2e-3)
+    rv.out(f'host F vs FD(E): max|dF|={np.abs(F_py - F_fd).max():.3g}')
+    rv.finish()
+
+
+def _sp_fixture(Rlad, seed=13):
+    """ContactSurfaceCL built with poly8sp options + random atom/bond centers
+    and a point cloud in their 9 A support. Returns (cs, centers, w, P, nmod)."""
+    from spammm.SPM.AFM import AFMulator
+    a = AFMulator(pme_core_basis='poly8sp', pme_poly_R=np.asarray(Rlad, np.float64))
+    cs = a._cs_fit_helper()
+    rng = np.random.default_rng(seed)
+    na_, nb = 14, 6
+    centers = rng.uniform(-6.0, 6.0, (na_ + nb, 3))
+    w = np.full(na_ + nb, 5.0 / 9.0); w[:na_] = 1.0
+    nmod = 3 + 3 * (len(Rlad) - 3)
+    P = centers[rng.integers(0, len(centers), 5000)] + rng.normal(0.0, 3.0, (5000, 3))
+    atoms4 = np.zeros((len(centers), 4), np.float32); atoms4[:, :3] = centers; atoms4[:, 3] = w
+    if getattr(cs, 'cs_sp_atoms_buff', None) is None or cs.cs_sp_atoms_buff.size != len(centers) * 16:
+        import pyopencl as cl
+        cs.cs_sp_atoms_buff = cl.Buffer(cs.ctx, cl.mem_flags.READ_WRITE, len(centers) * 16)
+    cs.toGPU_(cs.cs_sp_atoms_buff, atoms4)
+    return cs, centers, w, np.ascontiguousarray(P, np.float32), nmod
+
+
+def _sp_upload_points(cs, P, ncoef, SB=1024):
+    import numpy as _np
+    ns = len(P)
+    ngroups = (ns + SB - 1) // SB
+    cs._sp_ensure(ns, ncoef, ngroups)
+    cs.toGPU_(cs.cs_sp_samp_buff, P.reshape(-1))
+    return ns, ngroups
+
+
+def _sp_Av(cs, v, ns, ncoef, d_span, wF=0.3):
+    import numpy as _np
+    cs.toGPU_(cs.cs_sp_v_buff, _np.ascontiguousarray(v, _np.float32))
+    cs._sp_Av(cs._roundup(ns, cs.nloc), ns, ncoef, _sp_nat(cs), d_span, wF, cs.cs_sp_v_buff, cs.cs_sp_q_buff)
+    return cs.fromGPU_(cs.cs_sp_q_buff, shape=(ns, 4)).copy()
+
+
+def _sp_Atv(cs, v4, ns, ncoef, ngroups, d_span, wF=0.3, sq=0, SB=1024):
+    import numpy as _np
+    cs.toGPU_(cs.cs_sp_s_buff, _np.ascontiguousarray(v4, _np.float32))
+    cs._sp_Atv(ns, ncoef, _sp_nat(cs), ngroups, SB, d_span, wF, sq, cs.cs_sp_g_buff)
+    return cs.fromGPU_(cs.cs_sp_g_buff, shape=(ncoef,)).copy()
+
+
+def _sp_nat(cs):
+    return int(cs.cs_sp_atoms_buff.size // 16)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('Rlad', [[9.0, 5.612486080160911, 3.5, 7.0, 3.5], [9.0, 5.612486080160911, 3.5, 7.0, 5.0, 3.5]])
+def test_sp_cg_adjoint_dot_test(Rlad, make_review):
+    """Adjoint dot-test tying cs_pme_sp_basis (Atv gather) to cs_pme_sp_accum
+    (Av eval funnel): <Âz, v> == <z, Âᵀv>; plus Atv(sq=1) column norms vs
+    one-hot Av columns."""
+    rv = make_review(f'test_sp_cg_adjoint_dot_test_{len(Rlad)}')
+    cs, centers, w, P, nmod = _sp_fixture(Rlad)
+    nc, ncoef = len(centers), len(centers) * nmod
+    d_span = np.float32(Rlad[0])
+    SB = 1024
+    ns, ngroups = _sp_upload_points(cs, P, ncoef, SB)
+    rng = np.random.default_rng(5)
+    z = rng.normal(0.0, 1.0, ncoef)
+    v = rng.normal(0.0, 1.0, (ns, 4))
+    wF = 0.3
+    Az = _sp_Av(cs, z, ns, ncoef, d_span, wF)
+    Atv = _sp_Atv(cs, v, ns, ncoef, ngroups, d_span, wF, sq=0, SB=SB)
+    lhs = float(np.dot(Az.ravel(), v.ravel()))
+    rhs = float(np.dot(z, Atv))
+    tol = 1e-4 * float(np.linalg.norm(Az) * np.linalg.norm(v))
+    rv.out(f'NMODES={nmod} <Az,v>={lhs:.6e} <z,Atv>={rhs:.6e} |d|={abs(lhs - rhs):.3e} tol={tol:.3e}')
+    assert abs(lhs - rhs) <= tol
+    # sq=1 column norms == sum_i |Av(e_j)|^2 for a few one-hot columns
+    coln = _sp_Atv(cs, np.zeros((ns, 4), np.float32), ns, ncoef, ngroups, d_span, wF, sq=1, SB=SB)
+    for j in rng.choice(ncoef, 5, replace=False):
+        e = np.zeros(ncoef); e[j] = 1.0
+        cn = float((_sp_Av(cs, e, ns, ncoef, d_span, wF) ** 2).sum())
+        rel = abs(cn - coln[j]) / max(coln[j], 1e-30)
+        rv.out(f'  col {j}: Atv_sq1={coln[j]:.6e} onehot={cn:.6e} rel={rel:.2e}')
+        assert rel <= 1e-4
+    rv.finish()
+
+
+@pytest.mark.gpu
+def test_fit_core_sp_cg_vs_lstsq(make_review):
+    """GPU CGLS fit vs dense CPU lstsq on the same synthetic target
+    b = Â c_true + noise: predicted E/F on the samples agree to ~1e-3."""
+    Rlad = np.array([9.0, 5.612486080160911, 3.5, 7.0, 3.5])
+    rv = make_review('test_fit_core_sp_cg_vs_lstsq')
+    cs, centers, w, P, nmod = _sp_fixture(Rlad, seed=17)
+    nc, ncoef = len(centers), len(centers) * nmod
+    d_span = np.float32(Rlad[0])
+    SB = 1024
+    ns, ngroups = _sp_upload_points(cs, P, ncoef, SB)
+    rng = np.random.default_rng(3)
+    wF = 0.3
+    c_true = rng.normal(0.0, 1.0, (nc, nmod))
+    c_true[14:, 1:] = 0.0                                     # bond centers: slot0 only
+    y0 = _sp_Av(cs, c_true.ravel(), ns, ncoef, d_span, wF=1.0)  # wF=1 -> y=(grad,E)
+    E_ref = y0[:, 3].astype(np.float64) + rng.normal(0.0, 1e-4, ns)
+    F_ref = (-y0[:, :3]).astype(np.float64) + rng.normal(0.0, 1e-4, (ns, 3))
+    coeffs, info = cs.fit_core_sp_cg(centers, w, Rlad, P, E_ref, F_ref, wF=wF, n_iter=2000, tol=1e-8)
+    rv.out(f'CGLS: iters={info["iters"]} sec={info["sec"]:.2f} hist={info["hist"][::max(1, info["iters"] // 5)]}')
+    # dense lstsq reference: build Â columnwise from one-hot Av
+    b4 = np.zeros((ns, 4)); b4[:, :3] = -wF * F_ref; b4[:, 3] = E_ref
+    A = np.empty((4 * ns, ncoef))
+    for j in range(ncoef):
+        e = np.zeros(ncoef); e[j] = 1.0
+        A[:, j] = _sp_Av(cs, e, ns, ncoef, d_span, wF).ravel()
+    c_lsq, *_ = np.linalg.lstsq(A, b4.ravel(), rcond=1e-12)
+    y_gpu = _sp_Av(cs, coeffs.ravel(), ns, ncoef, d_span, wF=1.0)
+    y_lsq = _sp_Av(cs, c_lsq, ns, ncoef, d_span, wF=1.0)
+    dE = np.sqrt(np.mean((y_gpu[:, 3] - y_lsq[:, 3]) ** 2)) / np.sqrt(np.mean(y_lsq[:, 3] ** 2))
+    dF = np.sqrt(np.mean((y_gpu[:, :3] - y_lsq[:, :3]) ** 2)) / np.sqrt(np.mean(y_lsq[:, :3] ** 2))
+    rv.out(f'pred diff: rel rms E={dE:.3e} F={dF:.3e}; true-vs-fit rel rms E={np.sqrt(np.mean((y_gpu[:,3]-E_ref)**2))/np.sqrt(np.mean(E_ref**2)):.3e}')
+    assert dE <= 1e-3 and dF <= 1e-3
+    rv.finish()
+
+
 def test_coremesh_gpu_basis_mismatch():
     from types import SimpleNamespace
     from spammm.SPM.AFM import AFMulator

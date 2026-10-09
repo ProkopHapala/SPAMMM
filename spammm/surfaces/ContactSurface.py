@@ -432,14 +432,15 @@ class PICParams:
 class ContactSurfaceCL(OpenCLBase):
     """GPU contact surface: brute reference, separable CG/tile fit, PIC (pure OpenCL)."""
 
-    def __init__(self, nloc=64, ctx=None, queue=None, **kw):
+    def __init__(self, nloc=64, ctx=None, queue=None, build_options=None, **kw):
         super().__init__(nloc=nloc, ctx=ctx, queue=queue, **kw)
         kernel_paths = [
             os.path.join(_KERNEL_DIR, 'common.cl'),
             os.path.join(_KERNEL_DIR, 'Forces.cl'),
             os.path.join(_KERNEL_DIR, 'contact_surface.cl'),
         ]
-        self.load_program_multi(kernel_paths, bPrint=False, build_options=['-DDBG_UFF=0', '-D', 'AFM_STANDALONE=1'])
+        opts = ['-DDBG_UFF=0', '-D', 'AFM_STANDALONE=1'] + list(build_options or [])
+        self.load_program_multi(kernel_paths, bPrint=False, build_options=opts)
         self._natoms = 0
         self._nq_max = 0
         self._ns_max = 0
@@ -889,6 +890,157 @@ class ContactSurfaceCL(OpenCLBase):
             return out[:, 3], out[:, :3]
         return None
 
+    # ── poly8sp matrix-free core fit (CGLS; design doc §16) ──────────────────
+    # Program must be built with CS_PME_SP_CORE=1 (AFMulator._pme_build_opts for
+    # pme_core_basis='poly8sp'). Operators: cs_sp_Av = [E; wF*grad] per sample,
+    # cs_sp_Atv (sq=0 adjoint / sq=1 column norms) + cs_reduce_groups.
+    # Sample-space vectors are float4-per-sample handled as flat 4*ns floats.
+
+    def _sp_ensure(self, ns, ncoef, ngroups):
+        n = dict(ns=ns, ncoef=ncoef, ng=ngroups)
+        if getattr(self, '_sp_dims', None) != n:
+            self.try_make_buffers({'cs_sp_samp': ns * 12, 'cs_sp_b': ns * 16, 'cs_sp_s': ns * 16, 'cs_sp_q': ns * 16,
+                                   'cs_sp_z': ncoef * 4, 'cs_sp_g': ncoef * 4, 'cs_sp_p': ncoef * 4, 'cs_sp_D': ncoef * 4,
+                                   'cs_sp_v': ncoef * 4, 'cs_sp_partial': ngroups * ncoef * 4}, suffix='_buff')
+            self._sp_dims = n
+
+    def _sp_Av(self, nG, ns, ncoef, nat, d_span, wF, v_buf, y_buf):
+        lsz = self.nloc
+        self.prg.cs_sp_Av(self.queue, (nG,), (lsz,), self.cs_sp_samp_buff, v_buf, y_buf, self.cs_sp_atoms_buff,
+                          np.int32(nat), np.float32(d_span), np.float32(wF), np.int32(ns),
+                          cl.LocalMemory(nat * 16), cl.LocalMemory(ncoef * 4))
+
+    def _sp_Atv(self, ns, ncoef, nat, ngroups, SB, d_span, wF, sq, out_buf):
+        lsz = self.nloc
+        self.prg.cs_sp_Atv(self.queue, (ngroups * lsz,), (lsz,), self.cs_sp_samp_buff, self.cs_sp_s_buff, self.cs_sp_partial_buff,
+                           self.cs_sp_atoms_buff, np.int32(nat), np.float32(d_span), np.float32(wF),
+                           np.int32(ns), np.int32(SB), np.int32(sq),
+                           cl.LocalMemory(nat * 16), cl.LocalMemory(ncoef * 4), cl.LocalMemory(lsz * 16), cl.LocalMemory(lsz * 16))
+        nGc = self._roundup(ncoef, lsz)
+        self.prg.cs_reduce_groups(self.queue, (nGc,), (lsz,), np.int32(ncoef), np.int32(ngroups), self.cs_sp_partial_buff, out_buf)
+
+    def fit_core_sp_cg(self, centers, w, Rlad, pts, E_ref, F_ref, wF=0.3, n_iter=4000, tol=1e-6, lam=0.0, SB=1024, bPrint=True, active=None):
+        """GPU matrix-free CGLS fit of the poly8sp core (design doc §16).
+
+        Solves  min_c ||Â c - b̂||²  with Â = [E_rows; wF*grad_rows],
+        b̂ = (-wF*F_ref, E_ref) one float4/sample, on the column-scaled unknown
+        z (c = D z, D = 1/||â_j|| via the sq=1 column-norm pass). Never forms Â:
+        each iteration is one cs_sp_Av + one cs_sp_Atv/reduce. `active` (ncoef
+        bool, optional) freezes inactive columns at 0 via D=0 (e.g. bond centers
+        restricted to slot0). Returns (coeffs (nc,NMODES) float64 in kernel slot
+        layout, info dict). The fitted coefficient buffer stays resident for
+        eval_core_sp_gpu()."""
+        assert hasattr(self.prg, 'cs_sp_Av'), 'ContactSurfaceCL program lacks cs_sp_* kernels — build with CS_PME_SP_CORE=1 (poly8sp options)'
+        centers = np.ascontiguousarray(centers, np.float64).reshape(-1, 3)
+        w = np.ascontiguousarray(w, np.float64).reshape(-1)
+        assert len(w) == len(centers)
+        Rlad = np.asarray(Rlad, np.float64)
+        nmod = 3 + 3 * (len(Rlad) - 3)
+        nc = len(centers); ncoef = nc * nmod
+        pts = np.ascontiguousarray(pts, np.float32).reshape(-1, 3)
+        E_ref = np.ascontiguousarray(E_ref, np.float64).reshape(-1)
+        assert len(pts) == len(E_ref)
+        ns = len(pts)
+        wF_eff = float(wF) if F_ref is not None else 0.0
+        if F_ref is None:
+            F_ref = np.zeros((ns, 3), np.float64)
+        lsz = self.nloc
+        loc = self.ctx.devices[0].get_info(cl.device_info.LOCAL_MEM_SIZE)
+        need = nc * 16 + ncoef * 4 + 2 * lsz * 16          # Atv: LATOMS+LACC+LPOS+LV (max of both kernels)
+        assert need <= loc, f'local memory {need} B > device {loc} B for nat={nc} NMODES={nmod}'
+        SB = max(int(SB), lsz)
+        ngroups = (ns + SB - 1) // SB
+        self._sp_ensure(ns, ncoef, ngroups)
+        atoms4 = np.zeros((nc, 4), np.float32); atoms4[:, :3] = centers; atoms4[:, 3] = w
+        if getattr(self, 'cs_sp_atoms_buff', None) is None or self.cs_sp_atoms_buff.size != nc * 16:
+            self.cs_sp_atoms_buff = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, nc * 16)
+        self.toGPU_(self.cs_sp_atoms_buff, atoms4)
+        b4 = np.zeros((ns, 4), np.float32)
+        b4[:, :3] = -wF_eff * F_ref; b4[:, 3] = E_ref
+        self.toGPU_(self.cs_sp_samp_buff, pts.reshape(-1))
+        self.toGPU_(self.cs_sp_b_buff, b4)
+        d_span = np.float32(Rlad[0])
+        t0 = time.perf_counter()
+        nGs = self._roundup(ns, lsz)
+        nGc = self._roundup(ncoef, lsz)
+        ns4 = 4 * ns
+        # residual s = b̂ - Â z, z = 0 -> s = b̂ ; g = D (Âᵀ s) ; p = g
+        self.prg.cs_copy(self.queue, (self._roundup(ns4, lsz),), (lsz,), np.int32(ns4), self.cs_sp_b_buff, self.cs_sp_s_buff)
+        # Jacobi column norms: D = 1/sqrt(colnorm) (sq=1 pass ignores v)
+        self._sp_Atv(ns, ncoef, nc, ngroups, SB, d_span, wF_eff, 1, self.cs_sp_D_buff)
+        colnorm = self.fromGPU_(self.cs_sp_D_buff, shape=(ncoef,))
+        assert np.isfinite(colnorm).all(), 'non-finite column norm in sp design'
+        if bPrint and (colnorm <= 0).any():
+            print(f'  fit_core_sp_cg: {(colnorm <= 0).sum()}/{ncoef} zero-norm columns (unconstrained DOFs stay 0)', flush=True)
+        D = 1.0 / np.sqrt(np.maximum(colnorm, 1e-30)).astype(np.float32)
+        if active is not None:
+            active = np.asarray(active, bool)
+            assert active.shape == (ncoef,)
+            D[~active] = 0.0                                     # frozen columns: g,p,z,c all stay 0
+        self.toGPU_(self.cs_sp_D_buff, D)
+        self._sp_Atv(ns, ncoef, nc, ngroups, SB, d_span, wF_eff, 0, self.cs_sp_g_buff)
+        self.prg.cs_mul(self.queue, (nGc,), (lsz,), np.int32(ncoef), self.cs_sp_g_buff, self.cs_sp_D_buff, self.cs_sp_g_buff)
+        self.prg.cs_zero(self.queue, (nGc,), (lsz,), np.int32(ncoef), self.cs_sp_z_buff)
+        self.prg.cs_copy(self.queue, (nGc,), (lsz,), np.int32(ncoef), self.cs_sp_g_buff, self.cs_sp_p_buff)
+        gg = self.dot_gpu(self.cs_sp_g_buff, self.cs_sp_g_buff, ncoef)
+        g0 = np.sqrt(gg)
+        lam2 = np.float32(lam * lam)
+        hist = []
+        it = 0
+        for it in range(1, n_iter + 1):
+            hist.append(np.sqrt(gg) / g0)
+            if hist[-1] < tol:
+                break
+            self.prg.cs_mul(self.queue, (nGc,), (lsz,), np.int32(ncoef), self.cs_sp_p_buff, self.cs_sp_D_buff, self.cs_sp_v_buff)   # v = D p
+            self._sp_Av(nGs, ns, ncoef, nc, d_span, wF_eff, self.cs_sp_v_buff, self.cs_sp_q_buff)                                    # q = Â D p
+            qq = self.dot_gpu(self.cs_sp_q_buff, self.cs_sp_q_buff, ns4)
+            if lam > 0:
+                qq += float(lam2) * self.dot_gpu(self.cs_sp_p_buff, self.cs_sp_p_buff, ncoef)
+            alpha = gg / (qq + 1e-30)
+            self.prg.addMul(self.queue, (nGc,), (lsz,), np.int32(ncoef), self.cs_sp_z_buff, self.cs_sp_p_buff, np.float32(alpha))
+            self.prg.addMul(self.queue, (self._roundup(ns4, lsz),), (lsz,), np.int32(ns4), self.cs_sp_s_buff, self.cs_sp_q_buff, np.float32(-alpha))
+            self._sp_Atv(ns, ncoef, nc, ngroups, SB, d_span, wF_eff, 0, self.cs_sp_g_buff)
+            self.prg.cs_mul(self.queue, (nGc,), (lsz,), np.int32(ncoef), self.cs_sp_g_buff, self.cs_sp_D_buff, self.cs_sp_g_buff)      # g = D Âᵀ s
+            if lam > 0:
+                self.prg.addMul(self.queue, (nGc,), (lsz,), np.int32(ncoef), self.cs_sp_g_buff, self.cs_sp_z_buff, np.float32(-lam2))
+            gg_new = self.dot_gpu(self.cs_sp_g_buff, self.cs_sp_g_buff, ncoef)
+            beta = gg_new / (gg + 1e-30)
+            self.prg.setLinear(self.queue, (nGc,), (lsz,), np.int32(ncoef), self.cs_sp_p_buff, np.float32(1.0), self.cs_sp_g_buff, np.float32(beta), self.cs_sp_p_buff)
+            gg = gg_new
+        # fitted coefficients c = D z -> resident cs_sp_v_buff, eval via cs_sp_Av
+        self.prg.cs_mul(self.queue, (nGc,), (lsz,), np.int32(ncoef), self.cs_sp_z_buff, self.cs_sp_D_buff, self.cs_sp_v_buff)
+        self.queue.finish()
+        sec = time.perf_counter() - t0
+        self._sp_fit = dict(nat=nc, nmod=nmod, d_span=float(d_span), wF=float(wF_eff))
+        coeffs = self.fromGPU_(self.cs_sp_v_buff, shape=(ncoef,)).astype(np.float64).reshape(nc, nmod)
+        info = dict(iters=it, sec=sec, hist=hist, colnorm=colnorm, rms_s=float(np.sqrt(self.dot_gpu(self.cs_sp_s_buff, self.cs_sp_s_buff, ns4) / ns4)))
+        if bPrint:
+            print(f'fit_core_sp_cg: ns={ns} ncoef={ncoef} ({nc}x{nmod}) iters={it} |Âᵀs|/|Âᵀs0|={hist[-1]:.2e} resid_rms={info["rms_s"]:.3e} ({sec:.1f}s)', flush=True)
+        return coeffs, info
+
+    def eval_core_sp_gpu(self, pts, chunk=1 << 20):
+        """Evaluate the fitted poly8sp core (E, F=-grad E) via cs_sp_Av with wF=1.
+        Requires a prior fit_core_sp_cg (resident centers + coefficients)."""
+        fit = getattr(self, '_sp_fit', None)
+        assert fit is not None, 'eval_core_sp_gpu requires a prior fit_core_sp_cg'
+        pts = np.ascontiguousarray(pts, np.float32).reshape(-1, 3)
+        n = len(pts)
+        ncoef = fit['nat'] * fit['nmod']
+        E = np.empty(n); F = np.empty((n, 3))
+        for i0 in range(0, n, int(chunk)):
+            nb = min(int(chunk), n - i0)
+            self._sp_ensure_eval(nb)
+            self.toGPU_(self.cs_sp_samp_buff, pts[i0:i0 + nb].reshape(-1))
+            self._sp_Av(self._roundup(nb, self.nloc), nb, ncoef, fit['nat'], np.float32(fit['d_span']), 1.0, self.cs_sp_v_buff, self.cs_sp_q_buff)
+            y = self.fromGPU_(self.cs_sp_q_buff, shape=(nb, 4))
+            E[i0:i0 + nb] = y[:, 3]
+            F[i0:i0 + nb] = -y[:, :3]
+        return E, F
+
+    def _sp_ensure_eval(self, ns):
+        if getattr(self, 'cs_sp_samp_buff', None) is None or self.cs_sp_samp_buff.size < ns * 12:
+            self.try_make_buffers({'cs_sp_samp': ns * 12, 'cs_sp_q': ns * 16}, suffix='_buff')
+
 
 # backward-compatible aliases
 SeparableBsplinePoly = SeparableParams
@@ -1106,6 +1258,8 @@ class ContactPMEParams:
     # Resident-byte accounting (sum of all device-resident buffers, excluding
     # temporary build/test buffers). Updated by resident_bytes property.
     _resident_bytes: int = 0
+    core_span_override: float = None   # set for split_params=None params (poly8 core+mesh):
+                                       # supplies r_cut and core_d_span (kernel ABI span)
 
     def __post_init__(self):
         self._resident_bytes = self._compute_resident_bytes()
@@ -1150,12 +1304,16 @@ class ContactPMEParams:
     @property
     def r_cut(self) -> float:
         """Neighbor / core outer cutoff: r_core_max for compact splits, else legacy r_cut."""
+        if self.core_span_override is not None:
+            return float(self.core_span_override)
         sp = self.split_params
         return float(getattr(sp, 'r_core_max', sp.r_cut))
 
     @property
     def core_d_span(self) -> float:
         """r_b - r_lo (= Δ_in + Δ_b). Passed to OpenCL as basis support span."""
+        if self.core_span_override is not None:
+            return float(self.core_span_override)
         from spammm.surfaces.PMESplit import _COMPACT_SPLIT_MODES
         sp = self.split_params
         if getattr(sp, 'split_mode', 'paw') in _COMPACT_SPLIT_MODES:
@@ -1251,4 +1409,46 @@ def cpm_params_from_samples(samples, mesh_origin, mesh_h, halo, apos, cLJs,
                             atom_pos=np.asarray(apos, np.float64), bucket_atoms=batoms,
                             bucket_offsets=boffs, bucket_nbx=nbx, bucket_nby=nby,
                             bucket_cell_size=cs, bucket_bounds=(x0, y0, x1, y1))
+
+
+def cpm_params_from_coremesh(mesh_coeffs, mesh_origin, mesh_h, halo, centers, core_fit):
+    """Assemble ContactPMEParams for the poly8 core+coarse-mesh representation.
+
+    Unlike cpm_params_from_samples, `mesh_coeffs` are FITTED B-spline control
+    coefficients (fit_coremesh_lsq output on E - core) — NOT node samples, so no
+    prefilter is applied. `centers` are the poly8 core centers (atoms + bond
+    midpoints), uploaded as the kernel atoms with w=r_lo (poly8: 0; poly8sp:
+    radius scale) and span=max cutoff via core_span_override (split_params=None
+    — nothing in the eval/scan path
+    may dereference it; r_cut/core_d_span come from the override).
+
+    Args:
+        mesh_coeffs: (nx,ny,nz) fitted B-spline control coefficients.
+        mesh_origin: (3,) world coords of node (0,0,0); mesh_h: node spacing [A].
+        halo: halo node count per side used at fit time.
+        centers: (nc,3) core centers; core_fit: poly8 (coeffs (nc,5)) or
+            poly8sp (coeffs (nc,9), r_lo=radius scale) CoreFit.
+    """
+    centers = np.asarray(centers, np.float64).reshape(-1, 3)
+    assert core_fit.basis in ('poly8', 'poly8sp'), f'cpm_params_from_coremesh expects basis poly8/poly8sp, got {core_fit.basis}'
+    nmod = 3 * (len(core_fit.poly_R) - 2) if core_fit.basis == 'poly8sp' else 5   # 3 s + 3*NP p slots
+    assert core_fit.coeffs.shape == (len(centers), nmod), f'coeffs {core_fit.coeffs.shape} vs ({len(centers)},{nmod})'
+    if core_fit.basis == 'poly8sp':
+        # kernel SP branch: w = radius scale, per-center cutoff = w * R0 (poly_R[0])
+        assert np.all(np.asarray(core_fit.r_lo) > 0), 'poly8sp expects r_lo = radius scale > 0'
+        assert np.allclose(np.asarray(core_fit.r_b), np.asarray(core_fit.r_lo) * core_fit.poly_R[0]), 'poly8sp r_b != r_lo * R0'
+    ns = np.asarray(np.asarray(mesh_coeffs).shape, np.int64)
+    cs = float(np.max(core_fit.r_b))            # max per-center evaluation cutoff (== max(poly_R) for poly8)
+    x0 = float(centers[:, 0].min()) - cs; x1 = float(centers[:, 0].max()) + cs
+    y0 = float(centers[:, 1].min()) - cs; y1 = float(centers[:, 1].max()) + cs
+    batoms, boffs, nbx, nby = build_pic_buckets(centers, x0, y0, x1, y1, cs)
+    interior = (np.array([halo] * 3, np.int64),
+                np.array([ns[0] - 1 - halo, ns[1] - 1 - halo, ns[2] - 1 - halo], np.int64))
+    return ContactPMEParams(mesh_coeffs=np.asarray(mesh_coeffs, np.float64),
+                            mesh_origin=np.asarray(mesh_origin, np.float64),
+                            mesh_h=float(mesh_h), mesh_halo=int(halo),
+                            query_interior=interior, core_fit=core_fit, split_params=None,
+                            atom_pos=centers, bucket_atoms=batoms, bucket_offsets=boffs,
+                            bucket_nbx=nbx, bucket_nby=nby, bucket_cell_size=cs,
+                            bucket_bounds=(x0, y0, x1, y1), core_span_override=cs)
 

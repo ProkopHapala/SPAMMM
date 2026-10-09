@@ -24,6 +24,15 @@ sample_fdbm oracle — no F_total host download):
   --method sep   separable 2.5D contact fit (SeparableParams, B-spline XY x
                  poly z modes) -> fit_contact_field CG (~2 min/mol — DEPRECATED
                  slow path, kept for size comparison).
+  --method coremesh  poly8 core + coarse mesh: compact radial cores
+                 phi=(1-r/R)_+^8 on atoms + bond midpoints (slots of the global
+                 ladder R=[9,5.612,3.5,1,1], atoms {0,1,2} bonds {0,2}), plain
+                 LSQ on the shell 2.5<r_min<4.0 (probe side z>mol_z+0.5), then a
+                 weighted P-spline mesh (fit_coremesh_lsq) on E-core for
+                 r_min>2.5 (no outer cut). Kernel-side -DCS_PME_POLY_CORE=1.
+                 Also scans a 'spline_only' baseline (same weighted mesh on full
+                 E, zero core) and writes compare_pp_dxy.png (relaxed-PP lateral
+                 displacement of FDBM vs both fits).
 
 Per molecule: azaindol + PTCDA; ONE FDBMPipeline shared across the batch.
 Validation: holdout E/F vs oracle, serialization round-trip, rescan df/Fz corr.
@@ -32,6 +41,7 @@ comparison_arrays.npz under debug/testplot_fdbm_fields_compress/<mol>/.
 """
 
 import os
+import re
 import sys
 import time
 import numpy as np
@@ -64,13 +74,19 @@ def _variant_figure(a_util, variants, row_specs, h_Fz, scan_xs, scan_ys, figure,
 def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
                  bspl_steps=(0.8,), n_iter=1200, z_modes=8, poly_z0=2.2, poly_R=8.0,
                  no_core=False, n_shell=6000, n_cloud=32768,
-                 delta_in=1.0, delta_b=1.0, z_fit_dz=1.2, resid_cap=10.0):
+                 delta_in=1.0, delta_b=1.0, z_fit_dz=1.2, resid_cap=10.0, lam=1e-3,
+                 core_basis='poly8', core_wF=0.3, core_spec='A:s3p2+B:s1', core_solver='gpu',
+                 skip_spline_only=False):
     from spammm import atomicUtils as au
     from spammm.SPM import AFM as afm, AFM_utils as afm_utils
     from spammm.config_utils import get_dftb_basis_path
     from spammm.forcefields.FFController import make_planar_xy, orient_long_axis_x
 
-    outdir = os.path.join(OUTROOT, f'{mol_name}_s{step:g}_{method}{h_mesh if method == "pme" else bspl_steps[0]:g}')
+    tag = method
+    if method == 'coremesh':
+        spec_tag = '' if core_basis == 'poly8' else '-' + re.sub(r'[^A-Za-z0-9]+', '', core_spec)
+        tag = f'coremesh_{core_basis}{spec_tag}'
+    outdir = os.path.join(OUTROOT, f'{mol_name}_s{step:g}_{tag}{h_mesh if method != "sep" else bspl_steps[0]:g}')
     os.makedirs(outdir, exist_ok=True)
     atomPos, _, enames, _, _ = au.load_xyz(xyz_file)
     ELEM_Z = {'H':1,'C':6,'N':7,'O':8,'F':9,'P':15,'S':16}
@@ -115,8 +131,8 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
     E_hold, F_hold = sample(holdout)
     K_lat, K_rad = afm.stiffness_Nm_to_eVA2(0.5), 20.0
     t0 = time.perf_counter()
-    FEs_ref, _ = a.scan_fdbm(scan_xs, scan_ys, h_scan, mol_z=mol_z,
-                             K_LAT=K_lat, K_RAD=K_rad, bond_length=BOND_L, use_fire=True)
+    FEs_ref, disp_ref = a.scan_fdbm(scan_xs, scan_ys, h_scan, mol_z=mol_z,
+                                    K_LAT=K_lat, K_RAD=K_rad, bond_length=BOND_L, use_fire=True)
     t_scan_ref = time.perf_counter() - t0
     idx_df = np.array([int(np.argmin(abs(h_scan - h))) for h in h_df])
     idx_Fz = np.array([int(np.argmin(abs(h_scan - h))) for h in h_Fz])
@@ -242,6 +258,154 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
                          f'Fz_rmse={rmse(Fz_ref[..., iz], Fz_fit[..., iz]):.4e}')
         print('\n'.join(lines[-(4 + 3 + len(h_Fz)):]), flush=True)
 
+    elif method == 'coremesh':
+        # poly8 core (atoms + bond midpoints, phi=(1-r/R)_+^8) fitted on the shell
+        # 2.5<r_min<4.0, then a weighted cubic B-spline mesh on E-core for r_min>2.5
+        # (NO outer cut). Kernel-side: same contact_pme ABI with -DCS_PME_POLY_CORE=1.
+        from spammm.surfaces.PICCore import (POLY_CORE_R, core_centers_atoms_bonds,
+                                             fit_core_poly_shell, eval_core_poly)
+        from spammm.surfaces.CoarseMesh import fit_coremesh_lsq
+        from spammm.surfaces.ContactSurface import cpm_params_from_coremesh
+        import pickle, dataclasses
+        h = float(h_mesh); halo = MESH_HALO
+        s = 4 if h >= 1.0 else 2                                  # supersampling -> sample step h/s
+        dg = h / s
+        lo = qb[:, 0] - halo * h
+        n_mesh = np.round((qb[:, 1] + halo * h - lo) / h).astype(int) + 1
+        ns_ss = (n_mesh - 1) * s + 1                              # node-aligned supersampled grid
+        grids = np.meshgrid(*[lo[a_] + np.arange(ns_ss[a_]) * dg for a_ in range(3)], indexing='ij')
+        pts = np.ascontiguousarray(np.stack(grids, -1).reshape(-1, 3), dtype=np.float32)
+        print(f'[coremesh] h={h} s={s} sample grid {tuple(ns_ss)} ({pts.shape[0]} pts) -> mesh nodes {tuple(n_mesh)}', flush=True)
+        t0 = time.perf_counter()
+        E_ss, F_ss = sample(pts)
+        assert np.isfinite(E_ss).all(), 'coremesh sample grid outside FDBM grid'
+        t_samp = time.perf_counter() - t0
+        z_min = mol_z + 0.5
+        t1 = time.perf_counter()
+        cg_info = None
+        if core_basis == 'poly8sp':
+            # angular sp core (default spec A:s3p2+B:s1 -> 9 slots/center, kernel CS_PME_SP_CORE)
+            from spammm.surfaces.PICCore import fit_core_sp_shell, eval_core_sp, sp_ladder
+            Rlab, _ = sp_ladder(core_spec)
+            if core_solver == 'gpu':
+                # the GPU CGLS runs in the kernel slot layout -> SP-compiled
+                # program must exist BEFORE the fit (the later call is a no-op)
+                a.set_pme_core_basis('poly8sp', poly_R=Rlab)
+            fit, centers = fit_core_sp_shell(atomPos, pts=pts, E=E_ss, F=F_ss, wF=core_wF, rin=2.5, rcut=4.0, z_min=z_min, spec=core_spec, solver=core_solver, afm=a)
+            cg_info = getattr(fit, 'cg_info', None)
+            if core_solver == 'gpu':
+                E_core, _ = a._cs_fit_helper().eval_core_sp_gpu(pts)
+            else:
+                E_core, _ = eval_core_sp(pts, centers, fit.coeffs, fit.r_lo, fit.poly_R)
+            n_bond = len(centers) - len(atomPos)
+            Rlab = fit.poly_R
+        else:
+            centers, is_bond = core_centers_atoms_bonds(atomPos, dbond=1.6)
+            fit = fit_core_poly_shell(atomPos, centers, is_bond, pts=pts, E=E_ss, rin=2.5, rcut=4.0, z_min=z_min)
+            E_core, _ = eval_core_poly(pts, centers, fit.coeffs)
+            n_bond = int(is_bond.sum())
+            Rlab = POLY_CORE_R
+        resid = (E_ss.astype(np.float64) - E_core).reshape(ns_ss)
+        from spammm.surfaces.PICCore import min_dist_to_atoms
+        rm_pts = min_dist_to_atoms(pts, atomPos)
+        w = ((rm_pts > 2.5) & (pts[:, 2] > z_min)).reshape(ns_ss).astype(np.float64)
+        t_core = time.perf_counter() - t1
+        tm = time.perf_counter()
+        mesh, _, dg_res = fit_coremesh_lsq(resid, np.empty((0, 3)), lo, h, np.empty(0), np.empty(0),
+                                           s=s, weights=w, lam=lam, tol=1e-7, maxiter=20000)
+        t_m1 = time.perf_counter() - tm
+        print(f'[coremesh] mesh(E-core) CG iters {dg_res["iterations"]} wrms={dg_res["wrmse"]*1e3:.3f} meV ({t_m1:.1f}s)', flush=True)
+        cpm = cpm_params_from_coremesh(mesh.coeffs, lo, h, halo, centers, fit)
+        tm = time.perf_counter()
+        if skip_spline_only:
+            mesh_s = None; t_m2 = 0.0; dg_spl = None
+            print('[coremesh] mesh_spl=skipped (--skip-spline-only)', flush=True)
+        else:
+            mesh_s, _, dg_spl = fit_coremesh_lsq(E_ss.astype(np.float64).reshape(ns_ss), np.empty((0, 3)), lo, h, np.empty(0), np.empty(0),
+                                               s=s, weights=w, lam=lam, tol=1e-7, maxiter=20000)
+            t_m2 = time.perf_counter() - tm
+            print(f'[coremesh] mesh(spline-only) CG iters {dg_spl["iterations"]} wrms={dg_spl["wrmse"]*1e3:.3f} meV ({t_m2:.1f}s)', flush=True)
+        print(f'[timing] sample={t_samp:.2f}s core_fit={t_core:.2f}s mesh1={t_m1:.2f}s mesh2={t_m2:.2f}s' + (f' cg_iters={cg_info["iters"]} cg_sec={cg_info["sec"]:.2f}' if cg_info is not None else ''), flush=True)
+        fit0 = dataclasses.replace(fit, coeffs=np.zeros_like(fit.coeffs))
+        cpm0 = cpm_params_from_coremesh(mesh_s.coeffs, lo, h, halo, centers, fit0) if not skip_spline_only else None
+        a.set_pme_core_basis(core_basis, poly_R=Rlab)
+        t_fit = time.perf_counter() - t0
+        blob = pickle.dumps(cpm)
+        archive = os.path.join(outdir, f'coremesh_{h:g}.pkl')
+        with open(archive, 'wb') as f:
+            f.write(blob)
+        arch_bytes = len(blob)
+        snapshots.update({'coremesh_centers': centers, 'coremesh_coeffs': fit.coeffs,
+                          'mesh_ns': n_mesh, 'mesh_lo': lo, 'mesh_coeffs': mesh.coeffs})
+        lines.extend([f'\n[coremesh_{h:g}] {core_basis} core+mesh: {len(centers)} centers '
+                      f'({n_bond} bonds), R={np.asarray(Rlab).tolist()}, s={s}, lam={lam:g}, wF={core_wF:g}',
+                      f'fit breakdown: sample={t_samp:.2f}s core={t_core:.2f}s mesh_res={t_m1:.2f}s mesh_spl={t_m2:.2f}s total={t_fit:.2f}s',
+                      f'mesh={tuple(n_mesh)} h={h} halo={halo} resident_bytes={cpm.resident_bytes} '
+                      f'archive_pickle_bytes={arch_bytes} dense_ratio={dense_bytes / cpm.resident_bytes:.0f}x',
+                      f'fit_sec={t_fit:.2f} (sample+core+2x mesh CG)'])
+        nom_xy = np.meshgrid(scan_xs, scan_ys, indexing='ij')
+
+        def scan_variant(label, cpm_v):
+            a.cpm = cpm_v; a._cpm_upload_id = None; a._cpm_coeffs0 = None
+            a.pme_set_field(None)
+            E_g, F_g = a.eval_contact_pme(holdout, params=cpm_v, use_gpu=True, core_backend='local')
+            t0 = time.perf_counter()                                  # eval scaling: warm GPU re-eval of the holdout batch
+            a.eval_contact_pme(holdout, params=cpm_v, use_gpu=True, core_backend='local')
+            a.queue.finish()
+            t_eval = (time.perf_counter() - t0) * 1e3 / len(holdout)  # ms per 1k points
+            E_py, F_py = a._pme_eval_python(cpm_v, holdout)
+            mlow = E_hold < 0.3
+            lines.append(f'[{label}] holdout_E_rmse={rmse(E_hold, E_g):.4e} max={np.abs(E_hold - E_g).max():.4e} '
+                         f'E<0.3_rmse={rmse(E_hold[mlow], E_g[mlow]):.4e} (n={int(mlow.sum())})')
+            for c, nm in enumerate(('Fx', 'Fy', 'Fz')):
+                lines.append(f'[{label}] holdout_{nm}_rmse={rmse(F_hold[:, c], F_g[:, c]):.4e} corr={corr(F_hold[:, c], F_g[:, c]):.6f}')
+            lines.append(f'[{label}] CPU-GPU parity max|dE|={np.abs(E_g - E_py).max():.3e} max|dF|={np.abs(F_g - F_py).max():.3e}')
+            t0 = time.perf_counter()
+            FEs_fit, _ = a.run_scan_contact_pme(nxy=(len(scan_xs), len(scan_ys)), nz=len(h_scan),
+                                                dtip=-0.1, scan_p0=scan_p0, scan_da=scan_da, scan_db=scan_db,
+                                                core_backend='local')
+            sc = time.perf_counter() - t0
+            pp = a.last_pp[:, :, ::-1, :3]                       # kernel iz=0=top -> ascending height
+            rm_pp = min_dist_to_atoms(pp.reshape(-1, 3), atomPos)
+            dz_pp = pp[..., 2].ravel() - mol_z
+            lines.append(f'[{label}] hole guard: relaxed PP min r_min={rm_pp.min():.3f} A  min z-mol_z={dz_pp.min():.3f} A  '
+                         f'n(r_min<2.0)={int((rm_pp < 2.0).sum())}  n(r_min<2.0 & z<mol_z+2.0)={int(((rm_pp < 2.0) & (dz_pp < 2.0)).sum())}')
+            FEs_fit = FEs_fit[:, :, ::-1, :]
+            assert np.isfinite(FEs_fit).all() and float(np.std(FEs_fit[..., 2])) > 1e-8
+            df_fit = afm.compute_df_amp(FEs_fit[..., 2], 0.1, amp=1.0)[..., idx_df]
+            Fz_fit = FEs_fit[..., 2][..., idx_Fz]
+            dxy = np.hypot(pp[..., 0] - nom_xy[0][:, :, None], pp[..., 1] - nom_xy[1][:, :, None])[..., idx_Fz]
+            for iz, (hf, hd) in enumerate(zip(h_Fz, h_df)):
+                lines.append(f'[{label}] h_Fz={hf:.2f} h_df={hd:.2f} df_corr={corr(df_ref[..., iz], df_fit[..., iz]):.6f} '
+                             f'df_rmse={rmse(df_ref[..., iz], df_fit[..., iz]):.4e} '
+                             f'Fz_corr={corr(Fz_ref[..., iz], Fz_fit[..., iz]):.6f} '
+                             f'Fz_rmse={rmse(Fz_ref[..., iz], Fz_fit[..., iz]):.4e}')
+            lines.append(f'[{label}] scan_sec={sc:.2f} eval_ms_per_1k={t_eval:.3f} npts={len(holdout)}')
+            print('\n'.join(lines[-(2 + 3 + len(h_Fz)):]), flush=True)
+            return dict(df=df_fit, Fz=Fz_fit, dxy=dxy, E_hold=E_g, F_hold=F_g, FEs=FEs_fit, scan_sec=sc, eval_ms=t_eval)
+
+        variants['FDBM']['dxy'] = np.hypot(disp_ref['dx'], disp_ref['dy'])[..., idx_Fz]
+        pp_variants = {}; scan_secs = []
+        eval_ms = None
+        for label, cpm_v in ((f'coremesh_{h:g}', cpm),) + (() if skip_spline_only else ((f'spline_only_{h:g}', cpm0),)):
+            r = scan_variant(label, cpm_v)
+            if label.startswith('coremesh'):
+                eval_ms = r['eval_ms']
+            variants[label] = {'df': r['df'], 'Fz': r['Fz'], 'dxy': r['dxy']}
+            row_specs.append(('df', label, f'{label} df', 'gray'))
+            snapshots.update({f'{label}_E_hold': r['E_hold'], f'{label}_F_hold': r['F_hold'],
+                              f'{label}_df': r['df'], f'{label}_Fz': r['Fz'], f'{label}_FEs': r['FEs'],
+                              f'{label}_dxy': r['dxy']})
+            pp_variants[label] = {'dxy': r['dxy']}
+            scan_secs.append(r['scan_sec'])
+        scan_sec = sum(scan_secs)
+        pp_fig = os.path.join(outdir, 'compare_pp_dxy.png')
+        pv = {'FDBM': {'dxy': variants['FDBM']['dxy']}}; pv.update(pp_variants)
+        afm_utils.plot_afm_variant_height_strip(pv, [('dxy', k, f'{k} |dxy|', 'viridis') for k in pv],
+                                                h_Fz, pp_fig, title=f'{mol_name} relaxed-PP lateral displacement |dxy| (FDBM vs fits)',
+                                                extent=afm_utils.scan_extent(scan_xs, scan_ys), amp=None, amp_align=False, dpi=150)
+        print(f'REVIEW: {pp_fig}', flush=True)
+
     else:  # separable 2.5D contact fit (CG — DEPRECATED slow path)
         from spammm.surfaces.ContactSurface import (
             SeparableParams, _bspline_prefilter_2d, bspline_n_intervals, make_fit_grid_zstack)
@@ -307,10 +471,17 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
     with open(summary, 'w') as f:
         f.write('\n'.join(lines) + '\n')
     print(f'REVIEW: {summary}\nREVIEW: {figure}', flush=True)
-    return {'mol': mol_name, 'method': method, 't_fields': t_fields, 'fit_sec': t_fit,
-            'scan_sec': scan_sec, 'archive_kb': arch_bytes / 1024,
-            'dense_mb': dense_bytes / 1e6,
-            'ratio': dense_bytes / (cpm.resident_bytes if method == 'pme' else loaded.resident_bytes)}
+    row = {'mol': mol_name, 'method': method, 'tag': tag, 't_fields': t_fields, 'fit_sec': t_fit,
+           'scan_sec': scan_sec, 'archive_kb': arch_bytes / 1024,
+           'dense_mb': dense_bytes / 1e6,
+           'ratio': dense_bytes / (loaded.resident_bytes if method == 'sep' else cpm.resident_bytes)}
+    if method == 'coremesh':
+        row.update(natoms=len(atomPos), ncenters=len(centers), ncoef=int(fit.coeffs.size),
+                   npts=len(pts), mesh_nodes='x'.join(map(str, n_mesh)), core_fit_sec=t_core,
+                   cg_iters=(cg_info['iters'] if cg_info is not None else -1), cg_sec=(cg_info['sec'] if cg_info is not None else 0.0),
+                   mesh_res_sec=t_m1, mesh_res_iters=dg_res['iterations'], eval_ms=eval_ms,
+                   resident_bytes=cpm.resident_bytes)
+    return row
 
 
 def main():
@@ -318,29 +489,64 @@ def main():
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument('mols', nargs='*', default=['azaindol', 'PTCDA'])
-    p.add_argument('--method', choices=('pme', 'sep'), default='pme')
-    p.add_argument('--h-mesh', type=float, default=H_MESH)
+    p.add_argument('--method', choices=('pme', 'sep', 'coremesh'), default='pme')
+    p.add_argument('--h-mesh', type=float, default=None, help=f'mesh spacing [A]; default {H_MESH} for pme, 1.0 for coremesh')
+    p.add_argument('--lam', type=float, default=1e-3, help='mesh smoothness penalty (coremesh)')
     p.add_argument('--step', type=float, default=0.1, help='FDBM density/field grid step [A]')
     p.add_argument('--no-core', action='store_true', help='zero-core PME (old artifact-prone path)')
     p.add_argument('--din', type=float, default=1.0, help='SplitParams delta_in (r_lo=R0-din)')
     p.add_argument('--db', type=float, default=1.0, help='SplitParams delta_b (r_b=R0+db)')
     p.add_argument('--z-fit', type=float, default=1.2, help='min z of core-fit samples above mol_top [A]')
     p.add_argument('--cap', type=float, default=10.0, help='residual cap: nodes |resid|>cap are inpainted [eV]')
+    p.add_argument('--core-basis', choices=('poly8', 'poly8sp'), default='poly8',
+                   help='coremesh core basis: poly8 = 5 scalar slots; poly8sp = 9-slot angular sp (A:s3p2+B:s1)')
+    p.add_argument('--core-wF', type=float, default=0.3, help='poly8sp force-row weight in core LSQ (0 = energy only)')
+    p.add_argument('--core-spec', default='A:s3p2+B:s1', help="poly8sp basis spec, e.g. 'A:s3p2+B:s1' or atom-only 'A:s3p3'")
+    p.add_argument('--core-solver', choices=('gpu', 'lstsq'), default='gpu',
+                   help="poly8sp core fit solver: gpu = matrix-free CGLS on OpenCL (design doc §16); lstsq = CPU dense design (small molecules only)")
+    p.add_argument('--skip-spline-only', action='store_true', help='coremesh: skip the spline-only mesh fit + scan variant (halves mesh time)')
     args = p.parse_args()
     MOLS = {'azaindol': 'data/xyz/azaindol.xyz', 'PTCDA': 'data/xyz/PTCDA.xyz',
-            'pentacene': 'data/xyz/pentacene.xyz'}
+            'pentacene': 'data/xyz/pentacene.xyz', 'PTCDI': 'data/xyz/PTCDI.xyz',
+            'porphirin': 'data/xyz/porphirin.xyz',
+            'circumcoronene': 'data/xyz/circumcoronene.xyz',
+            'circumcircumcoronene': 'data/xyz/circumcircumcoronene.xyz'}
     pipe = FDBMPipeline()          # ONE pipeline for the whole batch (batch contract)
     rows = []
     for m in args.mols:
+        h_mesh = args.h_mesh if args.h_mesh is not None else (1.0 if args.method == 'coremesh' else H_MESH)
         rows.append(compress_mol(pipe, m, MOLS[m], args.step, method=args.method,
-                                 h_mesh=args.h_mesh, no_core=args.no_core,
+                                 h_mesh=h_mesh, no_core=args.no_core,
                                  delta_in=args.din, delta_b=args.db,
-                                 z_fit_dz=args.z_fit, resid_cap=args.cap))
+                                 z_fit_dz=args.z_fit, resid_cap=args.cap, lam=args.lam,
+                                 core_basis=args.core_basis, core_wF=args.core_wF, core_spec=args.core_spec, core_solver=args.core_solver,
+                                 skip_spline_only=args.skip_spline_only))
     print(f"\n\n{'='*80}")
-    print(f"{'mol':10s} {'method':7s} {'fields s':>9s} {'fit s':>7s} {'scan s':>7s} {'dense MB':>9s} {'arch KB':>9s} {'ratio':>7s}")
+    hdr = (f"{'mol':22s} {'method':8s} {'nat':>4s} {'ncntr':>6s} {'ncoef':>6s} {'npts':>9s} {'mesh':>10s} "
+           f"{'core_s':>7s} {'cgit':>5s} {'mesh1_s':>7s} {'scan_s':>7s} {'ms/1k':>6s} {'res_MB':>7s} "
+           f"{'fit_s':>7s} {'dense_MB':>8s} {'arch_KB':>8s} {'ratio':>7s}")
+
+    def _c(v, fm, na='-'):
+        return na if v is None else fm.format(v)
+
+    def _row(r):
+        return (f"{r['mol']:22s} {r['method']:8s} {_c(r.get('natoms'), '{:4d}')} {_c(r.get('ncenters'), '{:6d}')} "
+                f"{_c(r.get('ncoef'), '{:6d}')} {_c(r.get('npts'), '{:9d}')} {_c(r.get('mesh_nodes'), '{:>10s}')} "
+                f"{_c(r.get('core_fit_sec'), '{:7.2f}')} {_c(r.get('cg_iters'), '{:5d}')} {_c(r.get('mesh_res_sec'), '{:7.2f}')} "
+                f"{r['scan_sec']:7.2f} {_c(r.get('eval_ms'), '{:6.3f}')} {_c(None if r.get('resident_bytes') is None else r['resident_bytes'] / 1e6, '{:7.2f}')} "
+                f"{r['fit_sec']:7.2f} {r['dense_mb']:8.1f} {r['archive_kb']:8.1f} {r['ratio']:6.0f}x")
+
+    print(hdr)
     for r in rows:
-        print(f"{r['mol']:10s} {r['method']:7s} {r['t_fields']:9.2f} {r['fit_sec']:7.2f} {r['scan_sec']:7.2f} "
-              f"{r['dense_mb']:9.1f} {r['archive_kb']:9.1f} {r['ratio']:7.0f}x")
+        line = _row(r)
+        print(line)
+        scal = os.path.join(OUTROOT, f"SCALING_{r.get('tag', r['method'])}.out")
+        if not os.path.exists(scal) or os.path.getsize(scal) == 0:
+            with open(scal, 'w') as f:
+                f.write(hdr + '\n')
+        with open(scal, 'a') as f:
+            f.write(line + '\n')
+        print(f'REVIEW: {scal}')
 
 
 if __name__ == '__main__':

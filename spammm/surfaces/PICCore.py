@@ -10,6 +10,14 @@ Default split target is the compact residual (PMESplit split_mode='paw'/'hermite
 
 Fit uses Boltzmann weights on total v(r) (like ContactSurface.boltzmann_fit_weights)
 plus separate E/F block normalization so the well is not lost to derivative scale.
+
+Two extra compact bases for the sequential core+mesh FDBM fit:
+  'poly8'   5-slot scalar ladder phi=(1-r/R)_+^8 (fit_core_poly_shell/eval_core_poly;
+            kernel CS_PME_POLY_CORE, NMODES=5).
+  'poly8sp' angular sp layout (fit_core_sp_shell/eval_core_sp; kernel CS_PME_SP_CORE):
+            slots 0-2 = s radials, then NP p-shells (3+3k..5+3k), nmod = 3+3*NP
+            (9 for 'A:s3p2+B:s1', 12 for 'A:s3p3'). w-channel carries per-center
+            radius scale (atoms 1.0, bond midpoints Rb/R0 -> 'B:s1' R=5 A).
 """
 from __future__ import annotations
 import numpy as np
@@ -43,6 +51,7 @@ class CoreFit:
     held_max_E: np.ndarray   # (na,) held-out max |dE|
     held_max_F: np.ndarray   # (na,) held-out max |dF|
     worst_r: np.ndarray      # (na,) worst held-out radius
+    poly_R: np.ndarray = None  # (5,) cutoff ladder for basis='poly8' (unused otherwise)
 
     @property
     def r_cut(self) -> float:
@@ -51,6 +60,288 @@ class CoreFit:
 
 
 # ── basis functions ─────────────────────────────────────────────────────────
+
+# poly8 core+mesh basis (sequential core-then-mesh FDBM fit): phi_m(r) = (1 - r/R_m)_+^N.
+# 5-slot global ladder; slots 3,4 are padding (coeff 0) so atoms use {0,1,2} and
+# bond centers {0,2} — active cutoffs (9, 5.612, 3.5) A for atoms, (9, 3.5) for bonds.
+POLY_CORE_N = 8
+POLY_CORE_R = np.concatenate([np.geomspace(9.0, 3.5, 3), [1.0, 1.0]])
+POLY_ATOM_SLOTS = (0, 1, 2)
+POLY_BOND_SLOTS = (0, 2)
+
+# poly8sp angular core (basis 'poly8sp', kernel CS_PME_SP_CORE, NMODES=9):
+#   slots 0-2  s radials at R = SP_CORE_R[0..2] * w_i   (phi = (1-r/R)_+^N)
+#   slots 3-5  p shell  (phi*n_x, phi*n_y, phi*n_z) at R = SP_CORE_R[3] * w_i
+#   slots 6-8  p shell  at R = SP_CORE_R[4] * w_i
+# w_i = per-center radius scale carried in the atom w-channel: atoms 1.0,
+# bond midpoints SP_BOND_RSCALE (so bond slot0 has R = 9*5/9 = 5 A = 'B:s1').
+# == spec 'A:s3p2+B:s1' of CoreBasisStudy (column order verified in fit_core_sp_shell).
+SP_CORE_R = np.concatenate([np.geomspace(9.0, 3.5, 3), [7.0, 3.5]])
+SP_NMODES = 9
+SP_BOND_RSCALE = 5.0 / 9.0
+
+
+def min_dist_to_atoms(P, apos):
+    """r_min = distance from each point to nearest atom (cKDTree; no (np,nat) broadcast)."""
+    from scipy.spatial import cKDTree
+    return cKDTree(np.asarray(apos, np.float64).reshape(-1, 3)).query(np.asarray(P, np.float64).reshape(-1, 3))[0]
+
+
+def poly_core_basis(r, R=POLY_CORE_R, N=POLY_CORE_N):
+    """phi_m(r) = (1 - r/R_m)_+^N and dphi_m/dr = -(N/R_m)(1 - r/R_m)_+^(N-1).
+
+    Returns (phi, dphi), each (..., 5). Exactly zero for r >= R_m.
+    Matches the CS_PME_POLY_CORE branch of cs_pme_core_basis (contact_surface.cl).
+    """
+    r = np.asarray(r, dtype=np.float64)[..., None]
+    R = np.asarray(R, dtype=np.float64)
+    u = np.clip(1.0 - r / R, 0.0, None)
+    phi = u ** N
+    dphi = np.where(u > 0.0, -(N / R) * u ** (N - 1), 0.0)
+    return phi, dphi
+
+
+def core_centers_atoms_bonds(apos, dbond=1.6):
+    """Core centers: all atoms + midpoints of atom pairs with d < dbond (all pairs,
+    incl. X-H). Returns (centers (nc,3), is_bond (nc,) bool)."""
+    apos = np.asarray(apos, np.float64).reshape(-1, 3)
+    iu = np.triu_indices(len(apos), 1)
+    dij = np.linalg.norm(apos[iu[0]] - apos[iu[1]], axis=1)
+    bnd = dij < dbond
+    B = 0.5 * (apos[iu[0][bnd]] + apos[iu[1][bnd]])
+    return np.vstack([apos, B]), np.r_[np.zeros(len(apos), bool), np.ones(len(B), bool)]
+
+
+def eval_core_poly(queries, centers, coeffs, R=POLY_CORE_R, N=POLY_CORE_N, chunk=200000):
+    """Batch evaluation of the poly8 core field E = sum_i sum_m c[i,m] phi_m(r_i).
+
+    Vectorized/chunked via cKDTree pair lists. Returns (E, F) with F = -grad E."""
+    from scipy.spatial import cKDTree
+    queries = np.asarray(queries, np.float64).reshape(-1, 3)
+    centers = np.asarray(centers, np.float64).reshape(-1, 3)
+    coeffs = np.asarray(coeffs, np.float64)
+    R = np.asarray(R, np.float64)
+    assert coeffs.shape == (len(centers), len(R)), f'coeffs {coeffs.shape} vs ({len(centers)},{len(R)})'
+    E = np.zeros(len(queries))
+    F = np.zeros((len(queries), 3))
+    tree = cKDTree(centers)
+    Rmax = float(R.max())
+    for i0 in range(0, len(queries), chunk):
+        q = queries[i0:i0 + chunk]
+        pairs = cKDTree(q).sparse_distance_matrix(tree, Rmax, output_type='coo_matrix')
+        if pairs.nnz == 0:
+            continue
+        s_idx, a_idx = pairs.row, pairs.col
+        dvec = q[s_idx] - centers[a_idx]
+        r = np.linalg.norm(dvec, axis=1)
+        phi, dphi = poly_core_basis(r, R, N)
+        np.add.at(E[i0:i0 + chunk], s_idx, (phi * coeffs[a_idx]).sum(1))
+        fr = -(dphi * coeffs[a_idx]).sum(1)[:, None] * dvec / np.maximum(r, 1e-30)[:, None]
+        np.add.at(F[i0:i0 + chunk], s_idx, fr)
+    return E, F
+
+
+def fit_core_poly_shell(apos, centers, is_bond, R=POLY_CORE_R, atom_slots=POLY_ATOM_SLOTS,
+                        bond_slots=POLY_BOND_SLOTS, pts=None, E=None, rin=2.5, rcut=4.0,
+                        z_min=None, N=POLY_CORE_N, bPrint=True):
+    """Plain unweighted LSQ fit of poly8 core coefficients on the shell
+    rin < r_min < rcut (r_min = distance to nearest ATOM), probe side z > z_min.
+
+    Design columns = active (center, slot) pairs only; inactive slots stay 0.
+    Returns CoreFit (basis='poly8', coeffs (nc,5), r_lo=0, r_b=max R, powers=N,
+    poly_R=R; diagnostic arrays NaN)."""
+    apos = np.asarray(apos, np.float64).reshape(-1, 3)
+    centers = np.asarray(centers, np.float64).reshape(-1, 3)
+    is_bond = np.asarray(is_bond, bool)
+    assert len(is_bond) == len(centers)
+    R = np.asarray(R, np.float64)
+    P = np.asarray(pts, np.float64).reshape(-1, 3)
+    E = np.asarray(E, np.float64).ravel()
+    assert E.shape == (len(P),)
+    rmin = min_dist_to_atoms(P, apos)
+    m = (rmin > rin) & (rmin < rcut)
+    if z_min is not None:
+        m &= P[:, 2] > z_min
+    Pf, Ef = P[m], E[m]
+    slots = [(ic, s) for ic in range(len(centers)) for s in (bond_slots if is_bond[ic] else atom_slots)]
+    M = np.empty((len(Pf), len(slots)))
+    for j, (ic, s) in enumerate(slots):
+        r = np.linalg.norm(Pf - centers[ic], axis=1)
+        M[:, j] = np.clip(1.0 - r / R[s], 0.0, None) ** N
+    coef, *_ = np.linalg.lstsq(M, Ef, rcond=1e-12)
+    coeffs = np.zeros((len(centers), len(R)))
+    for j, (ic, s) in enumerate(slots):
+        coeffs[ic, s] = coef[j]
+    ec = M @ coef - Ef
+    nc = len(centers)
+    nan = np.full(nc, np.nan)
+    if bPrint:
+        print(f'fit_core_poly_shell: fit samples {len(Pf)}, ncoef {len(slots)} ({len(centers)} centers), '
+              f'cond~{np.linalg.cond(M):.2e}  shell rms={1e3 * np.sqrt(np.mean(ec**2)):.2f} meV '
+              f'max={1e3 * np.abs(ec).max():.1f} meV', flush=True)
+    return CoreFit(coeffs=coeffs, r_lo=np.zeros(nc), r_b=np.full(nc, float(R.max())),
+                   powers=np.full(len(R), N, dtype=np.int64), basis='poly8',
+                   cond_raw=np.full(nc, np.linalg.cond(M)), cond_hier=nan.copy(),
+                   train_rmse_E=nan.copy(), train_rmse_F=nan.copy(), held_rmse_E=nan.copy(),
+                   held_rmse_F=nan.copy(), held_max_E=nan.copy(), held_max_F=nan.copy(),
+                   worst_r=nan.copy(), poly_R=R.copy())
+
+
+def sp_ladder(spec='A:s3p2+B:s1'):
+    """Kernel radius ladder for a CoreBasisStudy spec: [A s-radii] + [A p-radii]
+    (len = 3 + NP; kernel fixed at 3 s-slots + NP p-shells -> nmod = 3+3*NP).
+    Also returns bond radius Rb (None if spec has no B group)."""
+    from spammm.surfaces.CoreBasisStudy import parse_spec
+    rad = {k: cnt for k, cnt in parse_spec(spec)['groups']}
+    Rs = list(rad['A'].get('s', []))
+    Rp = list(rad['A'].get('p', []))
+    assert len(Rs) == 3, f'kernel SP layout requires exactly 3 s-slots, got {len(Rs)}'
+    Rb = float(rad['B']['s'][0]) if 'B' in rad else None
+    return np.array(Rs + Rp, np.float64), Rb
+
+
+def fit_core_sp_shell(apos, pts=None, E=None, F=None, wF=0.3, rin=2.5, rcut=4.0,
+                      z_min=None, dbond=1.6, spec='A:s3p2+B:s1', N=POLY_CORE_N, bPrint=True,
+                      solver='lstsq', afm=None):
+    """Weighted LSQ fit of the poly8sp core on shell rin<r_min<rcut.
+
+    solver='lstsq' delegates the basis machinery to CoreBasisStudy (build_terms +
+    fit_core_lsq), then repacks the mode-major coefficient vector into the
+    kernel's per-center layout: slots 0-2 s at Rlad[0..2]*w, then NP p-shells
+    (3+3k..5+3k at Rlad[3+k]*w). solver='gpu' runs the matrix-free CGLS
+    (ContactSurfaceCL.fit_core_sp_cg, design doc §16) directly in the kernel slot
+    layout — requires afm, an AFMulator already compiled for 'poly8sp' with the
+    matching ladder (a.set_pme_core_basis first). Bond slot = single s at Rb
+    (encoded as slot0 with radius scale w=Rb/Rlad[0]). Returns (CoreFit
+    basis='poly8sp', centers (nc,3)) — centers ordered atoms then bond
+    midpoints, matching CoreBasisStudy.build_terms."""
+    from spammm.surfaces.CoreBasisStudy import build_terms, fit_core_lsq
+    apos = np.asarray(apos, np.float64).reshape(-1, 3)
+    na = len(apos)
+    Rlad, Rb = sp_ladder(spec)
+    NP = len(Rlad) - 3
+    nmod = 3 + 3 * NP
+    sets = build_terms(apos, spec)
+    (Ca, ma) = sets[0]
+    assert np.allclose(Ca, apos)
+    exp = [(Rlad[m], 's') for m in range(3)] + [(Rlad[3 + k], 'p') for k in range(NP) for _ in range(3)]
+    assert [(m[0], m[1]) for m in ma] == exp, f'kernel slot layout mismatch: {[(m[0], m[1]) for m in ma]} vs {exp}'
+    Cb, mb = (sets[1] if len(sets) > 1 else (np.zeros((0, 3)), []))
+    if len(sets) > 1:
+        assert len(mb) == 1 and abs(mb[0][0] - Rb) < 1e-9
+    centers = np.concatenate([Ca, Cb])
+    nb = len(Cb)
+    P = np.asarray(pts, np.float64).reshape(-1, 3)
+    E = np.asarray(E, np.float64).ravel()
+    rmin = min_dist_to_atoms(P, apos)
+    m = (rmin > rin) & (rmin < rcut)
+    if z_min is not None:
+        m &= P[:, 2] > z_min
+    Pf, Ef = P[m], E[m]
+    Ff = np.asarray(F, np.float64).reshape(-1, 3)[m] if (wF > 0 and F is not None) else None
+    w = np.ones(na + nb)
+    if nb:
+        w[na:] = Rb / Rlad[0]                            # bond radius scale (kernel w-channel)
+    if solver == 'gpu':
+        assert afm is not None, "solver='gpu' needs afm=AFMulator compiled for 'poly8sp'"
+        opts = getattr(afm, '_pme_build_opts', []) or []
+        assert 'CS_PME_SP_CORE=1' in opts, f"afm not compiled for poly8sp (opts={opts})"
+        nmod_afm = 3 * (len(afm.pme_poly_R) - 2) if afm.pme_poly_R is not None else None
+        assert nmod_afm == nmod, f'NMODES mismatch: afm {nmod_afm} vs spec {nmod}'
+        active = np.ones(na * nmod, bool)
+        if nb:
+            ab = np.zeros(nb * nmod, bool); ab[0::nmod] = True   # bond centers: slot0 only (='B:s1')
+            active = np.concatenate([active, ab])
+        coeffs, cinfo = afm._cs_fit_helper().fit_core_sp_cg(centers, w, Rlad, Pf, Ef, Ff, wF=wF, bPrint=bPrint, active=active)
+        _cg_info = cinfo
+        if bPrint:
+            print(f'fit_core_sp_shell(gpu): spec={spec} fit samples {len(Pf)}, ncoef {coeffs.size} ({na}+{nb} centers), wF={wF if Ff is not None else 0.0} '
+                  f'iters={cinfo["iters"]} ({cinfo["sec"]:.1f}s)  resid rms={cinfo["rms_s"] * 1e3:.2f} meV-rows', flush=True)
+        cond = np.nan
+    else:
+        assert solver == 'lstsq', f"unknown solver '{solver}'"
+        coef, ME = fit_core_lsq(Pf, Ef, Ff, sets, wF=wF if Ff is not None else 0.0)
+        assert coef.shape == (nmod * na + nb,)
+        coeffs = np.zeros((na + nb, nmod))
+        coeffs[:na] = coef[:nmod * na].reshape(nmod, na).T   # mode-major -> per-center slots
+        if nb:
+            coeffs[na:, 0] = coef[nmod * na:]                # bond s -> slot 0
+        ec = ME @ coef - Ef
+        cond = np.linalg.cond(ME)
+        _cg_info = None
+        if bPrint:
+            print(f'fit_core_sp_shell: spec={spec} fit samples {len(Pf)}, ncoef {len(coef)} ({na}+{nb} centers), wF={wF if Ff is not None else 0.0} '
+                  f'cond~{cond:.2e}  shell rms={1e3 * np.sqrt(np.mean(ec**2)):.2f} meV '
+                  f'max={1e3 * np.abs(ec).max():.1f} meV', flush=True)
+    nc = na + nb
+    nan = np.full(nc, np.nan)
+    cf = CoreFit(coeffs=coeffs, r_lo=w, r_b=w * Rlad[0], powers=np.full(nmod, N, dtype=np.int64),
+                    basis='poly8sp', cond_raw=np.full(nc, cond), cond_hier=nan.copy(),
+                    train_rmse_E=nan.copy(), train_rmse_F=nan.copy(), held_rmse_E=nan.copy(),
+                    held_rmse_F=nan.copy(), held_max_E=nan.copy(), held_max_F=nan.copy(),
+                    worst_r=nan.copy(), poly_R=Rlad.copy())
+    cf.cg_info = _cg_info
+    return cf, centers
+
+
+def eval_core_sp(queries, centers, coeffs, w, Rlad=SP_CORE_R, N=POLY_CORE_N, chunk=20000):
+    """CPU reference for kernel CS_PME_SP_CORE: E = sum_i c_i . modes(r_i),
+    slots 0-2 s at Rlad[0..2]*w_i, p-shells at Rlad[3+k]*w_i (slots 3+3k..5+3k).
+    w = per-center radius scale (CoreFit.r_lo for basis='poly8sp').
+    Returns (E, F) with F = -grad E (mirrors cs_pme_sp_accum, which returns grad)."""
+    from scipy.spatial import cKDTree
+    queries = np.asarray(queries, np.float64).reshape(-1, 3)
+    centers = np.asarray(centers, np.float64).reshape(-1, 3)
+    coeffs = np.asarray(coeffs, np.float64)
+    w = np.asarray(w, np.float64)
+    Rlad = np.asarray(Rlad, np.float64)
+    NP = len(Rlad) - 3
+    assert coeffs.shape == (len(centers), 3 + 3 * NP)
+    E = np.zeros(len(queries))
+    F = np.zeros((len(queries), 3))
+    tree = cKDTree(centers)
+    Rmax = float(Rlad[0] * w.max())
+    for i0 in range(0, len(queries), chunk):
+        q = queries[i0:i0 + chunk]
+        pairs = cKDTree(q).sparse_distance_matrix(tree, Rmax, output_type='coo_matrix')
+        if pairs.nnz == 0:
+            continue
+        si, ai = pairs.row, pairs.col
+        dv = q[si] - centers[ai]
+        r = np.linalg.norm(dv, axis=1)
+        keep = r < w[ai] * Rlad[0]
+        si, ai, dv, r = si[keep], ai[keep], dv[keep], r[keep]
+        n = dv / np.maximum(r, 1e-30)[:, None]                       # unit vec center->query
+        c9 = coeffs[ai]
+        ws = w[ai]
+        e_ = np.zeros(len(r))
+        gr = np.zeros(len(r))                                        # dE/dr of s part
+        for m in range(3):
+            R = Rlad[m] * ws
+            u = np.clip(1.0 - r / R, 0.0, None)
+            u7 = u**7
+            act = u > 0
+            e_ += c9[:, m] * u7 * u
+            gr += np.where(act, c9[:, m] * (-(N / R) * u7), 0.0)
+        P = np.zeros((len(r), 3))
+        Q = np.zeros((len(r), 3))                                    # P=c*phi, Q=c*phi' per axis
+        for k in range(NP):
+            R = Rlad[3 + k] * ws
+            u = np.clip(1.0 - r / R, 0.0, None)
+            u7 = u**7
+            ph = u7 * u
+            dph = np.where(u > 0, -(N / R) * u7, 0.0)
+            P += c9[:, 3 + 3 * k:6 + 3 * k] * ph[:, None]
+            Q += c9[:, 3 + 3 * k:6 + 3 * k] * dph[:, None]
+        nP = (n * P).sum(1)
+        nQ = (n * Q).sum(1)
+        e_ += nP
+        a = gr + nQ                                                  # radial component of grad
+        G = a[:, None] * n + (P - nP[:, None] * n) / np.maximum(r, 1e-30)[:, None]
+        np.add.at(E[i0:i0 + chunk], si, e_)
+        np.add.at(F[i0:i0 + chunk], si, -G)
+    return E, F
+
 
 def core_basis(r, r_lo, r_b, powers=CORE_POWERS, smooth=False):
     """phi_m(r) = t^p_m and dphi_m/dr for the raw doubling-power basis.
@@ -769,6 +1060,10 @@ def eval_core(queries, atom_pos, fit: CoreFit, r_cut=None):
     na = len(atom_pos)
     rc = float(r_cut if r_cut is not None else fit.r_cut)
     assert na == fit.coeffs.shape[0], f"atom count mismatch: {na} vs {fit.coeffs.shape[0]}"
+    if fit.basis == 'poly8':
+        return eval_core_poly(queries, atom_pos, fit.coeffs, fit.poly_R)
+    if fit.basis == 'poly8sp':
+        return eval_core_sp(queries, atom_pos, fit.coeffs, fit.r_lo, fit.poly_R)
 
     margin = rc
     x0 = float(atom_pos[:, 0].min()) - margin

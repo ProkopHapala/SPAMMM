@@ -65,6 +65,12 @@ __kernel void setLinear(const int ntot, __global float* out, const float c1, __g
     out[i] = c1 * a1[i] + c2 * a2[i];
 }
 
+__kernel void cs_mul(const int n, __global const float* a, __global const float* b, __global float* out) {
+    int i = get_global_id(0);
+    if (i >= n) return;
+    out[i] = a[i] * b[i];
+}
+
 __attribute__((reqd_work_group_size(64, 1, 1)))
 __kernel void dot_wg(const int ntot, __global const float* a, __global const float* b, __global float* partial) {
     int gid = get_global_id(0);
@@ -1032,8 +1038,29 @@ __kernel void evalRadialPIC(
 // Python prototypes: spammm/surfaces/CoarseMesh.py (mesh), PICCore.py (core), PMESplit.py (split).
 // Stencil reference: gridFF.cl:72-93 (basis/dbasis) — copied formulas only, NOT PBC wrapping.
 
+#ifndef CS_PME_NMODES
 #define CS_PME_NMODES 5           // doubling-power core modes: p_m = 2,4,8,16,32
+#endif
 #define CS_PME_CORE_MAX_CAND 512  // safety cap on core candidates per query (fail-loud overflow)
+
+#ifndef CS_PME_POLY_CORE
+#define CS_PME_POLY_CORE 0        // 1 = poly^N compact modes (1 - r/R_m)_+^N (poly8 core+mesh fit)
+#endif
+#ifndef CS_PME_SP_CORE
+#define CS_PME_SP_CORE 0          // 1 = angular sp layout: slots 0-2 s at R0..2*w, 3-5 p(xyz) at R3*w, 6-8 p at R4*w
+#endif
+#if CS_PME_POLY_CORE && CS_PME_SMOOTH_CORE
+#error "CS_PME_POLY_CORE and CS_PME_SMOOTH_CORE are mutually exclusive"
+#endif
+#if CS_PME_POLY_CORE && (!defined(CS_PME_POLY_N) || CS_PME_POLY_N != 8)
+#error "CS_PME_POLY_CORE requires -DCS_PME_POLY_N=8 (basis implemented for N=8 only)"
+#endif
+#if CS_PME_SP_CORE && (!CS_PME_POLY_CORE || (CS_PME_NMODES != 9 && CS_PME_NMODES != 12))
+#error "CS_PME_SP_CORE requires CS_PME_POLY_CORE=1 and -DCS_PME_NMODES=9 or 12"
+#endif
+#if CS_PME_SP_CORE
+#define CS_PME_NP ((CS_PME_NMODES - 3) / 3)   // number of p-shells: slots 3+3k..5+3k at R_{3+k}*w
+#endif
 
 // ---- cardinal cubic B-spline basis (matches gridFF.cl:72-93 and CoarseMesh._basis) ----
 inline float4 cs_pme_basis(float u) {
@@ -1106,6 +1133,19 @@ inline float4 cs_pme_tricubic_eval(
 // t = (r_b - r)/(r_b - r_lo_i). Exactly zero for r >= r_b. Matches PICCore.core_basis.
 // r_b is per-atom (plateau: r_lo + Δ_in + Δ_b). Derivatives via chain rule on repeated squaring.
 inline void cs_pme_core_basis(float r, float r_lo_i, float r_b, float* phi, float* dphi) {
+#if CS_PME_POLY_CORE
+    // poly8 core+mesh modes: phi_m(r) = (1 - r/R_m)_+^N on the fixed ladder
+    // CS_PME_POLY_R0..R4. r_lo_i/r_b ignored (host uploads r_lo=0, span >= max R_m).
+    const float R[5] = {CS_PME_POLY_R0, CS_PME_POLY_R1, CS_PME_POLY_R2, CS_PME_POLY_R3, CS_PME_POLY_R4};
+    const float Nf = (float)CS_PME_POLY_N;
+    for (int m = 0; m < 5; m++) {
+        float u = 1.0f - r / R[m];
+        if (u <= 0.0f) { phi[m] = 0.0f; dphi[m] = 0.0f; continue; }
+        float u2 = u * u, u4 = u2 * u2, u7 = u4 * u2 * u;
+        phi[m] = u7 * u;                          // u^8 (repeated squaring)
+        dphi[m] = -(Nf / R[m]) * u7;              // -(N/R) u^(N-1)
+    }
+#else
     float D = r_b - r_lo_i;
     float t = (r_b - r) / D;
     if (t < 0.0f) t = 0.0f;
@@ -1131,12 +1171,61 @@ inline void cs_pme_core_basis(float r, float r_lo_i, float r_b, float* phi, floa
     phi[2] = active ? t8  : 0.0f;  dphi[2] = active ? dt8  : 0.0f;
     phi[3] = active ? t16 : 0.0f;  dphi[3] = active ? dt16 : 0.0f;
     phi[4] = active ? t32 : 0.0f;  dphi[4] = active ? dt32 : 0.0f;
+#endif
 }
 
 inline float2 cs_pme_core_reduce(const float* phi, const float* dphi, float c0, float c1, float c2, float c3, float c4) {
     return (float2)(c0 * phi[0] + c1 * phi[1] + c2 * phi[2] + c3 * phi[3] + c4 * phi[4],
                     c0 * dphi[0] + c1 * dphi[1] + c2 * dphi[2] + c3 * dphi[3] + c4 * dphi[4]);
 }
+
+#if CS_PME_SP_CORE
+// Angular sp-mode per-center accumulate (basis 'poly8sp', CPU ref PICCore.eval_core_sp).
+// Slots 0-2: s radials phi=(1-r/(R_m*w))_+^N at R0..R2; then CS_PME_NP p shells:
+// slots 3+3k..5+3k = (c*nx, c*ny, c*nz) at R_{3+k}*w. w = per-center radius scale
+// (atom w-channel; atoms=1, bond midpoints<1). p-terms carry tangential gradient:
+//   grad(n.P) = n*(n.P') + (P - n(n.P))/r,   P_a(r) = c_a phi(r).
+// Returns (dE/dx, dE/dy, dE/dz, E) — GRADIENT, not force (caller subtracts).
+inline float4 cs_pme_sp_accum(float dx, float dy, float dz, float r, float w,
+                              const float* c) {
+    const float Nf = (float)CS_PME_POLY_N;
+    float ir = 1.0f / r;
+    float nx = dx * ir, ny = dy * ir, nz = dz * ir;
+    const float Rs[3] = {CS_PME_POLY_R0, CS_PME_POLY_R1, CS_PME_POLY_R2};
+    float E = 0.0f, gr = 0.0f;                       // s part: E_s, dE_s/dr
+    for (int m = 0; m < 3; m++) {
+        float R = Rs[m] * w;
+        float u = 1.0f - r / R;
+        if (u <= 0.0f) continue;
+        float u2 = u * u, u4 = u2 * u2, u7 = u4 * u2 * u;
+        E  += c[m] * u7 * u;
+        gr += c[m] * (-(Nf / R) * u7);
+    }
+    const float Rp[CS_PME_NP] = {CS_PME_POLY_R3, CS_PME_POLY_R4
+#if CS_PME_NP == 3
+        , CS_PME_POLY_R5
+#endif
+        };
+    float Px = 0.0f, Py = 0.0f, Pz = 0.0f, Qx = 0.0f, Qy = 0.0f, Qz = 0.0f;  // P=c*phi, Q=c*phi'
+    for (int k = 0; k < CS_PME_NP; k++) {
+        float R = Rp[k] * w;
+        float u = 1.0f - r / R;
+        if (u <= 0.0f) continue;
+        float u2 = u * u, u4 = u2 * u2, u7 = u4 * u2 * u;
+        float ph = u7 * u, dph = -(Nf / R) * u7;
+        Px += c[3 + 3 * k] * ph;  Py += c[4 + 3 * k] * ph;  Pz += c[5 + 3 * k] * ph;
+        Qx += c[3 + 3 * k] * dph; Qy += c[4 + 3 * k] * dph; Qz += c[5 + 3 * k] * dph;
+    }
+    float nP = nx * Px + ny * Py + nz * Pz;
+    float nQ = nx * Qx + ny * Qy + nz * Qz;
+    E += nP;
+    float a = gr + nQ;                               // radial part of gradient
+    float gx = a * nx + (Px - nP * nx) * ir;
+    float gy = a * ny + (Py - nP * ny) * ir;
+    float gz = a * nz + (Pz - nP * nz) * ir;
+    return (float4)(gx, gy, gz, E);
+}
+#endif
 
 // Core field V_core at one point via XY buckets (3×3 lookup, cell_size >= r_core_max).
 // atoms[i] = (x, y, z, r_lo_i). atom_coeffs[i*NMODES + m]. Per-atom r_lo_i (not global).
@@ -1174,16 +1263,26 @@ inline float4 cs_pme_core_eval_at(
                 if (at < 0 || at >= nat) continue;
                 n_cand++;
                 float4 ap = atoms[at];
-                float r_lo_i = ap.w;
-                float r_b_i = r_lo_i + d_span;
+#if CS_PME_SP_CORE
+                float r_b_i = ap.w * d_span;       // w = radius scale; d_span = base Rmax (R0)
+#else
+                float r_b_i = ap.w + d_span;       // w = r_lo_i
+#endif
                 float dxp = x - ap.x, dyp = y - ap.y, dzp = z - ap.z;
                 float r2 = dxp * dxp + dyp * dyp + dzp * dzp + 1e-20f;
                 if (r2 < min_r2) { min_r2 = r2; offender = at; }
                 if (r2 >= r_b_i * r_b_i) continue;
                 float r = sqrt(r2);
-                float phi[CS_PME_NMODES], dphi[CS_PME_NMODES];
-                cs_pme_core_basis(r, r_lo_i, r_b_i, phi, dphi);
                 int ic = at * CS_PME_NMODES;
+#if CS_PME_SP_CORE
+                float c9[CS_PME_NMODES];
+                for (int m = 0; m < CS_PME_NMODES; m++) c9[m] = atom_coeffs[ic + m];
+                float4 g = cs_pme_sp_accum(dxp, dyp, dzp, r, ap.w, c9);
+                E += g.w;
+                Fx -= g.x; Fy -= g.y; Fz -= g.z;
+#else
+                float phi[CS_PME_NMODES], dphi[CS_PME_NMODES];
+                cs_pme_core_basis(r, ap.w, r_b_i, phi, dphi);
                 float4 c03 = vload4(0, atom_coeffs + ic);
                 float2 ed = cs_pme_core_reduce(phi, dphi, c03.x, c03.y, c03.z, c03.w, atom_coeffs[ic + 4]);
                 E += ed.x;
@@ -1193,6 +1292,7 @@ inline float4 cs_pme_core_eval_at(
                     Fy += fr * dyp;
                     Fz += fr * dzp;
                 }
+#endif
             }
         }
     }
@@ -1216,15 +1316,26 @@ inline float4 cs_pme_core_eval_local_at(
     int offender = -1;
     for (int at = 0; at < nat; at++) {
         float4 ap = LATOMS[at];
-        float r_b_i = ap.w + d_span;
+#if CS_PME_SP_CORE
+        float r_b_i = ap.w * d_span;             // w = radius scale; d_span = base Rmax (R0)
+#else
+        float r_b_i = ap.w + d_span;             // w = r_lo_i
+#endif
         float dxp = x - ap.x, dyp = y - ap.y, dzp = z - ap.z;
         float r2 = dxp * dxp + dyp * dyp + dzp * dzp + 1e-20f;
         if (r2 < min_r2) { min_r2 = r2; offender = at; }
         if (r2 >= r_b_i * r_b_i) continue;
         float r = sqrt(r2);
+        int ic = at * CS_PME_NMODES;
+#if CS_PME_SP_CORE
+        float c9[CS_PME_NMODES];
+        for (int m = 0; m < CS_PME_NMODES; m++) c9[m] = LCOEFFS[ic + m];
+        float4 g = cs_pme_sp_accum(dxp, dyp, dzp, r, ap.w, c9);
+        E += g.w;
+        Fx -= g.x; Fy -= g.y; Fz -= g.z;
+#else
         float phi[CS_PME_NMODES], dphi[CS_PME_NMODES];
         cs_pme_core_basis(r, ap.w, r_b_i, phi, dphi);
-        int ic = at * CS_PME_NMODES;
         float4 c03 = vload4(0, LCOEFFS + ic);
         float2 ed = cs_pme_core_reduce(phi, dphi, c03.x, c03.y, c03.z, c03.w, LCOEFFS[ic + 4]);
         E += ed.x;
@@ -1234,6 +1345,7 @@ inline float4 cs_pme_core_eval_local_at(
             Fy += fr * dyp;
             Fz += fr * dzp;
         }
+#endif
     }
     int overflow = 0;  // Direct all-atom loop has no bucket candidate cap or truncation.
     *out_status = 0;
@@ -1242,6 +1354,142 @@ inline float4 cs_pme_core_eval_local_at(
     *out_overflow = overflow;
     return (float4)(Fx, Fy, Fz, E);
 }
+
+#if CS_PME_SP_CORE
+// ===================== poly8sp matrix-free core fit (CGLS, no atomics) =====================
+// Design: doc/Tasks/ContactPME_CoreMesh_Fit_Design.md §16. Operators Â = [E; wF*grad]
+// on the core coefficients (kernel slot layout) — Av reuses the eval funnel,
+// Atv is an owner-computes gather (each work-item owns a disjoint center set,
+// accumulates into an exclusively-owned __local copy, one group per SB-sample
+// block) followed by a trivial cross-group reduce. No atomics anywhere.
+
+// Uncontracted per-mode basis + gradient: phi[m] and gphi[m*3+c] = d(phi_m)/dx_c.
+// Same slot layout / radius ladder / u<=0 skip as cs_pme_sp_accum; tied to it by
+// the host adjoint dot-test (test_sp_cg_adjoint_dot_test).
+inline void cs_pme_sp_basis(float dx, float dy, float dz, float r, float w,
+                            float* phi, float* gphi) {
+    const float Nf = (float)CS_PME_POLY_N;
+    float ir = 1.0f / r;
+    float nx = dx * ir, ny = dy * ir, nz = dz * ir;
+    const float Rs[3] = {CS_PME_POLY_R0, CS_PME_POLY_R1, CS_PME_POLY_R2};
+    const float Rp[CS_PME_NP] = {CS_PME_POLY_R3, CS_PME_POLY_R4
+#if CS_PME_NP == 3
+        , CS_PME_POLY_R5
+#endif
+        };
+    for (int m = 0; m < 3; m++) {
+        float R = Rs[m] * w;
+        float u = 1.0f - r / R;
+        float ph = 0.0f, dph = 0.0f;
+        if (u > 0.0f) { float u2 = u * u, u4 = u2 * u2, u7 = u4 * u2 * u; ph = u7 * u; dph = -(Nf / R) * u7; }
+        phi[m] = ph;
+        gphi[m * 3 + 0] = dph * nx; gphi[m * 3 + 1] = dph * ny; gphi[m * 3 + 2] = dph * nz;
+    }
+    for (int k = 0; k < CS_PME_NP; k++) {
+        float R = Rp[k] * w;
+        float u = 1.0f - r / R;
+        float ph = 0.0f, dph = 0.0f;
+        if (u > 0.0f) { float u2 = u * u, u4 = u2 * u2, u7 = u4 * u2 * u; ph = u7 * u; dph = -(Nf / R) * u7; }
+        for (int a = 0; a < 3; a++) {
+            int m = 3 + 3 * k + a;
+            float na = (a == 0) ? nx : ((a == 1) ? ny : nz);
+            // phi = ph*n_a; dphi/dx_c = n_a*dph*n_c + ph*(d_ac - n_a*n_c)/r
+            float g0 = na * dph - ph * na * ir;
+            phi[m] = ph * na;
+            gphi[m * 3 + 0] = g0 * nx + ph * ((a == 0) ? ir : 0.0f);
+            gphi[m * 3 + 1] = g0 * ny + ph * ((a == 1) ? ir : 0.0f);
+            gphi[m * 3 + 2] = g0 * nz + ph * ((a == 2) ? ir : 0.0f);
+        }
+    }
+}
+
+// Forward operator y = Â v: per sample (wF*dE/dx, wF*dE/dy, wF*dE/dz, E).
+// The core field is linear in the coefficients, so this is verbatim the local
+// eval funnel with v preloaded as the coefficient vector (cs_pme_core_eval_local_at
+// returns F = -grad E -> y.xyz = -wF*F). Local backend only; host asserts
+// nat*(16+4*NMODES) fits local memory.
+__kernel void cs_sp_Av(__global const float* samples, __global const float* v, __global float4* y,
+                       __global const float4* atoms, const int nat, const float d_span, const float wF, const int ns,
+                       __local float4* LATOMS, __local float* LCOEFFS)
+{
+    int lid = get_local_id(0), lsize = get_local_size(0);
+    for (int i = lid; i < nat; i += lsize) LATOMS[i] = atoms[i];
+    for (int i = lid; i < nat * CS_PME_NMODES; i += lsize) LCOEFFS[i] = v[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    int i = get_global_id(0);
+    if (i >= ns) return;
+    int status = 0; float min_r = 1e30f; int offender = -1, overflow = 0;
+    float4 fe = cs_pme_core_eval_local_at(samples[i * 3], samples[i * 3 + 1], samples[i * 3 + 2],
+                                          LATOMS, LCOEFFS, nat, d_span, &status, &min_r, &offender, &overflow);
+    y[i] = (float4)(-wF * fe.x, -wF * fe.y, -wF * fe.z, fe.w);
+}
+
+// Adjoint operator out[c,m] = sum_i phi_m(x_i-C_c)*v_i.w + wF*grad(phi_m).v_i.xyz,
+// or (sq=1) the column-norm pass sum_i phi_m^2 + wF^2|grad phi_m|^2.
+// Work-group g owns samples [g*SB, min((g+1)*SB, ns)); samples stream through
+// __local in tiles of lsize; each work-item owns centers at = lid, lid+lsize,...
+// and accumulates NMODES registers per center into its exclusively-owned LACC
+// entries -> no atomics. partial[g*ncoef + j] = LACC[j]; cs_reduce_groups sums.
+__kernel void cs_sp_Atv(__global const float* samples, __global const float4* v, __global float* partial,
+                        __global const float4* atoms, const int nat, const float d_span, const float wF,
+                        const int ns, const int SB, const int sq,
+                        __local float4* LATOMS, __local float* LACC, __local float4* LPOS, __local float4* LV)
+{
+    int g = get_group_id(0);
+    int lid = get_local_id(0), lsize = get_local_size(0);
+    int ncoef = nat * CS_PME_NMODES;
+    int i0 = g * SB, i1 = min(i0 + SB, ns);
+    for (int i = lid; i < nat; i += lsize) LATOMS[i] = atoms[i];
+    for (int i = lid; i < ncoef; i += lsize) LACC[i] = 0.0f;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int it = i0; it < i1; it += lsize) {
+        int j = it + lid;
+        if (j < i1) {
+            LPOS[lid] = (float4)(samples[j * 3], samples[j * 3 + 1], samples[j * 3 + 2], 0.0f);
+            LV[lid] = v[j];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        int nt = min(lsize, i1 - it);
+        for (int at = lid; at < nat; at += lsize) {
+            float4 ap = LATOMS[at];
+            float rc2 = ap.w * d_span; rc2 *= rc2;
+            float acc[CS_PME_NMODES];
+            for (int m = 0; m < CS_PME_NMODES; m++) acc[m] = 0.0f;
+            for (int j2 = 0; j2 < nt; j2++) {
+                float dx = LPOS[j2].x - ap.x, dy = LPOS[j2].y - ap.y, dz = LPOS[j2].z - ap.z;
+                float r2 = dx * dx + dy * dy + dz * dz + 1e-20f;
+                if (r2 >= rc2) continue;
+                float r = sqrt(r2);
+                float phi[CS_PME_NMODES], gphi[CS_PME_NMODES * 3];
+                cs_pme_sp_basis(dx, dy, dz, r, ap.w, phi, gphi);
+                if (sq == 0) {
+                    float4 vv = LV[j2];
+                    float vx = vv.x, vy = vv.y, vz = vv.z;
+                    for (int m = 0; m < CS_PME_NMODES; m++)
+                        acc[m] += phi[m] * vv.w + wF * (gphi[m * 3] * vx + gphi[m * 3 + 1] * vy + gphi[m * 3 + 2] * vz);
+                } else {
+                    for (int m = 0; m < CS_PME_NMODES; m++) {
+                        float gx = gphi[m * 3], gy = gphi[m * 3 + 1], gz = gphi[m * 3 + 2];
+                        acc[m] += phi[m] * phi[m] + wF * wF * (gx * gx + gy * gy + gz * gz);
+                    }
+                }
+            }
+            for (int m = 0; m < CS_PME_NMODES; m++) LACC[at * CS_PME_NMODES + m] += acc[m];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    for (int i = lid; i < ncoef; i += lsize) partial[g * ncoef + i] = LACC[i];
+}
+
+// out[j] = sum_g partial[g*nc + j] (one work-item per coefficient).
+__kernel void cs_reduce_groups(const int nc, const int ngroups, __global const float* partial, __global float* out) {
+    int j = get_global_id(0);
+    if (j >= nc) return;
+    float s = 0.0f;
+    for (int g = 0; g < ngroups; g++) s += partial[g * nc + j];
+    out[j] = s;
+}
+#endif
 
 // Combined PME eval at one point: V_mesh + V_core. F = -∇E. Shared by evalContactPME and relaxation.
 // Returns float4 (Fx,Fy,Fz,E). Telemetry via pointers.
@@ -2538,9 +2786,7 @@ __kernel void evalContactPMETile(
         const int ia = wg_atom_ids[a0 + j];
         LATOMS[j] = atoms[ia];
         const int ig = ia * CS_PME_NMODES, il = j * CS_PME_NMODES;
-        const float4 c03 = vload4(0, atom_coeffs + ig);
-        vstore4(c03, 0, LCOEFFS + il);
-        LCOEFFS[il + 4] = atom_coeffs[ig + 4];
+        for (int m = 0; m < CS_PME_NMODES; m++) LCOEFFS[il + m] = atom_coeffs[ig + m];
     }
     const int kz0 = tile_kz[iwg * (tile_meta.z ? tile_meta.z : 1) + iz_tile];
     for (int e = lid; e < nmesh; e += lsz) {
@@ -2608,9 +2854,7 @@ __kernel void relaxStrokesTiltedContactPMETileSph(
         const int ia = wg_atom_ids[a0 + j];
         LATOMS[j] = atoms[ia];
         const int ig = ia * CS_PME_NMODES, il = j * CS_PME_NMODES;
-        const float4 c03 = vload4(0, atom_coeffs + ig);
-        vstore4(c03, 0, LCOEFFS + il);
-        LCOEFFS[il + 4] = atom_coeffs[ig + 4];
+        for (int m = 0; m < CS_PME_NMODES; m++) LCOEFFS[il + m] = atom_coeffs[ig + m];
     }
     // --- initial mesh slab (iz = 0) ---
     int cache_kz = tile_kz[iwg * nz];

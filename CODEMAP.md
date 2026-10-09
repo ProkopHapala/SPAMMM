@@ -56,7 +56,8 @@ SPAMMM is a Python + PyOpenCL scientific simulation package for AFM/STM, molecul
 - `ContactSurface.py` — **quasi-2D contact field** for aperiodic AFM: separable B-spline×poly + radial PIC; also `ContactPMEParams` for particle-mesh backend
 - `PMESplit.py` — atomwise PAW/hermite/plateau/rho soft long/short split (default `paw`, `Δ_in=1.0`); `precompute_split_cache`
 - `CoarseMesh.py` — coarse 3D cubic B-spline mesh of V_L; batched prefilter; CPU raster oracle
-- `PICCore.py` — compact doubling-power core of v_S (`fit_core_1d` host; paw oracle `fit_core_paw_grid`; GPU `cs_fit_core_paw`)
+- `PICCore.py` — compact doubling-power core of v_S (`fit_core_1d` host; paw oracle `fit_core_paw_grid`; GPU `cs_fit_core_paw`); core+mesh bases: poly8 scalar (`fit_core_poly_shell`, `eval_core_poly`) and poly8sp angular s/p (`fit_core_sp_shell`, `eval_core_sp`, `sp_ladder`; kernel `CS_PME_SP_CORE`, NMODES=3+3·NP; GPU CGLS fit via `ContactSurfaceCL.fit_core_sp_cg` — kernels `cs_sp_Av`/`cs_sp_Atv`/`cs_reduce_groups`, no atomics; `min_dist_to_atoms`)
+- `CoreBasisStudy.py` — experimental angular core-basis survey machinery: spec grammar `A:s3p2+B:s1`, design matrix, weighted LSQ (force rows), core-only residual study vs oracle grid
 - `GridFFRelaxedScan.py` — relaxed scan over surface grid
 - `FoldedRigid.py` — folded basis rigid body relaxation
 - `Ewald2D.py` — 2D Ewald summation for surfaces
