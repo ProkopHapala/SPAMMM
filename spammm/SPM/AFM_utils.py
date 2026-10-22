@@ -1646,12 +1646,22 @@ def build_orbital_layout(basis_data, enames):
             max_l)
 
 
+# 3ob .skf ships NO spin constants -> mio-1-1 shell-resolved W values
+# (documented convention in SPAMMM/doc/topical_audit.md, used by muH runs).
+# Shared by every SCC-stable HSD writer (get_density_from_dftb_dense,
+# FDBMPipeline.dftb_prep) — single source for the open-shell fallback.
+DFTB_SPIN_W_MIO = {'H': '-0.072',
+                   'C': '-0.031 -0.025 -0.025 -0.023',
+                   'N': '-0.033 -0.027 -0.027 -0.026',
+                   'O': '-0.035 -0.030 -0.030 -0.028'}
+
+
 def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
                                  grid_spec=None, step=0.1, margin=4.0, z_extra=6.0,
                                  verbosity=0, max_shells=None, projection_basis_ang=None,
                                  project_density=True, need_es=True, need_ves=True,
                                  dm_in=None, ctx=None, queue=None, device_out=False,
-                                 max_scc=200, fermi_temp_K=None):
+                                 max_scc=100, fermi_temp_K=3000.0):
     """Get density grids using DFTBcore dense matrix projection (supports d-orbitals).
 
     Uses direct DFTBcore library access (no file parsing) and dense density matrix
@@ -1688,8 +1698,9 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
         dm_in: precomputed density matrix — skips the whole DFTBcore SCF (dual-basis reuse).
         max_scc: MaxSCCIterations in the generated dftb_in.hsd (SCC non-convergence
             aborts DFTB+ with ERROR STOP — keep small for batch screening).
-        fermi_temp_K: if set, write `Filling = Fermi { Temperature [Kelvin] }` —
-            smearing stabilizes SCC on near-degenerate HOMO/LUMO flakes.
+        fermi_temp_K: Fermi smearing temperature [K], ON BY DEFAULT (3000 K) —
+            near-degenerate HOMO/LUMO flakes oscillate SCC to a host-killing
+            ERROR STOP without it. Pass None/0 only with a specific reason.
         ctx/queue: share an existing OpenCL context (e.g. the AFMulator's) — enables the
             device-resident path (no GPU→CPU→GPU round trips). Design:
             doc/Tasks/FDBM_EndToEnd_GPU_Pipeline.md
@@ -1778,17 +1789,38 @@ def get_density_from_dftb_dense(atomPos, atomTypes, basis_hsd_path, work_dir,
         max_ang_lines.append(f'    {elem} = "{max_am_map[max_l]}"')
 
     # Write minimal DFTBcore-compatible HSD (no Analysis/Options blocks)
+    # SCC stability: Anderson mixer + small mixing + loose tol + Fermi smearing is the
+    # maximally-conservative setup — SCC non-convergence is a Fortran ERROR STOP that
+    # kills the host process (in-process libdftbcore), so we NEVER gamble on defaults.
     max_ang_str = '\n'.join(max_ang_lines)
     filling = f'  Filling = Fermi {{\n    Temperature [Kelvin] = {float(fermi_temp_K)}\n  }}\n' if fermi_temp_K else ''
+    ne_tot = int(sum(int(z) for z in atomTypes))                       # neutral electron count
+    # odd e- count -> radical: run open-shell (Colinear, 1 unpaired e-) instead of
+    # letting SCC oscillate to ERROR STOP. Callers should passivate decode defects
+    # upstream; this is the belt-and-suspenders fallback.
+    spin = ''
+    if ne_tot % 2:
+        missing = [e for e in species if e not in DFTB_SPIN_W_MIO]
+        if missing:
+            raise RuntimeError(f'odd electron count {ne_tot} but no SpinConstants for {missing} — cannot run open-shell')
+        spin = '  SpinPolarisation = Colinear {\n    UnpairedElectrons = 1\n  }\n'
+        spin += '  SpinConstants {\n    ShellResolvedSpin = Yes\n'
+        spin += ''.join(f'    {e} = {{ {DFTB_SPIN_W_MIO[e]} }}\n' for e in species if e in DFTB_SPIN_W_MIO)
+        spin += '  }\n'
+        if verbosity:
+            print(f'[get_density] odd electron count {ne_tot} -> Colinear spin (1 unpaired e-, mio SpinConstants)', flush=True)
     with open(hsd_path, 'w') as f:
         f.write(f'''Geometry = xyzFormat {{
   <<< "geom.xyz"
 }}
 Hamiltonian = DFTB {{
   SCC = Yes
-  SCCTolerance = 1e-7
+  SCCTolerance = 1e-5
   MaxSCCIterations = {max_scc}
-{filling}  SlaterKosterFiles = Type2FileNames {{
+  Mixer = Anderson {{
+    MixingParameter = 0.04
+  }}
+{spin}{filling}  SlaterKosterFiles = Type2FileNames {{
     Prefix = "{sk_dir}/"
     Separator = "-"
     Suffix = ".skf"
@@ -4329,7 +4361,7 @@ def run_contact_pp_afm(tag, atomPos, atomTypes, origin, step, ngrid, outdir, *,
         fit_dx=bspl_dx, fit_dy=bspl_dx,
         fit_boltzmann=True, fit_boltzmann_T=None,
         fit_force_weight=fit_force_weight, n_iter=n_iter,
-        brute_ref='afm', bPrint=True,
+        brute_ref='afm', bPrint=True, allow_slow_cg=True,
         h0_mode='spheres', h0_R_scale=float(h0_R_scale),
     )
     afmulator.queue.finish()

@@ -187,12 +187,16 @@ class FDBMPipeline:
 
     # ── DFTB single-point SCF (CPU/Fortran — the only non-GPU stage) ─────────
 
-    def dftb_prep(self, atomPos, atomTypes, basis_hsd_path, work_dir, max_shells=None, run_scf=True):
+    def dftb_prep(self, atomPos, atomTypes, basis_hsd_path, work_dir, max_shells=None, run_scf=True,
+                  max_scc=200, fermi_temp_K=3000.0):
         """Basis/geometry prep + one DFTBcore SCF → dm/eigvecs + all layout metadata.
 
         Replicates the SCF half of ``get_density_from_dftb_dense`` (files, SK copy,
         chdir, init/scf/dm/eig/finalize) so the new pipeline runs SCF exactly once
         per molecule regardless of how many basis projections follow.
+        SCC stability matches the robust writer: Anderson mixer + small mixing +
+        loose tol + Fermi smearing, plus odd-electron → Colinear spin fallback —
+        SCC non-convergence is a Fortran ERROR STOP that kills the host process.
         """
         from ..quantum.DFTB.DFTBcore import DFTBcore
         from spammm import atomicUtils as au
@@ -241,15 +245,33 @@ class FDBMPipeline:
             max_l_e = max(orb['AngularMomentum'] for orb in elem_data['orbitals'])
             max_ang_lines.append(f'    {elem} = "{max_am_map[max_l_e]}"')
         max_ang_str = '\n'.join(max_ang_lines)
+        # SCC stability: same robust defaults as get_density_from_dftb_dense —
+        # Anderson mixer + small mixing + loose tol + Fermi smearing; odd electron
+        # count -> Colinear open-shell instead of letting SCC oscillate to ERROR STOP.
+        filling = f'  Filling = Fermi {{\n    Temperature [Kelvin] = {float(fermi_temp_K)}\n  }}\n' if fermi_temp_K else ''
+        ne_tot = int(sum(int(z) for z in atomTypes))
+        spin = ''
+        if ne_tot % 2:
+            missing = [e for e in species if e not in afm_utils.DFTB_SPIN_W_MIO]
+            if missing:
+                raise RuntimeError(f'odd electron count {ne_tot} but no SpinConstants for {missing} — cannot run open-shell')
+            spin = '  SpinPolarisation = Colinear {\n    UnpairedElectrons = 1\n  }\n'
+            spin += '  SpinConstants {\n    ShellResolvedSpin = Yes\n'
+            spin += ''.join(f'    {e} = {{ {afm_utils.DFTB_SPIN_W_MIO[e]} }}\n' for e in species if e in afm_utils.DFTB_SPIN_W_MIO)
+            spin += '  }\n'
+            print(f'[dftb_prep] odd electron count {ne_tot} -> Colinear spin (1 unpaired e-, mio SpinConstants)', flush=True)
         with open(hsd_path, 'w') as f:
             f.write(f'''Geometry = xyzFormat {{
   <<< "geom.xyz"
 }}
 Hamiltonian = DFTB {{
   SCC = Yes
-  SCCTolerance = 1e-7
-  MaxSCCIterations = 200
-  SlaterKosterFiles = Type2FileNames {{
+  SCCTolerance = 1e-5
+  MaxSCCIterations = {max_scc}
+  Mixer = Anderson {{
+    MixingParameter = 0.04
+  }}
+{spin}{filling}  SlaterKosterFiles = Type2FileNames {{
     Prefix = "{sk_dir}/"
     Separator = "-"
     Suffix = ".skf"
@@ -392,12 +414,19 @@ Hamiltonian = DFTB {{
         atomPos = np.asarray(atomPos, dtype=np.float64)
         atomTypes = np.asarray(atomTypes, dtype=np.int32)
         ngrid = tuple(int(x) for x in ngrid[:3])
+        _rss = os.environ.get('FDBM_RSS')
+        def _hwm(tag):
+            if _rss:
+                import resource
+                print(f'[FDBM_RSS] {tag}: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.0f} MB', flush=True)
         variants_needed = ('diff', 'prol') if projection == 'prolonged' else \
                           ('diff', 'stock') if projection == 'stock' else \
                           ('diff', 'stock', 'prol')
         prep = self.dftb_prep(atomPos, atomTypes, basis_hsd, work_dir)
+        _hwm('after dftb_prep')
         bufs = self.project_densities(prep, grid_spec, step, dm=dm_in,
                                       variants=variants_needed, charge_check=charge_check)
+        _hwm('after project_densities')
         out = {'prep': prep, 'bufs': bufs}
         for variant in ('stock', 'prolonged'):
             if variant == 'stock' and 'stock' not in bufs:
@@ -409,6 +438,7 @@ Hamiltonian = DFTB {{
                 rho_scf_cl, bufs['diff'], atomPos, atomTypes, origin, step, ngrid,
                 A_pauli, beta_pauli, C6_CO=C6_CO, tip_mode=tip_mode, margin=margin,
                 basis=basis, oracle=oracle)
+            _hwm(f'after fields_for_fit[{variant}]')
         return out
 
     def scan_and_post(self, tag, atomPos, atomTypes, origin, step,

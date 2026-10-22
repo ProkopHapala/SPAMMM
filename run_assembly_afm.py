@@ -75,7 +75,7 @@ def _fit(afm: AFMulator, method: str, margin: float, bspl_dx: float, n_iter: int
         # Spherical contact h₀ with R < Morse R0 so clamp is in HARD repulsion (not at the well)
         afm.fit_contact_surface(margin=margin, bspl_dx=bspl_dx, poly_R=4.0, poly_z0=0.0, m_start=4, nz=6,
                                 fit_z_adaptive=(0.05, 4.0, 0.1, 0.8), fit_force_weight=1.0, n_iter=n_iter,
-                                h0_mode='spheres', h0_R_scale=h0_R_scale, bPrint=True)
+                                h0_mode='spheres', h0_R_scale=h0_R_scale, bPrint=True, allow_slow_cg=True)
     elif method == 'contact-pic':
         afm.fit_pic_contact_surface(margin=margin, poly_R=4.0, m_start=4, nz=4, cell_size=10.0,
                                     fit_z_adaptive=(1.0, 5.0, 0.2, 0.8), n_iter=n_iter, reg=pic_reg, bPrint=True)

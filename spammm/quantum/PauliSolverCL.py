@@ -49,6 +49,7 @@ class PauliSolverCL(OpenCLBase):
             raise FileNotFoundError(f"Kernel file not found or failed to build: {kpath}")
 
         self.krn_compute_tip_interaction = cl.Kernel(self.prg, 'compute_tip_interaction')
+        self.krn_compute_tip_interaction_nearest = cl.Kernel(self.prg, 'compute_tip_interaction_nearest')
         self.krn_solve_pme = cl.Kernel(self.prg, 'solve_pme')
         self._init_lookups()
 
@@ -69,7 +70,8 @@ class PauliSolverCL(OpenCLBase):
                          state_order=None, rots=None, bOmp=False,
                          bMakeArrays=True, Ts=None, return_probs=False,
                          return_state_energies=False, externTs=False, return_curmat=False,
-                         Wij=None):
+                         Wij=None, Vtips_gate=None, tip_cell=None,
+                         tip_periodic_sites=None, apply_validity_cut=True):
         """
         Main simulation function.
 
@@ -77,9 +79,40 @@ class PauliSolverCL(OpenCLBase):
         Vtips: (N,) voltages.
         pSites: (4, 3) or (4, 4). If (4,3), W component from params[3] (Esite).
         params: [Rtip, zV0, zVd, Esite, beta, Gamma, W, bMirror, bRamp]
+        tip_cell: optional planar lattice (2,2)/(2,3) — nearest-replica tip
+            gating/tunnelling per site, no replica sum (same as PME8).
+        tip_periodic_sites: bool mask [nSingle]; default all sites.
+        Vtips_gate: optional (N,) gate voltages for the tip interaction
+            (site-energy shifts); None => same as Vtips (old behaviour).
+        apply_validity_cut: False returns raw kernel current without the
+            historical Emax/W validity zeroing (same as PME8).
         """
         n_pixels = len(pTips)
         n_sites = self.nSingle
+
+        cell_cl = mask_cl = None
+        if tip_cell is None:
+            if tip_periodic_sites is not None:
+                raise ValueError("tip_periodic_sites requires tip_cell")
+        else:
+            from .PauliSolverCL8 import prepare_tip_cell
+            packed_cell = prepare_tip_cell(tip_cell)
+            mask = np.ones(self.nSingle, dtype=np.int32) if tip_periodic_sites is None else np.asarray(tip_periodic_sites)
+            if mask.shape != (self.nSingle,) or not np.isin(mask, [0, 1]).all():
+                raise ValueError("tip_periodic_sites must contain one boolean per solver site")
+            cell_cl = cl_array.to_device(self.queue, packed_cell)
+            mask_cl = cl_array.to_device(self.queue, np.ascontiguousarray(mask, dtype=np.int32))
+
+        Vtips = np.asarray(Vtips, dtype=np.float32)
+        if Vtips.size == 1:
+            Vtips = np.full(n_pixels, float(Vtips), dtype=np.float32)
+        assert Vtips.size == n_pixels, f"Vtips must be scalar or length {n_pixels}, got {Vtips.size}"
+        if Vtips_gate is not None:
+            Vtips_gate = np.asarray(Vtips_gate, dtype=np.float32)
+            if Vtips_gate.size == 1:
+                Vtips_gate = np.full(n_pixels, float(Vtips_gate), dtype=np.float32)
+            assert Vtips_gate.size == n_pixels, \
+                f"Vtips_gate must be scalar or length {n_pixels}, got {Vtips_gate.size}"
 
         p_tips_packed = pack_float4(pTips)
         p_tips_cl = cl_array.to_device(self.queue, p_tips_packed)
@@ -96,6 +129,8 @@ class PauliSolverCL(OpenCLBase):
         rots_cl = cl_array.to_device(self.queue, rots_host.reshape(n_sites * 3 * 3))
 
         v_tips_cl = cl_array.to_device(self.queue, np.array(Vtips, dtype=np.float32))
+        v_gate_cl = v_tips_cl if Vtips_gate is None else cl_array.to_device(
+            self.queue, np.array(Vtips_gate, dtype=np.float32))
         cs_cl = cl_array.to_device(self.queue, np.array(cs, dtype=np.float32))
         params_cl = cl_array.to_device(self.queue, np.array(params, dtype=np.float32))
 
@@ -103,16 +138,19 @@ class PauliSolverCL(OpenCLBase):
         t_factors_cl = cl_array.zeros(self.queue, (n_pixels, n_sites), dtype=np.float32)
 
         global_size_1 = (n_pixels,)
-        self.krn_compute_tip_interaction(
+        tip_kernel = self.krn_compute_tip_interaction if cell_cl is None else self.krn_compute_tip_interaction_nearest
+        periodic_args = () if cell_cl is None else (cell_cl.data, mask_cl.data)
+        tip_kernel(
             self.queue, global_size_1, None,
             np.int32(n_pixels), np.int32(n_sites),
             p_tips_cl.data,
             p_sites_cl.data,
             rots_cl.data,
-            v_tips_cl.data,
+            v_gate_cl.data,
             cs_cl.data,
             params_cl.data,
             np.int32(order),
+            *periodic_args,
             h_shifts_cl.data,
             t_factors_cl.data
         )
@@ -217,7 +255,7 @@ class PauliSolverCL(OpenCLBase):
         Tmin_cut = 0.0
         EW_cut = 2.0
         W_scalar = float(w_val)
-        if Es_tmp is not None and Ts_tmp is not None:
+        if apply_validity_cut and Es_tmp is not None and Ts_tmp is not None:
             Es_sp = Es_tmp.reshape(n_pixels, n_sites)
             Ts_sp = Ts_tmp.reshape(n_pixels, n_sites)
             Emax = Es_sp.max(axis=1)

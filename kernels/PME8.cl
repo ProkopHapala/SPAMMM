@@ -14,13 +14,53 @@
 #define N_SITES 8
 #define N_STATES 256
 #define PI 3.14159265359f
+#define PME_GMRES_M 128
+
+// Optional stationary arithmetic precision. Public field/current buffers retain
+// their original float ABI; the historical build remains entirely float.
+#ifdef PME8_STATIONARY_FP64
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+typedef double pme_real;
+#else
+typedef float pme_real;
+#endif
+
+inline pme_real pme_dot(int tid, __local const pme_real* a, __local const pme_real* b, __local pme_real* tmp) {
+    tmp[tid]=a[tid]*b[tid];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for(int stride=128;stride>0;stride>>=1){if(tid<stride)tmp[tid]+=tmp[tid+stride];barrier(CLK_LOCAL_MEM_FENCE);}
+    pme_real value=tmp[0];barrier(CLK_LOCAL_MEM_FENCE);return value;
+}
+
+inline void pme_stationary_matvec(int tid,int ns,__local const pme_real* x,__local pme_real* y,__local const pme_real* diag,__local const pme_real* rates,__local pme_real* tmp){
+    pme_real inflow=0;
+    for(int k=0;k<ns;k++)inflow+=rates[tid*N_SITES+k]*x[tid^(1<<k)];
+    tmp[tid]=x[tid];barrier(CLK_LOCAL_MEM_FENCE);
+    for(int stride=128;stride>0;stride>>=1){if(tid<stride)tmp[tid]+=tmp[tid+stride];barrier(CLK_LOCAL_MEM_FENCE);}
+    // Replace one redundant balance equation with sum(P)=1; row-scale the others.
+    y[tid]=(tid==255)?tmp[0]/256:(diag[tid]<0?x[tid]+inflow/diag[tid]:0);
+    barrier(CLK_LOCAL_MEM_FENCE);
+}
+
+inline pme_real pme_dot_global_local(int tid,__global const pme_real* a,__local const pme_real* b,__local pme_real* tmp){
+    tmp[tid]=a[tid]*b[tid];barrier(CLK_LOCAL_MEM_FENCE);
+    for(int stride=128;stride>0;stride>>=1){if(tid<stride)tmp[tid]+=tmp[tid+stride];barrier(CLK_LOCAL_MEM_FENCE);}
+    pme_real value=tmp[0];barrier(CLK_LOCAL_MEM_FENCE);return value;
+}
+
+inline void pme_stationary_matvec_global(int tid,int ns,__global const pme_real* x,__local pme_real* y,__local const pme_real* diag,__local const pme_real* rates,__local pme_real* tmp){
+    pme_real inflow=0;for(int k=0;k<ns;k++)inflow+=rates[tid*N_SITES+k]*x[tid^(1<<k)];
+    tmp[tid]=x[tid];barrier(CLK_LOCAL_MEM_FENCE);
+    for(int stride=128;stride>0;stride>>=1){if(tid<stride)tmp[tid]+=tmp[tid+stride];barrier(CLK_LOCAL_MEM_FENCE);}
+    y[tid]=(tid==255)?tmp[0]/256:(diag[tid]<0?x[tid]+inflow/diag[tid]:0);barrier(CLK_LOCAL_MEM_FENCE);
+}
 
 // ======================================================================
 // Helper Functions  (identical to PME.cl)
 // ======================================================================
 
-inline float fermi(float E, float mu, float T) {
-    return 1.0f / (1.0f + exp((E - mu) / T));
+inline pme_real fermi(float E, float mu, float T) {
+    return (pme_real)1 / ((pme_real)1 + exp(((pme_real)E - mu) / T));
 }
 
 inline float eval_multipole(float3 d, int order, __global const float* cs) {
@@ -209,7 +249,9 @@ __kernel void solve_pme8(
     __global float* restrict out_stateEs,       // [n_pixels * n_states] or NULL
 
     int   max_iter,
-    float tol
+    float tol,
+    int stationary_method, // 0: historical Euler; 1: Jacobi; 2: BiCGSTAB; 3: GMRES(32)
+    __global pme_real* krylov_workspace
 ) {
     int pix_id = get_group_id(0);
     int tid    = get_local_id(0);   // 0..255
@@ -218,15 +260,23 @@ __kernel void solve_pme8(
 
     // --- Local memory ---
     __local float Energies[N_STATES];           // 1 KB
-    __local float Rates  [N_STATES][N_SITES];   // 8 KB
-    __local float DiagLoss[N_STATES];           // 1 KB
-    __local float P_old  [N_STATES];            // 1 KB
-    __local float P_new  [N_STATES];            // 1 KB
-    __local float reduce_buf[N_STATES];         // 1 KB
-    __local float s_max_diff;                   // convergence flag
-    __local float s_max_rate;                   // max rate for dt
-    __local float s_dt;                         // timestep
-    __local float s_psum;                       // probability sum
+    __local pme_real Rates  [N_STATES][N_SITES];
+    __local pme_real DiagLoss[N_STATES];
+    __local pme_real P_old  [N_STATES];
+    __local pme_real P_new  [N_STATES];
+    __local pme_real reduce_buf[N_STATES];
+    __local pme_real s_max_diff;                // convergence flag
+    __local pme_real s_max_rate;                // max rate for dt
+    __local pme_real s_dt;                      // timestep
+    __local pme_real s_psum;                    // probability sum
+    __local pme_real krylov_vectors[6][N_STATES];
+    #define krylov_r krylov_vectors[0]
+    #define krylov_rhat krylov_vectors[1]
+    #define krylov_p krylov_vectors[2]
+    #define krylov_v krylov_vectors[3]
+    #define krylov_s krylov_vectors[4]
+    #define krylov_t krylov_vectors[5]
+    __local pme_real gmres_cs[PME_GMRES_M],gmres_sn[PME_GMRES_M],gmres_g[PME_GMRES_M+1],gmres_y[PME_GMRES_M];
 
     // ------------------------------------------------------------------
     // Phase 1: Many-Body Energies
@@ -271,7 +321,7 @@ __kernel void solve_pme8(
     float mu0 = lead_params[0]; float T0 = lead_params[1];
     float mu1 = v_tips[pix_id]; float T1 = lead_params[3];
 
-    float diag = 0.0f;
+    pme_real diag = 0.0f;
     for (int k = 0; k < n_sites; k++) {
         int mask_c = mask ^ (1 << k);
         int c = mask_c;
@@ -281,20 +331,20 @@ __kernel void solve_pme8(
         bool added = (bit_c && !bit_b);  // b→c adds electron (b lower)
 
         float t_val = T_factors[pix_id * n_sites + k];
-        float coup0 = Gamma0;
-        float coup1 = Gamma1 * t_val * t_val;
+        pme_real coup0 = Gamma0;
+        pme_real coup1 = (pme_real)Gamma1 * t_val * t_val;
 
-        float rate_in, rate_out;
+        pme_real rate_in, rate_out;
         if (added) {
             float E_diff = Energies[c] - Energies[tid];
-            float f0 = fermi(E_diff, mu0, T0);
-            float f1 = fermi(E_diff, mu1, T1);
+            pme_real f0 = fermi(E_diff, mu0, T0);
+            pme_real f1 = fermi(E_diff, mu1, T1);
             rate_out = (coup0 * f0 + coup1 * f1) * 2.0f * PI;          // b→c
             rate_in  = (coup0 * (1.0f-f0) + coup1 * (1.0f-f1)) * 2.0f * PI; // c→b
         } else {
             float E_diff = Energies[tid] - Energies[c];
-            float f0 = fermi(E_diff, mu0, T0);
-            float f1 = fermi(E_diff, mu1, T1);
+            pme_real f0 = fermi(E_diff, mu0, T0);
+            pme_real f1 = fermi(E_diff, mu1, T1);
             rate_in  = (coup0 * f0 + coup1 * f1) * 2.0f * PI;          // c→b
             rate_out = (coup0 * (1.0f-f0) + coup1 * (1.0f-f1)) * 2.0f * PI; // b→c
         }
@@ -321,8 +371,8 @@ __kernel void solve_pme8(
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int stride = 128; stride > 0; stride >>= 1) {
         if (tid < stride) {
-            float a = reduce_buf[tid];
-            float b = reduce_buf[tid + stride];
+            pme_real a = reduce_buf[tid];
+            pme_real b = reduce_buf[tid + stride];
             reduce_buf[tid] = (a > b) ? a : b;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -332,19 +382,132 @@ __kernel void solve_pme8(
         s_dt = 0.5f / (s_max_rate + 1e-30f);  // stable step
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-    float dt = s_dt;
+    pme_real dt = s_dt;
 
     P_old[tid] = 1.0f / (float)n_states;   // uniform start
     barrier(CLK_LOCAL_MEM_FENCE);
 
+    if(stationary_method==3){
+        // Restarted GMRES(128), with the actual stationary residual checked after
+        // every restart. The sparse rates and normalized system are unchanged.
+        __global pme_real* basis=krylov_workspace+(size_t)pix_id*(PME_GMRES_M+1)*(256+PME_GMRES_M);
+        __global pme_real* gmres_H=basis+(PME_GMRES_M+1)*256;
+        for(int cycle=0;cycle<max_iter/PME_GMRES_M;cycle++){
+            pme_stationary_matvec(tid,n_sites,P_old,P_new,DiagLoss,&Rates[0][0],reduce_buf);
+            krylov_vectors[0][tid]=(tid==255?((pme_real)1/256):0)-P_new[tid];barrier(CLK_LOCAL_MEM_FENCE);
+            pme_real beta=sqrt(pme_dot(tid,krylov_vectors[0],krylov_vectors[0],reduce_buf));
+            if(beta<tol)break;
+            basis[tid]=krylov_vectors[0][tid]/beta;
+            for(int k=tid;k<(PME_GMRES_M+1)*PME_GMRES_M;k+=256)gmres_H[k]=0;
+            if(tid<PME_GMRES_M+1)gmres_g[tid]=tid==0?beta:0;
+            barrier(CLK_LOCAL_MEM_FENCE|CLK_GLOBAL_MEM_FENCE);
+            int used=0;
+            for(int j=0;j<PME_GMRES_M;j++){
+                pme_stationary_matvec_global(tid,n_sites,basis+j*256,P_new,DiagLoss,&Rates[0][0],reduce_buf);
+                for(int i=0;i<=j;i++){
+                    pme_real hij=pme_dot_global_local(tid,basis+i*256,P_new,reduce_buf);
+                    if(tid==0)gmres_H[i*PME_GMRES_M+j]=hij;
+                    P_new[tid]-=hij*basis[i*256+tid];barrier(CLK_LOCAL_MEM_FENCE);
+                }
+                pme_real hn=sqrt(pme_dot(tid,P_new,P_new,reduce_buf));
+                basis[(j+1)*256+tid]=hn>(pme_real)1e-30?P_new[tid]/hn:0;
+                if(tid==0){
+                    gmres_H[(j+1)*PME_GMRES_M+j]=hn;
+                    for(int i=0;i<j;i++){
+                        pme_real hi=gmres_H[i*PME_GMRES_M+j],hn1=gmres_H[(i+1)*PME_GMRES_M+j];
+                        gmres_H[i*PME_GMRES_M+j]=gmres_cs[i]*hi+gmres_sn[i]*hn1;
+                        gmres_H[(i+1)*PME_GMRES_M+j]=-gmres_sn[i]*hi+gmres_cs[i]*hn1;
+                    }
+                    pme_real aa=gmres_H[j*PME_GMRES_M+j],bb=gmres_H[(j+1)*PME_GMRES_M+j],rr=hypot(aa,bb);
+                    gmres_cs[j]=rr>0?aa/rr:1;gmres_sn[j]=rr>0?bb/rr:0;
+                    gmres_H[j*PME_GMRES_M+j]=rr;gmres_H[(j+1)*PME_GMRES_M+j]=0;
+                    gmres_g[j+1]=-gmres_sn[j]*gmres_g[j];gmres_g[j]*=gmres_cs[j];
+                }
+                barrier(CLK_LOCAL_MEM_FENCE|CLK_GLOBAL_MEM_FENCE);used=j+1;
+                if(fabs(gmres_g[j+1])<tol || hn<(pme_real)1e-30)break;
+            }
+            if(tid==0){
+                for(int i=used-1;i>=0;i--){
+                    pme_real rhs=gmres_g[i];
+                    for(int j=i+1;j<used;j++)rhs-=gmres_H[i*PME_GMRES_M+j]*gmres_y[j];
+                    gmres_y[i]=fabs(gmres_H[i*PME_GMRES_M+i])>(pme_real)1e-30?rhs/gmres_H[i*PME_GMRES_M+i]:0;
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+            for(int i=0;i<used;i++)P_old[tid]+=gmres_y[i]*basis[i*256+tid];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        pme_stationary_matvec(tid,n_sites,P_old,P_new,DiagLoss,&Rates[0][0],reduce_buf);
+        krylov_r[tid]=(tid==255?((pme_real)1/256):0)-P_new[tid];barrier(CLK_LOCAL_MEM_FENCE);
+        pme_real residual=pme_dot(tid,krylov_r,krylov_r,reduce_buf);
+        // Squared-residual floor: FP64 can reach 1e-20; FP32 converged residuals
+        // are ~1e-12, so the same gate would flag every good solution as NaN.
+#ifdef PME8_STATIONARY_FP64
+        const pme_real residual_gate=(pme_real)1e-20;
+#else
+        const pme_real residual_gate=(pme_real)1e-8;
+#endif
+        if(residual>residual_gate)P_old[tid]=NAN;
+        if(P_old[tid]<0 && P_old[tid]>-(pme_real)1e-10)P_old[tid]=0;
+        barrier(CLK_LOCAL_MEM_FENCE);
+    } else if(stationary_method==2){
+        // Residual-controlled BiCGSTAB for the same normalized stationary system.
+        // It resolves weakly connected configurations without physical rate changes.
+        pme_stationary_matvec(tid,n_sites,P_old,krylov_v,DiagLoss,&Rates[0][0],reduce_buf);
+        krylov_r[tid]=(tid==255?((pme_real)1/256):0)-krylov_v[tid];
+        krylov_rhat[tid]=krylov_r[tid];krylov_p[tid]=0;krylov_v[tid]=0;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        pme_real rho_old=1,alpha=1,omega=1;
+        for(int iter=0;iter<max_iter;iter++){
+            pme_real rho=pme_dot(tid,krylov_rhat,krylov_r,reduce_buf);
+            if(fabs(rho)<(pme_real)1e-30)break;
+            pme_real beta=(rho/rho_old)*(alpha/omega);
+            krylov_p[tid]=krylov_r[tid]+beta*(krylov_p[tid]-omega*krylov_v[tid]);barrier(CLK_LOCAL_MEM_FENCE);
+            pme_stationary_matvec(tid,n_sites,krylov_p,krylov_v,DiagLoss,&Rates[0][0],reduce_buf);
+            pme_real denominator=pme_dot(tid,krylov_rhat,krylov_v,reduce_buf);
+            if(fabs(denominator)<(pme_real)1e-30)break;
+            alpha=rho/denominator;
+            krylov_s[tid]=krylov_r[tid]-alpha*krylov_v[tid];barrier(CLK_LOCAL_MEM_FENCE);
+            pme_real snorm=pme_dot(tid,krylov_s,krylov_s,reduce_buf);
+            if(snorm<(pme_real)tol*tol){P_old[tid]+=alpha*krylov_p[tid];barrier(CLK_LOCAL_MEM_FENCE);break;}
+            pme_stationary_matvec(tid,n_sites,krylov_s,krylov_t,DiagLoss,&Rates[0][0],reduce_buf);
+            pme_real ts=pme_dot(tid,krylov_t,krylov_s,reduce_buf);
+            pme_real tt=pme_dot(tid,krylov_t,krylov_t,reduce_buf);
+            if(tt<(pme_real)1e-30)break;
+            omega=ts/tt;
+            P_old[tid]+=alpha*krylov_p[tid]+omega*krylov_s[tid];
+            krylov_r[tid]=krylov_s[tid]-omega*krylov_t[tid];barrier(CLK_LOCAL_MEM_FENCE);
+            pme_real rnorm=pme_dot(tid,krylov_r,krylov_r,reduce_buf);
+            if(rnorm<(pme_real)tol*tol)break;
+            if(fabs(omega)<(pme_real)1e-30)break;
+            rho_old=rho;
+        }
+        pme_stationary_matvec(tid,n_sites,P_old,krylov_v,DiagLoss,&Rates[0][0],reduce_buf);
+        krylov_r[tid]=(tid==255?((pme_real)1/256):0)-krylov_v[tid];barrier(CLK_LOCAL_MEM_FENCE);
+        pme_real residual=pme_dot(tid,krylov_r,krylov_r,reduce_buf);
+        // Fail loudly on a nonconverged linear solve, instead of returning a plausible map.
+        if(residual>(pme_real)1e-16)P_old[tid]=NAN;
+        if(P_old[tid]<0 && P_old[tid]>-(pme_real)1e-10)P_old[tid]=0;
+        barrier(CLK_LOCAL_MEM_FENCE);
+    } else {
     for (int iter = 0; iter < max_iter; iter++) {
         // --- Euler step ---
-        float inflow = 0.0f;
+        pme_real inflow = 0.0f;
         for (int k = 0; k < n_sites; k++) {
             int c = mask ^ (1 << k);
             inflow += Rates[tid][k] * P_old[c];
         }
-        P_new[tid] = P_old[tid] + dt * (DiagLoss[tid] * P_old[tid] + inflow);
+        if (stationary_method == 1) {
+            // Solve D*P + R*P = 0 with damped Jacobi. Dividing each row by
+            // its own exit rate avoids the global Euler timestep freezing
+            // weak-tip transitions when substrate and tip rates differ greatly.
+            // Normalization below fixes the null-vector scale; the stationary
+            // equation is identical to Euler's. Preserve zero-exit states.
+            pme_real exit_rate = -DiagLoss[tid];
+            P_new[tid] = exit_rate > 0.0f ? 0.5f*(P_old[tid] + inflow/exit_rate) : P_old[tid];
+        } else {
+            P_new[tid] = P_old[tid] + dt * (DiagLoss[tid] * P_old[tid] + inflow);
+        }
         if (P_new[tid] < 0.0f) P_new[tid] = 0.0f;  // clamp negatives
         barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -367,8 +530,8 @@ __kernel void solve_pme8(
         barrier(CLK_LOCAL_MEM_FENCE);
         for (int stride = 128; stride > 0; stride >>= 1) {
             if (tid < stride) {
-                float a = reduce_buf[tid];
-                float b = reduce_buf[tid + stride];
+                pme_real a = reduce_buf[tid];
+                pme_real b = reduce_buf[tid + stride];
                 reduce_buf[tid] = (a > b) ? a : b;
             }
             barrier(CLK_LOCAL_MEM_FENCE);
@@ -377,12 +540,13 @@ __kernel void solve_pme8(
         barrier(CLK_LOCAL_MEM_FENCE);
 
         // --- Swap P_old and P_new ---
-        float tmp = P_old[tid];
+        pme_real tmp = P_old[tid];
         P_old[tid] = P_new[tid];
         P_new[tid] = tmp;
         barrier(CLK_LOCAL_MEM_FENCE);
 
         if (s_max_diff < tol) break;
+    }
     }
 
     // ------------------------------------------------------------------
@@ -400,7 +564,7 @@ __kernel void solve_pme8(
     // ------------------------------------------------------------------
     // I = sum over transitions b(lower)→c(higher) of [P_b * rate_enter_tip - P_c * rate_leave_tip]
     // Each thread computes its own state's contribution (only added-electron transitions).
-    float my_current = 0.0f;
+    pme_real my_current = 0.0f;
     for (int k = 0; k < n_sites; k++) {
         int mask_c = mask ^ (1 << k);
         int c = mask_c;
@@ -409,14 +573,14 @@ __kernel void solve_pme8(
         bool added = (bit_c && !bit_b);
         if (!added) continue;
 
-        float P_b = P_old[tid];
-        float P_c = P_old[c];
+        pme_real P_b = P_old[tid];
+        pme_real P_c = P_old[c];
         float E_diff = Energies[c] - Energies[tid];
         float t_val = T_factors[pix_id * n_sites + k];
-        float coupling1 = Gamma1 * t_val * t_val;
-        float f1 = fermi(E_diff, mu1, T1);
-        float rate_enter = coupling1 * f1 * 2.0f * PI;
-        float rate_leave = coupling1 * (1.0f - f1) * 2.0f * PI;
+        pme_real coupling1 = (pme_real)Gamma1 * t_val * t_val;
+        pme_real f1 = fermi(E_diff, mu1, T1);
+        pme_real rate_enter = coupling1 * f1 * 2.0f * PI;
+        pme_real rate_leave = coupling1 * (1.0f - f1) * 2.0f * PI;
         my_current += P_b * rate_enter - P_c * rate_leave;
     }
     reduce_buf[tid] = my_current;

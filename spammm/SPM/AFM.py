@@ -338,19 +338,22 @@ class AFMulator(OpenCLBase):
     DEFAULT_tipQZs     = np.array([ 0., 1.8, 3.6, 0.], dtype=np.float32)
 
 
-    def _pme_build_options(self, use_fire, pme_core_basis, pme_poly_R):
+    def _pme_build_options(self, use_fire, pme_core_basis, pme_poly_R, clamp_lo=False):
         """OpenCL -D build options for the AFM+contact_surface kernels.
 
         CS_PME_SMOOTH_CORE=1 for 'smooth'; CS_PME_POLY_CORE=1 + CS_PME_POLY_N +
         CS_PME_POLY_R0..R4 ladder for 'poly8'/'poly8sp'; 'poly8sp' additionally
         sets CS_PME_SP_CORE=1 + CS_PME_NMODES=9 (raw/smooth stay unchanged otherwise).
+        CS_PME_CORE_CLAMP_LO=1 restores the legacy r<r_lo flat clamp (default 0:
+        polynomial continuation into the repulsive core).
         """
         if pme_core_basis not in ('raw', 'smooth', 'poly8', 'poly8sp'):
             raise ValueError("pme_core_basis must be 'raw', 'smooth', 'poly8' or 'poly8sp'")
         poly = pme_core_basis in ('poly8', 'poly8sp')
         opts = ['-D', f'OPT_FIRE={1 if use_fire else 0}',
                 '-D', f'CS_PME_SMOOTH_CORE={int(pme_core_basis == "smooth")}',
-                '-D', f'CS_PME_POLY_CORE={int(poly)}']
+                '-D', f'CS_PME_POLY_CORE={int(poly)}',
+                '-D', f'CS_PME_CORE_CLAMP_LO={int(clamp_lo)}']
         if poly:
             from spammm.surfaces.PICCore import POLY_CORE_N
             R = np.asarray(pme_poly_R, np.float64)
@@ -364,11 +367,12 @@ class AFMulator(OpenCLBase):
             opts += ['-D', 'CS_PME_SP_CORE=1', '-D', f'CS_PME_NMODES={3 * (len(R) - 2)}']
         return opts
 
-    def __init__(self, cl_src_dir=None, use_morse=False, nloc=32, use_fire=True, pme_core_basis='raw', pme_poly_R=None):
+    def __init__(self, cl_src_dir=None, use_morse=False, nloc=32, use_fire=True, pme_core_basis='raw', pme_poly_R=None, pme_clamp_lo=False):
         if pme_core_basis not in ('raw', 'smooth', 'poly8', 'poly8sp'):
             raise ValueError("pme_core_basis must be 'raw', 'smooth', 'poly8' or 'poly8sp'")
         self.pme_core_basis = pme_core_basis
         self.pme_poly_R = np.asarray(pme_poly_R, np.float64) if pme_poly_R is not None else None
+        self.pme_clamp_lo = bool(pme_clamp_lo)
         super().__init__(nloc=nloc, preferred_vendor='nvidia', bPrint=True)
         self.use_morse = use_morse
         self.use_fire = use_fire
@@ -383,7 +387,7 @@ class AFMulator(OpenCLBase):
         self._global_mem = dev.get_info(cl.device_info.GLOBAL_MEM_SIZE)
         debug_print(2, f"AFMulator: device max_alloc={_bytes_to_gb(self._max_alloc):.3f} GB global_mem={_bytes_to_gb(self._global_mem):.3f} GB")
         # Build options: -DOPT_FIRE=0 for damped velocity (matches CPU), -DOPT_FIRE=1 for FIRE
-        build_options = self._pme_build_options(use_fire, pme_core_basis, pme_poly_R)
+        build_options = self._pme_build_options(use_fire, pme_core_basis, pme_poly_R, self.pme_clamp_lo)
         kernel_paths = [
             os.path.join(cl_src_dir, 'common.cl'),
             os.path.join(cl_src_dir, 'Forces.cl'),
@@ -1177,7 +1181,7 @@ class AFMulator(OpenCLBase):
         cl.enqueue_copy(self.queue, out, self.cs_out_fe_cl)
         return out[:, 3], out[:, :3]
 
-    def fit_contact_surface(self, margin=2.0, bspl_dx=0.4, poly_R=10.0, poly_z0=0.0, m_start=4, nz=5, z_offset=1.2, fit_z_half=0.4, fit_z_stack=None, fit_z_adaptive=None, fit_dx=None, fit_dy=None, fit_dz=0.15, fit_boltzmann=True, fit_boltzmann_T=None, fit_force_weight=0.0, n_iter=80, plqh=(1.0, 1.0, 0.0, 0.0), brute_ref='afm', sep=None, bPrint=True, h0_mode='spheres', h0_R_scale=0.75, h0_r_xy=8.0, s_min=None, s_max=None):
+    def fit_contact_surface(self, margin=2.0, bspl_dx=0.4, poly_R=10.0, poly_z0=0.0, m_start=4, nz=5, z_offset=1.2, fit_z_half=0.4, fit_z_stack=None, fit_z_adaptive=None, fit_dx=None, fit_dy=None, fit_dz=0.15, fit_boltzmann=True, fit_boltzmann_T=None, fit_force_weight=0.0, n_iter=80, plqh=(1.0, 1.0, 0.0, 0.0), brute_ref='afm', sep=None, bPrint=True, h0_mode='spheres', h0_R_scale=0.75, h0_r_xy=8.0, s_min=None, s_max=None, allow_slow_cg=False):
         """
         Fit quasi-2D separable field to replace img_FF for PP relaxation.
         Default reference matches evalMorseC_QZs_toImg (same cMs, tip charges, and force convention).
@@ -1273,7 +1277,7 @@ class AFMulator(OpenCLBase):
                 print(f"AFMulator.fit_contact_surface: Boltzmann weights T={T:.4f} eV  E_shift={E_shift:.4f} eV  w∈[{float(sample_weights.min()):.3e},{float(sample_weights.max()):.3e}]")
         sep = SeparableParams(x0f, y0f, bspl_dx, bspl_dx, bspl_nx, bspl_ny, poly_R=poly_R, poly_z0=poly_z0, m_start=m_start, nz=nz, apos=apos, h0_map=h0_dict, h0_r_xy=h0_r_xy, Rs=Rs)
         F_ref_pass = F_ref if fit_force_weight > 0.0 else None
-        rmse = self._cs_fit_helper().fit_separable_cg(sep, fit_pts, E_ref, F_ref=F_ref_pass, apos=apos, n_iter=n_iter, sample_weights=sample_weights, force_weight=fit_force_weight, bPrint=bPrint)
+        rmse = self._cs_fit_helper().fit_separable_cg(sep, fit_pts, E_ref, F_ref=F_ref_pass, apos=apos, n_iter=n_iter, sample_weights=sample_weights, force_weight=fit_force_weight, bPrint=bPrint, allow_slow_cg=allow_slow_cg)
         if fit_z_adaptive is not None or fit_z_stack is not None:
             sep.fit_z_offsets = np.asarray(z_planes - z_ref, dtype=np.float64)
         else:
@@ -1291,7 +1295,7 @@ class AFMulator(OpenCLBase):
         print(f"AFMulator.fit_contact_surface: done RMSE={rmse:.4e}")
         return sep
 
-    def fit_contact_field(self, sep, xyz, E_ref, F_ref=None, *, n_iter=200, tol=1e-5, force_weight=1.0, force_equalize=True, sample_weights=None, bPrint=True):
+    def fit_contact_field(self, sep, xyz, E_ref, F_ref=None, *, n_iter=200, tol=1e-5, force_weight=1.0, force_equalize=True, sample_weights=None, bPrint=True, allow_slow_cg=False):
         """Fit separable contact field from explicit (E,F) samples (no atom arrays, no use_morse).
 
         Caller supplies sep (explicit h0_map) and sampled reference field; delegates to
@@ -1350,7 +1354,7 @@ class AFMulator(OpenCLBase):
                 F_ref = np.vstack([F_ref, np.zeros((npad, 3), dtype=np.float32)])
                 w = np.ones(ns, dtype=np.float32) if sample_weights is None else sample_weights
                 sample_weights = np.concatenate([w, np.zeros(npad, dtype=np.float32)])
-        rmse = self._cs_fit_helper().fit_separable_cg(sep, xyz, E_ref, F_ref=F_ref if force_weight > 0.0 else None, apos=None, n_iter=n_iter, tol=tol, sample_weights=sample_weights, force_weight=force_weight, force_equalize=force_equalize, bPrint=bPrint)
+        rmse = self._cs_fit_helper().fit_separable_cg(sep, xyz, E_ref, F_ref=F_ref if force_weight > 0.0 else None, apos=None, n_iter=n_iter, tol=tol, sample_weights=sample_weights, force_weight=force_weight, force_equalize=force_equalize, bPrint=bPrint, allow_slow_cg=allow_slow_cg)
         if not np.isfinite(rmse) or not np.isfinite(sep.coeffs).all():
             raise RuntimeError(f'fit_separable_cg returned non-finite result (rmse={rmse})')
         sep.fit_rmse = float(rmse)
@@ -1996,18 +2000,33 @@ class AFMulator(OpenCLBase):
         """
         if poly_R is None:
             poly_R = self.pme_poly_R
-        opts = self._pme_build_options(self.use_fire, basis, poly_R)
+        opts = self._pme_build_options(self.use_fire, basis, poly_R, getattr(self, 'pme_clamp_lo', False))
         if opts == getattr(self, '_pme_build_opts', None):
             self.pme_core_basis = basis
             self.pme_poly_R = np.asarray(poly_R, np.float64) if poly_R is not None else None
             return
+        self._pme_rebuild(opts)
+        self.pme_core_basis = basis
+        self.pme_poly_R = np.asarray(poly_R, np.float64) if poly_R is not None else None
+
+    def set_pme_clamp_lo(self, clamp_lo):
+        """Recompile for CS_PME_CORE_CLAMP_LO on/off (legacy r<r_lo flat clamp vs
+        continuation). Same rebuild mechanism as set_pme_core_basis."""
+        clamp_lo = bool(clamp_lo)
+        opts = self._pme_build_options(self.use_fire, self.pme_core_basis, self.pme_poly_R, clamp_lo)
+        if opts == getattr(self, '_pme_build_opts', None):
+            self.pme_clamp_lo = clamp_lo
+            return
+        self._pme_rebuild(opts)
+        self.pme_clamp_lo = clamp_lo
+
+    def _pme_rebuild(self, opts):
+        """Recompile self.prg with new build options; invalidates the cpm upload."""
         source_parts = []
         for path in self._pme_kernel_paths:
             with open(path, 'r') as f:
                 source_parts.append(f.read())
         self.prg = cl.Program(self.ctx, '\n'.join(source_parts)).build(options=opts)
-        self.pme_core_basis = basis
-        self.pme_poly_R = np.asarray(poly_R, np.float64) if poly_R is not None else None
         self._pme_build_opts = opts
         self._cpm_upload_id = None          # old program's upload key is stale
 
@@ -2265,7 +2284,7 @@ class AFMulator(OpenCLBase):
                              use_gpu=None, core_backend='auto', workgroup_size=None,
                              relax_mode='fire', qn_cap=0, qn_conv=1.0,
                              tile_xy=None, rho_max=1.0, nzL=5, rho_cap=None,
-                             fe0=False):
+                             fe0=False, keep_host=True):
         """PP-AFM scan using the contact_pme backend.
 
         Same scan geometry and outputs as run_scan_contact(), but the field
@@ -2296,8 +2315,14 @@ class AFMulator(OpenCLBase):
                 iz). True = all nz slices; or pass an iterable of kernel z-step
                 indices (iz=0 = highest) to write only those planes.
                 Download slices with download_fe0(izs).
+            keep_host: download the full FEs/PP arrays to host (default True —
+                legacy behavior). Pass False when only device-side products are
+                needed (scan_df_cl via compute_df_amp_z_gpu, fe0 via download_fe0):
+                skips ~57 MB of PCIe transfer per scan and the host isfinite pass;
+                FEs return value and last_pp are then None. Telemetry/status
+                download and postflight checks stay enabled either way.
         Returns:
-            FEs (nx_s, ny_s, nz, 4), pts (nx_s, ny_s, 3)
+            FEs (nx_s, ny_s, nz, 4) or None when keep_host=False, pts (nx_s, ny_s, 3)
         """
         from spammm.surfaces.ContactSurface import ContactPMEParams
         params = getattr(self, 'cpm', None)
@@ -2338,13 +2363,13 @@ class AFMulator(OpenCLBase):
                                     core_backend=core_backend, workgroup_size=workgroup_size,
                                     relax_mode=relax_mode, qn_cap=qn_cap, qn_conv=qn_conv,
                                     tile_xy=tile_xy, rho_max=rho_max, nzL=nzL, rho_cap=rho_cap,
-                                    fe0=fe0)
+                                    fe0=fe0, keep_host=keep_host)
         else:
             if fe0:
                 raise ValueError('fe0 output requires the GPU local+fire path')
             FEs = self._pme_scan_python(params, pts, nxy, nz, dtip)
         if getattr(self, 'verbosity', 0) > 0:
-            print(f"AFMulator.run_scan_contact_pme: done FEs.shape={FEs.shape}")
+            print(f"AFMulator.run_scan_contact_pme: done FEs.shape={FEs.shape if FEs is not None else 'device-only(keep_host=False)'}")
         return FEs, pts[:, :3].reshape(nx_s, ny_s, 3)
 
     def download_fe0(self, izs):
@@ -2376,8 +2401,8 @@ class AFMulator(OpenCLBase):
         ``last_pp``. Returns (na, 4) float32: r, R0, Fr, Fz. Fr > 0 is repulsive
         (Pauli wall, r < R0). One work-item per atom.
         """
-        if not hasattr(self, 'last_pp'):
-            raise RuntimeError('no relaxed PP positions; the last scan did not store deflections')
+        if getattr(self, 'last_pp', None) is None:
+            raise RuntimeError('no relaxed PP positions; last scan ran keep_host=False or stored no deflections')
         pp = np.ascontiguousarray(self.last_pp, np.float32)
         nx, ny, nz = pp.shape[:3]
         iz = int(iz)
@@ -2523,7 +2548,8 @@ class AFMulator(OpenCLBase):
 
     def _pme_scan_gpu(self, params, pts, nxy, nz, dtip, bAlloc, *, core_backend='auto',
                       workgroup_size=None, relax_mode='fire', qn_cap=0, qn_conv=1.0,
-                      tile_xy=None, rho_max=1.0, nzL=5, rho_cap=None, fe0=False):
+                      tile_xy=None, rho_max=1.0, nzL=5, rho_cap=None, fe0=False,
+                      keep_host=True):
         """GPU PP relaxation via bucket or Local contact-PME kernels.
         relax_mode: 'fire' (default), 'qn' (quasi-Newton), 'sph' (sphere-constrained
         Newton — |dpos|=L enforced analytically, only the 2 soft lateral DOFs solved).
@@ -2548,7 +2574,7 @@ class AFMulator(OpenCLBase):
         self._pme_upload_resident(params)
         if prof: _tp.append(('resident_upload', _time.perf_counter()))
         self.toGPU_(self.scan_pts_cl, pts)
-        FEs_h = np.zeros((n_scan * nz, 4), dtype=np.float32)
+        FEs_h = np.empty((n_scan * nz, 4), dtype=np.float32) if keep_host else None   # fully overwritten by fromGPU_ (or pass-2 lazy dl)
         tipC = self.tipC.copy(); tipC[3] = np.float32(dtip)
         na = params.na
         nx, ny, nz_m = params.mesh_shape
@@ -2700,11 +2726,14 @@ class AFMulator(OpenCLBase):
                 self.dpos0, self.relax_pars, self.surfFF, np.int32(nz))
         if prof:
             self.queue.finish(); _tp.append(('kernel_exec', _time.perf_counter()))
-        self.fromGPU_(self.scan_FEs_cl, FEs_h)
-        if relax_mode == 'fire' and backend == 'local':
-            PPs_h = np.empty((n_scan * nz, 4), np.float32)
-            self.fromGPU_(self.scan_disps_cl, PPs_h)
-            self.last_pp = PPs_h.reshape(nx_s, ny_s, nz, 4)
+        if keep_host:
+            self.fromGPU_(self.scan_FEs_cl, FEs_h)
+            if relax_mode == 'fire' and backend == 'local':
+                PPs_h = np.empty((n_scan * nz, 4), np.float32)
+                self.fromGPU_(self.scan_disps_cl, PPs_h)
+                self.last_pp = PPs_h.reshape(nx_s, ny_s, nz, 4)
+        else:
+            self.last_pp = None                 # device buffers only; download_fe0 unaffected
         if prof: _tp.append(('FEs_download_29MB', _time.perf_counter()))
         # Telemetry: download status only; pull detail buffers only on failure (fail-loud).
         status_z = np.empty(n_tele, dtype=np.int32)
@@ -2734,6 +2763,9 @@ class AFMulator(OpenCLBase):
             self.last_relax_hard = (self.last_relax_iters.reshape(n_scan, nz) < 0).any(axis=1).reshape(nx_s, ny_s)
             self.last_relax_flagz = (self.last_relax_iters.reshape(n_scan, nz) < 0).sum(axis=0)  # per-slice flag count (pre-merge)
             if len(hard_px):
+                if FEs_h is None:                                   # keep_host=False: pass-2 merge needs host copy — download on demand
+                    FEs_h = np.empty((n_scan * nz, 4), dtype=np.float32)
+                    self.fromGPU_(self.scan_FEs_cl, FEs_h)
                 n2 = len(hard_px)
                 flag2d = self.last_relax_iters.reshape(n_scan, nz) < 0
                 iz0 = np.argmax(flag2d[hard_px], axis=1).astype(np.int32)   # first flagged slice / pixel
@@ -2794,10 +2826,10 @@ class AFMulator(OpenCLBase):
         else:
             status = np.zeros(n_scan, dtype=np.int32)
             min_r = offender = overflow = None
-        FEs = FEs_h.reshape(nx_s, ny_s, nz, 4)
+        FEs = FEs_h.reshape(nx_s, ny_s, nz, 4) if keep_host else None
         scan_pts_xy = pts[:, :3].reshape(nx_s, ny_s, 3)
         self._pme_postflight_status(status, scan_pts_xy.reshape(-1, 3), min_r=min_r, offender=offender, overflow=overflow)
-        if not np.isfinite(FEs).all():
+        if keep_host and not np.isfinite(FEs).all():
             bad = np.argwhere(~np.isfinite(FEs).all(axis=-1))
             worst = tuple(bad[0]) if len(bad) else None
             raise RuntimeError(f"contact_pme GPU scan: non-finite FEs at {len(bad)} pixels, worst={worst}")
@@ -4259,18 +4291,17 @@ class _FDBMGpyFFT:
             self._step = None  # force k-grid rebuild
         if step is not None and self._step != float(step):
             self._step = float(step)
-            kx = 2.0 * np.pi * np.fft.fftfreq(nx, d=self._step)
-            ky = 2.0 * np.pi * np.fft.fftfreq(ny, d=self._step)
-            kz = 2.0 * np.pi * np.fft.fftfreq(nz, d=self._step)
-            KZ, KY, KX = np.meshgrid(kz, ky, kx, indexing='ij')
-            self._KX = KX.astype(np.float32)
-            self._KY = KY.astype(np.float32)
-            self._KZ = KZ.astype(np.float32)
-            k2 = self._KX**2 + self._KY**2 + self._KZ**2
+            # k2 = kx²+ky²+kz² broadcast from 1-D vectors — the previous np.meshgrid
+            # materialized 3 float64 full-grid arrays + f32 copies kept on self (~8 GB
+            # host at ~200 Mvox) for what is only ever used as k2_inv on device.
+            kx2 = (2.0 * np.pi * np.fft.fftfreq(nx, d=self._step)).astype(np.float32) ** 2
+            ky2 = (2.0 * np.pi * np.fft.fftfreq(ny, d=self._step)).astype(np.float32) ** 2
+            kz2 = (2.0 * np.pi * np.fft.fftfreq(nz, d=self._step)).astype(np.float32) ** 2
+            k2 = kx2[None, None, :] + ky2[None, :, None] + kz2[:, None, None]   # (nz,ny,nx) f32, one full array
             k2[0, 0, 0] = 1.0
-            self._k2_inv = (1.0 / k2).astype(np.float32)
-            self._k2_inv[0, 0, 0] = 0.0
-            self._k2_inv_cl = self.cl_array.to_device(self.queue, self._k2_inv)
+            np.divide(1.0, k2, out=k2)
+            k2[0, 0, 0] = 0.0
+            self._k2_inv_cl = self.cl_array.to_device(self.queue, np.ascontiguousarray(k2))
 
     def _gs3(self, shape=None):
         nx, ny, nz = self._shape if shape is None else shape

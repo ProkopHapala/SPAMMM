@@ -31,7 +31,7 @@ PyQt5 GUI for molecular editing and AFM simulation. Main window combines VisPy 3
 - **AFMExtension.py** — FDBM AFM/STM panel (GUI uses ModularPipeline only). **K_LAT in N/m** → eV/Å² internally. Default plot z=3.0 Å; atom overlay checkbox replots live; atoms as `'.'` dots. Prefer grid step ≤0.1 Å. Perf via pipeline `SPAMMM_AFM_FAST_S3` — see `doc/Tasks/PerfBenchmark_FDBM.md`, `doc/Tasks/AFMTesting.md`.
 - **KekuleExtension.py** — Kekulé π-bond-order solver panel
 - **FoldedRigidExtension.py** — Folded-basis rigid-body manipulation panel (load molecule, fit/load substrate potential, drag atoms)
-- **ChargeRingsExtension.py** — PME charge-ring STM: JSON params, Calc XY/xV/1D, cut-line overlay, many-body state probs (`doc/TopicalAudit/ChargeRings_PME.md`); sites still abstract until pose SSOT (`RigidMoleculePose_SSOT.md`)
+- **ChargeRingsExtension.py** — PME charge-ring STM: JSON params, Calc XY/xV/1D, cut-line overlay, many-body state probs (`doc/TopicalAudit/ChargeRings_PME.md`); sites still abstract until pose SSOT (`RigidMoleculePose_SSOT.md`). Includes the **Lattice PME8 (periodic)** section: interactive Temirov rectangular-lattice mode (full tip multipole cs, long/short/diagonal W in meV, live map/cuts vs registered experiment; backend `spammm/quantum/pme_lattice.py`, presets via `SPAMMM_LATTICE_PRESETS`).
 - **RigidAssemblyExtension.py** — Unified rigid-body panel: **Manipulate** maps scene atoms
   through PairFF dummy sites and relaxes all molecules concurrently with FAF; its probe map
   is the explicit `Probe E: static bodies + substrate` diagnostic with cached Total/PairFF/FAF

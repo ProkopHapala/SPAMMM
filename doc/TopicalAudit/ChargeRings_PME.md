@@ -55,6 +55,26 @@ Many-body **charge-state STM** of molecular sites (quantum dots): tip multipole 
 
 ## Open Issues
 
+### Temirov experimental fitting (2026-10-15)
+
+The external export `SPAMMM_export_for_ChaoLi/scripts/fit_temirov_pme.py` fits
+the registered 15.04 Å × 11.57 Å January Temirov maps using PME8 and one shared
+energy in a 2×4 occupation supercell. Early fits hold Wij=0; later maps receive a
+separate explicitly effective dipolar interaction screen. The geometry stays
+fixed and each tip/site pair selects one nearest supercell image.
+
+The wrapper now accepts optional `stationary_method='jacobi'` and
+`stationary_precision='double'`. Damped diagonal preconditioning avoids slow
+global Euler timesteps; double rate arithmetic retains small thermal hole
+probabilities at 1 K. Both are opt-in; defaults remain Euler/single. Calling
+`scan_current_tip(..., apply_validity_cut=False)` returns raw finite-temperature
+currents consistently with or without diagnostic energies. The original
+cutoff default is preserved. Independent dense 256-state comparisons and the
+existing PME8/PME4 smoke check are documented in the external fit README.
+
+Later interaction/image agreement is still limited; early-radius agreement does
+not validate a unique tip shape or a full independently occupied infinite lattice.
+
 - [ ] **Shared rigid pose SSOT** (`pos`+`qrot`) for PME ↔ PairFF ↔ Assembly ↔ FoldedRigid — audit: [`RigidBody.md`](RigidBody.md); design: [`Tasks/RigidMoleculePose_SSOT.md`](../Tasks/RigidMoleculePose_SSOT.md) (USER 2026-07-30; do not code until prioritized)
 - [ ] Hubbard / MQCA OpenCL import (task slices B–C)
 - [ ] MC fit + Wasserstein (E)
@@ -67,3 +87,23 @@ Many-body **charge-state STM** of molecular sites (quantum dots): tip multipole 
 - Task: [`doc/Tasks/Import_ChargeRings_PME.md`](../Tasks/Import_ChargeRings_PME.md)
 - Export SSOTs: `/home/prokop/git/ppafm/docs/export/charge_rings.export.md`, `/home/prokop/git/FireCore/doc/Topics/ManyBody/MQCA_Hubbard_Ising.export.md`
 - Folder README: [`spammm/quantum/README.md`](../../spammm/quantum/README.md)
+
+## Lattice PME8 (periodic) GUI mode (2026 added)
+
+`spammm/quantum/pme_lattice.py` ports the export workhorse
+`SPAMMM_export_for_ChaoLi/scripts/temirov_pme.py` (TemirovPME) into a
+preset-driven `LatticePME`: registered rectangular cell + basis from
+`geometry.json` (sha256-verified), n1×n2 occupation supercell (≤8 sites),
+nearest-replica tip PBC via `tip_cell` (never sums replicas), distance-shell
+Wij (long |a| / short |b| / diagonal |a+b|, meV in preset → eV), occupied-
+environment site energies `E_i = E_ref − W.row_sum` (toggleable), and the full
+10-coefficient PME8 tip multipole (`make_multipole_cs`; Qzz lives in cs6,
+off-diagonals are single coefficients — `make_quadrupole_Coeffs` is NOT used).
+Voltage = tip mu = gate. GUI section "Lattice PME8 (periodic)" in
+`ChargeRingsExtension.py` gives live dI/dV/current maps vs the registered
+experimental image (band-pass ridge scores) and long/short/diagonal x–V cuts
+(branch-signal correlations). Presets written by
+`export scripts/make_temirov_gui_presets.py` into
+`results/temirov_gui_presets/`; parity vs saved candidate maps is exact
+(`scripts/check_lattice_gui_parity.py`, rel diff 0 at 289 subsampled points).
+Tests: `tests/quantum/test_pme_lattice.py`, `tests/GUI/test_charge_rings_lattice.py`.

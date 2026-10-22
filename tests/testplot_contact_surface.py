@@ -173,7 +173,7 @@ def phase1_fit_close(afm, apos):
     y0f = float(apos[:, 1].min()) - MARGIN
     y1f = float(apos[:, 1].max()) + MARGIN
     print(f'  Phase1 fit: h0_mode={H0_MODE}  AFM brute  z∈[{FIT_Z_LO},{FIT_Z_HI}]Å above contact  dz {FIT_DZ_LO}→{FIT_DZ_HI}Å  {len(FIT_Z_PLANES)} planes  dx={BSPL_DX}Å  Boltzmann T={FIT_BOLTZMANN_T or "auto"}  force_weight={FIT_FORCE_WEIGHT} (E,Fx,Fy,Fz)')
-    sep = afm.fit_contact_surface(margin=MARGIN, bspl_dx=BSPL_DX, poly_R=POLY_R, poly_z0=POLY_Z0, m_start=M_START, nz=NZ, fit_z_adaptive=(FIT_Z_LO, FIT_Z_HI, FIT_DZ_LO, FIT_DZ_HI), fit_dx=FIT_DX, fit_dy=FIT_DY, fit_boltzmann=True, fit_boltzmann_T=FIT_BOLTZMANN_T, fit_force_weight=FIT_FORCE_WEIGHT, n_iter=120, brute_ref='afm', bPrint=True, h0_mode=H0_MODE, h0_R_scale=H0_R_SCALE)
+    sep = afm.fit_contact_surface(margin=MARGIN, bspl_dx=BSPL_DX, poly_R=POLY_R, poly_z0=POLY_Z0, m_start=M_START, nz=NZ, fit_z_adaptive=(FIT_Z_LO, FIT_Z_HI, FIT_DZ_LO, FIT_DZ_HI), fit_dx=FIT_DX, fit_dy=FIT_DY, fit_boltzmann=True, fit_boltzmann_T=FIT_BOLTZMANN_T, fit_force_weight=FIT_FORCE_WEIGHT, n_iter=120, brute_ref='afm', bPrint=True, h0_mode=H0_MODE, h0_R_scale=H0_R_SCALE, allow_slow_cg=True)
     h0 = sep.h0_map
     z_ref = float(getattr(sep, 'z_ref', zmax))
     print(f'  h0: min={h0.min():.3f} max={h0.max():.3f} std={h0.std():.4f}  z_ref={z_ref:.3f}  (spheres → corrugated envelope; dz=z−h₀)')
@@ -518,7 +518,7 @@ def phase2_pp_afm_parity(sep, apos):
     afm.tipQs[:] = 0.0
     n_grid = _grid_n(apos, MARGIN, Z_TOP, DX_GRID)
     afm.setup_grid(n=n_grid, margin=MARGIN, z_top=Z_TOP, shift_atoms=False)
-    afm.fit_contact_surface(sep=sep)
+    afm.fit_contact_surface(sep=sep, allow_slow_cg=True)
 
     nxy, scan_p0, scan_da, scan_db, extent, mol_z = afm.scan_bbox(margin=SCAN_MARGIN, dx=DX_SCAN)
     scan_kw = dict(nxy=nxy, nz=NZ_SCAN, dtip=DTIP, scan_p0=scan_p0, scan_da=scan_da, scan_db=scan_db)
@@ -1063,7 +1063,7 @@ def _make_afm_from_xyz(xyz_path, tip_R=0.0, tip_E=1.0, zero_tip_q=True):
 
 def _fit_sep(afm, knobs):
     kw = dict(knobs)
-    return afm.fit_contact_surface(**kw, fit_boltzmann=True, brute_ref='afm', bPrint=True)
+    return afm.fit_contact_surface(**kw, fit_boltzmann=True, brute_ref='afm', bPrint=True, allow_slow_cg=True)
 
 
 def _ensure_gridff(afm, dx=0.25, margin=4.0, z_top=10.0):
@@ -1417,7 +1417,7 @@ def run_fdbm_compression(cache_dir, out_dir, grid_step=0.1, bspl_steps=(0.8, 0.5
         sep = SeparableParams(x0, y0, dx, dx, ncx, ncy, poly_R=poly_R, poly_z0=poly_z0, m_start=1, nz=z_modes, h0_map=h0.ravel())
         print(f'Fitting {label}: {ncx}x{ncy}x{z_modes}; poly_z0={poly_z0} poly_R={poly_R}; E + Fx/Fy/Fz loss; n_iter={n_iter}', flush=True)
         t0 = time.perf_counter()
-        afm.fit_contact_field(sep, xyz, E_ref, F_ref, n_iter=n_iter, force_weight=1.0, sample_weights=weights, bPrint=True)
+        afm.fit_contact_field(sep, xyz, E_ref, F_ref, n_iter=n_iter, force_weight=1.0, sample_weights=weights, bPrint=True, allow_slow_cg=True)
         fit_sec = time.perf_counter() - t0
         archive = os.path.join(out_dir, f'{label}.npz')
         sep.save_npz(archive, metadata={'source': 'FDBM', 'source_field': field_path, 'source_grid': grid_path, 'source_stages': stages_path, 'projection': projection, 'grid_step': grid_step, 'atomPos': apos.tolist(), 'fit_h_min': 2.4, 'fit_h_max': float(fit_heights[-1]), 'tip': 'fixed tip from source FDBM cache; not refitted'})

@@ -57,7 +57,7 @@ def test_contact_surface_force_stencil_parity(xyz):
 def test_afm_contact_surface_scan(xyz):
     """Fit separable contact surface and run PP-relaxed scan without img_FF."""
     afm = _make_afm(xyz('benzene.xyz'))
-    sep = afm.fit_contact_surface(margin=2.0, bspl_dx=0.6, fit_z_stack=(1.0, 1.2, 1.5), n_iter=40, bPrint=False)
+    sep = afm.fit_contact_surface(margin=2.0, bspl_dx=0.6, fit_z_stack=(1.0, 1.2, 1.5), n_iter=40, bPrint=False, allow_slow_cg=True)
     assert sep.coeffs is not None
     assert sep.n_coeff < 50000, f"unexpected coeff count {sep.n_coeff}"
     apos = afm.atoms_arr[:, :3]
@@ -1108,7 +1108,7 @@ def test_contact_pme_core_ptcda_fit(xyz, make_review):
 
 
 def test_contact_pme_core_domain_violation(make_review):
-    """r < r_lo clamps to t=1 (finite); needed for PP-AFM close approach."""
+    """r < r_lo: polynomial continuation (default) vs legacy t=1 clamp (clamp_lo=True)."""
     from spammm.surfaces.PICCore import fit_core_1d, eval_core, core_basis
     rv = make_review('test_contact_pme_core_domain_violation')
     p = _core_split_params(_C_R0, _C_E0)
@@ -1117,20 +1117,24 @@ def test_contact_pme_core_domain_violation(make_review):
     r_lo = float(fit.r_lo[0])
     q_inside = np.array([[r_lo - 0.1, 0.0, 0.0]])
     E_in, F_in = eval_core(q_inside, atom_pos, fit)
-    rv.out(f'Inside r_lo-0.1: E={E_in[0]:.6e} F={F_in[0]} (must be finite; core clamps)')
+    rv.out(f'Inside r_lo-0.1: E={E_in[0]:.6e} F={F_in[0]} (finite; basis continues)')
     assert np.all(np.isfinite(E_in)) and np.all(np.isfinite(F_in))
-    # Clamp: phi at r_lo-ε equals phi at r_lo (t=1), dphi=0 → F_core≈0 for single atom on axis
+    # Continuation (default): phi grows below r_lo (t>1), dphi nonzero; C2 join at r_lo
     r_b = float(fit.r_b[0])
     phi_lo, dphi_lo = core_basis(np.array([r_lo]), r_lo, r_b, fit.powers)
     phi_in, dphi_in = core_basis(np.array([r_lo - 0.1]), r_lo, r_b, fit.powers)
-    assert np.allclose(phi_lo, phi_in), 'phi must match at/below r_lo (t=1 clamp)'
-    assert np.allclose(dphi_in, 0.0), 'dphi must be 0 below r_lo'
+    assert np.all(phi_in > phi_lo), 'continuation: phi must grow below r_lo (t>1)'
+    assert not np.allclose(dphi_in, 0.0), 'continuation: dphi must be nonzero below r_lo'
+    # Legacy clamp (clamp_lo=True): phi at r_lo-ε equals phi at r_lo (t=1), dphi=0
+    phi_cl, dphi_cl = core_basis(np.array([r_lo - 0.1]), r_lo, r_b, fit.powers, clamp_lo=True)
+    assert np.allclose(phi_lo, phi_cl), 'clamp_lo: phi must match at/below r_lo (t=1 clamp)'
+    assert np.allclose(dphi_cl, 0.0), 'clamp_lo: dphi must be 0 below r_lo'
     q_ok = np.array([[r_lo + 0.01, 0.0, 0.0]])
     E_ok, F_ok = eval_core(q_ok, atom_pos, fit)
     rv.out(f'At r_lo+0.01: E={E_ok[0]:.6e} F={F_ok[0]}')
     assert np.all(np.isfinite(E_ok))
-    rv.checklist('eval_core finite for r < r_lo (clamp, AFM close approach)',
-                 'phi(r<=r_lo) matches t=1; dphi=0',
+    rv.checklist('eval_core finite for r < r_lo (continuation; finite at moderate depth)',
+                 'phi(r<r_lo) continues t>1; dphi nonzero; clamp_lo=True restores flat clamp',
                  'eval_core works at r >= r_lo')
     rv.finish()
 
@@ -2139,7 +2143,7 @@ def test_fit_contact_field_2p5d(tmp_path):
     E_smp, F_smp = cs.eval_separable(pts, sep_ref)
 
     sep_fit = make_sep()
-    sep_fit = afm.fit_contact_field(sep_fit, pts, E_smp, F_smp, n_iter=200, tol=1e-5, force_weight=1.0)
+    sep_fit = afm.fit_contact_field(sep_fit, pts, E_smp, F_smp, n_iter=200, tol=1e-5, force_weight=1.0, allow_slow_cg=True)
     assert np.isfinite(sep_fit.coeffs).all()
     np.testing.assert_array_equal(sep_fit.fit_bounds, np.array([pts.min(axis=0), pts.max(axis=0)]))
 
@@ -2162,22 +2166,22 @@ def test_fit_contact_field_2p5d(tmp_path):
     np.testing.assert_allclose(F_ld, F_pred, atol=1e-6)
 
     with pytest.raises(ValueError):
-        afm.fit_contact_field(make_sep(), pts, E_smp[:-1])
+        afm.fit_contact_field(make_sep(), pts, E_smp[:-1], allow_slow_cg=True)
     with pytest.raises(ValueError):
-        afm.fit_contact_field(make_sep(), pts, np.full(len(pts), np.nan))
+        afm.fit_contact_field(make_sep(), pts, np.full(len(pts), np.nan), allow_slow_cg=True)
     with pytest.raises(ValueError):
-        afm.fit_contact_field(make_sep(), pts, E_smp, F_ref=None, force_weight=1.0)
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_ref=None, force_weight=1.0, allow_slow_cg=True)
     with pytest.raises(ValueError):
-        afm.fit_contact_field(make_sep(), pts, E_smp, F_ref=np.full_like(pts, np.nan), force_weight=1.0)
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_ref=np.full_like(pts, np.nan), force_weight=1.0, allow_slow_cg=True)
     with pytest.raises(ValueError):
-        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, force_weight=0.0, sample_weights=np.ones(len(pts) - 1))
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, force_weight=0.0, sample_weights=np.ones(len(pts) - 1), allow_slow_cg=True)
     with pytest.raises(ValueError):
-        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, force_weight=0.0, sample_weights=np.full(len(pts), -1.0))
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, force_weight=0.0, sample_weights=np.full(len(pts), -1.0), allow_slow_cg=True)
     with pytest.raises(ValueError):
-        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, force_weight=np.nan)
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, force_weight=np.nan, allow_slow_cg=True)
     with pytest.raises(ValueError):
-        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, tol=np.nan)
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, tol=np.nan, allow_slow_cg=True)
     with pytest.raises(ValueError):
-        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, n_iter=0)
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, n_iter=0, allow_slow_cg=True)
     with pytest.raises(ValueError):
-        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, force_weight=0.0, sample_weights=np.zeros(len(pts)))
+        afm.fit_contact_field(make_sep(), pts, E_smp, F_smp, force_weight=0.0, sample_weights=np.zeros(len(pts)), allow_slow_cg=True)

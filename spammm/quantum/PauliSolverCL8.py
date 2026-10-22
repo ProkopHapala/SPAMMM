@@ -64,7 +64,8 @@ class PauliSolverCL8(OpenCLBase):
 
     def __init__(self, nSingle=8, nLeads=2, verbosity=0, ctx=None, queue=None,
                  preferred_vendor='nvidia', device_index=0, bPrint=True,
-                 max_iter=2000, tol=1e-6):
+                 max_iter=2000, tol=1e-6, stationary_method='euler', stationary_precision='single',
+                 gmres_workspace_bytes=1 << 30):
         if nSingle > 8:
             raise ValueError(f"PME8.cl supports at most 8 sites (got {nSingle})")
         # nloc = 256 threads per workgroup
@@ -76,10 +77,26 @@ class PauliSolverCL8(OpenCLBase):
         self.verbosity = verbosity
         self.max_iter = max_iter
         self.tol = tol
+        if stationary_method not in ('euler', 'jacobi', 'bicgstab', 'gmres'):
+            raise ValueError("stationary_method must be 'euler', 'jacobi', 'bicgstab' or 'gmres'")
+        self.stationary_method = stationary_method
+        if stationary_precision not in ('single', 'double'):
+            raise ValueError("stationary_precision must be 'single' or 'double'")
+        self.stationary_precision = stationary_precision
+        # GMRES workspace: (PME_GMRES_M+1)*(256+PME_GMRES_M) = 129*384 pme_real
+        # per pixel; bound one launch to gmres_workspace_bytes.
+        itemsize = 8 if stationary_precision == 'double' else 4
+        self.gmres_workspace_bytes = int(gmres_workspace_bytes)
+        self.gmres_chunk_pixels = self.gmres_workspace_bytes // (129 * (256 + 128) * itemsize)
+        if self.gmres_chunk_pixels < 1:
+            raise ValueError(f'gmres_workspace_bytes={gmres_workspace_bytes} too small for even one pixel')
+        if stationary_precision == 'double' and 'cl_khr_fp64' not in self.queue.device.extensions:
+            raise RuntimeError('Double precision stationary PME requires cl_khr_fp64')
 
         kdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'kernels')
         kpath = os.path.abspath(os.path.join(kdir, 'PME8.cl'))
-        if not self.load_program(kernel_path=kpath, bMakeHeaders=False, bPrint=bPrint):
+        build_options = ['-DPME8_STATIONARY_FP64'] if stationary_precision == 'double' else None
+        if not self.load_program(kernel_path=kpath, bMakeHeaders=False, bPrint=bPrint, build_options=build_options):
             raise FileNotFoundError(f"Kernel file not found or failed to build: {kpath}")
 
         self.krn_compute_tip_interaction = cl.Kernel(self.prg, 'compute_tip_interaction')
@@ -99,7 +116,8 @@ class PauliSolverCL8(OpenCLBase):
     def scan_current_tip(self, pTips, Vtips, pSites, params, order, cs,
                          rots=None, Wij=None,
                          return_probs=False, return_state_energies=False,
-                         Vtips_gate=None, tip_cell=None, tip_periodic_sites=None):
+                         Vtips_gate=None, tip_cell=None, tip_periodic_sites=None,
+                         apply_validity_cut=True):
         """Main simulation function (mirrors PauliSolverCL.scan_current_tip).
 
         pTips: (N, 3) tip positions.
@@ -116,8 +134,25 @@ class PauliSolverCL8(OpenCLBase):
         Vtips_gate: optional (N,) gate voltages for compute_tip_interaction
             (site-energy shifts). Use e.g. alpha*(V_s - V0) for a lever-arm
             model while mu1 stays V_s. None => same as Vtips (old behaviour).
+        apply_validity_cut: retain the historical optional energy cutoff by
+            default. False returns the raw stationary kernel current, including
+            thermal tails below Emax=0; use this for consistent diagnostic and
+            production currents during finite-temperature parameter fitting.
         """
         # Optional nearest replica changes tip gating/tunnelling only. Ei/Wij
+        # The GMRES basis and Hessenberg workspace are bounded for every launch
+        # to gmres_workspace_bytes via self.gmres_chunk_pixels.
+        if self.stationary_method == 'gmres' and len(pTips) > self.gmres_chunk_pixels:
+            def batch_voltage(value, sl):
+                if value is None:
+                    return None
+                arr = np.asarray(value)
+                return value if arr.size == 1 else arr[sl]
+            chunks = []
+            for start in range(0, len(pTips), self.gmres_chunk_pixels):
+                sl = slice(start, min(start+self.gmres_chunk_pixels, len(pTips)))
+                chunks.append(self.scan_current_tip(pTips[sl],batch_voltage(Vtips,sl),pSites,params,order,cs,rots=rots,Wij=Wij,return_probs=return_probs,return_state_energies=return_state_energies,Vtips_gate=batch_voltage(Vtips_gate,sl),tip_cell=tip_cell,tip_periodic_sites=tip_periodic_sites,apply_validity_cut=apply_validity_cut))
+            return tuple(np.concatenate([c[k] for c in chunks],axis=0) if chunks[0][k] is not None else None for k in range(5))
         # and the many-body state space are untouched.
         cell_cl = mask_cl = None
         if tip_cell is None:
@@ -206,6 +241,13 @@ class PauliSolverCL8(OpenCLBase):
             out_stateEs_cl = cl_array.zeros(self.queue, n_pixels * self.nStates, dtype=np.float32)
 
         # Kernel 2: PME8 solver — 256 threads per pixel
+        krylov_workspace_cl = None
+        if self.stationary_method == 'gmres':
+            count = n_pixels*129*(256+128)
+            dtype = np.float64 if self.stationary_precision == 'double' else np.float32
+            if count*np.dtype(dtype).itemsize > self.gmres_workspace_bytes:
+                raise MemoryError('PME GMRES temporary workspace exceeds its gmres_workspace_bytes bound')
+            krylov_workspace_cl = cl_array.empty(self.queue,count,dtype=dtype)
         local_size_2 = (256,)
         global_size_2 = (n_pixels * 256,)
 
@@ -222,7 +264,9 @@ class PauliSolverCL8(OpenCLBase):
             out_probs_cl.data if out_probs_cl is not None else None,
             out_stateEs_cl.data if out_stateEs_cl is not None else None,
             np.int32(self.max_iter),
-            np.float32(self.tol)
+            np.float32(self.tol),
+            np.int32({'euler':0,'jacobi':1,'bicgstab':2,'gmres':3}[self.stationary_method]),
+            krylov_workspace_cl.data if krylov_workspace_cl is not None else None
         )
 
         currents = out_current_cl.get().astype(np.float64)
@@ -242,7 +286,7 @@ class PauliSolverCL8(OpenCLBase):
         W_scalar = float(w_val)
         Es_sp = Es.reshape(n_pixels, n_sites) if Es is not None else None
         Ts_sp = Ts.reshape(n_pixels, n_sites)
-        if Es_sp is not None:
+        if apply_validity_cut and Es_sp is not None:
             Emax = Es_sp.max(axis=1)
             gamma_amp = np.sqrt(gamma_input)
             Tmax = np.max(np.abs(gamma_amp * Ts_sp), axis=1)

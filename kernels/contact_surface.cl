@@ -17,6 +17,8 @@
 // Design: doc/Topics/AFM/ContactSurface_Static.md
 // Requires: common.cl + Forces.cl (getMorsePLQH) concatenated before this file.
 
+#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable
+
 #define CS_TILE 16
 #define CS_ATOM_TILE 32
 #define CS_PIC_LOCAL_MAX 384
@@ -1149,11 +1151,17 @@ inline void cs_pme_core_basis(float r, float r_lo_i, float r_b, float* phi, floa
     float D = r_b - r_lo_i;
     float t = (r_b - r) / D;
     if (t < 0.0f) t = 0.0f;
-    if (t > 1.0f) t = 1.0f;
-    // Active for all r < r_b. Below r_lo, t clips to 1 → constant residual (dphi=0).
-    // Needed for PP-AFM close approach; mesh soft field (PAW) remains valid at r→0.
     bool active = (r < r_b);
+#if CS_PME_CORE_CLAMP_LO
+    // Legacy "AFM close-approach" clamp: below r_lo the residual is constant (zero
+    // force) — creates an artificial plateau/ring when probes sample inside r_lo.
+    if (t > 1.0f) t = 1.0f;
     float dt = (r > r_lo_i && r < r_b) ? (-1.0f / D) : 0.0f;  // flat for r<=r_lo
+#else
+    // Continuation: let the polynomial continue below r_lo (t > 1) — smooth
+    // repulsive growth into the core; matches PICCore.core_basis(clamp_lo=False).
+    float dt = active ? (-1.0f / D) : 0.0f;
+#endif
     // Sampled-field option: C2 joins per mode, preserving all five coefficients.
     // The host validates the basis against the compiled option on upload.
 #if CS_PME_SMOOTH_CORE
@@ -1488,6 +1496,185 @@ __kernel void cs_reduce_groups(const int nc, const int ngroups, __global const f
     float s = 0.0f;
     for (int g = 0; g < ngroups; g++) s += partial[g * nc + j];
     out[j] = s;
+}
+
+// ===================== poly8sp Gram by column blocks (no readbacks, few launches) =====================
+// G[:,j0:j0+B) built per block of B consecutive coefs (spanning <=2 centers):
+// Av_blk writes y_b = A e_j for the block's coefs only (tests only the block's
+// centers, ~nat/B cheaper than per-column Av); Atv_blk accumulates all B
+// columns in registers per owner-atom; reduce writes into device-resident G.
+// Whole Gram = ~4 launches/block, ZERO mid-loop DtoH syncs.
+
+#define CS_SP_B 8
+__kernel void cs_sp_Av_blk(__global const float* samples, __global float4* y,     // y[ns*B]
+                           __global const float4* atoms, const int nat, const float d_span, const float wF,
+                           const int ns, const int j0, const int B,
+                           __local float4* LATOMS)
+{
+    int lid = get_local_id(0), lsize = get_local_size(0);
+    for (int i = lid; i < nat; i += lsize) LATOMS[i] = atoms[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    int s = get_global_id(0);
+    if (s >= ns) return;
+    float sx = samples[s * 3], sy = samples[s * 3 + 1], sz = samples[s * 3 + 2];
+    int c0 = j0 / CS_PME_NMODES, c1 = (j0 + B - 1) / CS_PME_NMODES;
+    for (int c = c0; c <= c1 && c < nat; c++) {
+        float4 ap = LATOMS[c];
+        float rc = ap.w * d_span;
+        float dx = sx - ap.x, dy = sy - ap.y, dz = sz - ap.z;
+        float r2 = dx * dx + dy * dy + dz * dz + 1e-20f;
+        if (r2 >= rc * rc) continue;
+        float r = sqrt(r2);
+        float phi[CS_PME_NMODES], gphi[CS_PME_NMODES * 3];
+        cs_pme_sp_basis(dx, dy, dz, r, ap.w, phi, gphi);
+        int m0 = (c == c0) ? (j0 - c * CS_PME_NMODES) : 0;
+        int m1 = min(CS_PME_NMODES, j0 + B - c * CS_PME_NMODES);
+        for (int m = m0; m < m1; m++) {
+            int jb = c * CS_PME_NMODES + m - j0;
+            y[s * B + jb] = (float4)(wF * gphi[m * 3], wF * gphi[m * 3 + 1], wF * gphi[m * 3 + 2], phi[m]);
+        }
+    }
+}
+
+// Adjoint for the whole block: work-item owns atom `at` (skips if its support
+// can't overlap either block center), accumulates acc[B][NMODES] over tiled
+// samples; partial[g][b][ncoef] then cs_reduce_groups_blk -> G_dev column.
+__kernel void cs_sp_Atv_blk(__global const float* samples, __global const float4* y, __global float* partial,
+                            __global const float4* atoms, const int nat, const float d_span, const float wF,
+                            const int ns, const int SB, const int j0, const int B,
+                            __local float4* LATOMS, __local float4* LPOS, __local float4* LV)
+{
+    int g = get_group_id(0);
+    int lid = get_local_id(0), lsize = get_local_size(0);
+    int ncoef = nat * CS_PME_NMODES;
+    int i0 = g * SB, i1 = min(i0 + SB, ns);
+    int c0 = j0 / CS_PME_NMODES, c1 = (j0 + B - 1) / CS_PME_NMODES;
+    for (int i = lid; i < nat; i += lsize) LATOMS[i] = atoms[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int it = i0; it < i1; it += lsize) {
+        int j = it + lid;
+        if (j < i1) {
+            LPOS[lid] = (float4)(samples[j * 3], samples[j * 3 + 1], samples[j * 3 + 2], 0.0f);
+            for (int b = 0; b < B; b++) LV[lid * CS_SP_B + b] = y[j * B + b];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        int nt = min(lsize, i1 - it);
+        for (int at = lid; at < nat; at += lsize) {
+            float4 ap = LATOMS[at];
+            float rad = ap.w * d_span;
+            // skip atoms whose support overlaps neither block center
+            int may = 0;
+            for (int c = c0; c <= c1 && c < nat; c++) {
+                float4 bp = LATOMS[c];
+                float rr = rad + bp.w * d_span;
+                float ddx = ap.x - bp.x, ddy = ap.y - bp.y, ddz = ap.z - bp.z;
+                if (ddx * ddx + ddy * ddy + ddz * ddz < rr * rr) may = 1;
+            }
+            if (!may) continue;
+            float acc[CS_SP_B][CS_PME_NMODES];
+            for (int b = 0; b < B; b++) for (int m = 0; m < CS_PME_NMODES; m++) acc[b][m] = 0.0f;
+            for (int j2 = 0; j2 < nt; j2++) {
+                float dx = LPOS[j2].x - ap.x, dy = LPOS[j2].y - ap.y, dz = LPOS[j2].z - ap.z;
+                float r2 = dx * dx + dy * dy + dz * dz + 1e-20f;
+                if (r2 >= rad * rad) continue;
+                float r = sqrt(r2);
+                float phi[CS_PME_NMODES], gphi[CS_PME_NMODES * 3];
+                cs_pme_sp_basis(dx, dy, dz, r, ap.w, phi, gphi);
+                for (int b = 0; b < B; b++) {
+                    float4 vv = LV[j2 * CS_SP_B + b];
+                    for (int m = 0; m < CS_PME_NMODES; m++)
+                        acc[b][m] += phi[m] * vv.w + wF * (gphi[m * 3] * vv.x + gphi[m * 3 + 1] * vv.y + gphi[m * 3 + 2] * vv.z);
+                }
+            }
+            for (int b = 0; b < B; b++)
+                for (int m = 0; m < CS_PME_NMODES; m++)
+                    partial[(g * CS_SP_B + b) * ncoef + at * CS_PME_NMODES + m] += acc[b][m];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+}
+
+// G_dev[(j0+b)*ncoef + j] = sum_g partial[(g*B+b)*ncoef + j]  (column-major store).
+__kernel void cs_reduce_groups_blk(const int ncoef, const int ngroups, const int j0, const int B,
+                                   __global const float* partial, __global float* Gdev)
+{
+    int t = get_global_id(0);
+    int b = t / ncoef, j = t % ncoef;
+    if (b >= B) return;
+    float s = 0.0f;
+    for (int g = 0; g < ngroups; g++) s += partial[(g * CS_SP_B + b) * ncoef + j];
+    Gdev[(j0 + b) * ncoef + j] = s;
+}
+
+// Gram contributions are accumulated in FIXED-POINT int64 (native atom_add,
+// no CAS retries — measured ~100x faster than float-CAS under contention):
+// Gi[e] += rint(v * CS_SP_GRAM_SCALE), host divides by CS_SP_GRAM_SCALE.
+// Quantization 2^-33/add is far below the f32 assembly noise it replaces.
+#define CS_SP_GRAM_SCALE 8589934592.0f   // 2^33; |sum| bound ~1e17 << int64 max
+
+// mode m of a sp core at (r2, w) contributes iff r2 < (R_m*w)^2 (phi can be
+// ~0 for p-modes even when active -> test the cutoff, not phi).
+inline int cs_pme_sp_mode_on(float r2, float w, int m) {
+    const float Rs[3] = {CS_PME_POLY_R0, CS_PME_POLY_R1, CS_PME_POLY_R2};
+    const float Rp[CS_PME_NP] = {CS_PME_POLY_R3, CS_PME_POLY_R4
+#if CS_PME_NP == 3
+        , CS_PME_POLY_R5
+#endif
+        };
+    float R = ((m < 3) ? Rs[m] : Rp[(m - 3) / 3]) * w;
+    return (r2 < R * R) ? 1 : 0;
+}
+
+// Single-launch Gram assembly: G = A^T A accumulated as per-sample outer
+// products. Work-item s collects its active centers, evaluates the sp basis
+// per active pair (a<=b), and scatters the mode-by-mode products into the
+// UPPER triangle of Gi (host symmetrizes). Replaces ~6 launches + 1 readback
+// PER COLUMN (~6k launches for ncoef=1224) with 1 launch + 1 readback.
+#define CS_SP_GRAM_MAXA 48
+__kernel void cs_sp_gram(__global const float* samples, __global long* Gi, __global uint* ntrunc,
+                         __global const float4* atoms, const int nat, const float d_span, const float wF,
+                         const int ns, const int ncoef, __local float4* LATOMS)
+{
+    int lid = get_local_id(0), lsize = get_local_size(0);
+    for (int i = lid; i < nat; i += lsize) LATOMS[i] = atoms[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    int s = get_global_id(0);
+    if (s >= ns) return;
+    float sx = samples[s * 3], sy = samples[s * 3 + 1], sz = samples[s * 3 + 2];
+    int act[CS_SP_GRAM_MAXA]; int nact = 0;
+    for (int at = 0; at < nat; at++) {
+        float4 ap = LATOMS[at]; float rc = ap.w * d_span;
+        float dx = sx - ap.x, dy = sy - ap.y, dz = sz - ap.z;
+        if (dx * dx + dy * dy + dz * dz < rc * rc) {
+            if (nact < CS_SP_GRAM_MAXA) act[nact++] = at; else atomic_add(ntrunc, 1u);
+        }
+    }
+    const float wF2 = wF * wF;
+    for (int ia = 0; ia < nact; ia++) {
+        int a = act[ia]; float4 ap = LATOMS[a];
+        float dx = sx - ap.x, dy = sy - ap.y, dz = sz - ap.z;
+        float r2a = dx * dx + dy * dy + dz * dz;
+        float ra = sqrt(r2a + 1e-20f);
+        float pa[CS_PME_NMODES], ga[CS_PME_NMODES * 3];
+        cs_pme_sp_basis(dx, dy, dz, ra, ap.w, pa, ga);
+        for (int ib = ia; ib < nact; ib++) {
+            int b = act[ib]; float4 bp = LATOMS[b];
+            float ex = sx - bp.x, ey = sy - bp.y, ez = sz - bp.z;
+            float r2b = ex * ex + ey * ey + ez * ez;
+            float rb = sqrt(r2b + 1e-20f);
+            float pb[CS_PME_NMODES], gb[CS_PME_NMODES * 3];
+            cs_pme_sp_basis(ex, ey, ez, rb, bp.w, pb, gb);
+            for (int m = 0; m < CS_PME_NMODES; m++) {
+                if (!cs_pme_sp_mode_on(r2a, ap.w, m)) continue;
+                int j = a * CS_PME_NMODES + m;
+                for (int k = (a == b) ? m : 0; k < CS_PME_NMODES; k++) {
+                    if (!cs_pme_sp_mode_on(r2b, bp.w, k)) continue;
+                    float v = pa[m] * pb[k] + wF2 * (ga[m * 3] * gb[k * 3] + ga[m * 3 + 1] * gb[k * 3 + 1] + ga[m * 3 + 2] * gb[k * 3 + 2]);
+                    atom_add(&Gi[j * ncoef + b * CS_PME_NMODES + k], (long)rint(v * CS_SP_GRAM_SCALE));
+                }
+            }
+        }
+    }
 }
 #endif
 

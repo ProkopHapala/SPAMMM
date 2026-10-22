@@ -64,6 +64,12 @@ def rmse(a, b):
     return float(np.sqrt(np.mean(d * d)))
 
 
+def _hwm(tag):
+    """Process max-RSS probe (ru_maxrss is monotonic HWM, kB on Linux) — memory audit."""
+    import resource
+    print(f'[RSS] {tag}: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.0f} MB', flush=True)
+
+
 def _variant_figure(a_util, variants, row_specs, h_Fz, scan_xs, scan_ys, figure, title):
     row_specs_full = row_specs + [('Fz', k, f'{k} Fz', 'bwr') for k in variants]
     a_util.plot_afm_variant_height_strip(variants, row_specs_full, h_Fz, figure,
@@ -76,7 +82,8 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
                  no_core=False, n_shell=6000, n_cloud=32768,
                  delta_in=1.0, delta_b=1.0, z_fit_dz=1.2, resid_cap=10.0, lam=1e-3,
                  core_basis='poly8', core_wF=0.3, core_spec='A:s3p2+B:s1', core_solver='gpu', core_ridge=1e-8,
-                 mesh_fit='inpaint', skip_spline_only=False):
+                 mesh_fit='inpaint', skip_spline_only=False, keep_z=False, inpaint_iters=150,
+                 sep_solver='direct', sep_ridge=1e-6, gram_mode='colblk'):
     from spammm import atomicUtils as au
     from spammm.SPM import AFM as afm, AFM_utils as afm_utils
     from spammm.config_utils import get_dftb_basis_path
@@ -92,9 +99,15 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
     ELEM_Z = {'H':1,'C':6,'N':7,'O':8,'F':9,'P':15,'S':16}
     atomTypes = np.array([ELEM_Z[e] for e in enames], dtype=np.int32)
     atomPos = np.asarray(atomPos, dtype=np.float64)
-    atomPos[:] = make_planar_xy(atomPos)
-    orient_long_axis_x(atomPos)
-    atomPos[:, 2] = 0.0
+    if keep_z:
+        atomPos -= atomPos.mean(0)                    # centre only; keep 3D shape (non-planar test)
+    else:
+        atomPos[:] = make_planar_xy(atomPos)
+        orient_long_axis_x(atomPos)
+        atomPos[:, 2] = 0.0
+    atomPos -= (atomPos.min(0) + atomPos.max(0)) / 2  # bbox centred at 0 — qb is symmetric around 0 while the
+                                                      # FDBM grid centres on COM; for off-centre molecules the
+                                                      # qb+halo sample range falls outside the field otherwise
     mol_z = float(atomPos[:, 2].max())
 
     scan_dx = 0.1          # scan raster stays fine regardless of field step
@@ -123,6 +136,7 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
     sample = res['prolonged']['sample']
     dense_bytes = int(np.prod(ngrid)) * 16
     print(f'run_fields: {t_fields:.2f}s  (dense field would be {dense_bytes/1e6:.1f} MB — never on host)')
+    _hwm('after run_fields')
 
     # ── 2. holdout + reference dense scan ──
     xlo, xhi = qb[0]; ylo, yhi = qb[1]
@@ -280,6 +294,7 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
         E_ss, F_ss = sample(pts)
         assert np.isfinite(E_ss).all(), 'coremesh sample grid outside FDBM grid'
         t_samp = time.perf_counter() - t0
+        _hwm('after ss sample')
         z_min = mol_z + 0.5
         t1 = time.perf_counter()
         cg_info = None
@@ -291,7 +306,7 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
                 # the GPU solvers run in the kernel slot layout -> SP-compiled
                 # program must exist BEFORE the fit (the later call is a no-op)
                 a.set_pme_core_basis('poly8sp', poly_R=Rlab)
-            fit, centers = fit_core_sp_shell(atomPos, pts=pts, E=E_ss, F=F_ss, wF=core_wF, rin=2.5, rcut=4.0, z_min=z_min, spec=core_spec, solver=core_solver, afm=a, ridge=core_ridge)
+            fit, centers = fit_core_sp_shell(atomPos, pts=pts, E=E_ss, F=F_ss, wF=core_wF, rin=2.5, rcut=4.0, z_min=z_min, spec=core_spec, solver=core_solver, afm=a, ridge=core_ridge, gram_mode=gram_mode)
             cg_info = getattr(fit, 'cg_info', None)
             if core_solver in ('gpu', 'gpugram'):
                 E_core, _ = a._cs_fit_helper().eval_core_sp_gpu(pts)
@@ -306,8 +321,26 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
             n_bond = int(is_bond.sum())
             Rlab = POLY_CORE_R
         resid = (E_ss.astype(np.float64) - E_core).reshape(ns_ss)
+        _hwm('after core eval')
         from spammm.surfaces.PICCore import min_dist_to_atoms, inpaint_residual
         t_core = time.perf_counter() - t1
+
+        def _inpaint_bbox(t3, ns, msk, n_iter, seed=None, margin=4):
+            """inpaint_residual restricted to the mask bbox (+margin cells): Jacobi sweeps
+            only update masked cells, so sweeping the full grid outside the mask's bounding
+            box wastes most of the work (measured dominant cost of the mesh stage)."""
+            msk = np.asarray(msk, bool).reshape(ns)
+            ii = np.where(msk)
+            i0 = np.maximum(np.array([a.min() for a in ii]) - margin, 0)
+            i1 = np.minimum(np.array([a.max() for a in ii]) + margin + 1, ns)
+            sl = tuple(slice(a, b) for a, b in zip(i0, i1))
+            sub_m = msk[sl]
+            sub_seed = None if seed is None else np.asarray(seed, np.float64).reshape(ns)[sl]
+            filled = inpaint_residual(np.asarray(t3)[sl].ravel(), sub_m.shape, sub_m, n_iter=n_iter, seed=sub_seed).reshape(sub_m.shape)
+            out = np.asarray(t3, np.float64).copy()
+            out_view = out[sl]
+            out_view[sub_m] = filled[sub_m]
+            return out.ravel()
 
         def mesh_fit_lsq(target3):
             """Fit mesh on node grid. 'inpaint': omit too-close cells (rm<2.5 or below
@@ -333,7 +366,7 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
                     g = ((pts - np.asarray(lo)) / h).T                       # node-fraction coords
                     seed = np.zeros(int(np.prod(ns_ss)))
                     seed[msk_ss.ravel()] = map_coordinates(cf, g[:, msk_ss.ravel()], order=3, mode='nearest', prefilter=False)
-                    rf_ss = inpaint_residual(target3.ravel(), ns_ss, msk_ss, n_iter=150, seed=seed).reshape(ns_ss)
+                    rf_ss = _inpaint_bbox(target3, ns_ss, msk_ss, n_iter=inpaint_iters, seed=seed).reshape(ns_ss)
                     cf = fit_mesh_lsq_3d(rf_ss, s=s, lam=lam)
                 return CoarseMesh(cf, np.asarray(lo, np.float64).copy(), float(h), 2,
                                   (np.full(3, halo, np.int64), np.asarray(n_mesh) - 1 - halo)), dict(iterations=0, wrmse=wrms)
@@ -346,6 +379,7 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
         tm = time.perf_counter()
         mesh, dg_res = mesh_fit_lsq(resid)
         t_m1 = time.perf_counter() - tm
+        _hwm('after mesh fit')
         print(f'[coremesh] mesh(E-core) {mesh_fit} iters {dg_res["iterations"]} wrms={dg_res["wrmse"]*1e3:.3f} meV ({t_m1:.1f}s)', flush=True)
         cpm = cpm_params_from_coremesh(mesh.coeffs, lo, h, halo, centers, fit)
         tm = time.perf_counter()
@@ -456,12 +490,21 @@ def compress_mol(pipe, mol_name, xyz_file, step, method='pme', h_mesh=H_MESH,
             h0 = _bspline_prefilter_2d(np.full((ncy, ncx), mol_z))
             sep = SeparableParams(x0, y0, dx, dx, ncx, ncy, poly_R=poly_R, poly_z0=poly_z0,
                                   m_start=1, nz=z_modes, h0_map=h0.ravel())
-            print(f'Fitting {label}: {ncx}x{ncy}x{z_modes} n_iter={n_iter}', flush=True)
             t0 = time.perf_counter()
-            a.fit_contact_field(sep, xyz, E_ref, F_ref, n_iter=n_iter, force_weight=1.0,
-                                sample_weights=weights, bPrint=True)
+            if sep_solver == 'direct':
+                from spammm.surfaces.ContactSurface import fit_sep_direct
+                print(f'Fitting {label}: {ncx}x{ncy}x{z_modes} direct Gram assembly', flush=True)
+                fit_sep_direct(sep, xyz, E_ref, sample_weights=weights, ridge=sep_ridge, bPrint=True)
+                a._cs_fit_helper().setup_separable(sep)
+                a.setup_contact_surface(sep)
+            else:
+                print(f'Fitting {label}: {ncx}x{ncy}x{z_modes} n_iter={n_iter}', flush=True)
+                a.fit_contact_field(sep, xyz, E_ref, F_ref, n_iter=n_iter, force_weight=1.0, allow_slow_cg=True,
+                                    sample_weights=weights, bPrint=True)
             t_fit = time.perf_counter() - t0
             archive = os.path.join(outdir, f'{label}.npz')
+            if os.path.exists(archive):
+                os.remove(archive)          # testplot artifact dir — rerun overwrites
             sep.save_npz(archive, metadata={'source': 'FDBMPipeline.run_fields', 'molecule': mol_name,
                                             'grid_step': step, 'atomPos': atomPos.tolist()})
             loaded = SeparableParams.load_npz(archive)
@@ -539,6 +582,13 @@ def main():
     p.add_argument('--mesh-fit', choices=('inpaint', 'cg'), default='inpaint',
                    help="coremesh mesh solve: inpaint = omit rm<2.5/z<z_min cells via harmonic fill + separable banded fit (fast, PAW recipe); cg = legacy weighted supersampled CG")
     p.add_argument('--skip-spline-only', action='store_true', help='coremesh: skip the spline-only mesh fit + scan variant (halves mesh time)')
+    p.add_argument('--inpaint-iters', type=int, default=150, help='coremesh inpaint: Jacobi sweeps on the supersampled-grid harmonic fill (bbox-restricted)')
+    p.add_argument('--gram-mode', choices=('colblk', 'col', 'sample'), default='colblk',
+                   help="gpugram Gram assembly: sample = one launch, per-sample outer products (default); col = DEBUG per-column Atv(Av e_j) launch storm")
+    p.add_argument('--sep-solver', choices=('direct', 'cg'), default='direct',
+                   help='sep: direct = assembled sparse Gram + CG solve (~1-3 s); cg = DEPRECATED matrix-free CG (~2 min)')
+    p.add_argument('--sep-ridge', type=float, default=1e-6, help='sep direct solve: Tikhonov ridge (fraction of mean Gram diagonal)')
+    p.add_argument('--keep-z', action='store_true', help='do NOT flatten z to 0 (non-planar molecules)')
     args = p.parse_args()
     MOLS = {'azaindol': 'data/xyz/azaindol.xyz', 'PTCDA': 'data/xyz/PTCDA.xyz',
             'pentacene': 'data/xyz/pentacene.xyz', 'PTCDI': 'data/xyz/PTCDI.xyz',
@@ -548,13 +598,16 @@ def main():
     pipe = FDBMPipeline()          # ONE pipeline for the whole batch (batch contract)
     rows = []
     for m in args.mols:
+        xyz = MOLS.get(m, m)            # bare name -> builtin table; else treat as a path
         h_mesh = args.h_mesh if args.h_mesh is not None else (1.0 if args.method == 'coremesh' else H_MESH)
-        rows.append(compress_mol(pipe, m, MOLS[m], args.step, method=args.method,
+        rows.append(compress_mol(pipe, os.path.splitext(os.path.basename(m))[0], xyz, args.step, method=args.method,
                                  h_mesh=h_mesh, no_core=args.no_core,
                                  delta_in=args.din, delta_b=args.db,
                                  z_fit_dz=args.z_fit, resid_cap=args.cap, lam=args.lam,
                                  core_basis=args.core_basis, core_wF=args.core_wF, core_spec=args.core_spec, core_solver=args.core_solver,
-                                 skip_spline_only=args.skip_spline_only, mesh_fit=args.mesh_fit, core_ridge=args.core_ridge))
+                                 skip_spline_only=args.skip_spline_only, mesh_fit=args.mesh_fit, core_ridge=args.core_ridge,
+                                 keep_z=args.keep_z, inpaint_iters=args.inpaint_iters,
+                                 sep_solver=args.sep_solver, sep_ridge=args.sep_ridge, gram_mode=args.gram_mode))
     print(f"\n\n{'='*80}")
     hdr = (f"{'mol':22s} {'method':8s} {'nat':>4s} {'ncntr':>6s} {'ncoef':>6s} {'npts':>9s} {'mesh':>10s} "
            f"{'core_s':>7s} {'cgit':>5s} {'mesh1_s':>7s} {'scan_s':>7s} {'ms/1k':>6s} {'res_MB':>7s} "

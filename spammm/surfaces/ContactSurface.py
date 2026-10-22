@@ -403,6 +403,165 @@ def separable_cl_args(sep: SeparableParams):
     return meta, origin_step, dy_rc, invRc_mstart
 
 
+def _bspline4_vec(t):
+    """Vectorized cardinal cubic B-spline weights, t (...,) -> (...,4). Same convention as kernel bspline4."""
+    t = np.asarray(t, dtype=np.float64)
+    t2 = t * t; t3 = t2 * t
+    om = 1.0 - t; om2 = om * om; om3 = om2 * om
+    return np.stack([om3 / 6.0, (3.0 * t3 - 6.0 * t2 + 4.0) / 6.0,
+                     (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) / 6.0, t3 / 6.0], axis=-1)
+
+
+def fit_sep_direct(sep, xyz, E_ref, sample_weights=None, ridge=1e-6, tol=1e-8, maxiter=500, bPrint=False):
+    """Direct sparse-normal-equations fit of SeparableParams — energy rows only.
+
+    Replaces the deprecated matrix-free CG (~2 min/mol) with an assembled solve
+    (~1-3 s): every sample row is a Kronecker product  w = v ⊗ phi  because all
+    16 active B-spline knots of an (x,y) column share the same z-mode vector
+    phi(t) — h0 is interpolated at the sample, not per-knot. Therefore
+
+        G[(a,k),(b,k')] = Σ_cols v_a v_b Γ_c[k,k'],   Γ_c = Σ_z w_s² φ φᵀ
+
+    assembled per unique (x,y) column; the Gram is block-banded (~7x7 knot
+    neighborhood x nz² modes). Solved by preconditioned CG on the assembled
+    matrix (block-Jacobi: per-knot nz×nz inverse). Explicit `ridge` replaces
+    the implicit regularization the slow CG iteration count used to provide.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.linalg import cg as sp_cg, LinearOperator
+    t0 = time.perf_counter()
+    xyz = np.asarray(xyz, dtype=np.float64)
+    E_ref = np.asarray(E_ref, dtype=np.float64)
+    ns = len(xyz)
+    w = np.ones(ns) if sample_weights is None else np.asarray(sample_weights, dtype=np.float64)
+    ncx, ncy, nz = sep.ncx, sep.ncy, sep.nz
+    nk = ncx * ncy; ncoef = nk * nz
+    invRc = 1.0 / sep.poly_R
+
+    # ── group samples by unique (x,y) column; sort samples so columns are contiguous ──
+    cols, inv = np.unique(xyz[:, :2], axis=0, return_inverse=True)
+    nc = len(cols)
+    order = np.argsort(inv, kind='stable')
+    inv_s = inv[order]
+    starts = np.flatnonzero(np.r_[True, inv_s[1:] != inv_s[:-1]])
+
+    # ── per-column B-spline knots (j outer, ii inner — kernel cs_sep_stencil order) ──
+    ux = (cols[:, 0] - sep.x0) / sep.dx; ix = np.floor(ux).astype(np.int64); tx = ux - ix
+    uy = (cols[:, 1] - sep.y0) / sep.dy; iy = np.floor(uy).astype(np.int64); ty = uy - iy
+    ixk = ix[:, None] + np.arange(-1, 3, dtype=np.int64)          # (nc,4)
+    iyk = iy[:, None] + np.arange(-1, 3, dtype=np.int64)
+    bx = _bspline4_vec(tx); by = _bspline4_vec(ty)                # (nc,4)
+    mx = (ixk >= 0) & (ixk < ncx); my = (iyk >= 0) & (iyk < ncy)
+    ixkc = np.clip(ixk, 0, ncx - 1); iykc = np.clip(iyk, 0, ncy - 1)
+    ka = (iykc[:, :, None] * ncx + ixkc[:, None, :]).reshape(nc, 16)   # (nc,16) knot ids
+    v = ((by[:, :, None] * bx[:, None, :]).reshape(nc, 16)
+         * (my[:, :, None] & mx[:, None, :]).reshape(nc, 16))
+    h0c = np.einsum('cp,cp->c', v, sep.h0_map[ka])
+
+    # ── per-sample z modes phi_k = t^{m_start 2^k} (kernel poly_z_doubling_modes) ──
+    dz = xyz[:, 2] - h0c[inv] - sep.poly_z0
+    tt = 1.0 - np.clip(dz * invRc, 0.0, 1.0)
+    phi = np.empty((ns, nz))
+    tpow = tt ** sep.m_start
+    for k in range(nz):
+        phi[:, k] = tpow
+        if k + 1 < nz:
+            tpow = tpow * tpow
+    w2 = w * w
+
+    # ── per-column Grams Γ (nc,8,8) and rhs r (nc,8) via sorted reduceat ──
+    phi_s = phi[order] * w2[order, None]
+    phi_o = phi_s[:, :, None] * phi[order][:, None, :]
+    Gam = np.add.reduceat(phi_o.reshape(ns, -1), starts, axis=0).reshape(nc, nz, nz)
+    r_c = np.add.reduceat((phi_s * E_ref[order, None]), starts, axis=0)
+
+    # ── Gram blocks: for each ordered knot-offset, H[off][ka] = Σ_c v_a v_b Γ_c ──
+    # Emit via sparse (knot x col) incidence per (la,lb) local pair -> no np.add.at.
+    H = np.zeros((49, nk, nz, nz))
+    rhs = np.zeros((nk, nz))
+    Gam64 = Gam.reshape(nc, -1)
+    for la in range(16):
+        ja, ia = divmod(la, 4)
+        np.add.at(rhs, ka[:, la], v[:, la, None] * r_c)
+        for dj in range(-3, 4):
+            jb = ja + dj
+            if not 0 <= jb < 4:
+                continue
+            for di in range(-3, 4):
+                ib = ia + di
+                if not 0 <= ib < 4:
+                    continue
+                lb = jb * 4 + ib
+                off = (dj + 3) * 7 + (di + 3)
+                wab = v[:, la] * v[:, lb]
+                # sparse incidence knot_a x col with weights wab
+                W = coo_matrix((wab, (ka[:, la], np.arange(nc))), shape=(nk, nc)).tocsr()
+                H[off] += (W @ Gam64).reshape(nk, nz, nz)
+    del Gam, Gam64, phi_o, phi_s
+
+    # ── emit COO triples: coeff layout ic = knot + nk*k ──
+    rows_l, cols_l, vals_l = [], [], []
+    kk = np.arange(nz) * nk
+    for dj in range(-3, 4):
+        for di in range(-3, 4):
+            off = (dj + 3) * 7 + (di + 3)
+            ixa = np.arange(ncx); iya = np.arange(ncy)
+            vxm = (ixa + di >= 0) & (ixa + di < ncx); vym = (iya + dj >= 0) & (iya + dj < ncy)
+            IYA, IXA = np.meshgrid(iya[vym], ixa[vxm], indexing='ij')
+            a = (IYA * ncx + IXA).ravel(); b = ((IYA + dj) * ncx + (IXA + di)).ravel()
+            rr = np.broadcast_to((a[:, None] + kk)[:, :, None], (len(a), nz, nz))
+            cc = np.broadcast_to((b[:, None] + kk)[:, None, :], (len(a), nz, nz))
+            rows_l.append(rr.ravel()); cols_l.append(cc.ravel()); vals_l.append(H[off][a].ravel())
+    G = coo_matrix((np.concatenate(vals_l), (np.concatenate(rows_l), np.concatenate(cols_l))),
+                   shape=(ncoef, ncoef)).tocsr()
+    del H, rows_l, cols_l, vals_l
+    b = rhs.T.ravel()                                  # rhs[knot,k] -> flat[k*nk+knot]
+    assert b.size == ncoef
+
+    # ── ridge + solve: sparse LU (SuperLU) first, block-Jacobi CG fallback ──
+    from scipy.sparse import eye as sp_eye
+    from scipy.sparse.linalg import spsolve
+    diag = np.asarray(G.diagonal())
+    lam = ridge * max(diag.mean(), 1e-30)
+    G = G + lam * sp_eye(ncoef, format='csr')
+    c = None
+    try:
+        t_s = time.perf_counter()
+        c = spsolve(G, b)
+        if not np.isfinite(c).all():
+            c = None
+        elif bPrint:
+            print(f'  fit_sep_direct: splu {time.perf_counter()-t_s:.2f}s')
+    except Exception as e:
+        if bPrint:
+            print(f'  fit_sep_direct: spsolve failed ({e}) -> CG')
+    if c is None:
+        Dblk = np.zeros((nk, nz, nz))
+        Gc = G.tocoo()
+        for k in range(nz):
+            for k2 in range(nz):
+                sel = (Gc.row % nk == Gc.col % nk) & (Gc.row // nk == k) & (Gc.col // nk == k2)
+                if sel.any():
+                    np.add.at(Dblk[..., k, k2].ravel(), Gc.row[sel] % nk, Gc.data[sel])
+        Dinv = np.linalg.inv(Dblk + lam * np.eye(nz)[None])
+        M = LinearOperator((ncoef, ncoef), matvec=lambda x: np.einsum('akl,al->ak', Dinv, x.reshape(nz, nk).T).T.ravel(),
+                           dtype=np.float64)
+        c, info = sp_cg(G, b, rtol=tol, maxiter=maxiter, M=M)
+        if info != 0 and bPrint:
+            print(f'  fit_sep_direct: CG info={info} after {maxiter} iters')
+    sep.coeffs = c
+    # rmse on the samples
+    C = c.reshape(nz, nk).T                          # (nk, nz)
+    E_pred = np.zeros(ns)
+    for p in range(16):
+        E_pred += v[inv, p] * np.einsum('nk,nk->n', phi, C[ka[inv, p]])
+    wsum = max(float((w2).sum()), 1e-16)
+    rmse = float(np.sqrt(np.sum(w2 * (E_pred - E_ref) ** 2) / wsum))
+    if bPrint:
+        print(f'  fit_sep_direct: {nc} cols, ncoef={ncoef}, CG done, rmse={rmse:.4e}, {time.perf_counter()-t0:.2f}s')
+    return rmse
+
+
 class PICParams:
     """Radial PIC metadata (coeffs + buckets on GPU)."""
 
@@ -621,12 +780,18 @@ class ContactSurfaceCL(OpenCLBase):
             self.prg.cs_zero_outside(self.queue, (nGc,), (self.nloc,), np.int32(nc), self.cs_p_buff, np.int32(i0), np.int32(i1))
         return np.sqrt(rsnew / max(nc, 1))
 
-    def fit_separable_cg(self, sep: SeparableParams, xyz, E_ref, F_ref=None, apos=None, n_iter=80, tol=1e-5, sample_weights=None, force_weight=0.0, force_equalize=True, bPrint=False):
+    def fit_separable_cg(self, sep: SeparableParams, xyz, E_ref, F_ref=None, apos=None, n_iter=80, tol=1e-5, sample_weights=None, force_weight=0.0, force_equalize=True, bPrint=False, allow_slow_cg=False):
         """Global GPU CG fit. Optional WLS plus Fx,Fy,Fz rows; force_weight=1 equalizes RMS(E) vs RMS(Fα).
 
         DEPRECATED for batch compression — iterative CG (~2 min/mol). Prefer the
-        direct cpm_params_from_samples() dense-mesh prefilter (~0.05 s/mol).
+        direct cpm_params_from_samples() dense-mesh prefilter (~0.05 s/mol) or the
+        coremesh path (poly8sp cores + banded mesh solve, ~1-4 s/mol). Callers must
+        pass allow_slow_cg=True explicitly; otherwise this raises.
         """
+        if not allow_slow_cg:
+            raise RuntimeError('fit_separable_cg is the DEPRECATED slow path (~1200 CG iters, ~1-2 min/mol). '
+                               'Pass allow_slow_cg=True only for one-off reference fits; for batch use coremesh '
+                               '(testplot_fdbm_fields_compress.py --method coremesh) or cpm_params_from_samples.')
         self.setup_separable(sep, apos=apos)
         self.upload_samples(xyz, E_ref, F_ref=F_ref if force_weight > 0.0 else None, sample_weights=sample_weights)
         wE, wF = self._loss_row_weights(E_ref, F_ref, force_weight, force_equalize=force_equalize)
@@ -715,8 +880,10 @@ class ContactSurfaceCL(OpenCLBase):
                 tiles.append({'itx': itx, 'ity': ity, 'bbox': (tx0, ty0, tx1, ty1), 'ic0': int(ic_arr.min()), 'ic1': int(ic_arr.max()) + 1})
         return tiles
 
-    def fit_separable_tiles(self, sep: SeparableParams, xyz, E_ref, apos=None, tile_ang=32.0, x0f=0.0, x1f=200.0, y0f=0.0, y1f=200.0, n_iter_per_tile=40, tol=1e-5, bPrint=False):
+    def fit_separable_tiles(self, sep: SeparableParams, xyz, E_ref, apos=None, tile_ang=32.0, x0f=0.0, x1f=200.0, y0f=0.0, y1f=200.0, n_iter_per_tile=40, tol=1e-5, bPrint=False, allow_slow_cg=False):
         """Independent tile CG: each tile updates only its coeff range (8-neighbor halo via full Av)."""
+        if not allow_slow_cg:
+            raise RuntimeError('fit_separable_tiles is an experimental slow CG path — pass allow_slow_cg=True explicitly.')
         self.setup_separable(sep, apos=apos)
         self.upload_samples(xyz, E_ref)
         ns = len(xyz)
@@ -1018,12 +1185,18 @@ class ContactSurfaceCL(OpenCLBase):
             print(f'fit_core_sp_cg: ns={ns} ncoef={ncoef} ({nc}x{nmod}) iters={it} |Âᵀs|/|Âᵀs0|={hist[-1]:.2e} resid_rms={info["rms_s"]:.3e} ({sec:.1f}s)', flush=True)
         return coeffs, info
 
-    def fit_core_sp_gram(self, centers, w, Rlad, pts, E_ref, F_ref, wF=0.3, ridge=1e-6, SB=1024, bPrint=True, active=None):
-        """Direct normal-equation solve on the GPU: assemble G = ÂᵀÂ column by
-        column (G[:,j] = Atv(Av e_j), ~3 kernel calls/column, no dense design
-        anywhere), then Jacobi-scaled Tikhonov + Cholesky on the host.
+    def fit_core_sp_gram(self, centers, w, Rlad, pts, E_ref, F_ref, wF=0.3, ridge=1e-6, SB=1024, bPrint=True, active=None, gram_mode='sample'):
+        """Direct normal-equation solve on the GPU: assemble G = ÂᵀÂ by
+        8-coef column blocks (gram_mode='colblk', default — cs_sp_Av_blk +
+        cs_sp_Atv_blk + cs_reduce_groups_blk per block, device-resident G,
+        ZERO mid-loop readbacks; ~4 launches/block vs ~6 launches + 1 sync
+        PER COLUMN in gram_mode='col'). 'sample' = experimental single-launch
+        per-sample outer-product kernel (cs_sp_gram, int64 fixed-point
+        atomics) — exact same math, verified rel-diff ~2e-7, but O(nact²·NM²)
+        per sample: fine for narrow-support bases, pathological for poly8sp's
+        9 Å supports (nact 50-100+). Tikhonov + Cholesky on host afterwards.
         Deterministic — no CG iterations. Same contract as fit_core_sp_cg
-        (returns per-center slot-layout coeffs; fitted buffer stays resident)."""
+        (returns per-center slot-layout coeffs; buffer stays resident)."""
         assert hasattr(self.prg, 'cs_sp_Av'), 'ContactSurfaceCL program lacks cs_sp_* kernels — build with CS_PME_SP_CORE=1 (poly8sp options)'
         centers = np.ascontiguousarray(centers, np.float64).reshape(-1, 3)
         w = np.ascontiguousarray(w, np.float64).reshape(-1)
@@ -1064,20 +1237,68 @@ class ContactSurfaceCL(OpenCLBase):
         assert np.isfinite(colnorm).all(), 'non-finite column norm in sp design'
         self._sp_Atv(ns, ncoef, nc, ngroups, SB, d_span, wF_eff, 0, self.cs_sp_g_buff)
         b = self.fromGPU_(self.cs_sp_g_buff, shape=(ncoef,)).astype(np.float64)
-        # Gram columns: only active ones (inactive slot columns are exactly 0)
-        G = np.zeros((ncoef, ncoef), np.float64)
         jact = np.flatnonzero(act & (colnorm > 0))
-        one = np.zeros(1, np.float32); one[0] = 1.0
-        for j in jact:
-            self.prg.cs_zero(self.queue, (self._roundup(ncoef, lsz),), (lsz,), np.int32(ncoef), self.cs_sp_v_buff)
-            cl.enqueue_fill_buffer(self.queue, self.cs_sp_v_buff, one, 4 * int(j), 4)
-            self._sp_Av(nGs, ns, ncoef, nc, d_span, wF_eff, self.cs_sp_v_buff, self.cs_sp_q_buff)
-            self.prg.cs_copy(self.queue, (self._roundup(ns4, lsz),), (lsz,), np.int32(ns4), self.cs_sp_q_buff, self.cs_sp_s_buff)
-            self._sp_Atv(ns, ncoef, nc, ngroups, SB, d_span, wF_eff, 0, self.cs_sp_g_buff)
-            G[:, j] = self.fromGPU_(self.cs_sp_g_buff, shape=(ncoef,))
-            if bPrint and j % 200 == 0:
-                print(f'  fit_core_sp_gram: col {j}/{ncoef} ({time.perf_counter() - t0:.1f}s)', flush=True)
-        G = 0.5 * (G + G.T)                                        # symmetrize f32 assembly noise
+        if gram_mode == 'colblk':
+            # blocked columns: ~4 launches per 8-coef block, zero mid-loop readbacks;
+            # G columns accumulate in device-resident Gdev, read back once.
+            BS = 8
+            nblk = (ncoef + BS - 1) // BS
+            nb_y = ns * BS
+            nb_p = ngroups * BS * ncoef
+            for name, nb in (('cs_sp_yb', nb_y * 16), ('cs_sp_pb', nb_p * 4), ('cs_sp_Gd', ncoef * ncoef * 4)):
+                if getattr(self, name + '_buff', None) is None or getattr(self, name + '_buff').size != nb:
+                    setattr(self, name + '_buff', cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, nb))
+            nGy = self._roundup(ns, lsz)
+            nGr = self._roundup(BS * ncoef, lsz)
+            zero4 = np.zeros(4, np.uint8)
+            for j0 in range(0, ncoef, BS):
+                Bc = min(BS, ncoef - j0)
+                cl.enqueue_fill_buffer(self.queue, self.cs_sp_yb_buff, zero4, 0, nb_y * 16)
+                cl.enqueue_fill_buffer(self.queue, self.cs_sp_pb_buff, zero4, 0, nb_p * 4)
+                self.prg.cs_sp_Av_blk(self.queue, (nGy,), (lsz,), self.cs_sp_samp_buff, self.cs_sp_yb_buff,
+                                      self.cs_sp_atoms_buff, np.int32(nc), d_span, np.float32(wF_eff), np.int32(ns),
+                                      np.int32(j0), np.int32(Bc), cl.LocalMemory(nc * 16))
+                self.prg.cs_sp_Atv_blk(self.queue, (ngroups * lsz,), (lsz,), self.cs_sp_samp_buff, self.cs_sp_yb_buff, self.cs_sp_pb_buff,
+                                       self.cs_sp_atoms_buff, np.int32(nc), d_span, np.float32(wF_eff),
+                                       np.int32(ns), np.int32(SB), np.int32(j0), np.int32(Bc),
+                                       cl.LocalMemory(nc * 16), cl.LocalMemory(lsz * 16), cl.LocalMemory(lsz * BS * 16))
+                self.prg.cs_reduce_groups_blk(self.queue, (nGr,), (lsz,), np.int32(ncoef), np.int32(ngroups),
+                                              np.int32(j0), np.int32(Bc), self.cs_sp_pb_buff, self.cs_sp_Gd_buff)
+            G = self.fromGPU_(self.cs_sp_Gd_buff, shape=(ncoef, ncoef)).astype(np.float64).T   # Gdev holds column j contiguous
+        elif gram_mode == 'sample':
+            # single launch: per-sample outer products -> upper triangle of G (fixed-point int64)
+            nG2 = ncoef * ncoef
+            if getattr(self, 'cs_sp_G_buff', None) is None or self.cs_sp_G_buff.size != nG2 * 8:
+                self.cs_sp_G_buff = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, nG2 * 8)
+            if getattr(self, 'cs_sp_ntrunc_buff', None) is None:
+                self.cs_sp_ntrunc_buff = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, 4)
+            cl.enqueue_fill_buffer(self.queue, self.cs_sp_G_buff, np.uint8(0), 0, nG2 * 8)
+            cl.enqueue_fill_buffer(self.queue, self.cs_sp_ntrunc_buff, np.uint32(0), 0, 4)
+            self.prg.cs_sp_gram(self.queue, (nGs,), (lsz,), self.cs_sp_samp_buff, self.cs_sp_G_buff, self.cs_sp_ntrunc_buff,
+                                self.cs_sp_atoms_buff, np.int32(nc), d_span, np.float32(wF_eff), np.int32(ns), np.int32(ncoef),
+                                cl.LocalMemory(nc * 16))
+            Gi = self.fromGPU_(self.cs_sp_G_buff, shape=(ncoef, ncoef), dtype=np.int64)
+            ntr = int(self.fromGPU_(self.cs_sp_ntrunc_buff, shape=(1,), dtype=np.uint32)[0])
+            assert ntr == 0, f'cs_sp_gram truncated {ntr} active centers (>CS_SP_GRAM_MAXA) — raise MAXA'
+            G = Gi.astype(np.float64) / 8589934592.0                # CS_SP_GRAM_SCALE = 2^33
+            G = G + np.triu(G, 1).T                               # kernel accumulated upper triangle only
+        else:
+            # DEBUG fallback: Gram columns G[:,j] = Atv(Av e_j), ~6 launches + 1 readback each
+            G = np.zeros((ncoef, ncoef), np.float64)
+            one = np.zeros(1, np.float32); one[0] = 1.0
+            for j in jact:
+                self.prg.cs_zero(self.queue, (self._roundup(ncoef, lsz),), (lsz,), np.int32(ncoef), self.cs_sp_v_buff)
+                cl.enqueue_fill_buffer(self.queue, self.cs_sp_v_buff, one, 4 * int(j), 4)
+                self._sp_Av(nGs, ns, ncoef, nc, d_span, wF_eff, self.cs_sp_v_buff, self.cs_sp_q_buff)
+                self.prg.cs_copy(self.queue, (self._roundup(ns4, lsz),), (lsz,), np.int32(ns4), self.cs_sp_q_buff, self.cs_sp_s_buff)
+                self._sp_Atv(ns, ncoef, nc, ngroups, SB, d_span, wF_eff, 0, self.cs_sp_g_buff)
+                G[:, j] = self.fromGPU_(self.cs_sp_g_buff, shape=(ncoef,))
+                if bPrint and j % 200 == 0:
+                    print(f'  fit_core_sp_gram: col {j}/{ncoef} ({time.perf_counter() - t0:.1f}s)', flush=True)
+        G = 0.5 * (G + G.T)                                        # symmetrize f32 assembly noise (sample mode is already exactly symmetric)
+        self._dbg_G = G                                            # DEBUG: raw Gram for gram_mode parity checks
+        if os.environ.get('CS_DUMP_G'):
+            np.save(os.environ['CS_DUMP_G'], G)
         d = 1.0 / np.sqrt(np.maximum(colnorm, 1e-30)); d[~(act & (colnorm > 0))] = 0.0
         Gs = G * d[:, None] * d[None, :] + float(ridge) * np.eye(ncoef)
         try:

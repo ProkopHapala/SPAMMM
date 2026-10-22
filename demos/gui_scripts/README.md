@@ -62,6 +62,10 @@ The panel remembers these per script in QSettings.
 - **azaindol_draw_demo.py** — Same sequence via live GUI tools; full-window PNG frames → GIF
   - Example: `./run_gui.sh --script demos/gui_scripts/azaindol_draw_demo.py`
   - `--canvas-only` for VisPy viewport only; `--zoom-out 2` (default) fits selection box
+- **charge_rings_lattice.py** — Open the Charge Rings panel, load a lattice
+  PME8 preset (default `temirov_7T.json` in the export repo), and run the Map
+  (dI/dV/current vs registered experiment). Args: `--preset`, `--V`, `--live`.
+  - Example: `./run_gui.sh --script demos/gui_scripts/charge_rings_lattice.py`
 
 ## Adding a new script
 

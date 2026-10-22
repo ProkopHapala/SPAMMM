@@ -84,7 +84,7 @@ SP_BOND_RSCALE = 5.0 / 9.0
 def min_dist_to_atoms(P, apos):
     """r_min = distance from each point to nearest atom (cKDTree; no (np,nat) broadcast)."""
     from scipy.spatial import cKDTree
-    return cKDTree(np.asarray(apos, np.float64).reshape(-1, 3)).query(np.asarray(P, np.float64).reshape(-1, 3))[0]
+    return cKDTree(np.asarray(apos, np.float64).reshape(-1, 3)).query(np.asarray(P, np.float64).reshape(-1, 3), workers=-1)[0]
 
 
 def poly_core_basis(r, R=POLY_CORE_R, N=POLY_CORE_N):
@@ -202,7 +202,7 @@ def sp_ladder(spec='A:s3p2+B:s1'):
 
 def fit_core_sp_shell(apos, pts=None, E=None, F=None, wF=0.3, rin=2.5, rcut=4.0,
                       z_min=None, dbond=1.6, spec='A:s3p2+B:s1', N=POLY_CORE_N, bPrint=True,
-                      solver='lstsq', afm=None, ridge=1e-8):
+                      solver='lstsq', afm=None, ridge=1e-8, gram_mode='colblk'):
     """Weighted LSQ fit of the poly8sp core on shell rin<r_min<rcut.
 
     solver='lstsq' delegates the basis machinery to CoreBasisStudy (build_terms +
@@ -253,7 +253,7 @@ def fit_core_sp_shell(apos, pts=None, E=None, F=None, wF=0.3, rin=2.5, rcut=4.0,
             ab = np.zeros(nb * nmod, bool); ab[0::nmod] = True   # bond centers: slot0 only (='B:s1')
             active = np.concatenate([active, ab])
         if solver == 'gpugram':
-            coeffs, cinfo = afm._cs_fit_helper().fit_core_sp_gram(centers, w, Rlad, Pf, Ef, Ff, wF=wF, ridge=ridge, bPrint=bPrint, active=active)
+            coeffs, cinfo = afm._cs_fit_helper().fit_core_sp_gram(centers, w, Rlad, Pf, Ef, Ff, wF=wF, ridge=ridge, bPrint=bPrint, active=active, gram_mode=gram_mode)
         else:
             coeffs, cinfo = afm._cs_fit_helper().fit_core_sp_cg(centers, w, Rlad, Pf, Ef, Ff, wF=wF, bPrint=bPrint, active=active)
         _cg_info = cinfo
@@ -358,12 +358,14 @@ def eval_core_sp(queries, centers, coeffs, w, Rlad=SP_CORE_R, N=POLY_CORE_N, chu
     return E, F
 
 
-def core_basis(r, r_lo, r_b, powers=CORE_POWERS, smooth=False):
+def core_basis(r, r_lo, r_b, powers=CORE_POWERS, smooth=False, clamp_lo=False):
     """phi_m(r) = t^p_m and dphi_m/dr for the raw doubling-power basis.
 
     t = (r_b - r)/(r_b - r_lo). Returns (phi, dphi) each shape (..., N_MODES).
     For r >= r_b: phi = 0, dphi = 0 (exact cutoff).
-    For r <= r_lo: t clipped to 1 → phi = 1^{p}=1, dphi = 0 (AFM close-approach clamp).
+    For r < r_lo: the polynomial continues (t > 1) — smooth repulsive continuation
+    instead of the old flat clamp. clamp_lo=True restores the legacy clamp
+    (t clipped to 1 → phi=1, dphi=0; "AFM close-approach clamp").
     smooth=True: map t through quintic smootherstep before taking powers. All
     modes then have C2 joins independently; no coefficient constraints consume
     fitting degrees of freedom. This is a distinct, explicitly tagged basis.
@@ -373,10 +375,13 @@ def core_basis(r, r_lo, r_b, powers=CORE_POWERS, smooth=False):
     r_b = np.asarray(r_b, dtype=np.float64)
     D = r_b - r_lo
     t = (r_b - r) / D
-    t = np.clip(t, 0.0, 1.0)
+    if clamp_lo:
+        t = np.clip(t, 0.0, 1.0)
+    else:
+        t = np.maximum(t, 0.0)
     active = r < r_b
-    # dphi only in open (r_lo, r_b); flat clamp below r_lo
-    d_active = (r > r_lo) & (r < r_b)
+    # dphi in the open basis domain; with clamp_lo it is flat below r_lo
+    d_active = ((r > r_lo) & active) if clamp_lo else active
     dt = -np.ones_like(t)/D
     if smooth:
         dt *= 30*t*t*(1-t)*(1-t)
