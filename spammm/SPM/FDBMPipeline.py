@@ -131,6 +131,20 @@ class FDBMPipeline:
         cutoffs = np.array([sp_by_name[dftb_data['species_names'][si]]['orbitals'][0]['cutoff'] for si in dftb_data['species_per_atom']])
         return {'pos': coords_ang, 'Rcut': cutoffs, 'type': atomic_numbers}
 
+    def release_scratch(self):
+        """Drop ALL shape-keyed device buffers — call between molecules of
+        DIFFERENT grid shape to bound VRAM (~5 GB/74Mvox-shape otherwise
+        accumulates: fft scratch x~8, tip tot/del, rho bufs, ones).
+        Keeps the context, queue, compiled programs, projectors, parsed
+        bases and host-side tip cache — only reallocation, no re-init."""
+        self.ffts.clear()
+        self._tip_dev.clear()
+        self._rho_stock_cl.clear()
+        self._ones_cl.clear()
+        a = self.afm
+        if a is not None:
+            a.img_FF_fdbm = None          # RGBA float images (~16 B/voxel x2)
+
     def _rho_stock_buf(self, shape):
         shape = tuple(int(x) for x in shape[:3])
         b = self._rho_stock_cl.get(shape)
@@ -302,7 +316,7 @@ Hamiltonian = DFTB {{
 
     # ── device-resident density projection ──────────────────────────────────
 
-    def project_densities(self, prep, grid_spec, step, dm=None, variants=('diff', 'prol'), charge_check=True):
+    def project_densities(self, prep, grid_spec, step, dm=None, variants=('diff', 'prol'), charge_check=True, nmax_atom=64):
         """Project densities straight into the shape's FFT scratch buffers (no host copies).
 
         variants: subset of {'diff','prol','stock'} —
@@ -323,7 +337,7 @@ Hamiltonian = DFTB {{
         if 'diff' in variants or 'stock' in variants:
             proj_stock = self.ensure_projector(('stock', bkey), basis_ang, max_shells=ms)
             atoms_stock = self._atoms_dict(prep['dftb_data'], basis_ang)
-            tdev_stock = proj_stock.build_tasks_dev(atoms_stock, grid_spec)   # tasks stay on GPU
+            tdev_stock = proj_stock.build_tasks_dev(atoms_stock, grid_spec, nMaxAtom=nmax_atom)   # tasks stay on GPU
         if 'diff' in variants:
             dm_na, _, _ = dg.build_na_dm_diagonal(prep['geo'], basis_ang, atoms_stock, norb, off)
             dm_diff = dm32 - np.asarray(dm_na, dtype=np.float32)          # B3 folded inside projector
@@ -337,7 +351,7 @@ Hamiltonian = DFTB {{
             basis_prol = self.species_ang(prep['basis_hsd_path'], 'prol')
             proj_prol = self.ensure_projector(('prol', bkey), basis_prol, max_shells=ms)
             atoms_prol = self._atoms_dict(prep['dftb_data'], basis_prol)   # prolonged cutoffs → own task list
-            tdev_prol = proj_prol.build_tasks_dev(atoms_prol, grid_spec)
+            tdev_prol = proj_prol.build_tasks_dev(atoms_prol, grid_spec, nMaxAtom=nmax_atom)
             proj_prol.project_density_dense(dm32, norb, off, atoms_prol, grid_spec, out_cl=fft._xyz_rho_scf.data, tasks_dev=tdev_prol)
             out['prol'] = fft._xyz_rho_scf
 
@@ -404,7 +418,7 @@ Hamiltonian = DFTB {{
     def run_fields(self, atomPos, atomTypes, basis_hsd, work_dir, grid_spec, origin, step, ngrid,
                    A_pauli, beta_pauli, tip_mode='co', *,
                    projection='prolonged', basis='3ob-3-1', margin=4.0, C6_CO=30.0,
-                   dm_in=None, oracle=True, charge_check=True):
+                   dm_in=None, oracle=True, charge_check=True, nmax_atom=64):
         """prep → project → potentials only. Mirrors ``run`` minus the scan stage —
         for FDBM→PME/contact encode and dataset field labels.
 
@@ -425,7 +439,8 @@ Hamiltonian = DFTB {{
         prep = self.dftb_prep(atomPos, atomTypes, basis_hsd, work_dir)
         _hwm('after dftb_prep')
         bufs = self.project_densities(prep, grid_spec, step, dm=dm_in,
-                                      variants=variants_needed, charge_check=charge_check)
+                                      variants=variants_needed, charge_check=charge_check,
+                                      nmax_atom=nmax_atom)
         _hwm('after project_densities')
         out = {'prep': prep, 'bufs': bufs}
         for variant in ('stock', 'prolonged'):
